@@ -8,7 +8,7 @@ mod update_tests {
     };
     use aruna_server::models::models::{Author as ModelAuthor, KeyValue as ModelKeyValue};
     use aruna_server::models::requests::{
-        UpdateResourceAuthorsRequest, UpdateResourceAuthorsResponse,
+        AddUserResponse, UpdateResourceAuthorsRequest, UpdateResourceAuthorsResponse,
         UpdateResourceDescriptionRequest, UpdateResourceDescriptionResponse,
         UpdateResourceIdentifiersRequest, UpdateResourceIdentifiersResponse,
         UpdateResourceLabelsRequest, UpdateResourceLabelsResponse, UpdateResourceLicenseRequest,
@@ -285,5 +285,41 @@ mod update_tests {
             .resource
             .authors
             .contains(&update_authors.authors_to_remove[0]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_user() {
+        let mut clients = init_test(OFFSET).await;
+        // Create realm
+        let request = CreateRealmRequest {
+            tag: "test".to_string(),
+            name: "TestRealm".to_string(),
+            description: String::new(),
+        };
+        let response = clients
+            .realm_client
+            .create_realm(request)
+            .await
+            .unwrap()
+            .into_inner();
+        let group_id = Ulid::from_string(&response.admin_group_id).unwrap();
+
+        let url = format!(
+            "{}/api/v3/groups/{}/user/01JER6Q2MEX5SS7GQCSSDFJJVG",
+            clients.rest_endpoint, group_id
+        );
+        println!("{url}");
+
+        let client = reqwest::Client::new();
+        let _: AddUserResponse = client
+            .patch(url)
+            .query(&[("permission", "Read")])
+            .header("Authorization", format!("Bearer {}", ADMIN_TOKEN))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
     }
 }
