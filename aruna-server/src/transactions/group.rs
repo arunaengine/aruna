@@ -223,10 +223,7 @@ impl WriteRequest for AddUserRequestTx {
         controller.authorize(&self.requester, &self.req).await?;
 
         let group_id = self.req.group_id;
-        let requester_id = self
-            .requester
-            .get_id()
-            .ok_or_else(|| ArunaError::Forbidden("Unregistered".to_string()))?;
+        let user_id = self.req.user_id;
         let permission = match self.req.permission {
             crate::models::models::Permission::None => PERMISSION_NONE,
             crate::models::models::Permission::Read => PERMISSION_READ,
@@ -240,8 +237,8 @@ impl WriteRequest for AddUserRequestTx {
             let mut wtxn = store.write_txn()?;
 
             // Get indices
-            let Some(user_idx) = store.get_idx_from_ulid(&requester_id, wtxn.get_txn()) else {
-                return Err(ArunaError::NotFound(requester_id.to_string()));
+            let Some(user_idx) = store.get_idx_from_ulid(&user_id, wtxn.get_txn()) else {
+                return Err(ArunaError::NotFound(user_id.to_string()));
             };
             let Some(group_idx) = store.get_idx_from_ulid(&group_id, wtxn.get_txn()) else {
                 return Err(ArunaError::NotFound(group_id.to_string()));

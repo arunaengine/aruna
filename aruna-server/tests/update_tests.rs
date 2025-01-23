@@ -6,19 +6,13 @@ mod update_tests {
     use aruna_rust_api::v3::aruna::api::v3::{
         Author, CreateProjectRequest, CreateRealmRequest, CreateResourceRequest, KeyValue, Realm,
     };
-    use aruna_server::models::models::{Author as ModelAuthor, KeyValue as ModelKeyValue};
+    use aruna_server::models::models::{Author as ModelAuthor, KeyValue as ModelKeyValue, Permission};
     use aruna_server::models::requests::{
-        AddUserResponse, UpdateResourceAuthorsRequest, UpdateResourceAuthorsResponse,
-        UpdateResourceDescriptionRequest, UpdateResourceDescriptionResponse,
-        UpdateResourceIdentifiersRequest, UpdateResourceIdentifiersResponse,
-        UpdateResourceLabelsRequest, UpdateResourceLabelsResponse, UpdateResourceLicenseRequest,
-        UpdateResourceLicenseResponse, UpdateResourceNameRequest, UpdateResourceNameResponse,
-        UpdateResourceTitleRequest, UpdateResourceTitleResponse, UpdateResourceVisibilityRequest,
-        UpdateResourceVisibilityResponse,
+        AddUserResponse, GetGroupsFromUserResponse, UpdateResourceAuthorsRequest, UpdateResourceAuthorsResponse, UpdateResourceDescriptionRequest, UpdateResourceDescriptionResponse, UpdateResourceIdentifiersRequest, UpdateResourceIdentifiersResponse, UpdateResourceLabelsRequest, UpdateResourceLabelsResponse, UpdateResourceLicenseRequest, UpdateResourceLicenseResponse, UpdateResourceNameRequest, UpdateResourceNameResponse, UpdateResourceTitleRequest, UpdateResourceTitleResponse, UpdateResourceVisibilityRequest, UpdateResourceVisibilityResponse
     };
     use ulid::Ulid;
 
-    use crate::common::{init_test, ADMIN_TOKEN};
+    use crate::common::{init_test, ADMIN_TOKEN, REGULAR_TOKEN, REGULAR_ULID};
     pub const OFFSET: u16 = 200;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -304,13 +298,12 @@ mod update_tests {
             .into_inner();
         let group_id = Ulid::from_string(&response.admin_group_id).unwrap();
 
-        let url = format!(
-            "{}/api/v3/groups/{}/user/01JER6Q2MEX5SS7GQCSSDFJJVG",
-            clients.rest_endpoint, group_id
-        );
-        println!("{url}");
-
         let client = reqwest::Client::new();
+
+        let url = format!(
+            "{}/api/v3/groups/{}/user/{}",
+            clients.rest_endpoint, group_id, REGULAR_ULID
+        );
         let _: AddUserResponse = client
             .patch(url)
             .query(&[("permission", "Read")])
@@ -321,5 +314,18 @@ mod update_tests {
             .json()
             .await
             .unwrap();
+
+        let url = format!("{}/api/v3/users/groups", clients.rest_endpoint);
+        let groups: GetGroupsFromUserResponse = client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", REGULAR_TOKEN))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert!(groups.groups.iter().any(|(g,perm)| g.id == group_id && perm == &Permission::Read));
     }
 }
