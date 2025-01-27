@@ -8,7 +8,7 @@ use crate::{
     context::{BatchPermission, Context},
     error::ArunaError,
     models::{
-        models::{ArunaTokenClaims, Audience, IssuerKey, IssuerType, Scope},
+        models::{ArunaTokenClaims, Audience, IssuerKey, IssuerType, Permission, Scope},
         requests::{AddOidcProviderRequest, AddOidcProviderResponse},
     },
     storage::store::Store,
@@ -511,7 +511,12 @@ fn validate_subscriber_of(
         return Err(ArunaError::Forbidden("No owner found".to_string()));
     };
     if subscriber.owner != user_id {
-        Err(ArunaError::Forbidden("Not owner".to_string()))
+        let perm = store.get_permissions(&subscriber.owner, None, &user_id)?;
+        if perm != Permission::Admin {
+            Err(ArunaError::Forbidden("Not owner".to_string()))
+        } else {
+            Ok(())
+        }
     } else {
         Ok(())
     }

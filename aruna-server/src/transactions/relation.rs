@@ -108,6 +108,7 @@ impl Request for GetRelationsRequest {
                     relations
                 }
             };
+            let total_hits = relations.len() as u32;
 
             let new_offset = if relations.len() < offset + self.page_size {
                 None
@@ -126,6 +127,7 @@ impl Request for GetRelationsRequest {
             Ok::<_, ArunaError>(GetRelationsResponse {
                 relations,
                 offset: new_offset,
+                total_hits,
             })
         })
         .await

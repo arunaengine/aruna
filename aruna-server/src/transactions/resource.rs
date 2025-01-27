@@ -15,8 +15,8 @@ use crate::{
     logerr,
     models::{
         models::{
-            Component, DataLocation, NodeVariant, Resource, ResourceVariant, SyncingStatus,
-            VisibilityClass,
+            Component, DataLocation, NodeVariant, Resource, ResourceVariant, Subscriber,
+            SyncingStatus, VisibilityClass,
         },
         requests::{
             AuthorizeRequest, AuthorizeResponse, CreateProjectRequest, CreateProjectResponse,
@@ -282,6 +282,16 @@ impl WriteRequest for CreateProjectRequestTx {
                 realm_idx,
                 project_idx,
                 relation_types::PROJECT_PART_OF_REALM,
+            )?;
+
+            store.add_subscriber(
+                &mut wtxn,
+                Subscriber {
+                    id: group_id,
+                    owner: group_id,
+                    target_idx: project_idx,
+                    cascade: true,
+                },
             )?;
 
             match project.visibility {

@@ -625,7 +625,7 @@ pub async fn register_user(
 pub async fn add_user(
     Path((group_id, user_id)): Path<(Ulid, Ulid)>,
     State(state): State<Arc<Controller>>,
-    Query(permission): Query<Permission>,
+    Query(permission): Query<PermissionWrapper>,
     header: HeaderMap,
 ) -> impl IntoResponse {
     into_axum_response(
@@ -634,7 +634,7 @@ pub async fn add_user(
                 AddUserRequest {
                     group_id,
                     user_id,
-                    permission,
+                    permission: permission.permission,
                 },
                 extract_token(&header),
             )

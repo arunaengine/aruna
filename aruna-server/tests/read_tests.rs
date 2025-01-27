@@ -21,6 +21,7 @@ mod read_tests {
             UserAccessGroupResponse,
         },
     };
+    use serde_json::json;
     use ulid::Ulid;
     pub const OFFSET: u16 = 100;
 
@@ -629,10 +630,13 @@ mod read_tests {
             .json()
             .await
             .unwrap();
-        assert!(response.events.iter().any(|(_, value)| value["type"] == "GroupAccessRealmTx"));
-         //   .values()
-         //   .into_iter()
-         //   .any(|v| v["type"] == "GroupAccessRealmTx")));
+        assert!(response
+            .events
+            .iter()
+            .any(|(_, value)| value["type"] == "GroupAccessRealmTx"));
+        //   .values()
+        //   .into_iter()
+        //   .any(|v| v["type"] == "GroupAccessRealmTx")));
 
         // Request group access
         let url = format!("{}/api/v3/groups/{}/join", clients.rest_endpoint, group_id);
@@ -657,7 +661,10 @@ mod read_tests {
             .json()
             .await
             .unwrap();
-        assert!(response.events.iter().any(|(_, value)| value["type"] == "UserAccessGroupTx"));
+        assert!(response
+            .events
+            .iter()
+            .any(|(_, value)| value["type"] == "UserAccessGroupTx"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -774,5 +781,103 @@ mod read_tests {
             .json()
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_events() {
+        // Setup
+        let mut clients = init_test(OFFSET).await;
+
+        // Create realm
+        let create_request = CreateRealmRequest {
+            tag: "test".to_string(),
+            name: "TestRealm".to_string(),
+            description: String::new(),
+        };
+
+        let response = clients
+            .realm_client
+            .create_realm(create_request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+
+        let realm_id = response.realm.unwrap().id;
+        let group_id = response.admin_group_id;
+        let group_ulid = Ulid::from_string(&group_id).unwrap();
+
+        // Create project
+        let request = CreateProjectRequest {
+            name: "TestProject".to_string(),
+            group_id,
+            realm_id,
+            visibility: 1,
+            ..Default::default()
+        };
+        let parent_id = Ulid::from_string(
+            &clients
+                .resource_client
+                .create_project(request.clone())
+                .await
+                .unwrap()
+                .into_inner()
+                .resource
+                .unwrap()
+                .id,
+        )
+        .unwrap();
+
+        // Create resources
+        let mut resources = Vec::new();
+        for i in 0..50 {
+            resources.push(BatchResource {
+                name: format!("TestEventsObject{i}"),
+                parent: aruna_server::models::requests::Parent::ID(parent_id),
+                variant: aruna_server::models::models::ResourceVariant::Folder,
+                ..Default::default()
+            });
+        }
+        let request = CreateResourceBatchRequest { resources };
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/v3/resources/batch", clients.rest_endpoint);
+        let _response: CreateResourceBatchResponse = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", ADMIN_TOKEN))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let url = format!("{}/api/v3/info/events", clients.rest_endpoint);
+        let group_events_response: GetEventsResponse = client
+            .get(url.clone())
+            .header("Authorization", format!("Bearer {}", ADMIN_TOKEN))
+            .query(&[("subscriber_id", group_ulid)])
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        // Ugly json parsing to skip over "ULID": Object {} part
+        let mut events = group_events_response.events.values().into_iter();
+
+        // Find CreateProject
+        assert_eq!(
+             events.next().unwrap()["type"].clone(),
+             "CreateProjectRequestTx"
+         );
+
+         // Find CreateBatch
+         assert_eq!(
+             events.next().unwrap()["type"].clone(),
+             "CreateResourceBatchRequestTx"
+        )
     }
 }

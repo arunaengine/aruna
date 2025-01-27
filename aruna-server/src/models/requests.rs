@@ -294,6 +294,12 @@ pub struct AddUserRequest {
     pub permission: Permission,
 }
 
+// Is needed to parse permissions correctly in query parameters
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct PermissionWrapper {
+    pub permission: Permission,
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddUserResponse {}
 
@@ -331,6 +337,7 @@ pub struct GetRelationsRequest {
 pub struct GetRelationsResponse {
     pub relations: Vec<Relation>,
     pub offset: Option<usize>,
+    pub total_hits: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]

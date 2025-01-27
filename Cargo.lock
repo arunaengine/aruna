@@ -120,7 +120,7 @@ dependencies = [
 [[package]]
 name = "aruna-rust-api"
 version = "2.0.0"
-source = "git+https://github.com/arunaengine/rust-api.git?branch=feat%2Fv3#ec0b4c2ca1202134e0384e52a90dd83b14704059"
+source = "git+https://github.com/arunaengine/rust-api.git?branch=feat%2Fv3#a7bccbaff80cfe6a760125e7ece0ef60e923a2d4"
 dependencies = [
  "prost",
  "prost-types",
@@ -4060,7 +4060,7 @@ checksum = "0c1318b19085f08681016926435853bbf7858f9c082d0999b80550ff5d9abe15"
 dependencies = [
  "bytes",
  "heck",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
@@ -4080,7 +4080,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e9552f850d5f0964a4e4d0bf306459ac29323ddfbae05e35a7c0d35cb0803cc5"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.89",
@@ -6481,7 +6481,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
