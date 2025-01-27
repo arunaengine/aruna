@@ -337,6 +337,7 @@ pub struct GetRelationsRequest {
 pub struct GetRelationsResponse {
     pub relations: Vec<Relation>,
     pub offset: Option<usize>,
+    pub total_hits: u32,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
