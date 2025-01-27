@@ -130,6 +130,7 @@ pub const FIELDS: &[Field] = &[
         name: field_names::GLOBAL_ADMIN_FIELD,
         index: 22,
     }, // 22 Bool - Is the user a global admin         | User
+    // TODO: Remove and merge into TAGS_FIELD
     Field {
         name: field_names::TAG_FIELD,
         index: 23,
@@ -145,11 +146,11 @@ pub const FIELDS: &[Field] = &[
     Field {
         name: field_names::PUBLIC,
         index: 26,
-    }, // 25 String - Visiblity of component            | Component
+    }, // 26 String - Visiblity of component            | Component
     Field {
         name: field_names::LICENSE_TERMS,
         index: 27,
-    }, // 25 String - Visiblity of component            | Component
+    }, // 27 String - Visiblity of component            | Component
 ];
 
 pub mod relation_types {

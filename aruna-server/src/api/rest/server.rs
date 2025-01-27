@@ -1,5 +1,5 @@
 use crate::{error::ArunaError, transactions::controller::Controller};
-use axum::{response::Redirect, routing::get};
+use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::trace::TraceLayer;
 use utoipa::OpenApi;
@@ -29,7 +29,8 @@ impl RestServer {
                     .on_response(())
                     .on_body_chunk(())
                     .on_eos(()),
-            );
+            )
+            .layer(DefaultBodyLimit::max(5 * 1024 * 1024));
         axum::serve(listener, app.into_make_service())
             .await
             .map_err(|e| ArunaError::ServerError(e.to_string()))?;

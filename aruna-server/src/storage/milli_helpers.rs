@@ -1,5 +1,5 @@
 use crate::{
-    constants::{Field, FIELDS},
+    constants::{field_names, Field, FIELDS},
     error::ArunaError,
     logerr,
 };
@@ -26,7 +26,22 @@ pub(crate) fn prepopulate_fields<'a: 'b, 'b>(
     let config = IndexerConfig::default();
     let mut settings = Settings::new(&mut wtxn, &index, &config);
     settings.set_filterable_fields(FIELDS.iter().map(|s| s.name.to_string()).collect());
-    settings.set_searchable_fields(FIELDS.iter().map(|s| s.name.to_string()).collect());
+    settings.set_searchable_fields(
+        FIELDS
+            .iter()
+            .filter_map(|s| match s.name {
+                field_names::NAME_FIELD
+                | field_names::DESCRIPTION_FIELD
+                | field_names::LABELS_FIELD
+                | field_names::AUTHORS_FIELD
+                | field_names::TAGS_FIELD
+                | field_names::FIRST_NAME_FIELD
+                | field_names::LAST_NAME_FIELD
+                | field_names::LICENSE_TERMS => Some(s.name.to_string()),
+                _ => None,
+            })
+            .collect(),
+    );
     settings.execute(|_| (), || false).inspect_err(logerr!())?;
 
     // Ensure that the existing map has the expected field u32 mappings
