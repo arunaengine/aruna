@@ -3,7 +3,7 @@ use crate::{
     error::ArunaError,
     logerr,
 };
-use heed::RwTxn;
+use milli::heed::RwTxn;
 use milli::{
     update::{IndexerConfig, Settings},
     FieldsIdsMap, Index,

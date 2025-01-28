@@ -12,7 +12,7 @@ pub struct FieldIterator<'a> {
 }
 
 impl<'a> FieldIterator<'a> {
-    pub fn new(reader: &KvReaderU16<'a>) -> Self {
+    pub fn new(reader: &'a KvReaderU16) -> Self {
         Self {
             iter: reader.iter().peekable(),
         }

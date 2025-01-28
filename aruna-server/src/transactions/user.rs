@@ -360,7 +360,7 @@ impl Request for GetGroupsFromUserRequest {
                 .try_into()
                 .inspect_err(logerr!())?;
                 if matches!(variant, NodeVariant::Group) {
-                    let group = Group::try_from(&raw_node)?;
+                    let group = Group::try_from(raw_node)?;
 
                     let perm = match relation.relation_type.as_str() {
                         "PermissionNone" => Permission::None,

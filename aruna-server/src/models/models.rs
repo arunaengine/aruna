@@ -144,7 +144,7 @@ impl TryFrom<serde_json::Number> for NodeVariant {
     }
 }
 
-pub trait Node: for<'a> TryFrom<&'a KvReaderU16<'a>, Error = ParseError>
+pub trait Node: for<'a> TryFrom<&'a KvReaderU16, Error = ParseError>
 where
     for<'a> &'a Self: TryInto<serde_json::Map<String, Value>, Error = ArunaError>,
 {
@@ -205,10 +205,10 @@ impl TryFrom<&Resource> for serde_json::Map<String, Value> {
 }
 
 // Implement TryFrom for Resource
-impl<'a> TryFrom<&KvReaderU16<'a>> for Resource {
+impl TryFrom<&KvReaderU16> for Resource {
     type Error = ParseError;
 
-    fn try_from(obkv: &KvReaderU16<'a>) -> Result<Self, Self::Error> {
+    fn try_from(obkv: &KvReaderU16) -> Result<Self, Self::Error> {
         let mut obkv = FieldIterator::new(obkv);
 
         let id: Ulid = obkv.get_required_field(0)?;
@@ -276,10 +276,10 @@ impl TryFrom<&User> for serde_json::Map<String, Value> {
 }
 
 // Implement TryFrom for User
-impl<'a> TryFrom<&KvReaderU16<'a>> for User {
+impl TryFrom<&KvReaderU16> for User {
     type Error = ParseError;
 
-    fn try_from(obkv: &KvReaderU16<'a>) -> Result<Self, Self::Error> {
+    fn try_from(obkv: &KvReaderU16) -> Result<Self, Self::Error> {
         let mut obkv = FieldIterator::new(obkv);
         // Get the required id
         let id: Ulid = obkv.get_required_field(0)?;
@@ -327,10 +327,10 @@ impl TryFrom<&ServiceAccount> for serde_json::Map<String, Value> {
 }
 
 // Implement TryFrom for ServiceAccount
-impl<'a> TryFrom<&KvReaderU16<'a>> for ServiceAccount {
+impl TryFrom<&KvReaderU16> for ServiceAccount {
     type Error = ParseError;
 
-    fn try_from(obkv: &KvReaderU16<'a>) -> Result<Self, Self::Error> {
+    fn try_from(obkv: &KvReaderU16) -> Result<Self, Self::Error> {
         let mut obkv = FieldIterator::new(obkv);
         // Get the required id
         let id: Ulid = obkv.get_required_field(0)?;
@@ -373,10 +373,10 @@ impl TryFrom<&Group> for serde_json::Map<String, Value> {
 }
 
 // Implement TryFrom for Group
-impl<'a> TryFrom<&KvReaderU16<'a>> for Group {
+impl TryFrom<&KvReaderU16> for Group {
     type Error = ParseError;
 
-    fn try_from(obkv: &KvReaderU16<'a>) -> Result<Self, Self::Error> {
+    fn try_from(obkv: &KvReaderU16) -> Result<Self, Self::Error> {
         let mut obkv = FieldIterator::new(obkv);
         // Get the required id
         let id: Ulid = obkv.get_required_field(0)?;
@@ -420,10 +420,10 @@ impl TryFrom<&Realm> for serde_json::Map<String, Value> {
 }
 
 // Implement TryFrom for Group
-impl<'a> TryFrom<&KvReaderU16<'a>> for Realm {
+impl TryFrom<&KvReaderU16> for Realm {
     type Error = ParseError;
 
-    fn try_from(obkv: &KvReaderU16<'a>) -> Result<Self, Self::Error> {
+    fn try_from(obkv: &KvReaderU16) -> Result<Self, Self::Error> {
         let mut obkv = FieldIterator::new(obkv);
         // Get the required id
         let id: Ulid = obkv.get_required_field(0)?;
@@ -886,10 +886,10 @@ impl TryFrom<&Component> for serde_json::Map<String, Value> {
 }
 
 // Implement TryFrom for User
-impl<'a> TryFrom<&KvReaderU16<'a>> for Component {
+impl TryFrom<&KvReaderU16> for Component {
     type Error = ParseError;
 
-    fn try_from(obkv: &KvReaderU16<'a>) -> Result<Self, Self::Error> {
+    fn try_from(obkv: &KvReaderU16) -> Result<Self, Self::Error> {
         let mut obkv = FieldIterator::new(obkv);
         // Get the required id
         let id: Ulid = obkv.get_required_field(0)?;
@@ -957,10 +957,10 @@ impl TryFrom<&License> for serde_json::Map<String, Value> {
 }
 
 // Implement TryFrom for User
-impl<'a> TryFrom<&KvReaderU16<'a>> for License {
+impl TryFrom<&KvReaderU16> for License {
     type Error = ParseError;
 
-    fn try_from(obkv: &KvReaderU16<'a>) -> Result<Self, Self::Error> {
+    fn try_from(obkv: &KvReaderU16) -> Result<Self, Self::Error> {
         let mut obkv = FieldIterator::new(obkv);
         // Get the required id
         let id: Ulid = obkv.get_required_field(0)?;

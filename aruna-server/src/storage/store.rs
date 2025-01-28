@@ -17,7 +17,7 @@ use crate::{
 };
 use ahash::{HashSet, RandomState};
 use chrono::NaiveDateTime;
-use heed::{
+use milli::heed::{
     byteorder::BigEndian,
     types::{SerdeBincode, Str, U128},
     Database, DatabaseFlags, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, Unspecified,
@@ -30,7 +30,7 @@ use milli::{
     CboRoaringBitmapCodec, DefaultSearchLogger, Filter, GeoSortStrategy, Index, SearchContext,
     TermsMatchingStrategy, TimeBudget, BEU32, BEU64,
 };
-use obkv::KvReader;
+use obkv::{KvReader, KvReaderU16};
 use petgraph::{
     graph::{EdgeIndex, NodeIndex},
     visit::EdgeRef,
@@ -242,7 +242,7 @@ impl Store {
         unsafe { env_options.flags(EnvFlags::MAP_ASYNC | EnvFlags::WRITE_MAP) };
         env_options.map_size(10 * 1024 * 1024 * 1024); // 1GB
 
-        let milli_index = Index::new(env_options, path).inspect_err(logerr!())?;
+        let milli_index = Index::new(env_options, path, true).inspect_err(logerr!())?;
 
         let mut write_txn = milli_index.write_txn().inspect_err(logerr!())?;
 
@@ -319,7 +319,7 @@ impl Store {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub fn read_txn(&self) -> Result<heed::RoTxn, ArunaError> {
+    pub fn read_txn(&self) -> Result<milli::heed::RoTxn, ArunaError> {
         Ok(self.milli_index.read_txn().inspect_err(logerr!())?)
     }
 
@@ -457,7 +457,7 @@ impl Store {
         &self,
         rtxn: &'a RoTxn<'a>,
         node_idx: u32,
-    ) -> Option<KvReader<'a, u16>> {
+    ) -> Option<&'a KvReaderU16> {
         self.milli_index
             .documents
             .get(rtxn, &node_idx)
@@ -912,25 +912,25 @@ impl Store {
                         NodeVariant::ResourceProject
                         | NodeVariant::ResourceFolder
                         | NodeVariant::ResourceObject => {
-                            GenericNode::Resource(Resource::try_from(&obkv).inspect_err(logerr!())?)
+                            GenericNode::Resource(Resource::try_from(obkv).inspect_err(logerr!())?)
                         }
                         NodeVariant::User => {
-                            GenericNode::User(User::try_from(&obkv).inspect_err(logerr!())?)
+                            GenericNode::User(User::try_from(obkv).inspect_err(logerr!())?)
                         }
                         NodeVariant::ServiceAccount => GenericNode::ServiceAccount(
-                            ServiceAccount::try_from(&obkv).inspect_err(logerr!())?,
+                            ServiceAccount::try_from(obkv).inspect_err(logerr!())?,
                         ),
                         NodeVariant::Group => {
-                            GenericNode::Group(Group::try_from(&obkv).inspect_err(logerr!())?)
+                            GenericNode::Group(Group::try_from(obkv).inspect_err(logerr!())?)
                         }
                         NodeVariant::Realm => {
-                            GenericNode::Realm(Realm::try_from(&obkv).inspect_err(logerr!())?)
+                            GenericNode::Realm(Realm::try_from(obkv).inspect_err(logerr!())?)
                         }
                         NodeVariant::Component => GenericNode::Component(
-                            Component::try_from(&obkv).inspect_err(logerr!())?,
+                            Component::try_from(obkv).inspect_err(logerr!())?,
                         ),
                         NodeVariant::License => {
-                            GenericNode::License(License::try_from(&obkv).inspect_err(logerr!())?)
+                            GenericNode::License(License::try_from(obkv).inspect_err(logerr!())?)
                         }
                     })
                 })

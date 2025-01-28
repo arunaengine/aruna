@@ -5,7 +5,7 @@ use crate::{
     logerr,
     models::models::{EdgeType, NodeVariant, Permission, RawRelation},
 };
-use heed::{types::SerdeBincode, Database, RoTxn};
+use milli::heed::{types::SerdeBincode, Database, RoTxn};
 use milli::{ObkvCodec, BEU32, BEU64};
 use petgraph::{
     graph::NodeIndex,

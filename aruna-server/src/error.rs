@@ -134,6 +134,12 @@ impl From<heed::Error> for ArunaError {
     }
 }
 
+impl From<milli::heed::Error> for ArunaError {
+    fn from(e: milli::heed::Error) -> Self {
+        ArunaError::DatabaseError(e.to_string())
+    }
+}
+
 impl From<synevi::SyneviError> for ArunaError {
     fn from(e: synevi::SyneviError) -> Self {
         ArunaError::ConsensusError(e.to_string())

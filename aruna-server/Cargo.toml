@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-petgraph = "0.6.5"
-milli = { git = "https://github.com/arunaengine/meilisearch.git" }
+petgraph = "0.7.1"
+milli = { git = "https://github.com/arunaengine/meilisearch.git"}
 synevi = { git = "https://github.com/arunaengine/synevi.git", branch = "feat/refactor_wait_handler" }
 aruna-rust-api = { git = "https://github.com/arunaengine/rust-api.git", branch = "feat/v3" }
 serde = { version = "1.0.214", features = ["derive"] }
@@ -18,9 +18,9 @@ tokio = { version = "1.41.1", features = ["full"] }
 dotenvy = "0.15.7"
 chrono = "0.4.38"
 utoipa = { version = "5.2.0", features = ["chrono", "axum_extras", "ulid", "url"] }
-utoipa-swagger-ui = { version = "8.0.3", features = ["axum"] }
+utoipa-swagger-ui = { version = "9.0.0", features = ["axum"] }
 prost = "0.13.3"
-axum = "0.7.7"
+axum = "0.8.1"
 serde_json = "1.0.132"
 tower-http = { version = "0.6.1", features = ["cors", "trace"] }
 tracing = "0.1.40"
@@ -32,13 +32,13 @@ sha2 = "0.10.8"
 reqwest = { version = "0.12.9", features = ["json"] }
 prost-wkt = "0.6"
 prost-wkt-types = "0.6"
-heed = "0.20.5"
+heed = "0.21.0"
 typetag = "0.2.18"
-obkv = "0.2.2"
+obkv = "0.3.0"
 roaring = "0.10.6"
 url = { version = "2.5.3", features = ["serde"] }
-utoipa-axum = "0.1.2"
-axum-extra = {version = "0.9.6", features = ["query"]}
+utoipa-axum = "0.2.0"
+axum-extra = {version = "0.10.0", features = ["query"]}
 ed25519-dalek = { version = "2.1.1", features = ["pem"] }
 curve25519-dalek = "4.1.3"
 sha3 = { version = "0.10.8", features = ["std", "asm"] }

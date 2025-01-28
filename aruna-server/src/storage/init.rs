@@ -1,4 +1,4 @@
-use heed::{
+use milli::heed::{
     types::{SerdeBincode, Str},
     Database, Unspecified,
 };
@@ -18,7 +18,7 @@ use super::{
 
 #[tracing::instrument(level = "trace", skip(write_txn, key_config))]
 pub(super) fn init_encoding_keys(
-    mut write_txn: &mut heed::RwTxn,
+    mut write_txn: &mut milli::heed::RwTxn,
     key_config: &(u32, String, String),
     single_entry_db: &Database<Unspecified, Unspecified>,
 ) -> Result<(), ArunaError> {
@@ -37,7 +37,7 @@ pub(super) fn init_encoding_keys(
 
 #[tracing::instrument(level = "trace", skip(write_txn, key_config))]
 pub(super) fn init_issuers(
-    mut write_txn: &mut heed::RwTxn,
+    mut write_txn: &mut milli::heed::RwTxn,
     key_config: &(u32, String, String),
     single_entry_db: &Database<Unspecified, Unspecified>,
 ) -> Result<(), ArunaError> {
@@ -91,7 +91,7 @@ pub(super) fn init_issuers(
 
 #[tracing::instrument(level = "trace", skip(write_txn))]
 pub(super) fn init_relations(
-    mut write_txn: &mut heed::RwTxn,
+    mut write_txn: &mut milli::heed::RwTxn,
     relation_infos: &Database<BEU32, SerdeBincode<RelationInfo>>,
 ) -> Result<(), ArunaError> {
     const_relations().iter().try_for_each(|info| {
