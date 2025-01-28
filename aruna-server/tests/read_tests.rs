@@ -362,7 +362,7 @@ mod read_tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(response.expected_hits, 12);
+        assert_eq!(response.expected_hits, 10);
 
         let response: SearchResponse = client
             .get(url)

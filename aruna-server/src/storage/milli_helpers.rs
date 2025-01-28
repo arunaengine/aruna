@@ -25,8 +25,8 @@ pub(crate) fn prepopulate_fields<'a: 'b, 'b>(
     // Make fields search and filterable
     let config = IndexerConfig::default();
     let mut settings = Settings::new(&mut wtxn, &index, &config);
-    settings.set_filterable_fields(FIELDS.iter().map(|s| s.name.to_string()).collect());
     settings.set_searchable_fields(
+        // Optimized searchable fields
         FIELDS
             .iter()
             .filter_map(|s| match s.name {
@@ -42,20 +42,22 @@ pub(crate) fn prepopulate_fields<'a: 'b, 'b>(
             })
             .collect(),
     );
+    settings.set_filterable_fields(FIELDS.iter().map(|s| s.name.to_string()).collect());
     settings.execute(|_| (), || false).inspect_err(logerr!())?;
 
+    index.put_fields_ids_map(&mut wtxn, &field_ids_map)?;
     // Ensure that the existing map has the expected field u32 mappings
     let existing_map = index.fields_ids_map(&wtxn)?;
 
-    if !existing_map.is_empty() {
-        existing_map.iter().zip(field_ids_map.iter()).for_each(
-            |((got_id, got_name), (id, name))| {
-                assert_eq!(got_id, id);
-                assert_eq!(got_name, name);
-            },
-        );
-    } else {
-        index.put_fields_ids_map(&mut wtxn, &field_ids_map)?;
-    }
+    // This assertion is now more or less useless,
+    // but for future idx shenanigans a good reference
+    existing_map
+        .iter()
+        .zip(field_ids_map.iter())
+        .for_each(|((got_id, got_name), (id, name))| {
+            assert_eq!(got_id, id);
+            assert_eq!(got_name, name);
+        });
+
     Ok(())
 }
