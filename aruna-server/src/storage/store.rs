@@ -3,8 +3,8 @@ use crate::{
     error::ArunaError,
     logerr,
     models::models::{
-        Component, EdgeType, GenericNode, Group, IssuerKey, IssuerType, License, Node, NodeVariant,
-        Permission, RawRelation, Realm, Relation, RelationInfo, Resource, ServerState,
+        Component, EdgeType, GenericNode, Group, IssuerKey, IssuerType, License, MilliIdx, Node,
+        NodeVariant, Permission, RawRelation, Realm, Relation, RelationInfo, Resource, ServerState,
         ServiceAccount, Subscriber, Token, User,
     },
     storage::{
@@ -15,14 +15,14 @@ use crate::{
     },
     transactions::{controller::KeyConfig, request::Requester},
 };
-use ahash::{HashSet, RandomState};
+use ahash::RandomState;
 use chrono::NaiveDateTime;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use milli::heed::{
     byteorder::BigEndian,
     types::{SerdeBincode, Str, U128},
-    Database, DatabaseFlags, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, Unspecified,
+    Database, DatabaseFlags, EnvFlags, EnvOpenOptions, PutFlags, Unspecified,
 };
-use jsonwebtoken::{DecodingKey, EncodingKey};
 use milli::{
     documents::{DocumentsBatchBuilder, DocumentsBatchReader},
     execute_search, filtered_universe,
@@ -30,131 +30,23 @@ use milli::{
     CboRoaringBitmapCodec, DefaultSearchLogger, Filter, GeoSortStrategy, Index, SearchContext,
     TermsMatchingStrategy, TimeBudget, BEU32, BEU64,
 };
-use obkv::{KvReader, KvReaderU16};
-use petgraph::{
-    graph::{EdgeIndex, NodeIndex},
-    visit::EdgeRef,
-    Direction, Graph,
-};
+use obkv::KvReaderU16;
+use petgraph::{visit::EdgeRef, Direction};
 use roaring::RoaringBitmap;
 use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
     io::Cursor,
-    sync::{atomic::AtomicU64, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{atomic::AtomicU64, RwLock},
 };
 use ulid::Ulid;
 
-use super::{graph::{get_permissions, get_realm_and_groups, get_subtree, IndexHelper}, obkv_ext::FieldIterator};
-
-pub struct WriteTxn<'a> {
-    txn: Option<RwTxn<'a>>,
-    graph_lock: RwLockWriteGuard<'a, Graph<NodeVariant, EdgeType>>,
-    events: &'a Database<BEU32, U128<BigEndian>>,
-    subscribers: &'a Database<U128<BigEndian>, SerdeBincode<Vec<u128>>>,
-    single_entry_database: &'a Database<Unspecified, Unspecified>,
-    nodes: Vec<NodeIndex>,
-    added_edges: Vec<EdgeIndex>,
-    removed_edges: Vec<(NodeIndex, NodeIndex, EdgeType)>,
-    committed: bool,
-}
-
-impl<'a> WriteTxn<'a> {
-    pub fn get_txn(&mut self) -> &mut RwTxn<'a> {
-        self.txn.as_mut().expect("Transaction already committed")
-    }
-
-    pub fn get_ro_txn(&self) -> &RoTxn<'a> {
-        self.txn.as_ref().expect("Transaction already committed")
-    }
-
-    pub fn add_node(&mut self, node: NodeVariant) -> NodeIndex {
-        let idx = self.graph_lock.add_node(node);
-        self.nodes.push(idx);
-        idx
-    }
-
-    pub fn add_edge(&mut self, source: NodeIndex, target: NodeIndex, edge_type: EdgeType) {
-        let idx = self.graph_lock.add_edge(source, target, edge_type);
-        self.added_edges.push(idx);
-    }
-
-    pub fn remove_edge(&mut self, index: EdgeIndex) -> Option<u32> {
-        let (from, to) = self.graph_lock.edge_endpoints(index)?;
-        let weight = self.graph_lock.remove_edge(index)?;
-        self.removed_edges.push((from, to, weight));
-        Some(weight)
-    }
-
-    // This is a read-only function that allows for the graph to be accessed
-    // SAFETY: The caller must guarantee that the graph is not modified with this guard
-    pub fn get_ro_graph(&self) -> &RwLockWriteGuard<'a, Graph<NodeVariant, EdgeType>> {
-        &self.graph_lock
-    }
-
-    pub fn commit(
-        mut self,
-        event_id: u128,
-        targets: &[u32],
-        additional_affected: &[u32],
-    ) -> Result<(), ArunaError> {
-        let mut txn = self.txn.take().expect("Transaction already committed");
-
-        let mut affected = HashSet::from_iter(targets.iter().cloned());
-        affected.extend(additional_affected.iter().cloned());
-        for target in targets {
-            self.events
-                .put(&mut txn, target, &event_id)
-                .inspect_err(logerr!())?;
-            affected.extend(get_subtree(&self.graph_lock, *target)?);
-        }
-
-        let db = self
-            .single_entry_database
-            .remap_types::<Str, SerdeBincode<Vec<Subscriber>>>();
-
-        let subscribers = db
-            .get(&txn, single_entry_names::SUBSCRIBER_CONFIG)
-            .inspect_err(logerr!())?;
-
-        if let Some(subscribers) = subscribers {
-            for subscriber in subscribers {
-                if affected.contains(&subscriber.target_idx) {
-                    let mut subscriber_events = self
-                        .subscribers
-                        .get(&txn, &subscriber.id.0)
-                        .inspect_err(logerr!())?
-                        .unwrap_or_default();
-                    subscriber_events.push(event_id);
-                    self.subscribers
-                        .put(&mut txn, &subscriber.id.0, &subscriber_events)
-                        .inspect_err(logerr!())?;
-                }
-            }
-        }
-
-        txn.commit().inspect_err(logerr!())?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl<'a> Drop for WriteTxn<'a> {
-    fn drop(&mut self) {
-        if !self.committed {
-            for idx in self.added_edges.drain(..) {
-                self.graph_lock.remove_edge(idx);
-            }
-            for idx in self.nodes.drain(..) {
-                self.graph_lock.remove_node(idx);
-            }
-            for (from, to, weight) in self.removed_edges.drain(..) {
-                self.graph_lock.add_edge(from, to, weight);
-            }
-        }
-    }
-}
+use super::{
+    graph::{Graph, GraphTxn, IndexHelper, Mode},
+    obkv_ext::FieldIterator,
+    txns::{ReadTxn, Txn, WriteTxn},
+};
 
 // LMBD database names
 pub mod db_names {
@@ -225,7 +117,9 @@ pub struct Store {
     //issuer_decoding_keys: HashMap<DecodingKeyIdentifier, IssuerInfo, RandomState>,
     //signing_info: (u32, EncodingKey, DecodingKey),
     // This has to be a RwLock because the graph is mutable
-    graph: RwLock<Graph<NodeVariant, EdgeType>>,
+    graph: RwLock<Graph>,
+    // graph: RwLock<Graph<NodeVariant, EdgeType>>,
+    // idx_mappings: RwLock<IdxMappings>,
 }
 
 impl Store {
@@ -319,23 +213,17 @@ impl Store {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub fn read_txn(&self) -> Result<milli::heed::RoTxn, ArunaError> {
-        Ok(self.milli_index.read_txn().inspect_err(logerr!())?)
-    }
-
-    #[tracing::instrument(level = "trace", skip(self))]
-    pub fn get_graph(&self) -> RwLockReadGuard<'_, Graph<NodeVariant, EdgeType>> {
-        self.graph.read().expect("Poisoned lock")
+    pub fn read_txn(&self) -> Result<ReadTxn, ArunaError> {
+        Ok(ReadTxn {
+            txn: self.milli_index.read_txn().inspect_err(logerr!())?,
+            graph: &self.graph,
+        })
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn write_txn(&self) -> Result<WriteTxn, ArunaError> {
-        // Lock the graph first
-        // Invariant: You can only aquire a write transaction if the graph is locked
-        let graph_lock = self.graph.write().expect("Poisoned lock");
-
         Ok(WriteTxn {
-            graph_lock,
+            graph: &self.graph,
             txn: Some(self.milli_index.write_txn().inspect_err(logerr!())?),
             events: &self.events,
             subscribers: &self.subscribers,
@@ -347,39 +235,48 @@ impl Store {
         })
     }
 
-    #[tracing::instrument(level = "trace", skip(self, id, rtxn))]
-    pub fn get_idx_from_ulid(&self, id: &Ulid, rtxn: &RoTxn) -> Option<u32> {
+    #[tracing::instrument(level = "trace", skip(self, id, txn))]
+    pub fn get_idx_from_ulid<'a>(&self, id: &Ulid, txn: &impl Txn<'a>) -> Option<MilliIdx> {
         self.milli_index
             .external_documents_ids
-            .get(rtxn, &id.to_string())
+            .get(txn.get_ro_txn(), &id.to_string())
             .inspect_err(logerr!())
             .ok()
             .flatten()
+            .map(|idx| MilliIdx(idx))
     }
 
-    #[tracing::instrument(level = "trace", skip(self, id, rtxn))]
-    pub fn get_idx_from_ulid_validate(
+    #[tracing::instrument(level = "trace", skip(self, id, txn))]
+    pub fn get_idx_from_ulid_validate<'a>(
         &self,
         id: &Ulid,
         field_name: &str,
         expected_variants: &[NodeVariant],
-        rtxn: &RoTxn,
-        graph: &Graph<NodeVariant, EdgeType>,
-    ) -> Result<u32, ArunaError> {
-        let idx = self
+        txn: &impl Txn<'a>,
+    ) -> Result<MilliIdx, ArunaError> {
+        let milli_idx = self
             .milli_index
             .external_documents_ids
-            .get(rtxn, &id.to_string())
+            .get(txn.get_ro_txn(), &id.to_string())
             .inspect_err(logerr!())
             .ok()
             .flatten()
             .ok_or_else(|| {
                 ArunaError::NotFound(format!("Resource not found: {}, field: {}", id, field_name))
             })?;
+        let graph_lock = self.graph.read().expect("Poisoned lock");
+        let graph_idx = *graph_lock
+            .idx_mappings
+            .milli_graph
+            .get(milli_idx as usize)
+            .ok_or_else(|| ArunaError::GraphError("Idx not found".to_string()))?;
 
-        let node_weight = graph.node_weight(idx.into()).ok_or_else(|| {
-            ArunaError::NotFound(format!("Resource not found: {}, field: {}", id, field_name))
-        })?;
+        let node_weight = graph_lock
+            .graph
+            .node_weight(graph_idx.into())
+            .ok_or_else(|| {
+                ArunaError::NotFound(format!("Resource not found: {}, field: {}", id, field_name))
+            })?;
 
         if !expected_variants.contains(node_weight) {
             return Err(ArunaError::InvalidParameter {
@@ -391,15 +288,15 @@ impl Store {
             });
         }
 
-        Ok(idx)
+        Ok(MilliIdx(milli_idx))
     }
 
-    #[tracing::instrument(level = "trace", skip(self, id, rtxn))]
-    pub fn get_ulid_from_idx(&self, id: &u32, rtxn: &RoTxn) -> Option<Ulid> {
+    #[tracing::instrument(level = "trace", skip(self, id, txn))]
+    pub fn get_ulid_from_idx<'a>(&self, id: &MilliIdx, txn: &impl Txn<'a>) -> Option<Ulid> {
         let response = self
             .milli_index
             .documents
-            .get(rtxn, &id)
+            .get(txn.get_ro_txn(), &id.0)
             .inspect_err(logerr!())
             .ok()
             .flatten()?;
@@ -410,8 +307,8 @@ impl Store {
     pub fn create_relation(
         &self,
         wtxn: &mut WriteTxn,
-        source: u32,
-        target: u32,
+        source: MilliIdx,
+        target: MilliIdx,
         edge_type: EdgeType,
     ) -> Result<(), ArunaError> {
         let relation = RawRelation {
@@ -436,15 +333,15 @@ impl Store {
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_node<T: Node>(&self, rtxn: &RoTxn<'_>, node_idx: u32) -> Option<T>
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_node<'b, T: Node>(&self, txn: &impl Txn<'b>, node_idx: MilliIdx) -> Option<T>
     where
         for<'a> &'a T: TryInto<serde_json::Map<String, Value>, Error = ArunaError>,
     {
         let response = self
             .milli_index
             .documents
-            .get(rtxn, &node_idx)
+            .get(txn.get_ro_txn(), &node_idx.0)
             .inspect_err(logerr!())
             .ok()
             .flatten()?;
@@ -452,15 +349,15 @@ impl Store {
         T::try_from(&response).ok()
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_raw_node<'a>(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_raw_node<'b: 'a, 'a>(
         &self,
-        rtxn: &'a RoTxn<'a>,
-        node_idx: u32,
+        txn: &'b impl Txn<'b>,
+        node_idx: MilliIdx,
     ) -> Option<&'a KvReaderU16> {
         self.milli_index
             .documents
-            .get(rtxn, &node_idx)
+            .get(txn.get_ro_txn(), &node_idx.0)
             .inspect_err(logerr!())
             .ok()
             .flatten()
@@ -471,7 +368,7 @@ impl Store {
         &'a self,
         wtxn: &mut WriteTxn<'a>,
         node: &T,
-    ) -> Result<u32, ArunaError>
+    ) -> Result<MilliIdx, ArunaError>
     where
         for<'b> &'b T: TryInto<serde_json::Map<String, Value>, Error = ArunaError>,
     {
@@ -512,24 +409,24 @@ impl Store {
         builder.execute()?;
 
         // Get the idx of the node
-        let idx = self
-            .get_idx_from_ulid(&id, &wtxn.get_txn())
+        let milli_idx = self
+            .get_idx_from_ulid(&id, wtxn)
             .ok_or_else(|| ArunaError::DatabaseError("Missing idx".to_string()))?;
 
         // Add the node to the graph
-        let index = wtxn.add_node(variant);
+        let _graph_index = wtxn.add_node(milli_idx, variant);
 
         // Ensure that the index in graph and milli stays in sync
-        assert_eq!(index.index() as u32, idx);
+        // assert_eq!(index.index() as u32, milli_idx);
 
-        Ok(idx)
+        Ok(milli_idx)
     }
 
     pub fn create_nodes_batch<'a, T: Node>(
         &'a self,
         wtxn: &mut WriteTxn<'a>,
         nodes: Vec<&T>,
-    ) -> Result<Vec<(Ulid, u32)>, ArunaError>
+    ) -> Result<Vec<(Ulid, MilliIdx)>, ArunaError>
     where
         for<'b> &'b T: TryInto<serde_json::Map<String, Value>, Error = ArunaError>,
     {
@@ -577,17 +474,17 @@ impl Store {
         let mut result = Vec::new();
         for (id, variant) in ids {
             // Get the idx of the node
-            let idx = self
-                .get_idx_from_ulid(&id, &wtxn.get_txn())
+            let milli_idx = self
+                .get_idx_from_ulid(&id, wtxn)
                 .ok_or_else(|| ArunaError::DatabaseError("Missing idx".to_string()))?;
 
             // Add the node to the graph
-            let index = wtxn.add_node(variant);
+            let _index = wtxn.add_node(milli_idx, variant);
 
             // Ensure that the index in graph and milli stays in sync
-            assert_eq!(index.index() as u32, idx);
+            // assert_eq!(index.index() as u32, idx);
 
-            result.push((id, idx));
+            result.push((id, milli_idx));
         }
 
         Ok(result)
@@ -615,7 +512,7 @@ impl Store {
         let signing_info = self
             .single_entry_database
             .remap_types::<Str, SigningInfoCodec>()
-            .get(&rtxn, single_entry_names::SIGNING_KEYS)
+            .get(&rtxn.get_ro_txn(), single_entry_names::SIGNING_KEYS)
             .inspect_err(logerr!())
             .expect("Signing info not found")
             .expect("Signing info not found");
@@ -634,7 +531,7 @@ impl Store {
         let issuers = self
             .single_entry_database
             .remap_types::<Str, SerdeBincode<Vec<IssuerKey>>>()
-            .get(&read_txn, single_entry_names::ISSUER_KEYS)
+            .get(&read_txn.get_ro_txn(), single_entry_names::ISSUER_KEYS)
             .inspect_err(logerr!())
             .ok()??;
 
@@ -652,55 +549,58 @@ impl Store {
                 )
             })
     }
-    #[tracing::instrument(level = "trace", skip(self, graph))]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_raw_relations(
         &self,
-        idx: u32,
+        idx: MilliIdx,
         filter: Option<&[EdgeType]>,
         direction: Direction,
-        graph: &Graph<NodeVariant, EdgeType>,
-    ) -> Vec<RawRelation> {
-        super::graph::get_relations(&graph, idx, filter, direction)
+    ) -> Result<Vec<RawRelation>, ArunaError> {
+        GraphTxn {
+            state: self.graph.read().expect("Poisoned lock"),
+            mode: Mode::ReadTxn,
+        }
+        .get_relations(idx, filter, direction)
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_relations(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_relations<'a>(
         &self,
-        idx: u32,
+        idx: MilliIdx,
         filter: Option<&[EdgeType]>,
         direction: Direction,
-        rtxn: &RoTxn,
+        txn: &impl Txn<'a>,
     ) -> Result<Vec<Relation>, ArunaError> {
-        let graph_lock = self.graph.read().expect("Poisoned lock");
+        let graph_txn = txn.get_ro_graph();
 
-        let relations = super::graph::get_relations(&graph_lock, idx, filter, direction);
+        let relations = graph_txn.get_relations(idx, filter, direction)?;
 
         let mut result = Vec::new();
         for raw_relation in relations {
             let relation = match direction {
                 Direction::Outgoing => Relation {
                     from_id: self
-                        .get_ulid_from_idx(&raw_relation.source, rtxn)
+                        .get_ulid_from_idx(&raw_relation.source, txn)
                         .ok_or_else(|| ArunaError::NotFound("Index not found".to_string()))?,
                     to_id: self
-                        .get_ulid_from_idx(&raw_relation.target, rtxn)
+                        .get_ulid_from_idx(&raw_relation.target, txn)
                         .ok_or_else(|| ArunaError::NotFound("Index not found".to_string()))?,
                     relation_type: self
                         .relation_infos
-                        .get(&rtxn, &raw_relation.edge_type)?
+                        .get(&txn.get_ro_txn(), &raw_relation.edge_type)?
                         .ok_or_else(|| ArunaError::NotFound("Edge type not found".to_string()))?
                         .forward_type,
                 },
                 Direction::Incoming => Relation {
                     from_id: self
-                        .get_ulid_from_idx(&raw_relation.source, rtxn)
+                        .get_ulid_from_idx(&raw_relation.source, txn)
                         .ok_or_else(|| ArunaError::NotFound("Index not found".to_string()))?,
                     to_id: self
-                        .get_ulid_from_idx(&raw_relation.target, rtxn)
+                        .get_ulid_from_idx(&raw_relation.target, txn)
                         .ok_or_else(|| ArunaError::NotFound("Index not found".to_string()))?,
                     relation_type: self
                         .relation_infos
-                        .get(&rtxn, &raw_relation.edge_type)?
+                        .get(&txn.get_ro_txn(), &raw_relation.edge_type)?
                         .ok_or_else(|| ArunaError::NotFound("Edge type not found".to_string()))?
                         .backward_type,
                 },
@@ -719,6 +619,7 @@ impl Store {
         user: &Ulid,
     ) -> Result<Permission, ArunaError> {
         let rtxn = self.read_txn()?;
+
         let resource_idx = self.get_idx_from_ulid(resource, &rtxn).ok_or_else(|| {
             tracing::error!(?resource, "From not found");
             ArunaError::Unauthorized
@@ -730,41 +631,41 @@ impl Store {
             tracing::error!("To not found");
             ArunaError::Unauthorized
         })?;
+
+        let graph = rtxn.get_ro_graph();
+        let result = graph.get_permissions(resource_idx, user_idx, constraint_idx)?;
+
+        drop(graph);
+
         rtxn.commit()?;
-        let graph = self.graph.read().expect("Poisoned lock");
-        get_permissions(&graph, resource_idx, user_idx, constraint_idx)
+
+        Ok(result)
     }
 
     /// Returns the token
-    #[tracing::instrument(level = "trace", skip(self, rtxn, graph))]
-    pub fn get_token(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_token<'a>(
         &self,
         requester_id: &Ulid,
         token_idx: u16,
-        rtxn: &RoTxn,
-        graph: &Graph<NodeVariant, EdgeType>,
+        txn: &impl Txn<'a>,
     ) -> Result<Token, ArunaError> {
-        let read_txn = self.read_txn()?;
-
         // Get the internal idx of the token
         let requester_internal_idx = self.get_idx_from_ulid_validate(
             &requester_id,
             "requester",
             &[NodeVariant::User, NodeVariant::ServiceAccount],
-            &rtxn,
-            graph,
+            txn,
         )?;
 
         let Some(tokens) = self
             .tokens
-            .get(&read_txn, &requester_internal_idx)
+            .get(&txn.get_ro_txn(), &requester_internal_idx.0)
             .inspect_err(logerr!())?
         else {
             tracing::error!("No tokens found");
             return Err(ArunaError::Unauthorized);
         };
-
-        read_txn.commit()?;
 
         let Some(Some(token)) = tokens.get(token_idx as usize) else {
             tracing::error!("Token not found");
@@ -788,12 +689,28 @@ impl Store {
             })?;
 
         let graph = self.graph.read().expect("Poisoned lock");
-        for edge in graph.edges_directed(sa_idx.into(), petgraph::Direction::Outgoing) {
+        let sa_graph_idx = *graph
+            .idx_mappings
+            .milli_graph
+            .get(sa_idx.0 as usize)
+            .ok_or_else(|| ArunaError::GraphError("Index not found".to_string()))?;
+
+        for edge in graph
+            .graph
+            .edges_directed(sa_graph_idx.into(), petgraph::Direction::Outgoing)
+        {
             match edge.weight() {
                 PERMISSION_NONE..=PERMISSION_ADMIN => {
-                    let group_idx = edge.target().as_u32();
+                    let group_graph_idx = edge.target().as_u32();
+                    let group_milli_idx = MilliIdx(
+                        *graph
+                            .idx_mappings
+                            .graph_milli
+                            .get(group_graph_idx as usize)
+                            .ok_or_else(|| ArunaError::GraphError("Index not found".to_string()))?,
+                    );
                     let group = self
-                        .get_ulid_from_idx(&group_idx, &read_txn)
+                        .get_ulid_from_idx(&group_milli_idx, &read_txn)
                         .ok_or_else(|| {
                             tracing::error!("Group not found");
                             ArunaError::Unauthorized
@@ -806,25 +723,27 @@ impl Store {
             }
         }
 
+        read_txn.commit()?;
         tracing::error!("Group not found");
         Err(ArunaError::Unauthorized)
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
+    #[tracing::instrument(level = "trace", skip(self, wtxn))]
     pub fn add_token(
         &self,
-        rtxn: &mut RwTxn,
+        wtxn: &mut WriteTxn,
         event_id: u128,
         user_id: &Ulid,
         mut token: Token,
     ) -> Result<Token, ArunaError> {
         let user_idx = self
-            .get_idx_from_ulid(user_id, rtxn)
+            .get_idx_from_ulid(user_id, wtxn)
             .ok_or_else(|| ArunaError::NotFound(user_id.to_string()))?;
 
+        let txn = wtxn.get_txn();
         let mut tokens = self
             .tokens
-            .get(rtxn, &user_idx)
+            .get(txn, &user_idx.0)
             .inspect_err(logerr!())?
             .unwrap_or_default();
 
@@ -832,45 +751,46 @@ impl Store {
 
         tokens.push(Some(token));
         self.tokens
-            .put(rtxn, &user_idx, &tokens)
+            .put(txn, &user_idx.0, &tokens)
             .inspect_err(logerr!())?;
 
         // Add token creation event to user
         self.events
-            .put(rtxn, &user_idx, &event_id)
+            .put(txn, &user_idx.0, &event_id)
             .inspect_err(logerr!())?;
 
         Ok(tokens.pop().flatten().expect("Added token before"))
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_tokens(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_tokens<'a>(
         &self,
-        rtxn: &RoTxn,
+        txn: &impl Txn<'a>,
         user_id: &Ulid,
     ) -> Result<Vec<Option<Token>>, ArunaError> {
         let user_idx = self
-            .get_idx_from_ulid(user_id, rtxn)
+            .get_idx_from_ulid(user_id, txn)
             .ok_or_else(|| ArunaError::NotFound(user_id.to_string()))?;
 
         Ok(self
             .tokens
-            .get(rtxn, &user_idx)
+            .get(txn.get_ro_txn(), &user_idx.0)
             .inspect_err(logerr!())?
             .unwrap_or_default())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn search(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn search<'a>(
         &self,
         query: String,
         from: usize,
         limit: usize,
         filter: Option<&str>,
-        rtxn: &RoTxn,
+        txn: &impl Txn<'a>,
         filter_universe: RoaringBitmap,
     ) -> Result<(usize, Vec<GenericNode>), ArunaError> {
-        let mut universe = self.filtered_universe(filter, rtxn)?;
+        let rtxn = txn.get_ro_txn();
+        let mut universe = self.filtered_universe(filter, txn)?;
         universe &= filter_universe;
 
         let mut ctx = SearchContext::new(&self.milli_index, &rtxn).inspect_err(logerr!())?;
@@ -941,11 +861,11 @@ impl Store {
     // This is a lower level function that only returns the filtered universe
     // We can use this to check for generic "exists" queries
     // For full search results use the search function
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn filtered_universe(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn filtered_universe<'a>(
         &self,
         filter: Option<&str>,
-        rtxn: &RoTxn,
+        txn: &impl Txn<'a>,
     ) -> Result<RoaringBitmap, ArunaError> {
         let filter = if let Some(filter) = filter {
             Filter::from_str(filter).inspect_err(logerr!())?
@@ -953,13 +873,16 @@ impl Store {
             None
         };
 
-        Ok(filtered_universe(&self.milli_index, rtxn, &filter).inspect_err(logerr!())?)
+        Ok(
+            filtered_universe(&self.milli_index, txn.get_ro_txn(), &filter)
+                .inspect_err(logerr!())?,
+        )
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
+    #[tracing::instrument(level = "trace", skip(self, wtxn))]
     pub fn add_public_resources_universe(
         &self,
-        rtxn: &mut WriteTxn,
+        wtxn: &mut WriteTxn,
         universe: &[u32],
     ) -> Result<(), ArunaError> {
         let mut universe = RoaringBitmap::from_iter(universe.iter().copied());
@@ -967,7 +890,7 @@ impl Store {
         let existing = self
             .single_entry_database
             .remap_types::<Str, CboRoaringBitmapCodec>()
-            .get(&rtxn.get_txn(), single_entry_names::PUBLIC_RESOURCES)
+            .get(&wtxn.get_txn(), single_entry_names::PUBLIC_RESOURCES)
             .inspect_err(logerr!())?
             .unwrap_or_default();
 
@@ -977,7 +900,7 @@ impl Store {
         self.single_entry_database
             .remap_types::<Str, CboRoaringBitmapCodec>()
             .put(
-                rtxn.get_txn(),
+                wtxn.get_txn(),
                 single_entry_names::PUBLIC_RESOURCES,
                 &universe,
             )
@@ -985,15 +908,15 @@ impl Store {
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn add_user_universe(&self, rtxn: &mut WriteTxn, user: u32) -> Result<(), ArunaError> {
+    #[tracing::instrument(level = "trace", skip(self, wtxn))]
+    pub fn add_user_universe(&self, wtxn: &mut WriteTxn, user: u32) -> Result<(), ArunaError> {
         let mut universe = RoaringBitmap::new();
         universe.insert(user);
 
         let existing = self
             .single_entry_database
             .remap_types::<Str, CboRoaringBitmapCodec>()
-            .get(&rtxn.get_txn(), single_entry_names::SEARCHABLE_USERS)
+            .get(&wtxn.get_txn(), single_entry_names::SEARCHABLE_USERS)
             .inspect_err(logerr!())?
             .unwrap_or_default();
 
@@ -1003,7 +926,7 @@ impl Store {
         self.single_entry_database
             .remap_types::<Str, CboRoaringBitmapCodec>()
             .put(
-                rtxn.get_txn(),
+                wtxn.get_txn(),
                 single_entry_names::SEARCHABLE_USERS,
                 &universe,
             )
@@ -1011,10 +934,10 @@ impl Store {
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
+    #[tracing::instrument(level = "trace", skip(self, wtxn))]
     pub fn add_read_permission_universe(
         &self,
-        rtxn: &mut WriteTxn,
+        wtxn: &mut WriteTxn,
         target: u32, // Group, User or Realm
         universe: &[u32],
     ) -> Result<(), ArunaError> {
@@ -1022,7 +945,7 @@ impl Store {
 
         let existing = self
             .read_permissions
-            .get(&rtxn.get_txn(), &target)
+            .get(&wtxn.get_txn(), &target)
             .inspect_err(logerr!())?
             .unwrap_or_default();
 
@@ -1030,71 +953,78 @@ impl Store {
         universe |= existing;
 
         self.read_permissions
-            .put(rtxn.get_txn(), &target, &universe)
+            .put(wtxn.get_txn(), &target, &universe)
             .inspect_err(logerr!())?;
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_read_permission_universe(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_read_permission_universe<'a>(
         &self,
-        rtxn: &RoTxn,
+        txn: &impl Txn<'a>,
         read_resources: &[u32],
     ) -> Result<RoaringBitmap, ArunaError> {
         let mut universe = RoaringBitmap::new();
         for read_resource in read_resources {
             universe |= self
                 .read_permissions
-                .get(rtxn, read_resource)
+                .get(txn.get_ro_txn(), read_resource)
                 .inspect_err(logerr!())?
                 .unwrap_or_default();
         }
         Ok(universe)
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_public_universe(&self, rtxn: &RoTxn) -> Result<RoaringBitmap, ArunaError> {
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_public_universe<'a>(&self, txn: &impl Txn<'a>) -> Result<RoaringBitmap, ArunaError> {
         Ok(self
             .single_entry_database
             .remap_types::<Str, CboRoaringBitmapCodec>()
-            .get(&rtxn, single_entry_names::PUBLIC_RESOURCES)
+            .get(&txn.get_ro_txn(), single_entry_names::PUBLIC_RESOURCES)
             .inspect_err(logerr!())?
             .unwrap_or_default())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_user_universe(&self, rtxn: &RoTxn) -> Result<RoaringBitmap, ArunaError> {
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_user_universe<'a>(&self, txn: &impl Txn<'a>) -> Result<RoaringBitmap, ArunaError> {
         Ok(self
             .single_entry_database
             .remap_types::<Str, CboRoaringBitmapCodec>()
-            .get(&rtxn, single_entry_names::SEARCHABLE_USERS)
+            .get(txn.get_ro_txn(), single_entry_names::SEARCHABLE_USERS)
             .inspect_err(logerr!())?
             .unwrap_or_default())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub fn get_realm_and_groups(&self, user_idx: u32) -> Result<Vec<u32>, ArunaError> {
-        get_realm_and_groups(&self.graph.read().expect("RWLock poison error"), user_idx)
+    pub fn get_realm_and_groups(&self, user_idx: MilliIdx) -> Result<Vec<MilliIdx>, ArunaError> {
+        GraphTxn {
+            state: self.graph.read().expect("RWLock poison error"),
+            mode: Mode::ReadTxn,
+        }
+        .get_realm_and_groups(user_idx)
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_relation_info(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_relation_info<'a>(
         &self,
         relation_idx: &u32,
-        rtxn: &RoTxn,
+        txn: &impl Txn<'a>,
     ) -> Result<Option<RelationInfo>, ArunaError> {
         let relation_info = self
             .relation_infos
-            .get(&rtxn, relation_idx)
+            .get(txn.get_ro_txn(), relation_idx)
             .inspect_err(logerr!())?;
         Ok(relation_info)
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_relation_infos(&self, rtxn: &RoTxn) -> Result<Vec<RelationInfo>, ArunaError> {
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_relation_infos<'a>(
+        &self,
+        txn: &impl Txn<'a>,
+    ) -> Result<Vec<RelationInfo>, ArunaError> {
         let relation_info = self
             .relation_infos
-            .iter(&rtxn)
+            .iter(txn.get_ro_txn())
             .inspect_err(logerr!())?
             .filter_map(|a| Some(a.ok()?.1))
             .collect();
@@ -1105,21 +1035,20 @@ impl Store {
     pub fn add_component_key(
         &self,
         wtxn: &mut WriteTxn,
-        component_idx: u32,
+        component_idx: MilliIdx,
         pubkey: String,
     ) -> Result<(), ArunaError> {
-        let mut wtxn = wtxn.get_txn();
         let issuer_single_entry_db = self
             .single_entry_database
             .remap_types::<Str, SerdeBincode<Vec<IssuerKey>>>();
 
         let mut entries = issuer_single_entry_db
-            .get(&wtxn, single_entry_names::ISSUER_KEYS)
+            .get(&wtxn.get_ro_txn(), single_entry_names::ISSUER_KEYS)
             .inspect_err(logerr!())?;
 
         let component = self
-            .get_node::<Component>(&wtxn, component_idx)
-            .ok_or_else(|| ArunaError::NotFound(format!("{component_idx}")))?;
+            .get_node::<Component>(wtxn, component_idx)
+            .ok_or_else(|| ArunaError::NotFound(format!("{}", component_idx.0)))?;
 
         let (decoding_key, x25519_pubkey) = pubkey_from_pem(&pubkey).inspect_err(logerr!())?;
 
@@ -1138,13 +1067,21 @@ impl Store {
             Some(ref mut current_keys) if !current_keys.contains(&key) => {
                 current_keys.push(key);
                 issuer_single_entry_db
-                    .put(&mut wtxn, single_entry_names::ISSUER_KEYS, &current_keys)
+                    .put(
+                        &mut wtxn.get_txn(),
+                        single_entry_names::ISSUER_KEYS,
+                        &current_keys,
+                    )
                     .inspect_err(logerr!())?;
             }
             _ => {
                 // TODO: This should not happen at this stage right?
                 issuer_single_entry_db
-                    .put(&mut wtxn, single_entry_names::ISSUER_KEYS, &vec![key])
+                    .put(
+                        &mut wtxn.get_txn(),
+                        single_entry_names::ISSUER_KEYS,
+                        &vec![key],
+                    )
                     .inspect_err(logerr!())?;
             }
         }
@@ -1204,12 +1141,12 @@ impl Store {
     pub fn add_oidc_mapping(
         &self,
         wtxn: &mut WriteTxn,
-        user_idx: u32,
+        user_idx: MilliIdx,
         oidc_mapping: (String, String), // (oidc_id, issuer_name)
     ) -> Result<(), ArunaError> {
         let mut wtxn = wtxn.get_txn();
         self.oidc_mappings
-            .put(&mut wtxn, &oidc_mapping, &user_idx)
+            .put(&mut wtxn, &oidc_mapping, &user_idx.0)
             .inspect_err(logerr!())?;
         Ok(())
     }
@@ -1223,10 +1160,10 @@ impl Store {
 
         let user_idx = if let Some(user_idx) = self
             .oidc_mappings
-            .get(&read_txn, &oidc_mapping)
+            .get(&read_txn.get_ro_txn(), &oidc_mapping)
             .inspect_err(logerr!())?
         {
-            user_idx
+            MilliIdx(user_idx)
         } else {
             return Ok(Requester::Unregistered {
                 oidc_subject: oidc_mapping.0,
@@ -1236,7 +1173,7 @@ impl Store {
 
         let user: User = self
             .get_node(&read_txn, user_idx)
-            .ok_or_else(|| ArunaError::NotFound(format!("{user_idx}")))?;
+            .ok_or_else(|| ArunaError::NotFound(format!("{}", user_idx.0)))?;
 
         read_txn.commit()?;
 
@@ -1250,32 +1187,32 @@ impl Store {
         })
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_realms_for_user(
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_realms_for_user<'a>(
         &self,
-        rtxn: &RoTxn<'_>,
+        txn: &impl Txn<'a>,
         user: Ulid,
     ) -> Result<Vec<Realm>, ArunaError> {
-        let graph = self.graph.read().expect("Poisoned lock");
+        let graph = txn.get_ro_graph();
         let user_idx = self
-            .get_idx_from_ulid(&user, &rtxn)
+            .get_idx_from_ulid(&user, txn)
             .ok_or_else(|| ArunaError::NotFound("User not found".to_string()))?;
-        let realm_idxs = super::graph::get_realms(&graph, user_idx)?;
+        let realm_idxs = graph.get_realms(user_idx)?;
         let mut realms = Vec::new();
         for realm in realm_idxs {
-            realms.push(self.get_node(&rtxn, realm).expect("Database error"));
+            realms.push(self.get_node(txn, realm).expect("Database error"));
         }
         Ok(realms)
     }
 
-    #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_subscribers(&self, rtxn: &RoTxn<'_>) -> Result<Vec<Subscriber>, ArunaError> {
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_subscribers<'a>(&self, txn: &impl Txn<'a>) -> Result<Vec<Subscriber>, ArunaError> {
         let db = self
             .single_entry_database
             .remap_types::<Str, SerdeBincode<Vec<Subscriber>>>();
 
         let subscribers = db
-            .get(&rtxn, single_entry_names::SUBSCRIBER_CONFIG)
+            .get(txn.get_ro_txn(), single_entry_names::SUBSCRIBER_CONFIG)
             .inspect_err(logerr!())?;
 
         Ok(subscribers.unwrap_or_default())
@@ -1445,9 +1382,9 @@ impl Store {
         // Collect ids
         let mut ids = Vec::new();
         for idx in idxs {
-            let raw_node = 
-                self.get_raw_node(wtxn.get_ro_txn(), *idx)
-                    .ok_or_else(|| ArunaError::ServerError("Idx did not match any id".to_string()))?;
+            let raw_node = self
+                .get_raw_node(wtxn, MilliIdx(*idx))
+                .ok_or_else(|| ArunaError::ServerError("Idx did not match any id".to_string()))?;
 
             let mut obkv = FieldIterator::new(&raw_node);
             let id: Ulid = obkv.get_required_field(0)?;
@@ -1479,7 +1416,10 @@ impl Store {
                 ID_FIELD.to_string(),
                 serde_json::Value::String(id.to_string()),
             );
-            json_object.insert(VARIANT_FIELD.to_string(), serde_json::Value::Number(variant.into()));
+            json_object.insert(
+                VARIANT_FIELD.to_string(),
+                serde_json::Value::Number(variant.into()),
+            );
             json_object.insert(DELETED_FIELD.to_string(), serde_json::Value::Bool(true));
             documents_batch.append_json_object(&json_object)?;
         }

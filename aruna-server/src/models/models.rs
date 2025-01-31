@@ -647,8 +647,13 @@ pub struct Relation {
     pub relation_type: String,
 }
 
-pub type Source = u32;
-pub type Target = u32;
+#[derive(Deserialize, Serialize, Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct MilliIdx(pub u32);
+#[derive(Deserialize, Serialize, Debug, Copy, Clone)]
+pub struct GraphIdx(pub u32);
+
+pub type Source = MilliIdx;
+pub type Target = MilliIdx;
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct RawRelation {
