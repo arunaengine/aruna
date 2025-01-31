@@ -735,18 +735,28 @@ impl GrpcQueryHandler {
                 debug!(?message, "received event message");
 
                 if let Ok(Some(r)) = self.process_message(message).await {
-                    let mut req = Request::new(AcknowledgeMessageBatchRequest { replies: vec![r] });
+                    for a in 0..5 {
+                        let mut req = Request::new(AcknowledgeMessageBatchRequest {
+                            replies: vec![r.clone()],
+                        });
 
-                    Self::add_token_to_md(req.metadata_mut(), &self.long_lived_token)?;
-
-                    self.event_notification_service
-                        .clone()
-                        .acknowledge_message_batch(req)
-                        .await
-                        .map_err(|e| {
-                            error!(error = ?e, msg = e.to_string());
-                            e
-                        })?;
+                        Self::add_token_to_md(req.metadata_mut(), &self.long_lived_token)?;
+                        match self
+                            .event_notification_service
+                            .clone()
+                            .acknowledge_message_batch(req)
+                            .await
+                        {
+                            Ok(_) => break,
+                            Err(e) => {
+                                error!(error = ?e, msg = e.to_string());
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                                if a == 4 {
+                                    return Err(e.into());
+                                }
+                            }
+                        };
+                    }
                     debug!("acknowledged message");
                 }
             } else {
