@@ -17,12 +17,12 @@ use crate::{
 };
 use ahash::{HashSet, RandomState};
 use chrono::NaiveDateTime;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use milli::heed::{
     byteorder::BigEndian,
     types::{SerdeBincode, Str, U128},
     Database, DatabaseFlags, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, Unspecified,
 };
-use jsonwebtoken::{DecodingKey, EncodingKey};
 use milli::{
     documents::{DocumentsBatchBuilder, DocumentsBatchReader},
     execute_search, filtered_universe,
@@ -46,7 +46,10 @@ use std::{
 };
 use ulid::Ulid;
 
-use super::{graph::{get_permissions, get_realm_and_groups, get_subtree, IndexHelper}, obkv_ext::FieldIterator};
+use super::{
+    graph::{get_permissions, get_realm_and_groups, get_subtree, IndexHelper},
+    obkv_ext::FieldIterator,
+};
 
 pub struct WriteTxn<'a> {
     txn: Option<RwTxn<'a>>,
@@ -453,11 +456,7 @@ impl Store {
     }
 
     #[tracing::instrument(level = "trace", skip(self, rtxn))]
-    pub fn get_raw_node<'a>(
-        &self,
-        rtxn: &'a RoTxn<'a>,
-        node_idx: u32,
-    ) -> Option<&'a KvReaderU16> {
+    pub fn get_raw_node<'a>(&self, rtxn: &'a RoTxn<'a>, node_idx: u32) -> Option<&'a KvReaderU16> {
         self.milli_index
             .documents
             .get(rtxn, &node_idx)
@@ -1445,9 +1444,9 @@ impl Store {
         // Collect ids
         let mut ids = Vec::new();
         for idx in idxs {
-            let raw_node = 
-                self.get_raw_node(wtxn.get_ro_txn(), *idx)
-                    .ok_or_else(|| ArunaError::ServerError("Idx did not match any id".to_string()))?;
+            let raw_node = self
+                .get_raw_node(wtxn.get_ro_txn(), *idx)
+                .ok_or_else(|| ArunaError::ServerError("Idx did not match any id".to_string()))?;
 
             let mut obkv = FieldIterator::new(&raw_node);
             let id: Ulid = obkv.get_required_field(0)?;
@@ -1479,7 +1478,10 @@ impl Store {
                 ID_FIELD.to_string(),
                 serde_json::Value::String(id.to_string()),
             );
-            json_object.insert(VARIANT_FIELD.to_string(), serde_json::Value::Number(variant.into()));
+            json_object.insert(
+                VARIANT_FIELD.to_string(),
+                serde_json::Value::Number(variant.into()),
+            );
             json_object.insert(DELETED_FIELD.to_string(), serde_json::Value::Bool(true));
             documents_batch.append_json_object(&json_object)?;
         }

@@ -257,7 +257,6 @@ express Statement of Purpose.
             .await
             .unwrap();
 
-        println!("{:?}", response);
         assert_eq!(response.resource.license_id, request.license_id.unwrap());
 
         let request = aruna_server::models::requests::CreateProjectRequest {
@@ -316,7 +315,6 @@ express Statement of Purpose.
             .resource
             .unwrap();
 
-        println!("{:?}", response);
 
         assert_eq!(response.name, request.name);
         assert_eq!(response.visibility, 1);
