@@ -636,7 +636,7 @@ impl AuthHandler {
             aud: "aruna".to_string(),
             exp: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)?
-                .add(Duration::from_secs(15 * 60))
+                .add(Duration::from_secs(60 * 60 * 24))
                 .as_secs() as usize,
             tid: tid.map(|x| x.into()),
             it: Some(Intent {
