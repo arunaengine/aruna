@@ -213,11 +213,18 @@ impl DataHandler {
             .get_object(before_location.clone(), None, tx_send)
             .await
             .map_err(|e| {
-                error!(error = ?e, msg = e.to_string());
+                let object_id = object.id;
+                error!(error = ?e, location = ?before_location, object_id = ?object_id, msg = "Failed to get multipart for location");
                 e
             })?;
 
-        //
+        // TODO: Delete broken multiparts ?
+        // let upload_id = before_location
+        //     .upload_id
+        //     .as_ref()
+        //     .ok_or_else(|| anyhow!("Missing upload_id"))?
+        //     .to_string();
+        // cache.delete_parts_by_upload_id(upload_id).await?;
 
         let (before_size, after_size, sha, md5, final_sha) = aswr_handle
             .await
