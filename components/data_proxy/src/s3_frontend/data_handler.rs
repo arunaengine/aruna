@@ -225,15 +225,17 @@ impl DataHandler {
                         .as_ref()
                         .ok_or_else(|| anyhow!("Missing upload_id"))?
                         .to_string();
-                    cache.delete_parts_by_upload_id(upload_id).await.map_err(
-                        |e| {
+                    cache
+                        .delete_parts_by_upload_id(upload_id)
+                        .await
+                        .map_err(|e| {
                             error!(error = ?e, msg = "Failed to delete parts");
                             e
-                        },
-                    )?;
+                        })?;
                     cache
                         .delete_location_with_mappings(object_id, before_location)
-                        .await.map_err(|e| {
+                        .await
+                        .map_err(|e| {
                             error!(error = ?e, msg = "Failed to delete location with mappings");
                             e
                         })?;

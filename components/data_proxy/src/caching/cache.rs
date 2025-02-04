@@ -289,7 +289,8 @@ impl Cache {
                                     before_location,
                                     None,
                                 )
-                                .await {
+                                .await
+                                {
                                     error!(error = ?e, "Failed to finalize location");
                                 }
                             }
