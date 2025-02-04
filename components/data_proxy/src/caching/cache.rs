@@ -282,14 +282,16 @@ impl Cache {
                         );
                         tokio::spawn(
                             async move {
-                                DataHandler::finalize_location(
+                                if let Err(e) = DataHandler::finalize_location(
                                     object,
                                     cache,
                                     backend,
                                     before_location,
                                     None,
                                 )
-                                .await
+                                .await {
+                                    error!(error = ?e, "Failed to finalize location");
+                                }
                             }
                             .instrument(info_span!("finalize_location")),
                         );

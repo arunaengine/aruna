@@ -217,17 +217,26 @@ impl DataHandler {
             Ok(_) => {}
             Err(e) => {
                 let object_id = object.id;
-                error!(location = ?before_location, object_id = ?object_id, error = ?e, msg = "Failed to get multipart for location");
+                error!(location = ?before_location, object = ?object, error = ?e, msg = "Failed to get multipart for location");
                 if object.object_status == Status::Initializing {
+                    debug!("Object is in initializing state, cleaning up");
                     let upload_id = before_location
                         .upload_id
                         .as_ref()
                         .ok_or_else(|| anyhow!("Missing upload_id"))?
                         .to_string();
-                    cache.delete_parts_by_upload_id(upload_id).await?;
+                    cache.delete_parts_by_upload_id(upload_id).await.map_err(
+                        |e| {
+                            error!(error = ?e, msg = "Failed to delete parts");
+                            e
+                        },
+                    )?;
                     cache
                         .delete_location_with_mappings(object_id, before_location)
-                        .await?;
+                        .await.map_err(|e| {
+                            error!(error = ?e, msg = "Failed to delete location with mappings");
+                            e
+                        })?;
                 } else {
                     error!(?object_id, "Object is not in initializing state");
                 }
