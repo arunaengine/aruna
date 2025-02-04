@@ -1122,6 +1122,36 @@ impl Cache {
         Ok(())
     }
 
+
+    #[tracing::instrument(level = "trace", skip(self, object_id, location))]
+    pub async fn delete_location_with_mappings(
+        &self,
+        object_id: DieselUlid,
+        location: ObjectLocation,
+    ) -> Result<()> {
+
+        if let Some(persistence) = self.persistence.read().await.as_ref() {
+
+
+            let mut client = persistence.get_client().await?;
+            let transaction = client.transaction().await?;
+            let transaction_client = transaction.client();
+
+            ObjectLocation::delete(&location.id, transaction_client).await?;
+            LocationBinding::delete_by_object_id(&object_id, transaction_client).await?;
+            transaction.commit().await?;
+        }
+
+        if let Some(resource) = self.resources.get(&object_id) {
+            let (_, loc) = resource.value();
+            *loc.write().await = None;
+        } else {
+            bail!("Resource not found")
+        };
+
+        Ok(())
+    }
+
     #[tracing::instrument(
         level = "trace",
         skip(self, upload_id, object_id, part_number, raw_size, final_size)

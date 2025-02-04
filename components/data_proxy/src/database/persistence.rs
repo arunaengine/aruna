@@ -303,7 +303,7 @@ impl LocationBinding {
             .collect::<Vec<Self>>())
     }
 
-    pub async fn _delete_by_object_id(object_id: &DieselUlid, client: &Client) -> Result<()> {
+    pub async fn delete_by_object_id(object_id: &DieselUlid, client: &Client) -> Result<()> {
         let query = "DELETE FROM location_binding WHERE object_id = $1;".to_string();
         let prepared = client.prepare(&query).await.map_err(|e| {
             error!(error = ?e, msg = e.to_string());

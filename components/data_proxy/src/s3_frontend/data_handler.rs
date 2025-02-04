@@ -7,6 +7,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use aruna_rust_api::api::storage::models::v2::Hash;
 use aruna_rust_api::api::storage::models::v2::Hashalgorithm;
+use aruna_rust_api::api::storage::models::v2::Status;
 use diesel_ulid::DieselUlid;
 use md5::{Digest, Md5};
 use pithos_lib::streamreadwrite::GenericStreamReadWriter;
@@ -209,22 +210,27 @@ impl DataHandler {
             .instrument(info_span!("finalize_location")),
         );
 
-        backend
+        match backend
             .get_object(before_location.clone(), None, tx_send)
-            .await
-            .map_err(|e| {
+            .await{
+            Ok(_) => {}
+            Err(e) => {
                 let object_id = object.id;
-                error!(error = ?e, location = ?before_location, object_id = ?object_id, msg = "Failed to get multipart for location");
-                e
-            })?;
-
-        // TODO: Delete broken multiparts ?
-        // let upload_id = before_location
-        //     .upload_id
-        //     .as_ref()
-        //     .ok_or_else(|| anyhow!("Missing upload_id"))?
-        //     .to_string();
-        // cache.delete_parts_by_upload_id(upload_id).await?;
+                error!(location = ?before_location, object_id = ?object_id, error = ?e, msg = "Failed to get multipart for location");
+                if object.object_status == Status::Initializing {
+                    let upload_id = before_location
+                        .upload_id
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("Missing upload_id"))?
+                        .to_string();
+                    cache.delete_parts_by_upload_id(upload_id).await?;
+                    cache.delete_location_with_mappings(object_id, before_location).await?;
+                }else{
+                    error!(?object_id, "Object is not in initializing state");
+                }
+                return Err(e);
+            }
+            }
 
         let (before_size, after_size, sha, md5, final_sha) = aswr_handle
             .await
