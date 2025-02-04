@@ -212,7 +212,8 @@ impl DataHandler {
 
         match backend
             .get_object(before_location.clone(), None, tx_send)
-            .await{
+            .await
+        {
             Ok(_) => {}
             Err(e) => {
                 let object_id = object.id;
@@ -224,13 +225,15 @@ impl DataHandler {
                         .ok_or_else(|| anyhow!("Missing upload_id"))?
                         .to_string();
                     cache.delete_parts_by_upload_id(upload_id).await?;
-                    cache.delete_location_with_mappings(object_id, before_location).await?;
-                }else{
+                    cache
+                        .delete_location_with_mappings(object_id, before_location)
+                        .await?;
+                } else {
                     error!(?object_id, "Object is not in initializing state");
                 }
                 return Err(e);
             }
-            }
+        }
 
         let (before_size, after_size, sha, md5, final_sha) = aswr_handle
             .await

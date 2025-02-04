@@ -1122,17 +1122,13 @@ impl Cache {
         Ok(())
     }
 
-
     #[tracing::instrument(level = "trace", skip(self, object_id, location))]
     pub async fn delete_location_with_mappings(
         &self,
         object_id: DieselUlid,
         location: ObjectLocation,
     ) -> Result<()> {
-
         if let Some(persistence) = self.persistence.read().await.as_ref() {
-
-
             let mut client = persistence.get_client().await?;
             let transaction = client.transaction().await?;
             let transaction_client = transaction.client();
