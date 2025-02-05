@@ -8,7 +8,7 @@ use crate::{
             AUTHORS_FIELD, DESCRIPTION_FIELD, IDENTIFIERS_FIELD, ID_FIELD, LABELS_FIELD,
             LAST_MODIFIED_FIELD, LICENSE_FIELD, NAME_FIELD, TAG_FIELD, VISIBILITY_FIELD,
         },
-        relation_types::{self, DEFAULT, OWNS_PROJECT, PERMISSION_ADMIN, PROJECT_PART_OF_REALM},
+        relation_types::{self, DEFAULT, OWNS_PROJECT, PROJECT_PART_OF_REALM},
     },
     context::{BatchPermission, Context},
     error::ArunaError,
@@ -172,6 +172,8 @@ impl WriteRequest for CreateProjectRequestTx {
         let group_id = self.req.group_id;
         let realm_id = self.req.realm_id;
 
+        let license_id = self.req.license_id;
+
         let endpoint = self.req.data_endpoint.clone();
 
         let _requester = self.requester.clone();
@@ -260,6 +262,16 @@ impl WriteRequest for CreateProjectRequestTx {
                     return Err(ArunaError::NotFound(endpoint_idx.0.to_string()));
                 }
             }
+
+            // Check if provided license_id is linked with a license
+            if let Some(license_id) = license_id {
+                store.get_idx_from_ulid_validate(
+                    &license_id,
+                    "license_id",
+                    &[NodeVariant::License],
+                    &wtxn
+                )?;
+            };
 
             // Create project
             let project_idx = store.create_node(&mut wtxn, &project)?;
@@ -412,7 +424,7 @@ impl WriteRequest for CreateResourceRequestTx {
             location: vec![], // TODO: Locations and DataProxies
             hashes: vec![],
         };
-
+        let license_id = self.req.license_id;
         let parent_id = self.req.parent_id;
 
         let store = controller.get_store();
@@ -439,6 +451,16 @@ impl WriteRequest for CreateResourceRequestTx {
                     error: "Wrong parent, must be folder or project".to_string(),
                 });
             }
+
+            // Check if provided license_id is linked with a license
+            if let Some(license_id) = license_id {
+                store.get_idx_from_ulid_validate(
+                    &license_id,
+                    "license_id",
+                    &[NodeVariant::License],
+                    &wtxn
+                )?;
+            };
 
             let mut parent_endpoints = parent_node.location.clone();
             let affected = parent_endpoints

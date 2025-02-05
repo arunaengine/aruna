@@ -5,7 +5,33 @@ services:
       - 1998:8080
     environment:
       KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin      
+      KC_HEALTH_ENABLED: true
     volumes:
       - ./aruna-server/tests/test_db/realm.json:/opt/keycloak/data/import/realm.json
     command: "start-dev --import-realm"
+    healthcheck:
+      # I hate keycloak
+      test: ['CMD-SHELL', '[ -f /tmp/HealthCheck.java ] || echo "public class HealthCheck { public static void main(String[] args) throws java.lang.Throwable { System.exit(java.net.HttpURLConnection.HTTP_OK == ((java.net.HttpURLConnection)new java.net.URL(args[0]).openConnection()).getResponseCode() ? 0 : 1); } }" > /tmp/HealthCheck.java && java /tmp/HealthCheck.java http://localhost:9000/health/live']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  aruna:
+    image: aruna:latest
+    network_mode: "host"
+    environment:
+      NODE_ID: 01J69YGPPZY80206PGHHXBR863
+      GRPC_PORT: 50050
+      GRPC_PORT_CONSENSUS: 50051
+      REST_PORT: 8080
+      NODE_SERIAL: 0
+      DB_PATH: ./01J69YGPPZY80206PGHHXBR863
+      ENCODING_KEY: MC4CAQAwBQYDK2VwBCIEICHl/V9wxvENDJKePwusDhnC7xgaHYV6iHLb0ENJZndj
+      DECODING_KEY: MCowBQYDK2VwAyEA2YfYTgb8Y0LTFr+2Rm2Fkdu38eJTfnsMDH2iZHErBH0=
+      KEY_SERIAL: 1
+      OIDC_ISSUER_NAME: http://localhost:1998/realms/test
+      OIDC_ISSUER_ENDPOINT: http://localhost:1998/realms/test/protocol/openid-connect/certs
+      OIDC_ISSUER_AUDIENCES: test;test-long
+    depends_on:
+      keycloak:
+        condition: service_healthy

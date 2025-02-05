@@ -30,7 +30,7 @@ impl RestServer {
                     .on_body_chunk(())
                     .on_eos(()),
             )
-            .layer(DefaultBodyLimit::max(5 * 1024 * 1024));
+            .layer(DefaultBodyLimit::max(1024 * 1024 * 1024));
         axum::serve(listener, app.into_make_service())
             .await
             .map_err(|e| ArunaError::ServerError(e.to_string()))?;

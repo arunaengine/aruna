@@ -131,7 +131,7 @@ impl Request for GetLicensesRequest {
 
     async fn run_request(
         self,
-        requester: Option<Requester>,
+        _requester: Option<Requester>,
         controller: &Controller,
     ) -> Result<Self::Response, ArunaError> {
         let store = controller.get_store();

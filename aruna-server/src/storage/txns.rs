@@ -93,6 +93,7 @@ impl<'a> WriteTxn<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(super) fn remove_edge(&mut self, index: EdgeIndex) -> Option<u32> {
         let (from, to) = self
             .graph
@@ -211,7 +212,7 @@ pub struct ReadTxn<'a> {
 
 impl<'a> ReadTxn<'a> {
     pub fn commit(self) -> Result<(), ArunaError> {
-        self.txn.commit().inspect_err(logerr!());
+        self.txn.commit().inspect_err(logerr!())?;
         Ok(())
     }
 }

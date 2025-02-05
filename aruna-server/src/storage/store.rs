@@ -328,7 +328,7 @@ impl Store {
             )
             .inspect_err(logerr!())?;
 
-        wtxn.add_edge(source.into(), target.into(), edge_type);
+        wtxn.add_edge(source.into(), target.into(), edge_type).inspect_err(logerr!())?;
 
         Ok(())
     }

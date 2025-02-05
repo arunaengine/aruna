@@ -12,13 +12,7 @@ mod read_tests {
     use aruna_server::models::{
         models::Permission,
         requests::{
-            BatchResource, CreateGroupRequest as ModelsCreateGroupRequest,
-            CreateGroupResponse as ModelsCreateGroupResponse,
-            CreateProjectRequest as ModelsCreateProject, CreateProjectResponse,
-            CreateResourceBatchRequest, CreateResourceBatchResponse, GetEventsResponse,
-            GetGroupsFromUserResponse, GetRealmsFromUserResponse, GetRelationsRequest,
-            GetRelationsResponse, GetResourcesResponse, GroupAccessRealmResponse, SearchResponse,
-            UserAccessGroupResponse,
+            BatchResource, CreateGroupRequest as ModelsCreateGroupRequest, CreateGroupResponse as ModelsCreateGroupResponse, CreateLicenseRequest, CreateLicenseResponse, CreateProjectRequest as ModelsCreateProject, CreateProjectResponse, CreateResourceBatchRequest, CreateResourceBatchResponse, GetEventsResponse, GetGroupsFromUserResponse, GetRealmsFromUserResponse, GetRelationsRequest, GetRelationsResponse, GetResourcesResponse, GroupAccessRealmResponse, SearchResponse, UserAccessGroupResponse
         },
     };
     use serde_json::json;
@@ -79,6 +73,90 @@ mod read_tests {
             .any(|(g, p)| g.id == Ulid::from_string(&group_id).unwrap() && p == &Permission::Admin))
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_resources() {
+        let mut clients = init_test(OFFSET).await;
+
+        let create_request = CreateRealmRequest {
+            tag: "get-resource-test".to_string(),
+            name: "GetResourceTest".to_string(),
+            description: String::new(),
+        };
+
+        let response = clients
+            .realm_client
+            .create_realm(create_request.clone())
+            .await
+            .unwrap()
+            .into_inner();
+
+        let realm_id = Ulid::from_string(&response.realm.unwrap().id).unwrap();
+        let group_id = Ulid::from_string(&response.admin_group_id).unwrap();
+
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/v3/license", clients.rest_endpoint);
+
+        let request = CreateLicenseRequest {
+            name: "CC0".to_string(),
+            description: "CC0 bla bla bla".to_string(),
+            license_terms: "Creative Commons Legal Code".to_string()};
+
+        let response: CreateLicenseResponse = client
+            .post(url)
+            .header("Authorization", format!("Bearer {}", ADMIN_TOKEN))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let request = aruna_server::models::requests::CreateProjectRequest {
+            name: "test-project".to_string(),
+            title: "This is a test title".to_string(),
+            description: "This is a test project description".to_string(),
+            visibility: aruna_server::models::models::VisibilityClass::Private, 
+            license_id: Some(response.license_id),
+            group_id,
+            realm_id,
+            ..Default::default()
+        };
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/api/v3/resources/projects", clients.rest_endpoint);
+
+        let create_response: CreateProjectResponse = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", ADMIN_TOKEN))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let url = format!("{}/api/v3/resources", clients.rest_endpoint);
+
+        let response: GetResourcesResponse = client
+            .get(url)
+            .header("Authorization", format!("Bearer {}", ADMIN_TOKEN))
+            .query(&[("ids", create_response.resource.id)])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let resource = response.resources.iter().next().unwrap();
+
+        assert_eq!(&resource.name, &request.name);
+        assert_eq!(resource.license_id, request.license_id.unwrap());
+        assert_eq!(&resource.description, &request.description);
+        assert_eq!(&resource.title, &request.title);
+    }
     #[tokio::test(flavor = "multi_thread")]
     async fn test_search() {
         // Setup
@@ -861,7 +939,7 @@ mod read_tests {
             .json()
             .await
             .unwrap();
- 
+
         // Ugly json parsing to skip over "ULID": Object {} part
         let mut events = group_events_response
             .events

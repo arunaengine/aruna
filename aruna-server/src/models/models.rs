@@ -10,7 +10,7 @@ use utoipa::ToSchema;
 
 use crate::{
     constants::{
-        field_names::{DELETED_FIELD, VARIANT_FIELD},
+        field_names::{DELETED_FIELD, LICENSE_FIELD, TAG_FIELD, VARIANT_FIELD},
         relation_types::*,
     },
     error::ArunaError,
@@ -168,9 +168,23 @@ pub fn into_serde_json_map<T: Serialize>(
         Value::Object(mut map) => {
             map.insert(
                 VARIANT_FIELD.to_string(),
-                Value::Number(Number::from(variant as u64)),
+                Value::Number(Number::from(variant.clone() as u64)),
             );
             map.insert(DELETED_FIELD.to_string(), Value::Bool(false));
+
+            match variant {
+                NodeVariant::ResourceFolder
+                | NodeVariant::ResourceObject
+                | NodeVariant::ResourceProject => {
+                    if let Some(license) = map.remove("license_id") {
+                        map.insert(LICENSE_FIELD.to_string(), license);
+                    }
+                    if let Some(title) = map.remove("title") {
+                        map.insert(TAG_FIELD.to_string(), title);
+                    }
+                }
+                _ => {}
+            }
             Ok(map)
         }
         _ => Err(ArunaError::ConversionError {
