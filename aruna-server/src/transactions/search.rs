@@ -48,8 +48,12 @@ impl Request for SearchRequest {
                                 .ok_or_else(|| {
                                     ArunaError::NotFound("Requester not found".to_string())
                                 })?;
-                        let mut permission_targets = store.get_realm_and_groups(user_idx)?;
-                        permission_targets.push(user_idx);
+                        let mut permission_targets = store
+                            .get_realm_and_groups(user_idx)?
+                            .iter()
+                            .map(|idx| idx.0)
+                            .collect::<Vec<u32>>();
+                        permission_targets.push(user_idx.0);
                         let mut universe =
                             store.get_read_permission_universe(&rtxn, &permission_targets)?;
                         universe |= store.get_public_universe(&rtxn)?;

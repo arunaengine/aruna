@@ -73,7 +73,7 @@ impl WriteRequest for CreateLicenseRequestTx {
 
             // Create license
             let license_idx = store.create_node(&mut wtxn, &license)?;
-            store.add_public_resources_universe(&mut wtxn, &[license_idx])?;
+            store.add_public_resources_universe(&mut wtxn, &[license_idx.0])?;
 
             // Affected nodes: Group, Realm, Project
             wtxn.commit(associated_event_id, &[], &[])?;

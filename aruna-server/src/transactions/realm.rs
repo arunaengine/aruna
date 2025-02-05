@@ -6,21 +6,15 @@ use crate::{
     constants::relation_types::{
         self, DEFAULT, GROUP_ADMINISTRATES_REALM, GROUP_PART_OF_REALM, OWNED_BY_USER,
         PERMISSION_READ, REALM_USES_COMPONENT, SHARES_PERMISSION,
-    },
-    context::Context,
-    error::ArunaError,
-    logerr,
-    models::{
-        models::{Component, Group, NodeVariant, Realm},
+    }, context::Context, error::ArunaError, logerr, models::{
+        models::{Component, Group, MilliIdx, NodeVariant, Realm},
         requests::{
             AddComponentToRealmRequest, AddComponentToRealmResponse, AddGroupRequest,
             AddGroupResponse, CreateRealmRequest, CreateRealmResponse, GetGroupsFromRealmRequest,
             GetGroupsFromRealmResponse, GetRealmComponentsRequest, GetRealmComponentsResponse,
             GetRealmRequest, GetRealmResponse, GroupAccessRealmRequest, GroupAccessRealmResponse,
         },
-    },
-    storage::graph::{get_relations, has_relation},
-    transactions::request::SerializedResponse,
+    }, storage::txns::Txn, transactions::request::SerializedResponse
 };
 use petgraph::Direction::{self, Outgoing};
 use serde::{Deserialize, Serialize};
@@ -107,7 +101,7 @@ impl WriteRequest for CreateRealmRequestTx {
             if !store
                 .filtered_universe(
                     Some(&format!("tag='{}' AND variant=6", realm.tag.clone())),
-                    &wtxn.get_txn(),
+                    &wtxn,
                 )?
                 .is_empty()
             {
@@ -118,7 +112,7 @@ impl WriteRequest for CreateRealmRequestTx {
                 });
             };
 
-            let Some(user_idx) = store.get_idx_from_ulid(&requester_id, wtxn.get_txn()) else {
+            let Some(user_idx) = store.get_idx_from_ulid(&requester_id, &wtxn) else {
                 return Err(ArunaError::NotFound(requester_id.to_string()));
             };
 
@@ -143,8 +137,8 @@ impl WriteRequest for CreateRealmRequestTx {
                 relation_types::GROUP_ADMINISTRATES_REALM,
             )?;
 
-            store.add_read_permission_universe(&mut wtxn, group_idx, &[realm_idx, group_idx])?;
-            store.add_read_permission_universe(&mut wtxn, realm_idx, &[realm_idx, group_idx])?;
+            store.add_read_permission_universe(&mut wtxn, group_idx.0, &[realm_idx.0, group_idx.0])?;
+            store.add_read_permission_universe(&mut wtxn, realm_idx.0, &[realm_idx.0, group_idx.0])?;
 
             // Affected nodes: User, Realm and Group
 
@@ -219,11 +213,11 @@ impl WriteRequest for AddGroupRequestTx {
 
             let mut wtxn = store.write_txn()?;
 
-            let Some(group_idx) = store.get_idx_from_ulid(&group_id, wtxn.get_txn()) else {
+            let Some(group_idx) = store.get_idx_from_ulid(&group_id, &wtxn) else {
                 return Err(ArunaError::NotFound(group_id.to_string()));
             };
 
-            let Some(realm_idx) = store.get_idx_from_ulid(&realm_id, wtxn.get_txn()) else {
+            let Some(realm_idx) = store.get_idx_from_ulid(&realm_id, &wtxn) else {
                 return Err(ArunaError::NotFound(realm_id.to_string()));
             };
 
@@ -235,7 +229,7 @@ impl WriteRequest for AddGroupRequestTx {
                 relation_types::GROUP_PART_OF_REALM,
             )?;
 
-            store.add_read_permission_universe(&mut wtxn, realm_idx, &[group_idx])?;
+            store.add_read_permission_universe(&mut wtxn, realm_idx.0, &[group_idx.0])?;
 
             // Affected nodes: Realm and Group
             wtxn.commit(associated_event_id, &[realm_idx, group_idx], &[])?;
@@ -481,37 +475,34 @@ impl WriteRequest for AddComponentToRealmRequestTx {
                 &component_id,
                 "component_id",
                 &[NodeVariant::Component],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
 
             let user_idx = store.get_idx_from_ulid_validate(
                 &requester_id,
                 "user",
                 &[NodeVariant::User, NodeVariant::ServiceAccount],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
 
             let realm_idx = store.get_idx_from_ulid_validate(
                 &realm_id,
                 "realm_id",
                 &[NodeVariant::Realm],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
 
             let component = store
-                .get_node::<Component>(wtxn.get_txn(), component_idx)
+                .get_node::<Component>(&wtxn, component_idx)
                 .ok_or_else(|| ArunaError::NotFound(component_id.to_string()))?;
 
+
             if !component.public
-                && !has_relation(
-                    wtxn.get_ro_graph(),
+                && !wtxn.get_ro_graph().has_relation(
                     component_idx,
                     user_idx,
                     &[OWNED_BY_USER],
-                )
+                )?
             {
                 error!("User does not own component");
                 return Err(ArunaError::Unauthorized);
@@ -525,18 +516,18 @@ impl WriteRequest for AddComponentToRealmRequestTx {
                 relation_types::REALM_USES_COMPONENT,
             )?;
 
-            if !get_relations(wtxn.get_ro_graph(), realm_idx, Some(&[DEFAULT]), Outgoing)
+            if !wtxn.get_ro_graph().get_relations(realm_idx, Some(&[DEFAULT]), Outgoing)?
                 .iter()
                 .any(|r| {
-                    wtxn.get_ro_graph().node_weight(r.target.into())
-                        == Some(&NodeVariant::Component)
+                    wtxn.get_ro_graph().node_weight(r.target)
+                        == Some(NodeVariant::Component)
                 })
             {
                 store.create_relation(&mut wtxn, realm_idx, component_idx, DEFAULT)?;
                 // TODO: Update all projects + resources to
             }
 
-            store.add_read_permission_universe(&mut wtxn, realm_idx, &[component_idx])?;
+            store.add_read_permission_universe(&mut wtxn, realm_idx.0, &[component_idx.0])?;
 
             // Affected nodes: Realm and Group
             wtxn.commit(associated_event_id, &[realm_idx, component_idx], &[])?;
@@ -611,16 +602,16 @@ impl WriteRequest for GroupAccessRealmTx {
 
         Ok(tokio::task::spawn_blocking(move || {
             let wtxn = store.write_txn()?;
-            let ro_txn = wtxn.get_ro_txn();
-            let graph = wtxn.get_ro_graph();
+            // let ro_txn = wtxn.get_ro_txn();
+            // let graph = wtxn.get_ro_graph();
 
-            let Some(group_idx) = store.get_idx_from_ulid(&group_id, ro_txn) else {
+            let Some(group_idx) = store.get_idx_from_ulid(&group_id, &wtxn) else {
                 return Err(ArunaError::NotFound(group_id.to_string()));
             };
-            let Some(realm_idx) = store.get_idx_from_ulid(&realm_id, ro_txn) else {
+            let Some(realm_idx) = store.get_idx_from_ulid(&realm_id, &wtxn) else {
                 return Err(ArunaError::NotFound(realm_id.to_string()));
             };
-            let Some(requester_idx) = store.get_idx_from_ulid(&requester, ro_txn) else {
+            let Some(requester_idx) = store.get_idx_from_ulid(&requester, &wtxn) else {
                 return Err(ArunaError::NotFound(requester.to_string()));
             };
 
@@ -631,17 +622,16 @@ impl WriteRequest for GroupAccessRealmTx {
                     realm_idx,
                     Some(&[GROUP_ADMINISTRATES_REALM]),
                     Direction::Incoming,
-                    graph,
-                )
+                )?
                 .iter()
                 .map(|rel| rel.source)
-                .collect::<Vec<u32>>();
+                .collect::<Vec<MilliIdx>>();
             for admin_group in relations {
                 let users = &store
-                    .get_raw_relations(admin_group, Some(&filter), Direction::Incoming, graph)
+                    .get_raw_relations(admin_group, Some(&filter), Direction::Incoming)?
                     .iter()
                     .map(|rel| rel.source)
-                    .collect::<Vec<u32>>();
+                    .collect::<Vec<MilliIdx>>();
                 affected.extend(users);
             }
             // Notification gets automatically created in commit

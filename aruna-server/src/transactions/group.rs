@@ -11,7 +11,7 @@ use crate::{
     error::ArunaError,
     logerr,
     models::{
-        models::Group,
+        models::{Group, MilliIdx},
         requests::{
             AddUserRequest, AddUserResponse, CreateGroupRequest, CreateGroupResponse,
             GetGroupRequest, GetGroupResponse, GetUsersFromGroupRequest, GetUsersFromGroupResponse,
@@ -91,7 +91,7 @@ impl WriteRequest for CreateGroupRequestTx {
         Ok(tokio::task::spawn_blocking(move || {
             let mut wtxn = store.write_txn()?;
 
-            let Some(user_idx) = store.get_idx_from_ulid(&requester_id, wtxn.get_txn()) else {
+            let Some(user_idx) = store.get_idx_from_ulid(&requester_id, &wtxn) else {
                 return Err(ArunaError::NotFound(requester_id.to_string()));
             };
 
@@ -106,7 +106,7 @@ impl WriteRequest for CreateGroupRequestTx {
                 relation_types::PERMISSION_ADMIN,
             )?;
 
-            store.add_read_permission_universe(&mut wtxn, group_idx, &[group_idx])?;
+            store.add_read_permission_universe(&mut wtxn, group_idx.0, &[group_idx.0])?;
 
             // Affected nodes: User and Group
             wtxn.commit(associated_event_id, &[user_idx, group_idx], &[])?;
@@ -237,10 +237,10 @@ impl WriteRequest for AddUserRequestTx {
             let mut wtxn = store.write_txn()?;
 
             // Get indices
-            let Some(user_idx) = store.get_idx_from_ulid(&user_id, wtxn.get_txn()) else {
+            let Some(user_idx) = store.get_idx_from_ulid(&user_id, &wtxn) else {
                 return Err(ArunaError::NotFound(user_id.to_string()));
             };
-            let Some(group_idx) = store.get_idx_from_ulid(&group_id, wtxn.get_txn()) else {
+            let Some(group_idx) = store.get_idx_from_ulid(&group_id, &wtxn) else {
                 return Err(ArunaError::NotFound(group_id.to_string()));
             };
 
@@ -380,13 +380,11 @@ impl WriteRequest for UserAccessGroupTx {
         let group_id = self.req.group_id;
         Ok(tokio::task::spawn_blocking(move || {
             let wtxn = store.write_txn()?;
-            let ro_txn = wtxn.get_ro_txn();
-            let graph = wtxn.get_ro_graph();
 
-            let Some(group_idx) = store.get_idx_from_ulid(&group_id, ro_txn) else {
+            let Some(group_idx) = store.get_idx_from_ulid(&group_id, &wtxn) else {
                 return Err(ArunaError::NotFound(group_id.to_string()));
             };
-            let Some(requester_idx) = store.get_idx_from_ulid(&requester_id, ro_txn) else {
+            let Some(requester_idx) = store.get_idx_from_ulid(&requester_id, &wtxn) else {
                 return Err(ArunaError::NotFound(requester_id.to_string()));
             };
 
@@ -394,10 +392,10 @@ impl WriteRequest for UserAccessGroupTx {
             let filter = (PERMISSION_READ..=PERMISSION_ADMIN).collect::<Vec<u32>>();
             affected.extend(
                 store
-                    .get_raw_relations(group_idx, Some(&filter), Direction::Incoming, graph)
+                    .get_raw_relations(group_idx, Some(&filter), Direction::Incoming)?
                     .iter()
                     .map(|rel| rel.source)
-                    .collect::<Vec<u32>>(),
+                    .collect::<Vec<MilliIdx>>(),
             );
 
             // Notification gets automatically created in commit

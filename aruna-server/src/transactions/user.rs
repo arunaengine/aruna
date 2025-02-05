@@ -23,7 +23,7 @@ use crate::{
             GetUserResponse, RegisterUserRequest, RegisterUserResponse,
         },
     },
-    storage::graph::has_relation,
+    storage::txns::Txn,
     transactions::request::SerializedResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -117,7 +117,7 @@ impl WriteRequest for RegisterUserRequestTx {
                 Subscriber {
                     id: user.id,
                     owner: user.id,
-                    target_idx: user_idx,
+                    target_idx: user_idx.0,
                     cascade: false,
                 },
             )?;
@@ -213,10 +213,10 @@ impl WriteRequest for CreateTokenRequestTx {
 
             // Create token
             let user_idx = store
-                .get_idx_from_ulid(&user_id, wtxn.get_txn())
+                .get_idx_from_ulid(&user_id, &wtxn)
                 .ok_or_else(|| ArunaError::NotFound("User not found".to_string()))?;
             let token = store.add_token(
-                wtxn.get_txn(),
+                &mut wtxn,
                 associated_event_id,
                 &token.user_id.clone(),
                 token,
@@ -573,63 +573,55 @@ impl WriteRequest for CreateS3CredentialsRequestTx {
                 &user_id,
                 "user_id",
                 &[NodeVariant::User, NodeVariant::ServiceAccount],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
 
             let component_idx = store.get_idx_from_ulid_validate(
                 &component_id,
                 "component_id",
                 &[NodeVariant::Component],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
 
             let realm_idx = store.get_idx_from_ulid_validate(
                 &realm_id,
                 "realm_id",
                 &[NodeVariant::Realm],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
 
             let group_idx = store.get_idx_from_ulid_validate(
                 &group_id,
                 "group_id",
                 &[NodeVariant::Group],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
-
-            if !has_relation(
-                wtxn.get_ro_graph(),
+            if !wtxn.get_ro_graph().has_relation(
                 user_idx,
                 group_idx,
                 &((PERMISSION_NONE..=PERMISSION_ADMIN).collect::<Vec<u32>>()),
-            ) {
+            )? {
                 return Err(ArunaError::Forbidden("User not in group".to_string()));
             }
 
-            if !has_relation(
-                wtxn.get_ro_graph(),
+            if !wtxn.get_ro_graph().has_relation(
                 realm_idx,
                 component_idx,
                 &[REALM_USES_COMPONENT],
-            ) {
+            )? {
                 return Err(ArunaError::Forbidden("Component not in realm".to_string()));
             }
 
-            if !has_relation(
-                wtxn.get_ro_graph(),
+            if !wtxn.get_ro_graph().has_relation(
                 group_idx,
                 realm_idx,
                 &[GROUP_PART_OF_REALM, GROUP_ADMINISTRATES_REALM],
-            ) {
+            )? {
                 return Err(ArunaError::Forbidden("Group not part of realm".to_string()));
             }
 
             let token = store.add_token(
-                wtxn.get_txn(),
+                &mut wtxn,
                 associated_event_id,
                 &token.user_id.clone(),
                 token,

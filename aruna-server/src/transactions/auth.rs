@@ -430,7 +430,6 @@ fn validate_user_only(user: Requester, store: Arc<Store>) -> Result<(), ArunaErr
                     user.get_token_idx()
                         .ok_or_else(|| ArunaError::Forbidden("No token".to_string()))?,
                     &txn,
-                    &store.get_graph(),
                 )?;
                 match token.scope {
                     Scope::Personal => Ok(()),
@@ -468,7 +467,6 @@ fn validate_subscriber_of(
                     user.get_token_idx()
                         .ok_or_else(|| ArunaError::Forbidden("No token".to_string()))?,
                     &txn,
-                    &store.get_graph(),
                 )?;
                 match token.scope {
                     Scope::Personal => Ok(()),
@@ -483,7 +481,7 @@ fn validate_subscriber_of(
             ..
         } => {
             let token =
-                store.get_token(&service_account_id, *token_id, &txn, &store.get_graph())?;
+                store.get_token(&service_account_id, *token_id, &txn)?;
             match token.scope {
                 Scope::Personal => Ok(()),
                 _ => Err(ArunaError::Forbidden("Invalid scope".to_string())),
@@ -533,7 +531,7 @@ fn validate_permission_batch(
 
     let additional_constraint = if let Some(tokenidx) = user.get_token_idx() {
         let txn = store.read_txn()?;
-        let token = store.get_token(&user_id, tokenidx, &txn, &store.get_graph())?;
+        let token = store.get_token(&user_id, tokenidx, &txn)?;
 
         match token.scope {
             Scope::Personal => None,

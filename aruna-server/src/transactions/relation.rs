@@ -226,10 +226,10 @@ impl WriteRequest for CreateRelationTx {
         Ok(tokio::task::spawn_blocking(move || {
             let mut wtxn = store.write_txn()?;
 
-            let Some(source_idx) = store.get_idx_from_ulid(&source_id, wtxn.get_txn()) else {
+            let Some(source_idx) = store.get_idx_from_ulid(&source_id, &wtxn) else {
                 return Err(ArunaError::NotFound(format!("{source_id} not found")));
             };
-            let Some(target_idx) = store.get_idx_from_ulid(&target_id, wtxn.get_txn()) else {
+            let Some(target_idx) = store.get_idx_from_ulid(&target_id, &wtxn) else {
                 return Err(ArunaError::NotFound(format!("{source_id} not found")));
             };
             match variant {
@@ -239,7 +239,7 @@ impl WriteRequest for CreateRelationTx {
                     ));
                 }
                 _ => {
-                    if !store.get_relation_info(&variant, wtxn.get_txn())?.is_some() {
+                    if !store.get_relation_info(&variant, &wtxn)?.is_some() {
                         return Err(ArunaError::NotFound(format!(
                             "Relation variant_idx {variant} not found"
                         )));
@@ -312,7 +312,7 @@ impl WriteRequest for CreateRelationVariantTx {
             let mut wtxn = store.write_txn()?;
 
             let idx = store
-                .get_relation_infos(&wtxn.get_txn())?
+                .get_relation_infos(&wtxn)?
                 .iter()
                 .map(|i| i.idx)
                 .max()

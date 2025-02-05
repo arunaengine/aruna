@@ -116,6 +116,9 @@ pub fn load_graph(
 }
 
 impl GraphTxn<'_> {
+    pub fn node_weight(&self, idx: MilliIdx) -> Option<NodeVariant> {
+        self.state.graph.node_weight(idx.0.into()).cloned()
+    }
     pub fn get_relations(
         &self,
         idx: MilliIdx,
@@ -415,7 +418,7 @@ impl GraphTxn<'_> {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn has_relation(
-        self,
+        &self,
         source_idx: MilliIdx,
         target_idx: MilliIdx,
         edge_type: &[EdgeType],

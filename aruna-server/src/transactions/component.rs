@@ -73,7 +73,7 @@ impl WriteRequest for CreateComponentRequestTx {
 
             let Some(requester_idx) = requester
                 .get_id()
-                .map(|id| store.get_idx_from_ulid(&id, wtxn.get_txn()))
+                .map(|id| store.get_idx_from_ulid(&id, &wtxn))
                 .flatten()
             else {
                 return Err(ArunaError::Unauthorized);
@@ -94,9 +94,9 @@ impl WriteRequest for CreateComponentRequestTx {
             store.create_relation(&mut wtxn, idx, requester_idx, relation_types::OWNED_BY_USER)?;
 
             // Add a listener if the component is a proxy
-            store.add_read_permission_universe(&mut wtxn, requester_idx, &[idx])?;
+            store.add_read_permission_universe(&mut wtxn, requester_idx.0, &[idx.0])?;
             if component.public {
-                store.add_public_resources_universe(&mut wtxn, &[idx])?;
+                store.add_public_resources_universe(&mut wtxn, &[idx.0])?;
             }
 
             store.add_subscriber(
@@ -104,7 +104,7 @@ impl WriteRequest for CreateComponentRequestTx {
                 Subscriber {
                     id,
                     owner: id,
-                    target_idx: idx,
+                    target_idx: idx.0,
                     cascade: true,
                 },
             )?;

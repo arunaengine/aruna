@@ -15,7 +15,7 @@ use crate::{
     logerr,
     models::{
         models::{
-            Component, DataLocation, NodeVariant, Resource, ResourceVariant, Subscriber,
+            Component, DataLocation, MilliIdx, NodeVariant, Resource, ResourceVariant, Subscriber,
             SyncingStatus, VisibilityClass,
         },
         requests::{
@@ -31,8 +31,8 @@ use crate::{
         },
     },
     storage::{
-        graph::{self, get_parent, get_related_user_or_groups, get_relations, has_relation},
-        store::{Store, WriteTxn},
+        store::Store,
+        txns::{Txn, WriteTxn},
     },
     transactions::request::WriteRequest,
 };
@@ -72,7 +72,7 @@ impl Request for CreateProjectRequest {
 
             (self.group_id, self.realm_id) = tokio::task::spawn_blocking(move || {
                 let rtxn = store.read_txn()?;
-                let token = store.get_token(&user_id, token_idx, &rtxn, &store.get_graph())?;
+                let token = store.get_token(&user_id, token_idx, &rtxn)?;
                 Ok::<_, ArunaError>((
                     token
                         .default_group
@@ -187,16 +187,14 @@ impl WriteRequest for CreateProjectRequestTx {
                 &group_id,
                 "group_id",
                 &[NodeVariant::Group],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
             // Get the realm
             let realm_idx = store.get_idx_from_ulid_validate(
                 &realm_id,
                 "realm_id",
                 &[NodeVariant::Realm],
-                wtxn.get_ro_txn(),
-                wtxn.get_ro_graph(),
+                &wtxn,
             )?;
 
             // Validate that the data endpoint is part of the realm
@@ -206,16 +204,14 @@ impl WriteRequest for CreateProjectRequestTx {
                     &data_endpoint,
                     "data_endpoint",
                     &[NodeVariant::Component],
-                    wtxn.get_ro_txn(),
-                    wtxn.get_ro_graph(),
+                    &wtxn,
                 )?;
 
-                if !has_relation(
-                    wtxn.get_ro_graph(),
+                if !wtxn.get_ro_graph().has_relation(
                     realm_idx,
                     data_endpoint_idx,
                     &[relation_types::REALM_USES_COMPONENT],
-                ) {
+                )? {
                     error!("Realm does not use this data endpoint");
                     return Err(ArunaError::InvalidParameter {
                         name: "data_endpoint".to_string(),
@@ -225,13 +221,14 @@ impl WriteRequest for CreateProjectRequestTx {
                 Some(data_endpoint_idx)
             } else {
                 debug!("No data endpoint provided");
-                get_relations(wtxn.get_ro_graph(), realm_idx, Some(&[DEFAULT]), Outgoing)
+                wtxn.get_ro_graph()
+                    .get_relations(realm_idx, Some(&[DEFAULT]), Outgoing)?
                     .iter()
                     .find_map(|r| {
                         debug!("Checking relation: {:?}", r);
-                        let node_type = wtxn.get_ro_graph().node_weight(r.target.into());
+                        let node_type = wtxn.get_ro_graph().node_weight(r.target);
                         debug!("Node type: {:?}", node_type);
-                        if node_type == Some(&NodeVariant::Component) {
+                        if node_type == Some(NodeVariant::Component) {
                             Some(r.target)
                         } else {
                             None
@@ -243,7 +240,7 @@ impl WriteRequest for CreateProjectRequestTx {
             if !store
                 .filtered_universe(
                     Some(&format!("name='{}' AND variant=0", project.name)),
-                    wtxn.get_txn(),
+                    &wtxn,
                 )?
                 .is_empty()
             {
@@ -254,13 +251,13 @@ impl WriteRequest for CreateProjectRequestTx {
             }
 
             if let Some(endpoint_idx) = endpoint_idx {
-                if let Some(component) = store.get_node::<Component>(wtxn.get_txn(), endpoint_idx) {
+                if let Some(component) = store.get_node::<Component>(&wtxn, endpoint_idx) {
                     project.location = vec![DataLocation {
                         endpoint_id: component.id,
                         status: SyncingStatus::Finished,
                     }];
                 } else {
-                    return Err(ArunaError::NotFound(endpoint_idx.to_string()));
+                    return Err(ArunaError::NotFound(endpoint_idx.0.to_string()));
                 }
             }
 
@@ -289,7 +286,7 @@ impl WriteRequest for CreateProjectRequestTx {
                 Subscriber {
                     id: group_id,
                     owner: group_id,
-                    target_idx: project_idx,
+                    target_idx: project_idx.0,
                     cascade: true,
                 },
             )?;
@@ -297,10 +294,10 @@ impl WriteRequest for CreateProjectRequestTx {
             match project.visibility {
                 crate::models::models::VisibilityClass::Public
                 | crate::models::models::VisibilityClass::PublicMetadata => {
-                    store.add_public_resources_universe(&mut wtxn, &[project_idx])?;
+                    store.add_public_resources_universe(&mut wtxn, &[project_idx.0])?;
                 }
                 crate::models::models::VisibilityClass::Private => {
-                    store.add_read_permission_universe(&mut wtxn, group_idx, &[project_idx])?;
+                    store.add_read_permission_universe(&mut wtxn, group_idx.0, &[project_idx.0])?;
                 }
             };
 
@@ -424,13 +421,13 @@ impl WriteRequest for CreateResourceRequestTx {
 
             let mut wtxn = store.write_txn()?;
 
-            let Some(parent_idx) = store.get_idx_from_ulid(&parent_id, wtxn.get_txn()) else {
+            let Some(parent_idx) = store.get_idx_from_ulid(&parent_id, &wtxn) else {
                 return Err(ArunaError::NotFound(parent_id.to_string()));
             };
 
             // Make sure that the parent is a folder or project
             let parent_node = store
-                .get_node::<Resource>(wtxn.get_txn(), parent_idx)
+                .get_node::<Resource>(&wtxn, parent_idx)
                 .expect("Idx exist but no node in documents -> corrupted database");
 
             if !matches!(
@@ -446,7 +443,7 @@ impl WriteRequest for CreateResourceRequestTx {
             let mut parent_endpoints = parent_node.location.clone();
             let affected = parent_endpoints
                 .iter()
-                .filter_map(|l| store.get_idx_from_ulid(&l.endpoint_id, wtxn.get_txn()))
+                .filter_map(|l| store.get_idx_from_ulid(&l.endpoint_id, &wtxn))
                 .collect::<Vec<_>>();
 
             if resource.variant == ResourceVariant::Object {
@@ -461,13 +458,13 @@ impl WriteRequest for CreateResourceRequestTx {
             // 0 Project, 1 Folder, 2 Object -> < 3
             let universe = store.filtered_universe(
                 Some(&format!("name='{}' AND variant < 3", resource.name)),
-                wtxn.get_txn(),
+                &wtxn,
             )?;
 
             // 2. Check if any of the resources in the universe have the same parent as a parent
             for idx in universe {
                 // We need to use this because we have a lock on the store
-                if get_parent(wtxn.get_ro_graph(), idx) == Some(parent_idx) {
+                if wtxn.get_ro_graph().get_parent(MilliIdx(idx)) == Some(parent_idx) {
                     return Err(ArunaError::ConflictParameter {
                         name: "name".to_string(),
                         error: "Resource with this name already exists in this hierarchy"
@@ -490,15 +487,15 @@ impl WriteRequest for CreateResourceRequestTx {
             match resource.visibility {
                 crate::models::models::VisibilityClass::Public
                 | crate::models::models::VisibilityClass::PublicMetadata => {
-                    store.add_public_resources_universe(&mut wtxn, &[resource_idx])?;
+                    store.add_public_resources_universe(&mut wtxn, &[resource_idx.0])?;
                 }
                 crate::models::models::VisibilityClass::Private => {
-                    let groups = get_related_user_or_groups(wtxn.get_ro_graph(), parent_idx)?;
+                    let groups = wtxn.get_ro_graph().get_related_user_or_groups(parent_idx)?;
                     for group_idx in groups {
                         store.add_read_permission_universe(
                             &mut wtxn,
-                            group_idx,
-                            &[resource_idx],
+                            group_idx.0,
+                            &[resource_idx.0],
                         )?;
                     }
                 }
@@ -639,15 +636,14 @@ impl WriteRequest for CreateResourceBatchRequestTx {
                 };
                 let parent_id = match batch_resource.parent {
                     Parent::ID(ulid) => {
-                        let parent_existing_idx = store
-                            .get_idx_from_ulid(&ulid, wtxn.get_txn())
-                            .ok_or_else(|| {
+                        let parent_existing_idx =
+                            store.get_idx_from_ulid(&ulid, &wtxn).ok_or_else(|| {
                                 error!("Parent not found: {}", ulid);
                                 ArunaError::NotFound(ulid.to_string())
                             })?;
 
                         let parent_node = store
-                            .get_node::<Resource>(wtxn.get_txn(), parent_existing_idx)
+                            .get_node::<Resource>(&wtxn, parent_existing_idx)
                             .expect("Idx exist but no node in documents -> corrupted database");
 
                         if !matches!(
@@ -661,9 +657,11 @@ impl WriteRequest for CreateResourceBatchRequestTx {
                         }
 
                         let mut parent_endpoints = parent_node.location.clone();
-                        affected_endpoints.extend(parent_endpoints.iter().filter_map(|l| {
-                            store.get_idx_from_ulid(&l.endpoint_id, wtxn.get_txn())
-                        }));
+                        affected_endpoints.extend(
+                            parent_endpoints
+                                .iter()
+                                .filter_map(|l| store.get_idx_from_ulid(&l.endpoint_id, &wtxn)),
+                        );
 
                         if resource.variant == ResourceVariant::Object {
                             parent_endpoints.iter_mut().for_each(|l| {
@@ -677,13 +675,15 @@ impl WriteRequest for CreateResourceBatchRequestTx {
                         // 0 Project, 1 Folder, 2 Object -> < 3
                         let universe = store.filtered_universe(
                             Some(&format!("name='{}' AND variant < 3", resource.name)),
-                            wtxn.get_txn(),
+                            &wtxn,
                         )?;
 
                         // 2. Check if any of the resources in the universe have the same parent as a parent
                         for idx in universe {
                             // We need to use this because we have a lock on the store
-                            if get_parent(wtxn.get_ro_graph(), idx) == Some(parent_existing_idx) {
+                            if wtxn.get_ro_graph().get_parent(MilliIdx(idx))
+                                == Some(parent_existing_idx)
+                            {
                                 return Err(ArunaError::ConflictParameter {
                                     name: "name".to_string(),
                                     error:
@@ -745,7 +745,7 @@ impl WriteRequest for CreateResourceBatchRequestTx {
 
             let mut affected = vec![];
             for (resource, parent_id) in &to_create {
-                let Some(parent_idx) = store.get_idx_from_ulid(&parent_id, wtxn.get_txn()) else {
+                let Some(parent_idx) = store.get_idx_from_ulid(&parent_id, &wtxn) else {
                     return Err(ArunaError::NotFound(parent_id.to_string()));
                 };
                 let (_, idx) = resource_idx
@@ -761,12 +761,12 @@ impl WriteRequest for CreateResourceBatchRequestTx {
                 match resource.visibility {
                     crate::models::models::VisibilityClass::Public
                     | crate::models::models::VisibilityClass::PublicMetadata => {
-                        store.add_public_resources_universe(&mut wtxn, &[*idx])?;
+                        store.add_public_resources_universe(&mut wtxn, &[idx.0])?;
                     }
                     crate::models::models::VisibilityClass::Private => {
-                        let groups = get_related_user_or_groups(wtxn.get_ro_graph(), parent_idx)?;
+                        let groups = wtxn.get_ro_graph().get_related_user_or_groups(parent_idx)?;
                         for group_idx in groups {
-                            store.add_read_permission_universe(&mut wtxn, group_idx, &[*idx])?;
+                            store.add_read_permission_universe(&mut wtxn, group_idx.0, &[idx.0])?;
                         }
                     }
                 };
@@ -927,13 +927,11 @@ impl WriteRequest for UpdateResourceTx {
             let mut wtxn = store.write_txn()?;
 
             // Get resource idx
-            let Some(resource_idx) = store.get_idx_from_ulid(&resource_id, wtxn.get_txn()) else {
+            let Some(resource_idx) = store.get_idx_from_ulid(&resource_id, &wtxn) else {
                 return Err(ArunaError::NotFound(resource_id.to_string()));
             };
 
-            let Some(old_resource): Option<Resource> =
-                store.get_node(&wtxn.get_txn(), resource_idx)
-            else {
+            let Some(old_resource): Option<Resource> = store.get_node(&wtxn, resource_idx) else {
                 return Err(ArunaError::NotFound(format!(
                     "Resource with id {resource_id} not found"
                 )));
@@ -951,7 +949,7 @@ impl WriteRequest for UpdateResourceTx {
             store.update_node_field(&mut wtxn, resource_id, map)?;
 
             // Affected nodes: Group, Realm, Project
-            let resource = store.get_node(wtxn.get_txn(), resource_idx).unwrap();
+            let resource = store.get_node(&wtxn, resource_idx).unwrap();
             let response = match request {
                 ResourceUpdateRequests::Name(_) => {
                     ResourceUpdateResponses::Name(UpdateResourceNameResponse { resource })
@@ -1015,7 +1013,7 @@ fn parse_update_fields(
                 if !store
                     .filtered_universe(
                         Some(&format!("name='{}' AND variant=0", request.name)),
-                        wtxn.get_txn(),
+                        wtxn,
                     )?
                     .is_empty()
                 {
@@ -1187,12 +1185,11 @@ impl WriteRequest for RegisterDataRequestTx {
             let mut wtxn = store.write_txn()?;
 
             // Get resource idx
-            let Some(resource_idx) = store.get_idx_from_ulid(&object_id, wtxn.get_txn()) else {
+            let Some(resource_idx) = store.get_idx_from_ulid(&object_id, &wtxn) else {
                 return Err(ArunaError::NotFound(object_id.to_string()));
             };
 
-            let Some(resource): Option<Resource> = store.get_node(&wtxn.get_txn(), resource_idx)
-            else {
+            let Some(resource): Option<Resource> = store.get_node(&wtxn, resource_idx) else {
                 return Err(ArunaError::NotFound(format!(
                     "Resource with id {object_id} not found"
                 )));
@@ -1336,11 +1333,11 @@ impl WriteRequest for DeleteTx {
             let mut wtxn = store.write_txn()?;
 
             // Get resource idx
-            let Some(resource_idx) = store.get_idx_from_ulid(&node_id, wtxn.get_txn()) else {
+            let Some(resource_idx) = store.get_idx_from_ulid(&node_id, &wtxn) else {
                 return Err(ArunaError::NotFound(node_id.to_string()));
             };
 
-            let Some(raw_node) = store.get_raw_node(wtxn.get_txn(), resource_idx) else {
+            let Some(raw_node) = store.get_raw_node(&wtxn, resource_idx) else {
                 return Err(ArunaError::NotFound(format!(
                     "Resource with id {node_id} not found"
                 )));
@@ -1356,44 +1353,53 @@ impl WriteRequest for DeleteTx {
             .inspect_err(logerr!())?;
             let to_delete_ids = match variant {
                 NodeVariant::ResourceProject => {
-                    let graph = wtxn.get_ro_graph();
                     // Collect all children
-                    let mut to_delete = graph::get_all_children(&graph, resource_idx)?;
+                    let mut to_delete: Vec<u32> = wtxn
+                        .get_ro_graph()
+                        .get_all_children(resource_idx)?
+                        .iter()
+                        .map(|idx| idx.0)
+                        .collect();
                     // Add project
-                    to_delete.push(resource_idx);
+                    to_delete.push(resource_idx.0);
                     to_delete
                 }
                 NodeVariant::ResourceFolder => {
-                    let graph = wtxn.get_ro_graph();
                     // Collect all children
-                    let mut to_delete = graph::get_all_children(&graph, resource_idx)?;
+                    let mut to_delete: Vec<u32> = wtxn
+                        .get_ro_graph()
+                        .get_all_children(resource_idx)?
+                        .iter()
+                        .map(|idx| idx.0)
+                        .collect();
                     // Add folder
-                    to_delete.push(resource_idx);
+                    to_delete.push(resource_idx.0);
                     to_delete
                 }
                 NodeVariant::ResourceObject => {
                     // Only object needs to be added
-                    vec![resource_idx]
+                    vec![resource_idx.0]
                 }
                 NodeVariant::Realm => {
                     let graph = wtxn.get_ro_graph();
                     let mut to_delete = Vec::new();
                     // Collect projects
-                    let projects = graph::get_relations(
-                        graph,
-                        resource_idx,
-                        Some(&[PROJECT_PART_OF_REALM]),
-                        Direction::Outgoing,
-                    )
-                    .iter()
-                    .map(|rel| rel.target)
-                    .collect::<Vec<u32>>();
+                    let projects = graph
+                        .get_relations(
+                            resource_idx,
+                            Some(&[PROJECT_PART_OF_REALM]),
+                            Direction::Outgoing,
+                        )?
+                        .iter()
+                        .map(|rel| rel.target)
+                        .collect::<Vec<MilliIdx>>();
                     // Collect project children
                     for project_idx in projects {
-                        to_delete.extend(graph::get_all_children(&graph, project_idx)?);
+                        to_delete
+                            .extend(graph.get_all_children(project_idx)?.iter().map(|idx| idx.0));
                     }
                     // Add realm
-                    to_delete.push(resource_idx);
+                    to_delete.push(resource_idx.0);
                     to_delete
                 }
                 NodeVariant::User => {
@@ -1404,27 +1410,24 @@ impl WriteRequest for DeleteTx {
                     return Err(ArunaError::Forbidden("Users cannot be deleted".to_string()));
                 }
                 NodeVariant::ServiceAccount => {
-                    vec![resource_idx]
+                    vec![resource_idx.0]
                 }
                 NodeVariant::Group => {
                     let graph = wtxn.get_ro_graph();
                     let mut to_delete = Vec::new();
                     // Collect projects
-                    let projects = graph::get_relations(
-                        graph,
-                        resource_idx,
-                        Some(&[OWNS_PROJECT]),
-                        Direction::Outgoing,
-                    )
-                    .iter()
-                    .map(|rel| rel.target)
-                    .collect::<Vec<u32>>();
+                    let projects = graph
+                        .get_relations(resource_idx, Some(&[OWNS_PROJECT]), Direction::Outgoing)?
+                        .iter()
+                        .map(|rel| rel.target)
+                        .collect::<Vec<MilliIdx>>();
                     // Collect project children
                     for project_idx in projects {
-                        to_delete.extend(graph::get_all_children(&graph, project_idx)?);
+                        to_delete
+                            .extend(graph.get_all_children(project_idx)?.iter().map(|idx| idx.0));
                     }
                     // Add group
-                    to_delete.push(resource_idx);
+                    to_delete.push(resource_idx.0);
                     to_delete
                 }
                 NodeVariant::Component => {
