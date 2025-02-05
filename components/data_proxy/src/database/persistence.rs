@@ -224,7 +224,7 @@ pub async fn delete_parts_by_upload_id(client: &Client, upload_id: String) -> Re
 impl LocationBinding {
     pub async fn insert_binding(&self, client: &Client) -> Result<()> {
         let query =
-            "INSERT INTO location_bindings (object_id, location_id) VALUES ($1::UUID, $2::UUID);"
+            "INSERT INTO location_bindings (object_id, location_id) VALUES ($1::UUID, $2::UUID) ON CONFLICT(object_id) DO UPDATE;"
                 .to_string();
         let prepared = client.prepare(&query).await.map_err(|e| {
             error!(error = ?e, msg = e.to_string());
