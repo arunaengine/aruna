@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::fmt::{Debug, Display, Formatter};
 use tokio_postgres::Client;
+use tracing::debug;
 use tracing::error;
 
 use crate::structs::LocationBinding;
@@ -217,7 +218,8 @@ pub async fn _get_parts_by_upload_id(
 pub async fn delete_parts_by_upload_id(client: &Client, upload_id: String) -> Result<()> {
     let query = "DELETE FROM multiparts WHERE data->>'upload_id' = $1;";
     let prepared = client.prepare(query).await?;
-    client.execute(&prepared, &[&upload_id]).await?;
+    let deleted = client.execute(&prepared, &[&upload_id]).await?;
+    debug!("Deleted {} parts for {}", deleted, upload_id);
     Ok(())
 }
 
@@ -304,7 +306,7 @@ impl LocationBinding {
     }
 
     pub async fn delete_by_object_id(object_id: &DieselUlid, client: &Client) -> Result<()> {
-        let query = "DELETE FROM location_binding WHERE object_id = $1;".to_string();
+        let query = "DELETE FROM location_bindings WHERE object_id = $1;".to_string();
         let prepared = client.prepare(&query).await.map_err(|e| {
             error!(error = ?e, msg = e.to_string());
             e
