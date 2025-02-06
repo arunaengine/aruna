@@ -126,10 +126,12 @@ impl Cache {
         cache.set_auth(auth_handler).await;
 
         // Set database conn in cache
-        if with_persistence {
+        let temp_locations = if with_persistence {
             let persistence = Database::new().await?;
-            cache.set_persistence(persistence).await?;
-        }
+            cache.set_persistence(persistence).await?
+        } else {
+            vec![]
+        };
 
         // Fully sync cache (and database if persistent DataProxy)
         if let Some(url) = notifications_url {
@@ -158,6 +160,7 @@ impl Cache {
             debug!("initialized notification handler");
         };
 
+        cache.handle_temp_locations(temp_locations).await?;
         Ok(cache)
     }
 
@@ -174,11 +177,14 @@ impl Cache {
     }
 
     #[tracing::instrument(level = "trace", skip(self, persistence))]
-    async fn set_persistence(&self, persistence: Database) -> Result<()> {
-        let persistence = self.sync_with_persistence(persistence).await?;
+    async fn set_persistence(
+        &self,
+        persistence: Database,
+    ) -> Result<Vec<(Object, ObjectLocation)>> {
+        let (persistence, templocations) = self.sync_with_persistence(persistence).await?;
         let mut guard = self.persistence.write().await;
         *guard = Some(persistence);
-        Ok(())
+        Ok(templocations)
     }
 
     #[tracing::instrument(level = "trace", skip(self, access_key))]
@@ -210,7 +216,10 @@ impl Cache {
     }
 
     #[tracing::instrument(level = "trace", skip(self, database))]
-    pub async fn sync_with_persistence(&self, database: Database) -> Result<Database> {
+    pub async fn sync_with_persistence(
+        &self,
+        database: Database,
+    ) -> Result<(Database, Vec<(Object, ObjectLocation)>)> {
         let client = database.get_client().await?;
 
         let access_keys = AccessKeyPermissions::get_all(&client).await?;
@@ -259,6 +268,8 @@ impl Cache {
 
         debug!("synced parts");
 
+        let mut temp_locations = vec![];
+
         for object in database_objects {
             let mut location = None;
             if object.object_type == ObjectType::Object {
@@ -267,36 +278,9 @@ impl Cache {
                     location = Some(ObjectLocation::get(&binding.location_id, &client).await?);
                 }
             }
-
-            let cache = self.get_cache().await?;
             if let Some(before_location) = &location {
                 if before_location.is_temporary {
-                    if let Some(backend) = &self.backend {
-                        let backend = backend.clone();
-                        let before_location = before_location.clone();
-                        let object = object.clone();
-                        trace!(
-                            ?object,
-                            ?before_location,
-                            "finalizing missing temp location"
-                        );
-                        tokio::spawn(
-                            async move {
-                                if let Err(e) = DataHandler::finalize_location(
-                                    object,
-                                    cache,
-                                    backend,
-                                    before_location,
-                                    None,
-                                )
-                                .await
-                                {
-                                    error!(error = ?e, "Failed to finalize location");
-                                }
-                            }
-                            .instrument(info_span!("finalize_location")),
-                        );
-                    }
+                    temp_locations.push((object.clone(), before_location.clone()));
                 }
             }
 
@@ -333,7 +317,36 @@ impl Cache {
         }
 
         debug!("synced resources");
-        Ok(database)
+        Ok((database, temp_locations))
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn handle_temp_locations(
+        &self,
+        temp_locations: Vec<(Object, ObjectLocation)>,
+    ) -> Result<()> {
+        let Some(backend) = &self.backend else {
+            bail!("No backend found")
+        };
+
+        let cache = self.get_cache().await?;
+        for (object, temp_location) in temp_locations {
+            let backend = backend.clone();
+            let cache = cache.clone();
+            trace!(?object, ?temp_location, "finalizing missing temp location");
+            tokio::spawn(
+                async move {
+                    if let Err(e) =
+                        DataHandler::finalize_location(object, cache, backend, temp_location, None)
+                            .await
+                    {
+                        error!(error = ?e, "Failed to finalize location");
+                    }
+                }
+                .instrument(info_span!("finalize_location")),
+            );
+        }
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
