@@ -263,7 +263,12 @@ impl StorageBackend for S3Backend {
             let part_number = etag.part_number;
 
             let completed_part = CompletedPart::builder()
-                .e_tag(etag.etag.replace('-', "").replace("\"", "").replace("\\", ""))
+                .e_tag(
+                    etag.etag
+                        .replace('-', "")
+                        .replace("\"", "")
+                        .replace("\\", ""),
+                )
                 .part_number(part_number)
                 .build();
 

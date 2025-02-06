@@ -1,0 +1,50 @@
+name: Build
+
+on:
+  push:
+    # Publish `main` as Docker `latest` image.
+    branches:
+      - main
+      - dev
+
+    # Publish `v1.2.3` tags as releases.
+    tags:
+      - v*
+
+env:
+  # TODO: Change variable to your image's name.
+  IMAGE_NAME_SERVER: aruna-server
+  IMAGE_NAME_PROXY: aruna-data-proxy
+
+jobs:
+  push:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          submodules: recursive
+      - name: Build proxy image
+        run: docker build . --file ./components/data_proxy/Dockerfile --tag $IMAGE_NAME_PROXY
+      - name: Push proxy image to harbor registry
+        run: |
+          # Strip git ref prefix from version
+          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
+
+          # Strip "v" prefix from tag name
+          [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
+
+          # Use Docker `latest` tag convention
+          [ "$VERSION" == "main" ] && VERSION="${{ github.run_number }}"
+
+          echo IMAGE_ID=$IMAGE_ID
+          echo VERSION=$VERSION
+
+          echo "${{ secrets.HARBORPW }}" | docker login harbor.computational.bio.uni-giessen.de -u '${{ secrets.HARBORUSER }}' --password-stdin
+
+          HARBOR_IMAGE_ID=harbor.computational.bio.uni-giessen.de/aruna/arunadataproxy
+
+          docker tag $IMAGE_NAME_PROXY $HARBOR_IMAGE_ID:$VERSION
+          docker push $HARBOR_IMAGE_ID:$VERSION 
+

@@ -47,28 +47,3 @@ jobs:
 
           docker tag $IMAGE_NAME_SERVER $HARBOR_IMAGE_ID:$VERSION
           docker push $HARBOR_IMAGE_ID:$VERSION
-       
-
-      - name: Build proxy image
-        run: docker build . --file ./components/data_proxy/Dockerfile --tag $IMAGE_NAME_PROXY
-      - name: Push proxy image to harbor registry
-        run: |
-          # Strip git ref prefix from version
-          VERSION=$(echo "${{ github.ref }}" | sed -e 's,.*/\(.*\),\1,')
-
-          # Strip "v" prefix from tag name
-          [[ "${{ github.ref }}" == "refs/tags/"* ]] && VERSION=$(echo $VERSION | sed -e 's/^v//')
-
-          # Use Docker `latest` tag convention
-          [ "$VERSION" == "main" ] && VERSION="${{ github.run_number }}"
-
-          echo IMAGE_ID=$IMAGE_ID
-          echo VERSION=$VERSION
-
-          echo "${{ secrets.HARBORPW }}" | docker login harbor.computational.bio.uni-giessen.de -u '${{ secrets.HARBORUSER }}' --password-stdin
-
-          HARBOR_IMAGE_ID=harbor.computational.bio.uni-giessen.de/aruna/arunadataproxy
-
-          docker tag $IMAGE_NAME_PROXY $HARBOR_IMAGE_ID:$VERSION
-          docker push $HARBOR_IMAGE_ID:$VERSION 
-
