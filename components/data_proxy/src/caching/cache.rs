@@ -2,7 +2,7 @@ use super::grpc_query_handler::GrpcQueryHandler;
 use crate::auth::auth::AuthHandler;
 use crate::caching::grpc_query_handler::sort_objects;
 use crate::data_backends::storage_backend::StorageBackend;
-use crate::database::persistence::delete_parts_by_upload_id;
+use crate::database::persistence::{delete_parts_by_object_id, delete_parts_by_upload_id};
 use crate::replication::replication_handler::ReplicationMessage;
 use crate::s3_frontend::data_handler::DataHandler;
 use crate::structs::{
@@ -813,6 +813,7 @@ impl Cache {
             let transaction = client.transaction().await?;
             let transaction_client = transaction.client();
 
+            delete_parts_by_object_id(transaction_client, &id).await?;
             ObjectLocation::delete(&id, transaction_client).await?;
             Object::delete(&id, transaction_client).await?;
 
@@ -834,6 +835,9 @@ impl Cache {
             warn!(?id, "Resource not found");
             return Ok(());
         };
+
+        self.multi_parts
+            .retain(|_, v| v.first().map_or(true, |e| e.object_id != id));
 
         let object = old.1 .0.read().await;
         for p in self

@@ -218,8 +218,14 @@ pub async fn _get_parts_by_upload_id(
 pub async fn delete_parts_by_upload_id(client: &Client, upload_id: String) -> Result<()> {
     let query = "DELETE FROM multiparts WHERE data->>'upload_id' = $1;";
     let prepared = client.prepare(query).await?;
-    let deleted = client.execute(&prepared, &[&upload_id]).await?;
-    debug!("Deleted {} parts for {}", deleted, upload_id);
+    client.execute(&prepared, &[&upload_id]).await?;
+    Ok(())
+}
+
+pub async fn delete_parts_by_object_id(client: &Client, object_id: &DieselUlid) -> Result<()> {
+    let query = "DELETE FROM multiparts WHERE data->>'object_id' = $1;";
+    let prepared = client.prepare(query).await?;
+    client.execute(&prepared, &[&object_id.to_string()]).await?;
     Ok(())
 }
 
