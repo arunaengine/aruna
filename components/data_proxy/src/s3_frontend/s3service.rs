@@ -183,7 +183,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let response = CompleteMultipartUploadOutput {
-            e_tag: Some(object.id.to_string()),
+            e_tag: Some(format!("-{}", object.id.to_string())),
             ..Default::default()
         };
 
