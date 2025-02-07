@@ -555,12 +555,13 @@ impl Store {
         idx: MilliIdx,
         filter: Option<&[EdgeType]>,
         direction: Direction,
+        range: Option<(u32, u32)>,
     ) -> Result<Vec<RawRelation>, ArunaError> {
         GraphTxn {
             state: self.graph.read().expect("Poisoned lock"),
             mode: Mode::ReadTxn,
         }
-        .get_relations(idx, filter, direction)
+        .get_relations(idx, filter, direction, range)
     }
 
     #[tracing::instrument(level = "trace", skip(self, txn))]
@@ -569,11 +570,12 @@ impl Store {
         idx: MilliIdx,
         filter: Option<&[EdgeType]>,
         direction: Direction,
+        range: Option<(u32, u32)>,
         txn: &impl Txn<'a>,
     ) -> Result<Vec<Relation>, ArunaError> {
         let graph_txn = txn.get_ro_graph();
 
-        let relations = graph_txn.get_relations(idx, filter, direction)?;
+        let relations = graph_txn.get_relations(idx, filter, direction, range)?;
 
         let mut result = Vec::new();
         for raw_relation in relations {

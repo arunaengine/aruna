@@ -323,6 +323,7 @@ impl Request for GetGroupsFromRealmRequest {
                     realm_idx,
                     Some(&[GROUP_PART_OF_REALM]),
                     Direction::Incoming,
+                    None,
                     &rtxn,
                 )?
                 .into_iter()
@@ -382,6 +383,7 @@ impl Request for GetRealmComponentsRequest {
                 realm_idx,
                 Some(&[REALM_USES_COMPONENT]),
                 Direction::Outgoing,
+                None,
                 &read_txn,
             )?;
 
@@ -516,7 +518,7 @@ impl WriteRequest for AddComponentToRealmRequestTx {
                 relation_types::REALM_USES_COMPONENT,
             )?;
 
-            if !wtxn.get_ro_graph().get_relations(realm_idx, Some(&[DEFAULT]), Outgoing)?
+            if !wtxn.get_ro_graph().get_relations(realm_idx, Some(&[DEFAULT]), Outgoing, None)?
                 .iter()
                 .any(|r| {
                     wtxn.get_ro_graph().node_weight(r.target)
@@ -622,13 +624,14 @@ impl WriteRequest for GroupAccessRealmTx {
                     realm_idx,
                     Some(&[GROUP_ADMINISTRATES_REALM]),
                     Direction::Incoming,
+                    None,
                 )?
                 .iter()
                 .map(|rel| rel.source)
                 .collect::<Vec<MilliIdx>>();
             for admin_group in relations {
                 let users = &store
-                    .get_raw_relations(admin_group, Some(&filter), Direction::Incoming)?
+                    .get_raw_relations(admin_group, Some(&filter), Direction::Incoming, None)?
                     .iter()
                     .map(|rel| rel.source)
                     .collect::<Vec<MilliIdx>>();

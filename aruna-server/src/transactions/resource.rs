@@ -224,7 +224,7 @@ impl WriteRequest for CreateProjectRequestTx {
             } else {
                 debug!("No data endpoint provided");
                 wtxn.get_ro_graph()
-                    .get_relations(realm_idx, Some(&[DEFAULT]), Outgoing)?
+                    .get_relations(realm_idx, Some(&[DEFAULT]), Outgoing, None)?
                     .iter()
                     .find_map(|r| {
                         debug!("Checking relation: {:?}", r);
@@ -1411,6 +1411,7 @@ impl WriteRequest for DeleteTx {
                             resource_idx,
                             Some(&[PROJECT_PART_OF_REALM]),
                             Direction::Outgoing,
+                            None,
                         )?
                         .iter()
                         .map(|rel| rel.target)
@@ -1439,7 +1440,7 @@ impl WriteRequest for DeleteTx {
                     let mut to_delete = Vec::new();
                     // Collect projects
                     let projects = graph
-                        .get_relations(resource_idx, Some(&[OWNS_PROJECT]), Direction::Outgoing)?
+                        .get_relations(resource_idx, Some(&[OWNS_PROJECT]), Direction::Outgoing, None)?
                         .iter()
                         .map(|rel| rel.target)
                         .collect::<Vec<MilliIdx>>();

@@ -124,6 +124,7 @@ impl GraphTxn<'_> {
         idx: MilliIdx,
         filter: Option<&[EdgeType]>,
         direction: Direction,
+        range: Option<(u32, u32)>,
     ) -> Result<Vec<RawRelation>, ArunaError> {
         let graph_idx = *self
             .state
@@ -132,6 +133,79 @@ impl GraphTxn<'_> {
             .get(idx.0 as usize)
             .ok_or_else(|| ArunaError::GraphError("Index not found".to_string()))?;
 
+        if let Some((start, end)) = range {
+            if start > end {
+                return Err(ArunaError::GraphError("Start bigger than end".to_string()));
+            }
+            let mut slice = Vec::new();
+            for e in start..end {
+                if let Some(edge) = self.state.graph.next_edge(e.into(), direction) {
+                    let edge_weight = match self.state.graph.edge_weight(edge) {
+                        Some(edge) => edge,
+                        None => continue,
+                    };
+                    let (source, target) = match self.state.graph.edge_endpoints(edge) {
+                        Some(refs) => refs,
+                        None => continue,
+                    };
+                    if let Some(filter) = filter {
+                        if !filter.contains(edge_weight) {
+                            continue;
+                        }
+                    }
+                    if matches!(self.mode, Mode::ReadTxn) {
+                        if self
+                            .state
+                            .in_flight_tx
+                            .edges
+                            .contains(&(edge.index() as u32))
+                        {
+                            continue;
+                        }
+                        if self.state.in_flight_tx.nodes.contains(&target.as_u32())
+                            || self.state.in_flight_tx.nodes.contains(&source.as_u32())
+                        {
+                            continue;
+                        }
+                    }
+                    let relation = match direction {
+                        Direction::Outgoing => RawRelation {
+                            source: idx,
+                            target: MilliIdx(
+                                match self
+                                    .state
+                                    .idx_mappings
+                                    .graph_milli
+                                    .get(target.as_u32() as usize)
+                                {
+                                    Some(i) => *i,
+                                    None => continue,
+                                },
+                            ),
+                            edge_type: *edge_weight,
+                        },
+                        Direction::Incoming => RawRelation {
+                            source: MilliIdx(
+                                match self
+                                    .state
+                                    .idx_mappings
+                                    .graph_milli
+                                    .get(source.as_u32() as usize)
+                                {
+                                    Some(i) => *i,
+                                    None => continue,
+                                },
+                            ),
+                            target: idx,
+                            edge_type: *edge_weight,
+                        },
+                    };
+                    slice.push(relation);
+                } else {
+                    break;
+                }
+            }
+        }
         Ok(self
             .state
             .graph

@@ -3609,7 +3609,7 @@ dependencies = [
 [[package]]
 name = "monotime"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#35078fea9b24427feae74c1f9d8758d027aa3701"
+source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#85e6caf57538d51be7b4b9f970109e4733617f72"
 dependencies = [
  "bytes",
  "serde",
@@ -4364,8 +4364,8 @@ version = "0.13.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0f3e5beed80eb580c68e2c600937ac2c4eedabdfd5ef1e5b7ea4f3fba84497b"
 dependencies = [
- "heck 0.5.0",
- "itertools 0.13.0",
+ "heck 0.4.1",
+ "itertools 0.11.0",
  "log",
  "multimap",
  "once_cell",
@@ -4385,7 +4385,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "157c5a9d7ea5c2ed2d9fb8f495b64759f7816c7eaea54ba3978f0d63000162e3"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "proc-macro2",
  "quote",
  "syn 2.0.96",
@@ -4421,7 +4421,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a669d5acbe719010c6f62a64e6d7d88fdedc1fe46e419747949ecb6312e9b14"
 dependencies = [
- "heck 0.5.0",
+ "heck 0.4.1",
  "prost",
  "prost-build",
  "prost-types",
@@ -5670,7 +5670,7 @@ dependencies = [
 [[package]]
 name = "synevi"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#35078fea9b24427feae74c1f9d8758d027aa3701"
+source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#85e6caf57538d51be7b4b9f970109e4733617f72"
 dependencies = [
  "monotime",
  "synevi_core",
@@ -5682,7 +5682,7 @@ dependencies = [
 [[package]]
 name = "synevi_core"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#35078fea9b24427feae74c1f9d8758d027aa3701"
+source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#85e6caf57538d51be7b4b9f970109e4733617f72"
 dependencies = [
  "ahash",
  "async-channel",
@@ -5711,7 +5711,7 @@ dependencies = [
 [[package]]
 name = "synevi_network"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#35078fea9b24427feae74c1f9d8758d027aa3701"
+source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#85e6caf57538d51be7b4b9f970109e4733617f72"
 dependencies = [
  "ahash",
  "async-trait",
@@ -5731,7 +5731,7 @@ dependencies = [
 [[package]]
 name = "synevi_persistence"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#35078fea9b24427feae74c1f9d8758d027aa3701"
+source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#85e6caf57538d51be7b4b9f970109e4733617f72"
 dependencies = [
  "ahash",
  "async-channel",
@@ -5757,7 +5757,7 @@ dependencies = [
 [[package]]
 name = "synevi_types"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#35078fea9b24427feae74c1f9d8758d027aa3701"
+source = "git+https://github.com/arunaengine/synevi.git?branch=feat%2Frefactor_wait_handler#85e6caf57538d51be7b4b9f970109e4733617f72"
 dependencies = [
  "ahash",
  "async-channel",
@@ -6797,7 +6797,7 @@ version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf221c93e13a30d793f7645a0e7762c55d169dbb0a49671918a2319d289b10bb"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

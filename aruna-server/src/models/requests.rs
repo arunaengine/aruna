@@ -328,7 +328,7 @@ pub struct GetRelationsRequest {
     #[serde(default)]
     pub filter: Vec<u32>, // Filter with Strings for directions or idx for rel idx?
     #[serde(default)]
-    pub offset: Option<usize>,
+    pub last_entry: Option<usize>, // usize
     #[serde(default = "default_page_size")]
     pub page_size: usize, // Max value 1000? Default 100
 }

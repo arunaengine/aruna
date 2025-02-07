@@ -51,9 +51,10 @@ impl Request for GetRelationsRequest {
                         source: self.node,
                     },
                 )
-                .await {
-                    Ok(_) => false,
-                    Err(err) => matches!(err, ArunaError::Forbidden(_)),
+                .await
+            {
+                Ok(_) => false,
+                Err(err) => matches!(err, ArunaError::Forbidden(_)),
             }
         } else {
             true
@@ -81,7 +82,12 @@ impl Request for GetRelationsRequest {
                 }
             }
 
-            let offset = self.offset.unwrap_or_default();
+            let offset = self.last_entry.unwrap_or_default() as u32;
+            let page_limit = if self.page_size > 1500 {
+                1500u32
+            } else {
+                self.page_size as u32
+            };
 
             let filter: Option<&[u32]> = if self.filter.is_empty() {
                 None
@@ -90,19 +96,33 @@ impl Request for GetRelationsRequest {
             };
 
             let relations = match self.direction {
-                Direction::Incoming => {
-                    store.get_relations(idx, filter, petgraph::Direction::Incoming, &rtxn)?
-                }
-                Direction::Outgoing => {
-                    store.get_relations(idx, filter, petgraph::Direction::Outgoing, &rtxn)?
-                }
+                Direction::Incoming => store.get_relations(
+                    idx,
+                    filter,
+                    petgraph::Direction::Incoming,
+                    Some((offset, page_limit)),
+                    &rtxn,
+                )?,
+                Direction::Outgoing => store.get_relations(
+                    idx,
+                    filter,
+                    petgraph::Direction::Outgoing,
+                    Some((offset, page_limit)),
+                    &rtxn,
+                )?,
                 Direction::All => {
-                    let mut relations =
-                        store.get_relations(idx, filter, petgraph::Direction::Incoming, &rtxn)?;
+                    let mut relations = store.get_relations(
+                        idx,
+                        filter,
+                        petgraph::Direction::Incoming,
+                        Some((offset, page_limit)),
+                        &rtxn,
+                    )?;
                     relations.extend(store.get_relations(
                         idx,
                         filter,
                         petgraph::Direction::Outgoing,
+                        Some((offset, page_limit)),
                         &rtxn,
                     )?);
                     relations
@@ -110,18 +130,10 @@ impl Request for GetRelationsRequest {
             };
             let total_hits = relations.len() as u32;
 
-            let new_offset = if relations.len() < offset + self.page_size {
+            let new_offset = if relations.len() < offset as usize + self.page_size {
                 None
             } else {
-                Some(offset + self.page_size)
-            };
-
-            let relations = match relations.get(offset..offset + self.page_size) {
-                Some(relations) => relations.to_vec(),
-                None => match relations.get(offset..) {
-                    Some(relations) => relations.to_vec(),
-                    None => relations,
-                },
+                Some(offset as usize + self.page_size)
             };
 
             Ok::<_, ArunaError>(GetRelationsResponse {

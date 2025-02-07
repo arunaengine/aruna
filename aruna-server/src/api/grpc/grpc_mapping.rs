@@ -523,7 +523,7 @@ impl TryFrom<grpc::GetRelationsRequest> for requests::GetRelationsRequest {
                 requests::Direction::Outgoing
             },
             filter: value.filter,
-            offset: Some(value.offset as usize),
+            last_entry: Some(value.offset as usize),
             page_size: value.page_size as usize,
         })
     }
