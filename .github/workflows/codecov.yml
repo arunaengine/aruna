@@ -51,5 +51,6 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           verbose: true
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: ${{ github.workspace }}/codecov.json
           fail_ci_if_error: true
