@@ -3,31 +3,53 @@ on:
     branches: [main]
   pull_request:
 name: coverage
-env:
-  CARGO_NET_GIT_FETCH_WITH_CLI: true
 jobs:
-  test:
+  report:
+    name: Generate Coverage Report
+    environment: coverage
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
+      RUSTFLAGS: "-Cinstrument-coverage"
+
     steps:
       - uses: arduino/setup-protoc@v1
-      - uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly
-          override: true
-      - uses: actions/checkout@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           submodules: recursive
+      - name: Install LLVM tools
+        run: sudo apt-get update && sudo apt-get install -y llvm
+
+      - id: setup
+        name: Setup Toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview
       - name: Setup
         run: docker compose -f compose.yaml up -d
         shell: bash
-      - uses: actions-rs/cargo@v1
+      - id: cache
+        name: Enable Workflow Cache
+        uses: Swatinem/rust-cache@v2
+      - id: tools
+        name: Install Tools
+        uses: taiki-e/install-action@v2
         with:
-          command: test
-          args: --all-features --no-fail-fast -- --include-ignored --test-threads=1
-        env:
-          CARGO_INCREMENTAL: '0'
-          RUSTFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
-          RUSTDOCFLAGS: '-Zprofile -Ccodegen-units=1 -Cinline-threshold=0 -Clink-dead-code -Coverflow-checks=off -Cpanic=abort -Zpanic_abort_tests'
-      - uses: actions-rs/grcov@v0.1.5
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@v3
+          tool: grcov,cargo-llvm-cov
+
+      - id: coverage
+        name: Generate Coverage Report
+        run: |
+          cargo clean 
+          cargo llvm-cov --all-features --workspace --codecov --output-path ./codecov.json -- --include-ignored --test-threads=1
+
+      - id: upload
+        name: Upload Coverage Report
+        uses: codecov/codecov-action@v5
+        with:
+          verbose: true
+          files: ${{ github.workspace }}/codecov.json
+          fail_ci_if_error: true
