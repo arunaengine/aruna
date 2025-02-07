@@ -16,6 +16,7 @@ use anyhow::Result;
 use aruna_rust_api::api::storage::models::v2::Hash;
 use aruna_rust_api::api::storage::models::v2::Hashalgorithm;
 use aruna_rust_api::api::storage::models::v2::Status;
+use aws_config::profile::parser;
 use base64::engine::general_purpose;
 use base64::Engine;
 use bytes::BufMut;
@@ -26,6 +27,7 @@ use http::HeaderValue;
 use md5::{Digest, Md5};
 use pithos_lib::helpers::footer_parser::Footer;
 use pithos_lib::helpers::footer_parser::FooterParser;
+use pithos_lib::helpers::footer_parser::FooterParserState;
 use pithos_lib::helpers::notifications::Message as PithosMessage;
 use pithos_lib::streamreadwrite::GenericStreamReadWriter;
 use pithos_lib::transformer::ReadWriter;
@@ -52,6 +54,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::pin;
+use tower::buffer;
 use tracing::debug;
 use tracing::error;
 use tracing::info_span;
@@ -547,8 +550,37 @@ impl S3 for ArunaS3Service {
                 s3_error!(InternalError, "Unable to parse footer")
             })?;
 
-            Some(parser.try_into().map_err(|_| {
-                error!(error = "Unable to convert footer");
+            if let FooterParserState::Missing(missing_bytes) = parser.state {
+                debug!(?missing_bytes, "Missing bytes in footer");
+                // Get the footer again with the missing bytes + one full chunk just to be sure
+                let buffer_size = ((65536 + 28) * 3) + missing_bytes;
+
+                let (footer_sender, footer_receiver) = async_channel::bounded(1000);
+                pin!(footer_receiver);
+                self.backend
+                    .get_object(
+                        location.clone(),
+                        Some(format!("bytes=-{}", buffer_size)),
+                        footer_sender,
+                    )
+                    .await
+                    .map_err(|_| {
+                        error!(error = "Unable to get encryption_footer");
+                        s3_error!(InternalError, "Unable to get encryption_footer")
+                    })?;
+                output = BytesMut::with_capacity(buffer_size);
+                while let Ok(Ok(bytes)) = footer_receiver.recv().await {
+                    output.put(bytes);
+                }
+                parser = FooterParser::new(&output).unwrap();
+                parser = parser.add_recipient(&key);
+                parser = parser.parse().map_err(|e| {
+                    error!(error = ?e, msg = "Unable to parse footer");
+                    s3_error!(InternalError, "Unable to parse footer")
+                })?;
+            }
+            Some(parser.try_into().map_err(|e| {
+                error!(?e, error = "Unable to convert footer");
                 s3_error!(InternalError, "Unable to convert footer")
             })?)
         } else {

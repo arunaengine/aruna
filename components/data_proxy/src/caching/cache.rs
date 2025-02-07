@@ -320,7 +320,7 @@ impl Cache {
         Ok((database, temp_locations))
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
+    #[tracing::instrument(level = "trace", skip(self, temp_locations))]
     pub async fn handle_temp_locations(
         &self,
         temp_locations: Vec<(Object, ObjectLocation)>,
