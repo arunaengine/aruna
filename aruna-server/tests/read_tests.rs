@@ -17,8 +17,8 @@ mod read_tests {
             CreateLicenseResponse, CreateProjectRequest as ModelsCreateProject,
             CreateProjectResponse, CreateResourceBatchRequest, CreateResourceBatchResponse,
             GetEventsResponse, GetGroupsFromUserResponse, GetRealmsFromUserResponse,
-            GetRelationsRequest, GetRelationsResponse, GetResourcesResponse,
-            GroupAccessRealmResponse, SearchResponse, UserAccessGroupResponse,
+            GetRelationsResponse, GetResourcesResponse, GroupAccessRealmResponse, SearchResponse,
+            UserAccessGroupResponse,
         },
     };
     use ulid::Ulid;
