@@ -15,7 +15,6 @@ mod read_tests {
             BatchResource, CreateGroupRequest as ModelsCreateGroupRequest, CreateGroupResponse as ModelsCreateGroupResponse, CreateLicenseRequest, CreateLicenseResponse, CreateProjectRequest as ModelsCreateProject, CreateProjectResponse, CreateResourceBatchRequest, CreateResourceBatchResponse, GetEventsResponse, GetGroupsFromUserResponse, GetRealmsFromUserResponse, GetRelationsRequest, GetRelationsResponse, GetResourcesResponse, GroupAccessRealmResponse, SearchResponse, UserAccessGroupResponse
         },
     };
-    use serde_json::json;
     use ulid::Ulid;
     pub const OFFSET: u16 = 100;
 
@@ -628,7 +627,7 @@ mod read_tests {
             node: Ulid::from_string(&parent_id).unwrap(),
             direction: aruna_server::models::requests::Direction::Outgoing,
             filter: vec![0],
-            offset: None,
+            last_entry: None,
             page_size: 1000,
         };
 
