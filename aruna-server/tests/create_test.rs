@@ -315,7 +315,6 @@ express Statement of Purpose.
             .resource
             .unwrap();
 
-
         assert_eq!(response.name, request.name);
         assert_eq!(response.visibility, 1);
         assert_eq!(response.title, request.title);

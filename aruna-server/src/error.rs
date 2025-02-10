@@ -122,6 +122,12 @@ impl From<bincode::Error> for ArunaError {
     }
 }
 
+impl From<base64::DecodeError> for ArunaError {
+    fn from(e: base64::DecodeError) -> Self {
+        ArunaError::DeserializeError(e.to_string())
+    }
+}
+
 impl From<std::io::Error> for ArunaError {
     fn from(e: std::io::Error) -> Self {
         ArunaError::IoError(e.to_string())

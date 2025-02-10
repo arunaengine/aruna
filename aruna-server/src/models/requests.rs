@@ -314,7 +314,7 @@ pub enum Direction {
 }
 
 fn default_page_size() -> usize {
-    100
+    1000
 }
 
 #[derive(
@@ -328,7 +328,7 @@ pub struct GetRelationsRequest {
     #[serde(default)]
     pub filter: Vec<u32>, // Filter with Strings for directions or idx for rel idx?
     #[serde(default)]
-    pub last_entry: Option<usize>, // usize
+    pub continuation_token: Option<String>, // usize
     #[serde(default = "default_page_size")]
     pub page_size: usize, // Max value 1000? Default 100
 }
@@ -336,8 +336,7 @@ pub struct GetRelationsRequest {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct GetRelationsResponse {
     pub relations: Vec<Relation>,
-    pub offset: Option<usize>,
-    pub total_hits: u32,
+    pub continuation_token: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]

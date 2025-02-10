@@ -12,7 +12,13 @@ mod read_tests {
     use aruna_server::models::{
         models::Permission,
         requests::{
-            BatchResource, CreateGroupRequest as ModelsCreateGroupRequest, CreateGroupResponse as ModelsCreateGroupResponse, CreateLicenseRequest, CreateLicenseResponse, CreateProjectRequest as ModelsCreateProject, CreateProjectResponse, CreateResourceBatchRequest, CreateResourceBatchResponse, GetEventsResponse, GetGroupsFromUserResponse, GetRealmsFromUserResponse, GetRelationsRequest, GetRelationsResponse, GetResourcesResponse, GroupAccessRealmResponse, SearchResponse, UserAccessGroupResponse
+            BatchResource, CreateGroupRequest as ModelsCreateGroupRequest,
+            CreateGroupResponse as ModelsCreateGroupResponse, CreateLicenseRequest,
+            CreateLicenseResponse, CreateProjectRequest as ModelsCreateProject,
+            CreateProjectResponse, CreateResourceBatchRequest, CreateResourceBatchResponse,
+            GetEventsResponse, GetGroupsFromUserResponse, GetRealmsFromUserResponse,
+            GetRelationsRequest, GetRelationsResponse, GetResourcesResponse,
+            GroupAccessRealmResponse, SearchResponse, UserAccessGroupResponse,
         },
     };
     use ulid::Ulid;
@@ -92,14 +98,14 @@ mod read_tests {
         let realm_id = Ulid::from_string(&response.realm.unwrap().id).unwrap();
         let group_id = Ulid::from_string(&response.admin_group_id).unwrap();
 
-
         let client = reqwest::Client::new();
         let url = format!("{}/api/v3/license", clients.rest_endpoint);
 
         let request = CreateLicenseRequest {
             name: "CC0".to_string(),
             description: "CC0 bla bla bla".to_string(),
-            license_terms: "Creative Commons Legal Code".to_string()};
+            license_terms: "Creative Commons Legal Code".to_string(),
+        };
 
         let response: CreateLicenseResponse = client
             .post(url)
@@ -116,7 +122,7 @@ mod read_tests {
             name: "test-project".to_string(),
             title: "This is a test title".to_string(),
             description: "This is a test project description".to_string(),
-            visibility: aruna_server::models::models::VisibilityClass::Private, 
+            visibility: aruna_server::models::models::VisibilityClass::Private,
             license_id: Some(response.license_id),
             group_id,
             realm_id,
@@ -602,7 +608,7 @@ mod read_tests {
             .id;
 
         let mut resources = Vec::new();
-        for i in 0..10 {
+        for i in 0..200 {
             // Create resource
             let request = GrpcCreateResourceRequest {
                 name: format!("TestResource{i}"),
@@ -623,21 +629,52 @@ mod read_tests {
             );
         }
 
-        let _get_relations = GetRelationsRequest {
-            node: Ulid::from_string(&parent_id).unwrap(),
-            direction: aruna_server::models::requests::Direction::Outgoing,
-            filter: vec![0],
-            last_entry: None,
-            page_size: 1000,
-        };
-
-        let _client = reqwest::Client::new();
-        let _url = format!(
+        let client = reqwest::Client::new();
+        let url = format!(
             "{}/api/v3/resources/{parent_id}/relations",
             clients.rest_endpoint
         );
 
-        // TODO: Test pagination, filters and permissions
+        let response: GetRelationsResponse = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", ADMIN_TOKEN))
+            .query(&[
+                ("node", parent_id.as_str()),
+                ("direction", "Outgoing"),
+                ("filter", "0"),
+                ("page_size", "70"),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(response.relations.len(), 70);
+        assert!(response.continuation_token.is_some());
+
+        let response: GetRelationsResponse = client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", ADMIN_TOKEN))
+            .query(&[
+                ("node", parent_id.as_str()),
+                ("direction", "Outgoing"),
+                ("filter", "0"),
+                ("page_size", "2000"),
+                (
+                    "continuation_token",
+                    response.continuation_token.unwrap().as_str(),
+                ),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(response.relations.len(), 130);
     }
 
     #[tokio::test(flavor = "multi_thread")]

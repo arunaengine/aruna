@@ -4,8 +4,8 @@ use crate::{
     logerr,
     models::models::{
         Component, EdgeType, GenericNode, Group, IssuerKey, IssuerType, License, MilliIdx, Node,
-        NodeVariant, Permission, RawRelation, Realm, Relation, RelationInfo, Resource, ServerState,
-        ServiceAccount, Subscriber, Token, User,
+        NodeVariant, Permission, RawRelation, Realm, Relation, RelationInfo, RelationRange,
+        Resource, ServerState, ServiceAccount, Subscriber, Token, User,
     },
     storage::{
         graph::load_graph,
@@ -328,7 +328,8 @@ impl Store {
             )
             .inspect_err(logerr!())?;
 
-        wtxn.add_edge(source.into(), target.into(), edge_type).inspect_err(logerr!())?;
+        wtxn.add_edge(source.into(), target.into(), edge_type)
+            .inspect_err(logerr!())?;
 
         Ok(())
     }
@@ -555,13 +556,12 @@ impl Store {
         idx: MilliIdx,
         filter: Option<&[EdgeType]>,
         direction: Direction,
-        range: Option<(u32, u32)>,
     ) -> Result<Vec<RawRelation>, ArunaError> {
         GraphTxn {
             state: self.graph.read().expect("Poisoned lock"),
             mode: Mode::ReadTxn,
         }
-        .get_relations(idx, filter, direction, range)
+        .get_relations(idx, filter, direction)
     }
 
     #[tracing::instrument(level = "trace", skip(self, txn))]
@@ -570,12 +570,11 @@ impl Store {
         idx: MilliIdx,
         filter: Option<&[EdgeType]>,
         direction: Direction,
-        range: Option<(u32, u32)>,
         txn: &impl Txn<'a>,
     ) -> Result<Vec<Relation>, ArunaError> {
         let graph_txn = txn.get_ro_graph();
 
-        let relations = graph_txn.get_relations(idx, filter, direction, range)?;
+        let relations = graph_txn.get_relations(idx, filter, direction)?;
 
         let mut result = Vec::new();
         for raw_relation in relations {
@@ -611,6 +610,56 @@ impl Store {
         }
 
         Ok(result)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, txn))]
+    pub fn get_relation_range<'a>(
+        &self,
+        idx: MilliIdx,
+        filter: Option<&[EdgeType]>,
+        direction: Direction,
+        range: RelationRange,
+        txn: &impl Txn<'a>,
+    ) -> Result<(Vec<Relation>, u32), ArunaError> {
+        let graph_txn = txn.get_ro_graph();
+
+        let (relations, last_entry) =
+            graph_txn.get_relation_range(idx, filter, direction, range)?;
+
+        let mut result = Vec::new();
+        for raw_relation in relations {
+            let relation = match direction {
+                Direction::Outgoing => Relation {
+                    from_id: self
+                        .get_ulid_from_idx(&raw_relation.source, txn)
+                        .ok_or_else(|| ArunaError::NotFound("Index not found".to_string()))?,
+                    to_id: self
+                        .get_ulid_from_idx(&raw_relation.target, txn)
+                        .ok_or_else(|| ArunaError::NotFound("Index not found".to_string()))?,
+                    relation_type: self
+                        .relation_infos
+                        .get(&txn.get_ro_txn(), &raw_relation.edge_type)?
+                        .ok_or_else(|| ArunaError::NotFound("Edge type not found".to_string()))?
+                        .forward_type,
+                },
+                Direction::Incoming => Relation {
+                    from_id: self
+                        .get_ulid_from_idx(&raw_relation.source, txn)
+                        .ok_or_else(|| ArunaError::NotFound("Index not found".to_string()))?,
+                    to_id: self
+                        .get_ulid_from_idx(&raw_relation.target, txn)
+                        .ok_or_else(|| ArunaError::NotFound("Index not found".to_string()))?,
+                    relation_type: self
+                        .relation_infos
+                        .get(&txn.get_ro_txn(), &raw_relation.edge_type)?
+                        .ok_or_else(|| ArunaError::NotFound("Edge type not found".to_string()))?
+                        .backward_type,
+                },
+            };
+            result.push(relation);
+        }
+
+        Ok((result, last_entry))
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

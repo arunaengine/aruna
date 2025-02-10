@@ -480,8 +480,7 @@ fn validate_subscriber_of(
             token_id,
             ..
         } => {
-            let token =
-                store.get_token(&service_account_id, *token_id, &txn)?;
+            let token = store.get_token(&service_account_id, *token_id, &txn)?;
             match token.scope {
                 Scope::Personal => Ok(()),
                 _ => Err(ArunaError::Forbidden("Invalid scope".to_string())),

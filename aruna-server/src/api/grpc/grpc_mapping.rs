@@ -523,7 +523,7 @@ impl TryFrom<grpc::GetRelationsRequest> for requests::GetRelationsRequest {
                 requests::Direction::Outgoing
             },
             filter: value.filter,
-            last_entry: Some(value.offset as usize),
+            continuation_token: todo!(),
             page_size: value.page_size as usize,
         })
     }
@@ -533,7 +533,7 @@ impl From<requests::GetRelationsResponse> for grpc::GetRelationsResponse {
     fn from(value: requests::GetRelationsResponse) -> Self {
         Self {
             relations: value.relations.into_iter().map(|r| r.into()).collect(),
-            offset: value.offset.map(|v| v as u64),
+            offset: todo!(),
         }
     }
 }

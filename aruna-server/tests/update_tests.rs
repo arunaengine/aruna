@@ -6,9 +6,18 @@ mod update_tests {
     use aruna_rust_api::v3::aruna::api::v3::{
         Author, CreateProjectRequest, CreateRealmRequest, CreateResourceRequest, KeyValue, Realm,
     };
-    use aruna_server::models::models::{Author as ModelAuthor, KeyValue as ModelKeyValue, Permission};
+    use aruna_server::models::models::{
+        Author as ModelAuthor, KeyValue as ModelKeyValue, Permission,
+    };
     use aruna_server::models::requests::{
-        AddUserResponse, GetGroupsFromUserResponse, UpdateResourceAuthorsRequest, UpdateResourceAuthorsResponse, UpdateResourceDescriptionRequest, UpdateResourceDescriptionResponse, UpdateResourceIdentifiersRequest, UpdateResourceIdentifiersResponse, UpdateResourceLabelsRequest, UpdateResourceLabelsResponse, UpdateResourceLicenseRequest, UpdateResourceLicenseResponse, UpdateResourceNameRequest, UpdateResourceNameResponse, UpdateResourceTitleRequest, UpdateResourceTitleResponse, UpdateResourceVisibilityRequest, UpdateResourceVisibilityResponse
+        AddUserResponse, GetGroupsFromUserResponse, UpdateResourceAuthorsRequest,
+        UpdateResourceAuthorsResponse, UpdateResourceDescriptionRequest,
+        UpdateResourceDescriptionResponse, UpdateResourceIdentifiersRequest,
+        UpdateResourceIdentifiersResponse, UpdateResourceLabelsRequest,
+        UpdateResourceLabelsResponse, UpdateResourceLicenseRequest, UpdateResourceLicenseResponse,
+        UpdateResourceNameRequest, UpdateResourceNameResponse, UpdateResourceTitleRequest,
+        UpdateResourceTitleResponse, UpdateResourceVisibilityRequest,
+        UpdateResourceVisibilityResponse,
     };
     use ulid::Ulid;
 
@@ -326,6 +335,9 @@ mod update_tests {
             .await
             .unwrap();
 
-        assert!(groups.groups.iter().any(|(g,perm)| g.id == group_id && perm == &Permission::Read));
+        assert!(groups
+            .groups
+            .iter()
+            .any(|(g, perm)| g.id == group_id && perm == &Permission::Read));
     }
 }

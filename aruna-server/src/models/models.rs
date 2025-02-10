@@ -676,6 +676,27 @@ pub struct RawRelation {
     pub edge_type: EdgeType,
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct RelationRange {
+    pub last_entry: Option<u32>,
+    pub page_size: u32,
+}
+
+impl Default for RelationRange {
+    fn default() -> Self {
+        RelationRange {
+            last_entry: None,
+            page_size: 1000,
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ContinuationToken {
+    pub last_incoming: Option<u32>,
+    pub last_outgoing: Option<u32>,
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct ServerInfo {
     pub node_id: Ulid,

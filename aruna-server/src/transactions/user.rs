@@ -339,7 +339,6 @@ impl Request for GetGroupsFromUserRequest {
                 user_idx,
                 Some(&filter),
                 petgraph::Direction::Outgoing,
-                None,
                 &rtxn,
             )?;
             for relation in &relations {

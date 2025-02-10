@@ -6,7 +6,11 @@ use crate::{
     constants::relation_types::{
         self, DEFAULT, GROUP_ADMINISTRATES_REALM, GROUP_PART_OF_REALM, OWNED_BY_USER,
         PERMISSION_READ, REALM_USES_COMPONENT, SHARES_PERMISSION,
-    }, context::Context, error::ArunaError, logerr, models::{
+    },
+    context::Context,
+    error::ArunaError,
+    logerr,
+    models::{
         models::{Component, Group, MilliIdx, NodeVariant, Realm},
         requests::{
             AddComponentToRealmRequest, AddComponentToRealmResponse, AddGroupRequest,
@@ -14,7 +18,9 @@ use crate::{
             GetGroupsFromRealmResponse, GetRealmComponentsRequest, GetRealmComponentsResponse,
             GetRealmRequest, GetRealmResponse, GroupAccessRealmRequest, GroupAccessRealmResponse,
         },
-    }, storage::txns::Txn, transactions::request::SerializedResponse
+    },
+    storage::txns::Txn,
+    transactions::request::SerializedResponse,
 };
 use petgraph::Direction::{self, Outgoing};
 use serde::{Deserialize, Serialize};
@@ -137,8 +143,16 @@ impl WriteRequest for CreateRealmRequestTx {
                 relation_types::GROUP_ADMINISTRATES_REALM,
             )?;
 
-            store.add_read_permission_universe(&mut wtxn, group_idx.0, &[realm_idx.0, group_idx.0])?;
-            store.add_read_permission_universe(&mut wtxn, realm_idx.0, &[realm_idx.0, group_idx.0])?;
+            store.add_read_permission_universe(
+                &mut wtxn,
+                group_idx.0,
+                &[realm_idx.0, group_idx.0],
+            )?;
+            store.add_read_permission_universe(
+                &mut wtxn,
+                realm_idx.0,
+                &[realm_idx.0, group_idx.0],
+            )?;
 
             // Affected nodes: User, Realm and Group
 
@@ -323,7 +337,6 @@ impl Request for GetGroupsFromRealmRequest {
                     realm_idx,
                     Some(&[GROUP_PART_OF_REALM]),
                     Direction::Incoming,
-                    None,
                     &rtxn,
                 )?
                 .into_iter()
@@ -383,7 +396,6 @@ impl Request for GetRealmComponentsRequest {
                 realm_idx,
                 Some(&[REALM_USES_COMPONENT]),
                 Direction::Outgoing,
-                None,
                 &read_txn,
             )?;
 
@@ -498,13 +510,10 @@ impl WriteRequest for AddComponentToRealmRequestTx {
                 .get_node::<Component>(&wtxn, component_idx)
                 .ok_or_else(|| ArunaError::NotFound(component_id.to_string()))?;
 
-
             if !component.public
-                && !wtxn.get_ro_graph().has_relation(
-                    component_idx,
-                    user_idx,
-                    &[OWNED_BY_USER],
-                )?
+                && !wtxn
+                    .get_ro_graph()
+                    .has_relation(component_idx, user_idx, &[OWNED_BY_USER])?
             {
                 error!("User does not own component");
                 return Err(ArunaError::Unauthorized);
@@ -518,12 +527,11 @@ impl WriteRequest for AddComponentToRealmRequestTx {
                 relation_types::REALM_USES_COMPONENT,
             )?;
 
-            if !wtxn.get_ro_graph().get_relations(realm_idx, Some(&[DEFAULT]), Outgoing, None)?
+            if !wtxn
+                .get_ro_graph()
+                .get_relations(realm_idx, Some(&[DEFAULT]), Outgoing)?
                 .iter()
-                .any(|r| {
-                    wtxn.get_ro_graph().node_weight(r.target)
-                        == Some(NodeVariant::Component)
-                })
+                .any(|r| wtxn.get_ro_graph().node_weight(r.target) == Some(NodeVariant::Component))
             {
                 store.create_relation(&mut wtxn, realm_idx, component_idx, DEFAULT)?;
                 // TODO: Update all projects + resources to
@@ -624,14 +632,13 @@ impl WriteRequest for GroupAccessRealmTx {
                     realm_idx,
                     Some(&[GROUP_ADMINISTRATES_REALM]),
                     Direction::Incoming,
-                    None,
                 )?
                 .iter()
                 .map(|rel| rel.source)
                 .collect::<Vec<MilliIdx>>();
             for admin_group in relations {
                 let users = &store
-                    .get_raw_relations(admin_group, Some(&filter), Direction::Incoming, None)?
+                    .get_raw_relations(admin_group, Some(&filter), Direction::Incoming)?
                     .iter()
                     .map(|rel| rel.source)
                     .collect::<Vec<MilliIdx>>();

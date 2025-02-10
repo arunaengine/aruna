@@ -296,7 +296,7 @@ impl Request for GetUsersFromGroupRequest {
 
             let mut users = Vec::new();
             for source in store
-                .get_relations(idx, Some(&filter), petgraph::Direction::Incoming, None, &rtxn)?
+                .get_relations(idx, Some(&filter), petgraph::Direction::Incoming, &rtxn)?
                 .into_iter()
                 .map(|r| r.from_id)
             {
@@ -392,7 +392,7 @@ impl WriteRequest for UserAccessGroupTx {
             let filter = (PERMISSION_READ..=PERMISSION_ADMIN).collect::<Vec<u32>>();
             affected.extend(
                 store
-                    .get_raw_relations(group_idx, Some(&filter), Direction::Incoming, None)?
+                    .get_raw_relations(group_idx, Some(&filter), Direction::Incoming)?
                     .iter()
                     .map(|rel| rel.source)
                     .collect::<Vec<MilliIdx>>(),

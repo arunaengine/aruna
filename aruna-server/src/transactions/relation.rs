@@ -1,3 +1,4 @@
+use base64::{prelude::BASE64_STANDARD, Engine};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -6,7 +7,7 @@ use crate::{
     context::Context,
     error::ArunaError,
     models::{
-        models::{RelationInfo, Resource},
+        models::{ContinuationToken, RelationInfo, RelationRange, Resource},
         requests::{
             CreateRelationRequest, CreateRelationResponse, CreateRelationVariantRequest,
             CreateRelationVariantResponse, Direction, GetRelationInfosRequest,
@@ -82,12 +83,11 @@ impl Request for GetRelationsRequest {
                 }
             }
 
-            let offset = self.last_entry.unwrap_or_default() as u32;
-            let page_limit = if self.page_size > 1500 {
-                1500u32
-            } else {
-                self.page_size as u32
+            let continuation_idx: Option<ContinuationToken> = match self.continuation_token {
+                Some(token) => Some(bincode::deserialize(&BASE64_STANDARD.decode(token)?)?),
+                None => None,
             };
+            let page_limit = self.page_size;
 
             let filter: Option<&[u32]> = if self.filter.is_empty() {
                 None
@@ -95,51 +95,142 @@ impl Request for GetRelationsRequest {
                 Some(&self.filter)
             };
 
-            let relations = match self.direction {
-                Direction::Incoming => store.get_relations(
-                    idx,
-                    filter,
-                    petgraph::Direction::Incoming,
-                    Some((offset, page_limit)),
-                    &rtxn,
-                )?,
-                Direction::Outgoing => store.get_relations(
-                    idx,
-                    filter,
-                    petgraph::Direction::Outgoing,
-                    Some((offset, page_limit)),
-                    &rtxn,
-                )?,
-                Direction::All => {
-                    let mut relations = store.get_relations(
+            let (relations, token) = match self.direction {
+                Direction::Incoming => {
+                    let range = match continuation_idx {
+                        Some(ContinuationToken {
+                            last_incoming: Some(last_entry),
+                            ..
+                        }) => RelationRange {
+                            last_entry: Some(last_entry),
+                            page_size: page_limit as u32,
+                        },
+                        None => RelationRange {
+                            last_entry: None,
+                            page_size: page_limit as u32,
+                        },
+                        _ => {
+                            tracing::error!("Invalid ContinuationToken");
+                            RelationRange {
+                                last_entry: None,
+                                page_size: page_limit as u32,
+                            }
+                        }
+                    };
+                    let (relations, last_entry) = store.get_relation_range(
                         idx,
                         filter,
                         petgraph::Direction::Incoming,
-                        Some((offset, page_limit)),
+                        range,
                         &rtxn,
                     )?;
-                    relations.extend(store.get_relations(
+                    let token = ContinuationToken {
+                        last_incoming: Some(last_entry),
+                        last_outgoing: None,
+                    };
+                    (relations, token)
+                }
+                Direction::Outgoing => {
+                    let range = match continuation_idx {
+                        Some(ContinuationToken {
+                            last_outgoing: Some(last_entry),
+                            ..
+                        }) => RelationRange {
+                            last_entry: Some(last_entry),
+                            page_size: page_limit as u32,
+                        },
+                        None => RelationRange {
+                            last_entry: None,
+                            page_size: page_limit as u32,
+                        },
+                        _ => {
+                            tracing::error!("Invalid ContinuationToken");
+                            RelationRange {
+                                last_entry: None,
+                                page_size: page_limit as u32,
+                            }
+                        }
+                    };
+                    let (relations, last_entry) = store.get_relation_range(
                         idx,
                         filter,
                         petgraph::Direction::Outgoing,
-                        Some((offset, page_limit)),
+                        range,
                         &rtxn,
-                    )?);
-                    relations
+                    )?;
+
+                    let token = ContinuationToken {
+                        last_incoming: None,
+                        last_outgoing: Some(last_entry),
+                    };
+                    (relations, token)
+                }
+                Direction::All => {
+                    let (in_range, out_range) = match continuation_idx {
+                        Some(ContinuationToken {
+                            last_outgoing: Some(last_out),
+                            last_incoming: Some(last_in),
+                        }) => (
+                            RelationRange {
+                                last_entry: Some(last_in),
+                                page_size: page_limit as u32,
+                            },
+                            RelationRange {
+                                last_entry: Some(last_out),
+                                page_size: page_limit as u32,
+                            },
+                        ),
+                        None => {
+                            let range = RelationRange {
+                                last_entry: None,
+                                page_size: page_limit as u32,
+                            };
+                            (range.clone(), range)
+                        }
+                        _ => {
+                            tracing::error!("Invalid ContinuationToken");
+                            let range = RelationRange {
+                                last_entry: None,
+                                page_size: page_limit as u32,
+                            };
+                            (range.clone(), range)
+                        }
+                    };
+                    let (mut relations, incoming_last_entry) = store.get_relation_range(
+                        idx,
+                        filter,
+                        petgraph::Direction::Incoming,
+                        in_range,
+                        &rtxn,
+                    )?;
+                    let (outgoing_relations, outgoing_last_entry) = store.get_relation_range(
+                        idx,
+                        filter,
+                        petgraph::Direction::Outgoing,
+                        out_range,
+                        &rtxn,
+                    )?;
+                    relations.extend(outgoing_relations);
+                    (
+                        relations,
+                        ContinuationToken {
+                            last_incoming: Some(incoming_last_entry),
+                            last_outgoing: Some(outgoing_last_entry),
+                        },
+                    )
                 }
             };
-            let total_hits = relations.len() as u32;
 
-            let new_offset = if relations.len() < offset as usize + self.page_size {
+            let continuation_token = if relations.len() < page_limit {
                 None
             } else {
-                Some(offset as usize + self.page_size)
+                let token = BASE64_STANDARD.encode(bincode::serialize(&token)?);
+                Some(token)
             };
 
             Ok::<_, ArunaError>(GetRelationsResponse {
                 relations,
-                offset: new_offset,
-                total_hits,
+                continuation_token,
             })
         })
         .await
