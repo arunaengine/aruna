@@ -109,7 +109,7 @@ impl Controller {
             .await?
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
+    #[tracing::instrument(level = "trace", skip(self, request))]
     pub(crate) async fn request<R: Request>(
         &self,
         request: R,

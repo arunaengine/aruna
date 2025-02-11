@@ -581,7 +581,7 @@ impl Request for CreateResourceBatchRequest {
             created_at: Utc::now().timestamp_millis(),
         };
 
-        let response = controller.transaction(Ulid::new().0, &request_tx).await?;
+        let response = controller.transaction(Ulid::new().0, &request_tx).await.inspect_err(logerr!())?;
 
         Ok(bincode::deserialize(&response).inspect_err(logerr!())?)
     }
@@ -763,7 +763,7 @@ impl WriteRequest for CreateResourceBatchRequestTx {
             }
 
             let resource_idx =
-                store.create_nodes_batch(&mut wtxn, to_create.iter().map(|e| &e.0).collect())?;
+                store.create_nodes_batch(&mut wtxn, to_create.iter().map(|e| &e.0).collect()).inspect_err(logerr!())?;
 
             let mut affected = vec![];
             for (resource, parent_id) in &to_create {
@@ -804,7 +804,7 @@ impl WriteRequest for CreateResourceBatchRequestTx {
         .map_err(|_e| {
             tracing::error!("Failed to join task");
             ArunaError::ServerError("".to_string())
-        })??)
+        }).inspect_err(logerr!())?.inspect_err(logerr!())?)
     }
 }
 

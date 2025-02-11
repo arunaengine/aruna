@@ -134,7 +134,7 @@ impl Store {
 
         let mut env_options = EnvOpenOptions::new();
         unsafe { env_options.flags(EnvFlags::MAP_ASYNC | EnvFlags::WRITE_MAP) };
-        env_options.map_size(10 * 1024 * 1024 * 1024); // 1GB
+        env_options.map_size(1024 * 1024 * 1024 * 1024); // 1 TB
 
         let milli_index = Index::new(env_options, path, true).inspect_err(logerr!())?;
 

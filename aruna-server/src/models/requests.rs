@@ -330,7 +330,9 @@ pub struct GetRelationsRequest {
     #[serde(default)]
     pub continuation_token: Option<String>, // usize
     #[serde(default = "default_page_size")]
-    pub page_size: usize, // Max value 1000? Default 100
+    pub page_size: usize, 
+    // Default 1000,
+    // If Direction::All -> Applied for each direction
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
