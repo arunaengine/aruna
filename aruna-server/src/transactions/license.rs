@@ -112,7 +112,7 @@ impl Request for GetLicenseRequest {
             let license = store.get_node::<License>(&rtxn, node_idx).ok_or_else(|| {
                 ArunaError::NotFound(format!("License with id {} not found", id.to_string()))
             })?;
-
+            rtxn.commit()?;
             Ok(GetLicenseResponse { license })
         })
         .await
@@ -142,6 +142,7 @@ impl Request for GetLicensesRequest {
             let universe = store.get_public_universe(&rtxn)?;
             let (_, result) =
                 store.search("".to_string(), 0, 10000, Some("variant=8"), &rtxn, universe)?;
+            rtxn.commit()?;
             let result = result
                 .into_iter()
                 .filter_map(|val| match val {

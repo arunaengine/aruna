@@ -291,6 +291,8 @@ impl Request for GetRealmRequest {
                 .get_node::<Realm>(&rtxn, realm_idx)
                 .ok_or_else(|| ArunaError::NotFound(self.id.to_string()))?;
 
+            rtxn.commit()?;
+
             Ok::<_, ArunaError>(GetRealmResponse { realm })
         })
         .await
@@ -413,6 +415,8 @@ impl Request for GetRealmComponentsRequest {
                     .expect("Database error: Store/Graph idx mismatch");
                 components.push(component);
             }
+
+            read_txn.commit()?;
 
             Ok::<GetRealmComponentsResponse, ArunaError>(GetRealmComponentsResponse { components })
         })

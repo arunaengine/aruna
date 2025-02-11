@@ -73,6 +73,8 @@ impl Request for CreateProjectRequest {
             (self.group_id, self.realm_id) = tokio::task::spawn_blocking(move || {
                 let rtxn = store.read_txn()?;
                 let token = store.get_token(&user_id, token_idx, &rtxn)?;
+
+                rtxn.commit()?;
                 Ok::<_, ArunaError>((
                     token
                         .default_group
@@ -882,6 +884,7 @@ impl Request for GetResourcesRequest {
                 }
                 resources.push(resource);
             }
+            rtxn.commit()?;
             Ok::<_, ArunaError>(GetResourcesResponse { resources })
         })
         .await
@@ -1292,6 +1295,8 @@ impl Request for AuthorizeRequest {
                 let Some(node) = store.get_node::<Resource>(&rtxn, idx) else {
                     return Err(ArunaError::NotFound(format!("{id} not found")));
                 };
+
+                rtxn.commit()?;
                 Ok::<bool, ArunaError>(matches!(node.visibility, VisibilityClass::Public))
             })
             .await

@@ -282,12 +282,13 @@ impl Request for GetUserRequest {
             let idx = store
                 .get_idx_from_ulid(&requester_ulid, &rtxn)
                 .ok_or_else(|| ArunaError::NotFound("Requester not found".to_string()))?;
-
-            Ok::<GetUserResponse, ArunaError>(GetUserResponse {
+            let response = GetUserResponse {
                 user: store
                     .get_node::<User>(&rtxn, idx)
                     .ok_or_else(|| ArunaError::NotFound("User not found".to_string()))?,
-            })
+            };
+            rtxn.commit()?;
+            Ok::<GetUserResponse, ArunaError>(response)
         })
         .await
         .map_err(|_e| {
@@ -377,6 +378,7 @@ impl Request for GetGroupsFromUserRequest {
                     groups.push((group, perm));
                 }
             }
+            rtxn.commit()?;
             Ok::<GetGroupsFromUserResponse, ArunaError>(GetGroupsFromUserResponse { groups })
         })
         .await
@@ -419,6 +421,8 @@ impl Request for GetRealmsFromUserRequest {
         tokio::task::spawn_blocking(move || {
             let read_txn = store.read_txn()?;
             let realms = store.get_realms_for_user(&read_txn, requester_id)?;
+
+            read_txn.commit()?;
             Ok::<GetRealmsFromUserResponse, ArunaError>(GetRealmsFromUserResponse { realms })
         })
         .await
@@ -465,6 +469,8 @@ impl Request for GetTokensRequest {
             let rtxn = store.read_txn()?;
 
             let tokens = store.get_tokens(&rtxn, &requester_ulid)?;
+
+            rtxn.commit()?;
 
             let tokens = tokens
                 .into_iter()
@@ -684,6 +690,8 @@ impl Request for GetS3CredentialsRequest {
             let rtxn = store.read_txn()?;
 
             let tokens = store.get_tokens(&rtxn, &requester_ulid)?;
+
+            rtxn.commit()?;
 
             let tokens = tokens
                 .into_iter()

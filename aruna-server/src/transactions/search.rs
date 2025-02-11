@@ -66,6 +66,8 @@ impl Request for SearchRequest {
             let (expected_hits, result) =
                 store.search(query, offset, limit, filter.as_deref(), &rtxn, universe)?;
 
+            rtxn.commit()?;
+
             Ok(SearchResponse {
                 expected_hits,
                 resources: result,

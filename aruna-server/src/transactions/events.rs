@@ -80,6 +80,10 @@ impl Request for GetEventsRequest {
                 events.push(value);
             }
 
+            // TODO: This should not stay this way, but is okay for now, 
+            // as long as no subscriber events are acknowledged
+            wtxn.commit(Ulid::new().into(), &[], &[])?;
+
             Ok::<_, ArunaError>(GetEventsResponse { events })
         })
         .await

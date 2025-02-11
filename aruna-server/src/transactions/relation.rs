@@ -221,6 +221,7 @@ impl Request for GetRelationsRequest {
                     )
                 }
             };
+            rtxn.commit()?;
 
             let continuation_token = if relations.len() < page_limit {
                 None
@@ -266,6 +267,7 @@ impl Request for GetRelationInfosRequest {
         tokio::task::spawn_blocking(move || {
             let rtxn = store.read_txn()?;
             let relation_infos = store.get_relation_infos(&rtxn)?;
+            rtxn.commit()?;
             Ok::<_, ArunaError>(GetRelationInfosResponse { relation_infos })
         })
         .await
