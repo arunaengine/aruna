@@ -142,13 +142,10 @@ impl GraphTxn<'_> {
         let mut slice = Vec::new();
         let mut edge = match last_entry {
             Some(idx) => idx.into(),
-            None => self
-                .state
-                .graph
-                .edges(graph_idx.into())
-                .next()
-                .ok_or_else(|| ArunaError::GraphError("EdgeIndex not found".to_string()))?
-                .id(),
+            None => match self.state.graph.edges(graph_idx.into()).next() {
+                Some(idx) => idx.id(),
+                None => return Ok((vec![], 0)),
+            },
         };
         for _ in 0..page_size {
             let edge_weight = match self.state.graph.edge_weight(edge) {

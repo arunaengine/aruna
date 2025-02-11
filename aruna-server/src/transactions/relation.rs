@@ -6,6 +6,7 @@ use crate::{
     constants::relation_types,
     context::Context,
     error::ArunaError,
+    logerr,
     models::{
         models::{ContinuationToken, RelationInfo, RelationRange, Resource},
         requests::{
@@ -234,7 +235,9 @@ impl Request for GetRelationsRequest {
             })
         })
         .await
-        .map_err(|e| ArunaError::ServerError(e.to_string()))??;
+        .map_err(|e| ArunaError::ServerError(e.to_string()))
+        .inspect_err(logerr!())?
+        .inspect_err(logerr!())?;
 
         Ok(response)
     }
