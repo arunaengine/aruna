@@ -21,6 +21,7 @@ impl Request for CreateComponentRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -56,6 +57,8 @@ pub struct CreateComponentRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateComponentRequestTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,

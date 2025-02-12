@@ -275,6 +275,8 @@ async fn init_testing_server(offset: u16) -> (u16, u16, Arc<Notify>) {
                 socket_addr: SocketAddr::from_str(&socket_addr).unwrap(),
                 init_node: None,
                 issuer_config: None,
+                opentelemetry_name: "aruna-test".to_string(),
+                opentelemetry_endpoint: "http://localhost:4317".to_string()
             },
             Some(notify_clone),
         )

@@ -32,6 +32,7 @@ impl Request for CreateGroupRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -69,6 +70,8 @@ pub struct CreateGroupRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateGroupRequestTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -131,6 +134,7 @@ impl Request for GetGroupRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -178,6 +182,7 @@ impl Request for AddUserRequest {
             source: self.group_id,
         }
     }
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -215,6 +220,8 @@ pub struct AddUserRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for AddUserRequestTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -271,6 +278,7 @@ impl Request for GetUsersFromGroupRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -329,6 +337,7 @@ impl Request for UserAccessGroupRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -364,6 +373,8 @@ pub struct UserAccessGroupTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for UserAccessGroupTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,

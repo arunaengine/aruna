@@ -29,6 +29,7 @@ impl Request for GetRelationsRequest {
         Context::InRequest
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -250,6 +251,7 @@ impl Request for GetRelationInfosRequest {
         Context::Public
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -286,6 +288,7 @@ impl Request for CreateRelationRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -319,6 +322,7 @@ pub struct CreateRelationTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateRelationTx {
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -374,6 +378,7 @@ impl Request for CreateRelationVariantRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -405,6 +410,7 @@ pub struct CreateRelationVariantTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateRelationVariantTx {
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,

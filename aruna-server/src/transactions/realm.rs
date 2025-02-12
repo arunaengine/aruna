@@ -33,6 +33,7 @@ impl Request for CreateRealmRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -75,6 +76,7 @@ pub struct CreateRealmRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateRealmRequestTx {
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -180,6 +182,7 @@ impl Request for AddGroupRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -213,6 +216,8 @@ pub struct AddGroupRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for AddGroupRequestTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -265,6 +270,7 @@ impl Request for GetRealmRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -311,6 +317,7 @@ impl Request for GetGroupsFromRealmRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -374,6 +381,7 @@ impl Request for GetRealmComponentsRequest {
         Context::Public
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -437,6 +445,7 @@ impl Request for AddComponentToRealmRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -470,6 +479,7 @@ pub struct AddComponentToRealmRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for AddComponentToRealmRequestTx {
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -565,6 +575,7 @@ impl Request for GroupAccessRealmRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -600,6 +611,8 @@ pub struct GroupAccessRealmTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for GroupAccessRealmTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,

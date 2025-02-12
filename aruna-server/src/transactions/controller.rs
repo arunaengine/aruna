@@ -86,6 +86,7 @@ impl Controller {
         self.store.clone()
     }
 
+    #[tracing::instrument(level = "trace", skip(self, transaction))]
     pub async fn transaction<R: WriteRequest>(
         &self,
         transaction_id: u128,
@@ -121,6 +122,7 @@ impl Controller {
         request.run_request(requester, self).await
     }
 
+    #[tracing::instrument(level = "trace", skip(self, transaction))]
     pub async fn process_transaction(
         &self,
         id: u128,

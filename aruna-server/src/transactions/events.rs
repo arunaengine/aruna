@@ -18,6 +18,7 @@ impl Request for GetEventsRequest {
         Context::SubscriberOwnerOf(self.subscriber_id)
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -50,6 +51,10 @@ impl Request for GetEventsRequest {
                     ArunaError::ServerError("Error getting events".to_string())
                 })?;
 
+            // TODO: This should not stay this way, but is okay for now,
+            // as long as no subscriber events are acknowledged
+            wtxn.commit(Ulid::new().into(), &[], &[])?;
+
             let mut events = vec![];
             for event in event_ids.iter() {
                 let event = node.get_event_by_id(*event).ok_or_else(|| {
@@ -79,10 +84,6 @@ impl Request for GetEventsRequest {
                 value.insert(Ulid::from(id).to_string(), json_event);
                 events.push(value);
             }
-
-            // TODO: This should not stay this way, but is okay for now, 
-            // as long as no subscriber events are acknowledged
-            wtxn.commit(Ulid::new().into(), &[], &[])?;
 
             Ok::<_, ArunaError>(GetEventsResponse { events })
         })

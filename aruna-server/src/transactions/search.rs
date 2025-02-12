@@ -16,6 +16,7 @@ impl Request for SearchRequest {
         Context::Public
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,

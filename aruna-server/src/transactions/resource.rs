@@ -51,6 +51,7 @@ impl Request for CreateProjectRequest {
         Context::InRequest
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         mut self,
         requester: Option<Requester>,
@@ -135,6 +136,7 @@ pub struct CreateProjectRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateProjectRequestTx {
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -350,6 +352,7 @@ impl Request for CreateResourceRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -389,6 +392,8 @@ pub struct CreateResourceRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateResourceRequestTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -557,6 +562,7 @@ impl Request for CreateResourceBatchRequest {
         )
     }
 
+    #[tracing::instrument(level = "trace", skip(self, controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -583,7 +589,10 @@ impl Request for CreateResourceBatchRequest {
             created_at: Utc::now().timestamp_millis(),
         };
 
-        let response = controller.transaction(Ulid::new().0, &request_tx).await.inspect_err(logerr!())?;
+        let response = controller
+            .transaction(Ulid::new().0, &request_tx)
+            .await
+            .inspect_err(logerr!())?;
 
         Ok(bincode::deserialize(&response).inspect_err(logerr!())?)
     }
@@ -600,12 +609,13 @@ pub struct CreateResourceBatchRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateResourceBatchRequestTx {
+    #[tracing::instrument(level = "trace", skip(self, controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
-        info!("Executing CreateResourceRequestTx");
+        info!("Executing CreateResourceBatchRequestTx");
 
         controller.authorize(&self.requester, &self.req).await?;
 
@@ -764,8 +774,9 @@ impl WriteRequest for CreateResourceBatchRequestTx {
                 to_create.push((resource, parent_id));
             }
 
-            let resource_idx =
-                store.create_nodes_batch(&mut wtxn, to_create.iter().map(|e| &e.0).collect()).inspect_err(logerr!())?;
+            let resource_idx = store
+                .create_nodes_batch(&mut wtxn, to_create.iter().map(|e| &e.0).collect())
+                .inspect_err(logerr!())?;
 
             let mut affected = vec![];
             for (resource, parent_id) in &to_create {
@@ -806,7 +817,9 @@ impl WriteRequest for CreateResourceBatchRequestTx {
         .map_err(|_e| {
             tracing::error!("Failed to join task");
             ArunaError::ServerError("".to_string())
-        }).inspect_err(logerr!())?.inspect_err(logerr!())?)
+        })
+        .inspect_err(logerr!())?
+        .inspect_err(logerr!())?)
     }
 }
 
@@ -825,6 +838,7 @@ impl Request for GetResourcesRequest {
         // )
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -903,6 +917,7 @@ impl Request for ResourceUpdateRequests {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -929,6 +944,8 @@ pub struct UpdateResourceTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for UpdateResourceTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -1160,6 +1177,7 @@ impl Request for RegisterDataRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -1187,6 +1205,7 @@ pub struct RegisterDataRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for RegisterDataRequestTx {
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -1277,6 +1296,7 @@ impl Request for AuthorizeRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -1318,6 +1338,7 @@ impl Request for DeleteRequest {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -1346,6 +1367,7 @@ pub struct DeleteTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for DeleteTx {
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,

@@ -23,6 +23,7 @@ impl Request for CreateLicenseRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -52,6 +53,8 @@ pub struct CreateLicenseRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateLicenseRequestTx {
+
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -96,6 +99,7 @@ impl Request for GetLicenseRequest {
         Context::Public
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         _requester: Option<Requester>,
@@ -129,6 +133,7 @@ impl Request for GetLicensesRequest {
         Context::Public
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         _requester: Option<Requester>,

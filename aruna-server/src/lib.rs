@@ -40,6 +40,8 @@ pub struct Config {
     pub key_config: (u32, String, String),
     pub socket_addr: SocketAddr,
     pub issuer_config: Option<(String, String, String)>,
+    pub opentelemetry_name: String,
+    pub opentelemetry_endpoint: String,
 }
 
 pub fn config_from_env() -> Config {
@@ -48,6 +50,8 @@ pub fn config_from_env() -> Config {
         dotenvy::from_filename_override(file).unwrap();
     }
 
+    let opentelemetry_name = dotenvy::var("OTEL_SERVICE_NAME").unwrap();
+    let opentelemetry_endpoint = dotenvy::var("OTEL_ENDPOINT").unwrap();
     let node_id = Ulid::from_string(&dotenvy::var("NODE_ID").unwrap()).unwrap();
     let grpc_port = dotenvy::var("GRPC_PORT").unwrap().parse::<u16>().unwrap();
     let grpc_port_consensus = dotenvy::var("GRPC_PORT_CONSENSUS")
@@ -85,6 +89,8 @@ pub fn config_from_env() -> Config {
         key_config,
         socket_addr,
         issuer_config,
+        opentelemetry_name,
+        opentelemetry_endpoint,
     }
 }
 
@@ -100,6 +106,7 @@ pub async fn start_server(
         rest_port,
         init_node,
         issuer_config,
+        ..
     }: Config,
     notify: Option<Arc<Notify>>,
 ) -> Result<(), ArunaError> {

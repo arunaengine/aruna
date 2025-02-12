@@ -142,6 +142,7 @@ impl Request for CreateTokenRequest {
         Context::Public
     }
 
+    #[tracing::instrument(level = "trace", skip(self, controller))]
     async fn run_request(
         mut self,
         requester: Option<Requester>,
@@ -181,6 +182,7 @@ pub struct CreateTokenRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateTokenRequestTx {
+    #[tracing::instrument(level = "trace", skip(self, controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -251,6 +253,7 @@ impl Request for GetUserRequest {
         Context::NotRegistered
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -305,6 +308,7 @@ impl Request for GetGroupsFromUserRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -396,6 +400,7 @@ impl Request for GetRealmsFromUserRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -440,6 +445,7 @@ impl Request for GetTokensRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,
@@ -500,6 +506,7 @@ impl Request for CreateS3CredentialsRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         mut self,
         requester: Option<Requester>,
@@ -539,6 +546,7 @@ pub struct CreateS3CredentialsRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateS3CredentialsRequestTx {
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
@@ -661,6 +669,7 @@ impl Request for GetS3CredentialsRequest {
         Context::UserOnly
     }
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         requester: Option<Requester>,

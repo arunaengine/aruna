@@ -186,13 +186,13 @@ impl Store {
         write_txn.commit().inspect_err(logerr!())?;
 
         let relation_idx = AtomicU64::new(0);
-        let graph = load_graph(
-            &milli_index.read_txn().inspect_err(logerr!())?,
-            &relation_idx,
-            &relations,
-            &milli_index.documents,
-        )
-        .inspect_err(logerr!())?;
+
+        let rtxn = milli_index.read_txn().inspect_err(logerr!())?;
+
+        let graph = load_graph(&rtxn, &relation_idx, &relations, &milli_index.documents)
+            .inspect_err(logerr!())?;
+
+        rtxn.commit()?;
 
         Ok(Self {
             milli_index,
