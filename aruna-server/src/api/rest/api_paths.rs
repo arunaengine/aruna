@@ -38,7 +38,7 @@ mod tags {
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_resource(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -61,7 +61,7 @@ pub async fn create_resource(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn update_resource_name(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -98,7 +98,7 @@ pub async fn update_resource_name(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn update_resource_title(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -135,7 +135,7 @@ pub async fn update_resource_title(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn update_resource_description(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -172,7 +172,7 @@ pub async fn update_resource_description(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn update_resource_visibility(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -209,7 +209,7 @@ pub async fn update_resource_visibility(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn update_resource_license(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -246,7 +246,7 @@ pub async fn update_resource_license(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn update_resource_labels(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -283,7 +283,7 @@ pub async fn update_resource_labels(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn update_resource_identifiers(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -320,7 +320,7 @@ pub async fn update_resource_identifiers(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn update_resource_authors(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -357,7 +357,7 @@ pub async fn update_resource_authors(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_resource_batch(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -380,7 +380,7 @@ pub async fn create_resource_batch(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_project(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -403,7 +403,7 @@ pub async fn create_project(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_relation(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -426,7 +426,7 @@ pub async fn create_relation(
     ),
     tag = GLOBAL,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_relation_variant(
     State(state): State<Arc<Controller>>,
     headers: HeaderMap,
@@ -452,7 +452,7 @@ pub async fn create_relation_variant(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_resource(
     State(state): State<Arc<Controller>>,
     axum_extra::extract::Query(request): axum_extra::extract::Query<GetResourcesRequest>,
@@ -475,7 +475,7 @@ pub async fn get_resource(
     ),
     tag = REALMS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_realm(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -501,7 +501,7 @@ pub async fn create_realm(
     ),
     tag = REALMS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_realm(
     Path(id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -532,7 +532,7 @@ pub async fn get_realm(
     ),
     tag = REALMS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn add_group(
     Path((realm_id, group_id)): Path<(Ulid, Ulid)>,
     State(state): State<Arc<Controller>>,
@@ -562,7 +562,7 @@ pub async fn add_group(
     ),
     tag = GROUPS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_group(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -588,7 +588,7 @@ pub async fn create_group(
     ),
     tag = GROUPS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_group(
     Path(id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -615,7 +615,7 @@ pub async fn get_group(
     ),
     tag = USERS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn register_user(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -642,7 +642,7 @@ pub async fn register_user(
     ),
     tag = GROUPS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn add_user(
     Path((group_id, user_id)): Path<(Ulid, Ulid)>,
     State(state): State<Arc<Controller>>,
@@ -677,7 +677,7 @@ pub async fn add_user(
     ),
     tag = USERS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_token(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -699,7 +699,7 @@ pub async fn create_token(
     ),
     tag = USERS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_tokens(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -725,7 +725,7 @@ pub async fn get_tokens(
     ),
     tag = USERS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_s3_credential(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -747,7 +747,7 @@ pub async fn create_s3_credential(
     ),
     tag = USERS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_s3_credentials(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -776,7 +776,7 @@ pub async fn get_s3_credentials(
     ),
     tag = INFO,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn search(
     State(state): State<Arc<Controller>>,
     Query(request): Query<SearchRequest>,
@@ -798,7 +798,7 @@ pub async fn search(
     ),
     tag = USERS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_user_realms(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -823,7 +823,7 @@ pub async fn get_user_realms(
     ),
     tag = USERS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_user_groups(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -849,7 +849,7 @@ pub async fn get_user_groups(
     ),
     tag = INFO,
 )]
-#[tracing::instrument(level = "debug", skip(_state))]
+#[tracing::instrument(level = "trace", skip(_state))]
 pub async fn get_stats(
     State(_state): State<Arc<Controller>>,
     _header: HeaderMap,
@@ -882,7 +882,7 @@ pub async fn get_stats(
     ),
     tag = REALMS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_realm_components(
     Path(id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -915,7 +915,7 @@ pub async fn get_realm_components(
     ),
     tag = REALMS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn add_component_to_realm(
     Path((id, component_id)): Path<(Ulid, Ulid)>,
     State(state): State<Arc<Controller>>,
@@ -955,7 +955,7 @@ pub async fn add_component_to_realm(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_relations(
     Path(id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -983,7 +983,7 @@ pub async fn get_relations(
     ),
     tag = GROUPS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_group_users(
     Path(group_id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -1016,7 +1016,7 @@ pub async fn get_group_users(
     ),
     tag = REALMS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_realm_groups(
     Path(realm_id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -1046,7 +1046,7 @@ pub async fn get_realm_groups(
     ),
     tag = GLOBAL,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_relation_infos(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -1072,7 +1072,7 @@ pub async fn get_relation_infos(
     ),
     tag = USERS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_user(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -1100,7 +1100,7 @@ pub async fn get_user(
     ),
     tag = INFO,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_events(
     State(state): State<Arc<Controller>>,
     Query(request): Query<GetEventsRequest>,
@@ -1126,7 +1126,7 @@ pub async fn get_events(
     ),
     tag = REALMS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn request_group_access_realm(
     Path(realm_id): Path<Ulid>,
     Query(GroupAccessRealmRequestHelper { group_id }): Query<GroupAccessRealmRequestHelper>,
@@ -1159,7 +1159,7 @@ pub async fn request_group_access_realm(
     ),
     tag = GROUPS,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn request_user_access_group(
     Path(group_id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -1186,7 +1186,7 @@ pub async fn request_user_access_group(
     ),
     tag = GLOBAL,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_component(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -1212,7 +1212,7 @@ pub async fn create_component(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn register_data(
     Path(id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -1240,7 +1240,7 @@ pub async fn register_data(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn authorize_resource(
     Path(id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -1270,7 +1270,7 @@ pub async fn authorize_resource(
     ),
     tag = RESOURCES,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn delete_resource(
     Path(id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -1297,7 +1297,7 @@ pub async fn delete_resource(
     ),
     tag = LICENSE,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn create_license(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,
@@ -1323,7 +1323,7 @@ pub async fn create_license(
     ),
     tag = LICENSE,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_license(
     Path(id): Path<Ulid>,
     State(state): State<Arc<Controller>>,
@@ -1350,7 +1350,7 @@ pub async fn get_license(
     ),
     tag = LICENSE,
 )]
-#[tracing::instrument(level = "debug", skip(state))]
+#[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_licenses(
     State(state): State<Arc<Controller>>,
     header: HeaderMap,

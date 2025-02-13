@@ -23,22 +23,30 @@ async fn main() {
         .build()
         .tracer(config.opentelemetry_name.clone());
 
-    let env_filter = EnvFilter::try_from_default_env()
+    let tracing_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("aruna_server=trace".parse().unwrap())
+        .add_directive("tower_http=debug".parse().unwrap())
+        .add_directive("synevi_core=trace".parse().unwrap());
+
+    let logging_env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or("none".into())
+        .add_directive("aruna_server=info".parse().unwrap())
         .add_directive("tower_http=info".parse().unwrap())
         .add_directive("synevi_core=info".parse().unwrap());
 
-    let telemetry_layer = tracing_opentelemetry::layer().with_tracer(provider);
+    let telemetry_layer = tracing_opentelemetry::layer()
+        .with_tracer(provider)
+        .with_filter(tracing_env_filter);
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_file(true)
-        .with_line_number(true);
+        .with_line_number(true)
+        .with_filter(logging_env_filter);
 
     tracing_subscriber::registry()
         .with(fmt_layer)
         .with(telemetry_layer)
-        .with(env_filter)
         .init();
 
     start_server(config, None).await.unwrap()
