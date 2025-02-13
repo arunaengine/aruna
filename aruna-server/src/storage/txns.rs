@@ -47,10 +47,12 @@ impl<'a> Txn<'a> for WriteTxn<'a> {
 }
 
 impl<'a> WriteTxn<'a> {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_txn(&mut self) -> &mut RwTxn<'a> {
         self.txn.as_mut().expect("Transaction already committed")
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub(super) fn add_node(&mut self, milli_idx: MilliIdx, node: NodeVariant) -> NodeIndex {
         let mut lock = self.graph.write().expect("Poisoned lock");
         let idx = lock.graph.add_node(node);
@@ -66,6 +68,7 @@ impl<'a> WriteTxn<'a> {
         idx
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub(super) fn add_edge(
         &mut self,
         source: MilliIdx,
@@ -94,6 +97,7 @@ impl<'a> WriteTxn<'a> {
     }
 
     #[allow(dead_code)]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub(super) fn remove_edge(&mut self, index: EdgeIndex) -> Option<u32> {
         let (from, to) = self
             .graph
@@ -114,7 +118,7 @@ impl<'a> WriteTxn<'a> {
 
     // This is a read-only function that allows for the graph to be accessed
     // SAFETY: The caller must guarantee that the graph is not modified with this guard
-
+    #[tracing::instrument(level = "trace", skip(self, targets, additional_affected))]
     pub fn commit(
         mut self,
         event_id: u128,
@@ -211,6 +215,7 @@ pub struct ReadTxn<'a> {
 }
 
 impl<'a> ReadTxn<'a> {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn commit(self) -> Result<(), ArunaError> {
         self.txn.commit().inspect_err(logerr!())?;
         Ok(())
@@ -218,9 +223,12 @@ impl<'a> ReadTxn<'a> {
 }
 
 impl<'a> Txn<'a> for ReadTxn<'a> {
+    #[tracing::instrument(level = "trace", skip(self))]
     fn get_ro_txn(&self) -> &RoTxn<'a> {
         &self.txn
     }
+
+    #[tracing::instrument(level = "trace", skip(self))]
     fn get_ro_graph(&self) -> GraphTxn {
         GraphTxn {
             state: self.graph.read().expect("Poisoned lock"),

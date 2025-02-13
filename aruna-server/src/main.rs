@@ -14,7 +14,7 @@ async fn main() {
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(config.opentelemetry_endpoint.clone())
-        .with_timeout(Duration::from_secs(3))
+        .with_timeout(Duration::from_secs(5))
         .build()
         .unwrap();
 
@@ -36,9 +36,9 @@ async fn main() {
         .with_line_number(true);
 
     tracing_subscriber::registry()
-        .with(env_filter)
         .with(fmt_layer)
         .with(telemetry_layer)
+        .with(env_filter)
         .init();
 
     start_server(config, None).await.unwrap()

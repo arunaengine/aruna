@@ -143,6 +143,7 @@ impl Controller {
 #[async_trait::async_trait]
 impl synevi::Executor for Controller {
     type Tx = ArunaTransaction;
+    #[tracing::instrument(level = "trace", skip(self, transaction))]
     async fn execute(&self, id: u128, transaction: Self::Tx) -> SyneviResult<Self> {
         trace!("Executing transaction");
         Ok(self.process_transaction(id, transaction).await)

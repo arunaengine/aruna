@@ -71,7 +71,9 @@ impl Request for CreateProjectRequest {
 
             let store = controller.get_store();
 
-            (self.group_id, self.realm_id) = tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+            (self.group_id, self.realm_id) = tokio::task::spawn_blocking(move || current_span.in_scope(||{
                 let rtxn = store.read_txn()?;
                 let token = store.get_token(&user_id, token_idx, &rtxn)?;
 
@@ -90,7 +92,7 @@ impl Request for CreateProjectRequest {
                             error: "expected default realm for token".to_string(),
                         })?,
                 ))
-            })
+            }))
             .await
             .map_err(|e| {
                 error!("Failed to join task: {}", e);
@@ -183,7 +185,9 @@ impl WriteRequest for CreateProjectRequestTx {
         let _requester = self.requester.clone();
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // Create project
 
             let mut wtxn = store.write_txn()?;
@@ -334,7 +338,7 @@ impl WriteRequest for CreateProjectRequestTx {
             Ok::<_, ArunaError>(bincode::serialize(&CreateProjectResponse {
                 resource: project,
             })?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -435,7 +439,9 @@ impl WriteRequest for CreateResourceRequestTx {
         let parent_id = self.req.parent_id;
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // Create resource
 
             let mut wtxn = store.write_txn()?;
@@ -533,7 +539,7 @@ impl WriteRequest for CreateResourceRequestTx {
             // Affected nodes: Group, Project
             wtxn.commit(associated_event_id, &[parent_idx, resource_idx], &affected)?;
             Ok::<_, ArunaError>(bincode::serialize(&CreateResourceResponse { resource })?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -631,7 +637,9 @@ impl WriteRequest for CreateResourceBatchRequestTx {
         })?;
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // Create resource
 
             let mut wtxn = store.write_txn()?;
@@ -812,7 +820,7 @@ impl WriteRequest for CreateResourceBatchRequestTx {
             Ok::<_, ArunaError>(bincode::serialize(&CreateResourceBatchResponse {
                 resources: to_create.into_iter().map(|(r, _)| r).collect(),
             })?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -875,7 +883,9 @@ impl Request for GetResourcesRequest {
         };
 
         let store = controller.get_store();
-        let response = tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        let response = tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let rtxn = store.read_txn()?;
             let mut resources = Vec::new();
 
@@ -900,7 +910,7 @@ impl Request for GetResourcesRequest {
             }
             rtxn.commit()?;
             Ok::<_, ArunaError>(GetResourcesResponse { resources })
-        })
+        }))
         .await
         .map_err(|e| ArunaError::ServerError(e.to_string()))??;
 
@@ -965,7 +975,9 @@ impl WriteRequest for UpdateResourceTx {
 
         let store = controller.get_store();
 
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             // Get resource idx
@@ -1028,7 +1040,7 @@ impl WriteRequest for UpdateResourceTx {
             wtxn.commit(associated_event_id, &[resource_idx], &[])?;
             // Create admin group, add user to admin group
             Ok::<_, ArunaError>(bincode::serialize(&response)?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -1225,7 +1237,9 @@ impl WriteRequest for RegisterDataRequestTx {
 
         let store = controller.get_store();
 
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             // Get resource idx
@@ -1278,7 +1292,7 @@ impl WriteRequest for RegisterDataRequestTx {
             wtxn.commit(associated_event_id, &[resource_idx], &[])?;
             // Create admin group, add user to admin group
             Ok::<_, ArunaError>(bincode::serialize(&RegisterDataResponse {})?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -1307,7 +1321,9 @@ impl Request for AuthorizeRequest {
         } else {
             let store = controller.get_store();
             let id = self.id;
-            tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+            tokio::task::spawn_blocking(move || current_span.in_scope(||{
                 let rtxn = store.read_txn()?;
                 let Some(idx) = store.get_idx_from_ulid(&id, &rtxn) else {
                     return Err(ArunaError::NotFound(format!("{id} not found")));
@@ -1318,7 +1334,7 @@ impl Request for AuthorizeRequest {
 
                 rtxn.commit()?;
                 Ok::<bool, ArunaError>(matches!(node.visibility, VisibilityClass::Public))
-            })
+            }))
             .await
             .map_err(|e| {
                 error!("Failed to join task: {}", e);
@@ -1378,7 +1394,9 @@ impl WriteRequest for DeleteTx {
         let store = controller.get_store();
         let node_id = self.req.id;
 
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             // Get resource idx
@@ -1498,7 +1516,7 @@ impl WriteRequest for DeleteTx {
             wtxn.commit(associated_event_id, &[resource_idx], &[])?;
 
             Ok::<_, ArunaError>(bincode::serialize(&RegisterDataResponse {})?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");

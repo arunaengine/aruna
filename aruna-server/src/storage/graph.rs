@@ -116,10 +116,12 @@ pub fn load_graph(
 }
 
 impl GraphTxn<'_> {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn node_weight(&self, idx: MilliIdx) -> Option<NodeVariant> {
         self.state.graph.node_weight(idx.0.into()).cloned()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_relation_range(
         &self,
         idx: MilliIdx,
@@ -217,6 +219,7 @@ impl GraphTxn<'_> {
         Ok((slice, edge.index() as u32))
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_relations(
         &self,
         idx: MilliIdx,
@@ -283,6 +286,7 @@ impl GraphTxn<'_> {
             .collect())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_relatives(
         &self,
         idx: MilliIdx,
@@ -345,6 +349,7 @@ impl GraphTxn<'_> {
             .collect())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_parent(&self, idx: MilliIdx) -> Option<MilliIdx> {
         let parents = self.get_relatives(idx, Incoming).ok()?;
         assert!(parents.len() <= 1);
@@ -352,6 +357,7 @@ impl GraphTxn<'_> {
     }
 
     #[allow(unused)]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_children(&self, idx: MilliIdx) -> Result<Vec<MilliIdx>, ArunaError> {
         self.get_relatives(idx, Outgoing)
     }
@@ -491,6 +497,7 @@ impl GraphTxn<'_> {
     }
 
     #[allow(unused)]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn check_node_variant(
         &self,
         idx: MilliIdx,

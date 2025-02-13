@@ -57,64 +57,72 @@ pub struct CreateComponentRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateComponentRequestTx {
-
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
         let store = controller.get_store();
         let requester = self.requester.clone();
         let req = self.req.clone();
         let id = self.id;
         Ok(tokio::task::spawn_blocking(move || {
-            // Create realm, add user to realm
 
-            let mut wtxn = store.write_txn()?;
+            current_span.in_scope(|| {
+                // Create realm, add user to realm
 
-            let Some(requester_idx) = requester
-                .get_id()
-                .map(|id| store.get_idx_from_ulid(&id, &wtxn))
-                .flatten()
-            else {
-                return Err(ArunaError::Unauthorized);
-            };
+                let mut wtxn = store.write_txn()?;
 
-            let component = Component {
-                id,
-                name: req.name.clone(),
-                description: req.description.clone(),
-                component_type: req.component_type,
-                endpoints: req.endpoints.clone(),
-                public: req.public,
-                deleted: false,
-            };
+                let Some(requester_idx) = requester
+                    .get_id()
+                    .map(|id| store.get_idx_from_ulid(&id, &wtxn))
+                    .flatten()
+                else {
+                    return Err(ArunaError::Unauthorized);
+                };
 
-            let idx = store.create_node(&mut wtxn, &component)?;
-            store.add_component_key(&mut wtxn, idx, req.pubkey)?;
-            store.create_relation(&mut wtxn, idx, requester_idx, relation_types::OWNED_BY_USER)?;
-
-            // Add a listener if the component is a proxy
-            store.add_read_permission_universe(&mut wtxn, requester_idx.0, &[idx.0])?;
-            if component.public {
-                store.add_public_resources_universe(&mut wtxn, &[idx.0])?;
-            }
-
-            store.add_subscriber(
-                &mut wtxn,
-                Subscriber {
+                let component = Component {
                     id,
-                    owner: id,
-                    target_idx: idx.0,
-                    cascade: true,
-                },
-            )?;
+                    name: req.name.clone(),
+                    description: req.description.clone(),
+                    component_type: req.component_type,
+                    endpoints: req.endpoints.clone(),
+                    public: req.public,
+                    deleted: false,
+                };
 
-            wtxn.commit(associated_event_id, &[requester_idx], &[])?;
+                let idx = store.create_node(&mut wtxn, &component)?;
+                store.add_component_key(&mut wtxn, idx, req.pubkey)?;
+                store.create_relation(
+                    &mut wtxn,
+                    idx,
+                    requester_idx,
+                    relation_types::OWNED_BY_USER,
+                )?;
 
-            Ok::<_, ArunaError>(bincode::serialize(&CreateComponentResponse { component })?)
+                // Add a listener if the component is a proxy
+                store.add_read_permission_universe(&mut wtxn, requester_idx.0, &[idx.0])?;
+                if component.public {
+                    store.add_public_resources_universe(&mut wtxn, &[idx.0])?;
+                }
+
+                store.add_subscriber(
+                    &mut wtxn,
+                    Subscriber {
+                        id,
+                        owner: id,
+                        target_idx: idx.0,
+                        cascade: true,
+                    },
+                )?;
+
+                wtxn.commit(associated_event_id, &[requester_idx], &[])?;
+
+                Ok::<_, ArunaError>(bincode::serialize(&CreateComponentResponse { component })?)
+            })
         })
         .await
         .map_err(|_e| {

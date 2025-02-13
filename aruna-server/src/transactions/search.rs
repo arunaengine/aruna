@@ -37,7 +37,9 @@ impl Request for SearchRequest {
         let offset = self.offset.unwrap_or(0);
         let limit = self.limit.unwrap_or(20);
 
-        tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let rtxn = store.read_txn()?;
 
             let universe = match requester {
@@ -73,7 +75,7 @@ impl Request for SearchRequest {
                 expected_hits,
                 resources: result,
             })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");

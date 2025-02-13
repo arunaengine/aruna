@@ -9,6 +9,7 @@ use milli::{
     FieldsIdsMap, Index,
 };
 
+#[tracing::instrument(level = "trace", skip(index, wtxn))]
 pub(crate) fn prepopulate_fields<'a: 'b, 'b>(
     index: &'a Index,
     mut wtxn: &mut RwTxn<'b>,

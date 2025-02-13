@@ -82,6 +82,7 @@ impl WriteRequest for CreateRealmRequestTx {
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let realm = Realm {
@@ -99,7 +100,7 @@ impl WriteRequest for CreateRealmRequestTx {
             .ok_or_else(|| ArunaError::Forbidden("Unregistered".to_string()))?;
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // Create realm, add user to realm
 
             let mut wtxn = store.write_txn()?;
@@ -164,7 +165,7 @@ impl WriteRequest for CreateRealmRequestTx {
                 realm,
                 admin_group_id: group.id,
             })?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -223,11 +224,12 @@ impl WriteRequest for AddGroupRequestTx {
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
         let group_id = self.req.group_id;
         let realm_id = self.req.realm_id;
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // Create realm, add user to realm
 
             let mut wtxn = store.write_txn()?;
@@ -255,7 +257,7 @@ impl WriteRequest for AddGroupRequestTx {
 
             // Create admin group, add user to admin group
             Ok::<_, ArunaError>(bincode::serialize(&AddGroupResponse {})?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -276,6 +278,7 @@ impl Request for GetRealmRequest {
         requester: Option<Requester>,
         controller: &Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
         // Disallow impersonation
         if requester
             .as_ref()
@@ -285,7 +288,7 @@ impl Request for GetRealmRequest {
             return Err(ArunaError::Unauthorized);
         }
         let store = controller.get_store();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // Create realm, add user to realm
             let rtxn = store.read_txn()?;
 
@@ -300,7 +303,7 @@ impl Request for GetRealmRequest {
             rtxn.commit()?;
 
             Ok::<_, ArunaError>(GetRealmResponse { realm })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -323,6 +326,7 @@ impl Request for GetGroupsFromRealmRequest {
         requester: Option<Requester>,
         controller: &Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
         // Disallow impersonation
         if requester
             .as_ref()
@@ -332,7 +336,7 @@ impl Request for GetGroupsFromRealmRequest {
             return Err(ArunaError::Unauthorized);
         }
         let store = controller.get_store();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // Create realm, add user to realm
             let rtxn = store.read_txn()?;
 
@@ -364,7 +368,7 @@ impl Request for GetGroupsFromRealmRequest {
             rtxn.commit()?;
 
             Ok::<_, ArunaError>(GetGroupsFromRealmResponse { groups })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -387,6 +391,7 @@ impl Request for GetRealmComponentsRequest {
         requester: Option<Requester>,
         controller: &Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
         // Disallow impersonation
         if requester
             .as_ref()
@@ -397,7 +402,7 @@ impl Request for GetRealmComponentsRequest {
         }
         let store = controller.get_store();
         let realm_id = self.realm_id;
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let read_txn = store.read_txn()?;
             let Some(realm_idx) = store.get_idx_from_ulid(&realm_id, &read_txn) else {
                 return Err(ArunaError::NotFound("Realm not found".to_string()));
@@ -427,7 +432,7 @@ impl Request for GetRealmComponentsRequest {
             read_txn.commit()?;
 
             Ok::<GetRealmComponentsResponse, ArunaError>(GetRealmComponentsResponse { components })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -485,6 +490,7 @@ impl WriteRequest for AddComponentToRealmRequestTx {
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let component_id = self.req.component_id;
@@ -494,7 +500,7 @@ impl WriteRequest for AddComponentToRealmRequestTx {
             ArunaError::Unauthorized
         })?;
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // Create realm, add user to realm
 
             let mut wtxn = store.write_txn()?;
@@ -557,7 +563,7 @@ impl WriteRequest for AddComponentToRealmRequestTx {
             wtxn.commit(associated_event_id, &[realm_idx, component_idx], &[])?;
 
             Ok::<_, ArunaError>(bincode::serialize(&AddComponentToRealmResponse {})?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -618,6 +624,7 @@ impl WriteRequest for GroupAccessRealmTx {
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let store = controller.get_store();
@@ -627,7 +634,7 @@ impl WriteRequest for GroupAccessRealmTx {
         let realm_id = self.req.realm_id;
         let group_id = self.req.group_id;
 
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let wtxn = store.write_txn()?;
             // let ro_txn = wtxn.get_ro_txn();
             // let graph = wtxn.get_ro_graph();
@@ -664,7 +671,7 @@ impl WriteRequest for GroupAccessRealmTx {
             // Notification gets automatically created in commit
             wtxn.commit(associated_event_id, &affected, &[requester_idx])?;
             Ok::<_, ArunaError>(bincode::serialize(&GroupAccessRealmResponse {})?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");

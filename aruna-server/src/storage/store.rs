@@ -423,6 +423,7 @@ impl Store {
         Ok(milli_idx)
     }
 
+    #[tracing::instrument(level = "trace", skip(self, nodes, wtxn))]
     pub fn create_nodes_batch<'a, T: Node>(
         &'a self,
         wtxn: &mut WriteTxn<'a>,

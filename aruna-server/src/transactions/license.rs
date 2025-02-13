@@ -53,13 +53,13 @@ pub struct CreateLicenseRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateLicenseRequestTx {
-
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let license = License {
@@ -72,18 +72,20 @@ impl WriteRequest for CreateLicenseRequestTx {
 
         let store = controller.get_store();
         Ok(tokio::task::spawn_blocking(move || {
-            let mut wtxn = store.write_txn()?;
+            current_span.in_scope(|| {
+                let mut wtxn = store.write_txn()?;
 
-            // Create license
-            let license_idx = store.create_node(&mut wtxn, &license)?;
-            store.add_public_resources_universe(&mut wtxn, &[license_idx.0])?;
+                // Create license
+                let license_idx = store.create_node(&mut wtxn, &license)?;
+                store.add_public_resources_universe(&mut wtxn, &[license_idx.0])?;
 
-            // Affected nodes: Group, Realm, Project
-            wtxn.commit(associated_event_id, &[], &[])?;
-            // Create admin group, add user to admin group
-            Ok::<_, ArunaError>(bincode::serialize(&CreateLicenseResponse {
-                license_id: license.id,
-            })?)
+                // Affected nodes: Group, Realm, Project
+                wtxn.commit(associated_event_id, &[], &[])?;
+                // Create admin group, add user to admin group
+                Ok::<_, ArunaError>(bincode::serialize(&CreateLicenseResponse {
+                    license_id: license.id,
+                })?)
+            })
         })
         .await
         .map_err(|_e| {
@@ -105,19 +107,22 @@ impl Request for GetLicenseRequest {
         _requester: Option<Requester>,
         controller: &Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
         let store = controller.get_store();
         let id = self.id;
 
         tokio::task::spawn_blocking(move || {
-            let rtxn = store.read_txn()?;
-            let node_idx = store.get_idx_from_ulid(&id, &rtxn).ok_or_else(|| {
-                ArunaError::NotFound(format!("License with id {} not found", id.to_string()))
-            })?;
-            let license = store.get_node::<License>(&rtxn, node_idx).ok_or_else(|| {
-                ArunaError::NotFound(format!("License with id {} not found", id.to_string()))
-            })?;
-            rtxn.commit()?;
-            Ok(GetLicenseResponse { license })
+            current_span.in_scope(|| {
+                let rtxn = store.read_txn()?;
+                let node_idx = store.get_idx_from_ulid(&id, &rtxn).ok_or_else(|| {
+                    ArunaError::NotFound(format!("License with id {} not found", id.to_string()))
+                })?;
+                let license = store.get_node::<License>(&rtxn, node_idx).ok_or_else(|| {
+                    ArunaError::NotFound(format!("License with id {} not found", id.to_string()))
+                })?;
+                rtxn.commit()?;
+                Ok(GetLicenseResponse { license })
+            })
         })
         .await
         .map_err(|_e| {
@@ -139,24 +144,27 @@ impl Request for GetLicensesRequest {
         _requester: Option<Requester>,
         controller: &Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
         let store = controller.get_store();
 
         tokio::task::spawn_blocking(move || {
-            let rtxn = store.read_txn()?;
+            current_span.in_scope(|| {
+                let rtxn = store.read_txn()?;
 
-            let universe = store.get_public_universe(&rtxn)?;
-            let (_, result) =
-                store.search("".to_string(), 0, 10000, Some("variant=8"), &rtxn, universe)?;
-            rtxn.commit()?;
-            let result = result
-                .into_iter()
-                .filter_map(|val| match val {
-                    GenericNode::License(license) => Some(license),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+                let universe = store.get_public_universe(&rtxn)?;
+                let (_, result) =
+                    store.search("".to_string(), 0, 10000, Some("variant=8"), &rtxn, universe)?;
+                rtxn.commit()?;
+                let result = result
+                    .into_iter()
+                    .filter_map(|val| match val {
+                        GenericNode::License(license) => Some(license),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
 
-            Ok(GetLicensesResponse { licenses: result })
+                Ok(GetLicensesResponse { licenses: result })
+            })
         })
         .await
         .map_err(|_e| {

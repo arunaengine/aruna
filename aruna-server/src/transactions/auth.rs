@@ -43,13 +43,16 @@ impl Controller {
             }
         };
 
+        let current_span = tracing::Span::current();
         let token_handler = self.get_token_handler();
-        let requester = tokio::task::spawn_blocking(move || token_handler.process_token(&token))
-            .await
-            .map_err(|e| {
-                tracing::error!(?e, "Error joining thread");
-                ArunaError::ServerError("Internal server error".to_string())
-            })??;
+        let requester = tokio::task::spawn_blocking(move || {
+            current_span.in_scope(|| token_handler.process_token(&token))
+        })
+        .await
+        .map_err(|e| {
+            tracing::error!(?e, "Error joining thread");
+            ArunaError::ServerError("Internal server error".to_string())
+        })??;
 
         self.authorize(&requester, request).await?;
 
@@ -65,47 +68,50 @@ impl Controller {
         let store = self.get_store();
         let user = user.clone();
 
+        let current_span = tracing::Span::current();
         tokio::task::spawn_blocking(move || {
-            match ctx {
-                Context::InRequest | Context::Public => Ok(()),
-                Context::NotRegistered => Ok(()), // Must provide valid oidc_token
-                Context::UserOnly => validate_user_only(user, store),
-                Context::SubscriberOwnerOf(subscriber_id) => {
-                    validate_subscriber_of(user, subscriber_id, store)
-                }
-                Context::GlobalAdmin => Err(ArunaError::Forbidden(String::new())), // TODO: Impl global
-                // admins
-                Context::Permission {
-                    min_permission,
-                    source,
-                } => validate_permission_batch(
-                    user,
-                    &[BatchPermission {
+            current_span.in_scope(|| {
+                match ctx {
+                    Context::InRequest | Context::Public => Ok(()),
+                    Context::NotRegistered => Ok(()), // Must provide valid oidc_token
+                    Context::UserOnly => validate_user_only(user, store),
+                    Context::SubscriberOwnerOf(subscriber_id) => {
+                        validate_subscriber_of(user, subscriber_id, store)
+                    }
+                    Context::GlobalAdmin => Err(ArunaError::Forbidden(String::new())), // TODO: Impl global
+                    // admins
+                    Context::Permission {
                         min_permission,
                         source,
-                    }],
-                    store,
-                ),
-                Context::PermissionBatch(permissions) => {
-                    validate_permission_batch(user, &permissions, store)
+                    } => validate_permission_batch(
+                        user,
+                        &[BatchPermission {
+                            min_permission,
+                            source,
+                        }],
+                        store,
+                    ),
+                    Context::PermissionBatch(permissions) => {
+                        validate_permission_batch(user, &permissions, store)
+                    }
+                    Context::PermissionFork {
+                        first_min_permission,
+                        first_source,
+                        second_min_permission,
+                        second_source,
+                    } => {
+                        let first = BatchPermission {
+                            min_permission: first_min_permission,
+                            source: first_source,
+                        };
+                        let second = BatchPermission {
+                            min_permission: second_min_permission,
+                            source: second_source,
+                        };
+                        validate_permission_batch(user, &[first, second], store)
+                    }
                 }
-                Context::PermissionFork {
-                    first_min_permission,
-                    first_source,
-                    second_min_permission,
-                    second_source,
-                } => {
-                    let first = BatchPermission {
-                        min_permission: first_min_permission,
-                        source: first_source,
-                    };
-                    let second = BatchPermission {
-                        min_permission: second_min_permission,
-                        source: second_source,
-                    };
-                    validate_permission_batch(user, &[first, second], store)
-                }
-            }
+            })
         })
         .await
         .map_err(|e| {
@@ -205,6 +211,7 @@ impl TokenHandler {
         Ok((access_key, shared_secret))
     }
 
+    #[tracing::instrument(level = "trace", skip(self, token))]
     fn process_token(&self, token: &str) -> Result<Requester, ArunaError> {
         // Split the token into header and payload
         let mut split = token.split('.').map(b64_decode);
@@ -393,6 +400,7 @@ impl WriteRequest for AddOidcProviderRequestTx {
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
+        let current_span = tracing::Span::current();
         if let Some(requester) = &self.requester {
             controller.authorize(requester, &self.req).await?;
         }
@@ -403,7 +411,7 @@ impl WriteRequest for AddOidcProviderRequestTx {
         let issuer_endpoint = self.req.issuer_endpoint.clone();
         let audiences = self.req.audiences.clone();
 
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             store.add_issuer(&mut wtxn, issuer_name, issuer_endpoint, audiences, keys)?;
@@ -412,7 +420,7 @@ impl WriteRequest for AddOidcProviderRequestTx {
             wtxn.commit(associated_event_id, &[], &[])?;
 
             Ok::<_, ArunaError>(bincode::serialize(&AddOidcProviderResponse {})?)
-        })
+        }))
         .await
         .map_err(|e| ArunaError::ServerError(e.to_string()))??)
     }

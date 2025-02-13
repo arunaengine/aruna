@@ -35,6 +35,7 @@ impl Request for GetRelationsRequest {
         requester: Option<Requester>,
         controller: &Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
         // Disallow impersonation
         if requester
             .as_ref()
@@ -64,7 +65,7 @@ impl Request for GetRelationsRequest {
         };
 
         let store = controller.get_store();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let rtxn = store.read_txn()?;
 
             let idx = store
@@ -235,7 +236,7 @@ impl Request for GetRelationsRequest {
                 relations,
                 continuation_token,
             })
-        })
+        }))
         .await
         .map_err(|e| ArunaError::ServerError(e.to_string()))
         .inspect_err(logerr!())?
@@ -257,6 +258,7 @@ impl Request for GetRelationInfosRequest {
         requester: Option<Requester>,
         controller: &Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
         // Disallow impersonation
         if requester
             .as_ref()
@@ -266,12 +268,12 @@ impl Request for GetRelationInfosRequest {
             return Err(ArunaError::Unauthorized);
         }
         let store = controller.get_store();
-        tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let rtxn = store.read_txn()?;
             let relation_infos = store.get_relation_infos(&rtxn)?;
             rtxn.commit()?;
             Ok::<_, ArunaError>(GetRelationInfosResponse { relation_infos })
-        })
+        }))
         .await
         .map_err(|e| ArunaError::ServerError(e.to_string()))?
     }
@@ -328,6 +330,7 @@ impl WriteRequest for CreateRelationTx {
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let source_id = self.req.source;
@@ -335,7 +338,7 @@ impl WriteRequest for CreateRelationTx {
         let variant = self.req.variant;
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             let Some(source_idx) = store.get_idx_from_ulid(&source_id, &wtxn) else {
@@ -363,7 +366,7 @@ impl WriteRequest for CreateRelationTx {
             wtxn.commit(associated_event_id, &[source_idx, target_idx], &[])?;
 
             Ok::<_, ArunaError>(bincode::serialize(&CreateRelationResponse {})?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -416,13 +419,14 @@ impl WriteRequest for CreateRelationVariantTx {
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, crate::error::ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let store = controller.get_store();
         let forward_type = self.req.forward_type.clone();
         let backward_type = self.req.backward_type.clone();
 
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             let idx = store
@@ -443,7 +447,7 @@ impl WriteRequest for CreateRelationVariantTx {
 
             wtxn.commit(associated_event_id, &[], &[])?;
             Ok::<_, ArunaError>(bincode::serialize(&CreateRelationVariantResponse { idx })?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");

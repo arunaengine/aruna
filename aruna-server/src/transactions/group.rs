@@ -70,13 +70,13 @@ pub struct CreateGroupRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for CreateGroupRequestTx {
-
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let group = Group {
@@ -92,29 +92,31 @@ impl WriteRequest for CreateGroupRequestTx {
 
         let store = controller.get_store();
         Ok(tokio::task::spawn_blocking(move || {
-            let mut wtxn = store.write_txn()?;
+            current_span.in_scope(|| {
+                let mut wtxn = store.write_txn()?;
 
-            let Some(user_idx) = store.get_idx_from_ulid(&requester_id, &wtxn) else {
-                return Err(ArunaError::NotFound(requester_id.to_string()));
-            };
+                let Some(user_idx) = store.get_idx_from_ulid(&requester_id, &wtxn) else {
+                    return Err(ArunaError::NotFound(requester_id.to_string()));
+                };
 
-            // Create group
-            let group_idx = store.create_node(&mut wtxn, &group)?;
+                // Create group
+                let group_idx = store.create_node(&mut wtxn, &group)?;
 
-            // Add relation user --ADMIN--> group
-            store.create_relation(
-                &mut wtxn,
-                user_idx,
-                group_idx,
-                relation_types::PERMISSION_ADMIN,
-            )?;
+                // Add relation user --ADMIN--> group
+                store.create_relation(
+                    &mut wtxn,
+                    user_idx,
+                    group_idx,
+                    relation_types::PERMISSION_ADMIN,
+                )?;
 
-            store.add_read_permission_universe(&mut wtxn, group_idx.0, &[group_idx.0])?;
+                store.add_read_permission_universe(&mut wtxn, group_idx.0, &[group_idx.0])?;
 
-            // Affected nodes: User and Group
-            wtxn.commit(associated_event_id, &[user_idx, group_idx], &[])?;
-            // Create admin group, add user to admin group
-            Ok::<_, ArunaError>(bincode::serialize(&CreateGroupResponse { group })?)
+                // Affected nodes: User and Group
+                wtxn.commit(associated_event_id, &[user_idx, group_idx], &[])?;
+                // Create admin group, add user to admin group
+                Ok::<_, ArunaError>(bincode::serialize(&CreateGroupResponse { group })?)
+            })
         })
         .await
         .map_err(|_e| {
@@ -140,6 +142,8 @@ impl Request for GetGroupRequest {
         requester: Option<Requester>,
         controller: &super::controller::Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
+
         // Disallow impersonation
         if requester
             .as_ref()
@@ -150,19 +154,21 @@ impl Request for GetGroupRequest {
         }
         let store = controller.get_store();
         let response = tokio::task::spawn_blocking(move || {
-            let rtxn = store.read_txn()?;
+            current_span.in_scope(|| {
+                let rtxn = store.read_txn()?;
 
-            let idx = store
-                .get_idx_from_ulid(&self.id, &rtxn)
-                .ok_or_else(|| return ArunaError::NotFound(self.id.to_string()))?;
+                let idx = store
+                    .get_idx_from_ulid(&self.id, &rtxn)
+                    .ok_or_else(|| return ArunaError::NotFound(self.id.to_string()))?;
 
-            let group = store
-                .get_node(&rtxn, idx)
-                .ok_or_else(|| return ArunaError::NotFound(self.id.to_string()))?;
+                let group = store
+                    .get_node(&rtxn, idx)
+                    .ok_or_else(|| return ArunaError::NotFound(self.id.to_string()))?;
 
-            rtxn.commit()?;
-            // Create admin group, add user to admin group
-            Ok::<_, ArunaError>(GetGroupResponse { group })
+                rtxn.commit()?;
+                // Create admin group, add user to admin group
+                Ok::<_, ArunaError>(GetGroupResponse { group })
+            })
         })
         .await
         .map_err(|_e| {
@@ -220,13 +226,13 @@ pub struct AddUserRequestTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for AddUserRequestTx {
-
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let group_id = self.req.group_id;
@@ -240,7 +246,7 @@ impl WriteRequest for AddUserRequestTx {
         };
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             // Get indices
@@ -260,7 +266,7 @@ impl WriteRequest for AddUserRequestTx {
 
             wtxn.commit(associated_event_id, &[user_idx, group_idx], &[])?;
             Ok::<_, ArunaError>(bincode::serialize(&AddUserResponse {})?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -284,6 +290,7 @@ impl Request for GetUsersFromGroupRequest {
         requester: Option<Requester>,
         controller: &super::controller::Controller,
     ) -> Result<Self::Response, ArunaError> {
+        let current_span = tracing::Span::current();
         // Disallow impersonation
         if requester
             .as_ref()
@@ -293,7 +300,7 @@ impl Request for GetUsersFromGroupRequest {
             return Err(ArunaError::Unauthorized);
         }
         let store = controller.get_store();
-        let response = tokio::task::spawn_blocking(move || {
+        let response = tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let rtxn = store.read_txn()?;
 
             let idx = store
@@ -320,7 +327,7 @@ impl Request for GetUsersFromGroupRequest {
             }
             rtxn.commit()?;
             Ok::<_, ArunaError>(GetUsersFromGroupResponse { users })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -373,13 +380,13 @@ pub struct UserAccessGroupTx {
 #[typetag::serde]
 #[async_trait::async_trait]
 impl WriteRequest for UserAccessGroupTx {
-
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn execute(
         &self,
         associated_event_id: u128,
         controller: &Controller,
     ) -> Result<SerializedResponse, ArunaError> {
+        let current_span = tracing::Span::current();
         controller.authorize(&self.requester, &self.req).await?;
 
         let requester_id = self
@@ -389,7 +396,7 @@ impl WriteRequest for UserAccessGroupTx {
 
         let store = controller.get_store();
         let group_id = self.req.group_id;
-        Ok(tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let wtxn = store.write_txn()?;
 
             let Some(group_idx) = store.get_idx_from_ulid(&group_id, &wtxn) else {
@@ -412,7 +419,7 @@ impl WriteRequest for UserAccessGroupTx {
             // Notification gets automatically created in commit
             wtxn.commit(associated_event_id, &affected, &[requester_idx])?;
             Ok::<_, ArunaError>(bincode::serialize(&UserAccessGroupResponse {})?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");

@@ -105,7 +105,9 @@ impl WriteRequest for RegisterUserRequestTx {
         };
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             // Create user
@@ -127,7 +129,7 @@ impl WriteRequest for RegisterUserRequestTx {
 
             // Create admin group, add user to admin group
             Ok::<_, ArunaError>(bincode::serialize(&RegisterUserResponse { user })?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -210,7 +212,9 @@ impl WriteRequest for CreateTokenRequestTx {
         let is_service_account = matches!(self.requester, Requester::ServiceAccount { .. });
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             // Create token
@@ -237,7 +241,7 @@ impl WriteRequest for CreateTokenRequestTx {
             )?;
             // Create admin group, add user to admin group
             Ok::<_, ArunaError>(bincode::serialize(&CreateTokenResponse { token, secret })?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -279,7 +283,9 @@ impl Request for GetUserRequest {
             })?;
 
         let store = controller.get_store();
-        tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let rtxn = store.read_txn()?;
 
             let idx = store
@@ -292,7 +298,7 @@ impl Request for GetUserRequest {
             };
             rtxn.commit()?;
             Ok::<GetUserResponse, ArunaError>(response)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -330,7 +336,9 @@ impl Request for GetGroupsFromUserRequest {
             .inspect_err(logerr!())?;
 
         let store = controller.get_store();
-        tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || current_span.in_scope(||{
             // TODO: Optimize!
             let mut groups = Vec::new();
             let filter = (PERMISSION_NONE..=PERMISSION_ADMIN).collect::<Vec<u32>>();
@@ -384,7 +392,7 @@ impl Request for GetGroupsFromUserRequest {
             }
             rtxn.commit()?;
             Ok::<GetGroupsFromUserResponse, ArunaError>(GetGroupsFromUserResponse { groups })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -423,13 +431,15 @@ impl Request for GetRealmsFromUserRequest {
             .inspect_err(logerr!())?;
 
         let store = controller.get_store();
-        tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let read_txn = store.read_txn()?;
             let realms = store.get_realms_for_user(&read_txn, requester_id)?;
 
             read_txn.commit()?;
             Ok::<GetRealmsFromUserResponse, ArunaError>(GetRealmsFromUserResponse { realms })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -471,7 +481,9 @@ impl Request for GetTokensRequest {
             })?;
 
         let store = controller.get_store();
-        tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let rtxn = store.read_txn()?;
 
             let tokens = store.get_tokens(&rtxn, &requester_ulid)?;
@@ -491,7 +503,7 @@ impl Request for GetTokensRequest {
                 .collect();
 
             Ok::<GetTokensResponse, ArunaError>(GetTokensResponse { tokens })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -578,7 +590,9 @@ impl WriteRequest for CreateS3CredentialsRequestTx {
         let _is_service_account = matches!(self.requester, Requester::ServiceAccount { .. });
 
         let store = controller.get_store();
-        Ok(tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        Ok(tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let mut wtxn = store.write_txn()?;
 
             // Create token
@@ -653,7 +667,7 @@ impl WriteRequest for CreateS3CredentialsRequestTx {
                 access_key,
                 secret_key,
             })?)
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
@@ -695,7 +709,9 @@ impl Request for GetS3CredentialsRequest {
             })?;
 
         let store = controller.get_store();
-        tokio::task::spawn_blocking(move || {
+
+        let current_span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || current_span.in_scope(||{
             let rtxn = store.read_txn()?;
 
             let tokens = store.get_tokens(&rtxn, &requester_ulid)?;
@@ -718,7 +734,7 @@ impl Request for GetS3CredentialsRequest {
                 .collect();
 
             Ok::<GetS3CredentialsResponse, ArunaError>(GetS3CredentialsResponse { tokens })
-        })
+        }))
         .await
         .map_err(|_e| {
             tracing::error!("Failed to join task");
