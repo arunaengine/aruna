@@ -11,8 +11,11 @@ pub(super) fn extract_token(header: &HeaderMap) -> Option<String> {
         .map(|v| v.to_string())
 }
 
+#[tracing::instrument(level = "trace", skip(response))]
 pub fn into_axum_response<T: Serialize>(response: Result<T, ArunaError>) -> impl IntoResponse {
-    response
+    let res = response
         .map(|r| (axum::http::StatusCode::OK, Json(r)).into_response())
-        .unwrap_or_else(|e| e.into_axum_tuple().into_response())
+        .unwrap_or_else(|e| e.into_axum_tuple().into_response());
+    tracing::trace!(status=?res.status());
+    res
 }

@@ -214,8 +214,11 @@ impl Store {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn read_txn(&self) -> Result<ReadTxn, ArunaError> {
+        tracing::trace!(msg="Get read_txn from milli");
+        let txn = self.milli_index.read_txn().inspect_err(logerr!())?;
+        tracing::trace!(msg="Got read_txn from milli");
         Ok(ReadTxn {
-            txn: self.milli_index.read_txn().inspect_err(logerr!())?,
+            txn,
             graph: &self.graph,
         })
     }
