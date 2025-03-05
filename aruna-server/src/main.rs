@@ -23,6 +23,13 @@ async fn main() {
         .build()
         .tracer(config.opentelemetry_name.clone());
 
+    let tokio_env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or("none".into())
+        .add_directive("tower_http=trace".parse().unwrap())
+        .add_directive("synevi_core=trace".parse().unwrap())
+        .add_directive("tokio=trace".parse().unwrap())
+        .add_directive("runtime=trace".parse().unwrap());
+
     let tracing_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("aruna_server=trace".parse().unwrap())
@@ -44,9 +51,12 @@ async fn main() {
         .with_line_number(true)
         .with_filter(logging_env_filter);
 
+    let console_layer = console_subscriber::spawn().with_filter(tokio_env_filter);
+
     tracing_subscriber::registry()
         .with(fmt_layer)
         .with(telemetry_layer)
+        .with(console_layer)
         .init();
 
     start_server(config, None).await.unwrap()

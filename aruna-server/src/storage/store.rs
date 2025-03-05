@@ -214,9 +214,10 @@ impl Store {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn read_txn(&self) -> Result<ReadTxn, ArunaError> {
-        tracing::trace!(msg="Get read_txn from milli");
+        tracing::trace!(msg = "Get read_txn from milli");
         let txn = self.milli_index.read_txn().inspect_err(logerr!())?;
-        tracing::trace!(msg="Got read_txn from milli");
+        let info = self.milli_index.env.info();
+        tracing::trace!(info = ?info);
         Ok(ReadTxn {
             txn,
             graph: &self.graph,
@@ -225,9 +226,13 @@ impl Store {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn write_txn(&self) -> Result<WriteTxn, ArunaError> {
+        tracing::trace!(msg = "Get write_txn from milli");
+        let txn = Some(self.milli_index.write_txn().inspect_err(logerr!())?);
+        let info = self.milli_index.env.info();
+        tracing::trace!(info = ?info);
         Ok(WriteTxn {
             graph: &self.graph,
-            txn: Some(self.milli_index.write_txn().inspect_err(logerr!())?),
+            txn,
             events: &self.events,
             subscribers: &self.subscribers,
             single_entry_database: &self.single_entry_database,
@@ -409,8 +414,12 @@ impl Store {
             ArunaError::DatabaseError("Error adding document".to_string())
         })?;
 
+        tracing::trace!(msg = "Ready for execution");
+
         // Execute the indexing
         builder.execute()?;
+
+        tracing::trace!(msg = "Execution successfull");
 
         // Get the idx of the node
         let milli_idx = self
@@ -1340,7 +1349,7 @@ impl Store {
 
     // This can also be used to acknowledge events
     #[tracing::instrument(level = "trace", skip(self, wtxn))]
-    pub fn get_events_subscriber(
+    pub fn get_events_subscriber<'a>(
         &self,
         wtxn: &mut WriteTxn,
         subscriber_id: u128,

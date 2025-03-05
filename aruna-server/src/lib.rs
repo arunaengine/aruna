@@ -111,6 +111,7 @@ pub async fn start_server(
     notify: Option<Arc<Notify>>,
 ) -> Result<(), ArunaError> {
     let first_node = init_node.is_none();
+
     let controller = Controller::new(
         database_path,
         node_id,
@@ -118,6 +119,7 @@ pub async fn start_server(
         socket_addr,
         init_node,
         key_config,
+        //sdx,
     )
     .await
     .unwrap();
@@ -178,7 +180,7 @@ pub async fn start_server(
         notify.notify_waiters();
     }
 
-    join_set.join_next().await;
+    join_set.join_all().await;
 
     Ok(())
 }

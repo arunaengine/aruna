@@ -349,7 +349,7 @@ pub async fn update_resource_authors(
     path = "/resources/batch",
     request_body = CreateResourceBatchRequest,
     responses(
-        (status = 200, body = CreateResourceResponse),
+        (status = 200, body = CreateResourceBatchResponse),
         ArunaError,
     ),
     security(

@@ -44,4 +44,16 @@ impl UserService for UserServiceImpl {
     ) -> Result<tonic::Response<grpc::GetTokensResponse>, tonic::Status> {
         todo!()
     }
+    async fn get_user_realms(
+        &self,
+        _request: tonic::Request<grpc::GetUserRealmsRequest>,
+    ) -> Result<tonic::Response<grpc::GetUserRealmsResponse>, tonic::Status> {
+        todo!()
+    }
+    async fn get_groups(
+        &self,
+        _request: tonic::Request<grpc::GetGroupsRequest>,
+    ) -> Result<tonic::Response<grpc::GetGroupsResponse>, tonic::Status> {
+        todo!()
+    }
 }
