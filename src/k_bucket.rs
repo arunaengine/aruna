@@ -1,0 +1,108 @@
+use crate::K_BUCKET_SIZE;
+use crate::node_info::NodeInfo;
+use iroh::{NodeAddr, NodeId};
+
+/// K-Bucket structure that stores NodeInfo directly in a fixed-size array
+pub struct KBucket {
+    nodes: [Option<NodeInfo>; K_BUCKET_SIZE],
+}
+
+impl KBucket {
+    /// Create a new empty K-bucket
+    pub fn new() -> Self {
+        // Initialize with None values
+        Self {
+            nodes: std::array::from_fn(|_| None),
+        }
+    }
+
+    /// Update the k-bucket with a node.
+    ///
+    /// If the node already exists, updates its last_seen timestamp.
+    /// If the bucket is full, returns the least recently seen node for pinging.
+    pub fn update(&mut self, info: NodeInfo) -> Option<NodeAddr> {
+        let node_id = &info.addr.node_id;
+
+        // If node exists, update its last_seen timestamp
+        if let Some(pos) = self.find_node(node_id) {
+            self.nodes[pos].as_mut().unwrap().update_last_seen();
+            return None;
+        }
+
+        // If an empty slot exists, add the node
+        if let Some(pos) = self.find_empty_slot() {
+            self.nodes[pos] = Some(info);
+            return None;
+        }
+
+        // If bucket is full, return the least recently seen node for ping
+        if let Some(pos) = self.find_least_recently_seen() {
+            // Return the address of the least recently seen node
+            let lrs_addr = self.nodes[pos].as_ref().map(|info| info.addr.clone());
+
+            // Replace with the new node
+            self.nodes[pos] = Some(info);
+
+            return lrs_addr;
+        }
+
+        // This should never happen as long as K_BUCKET_SIZE > 0
+        None
+    }
+
+    /// Find a node in the bucket by its ID
+    pub fn find_node(&self, node_id: &NodeId) -> Option<usize> {
+        self.nodes.iter().position(|opt_info| {
+            opt_info
+                .as_ref()
+                .is_some_and(|info| &info.addr.node_id == node_id)
+        })
+    }
+
+    /// Find an empty slot in the bucket
+    pub fn find_empty_slot(&self) -> Option<usize> {
+        self.nodes.iter().position(|opt_info| opt_info.is_none())
+    }
+
+    /// Find the least recently seen node in the bucket
+    pub fn find_least_recently_seen(&self) -> Option<usize> {
+        let mut oldest_pos = None;
+        let mut oldest_time = None;
+
+        for (i, opt_info) in self.nodes.iter().enumerate() {
+            if let Some(info) = opt_info {
+                if oldest_time.is_none() || info.last_seen < oldest_time.unwrap() {
+                    oldest_time = Some(info.last_seen);
+                    oldest_pos = Some(i);
+                }
+            }
+        }
+
+        oldest_pos
+    }
+
+    /// Get all nodes in this bucket
+    pub fn get_nodes(&self) -> Vec<NodeAddr> {
+        self.nodes
+            .iter()
+            .filter_map(|opt_info| opt_info.as_ref().map(|info| info.addr.clone()))
+            .collect()
+    }
+
+    /// Remove stale nodes from the bucket
+    pub fn prune_stale_nodes(&mut self) -> Vec<NodeId> {
+        let mut removed_nodes = Vec::new();
+
+        for opt_info in &mut self.nodes {
+            if let Some(info) = opt_info {
+                if info.is_stale() {
+                    let node_id = info.addr.node_id;
+                    removed_nodes.push(node_id);
+                    *opt_info = None;
+                }
+            }
+        }
+
+        removed_nodes
+    }
+}
