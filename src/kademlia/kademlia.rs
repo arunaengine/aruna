@@ -1,19 +1,25 @@
 use anyhow::{Result, anyhow};
 use futures_util::FutureExt;
-use iroh::{Endpoint, NodeAddr, NodeId};
+use iroh::endpoint::{RecvStream, SendStream};
+use iroh::{NodeAddr, NodeId};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::runtime::Handle;
+use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
-use crate::connection_handler::ConnectionHandler;
+use crate::connection_handler::{ConnectionHandler, ProtocolHandler};
 use crate::kademlia::k_bucket::KBucket;
 use crate::kademlia::messages::{FindResult, KademliaMessage, MessageType};
 use crate::kademlia::node_info::NodeInfo;
 use crate::kademlia::utils::{calculate_distance, get_bucket_index};
 use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
+
+pub const KADEMLIA_PROTOCOL_ID: u32 = 1;
 
 /// Internal mutable state of Kademlia
 #[derive(Debug)]
@@ -36,6 +42,7 @@ impl KademliaState {
 }
 
 /// Simplified command type enum with better type safety
+// TODO: This is unnecessary remove it
 #[derive(Debug)]
 enum CommandType {
     Find(Option<oneshot::Sender<Result<FindResult>>>),
@@ -100,54 +107,98 @@ impl CommandState {
 /// Kademlia distributed hash table implementation with interior mutability
 #[derive(Debug)]
 pub struct Kademlia {
-    node_addr: NodeAddr,
-    chandler: Arc<ConnectionHandler>,
-    pub state: RwLock<KademliaState>,
+    network: RwLock<Option<(NodeAddr, Arc<ConnectionHandler>)>>,
+    state: RwLock<KademliaState>,
     maintenance_handle: Mutex<Option<JoinHandle<()>>>,
-    self_arc: Mutex<Option<Arc<Self>>>,
+}
+
+#[async_trait::async_trait]
+impl ProtocolHandler for Kademlia {
+    async fn handle_stream(
+        &self,
+        mut send_stream: SendStream,
+        mut recv_stream: RecvStream,
+    ) -> Result<()> {
+        let len = recv_stream.read_u32().await?;
+        let mut buf = vec![0; len as usize];
+        recv_stream.read_exact(&mut buf).await?;
+        let message = postcard::from_bytes::<KademliaMessage>(&buf)
+            .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
+
+        if let Some(response) = self.handle_message(message).await {
+            // Serialize the response
+            let response_buf = postcard::to_allocvec(&response)
+                .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
+
+            // Send the response
+            send_stream.write_u32(response_buf.len() as u32).await?;
+            send_stream.write_all(&response_buf).await?;
+        } else {
+            // No response needed
+        }
+        Ok(())
+    }
 }
 
 impl Kademlia {
     /// Create a new Kademlia instance for the given node address
-    pub async fn new(chandler: Arc<ConnectionHandler>) -> Result<Arc<Self>> {
-        let node_addr = endpoint.node_addr().await?;
-        let kademlia = Arc::new(Self {
-            node_addr,
-            chandler,
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            network: RwLock::new(None),
             state: RwLock::new(KademliaState::new()),
             maintenance_handle: Mutex::new(None),
-            self_arc: Mutex::new(None),
-        });
+        })
+    }
+
+    pub async fn init(
+        self: Arc<Self>,
+        chandler: Arc<ConnectionHandler>,
+        bootstrap_nodes: Vec<NodeAddr>,
+    ) -> Result<()> {
+        // Get our node address
+        let node_addr = chandler.get_node_addr().await?;
+
+        // Store the connection handler
+        self.network
+            .write()
+            .await
+            .replace((node_addr.clone(), chandler));
+
+        // Set up the Kademlia instance
+        self.state
+            .write()
+            .await
+            .node_addresses
+            .insert(node_addr.node_id, node_addr.clone());
+
+        if !bootstrap_nodes.is_empty() {
+            self.bootstrap(bootstrap_nodes).await?;
+        }
 
         // Start the maintenance task
-        kademlia.clone().start_maintenance_task();
+        self.start_maintenance_task();
 
-        kademlia
-            .self_arc
-            .lock()
-            .unwrap()
-            .replace(kademlia.clone());
+        Ok(())
+    }
 
-        Ok(kademlia)
+    fn get_node_addr(&self) -> NodeAddr {
+        let handle = Handle::current();
+        handle
+            .block_on(async {
+                let network = self.network.read().await;
+                network.as_ref().map(|(addr, _)| addr.clone())
+            })
+            .expect("Network not initialized")
     }
 
     /// Get our node ID
     fn node_id(&self) -> NodeId {
-        self.node_addr.node_id
+        self.get_node_addr().node_id
     }
 
     /// Get node ID bytes as owned array
     fn node_id_bytes(&self) -> [u8; 32] {
-        *self.node_addr.node_id.as_bytes()
-    }
-
-    pub fn get_self(&self) -> Arc<Self> {
-        self.self_arc
-            .lock()
-            .unwrap()
-            .as_ref()
-            .expect("Self reference not set")
-            .clone()
+        self.node_id().as_bytes().clone()
     }
 
     /// Start periodic maintenance task
@@ -176,9 +227,9 @@ impl Kademlia {
     }
 
     /// Run maintenance to clean up stale nodes and timed-out requests
-    pub fn run_maintenance(&self) {
+    pub async fn run_maintenance(&self) {
         // Use a write lock to update the state
-        let mut state = self.state.write().unwrap();
+        let mut state = self.state.write().await;
 
         // Remove stale nodes from all buckets
         for bucket in state.k_buckets.iter_mut() {
@@ -218,62 +269,68 @@ impl Kademlia {
     }
 
     /// Handle an incoming Kademlia message
-    pub fn handle_message(&self, message: KademliaMessage) -> Option<KademliaMessage> {
+    pub async fn handle_message(&self, message: KademliaMessage) -> Option<KademliaMessage> {
         // Update routing table with sender
         {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write().await;
             self.update_node_seen(&mut state, message.sender.clone());
         }
 
         // Route message based on whether it's a request or response
         if message.is_response() {
             // Handle response (no reply needed)
-            self.handle_response(message);
+            self.handle_response(message).await;
             None
         } else {
             // Handle request and generate response
-            self.handle_request(message)
+            self.handle_request(message).await
         }
     }
 
     /// Handle a request message and generate a response
-    fn handle_request(&self, request: KademliaMessage) -> Option<KademliaMessage> {
+    async fn handle_request(&self, request: KademliaMessage) -> Option<KademliaMessage> {
         match request.msg_type {
             MessageType::PingRequest => {
                 // Simple ping response
-                Some(request.create_response(self.node_addr.clone(), MessageType::PingResponse))
+                Some(request.create_response(self.get_node_addr(), MessageType::PingResponse))
             }
 
             MessageType::FindRequest { target } => {
                 // Read lock for finding nodes
-                let state = self.state.read().unwrap();
+                let state = self.state.read().await;
 
                 // Check if we have the value for this target
                 let value = state
                     .resources
                     .get(&target)
-                    .and_then(|node_id| state.node_addresses.get(node_id).cloned());
+                    .cloned()
+                    .or_else(|| {
+                        // If not found, check if we have an exact result for the node address
+                        state.node_addresses.get(&target).map(|addr| addr.node_id)
+                    })
+                    // And then get the specific NodeAddr
+                    .and_then(|node_id| state.node_addresses.get(&node_id).cloned());
 
                 // Find closest nodes to target
-                let nodes = self.find_closest_nodes(&target);
+                let nodes = self.find_closest_nodes(&target).await;
 
                 // Create response
                 Some(request.create_response(
-                    self.node_addr.clone(),
+                    self.get_node_addr(),
                     MessageType::FindResponse { value, nodes },
                 ))
             }
 
             MessageType::StoreRequest { key, ref value } => {
                 // Write lock for storing
-                let mut state = self.state.write().unwrap();
+                let mut state = self.state.write().await;
 
                 // Store the key-value pair
                 state.resources.insert(key, value.node_id);
                 state.node_addresses.insert(value.node_id, value.clone());
 
                 // Create response
-                Some(request.create_response(self.node_addr.clone(), MessageType::StoreResponse))
+                Some(request.create_response(self.get_node_addr(), MessageType::StoreResponse))
             }
 
             // Ignore response messages in request handler
@@ -282,11 +339,11 @@ impl Kademlia {
     }
 
     /// Handle a response message
-    fn handle_response(&self, response: KademliaMessage) {
+    async fn handle_response(&self, response: KademliaMessage) {
         let command_id = response.id;
 
         // Process the response in the context of the pending command
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write().await;
 
         if let Some(cmd_state) = state.pending_commands.get_mut(&command_id) {
             match response.msg_type {
@@ -315,7 +372,7 @@ impl Kademlia {
                     cmd_state.pending_count -= 1;
 
                     // Process new nodes
-                    self.process_find_nodes(&mut state, command_id, nodes);
+                    self.process_find_nodes(&mut state, command_id, nodes).await;
                 }
 
                 MessageType::StoreResponse => {
@@ -331,7 +388,7 @@ impl Kademlia {
     }
 
     /// Process nodes from a find response
-    fn process_find_nodes(
+    async fn process_find_nodes(
         &self,
         state: &mut KademliaState,
         command_id: Ulid,
@@ -339,7 +396,7 @@ impl Kademlia {
     ) {
         // Add new nodes to our routing table and track as closest
         for node_addr in &nodes {
-            if node_addr.node_id != self.node_addr.node_id {
+            if node_addr.node_id != self.node_id() {
                 self.update_node_seen(state, node_addr.clone());
                 let cmd_state = state
                     .pending_commands
@@ -357,8 +414,7 @@ impl Kademlia {
         let new_nodes: Vec<_> = nodes
             .into_iter()
             .filter(|addr| {
-                !cmd_state.visited_nodes.contains(&addr.node_id)
-                    && addr.node_id != self.node_addr.node_id
+                !cmd_state.visited_nodes.contains(&addr.node_id) && addr.node_id != self.node_id()
             })
             .collect();
 
@@ -372,7 +428,7 @@ impl Kademlia {
         let target = cmd_state.target;
 
         // Find closest new nodes and query them
-        self.query_nodes(state, command_id, new_nodes, target);
+        self.query_nodes(state, command_id, new_nodes, target).await;
     }
 
     /// Check if a command is complete
@@ -411,7 +467,7 @@ impl Kademlia {
     }
 
     /// Query nodes for a target
-    fn query_nodes(
+    async fn query_nodes(
         &self,
         state: &mut KademliaState,
         command_id: Ulid,
@@ -450,11 +506,11 @@ impl Kademlia {
                 // Send message
                 let message = KademliaMessage::new_request(
                     command_id,
-                    self.node_addr.clone(),
+                    self.get_node_addr(),
                     MessageType::FindRequest { target },
                 );
 
-                self.send_message(message, addr);
+                self.send_message(message, addr).await;
             }
         }
     }
@@ -464,7 +520,7 @@ impl Kademlia {
         let node_id = addr.node_id;
 
         // Don't track ourselves
-        if node_id == self.node_addr.node_id {
+        if node_id == self.node_id() {
             return;
         }
 
@@ -481,25 +537,48 @@ impl Kademlia {
         // Try to update the bucket
         if let Some(least_recent_addr) = state.k_buckets[bucket_idx].update(node_info) {
             // Only ping if it's not us
-            if least_recent_addr.node_id != self.node_addr.node_id {
+            if least_recent_addr.node_id != self.node_id() {
                 self.spawn_ping(state, least_recent_addr);
             }
         }
     }
 
     /// Send a message to a node
-    fn send_message(&self, message: KademliaMessage, target_addr: NodeAddr) {
+    async fn send_message(
+        &self,
+        message: KademliaMessage,
+        target_addr: NodeAddr,
+    ) -> Result<KademliaMessage> {
+        let guard = self.network.read().await;
+        let Some((_, chandler)) = guard.as_ref() else {
+            return Err(anyhow!("Network not initialized"));
+        };
 
+        let (mut rx, mut sx) = chandler
+            .get_bidi_stream(target_addr.node_id, KADEMLIA_PROTOCOL_ID)
+            .await?;
 
+        // Serialize the message
+        let buf = postcard::to_allocvec(&message)
+            .map_err(|e| anyhow!("Failed to serialize message: {e:#}"))?;
+        // Send the message
+        sx.write_u32(buf.len() as u32).await?;
+        sx.write_all(&buf).await?;
+        sx.flush().await?;
 
+        // Read the response
+        let len = rx.read_u32().await?;
+        let mut buf = vec![0; len as usize];
+        rx.read_exact(&mut buf).await?;
+        let response = postcard::from_bytes::<KademliaMessage>(&buf)
+            .map_err(|e| anyhow!("Failed to deserialize response: {e:#}"))?;
 
-
-
+        Ok(response)
     }
 
     /// Find the closest nodes to a target from our routing table
-    fn find_closest_nodes(&self, target: &[u8; 32]) -> Vec<NodeAddr> {
-        let state = self.state.read().unwrap();
+    async fn find_closest_nodes(&self, target: &[u8; 32]) -> Vec<NodeAddr> {
+        let state = self.state.read().await;
         self.find_closest_nodes_inner(&state, target)
     }
 
@@ -559,7 +638,7 @@ impl Kademlia {
     }
 
     /// Spawn a ping command
-    fn spawn_ping(
+    async fn spawn_ping(
         &self,
         state: &mut KademliaState,
         target: NodeAddr,
@@ -579,9 +658,9 @@ impl Kademlia {
 
         // Send ping message
         let message =
-            KademliaMessage::new_request(id, self.node_addr.clone(), MessageType::PingRequest);
+            KademliaMessage::new_request(id, self.get_node_addr(), MessageType::PingRequest);
 
-        self.send_message(message, target);
+        self.send_message(message, target).await;
 
         receiver
     }
@@ -590,7 +669,7 @@ impl Kademlia {
     pub async fn find(&self, target: [u8; 32]) -> Result<FindResult> {
         // First check if we have the value locally
         let local_value = {
-            let state = self.state.read().unwrap();
+            let state = self.state.read().await;
             state
                 .resources
                 .get(&target)
@@ -606,7 +685,7 @@ impl Kademlia {
         }
 
         // Find closest nodes without holding a lock for too long
-        let closest_nodes = self.find_closest_nodes(&target);
+        let closest_nodes = self.find_closest_nodes(&target).await;
 
         // If no nodes found, return empty result
         if closest_nodes.is_empty() {
@@ -623,21 +702,21 @@ impl Kademlia {
 
         // Setup the find operation
         {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write().await;
 
             // Initialize state
             let mut cmd_state = CommandState::new(target, command_type);
 
             // Send find messages to closest nodes
             for addr in &closest_nodes {
-                if addr.node_id != self.node_addr.node_id {
+                if addr.node_id != self.node_id() {
                     cmd_state.visited_nodes.insert(addr.node_id);
                     cmd_state.pending_count += 1;
 
                     // Prepare message
                     let message = KademliaMessage::new_request(
                         command_id,
-                        self.node_addr.clone(),
+                        self.get_node_addr(),
                         MessageType::FindRequest { target },
                     );
 
@@ -660,13 +739,13 @@ impl Kademlia {
     pub async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<()> {
         // Store locally first
         {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write().await;
             state.resources.insert(key, value.node_id);
             state.node_addresses.insert(value.node_id, value.clone());
         }
 
         // Find nodes closest to the key without holding the lock
-        let closest_nodes = self.find_closest_nodes(&key);
+        let closest_nodes = self.find_closest_nodes(&key).await;
 
         // If no nodes, we're done
         if closest_nodes.is_empty() {
@@ -679,7 +758,7 @@ impl Kademlia {
 
         // Setup the store operation
         {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write().await;
 
             // Create command type
             let command_type = CommandType::Store(Some(sender));
@@ -689,7 +768,7 @@ impl Kademlia {
 
             // Send store messages to closest nodes
             for addr in closest_nodes {
-                if addr.node_id != self.node_addr.node_id {
+                if addr.node_id != self.node_id() {
                     // Track this node
                     cmd_state.visited_nodes.insert(addr.node_id);
                     cmd_state.pending_count += 1;
@@ -697,7 +776,7 @@ impl Kademlia {
                     // Send message
                     let message = KademliaMessage::new_request(
                         command_id,
-                        self.node_addr.clone(),
+                        self.get_node_addr(),
                         MessageType::StoreRequest {
                             key,
                             value: value.clone(),
@@ -729,7 +808,7 @@ impl Kademlia {
 
         // Add bootstrap nodes to our routing table
         {
-            let mut state = self.state.write().unwrap();
+            let mut state = self.state.write().await;
             for addr in bootstrap_nodes.clone() {
                 self.update_node_seen(&mut state, addr);
             }
@@ -740,32 +819,32 @@ impl Kademlia {
         let find_result = self.find(target).await?;
 
         // Store our node in the network
-        self.store(target, self.node_addr.clone()).await?;
+        self.store(target, self.get_node_addr()).await?;
 
         Ok(find_result.nodes)
     }
 
     // Utility functions for direct access to resources
-    pub fn store_local(&self, key: [u8; 32], value: NodeId) {
-        let mut state = self.state.write().unwrap();
+    pub async fn store_local(&self, key: [u8; 32], value: NodeId) {
+        let mut state = self.state.write().await;
         state.resources.insert(key, value);
     }
 
-    pub fn lookup_local(&self, key: &[u8; 32]) -> Option<NodeId> {
-        let state = self.state.read().unwrap();
+    pub async fn lookup_local(&self, key: &[u8; 32]) -> Option<NodeId> {
+        let state = self.state.read().await;
         state.resources.get(key).cloned()
     }
 
-    pub fn lookup_local_addr(&self, key: &[u8; 32]) -> Option<NodeAddr> {
-        let state = self.state.read().unwrap();
+    pub async fn lookup_local_addr(&self, key: &[u8; 32]) -> Option<NodeAddr> {
+        let state = self.state.read().await;
         state
             .resources
             .get(key)
             .and_then(|node_id| state.node_addresses.get(node_id).cloned())
     }
 
-    pub fn get_all_nodes(&self) -> Vec<NodeAddr> {
-        let state = self.state.read().unwrap();
+    pub async fn get_all_nodes(&self) -> Vec<NodeAddr> {
+        let state = self.state.read().await;
         state.node_addresses.values().cloned().collect()
     }
 }

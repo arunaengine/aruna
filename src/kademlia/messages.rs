@@ -1,8 +1,9 @@
 use iroh::NodeAddr;
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 /// Message type to distinguish between requests and responses
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MessageType {
     // Request types
     PingRequest,
@@ -24,7 +25,7 @@ pub enum MessageType {
 }
 
 /// Unified Message structure for Kademlia protocol
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KademliaMessage {
     pub id: Ulid,              // Message ID (for requests and responses)
     pub sender: NodeAddr,      // Sender of this message

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use iroh::{
     Endpoint, NodeId,
     discovery::{Discovery, DiscoveryItem},
@@ -7,7 +9,12 @@ use iroh::{
 use crate::Kademlia;
 use n0_future::boxed::BoxStream;
 
-impl Discovery for Kademlia {
+#[derive(Clone, Debug)]
+pub struct KademliaArc {
+    kademlia: Arc<Kademlia>,
+}
+
+impl Discovery for KademliaArc {
     fn publish(&self, _data: &NodeData) {}
 
     fn resolve(
@@ -16,11 +23,18 @@ impl Discovery for Kademlia {
         node_id: NodeId,
     ) -> Option<BoxStream<anyhow::Result<DiscoveryItem>>> {
         let target = node_id.as_bytes().clone();
-        let arc_self = self.get_self();
+        let self_clone = self.clone();
         let fut = async move {
-            let target = arc_self.find(target).await?;
+            let target = self_clone.kademlia.find(target).await?;
             Ok(DiscoveryItem::new(
-                NodeInfo::from_parts(node_id, NodeData::from(target.value.unwrap())),
+                NodeInfo::from_parts(
+                    node_id,
+                    NodeData::from(
+                        target
+                            .value
+                            .ok_or_else(|| anyhow::anyhow!("Node not found"))?,
+                    ),
+                ),
                 "ARUNA_KADEMLIA",
                 None,
             ))
