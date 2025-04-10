@@ -1,8 +1,9 @@
 use crate::K_BUCKET_SIZE;
-use crate::node_info::NodeInfo;
+use crate::kademlia::node_info::NodeInfo;
 use iroh::{NodeAddr, NodeId};
 
 /// K-Bucket structure that stores NodeInfo directly in a fixed-size array
+#[derive(Clone, Debug)]
 pub struct KBucket {
     nodes: [Option<NodeInfo>; K_BUCKET_SIZE],
 }

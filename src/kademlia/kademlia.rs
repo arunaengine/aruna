@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use futures_util::FutureExt;
-use iroh::{NodeAddr, NodeId};
+use iroh::{Endpoint, NodeAddr, NodeId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -8,13 +8,15 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
-use crate::k_bucket::KBucket;
-use crate::messages::{FindResult, KademliaMessage, MessageType};
-use crate::node_info::NodeInfo;
-use crate::utils::{calculate_distance, get_bucket_index};
+use crate::connection_handler::ConnectionHandler;
+use crate::kademlia::k_bucket::KBucket;
+use crate::kademlia::messages::{FindResult, KademliaMessage, MessageType};
+use crate::kademlia::node_info::NodeInfo;
+use crate::kademlia::utils::{calculate_distance, get_bucket_index};
 use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
 
 /// Internal mutable state of Kademlia
+#[derive(Debug)]
 struct KademliaState {
     k_buckets: [KBucket; 256],
     resources: HashMap<[u8; 32], NodeId>,
@@ -34,6 +36,7 @@ impl KademliaState {
 }
 
 /// Simplified command type enum with better type safety
+#[derive(Debug)]
 enum CommandType {
     Find(Option<oneshot::Sender<Result<FindResult>>>),
     Store(Option<oneshot::Sender<Result<()>>>),
@@ -41,6 +44,7 @@ enum CommandType {
 }
 
 /// Combined command state for tracking progress
+#[derive(Debug)]
 struct CommandState {
     started_at: Instant,
     visited_nodes: HashSet<NodeId>,
@@ -94,25 +98,37 @@ impl CommandState {
 }
 
 /// Kademlia distributed hash table implementation with interior mutability
+#[derive(Debug)]
 pub struct Kademlia {
     node_addr: NodeAddr,
-    state: RwLock<KademliaState>,
+    chandler: Arc<ConnectionHandler>,
+    pub state: RwLock<KademliaState>,
     maintenance_handle: Mutex<Option<JoinHandle<()>>>,
+    self_arc: Mutex<Option<Arc<Self>>>,
 }
 
 impl Kademlia {
     /// Create a new Kademlia instance for the given node address
-    pub fn new(node_addr: NodeAddr) -> Arc<Self> {
+    pub async fn new(chandler: Arc<ConnectionHandler>) -> Result<Arc<Self>> {
+        let node_addr = endpoint.node_addr().await?;
         let kademlia = Arc::new(Self {
             node_addr,
+            chandler,
             state: RwLock::new(KademliaState::new()),
             maintenance_handle: Mutex::new(None),
+            self_arc: Mutex::new(None),
         });
 
         // Start the maintenance task
-        Arc::clone(&kademlia).start_maintenance_task();
+        kademlia.clone().start_maintenance_task();
 
         kademlia
+            .self_arc
+            .lock()
+            .unwrap()
+            .replace(kademlia.clone());
+
+        Ok(kademlia)
     }
 
     /// Get our node ID
@@ -123,6 +139,15 @@ impl Kademlia {
     /// Get node ID bytes as owned array
     fn node_id_bytes(&self) -> [u8; 32] {
         *self.node_addr.node_id.as_bytes()
+    }
+
+    pub fn get_self(&self) -> Arc<Self> {
+        self.self_arc
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("Self reference not set")
+            .clone()
     }
 
     /// Start periodic maintenance task
@@ -464,12 +489,12 @@ impl Kademlia {
 
     /// Send a message to a node
     fn send_message(&self, message: KademliaMessage, target_addr: NodeAddr) {
-        // This function would integrate with the network layer
-        // For now, it's just a placeholder
-        println!(
-            "Sending {:?} to {:?}",
-            message.msg_type, target_addr.node_id
-        );
+
+
+
+
+
+
     }
 
     /// Find the closest nodes to a target from our routing table

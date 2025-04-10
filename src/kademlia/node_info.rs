@@ -3,7 +3,7 @@ use iroh::NodeAddr;
 use std::time::Instant;
 
 /// Node info struct - Contains node information with last_seen timestamp
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NodeInfo {
     pub addr: NodeAddr,
     pub last_seen: Instant,
