@@ -21,12 +21,15 @@ impl KBucket {
     ///
     /// If the node already exists, updates its last_seen timestamp.
     /// If the bucket is full, returns the least recently seen node for pinging.
-    pub fn update(&mut self, info: NodeInfo) -> Option<NodeAddr> {
+    pub fn update(&mut self, info: NodeInfo) -> Option<(NodeAddr, usize)> {
         let node_id = &info.addr.node_id;
 
         // If node exists, update its last_seen timestamp
         if let Some(pos) = self.find_node(node_id) {
-            self.nodes[pos].as_mut().unwrap().update_last_seen();
+            self.nodes[pos]
+                .as_mut()
+                .expect("This should exist")
+                .update_last_seen();
             return None;
         }
 
@@ -39,7 +42,9 @@ impl KBucket {
         // If bucket is full, return the least recently seen node for ping
         if let Some(pos) = self.find_least_recently_seen() {
             // Return the address of the least recently seen node
-            let lrs_addr = self.nodes[pos].as_ref().map(|info| info.addr.clone());
+            let lrs_addr = self.nodes[pos]
+                .as_ref()
+                .map(|info| (info.addr.clone(), pos));
 
             // Replace with the new node
             self.nodes[pos] = Some(info);
@@ -49,6 +54,18 @@ impl KBucket {
 
         // This should never happen as long as K_BUCKET_SIZE > 0
         None
+    }
+
+    pub fn replace_node(&mut self, pos: usize, info: NodeInfo) {
+        // Replace the node at the given position
+        self.nodes[pos] = Some(info);
+    }
+
+    pub fn refresh_node(&mut self, pos: usize) {
+        // Refresh the last seen time of the node at the given position
+        if let Some(info) = self.nodes[pos].as_mut() {
+            info.update_last_seen();
+        }
     }
 
     /// Find a node in the bucket by its ID

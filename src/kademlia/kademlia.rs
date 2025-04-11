@@ -1,33 +1,34 @@
 use anyhow::{Result, anyhow};
-use futures_util::FutureExt;
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{NodeAddr, NodeId};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
 
 use crate::connection_handler::{ConnectionHandler, ProtocolHandler};
 use crate::kademlia::k_bucket::KBucket;
-use crate::kademlia::messages::{FindResult, KademliaMessage, MessageType};
+use crate::kademlia::messages::{KademliaMessage, MessageType};
 use crate::kademlia::node_info::NodeInfo;
 use crate::kademlia::utils::{calculate_distance, get_bucket_index};
 use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
 
+use super::messages::FindResult;
+
 pub const KADEMLIA_PROTOCOL_ID: u32 = 1;
+pub const KEY_TTL: Duration = Duration::from_secs(86400); // 1d
+pub const REPUBLISH_INTERVAL: Duration = Duration::from_secs(84600); // 23h30m
 
 /// Internal mutable state of Kademlia
 #[derive(Debug)]
 struct KademliaState {
     k_buckets: [KBucket; 256],
-    resources: HashMap<[u8; 32], NodeId>,
+    resources: HashMap<[u8; 32], Vec<(NodeId, SystemTime)>>, // Multiple nodes per key with TTL
     node_addresses: HashMap<NodeId, NodeAddr>,
-    pending_commands: HashMap<Ulid, CommandState>,
 }
 
 impl KademliaState {
@@ -36,71 +37,31 @@ impl KademliaState {
             k_buckets: std::array::from_fn(|_| KBucket::new()),
             resources: HashMap::new(),
             node_addresses: HashMap::new(),
-            pending_commands: HashMap::new(),
-        }
-    }
-}
-
-/// Simplified command type enum with better type safety
-// TODO: This is unnecessary remove it
-#[derive(Debug)]
-enum CommandType {
-    Find(Option<oneshot::Sender<Result<FindResult>>>),
-    Store(Option<oneshot::Sender<Result<()>>>),
-    Ping(Option<oneshot::Sender<Result<bool>>>),
-}
-
-/// Combined command state for tracking progress
-#[derive(Debug)]
-struct CommandState {
-    started_at: Instant,
-    visited_nodes: HashSet<NodeId>,
-    closest_nodes: BTreeMap<[u8; 32], NodeAddr>, // Using BTreeMap with distance as key
-    found_value: Option<NodeAddr>,
-    target: [u8; 32],
-    pending_count: usize,
-    command_type: CommandType,
-}
-
-impl CommandState {
-    fn new(target: [u8; 32], command_type: CommandType) -> Self {
-        Self {
-            started_at: Instant::now(),
-            visited_nodes: HashSet::new(),
-            closest_nodes: BTreeMap::new(),
-            found_value: None,
-            target,
-            pending_count: 0,
-            command_type,
         }
     }
 
-    fn is_timed_out(&self) -> bool {
-        self.started_at.elapsed() > REQUEST_TIMEOUT
-    }
+    // Helper method to clean up expired resources
+    fn prune_expired_resources(&mut self) -> usize {
+        let now = SystemTime::now();
+        let mut total_pruned = 0;
+        let mut empty_keys = Vec::new();
 
-    fn add_closest_node(&mut self, node: NodeAddr) {
-        let distance = calculate_distance(&self.target, node.node_id.as_bytes());
+        for (key, values) in self.resources.iter_mut() {
+            let initial_size = values.len();
+            values.retain(|(_, expires_at)| *expires_at > now);
+            total_pruned += initial_size - values.len();
 
-        // Insert this node with its distance
-        self.closest_nodes.insert(distance, node);
-
-        // Keep only the K closest nodes
-        // Since BTreeMap is sorted by key (distance), we remove the largest distances
-        while self.closest_nodes.len() > K_BUCKET_SIZE {
-            if let Some(max_distance) = self.closest_nodes.keys().last().cloned() {
-                self.closest_nodes.remove(&max_distance);
+            if values.is_empty() {
+                empty_keys.push(*key);
             }
         }
-    }
 
-    fn get_closest_nodes(&self) -> Vec<NodeAddr> {
-        // Return the values (NodeAddr) from closest to farthest
-        self.closest_nodes.values().cloned().collect()
-    }
+        // Remove completely empty keys
+        for key in empty_keys {
+            self.resources.remove(&key);
+        }
 
-    fn get_found_value(&self) -> Option<NodeAddr> {
-        self.found_value.clone()
+        total_pruned
     }
 }
 
@@ -109,7 +70,7 @@ impl CommandState {
 pub struct Kademlia {
     network: RwLock<Option<(NodeAddr, Arc<ConnectionHandler>)>>,
     state: RwLock<KademliaState>,
-    maintenance_handle: Mutex<Option<JoinHandle<()>>>,
+    maintenance_handle: RwLock<Option<JoinHandle<()>>>,
 }
 
 #[async_trait::async_trait]
@@ -133,20 +94,18 @@ impl ProtocolHandler for Kademlia {
             // Send the response
             send_stream.write_u32(response_buf.len() as u32).await?;
             send_stream.write_all(&response_buf).await?;
-        } else {
-            // No response needed
         }
         Ok(())
     }
 }
 
 impl Kademlia {
-    /// Create a new Kademlia instance for the given node address
+    /// Create a new Kademlia instance
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             network: RwLock::new(None),
             state: RwLock::new(KademliaState::new()),
-            maintenance_handle: Mutex::new(None),
+            maintenance_handle: RwLock::new(None),
         })
     }
 
@@ -171,6 +130,7 @@ impl Kademlia {
             .node_addresses
             .insert(node_addr.node_id, node_addr.clone());
 
+        // Bootstrap the node if needed
         if !bootstrap_nodes.is_empty() {
             self.bootstrap(bootstrap_nodes).await?;
         }
@@ -207,26 +167,38 @@ impl Kademlia {
 
         // Spawn the background task with simple sleep-based scheduling
         let handle = tokio::spawn(async move {
+            let mut republish_timer = tokio::time::interval(REPUBLISH_INTERVAL);
+            let mut maintenance_timer = tokio::time::interval(Duration::from_secs(60));
+
             loop {
-                // Run maintenance every 60 seconds
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::select! {
+                    // Maintenance timer
+                    _ = maintenance_timer.tick() => {
+                        kademlia_clone.run_maintenance().await;
+                        println!("Maintenance run for node {}", kademlia_clone.node_id());
+                    }
 
-                // Run maintenance
-                kademlia_clone.run_maintenance();
-                println!("Maintenance run for node {}", kademlia_clone.node_id());
+                    // Republish timer
+                    _ = republish_timer.tick() => {
+                        kademlia_clone.republish_resources().await;
+                        println!("Resources republished for node {}", kademlia_clone.node_id());
+                    }
 
-                // Check for shutdown signal
-                if tokio::signal::ctrl_c().now_or_never().is_some() {
-                    break;
+                    // Check for shutdown signal
+                    _ = tokio::signal::ctrl_c() => {
+                        break;
+                    }
                 }
             }
         });
 
         // Store the handle
-        *self.maintenance_handle.lock().unwrap() = Some(handle);
+        tokio::spawn(async move {
+            *self.maintenance_handle.write().await = Some(handle);
+        });
     }
 
-    /// Run maintenance to clean up stale nodes and timed-out requests
+    /// Run maintenance to clean up stale nodes and expired keys
     pub async fn run_maintenance(&self) {
         // Use a write lock to update the state
         let mut state = self.state.write().await;
@@ -236,35 +208,39 @@ impl Kademlia {
             let _ = bucket.prune_stale_nodes();
         }
 
-        // Clean up timed-out commands
-        let timed_out: Vec<Ulid> = state
-            .pending_commands
-            .iter()
-            .filter(|(_, cmd_state)| cmd_state.is_timed_out())
-            .map(|(id, _)| *id)
-            .collect();
+        // Clean up expired resources
+        let pruned_count = state.prune_expired_resources();
 
-        // Simply abort all timed-out commands with error
-        for id in timed_out {
-            if let Some(cmd_state) = state.pending_commands.remove(&id) {
-                match cmd_state.command_type {
-                    CommandType::Find(mut sender) => {
-                        if let Some(s) = sender.take() {
-                            let _ = s.send(Err(anyhow!("Find operation timed out")));
-                        }
-                    }
-                    CommandType::Store(mut sender) => {
-                        if let Some(s) = sender.take() {
-                            let _ = s.send(Err(anyhow!("Store operation timed out")));
-                        }
-                    }
-                    CommandType::Ping(mut sender) => {
-                        if let Some(tx) = sender.take() {
-                            let _ = tx.send(Err(anyhow!("Ping operation timed out")));
-                        }
+        // Log maintenance results if significant
+        if pruned_count > 0 {
+            println!(
+                "Maintenance: pruned {} expired resource entries",
+                pruned_count
+            );
+        }
+    }
+
+    /// Periodically republish all stored key-value pairs
+    async fn republish_resources(&self) {
+        // Get all resources to republish
+        let resources_to_republish = {
+            let state = self.state.read().await;
+            let mut resources = Vec::new();
+
+            for (key, values) in &state.resources {
+                for (node_id, _) in values {
+                    if let Some(addr) = state.node_addresses.get(node_id) {
+                        resources.push((*key, addr.clone()));
                     }
                 }
             }
+
+            resources
+        };
+
+        // Republish each resource
+        for (key, value) in resources_to_republish {
+            let _ = self.store(key, value).await;
         }
     }
 
@@ -273,7 +249,8 @@ impl Kademlia {
         // Update routing table with sender
         {
             let mut state = self.state.write().await;
-            self.update_node_seen(&mut state, message.sender.clone());
+            self.update_node_seen(&mut state, message.sender.clone())
+                .await;
         }
 
         // Route message based on whether it's a request or response
@@ -299,25 +276,35 @@ impl Kademlia {
                 // Read lock for finding nodes
                 let state = self.state.read().await;
 
-                // Check if we have the value for this target
-                let value = state
-                    .resources
-                    .get(&target)
-                    .cloned()
-                    .or_else(|| {
-                        // If not found, check if we have an exact result for the node address
-                        state.node_addresses.get(&target).map(|addr| addr.node_id)
-                    })
-                    // And then get the specific NodeAddr
-                    .and_then(|node_id| state.node_addresses.get(&node_id).cloned());
+                // Get all values for this target
+                let mut values = Vec::new();
+
+                // First check resource values
+                if let Some(entries) = state.resources.get(&target) {
+                    for (node_id, _) in entries {
+                        if let Some(addr) = state.node_addresses.get(node_id) {
+                            values.push(addr.clone());
+                        }
+                    }
+                }
+
+                // Also check if we have an exact match for node ID
+                if values.is_empty() {
+                    if let Some(addr) = state.node_addresses.get(&target) {
+                        values.push(addr.clone());
+                    }
+                }
 
                 // Find closest nodes to target
-                let nodes = self.find_closest_nodes(&target).await;
+                let closest_nodes = self.find_closest_nodes(&target).await;
 
-                // Create response
+                // Create response with values and closest nodes
                 Some(request.create_response(
                     self.get_node_addr(),
-                    MessageType::FindResponse { value, nodes },
+                    MessageType::FindResponse {
+                        value: values,
+                        nodes: closest_nodes,
+                    },
                 ))
             }
 
@@ -325,8 +312,16 @@ impl Kademlia {
                 // Write lock for storing
                 let mut state = self.state.write().await;
 
-                // Store the key-value pair
-                state.resources.insert(key, value.node_id);
+                // Calculate expiration time
+                let expires_at = SystemTime::now() + KEY_TTL;
+
+                // Get or create entry for this key
+                let entries = state.resources.entry(key).or_insert_with(Vec::new);
+
+                // Update the entry with new TTL
+                entries.push((value.node_id, expires_at));
+
+                // Always update the node address mapping
                 state.node_addresses.insert(value.node_id, value.clone());
 
                 // Create response
@@ -340,205 +335,24 @@ impl Kademlia {
 
     /// Handle a response message
     async fn handle_response(&self, response: KademliaMessage) {
-        let command_id = response.id;
+        // Just update our routing table with received information
+        if let MessageType::FindResponse {
+            ref value,
+            ref nodes,
+        } = response.msg_type
+        {
+            let mut state = self.state.write().await;
 
-        // Process the response in the context of the pending command
-        let mut state = self.state.write().await;
-
-        if let Some(cmd_state) = state.pending_commands.get_mut(&command_id) {
-            match response.msg_type {
-                MessageType::PingResponse => {
-                    // Extract and complete the ping command
-                    if let CommandType::Ping(sender) =
-                        std::mem::replace(&mut cmd_state.command_type, CommandType::Ping(None))
-                    {
-                        if let Some(tx) = sender {
-                            let _ = tx.send(Ok(true));
-                        }
-                        // Remove this command
-                        state.pending_commands.remove(&command_id);
-                    }
-                }
-
-                MessageType::FindResponse { value, nodes } => {
-                    // Process find response
-                    // If we found a value, store it and complete
-                    if let Some(val) = value {
-                        cmd_state.found_value = Some(val);
-                        self.complete_command(&mut state, command_id);
-                        return;
-                    }
-
-                    cmd_state.pending_count -= 1;
-
-                    // Process new nodes
-                    self.process_find_nodes(&mut state, command_id, nodes).await;
-                }
-
-                MessageType::StoreResponse => {
-                    // Simply decrement pending count and check completion
-                    cmd_state.pending_count -= 1;
-                    self.check_command_completion(&mut state, command_id);
-                }
-
-                // Ignore request messages in response handler
-                _ => {}
-            }
-        }
-    }
-
-    /// Process nodes from a find response
-    async fn process_find_nodes(
-        &self,
-        state: &mut KademliaState,
-        command_id: Ulid,
-        nodes: Vec<NodeAddr>,
-    ) {
-        // Add new nodes to our routing table and track as closest
-        for node_addr in &nodes {
-            if node_addr.node_id != self.node_id() {
-                self.update_node_seen(state, node_addr.clone());
-                let cmd_state = state
-                    .pending_commands
-                    .get_mut(&command_id)
-                    .expect("Command state not found");
-                cmd_state.add_closest_node(node_addr.clone());
-            }
-        }
-        let cmd_state = state
-            .pending_commands
-            .get_mut(&command_id)
-            .expect("Command state not found");
-
-        // Find new nodes to query
-        let new_nodes: Vec<_> = nodes
-            .into_iter()
-            .filter(|addr| {
-                !cmd_state.visited_nodes.contains(&addr.node_id) && addr.node_id != self.node_id()
-            })
-            .collect();
-
-        if new_nodes.is_empty() || cmd_state.pending_count == 0 {
-            // No more nodes to query or no pending requests, check completion
-            self.check_command_completion(state, command_id);
-            return;
-        }
-
-        // Copy target for query_nodes
-        let target = cmd_state.target;
-
-        // Find closest new nodes and query them
-        self.query_nodes(state, command_id, new_nodes, target).await;
-    }
-
-    /// Check if a command is complete
-    fn check_command_completion(&self, state: &mut KademliaState, command_id: Ulid) {
-        if let Some(cmd_state) = state.pending_commands.get(&command_id) {
-            if cmd_state.pending_count == 0 || cmd_state.found_value.is_some() {
-                self.complete_command(state, command_id);
-            }
-        }
-    }
-
-    /// Complete a command and send the result
-    fn complete_command(&self, state: &mut KademliaState, command_id: Ulid) {
-        if let Some(mut cmd_state) = state.pending_commands.remove(&command_id) {
-            match &mut cmd_state.command_type {
-                CommandType::Find(sender) => {
-                    if let Some(s) = sender.take() {
-                        let _ = s.send(Ok(FindResult {
-                            value: cmd_state.get_found_value(),
-                            nodes: cmd_state.get_closest_nodes(),
-                        }));
-                    }
-                }
-                CommandType::Store(sender) => {
-                    if let Some(s) = sender.take() {
-                        let _ = s.send(Ok(()));
-                    }
-                }
-                CommandType::Ping(sender) => {
-                    if let Some(s) = sender.take() {
-                        let _ = s.send(Ok(true));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Query nodes for a target
-    async fn query_nodes(
-        &self,
-        state: &mut KademliaState,
-        command_id: Ulid,
-        nodes: Vec<NodeAddr>,
-        target: [u8; 32],
-    ) {
-        if let Some(cmd_state) = state.pending_commands.get_mut(&command_id) {
-            // Sort nodes by distance to target
-            let mut with_distance: Vec<_> = nodes
-                .into_iter()
-                .map(|addr| {
-                    let distance = calculate_distance(&target, addr.node_id.as_bytes());
-                    (addr, distance)
-                })
-                .collect();
-
-            with_distance.sort_by(|a, b| a.1.cmp(&b.1));
-
-            // Take up to ALPHA closest nodes
-            let closest = with_distance
-                .into_iter()
-                .take(ALPHA)
-                .map(|(addr, _)| addr)
-                .collect::<Vec<_>>();
-
-            if closest.is_empty() {
-                self.check_command_completion(state, command_id);
-                return;
+            // Add all value entries if present
+            for val in value {
+                state.node_addresses.insert(val.node_id, val.clone());
             }
 
-            // Send Find messages to closest nodes
-            for addr in closest {
-                cmd_state.visited_nodes.insert(addr.node_id);
-                cmd_state.pending_count += 1;
-
-                // Send message
-                let message = KademliaMessage::new_request(
-                    command_id,
-                    self.get_node_addr(),
-                    MessageType::FindRequest { target },
-                );
-
-                self.send_message(message, addr).await;
-            }
-        }
-    }
-
-    /// Update a node's info in the appropriate k-bucket
-    fn update_node_seen(&self, state: &mut KademliaState, addr: NodeAddr) {
-        let node_id = addr.node_id;
-
-        // Don't track ourselves
-        if node_id == self.node_id() {
-            return;
-        }
-
-        // Store in our quick lookup map
-        state.node_addresses.insert(node_id, addr.clone());
-
-        // Calculate bucket index
-        let distance = calculate_distance(&self.node_id_bytes(), node_id.as_bytes());
-        let bucket_idx = get_bucket_index(&distance);
-
-        // Create new node info
-        let node_info = NodeInfo::new(addr.clone());
-
-        // Try to update the bucket
-        if let Some(least_recent_addr) = state.k_buckets[bucket_idx].update(node_info) {
-            // Only ping if it's not us
-            if least_recent_addr.node_id != self.node_id() {
-                self.spawn_ping(state, least_recent_addr);
+            // Add all returned nodes
+            for node in nodes {
+                if node.node_id != self.node_id() {
+                    self.update_node_seen(&mut state, node.clone()).await;
+                }
             }
         }
     }
@@ -579,11 +393,6 @@ impl Kademlia {
     /// Find the closest nodes to a target from our routing table
     async fn find_closest_nodes(&self, target: &[u8; 32]) -> Vec<NodeAddr> {
         let state = self.state.read().await;
-        self.find_closest_nodes_inner(&state, target)
-    }
-
-    /// Inner implementation of find_closest_nodes that takes a state reference
-    fn find_closest_nodes_inner(&self, state: &KademliaState, target: &[u8; 32]) -> Vec<NodeAddr> {
         let distance_to_target = calculate_distance(&self.node_id_bytes(), target);
         let bucket_idx = get_bucket_index(&distance_to_target);
 
@@ -637,51 +446,87 @@ impl Kademlia {
         }
     }
 
-    /// Spawn a ping command
-    async fn spawn_ping(
-        &self,
-        state: &mut KademliaState,
-        target: NodeAddr,
-    ) -> oneshot::Receiver<Result<bool>> {
-        let (sender, receiver) = oneshot::channel();
+    /// Update a node's info in the appropriate k-bucket
+    async fn update_node_seen(&self, state: &mut KademliaState, addr: NodeAddr) {
+        let node_id = addr.node_id;
 
-        // Create ping command
-        let command_type = CommandType::Ping(Some(sender));
+        // Don't track ourselves
+        if node_id == self.node_id() {
+            return;
+        }
 
-        // Create command state
-        let mut cmd_state = CommandState::new([0u8; 32], command_type); // Target doesn't matter for ping
-        cmd_state.pending_count = 1;
+        // Store in our quick lookup map
+        state.node_addresses.insert(node_id, addr.clone());
 
-        // Generate ID and store command
+        // Calculate bucket index
+        let distance = calculate_distance(&self.node_id_bytes(), node_id.as_bytes());
+        let bucket_idx = get_bucket_index(&distance);
+
+        // Create new node info
+        let node_info = NodeInfo::new(addr.clone());
+
+        // Try to update the bucket
+        if let Some((least_recent_addr, idx)) =
+            state.k_buckets[bucket_idx].update(node_info.clone())
+        {
+            // Only ping if it's not us
+            if least_recent_addr.node_id != self.node_id() {
+                if let Ok(true) = self.spawn_ping(least_recent_addr).await {
+                    state.k_buckets[bucket_idx].refresh_node(idx);
+                } else {
+                    state.k_buckets[bucket_idx].replace_node(idx, node_info);
+                }
+            }
+        }
+    }
+
+    /// Ping a node to check if it's still alive
+    async fn spawn_ping(&self, target: NodeAddr) -> Result<bool> {
+        // Create ping message
         let id = Ulid::new();
-        state.pending_commands.insert(id, cmd_state);
-
-        // Send ping message
         let message =
             KademliaMessage::new_request(id, self.get_node_addr(), MessageType::PingRequest);
 
-        self.send_message(message, target).await;
-
-        receiver
+        // Send and wait for response
+        match self.send_message(message, target).await {
+            Ok(response) => match response.msg_type {
+                MessageType::PingResponse => Ok(true),
+                _ => Ok(false),
+            },
+            Err(_) => Ok(false),
+        }
     }
 
-    /// External API: Find operation
-    pub async fn find(&self, target: [u8; 32]) -> Result<FindResult> {
+    /// External API: Find operation with choice of mode
+    pub async fn find(&self, target: [u8; 32], shortcircuit: bool) -> Result<FindResult> {
         // First check if we have the value locally
-        let local_value = {
-            let state = self.state.read().await;
-            state
-                .resources
-                .get(&target)
-                .and_then(|node_id| state.node_addresses.get(node_id).cloned())
-                .map(|addr| FindResult {
-                    value: Some(addr),
-                    nodes: Vec::new(),
-                })
-        };
+        let mut local_values = Vec::new();
 
-        if let Some(result) = local_value {
-            return Ok(result);
+        {
+            let state = self.state.read().await;
+
+            // Check for values in resources
+            if let Some(entries) = state.resources.get(&target) {
+                for (node_id, _) in entries {
+                    if let Some(addr) = state.node_addresses.get(node_id) {
+                        local_values.push(addr.clone());
+                    }
+                }
+            }
+
+            // Check for exact node ID match (if we didn't find resource values)
+            if local_values.is_empty() {
+                if let Some(value) = state.node_addresses.get(&target) {
+                    local_values.push(value.clone());
+                }
+            }
+        }
+
+        if !local_values.is_empty() {
+            return Ok(FindResult {
+                value: local_values,
+                nodes: Vec::new(),
+            });
         }
 
         // Find closest nodes without holding a lock for too long
@@ -689,119 +534,176 @@ impl Kademlia {
 
         // If no nodes found, return empty result
         if closest_nodes.is_empty() {
+            return Ok(FindResult::empty());
+        }
+
+        // Now implement the actual find operation
+        self.find_with_nodes(target, closest_nodes, shortcircuit)
+            .await
+    }
+
+    /// Implementation of find that takes initial nodes
+    async fn find_with_nodes(
+        &self,
+        target: [u8; 32],
+        initial_nodes: Vec<NodeAddr>,
+        shortcircuit: bool,
+    ) -> Result<FindResult> {
+        // Set up tracking for the find operation
+        let mut visited_nodes = HashSet::new();
+        let mut closest_nodes = BTreeMap::new();
+        let mut found_values = Vec::new();
+        let mut pending_nodes = Vec::new();
+
+        // Initialize with our closest nodes, tracking distance
+        for node in initial_nodes {
+            if node.node_id != self.node_id() {
+                let distance = calculate_distance(&target, node.node_id.as_bytes());
+                closest_nodes.insert(distance, node.clone());
+                pending_nodes.push(node);
+            }
+        }
+
+        // Create ID for all requests in this operation
+        let command_id = Ulid::new();
+
+        // Track start time for timeout
+        let started_at = Instant::now();
+
+        // Main search loop
+        while !pending_nodes.is_empty() {
+            // Check for timeout
+            if started_at.elapsed() > REQUEST_TIMEOUT {
+                break;
+            }
+
+            // Get next batch of nodes to query (up to ALPHA)
+            let batch = pending_nodes
+                .drain(..std::cmp::min(ALPHA, pending_nodes.len()))
+                .collect::<Vec<_>>();
+
+            // Mark nodes as visited
+            for node in &batch {
+                visited_nodes.insert(node.node_id);
+            }
+
+            // Send FindRequest to each node in parallel
+            let mut responses = Vec::new();
+            for node in batch {
+                let message = KademliaMessage::new_request(
+                    command_id,
+                    self.get_node_addr(),
+                    MessageType::FindRequest { target },
+                );
+
+                if let Ok(response) = self.send_message(message, node).await {
+                    responses.push(response);
+                }
+            }
+
+            // Process all responses
+            let mut found_value_in_batch = false;
+
+            for response in responses {
+                if let MessageType::FindResponse { value, nodes } = response.msg_type {
+                    // Add all found values
+                    if !value.is_empty() {
+                        found_values.extend(value.clone());
+                        found_value_in_batch = true;
+                    }
+
+                    // Process returned nodes for further lookup
+                    for node in nodes {
+                        if node.node_id != self.node_id() && !visited_nodes.contains(&node.node_id)
+                        {
+                            let distance = calculate_distance(&target, node.node_id.as_bytes());
+                            closest_nodes.insert(distance, node.clone());
+
+                            // Keep only the K closest nodes
+                            while closest_nodes.len() > K_BUCKET_SIZE {
+                                if let Some(max_distance) = closest_nodes.keys().last().cloned() {
+                                    closest_nodes.remove(&max_distance);
+                                }
+                            }
+
+                            // Add to pending if we still want to search more
+                            pending_nodes.push(node);
+                        }
+                    }
+                }
+            }
+
+            // Check if we should short-circuit
+            if found_value_in_batch && shortcircuit {
+                break;
+            }
+        }
+
+        // If values found, return those
+        if !found_values.is_empty() {
             return Ok(FindResult {
-                value: None,
+                value: found_values,
                 nodes: Vec::new(),
             });
         }
 
-        // Create oneshot channel
-        let (sender, receiver) = oneshot::channel();
-        let command_id = Ulid::new();
-        let command_type = CommandType::Find(Some(sender));
-
-        // Setup the find operation
-        {
-            let mut state = self.state.write().await;
-
-            // Initialize state
-            let mut cmd_state = CommandState::new(target, command_type);
-
-            // Send find messages to closest nodes
-            for addr in &closest_nodes {
-                if addr.node_id != self.node_id() {
-                    cmd_state.visited_nodes.insert(addr.node_id);
-                    cmd_state.pending_count += 1;
-
-                    // Prepare message
-                    let message = KademliaMessage::new_request(
-                        command_id,
-                        self.get_node_addr(),
-                        MessageType::FindRequest { target },
-                    );
-
-                    // Send message
-                    self.send_message(message, addr.clone());
-                }
-            }
-
-            // Store command
-            state.pending_commands.insert(command_id, cmd_state);
-        }
-
-        // Wait for result
-        receiver
-            .await
-            .map_err(|_| anyhow!("Find operation failed"))?
+        // Otherwise return closest nodes
+        let closest = closest_nodes.values().cloned().collect();
+        Ok(FindResult {
+            value: Vec::new(),
+            nodes: closest,
+        })
     }
 
-    /// External API: Store operation
+    /// External API: Store operation (simplified)
     pub async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<()> {
-        // Store locally first
+        // Store locally first with TTL
         {
             let mut state = self.state.write().await;
-            state.resources.insert(key, value.node_id);
+            let expires_at = SystemTime::now() + KEY_TTL;
+
+            // Get or create entry for this key
+            let entries = state.resources.entry(key).or_insert_with(Vec::new);
+
+            // Update or insert the entry with new TTL
+            entries.push((value.node_id, expires_at));
+
+            // Update node address mapping
             state.node_addresses.insert(value.node_id, value.clone());
         }
 
-        // Find nodes closest to the key without holding the lock
-        let closest_nodes = self.find_closest_nodes(&key).await;
+        // Find nodes closest to the key
+        let find_result = self.find(key, false).await?;
 
-        // If no nodes, we're done
-        if closest_nodes.is_empty() {
-            return Ok(());
-        }
-
-        // Create oneshot channel
-        let (sender, receiver) = oneshot::channel();
+        // Send store message to all closest nodes
         let command_id = Ulid::new();
+        let mut store_requests = Vec::new();
 
-        // Setup the store operation
-        {
-            let mut state = self.state.write().await;
+        for node in find_result.nodes {
+            if node.node_id != self.node_id() {
+                let message = KademliaMessage::new_request(
+                    command_id,
+                    self.get_node_addr(),
+                    MessageType::StoreRequest {
+                        key,
+                        value: value.clone(),
+                    },
+                );
 
-            // Create command type
-            let command_type = CommandType::Store(Some(sender));
-
-            // Initialize state
-            let mut cmd_state = CommandState::new(key, command_type);
-
-            // Send store messages to closest nodes
-            for addr in closest_nodes {
-                if addr.node_id != self.node_id() {
-                    // Track this node
-                    cmd_state.visited_nodes.insert(addr.node_id);
-                    cmd_state.pending_count += 1;
-
-                    // Send message
-                    let message = KademliaMessage::new_request(
-                        command_id,
-                        self.get_node_addr(),
-                        MessageType::StoreRequest {
-                            key,
-                            value: value.clone(),
-                        },
-                    );
-
-                    self.send_message(message, addr);
-                }
-            }
-
-            if cmd_state.pending_count > 0 {
-                // Store command if we sent any messages
-                state.pending_commands.insert(command_id, cmd_state);
-            } else {
-                // No messages sent, complete immediately
-                return Ok(());
+                store_requests.push(self.send_message(message, node));
             }
         }
 
-        // Wait for result
-        receiver.await?
+        // Wait for all store requests to complete
+        for request in futures_util::future::join_all(store_requests).await {
+            let _ = request; // Ignore errors from individual nodes
+        }
+
+        Ok(())
     }
 
-    /// Bootstrap the node by adding it to an existing Kademlia network
-    pub async fn bootstrap(&self, bootstrap_nodes: Vec<NodeAddr>) -> Result<Vec<NodeAddr>> {
+    /// Bootstrap the node by adding it to an existing Kademlia network (private)
+    async fn bootstrap(&self, bootstrap_nodes: Vec<NodeAddr>) -> Result<Vec<NodeAddr>> {
         if bootstrap_nodes.is_empty() {
             return Err(anyhow!("No bootstrap nodes provided"));
         }
@@ -810,41 +712,18 @@ impl Kademlia {
         {
             let mut state = self.state.write().await;
             for addr in bootstrap_nodes.clone() {
-                self.update_node_seen(&mut state, addr);
+                self.update_node_seen(&mut state, addr).await;
             }
         }
 
         // Find our own node ID in the network to discover closest nodes
         let target = self.node_id_bytes();
-        let find_result = self.find(target).await?;
+        let find_result = self.find(target, false).await?;
 
         // Store our node in the network
         self.store(target, self.get_node_addr()).await?;
 
+        // Return the nodes we found
         Ok(find_result.nodes)
-    }
-
-    // Utility functions for direct access to resources
-    pub async fn store_local(&self, key: [u8; 32], value: NodeId) {
-        let mut state = self.state.write().await;
-        state.resources.insert(key, value);
-    }
-
-    pub async fn lookup_local(&self, key: &[u8; 32]) -> Option<NodeId> {
-        let state = self.state.read().await;
-        state.resources.get(key).cloned()
-    }
-
-    pub async fn lookup_local_addr(&self, key: &[u8; 32]) -> Option<NodeAddr> {
-        let state = self.state.read().await;
-        state
-            .resources
-            .get(key)
-            .and_then(|node_id| state.node_addresses.get(node_id).cloned())
-    }
-
-    pub async fn get_all_nodes(&self) -> Vec<NodeAddr> {
-        let state = self.state.read().await;
-        state.node_addresses.values().cloned().collect()
     }
 }

@@ -18,7 +18,7 @@ pub enum MessageType {
     // Response types
     PingResponse,
     FindResponse {
-        value: Option<NodeAddr>,
+        value: Vec<NodeAddr>, // List of node addresses that do contain the requested value, empty if not found
         nodes: Vec<NodeAddr>,
     },
     StoreResponse,
@@ -62,9 +62,16 @@ impl KademliaMessage {
     }
 }
 
-// Result types for public API methods
-#[derive(Clone, Debug)]
 pub struct FindResult {
-    pub value: Option<NodeAddr>,
-    pub nodes: Vec<NodeAddr>,
+    pub value: Vec<NodeAddr>, // The value(s) found, if any
+    pub nodes: Vec<NodeAddr>, // List of N closest nodes
+}
+
+impl FindResult {
+    pub fn empty() -> Self {
+        Self {
+            value: Vec::new(),
+            nodes: Vec::new(),
+        }
+    }
 }

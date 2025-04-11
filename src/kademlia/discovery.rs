@@ -25,13 +25,15 @@ impl Discovery for KademliaArc {
         let target = node_id.as_bytes().clone();
         let self_clone = self.clone();
         let fut = async move {
-            let target = self_clone.kademlia.find(target).await?;
+            let target = self_clone.kademlia.find(target, true).await?;
             Ok(DiscoveryItem::new(
                 NodeInfo::from_parts(
                     node_id,
                     NodeData::from(
                         target
                             .value
+                            .first()
+                            .cloned()
                             .ok_or_else(|| anyhow::anyhow!("Node not found"))?,
                     ),
                 ),
