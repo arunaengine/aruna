@@ -107,20 +107,21 @@ impl KBucket {
             .collect()
     }
 
-    /// Remove stale nodes from the bucket
-    pub fn prune_stale_nodes(&mut self) -> Vec<NodeId> {
-        let mut removed_nodes = Vec::new();
+    pub fn get_stale_nodes(&self) -> Vec<NodeAddr> {
+        self.nodes
+            .iter()
+            .filter_map(|opt_info| {
+                opt_info
+                    .as_ref()
+                    .filter(|info| info.is_stale())
+                    .map(|info| info.addr.clone())
+            })
+            .collect()
+    }
 
-        for opt_info in &mut self.nodes {
-            if let Some(info) = opt_info {
-                if info.is_stale() {
-                    let node_id = info.addr.node_id;
-                    removed_nodes.push(node_id);
-                    *opt_info = None;
-                }
-            }
+    pub fn remove_node(&mut self, node_id: &NodeId) {
+        if let Some(pos) = self.find_node(node_id) {
+            self.nodes[pos] = None;
         }
-
-        removed_nodes
     }
 }

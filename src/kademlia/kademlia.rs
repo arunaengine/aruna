@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{NodeAddr, NodeId, PublicKey};
-use log::{info, trace};
+use log::{info, trace, warn};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -18,17 +18,20 @@ use crate::kademlia::utils::{calculate_distance, get_bucket_index};
 use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
 
 use super::messages::FindResult;
+use super::time_handler::TimeHandler;
 
 pub const KADEMLIA_PROTOCOL_ID: u32 = 1;
 pub const KEY_TTL: Duration = Duration::from_secs(86400); // 1d
-pub const REPUBLISH_INTERVAL: Duration = Duration::from_secs(84600); // 23h30m
+pub const REPUBLISH_INTERVAL: Duration = Duration::from_secs(79200); // 22h
 
 /// Internal mutable state of Kademlia
 #[derive(Debug)]
 struct KademliaState {
     k_buckets: [KBucket; 256],
-    resources: HashMap<[u8; 32], Vec<(NodeId, SystemTime)>>, // Multiple nodes per key with TTL
+    resources: HashMap<[u8; 32], HashSet<NodeId>>, // Multiple (unique) nodes per key with TTL
     node_addresses: HashMap<NodeId, NodeAddr>,
+    local_resources: TimeHandler, // Tracking stored resources by us
+    store_timer: TimeHandler,     // Tracking all stored resources
 }
 
 impl KademliaState {
@@ -37,31 +40,30 @@ impl KademliaState {
             k_buckets: std::array::from_fn(|_| KBucket::new()),
             resources: HashMap::new(),
             node_addresses: HashMap::new(),
+            local_resources: TimeHandler::new(),
+            store_timer: TimeHandler::new(),
         }
     }
 
     // Helper method to clean up expired resources
     fn prune_expired_resources(&mut self) -> usize {
-        let now = SystemTime::now();
-        let mut total_pruned = 0;
-        let mut empty_keys = Vec::new();
-
-        for (key, values) in self.resources.iter_mut() {
-            let initial_size = values.len();
-            values.retain(|(_, expires_at)| *expires_at > now);
-            total_pruned += initial_size - values.len();
-
-            if values.is_empty() {
-                empty_keys.push(*key);
+        let Some(old) = SystemTime::now().checked_sub(KEY_TTL) else {
+            return 0;
+        };
+        let all = self.store_timer.remove_older_than(old);
+        for key in all.iter() {
+            // Remove the key from the resources map
+            if let Some(entries) = self.resources.get_mut(&key.key()) {
+                let Some(node_id) = key.node_id() else {
+                    continue;
+                };
+                entries.remove(&node_id);
+                if entries.is_empty() {
+                    self.resources.remove(&key.key());
+                }
             }
         }
-
-        // Remove completely empty keys
-        for key in empty_keys {
-            self.resources.remove(&key);
-        }
-
-        total_pruned
+        all.len()
     }
 }
 
@@ -166,7 +168,7 @@ impl Kademlia {
         // Spawn the background task with simple sleep-based scheduling
         let handle = tokio::spawn(async move {
             let mut republish_timer = tokio::time::interval(REPUBLISH_INTERVAL);
-            let mut maintenance_timer = tokio::time::interval(Duration::from_secs(60));
+            let mut maintenance_timer = tokio::time::interval(Duration::from_secs(3600));
 
             loop {
                 tokio::select! {
@@ -201,9 +203,44 @@ impl Kademlia {
         // Use a write lock to update the state
         let mut state = self.state.write().await;
 
+        let mut stale_nodes = Vec::new();
         // Remove stale nodes from all buckets
-        for bucket in state.k_buckets.iter_mut() {
-            let _ = bucket.prune_stale_nodes();
+        for bucket in state.k_buckets.iter() {
+            let potential_stale = bucket.get_stale_nodes();
+            stale_nodes.push(potential_stale)
+        }
+
+        // Remove the node from routing and ping it, if it's still alive
+        for (bucket_idx, stale_node) in stale_nodes.into_iter().enumerate() {
+            for stale in stale_node {
+                match self.spawn_ping(stale.clone()).await {
+                    Ok(true) => {
+                        // Node is alive, update its last seen time
+                        let Some(idx) = state.k_buckets[bucket_idx].find_node(&stale.node_id)
+                        else {
+                            warn!(
+                                "Node {} not found in bucket {}, this should not happen",
+                                stale.node_id, bucket_idx
+                            );
+                            continue;
+                        };
+                        state.k_buckets[bucket_idx].refresh_node(idx);
+                    }
+                    Ok(false) => {
+                        // Node is dead, remove it from the bucket
+                        state.k_buckets[bucket_idx].remove_node(&stale.node_id);
+                        // Also remove from the node addresses
+                        state.node_addresses.remove(&stale.node_id);
+                    }
+                    Err(e) => {
+                        warn!("Failed to ping node {}: {e:#}", stale.node_id);
+                        // Node is stale, remove it from the bucket
+                        state.k_buckets[bucket_idx].remove_node(&stale.node_id);
+                        // Also remove from the node addresses
+                        state.node_addresses.remove(&stale.node_id);
+                    }
+                }
+            }
         }
 
         // Clean up expired resources
@@ -221,22 +258,23 @@ impl Kademlia {
     /// Periodically republish all stored key-value pairs
     async fn republish_resources(&self) {
         // Get all resources to republish
+        let node_addr = self.get_node_addr().await;
         let resources_to_republish = {
-            let state = self.state.read().await;
-            let mut resources = Vec::new();
-
-            for (key, values) in &state.resources {
-                for (node_id, _) in values {
-                    if let Some(addr) = state.node_addresses.get(node_id) {
-                        resources.push((*key, addr.clone()));
-                    }
-                }
-            }
-
-            resources
+            let mut state = self.state.write().await;
+            let Some(republish_threshold) = SystemTime::now().checked_sub(REPUBLISH_INTERVAL)
+            else {
+                warn!("Failed to calculate republish threshold");
+                return;
+            };
+            state
+                .local_resources
+                .remove_older_than(republish_threshold)
+                .into_iter()
+                .map(|key| (key.key(), node_addr.clone()))
+                .collect::<Vec<_>>()
         };
 
-        // Republish each resource
+        // Republish each returned local resource
         for (key, value) in resources_to_republish {
             let _ = self.store(key, value).await;
         }
@@ -285,7 +323,7 @@ impl Kademlia {
 
                 // First check resource values
                 if let Some(entries) = state.resources.get(&target) {
-                    for (node_id, _) in entries {
+                    for node_id in entries {
                         if let Some(addr) = state.node_addresses.get(node_id) {
                             values.push(addr.clone());
                         }
@@ -316,14 +354,14 @@ impl Kademlia {
                 // Write lock for storing
                 let mut state = self.state.write().await;
 
-                // Calculate expiration time
-                let expires_at = SystemTime::now() + KEY_TTL;
-
                 // Get or create entry for this key
-                let entries = state.resources.entry(key).or_insert_with(Vec::new);
+                let entries = state.resources.entry(key).or_insert_with(HashSet::new);
 
                 // Update the entry with new TTL
-                entries.push((value.node_id, expires_at));
+                entries.insert(value.node_id);
+
+                // Insert the key into the local expiration timer
+                state.store_timer.insert(key, Some(value.node_id));
 
                 // Always update the node address mapping
                 state.node_addresses.insert(value.node_id, value.clone());
@@ -501,12 +539,9 @@ impl Kademlia {
             KademliaMessage::new_request(id, self.get_node_addr().await, MessageType::PingRequest);
 
         // Send and wait for response
-        match self.send_message(message, target).await {
-            Ok(response) => match response.msg_type {
-                MessageType::PingResponse => Ok(true),
-                _ => Ok(false),
-            },
-            Err(_) => Ok(false),
+        match self.send_message(message, target).await?.msg_type {
+            MessageType::PingResponse => Ok(true),
+            _ => Ok(false),
         }
     }
 
@@ -536,7 +571,7 @@ impl Kademlia {
 
             // Check for values in resources
             if let Some(entries) = state.resources.get(&target) {
-                for (node_id, _) in entries {
+                for node_id in entries {
                     if let Some(addr) = state.node_addresses.get(node_id) {
                         local_values.push(addr.clone());
                     }
@@ -706,13 +741,14 @@ impl Kademlia {
         // Store locally first with TTL
         {
             let mut state = self.state.write().await;
-            let expires_at = SystemTime::now() + KEY_TTL;
-
-            // Get or create entry for this key
-            let entries = state.resources.entry(key).or_insert_with(Vec::new);
-
-            // Update or insert the entry with new TTL
-            entries.push((value.node_id, expires_at));
+            // Only store if the key is a "key" and not the node ID
+            if value.node_id.as_bytes() != &key {
+                // Get or create entry for this key
+                let entries = state.resources.entry(key).or_insert_with(HashSet::new);
+                entries.insert(value.node_id);
+                // Track the key as local resource to ensure Republish
+                state.local_resources.insert(key, None);
+            }
 
             // Update node address mapping
             state.node_addresses.insert(value.node_id, value.clone());
@@ -764,7 +800,6 @@ impl Kademlia {
             for addr in bootstrap_nodes.clone() {
                 self.update_node_seen(&mut state, addr).await;
             }
-            //trace!("Current routing table: {:?}", state.k_buckets);
         }
 
         // Find our own node ID in the network to discover closest nodes
@@ -773,7 +808,6 @@ impl Kademlia {
         // Store our node in the network
         self.store(target, self.get_node_addr().await).await?;
 
-        // Return the nodes we found
         Ok(())
     }
 }
