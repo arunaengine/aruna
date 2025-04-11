@@ -27,6 +27,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     let result = chandler1.find(*c2_addr.node_id.as_bytes()).await?;
 
-    println!("Result: {:?}", result);
+    debug!("Result: {:?}", result);
+    assert_eq!(*result.value.first().unwrap(), c2_addr);
     Ok(())
 }

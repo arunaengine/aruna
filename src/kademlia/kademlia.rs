@@ -576,11 +576,6 @@ impl Kademlia {
                         local_values.push(addr.clone());
                     }
                 }
-            } else {
-                trace!(
-                    "Not found for addr: {:?}",
-                    PublicKey::from_bytes(&target).unwrap()
-                );
             }
 
             // Check for exact node ID match (if we didn't find resource values)
