@@ -11,7 +11,7 @@ use n0_future::boxed::BoxStream;
 
 #[derive(Clone, Debug)]
 pub struct KademliaArc {
-    kademlia: Arc<Kademlia>,
+    pub kademlia: Arc<Kademlia>,
 }
 
 impl Discovery for KademliaArc {

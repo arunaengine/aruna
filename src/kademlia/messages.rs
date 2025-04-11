@@ -62,6 +62,7 @@ impl KademliaMessage {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FindResult {
     pub value: Vec<NodeAddr>, // The value(s) found, if any
     pub nodes: Vec<NodeAddr>, // List of N closest nodes

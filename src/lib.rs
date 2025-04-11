@@ -12,6 +12,5 @@ pub const ARUNA_NET_ALPN: &[u8] = b"aruna-net/0.1.0";
 pub mod connection_handler;
 mod kademlia;
 
-
 pub use connection_handler::ConnectionHandler;
 pub use kademlia::kademlia::Kademlia;

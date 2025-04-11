@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow};
 use iroh::endpoint::{RecvStream, SendStream};
-use iroh::{NodeAddr, NodeId};
+use iroh::{NodeAddr, NodeId, PublicKey};
+use log::{info, trace};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
@@ -141,24 +141,22 @@ impl Kademlia {
         Ok(())
     }
 
-    fn get_node_addr(&self) -> NodeAddr {
-        let handle = Handle::current();
-        handle
-            .block_on(async {
-                let network = self.network.read().await;
-                network.as_ref().map(|(addr, _)| addr.clone())
-            })
+    async fn get_node_addr(&self) -> NodeAddr {
+        let network = self.network.read().await;
+        network
+            .as_ref()
+            .map(|(addr, _)| addr.clone())
             .expect("Network not initialized")
     }
 
     /// Get our node ID
-    fn node_id(&self) -> NodeId {
-        self.get_node_addr().node_id
+    async fn node_id(&self) -> NodeId {
+        self.get_node_addr().await.node_id
     }
 
     /// Get node ID bytes as owned array
-    fn node_id_bytes(&self) -> [u8; 32] {
-        self.node_id().as_bytes().clone()
+    async fn node_id_bytes(&self) -> [u8; 32] {
+        self.node_id().await.as_bytes().clone()
     }
 
     /// Start periodic maintenance task
@@ -175,13 +173,13 @@ impl Kademlia {
                     // Maintenance timer
                     _ = maintenance_timer.tick() => {
                         kademlia_clone.run_maintenance().await;
-                        println!("Maintenance run for node {}", kademlia_clone.node_id());
+                        info!("Maintenance run for node {}", kademlia_clone.node_id().await);
                     }
 
                     // Republish timer
                     _ = republish_timer.tick() => {
                         kademlia_clone.republish_resources().await;
-                        println!("Resources republished for node {}", kademlia_clone.node_id());
+                        info!("Resources republished for node {}", kademlia_clone.node_id().await);
                     }
 
                     // Check for shutdown signal
@@ -246,6 +244,12 @@ impl Kademlia {
 
     /// Handle an incoming Kademlia message
     pub async fn handle_message(&self, message: KademliaMessage) -> Option<KademliaMessage> {
+        trace!(
+            "Received message: {:?} @ node: {}",
+            message,
+            self.node_id().await
+        );
+
         // Update routing table with sender
         {
             let mut state = self.state.write().await;
@@ -269,7 +273,7 @@ impl Kademlia {
         match request.msg_type {
             MessageType::PingRequest => {
                 // Simple ping response
-                Some(request.create_response(self.get_node_addr(), MessageType::PingResponse))
+                Some(request.create_response(self.get_node_addr().await, MessageType::PingResponse))
             }
 
             MessageType::FindRequest { target } => {
@@ -300,7 +304,7 @@ impl Kademlia {
 
                 // Create response with values and closest nodes
                 Some(request.create_response(
-                    self.get_node_addr(),
+                    self.get_node_addr().await,
                     MessageType::FindResponse {
                         value: values,
                         nodes: closest_nodes,
@@ -325,7 +329,9 @@ impl Kademlia {
                 state.node_addresses.insert(value.node_id, value.clone());
 
                 // Create response
-                Some(request.create_response(self.get_node_addr(), MessageType::StoreResponse))
+                Some(
+                    request.create_response(self.get_node_addr().await, MessageType::StoreResponse),
+                )
             }
 
             // Ignore response messages in request handler
@@ -350,7 +356,7 @@ impl Kademlia {
 
             // Add all returned nodes
             for node in nodes {
-                if node.node_id != self.node_id() {
+                if node.node_id != self.node_id().await {
                     self.update_node_seen(&mut state, node.clone()).await;
                 }
             }
@@ -363,6 +369,13 @@ impl Kademlia {
         message: KademliaMessage,
         target_addr: NodeAddr,
     ) -> Result<KademliaMessage> {
+        trace!(
+            "Sending message: {:?} from node {} to node: {}",
+            message,
+            self.node_id().await,
+            target_addr.node_id
+        );
+
         let guard = self.network.read().await;
         let Some((_, chandler)) = guard.as_ref() else {
             return Err(anyhow!("Network not initialized"));
@@ -393,7 +406,7 @@ impl Kademlia {
     /// Find the closest nodes to a target from our routing table
     async fn find_closest_nodes(&self, target: &[u8; 32]) -> Vec<NodeAddr> {
         let state = self.state.read().await;
-        let distance_to_target = calculate_distance(&self.node_id_bytes(), target);
+        let distance_to_target = calculate_distance(&self.node_id_bytes().await, target);
         let bucket_idx = get_bucket_index(&distance_to_target);
 
         // Start with the exact bucket
@@ -451,7 +464,7 @@ impl Kademlia {
         let node_id = addr.node_id;
 
         // Don't track ourselves
-        if node_id == self.node_id() {
+        if node_id == self.node_id().await {
             return;
         }
 
@@ -459,7 +472,7 @@ impl Kademlia {
         state.node_addresses.insert(node_id, addr.clone());
 
         // Calculate bucket index
-        let distance = calculate_distance(&self.node_id_bytes(), node_id.as_bytes());
+        let distance = calculate_distance(&self.node_id_bytes().await, node_id.as_bytes());
         let bucket_idx = get_bucket_index(&distance);
 
         // Create new node info
@@ -470,7 +483,7 @@ impl Kademlia {
             state.k_buckets[bucket_idx].update(node_info.clone())
         {
             // Only ping if it's not us
-            if least_recent_addr.node_id != self.node_id() {
+            if least_recent_addr.node_id != self.node_id().await {
                 if let Ok(true) = self.spawn_ping(least_recent_addr).await {
                     state.k_buckets[bucket_idx].refresh_node(idx);
                 } else {
@@ -485,7 +498,7 @@ impl Kademlia {
         // Create ping message
         let id = Ulid::new();
         let message =
-            KademliaMessage::new_request(id, self.get_node_addr(), MessageType::PingRequest);
+            KademliaMessage::new_request(id, self.get_node_addr().await, MessageType::PingRequest);
 
         // Send and wait for response
         match self.send_message(message, target).await {
@@ -499,11 +512,27 @@ impl Kademlia {
 
     /// External API: Find operation with choice of mode
     pub async fn find(&self, target: [u8; 32], shortcircuit: bool) -> Result<FindResult> {
+        info!(
+            "Searching key: {:?} @ {} ",
+            PublicKey::from_bytes(&target).unwrap(),
+            self.node_id().await
+        );
+
         // First check if we have the value locally
         let mut local_values = Vec::new();
 
-        {
+        if shortcircuit {
             let state = self.state.read().await;
+            trace!(
+                "local nodes: {:?} @ node: {}",
+                state.node_addresses,
+                self.node_id().await
+            );
+            trace!(
+                "local resources: {:?} @ node: {}",
+                state.resources,
+                self.node_id().await
+            );
 
             // Check for values in resources
             if let Some(entries) = state.resources.get(&target) {
@@ -512,6 +541,11 @@ impl Kademlia {
                         local_values.push(addr.clone());
                     }
                 }
+            } else {
+                trace!(
+                    "Not found for addr: {:?}",
+                    PublicKey::from_bytes(&target).unwrap()
+                );
             }
 
             // Check for exact node ID match (if we didn't find resource values)
@@ -534,6 +568,11 @@ impl Kademlia {
 
         // If no nodes found, return empty result
         if closest_nodes.is_empty() {
+            trace!(
+                "No nodes found for target: {:?}",
+                PublicKey::from_bytes(&target).unwrap()
+            );
+
             return Ok(FindResult::empty());
         }
 
@@ -557,7 +596,7 @@ impl Kademlia {
 
         // Initialize with our closest nodes, tracking distance
         for node in initial_nodes {
-            if node.node_id != self.node_id() {
+            if node.node_id != self.node_id().await {
                 let distance = calculate_distance(&target, node.node_id.as_bytes());
                 closest_nodes.insert(distance, node.clone());
                 pending_nodes.push(node);
@@ -592,7 +631,7 @@ impl Kademlia {
             for node in batch {
                 let message = KademliaMessage::new_request(
                     command_id,
-                    self.get_node_addr(),
+                    self.get_node_addr().await,
                     MessageType::FindRequest { target },
                 );
 
@@ -614,7 +653,8 @@ impl Kademlia {
 
                     // Process returned nodes for further lookup
                     for node in nodes {
-                        if node.node_id != self.node_id() && !visited_nodes.contains(&node.node_id)
+                        if node.node_id != self.node_id().await
+                            && !visited_nodes.contains(&node.node_id)
                         {
                             let distance = calculate_distance(&target, node.node_id.as_bytes());
                             closest_nodes.insert(distance, node.clone());
@@ -657,6 +697,12 @@ impl Kademlia {
 
     /// External API: Store operation (simplified)
     pub async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<()> {
+        info!(
+            "Storing key: {:?} @ {} ",
+            PublicKey::from_bytes(&key).unwrap(),
+            self.node_id().await
+        );
+
         // Store locally first with TTL
         {
             let mut state = self.state.write().await;
@@ -675,15 +721,17 @@ impl Kademlia {
         // Find nodes closest to the key
         let find_result = self.find(key, false).await?;
 
+        trace!("Closest nodes to store: {:?}", find_result.nodes);
+
         // Send store message to all closest nodes
         let command_id = Ulid::new();
         let mut store_requests = Vec::new();
 
         for node in find_result.nodes {
-            if node.node_id != self.node_id() {
+            if node.node_id != self.node_id().await {
                 let message = KademliaMessage::new_request(
                     command_id,
-                    self.get_node_addr(),
+                    self.get_node_addr().await,
                     MessageType::StoreRequest {
                         key,
                         value: value.clone(),
@@ -703,7 +751,9 @@ impl Kademlia {
     }
 
     /// Bootstrap the node by adding it to an existing Kademlia network (private)
-    async fn bootstrap(&self, bootstrap_nodes: Vec<NodeAddr>) -> Result<Vec<NodeAddr>> {
+    async fn bootstrap(&self, bootstrap_nodes: Vec<NodeAddr>) -> Result<()> {
+        info!("Bootstrapping with nodes: {:?}", bootstrap_nodes);
+
         if bootstrap_nodes.is_empty() {
             return Err(anyhow!("No bootstrap nodes provided"));
         }
@@ -714,16 +764,16 @@ impl Kademlia {
             for addr in bootstrap_nodes.clone() {
                 self.update_node_seen(&mut state, addr).await;
             }
+            //trace!("Current routing table: {:?}", state.k_buckets);
         }
 
         // Find our own node ID in the network to discover closest nodes
-        let target = self.node_id_bytes();
-        let find_result = self.find(target, false).await?;
+        let target = self.node_id_bytes().await;
 
         // Store our node in the network
-        self.store(target, self.get_node_addr()).await?;
+        self.store(target, self.get_node_addr().await).await?;
 
         // Return the nodes we found
-        Ok(find_result.nodes)
+        Ok(())
     }
 }

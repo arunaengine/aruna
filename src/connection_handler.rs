@@ -1,8 +1,9 @@
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::Result;
 use iroh::{
-    Endpoint, NodeAddr, NodeId,
-    endpoint::{Connection, RecvStream, SendStream},
+    Endpoint, NodeAddr, NodeId, RelayMode, SecretKey,
+    endpoint::{Builder, Connection, RecvStream, SendStream},
 };
 use log::warn;
 use std::fmt::Debug;
@@ -17,23 +18,121 @@ pub trait ProtocolHandler: Send + Sync + Debug {
     ) -> anyhow::Result<()>;
 }
 
-use crate::ARUNA_NET_ALPN;
+use crate::{
+    ARUNA_NET_ALPN, Kademlia,
+    kademlia::{discovery::KademliaArc, messages::FindResult},
+};
 
 pub type ProtocolId = u32;
+
+pub struct ConnectionHandlerBuilder {
+    endpoint: iroh::endpoint::Builder,
+    protocol_handler_map: HashMap<ProtocolId, Arc<dyn ProtocolHandler>>,
+    kademlia: Arc<Kademlia>,
+}
+
+impl ConnectionHandlerBuilder {
+    pub fn new(secret_key: Option<SecretKey>) -> Self {
+        let kademlia = Kademlia::new();
+
+        let kademlia_arc: KademliaArc = KademliaArc {
+            kademlia: kademlia.clone(),
+        };
+
+        let mut endpoint = Builder::default()
+            .alpns(vec![ARUNA_NET_ALPN.to_vec()])
+            .add_discovery(move |_| Some(kademlia_arc))
+            .relay_mode(RelayMode::Disabled);
+
+        if let Some(secret_key) = secret_key {
+            endpoint = endpoint.secret_key(secret_key);
+        }
+
+        let mut protocol_handler_map: HashMap<ProtocolId, Arc<dyn ProtocolHandler>> =
+            HashMap::new();
+        protocol_handler_map.insert(1, kademlia.clone());
+
+        Self {
+            endpoint,
+            protocol_handler_map,
+            kademlia,
+        }
+    }
+
+    pub fn add_relay(self, relay_mode: RelayMode) -> Self {
+        let endpoint = self.endpoint.relay_mode(relay_mode);
+        Self {
+            endpoint,
+            protocol_handler_map: self.protocol_handler_map,
+            kademlia: self.kademlia,
+        }
+    }
+
+    pub fn add_bind_addr_v4(self, bind_addr: std::net::SocketAddrV4) -> Self {
+        let endpoint = self.endpoint.bind_addr_v4(bind_addr);
+        Self {
+            endpoint,
+            protocol_handler_map: self.protocol_handler_map,
+            kademlia: self.kademlia,
+        }
+    }
+
+    pub fn add_bind_addr_v6(self, bind_addr: std::net::SocketAddrV6) -> Self {
+        let endpoint = self.endpoint.bind_addr_v6(bind_addr);
+        Self {
+            endpoint,
+            protocol_handler_map: self.protocol_handler_map,
+            kademlia: self.kademlia,
+        }
+    }
+
+    pub fn add_protocol_handler(
+        self,
+        protocol_id: ProtocolId,
+        protocol_handler: Arc<dyn ProtocolHandler>,
+    ) -> Self {
+        let mut protocol_handler_map = self.protocol_handler_map;
+        protocol_handler_map.insert(protocol_id, protocol_handler);
+        Self {
+            endpoint: self.endpoint,
+            protocol_handler_map,
+            kademlia: self.kademlia,
+        }
+    }
+
+    pub async fn build(self, bootstrap_nodes: Vec<NodeAddr>) -> Result<Arc<ConnectionHandler>> {
+        let endpoint = self.endpoint.bind().await?;
+
+        let chandler =
+            ConnectionHandler::new(endpoint, self.protocol_handler_map, self.kademlia.clone());
+
+        self.kademlia
+            .init(chandler.clone(), bootstrap_nodes)
+            .await?;
+
+        Ok(chandler)
+    }
+}
 
 #[derive(Debug)]
 pub struct ConnectionHandler {
     endpoint: Endpoint,
     connections: RwLock<HashMap<NodeId, Connection>>,
     protocol_handler: HashMap<ProtocolId, Arc<dyn ProtocolHandler>>,
+    kademlia: Arc<Kademlia>,
 }
 
 impl ConnectionHandler {
-    pub fn new(endpoint: Endpoint) -> Arc<Self> {
+    fn new(
+        endpoint: Endpoint,
+        protocol_handler: HashMap<ProtocolId, Arc<dyn ProtocolHandler>>,
+        kademlia: Arc<Kademlia>,
+    ) -> Arc<Self> {
         let self_arc = Arc::new(Self {
             endpoint,
             connections: RwLock::new(HashMap::new()),
-            protocol_handler: HashMap::new(),
+            protocol_handler,
+            kademlia,
         });
 
         self_arc.clone().spawn_acceptor();
@@ -124,5 +223,13 @@ impl ConnectionHandler {
         let (mut rx, sx) = connection.open_bi().await?;
         rx.write_u32(protocol_id).await?;
         Ok((sx, rx))
+    }
+
+    pub async fn find(&self, key: [u8; 32]) -> Result<FindResult> {
+        self.kademlia.find(key, true).await
+    }
+
+    pub async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<()> {
+        self.kademlia.store(key, value).await
     }
 }
