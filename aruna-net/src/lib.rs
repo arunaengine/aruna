@@ -13,4 +13,6 @@ pub mod connection_handler;
 mod kademlia;
 
 pub use connection_handler::ConnectionHandler;
+pub use connection_handler::ConnectionHandlerBuilder;
 pub use kademlia::kademlia::Kademlia;
+pub use connection_handler::ProtocolHandler;
