@@ -4,6 +4,7 @@ use iroh::NodeId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Key {
+    // TODO: Use chrono::UTC instead of SystemTime for better time handling
     created: SystemTime,
     key: [u8; 32],
     node_id: Option<NodeId>,

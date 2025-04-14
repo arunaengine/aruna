@@ -1,18 +1,10 @@
-[package]
-name = "aruna-net"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["aruna-net"]
+resolver = "2"
 
-[dependencies]
-anyhow = "1.0.97"
-async-trait = "0.1.88"
-env_logger = "0.11.8"
-futures-util = "0.3.31"
-iroh = "0.34.1"
-log = "0.4.27"
-n0-future = "0.1.2"
-postcard = "1.1.1"
-rand = "0.9.0"
-serde = "1.0.219"
-tokio = { version = "1.44.2", features = ["full"] }
-ulid = { version = "1.2.1", features = ["serde"] }
+
+[workspace.package]
+description = "A federated data orchestration network"
+version = "3.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
