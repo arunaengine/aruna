@@ -1,0 +1,8 @@
+[package]
+name = "aruna"
+version = { workspace = true }
+edition = { workspace = true }
+
+[dependencies]
+tokio = { version = "1.44.2", features = ["full"] }
+aruna-net = { path = "../aruna-net" }
