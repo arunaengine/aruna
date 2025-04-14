@@ -1,5 +1,5 @@
 [workspace]
-members = ["aruna-net", "aruna"]
+members = ["aruna-net", "aruna", "metadata"]
 resolver = "2"
 
 
