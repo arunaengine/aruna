@@ -1,16 +1,18 @@
-use std::{marker::PhantomData, sync::Arc};
-use ulid::Ulid;
 use super::request::Request;
 use crate::{
-    error::ArunaError, network::network_trait::Network, persistence::{persistence::Persistor, search::search::Search, storage::store::Store}
+    error::ArunaError,
+    network::network_trait::Network,
+    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
 };
+use std::{marker::PhantomData, sync::Arc};
+use ulid::Ulid;
 
 pub struct Controller<St, Se, N, P>
 where
-    for<'a> St: Store<'a>,
-    Se: Search,
-    P: Persistor<St, Se>,
-    N: Network,
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    P: Persistor<St, Se> + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     pub persistence: Arc<P>,
     pub network: Arc<N>,
@@ -23,12 +25,12 @@ where
     for<'a> St: Store<'a>,
     Se: Search,
     P: Persistor<St, Se>,
-    N: Network,
+    N: Network<P, St, Se>,
 {
     #[tracing::instrument(level = "trace", skip(persistence, network))]
-    pub fn new(persistence: P, network: N) -> Self {
+    pub fn new(persistence: Arc<P>, network: N) -> Self {
         Self {
-            persistence: Arc::new(persistence),
+            persistence,
             network: Arc::new(network),
             phantom_store: PhantomData,
             phantom_search: PhantomData,
@@ -61,4 +63,3 @@ where
         self.persistence.clear().await
     }
 }
-

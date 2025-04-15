@@ -25,7 +25,7 @@ impl RestServer {
         for<'a> St: Store<'a> + 'static,
         Se: Search + 'static,
         P: Persistor<St, Se> + 'static,
-        N: Network + 'static,
+        N: Network<P, St, Se> + 'static,
     {
         let socket_address = SocketAddr::from(([0, 0, 0, 0], rest_port));
         let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();

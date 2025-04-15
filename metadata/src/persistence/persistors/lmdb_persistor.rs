@@ -17,21 +17,24 @@ use crate::{
         },
     },
 };
+use aruna_net::ProtocolHandler;
 use automerge::ActorId;
 use autosurgeon::reconcile;
+use iroh::endpoint::{RecvStream, SendStream};
 use roaring::RoaringBitmap;
 use std::sync::{Arc, atomic::AtomicU32};
 use tokio::join;
 use ulid::Ulid;
 
-pub struct LmdbTantivyPersistance {
+#[derive(Debug)]
+pub struct LmdbTantivyPersistence {
     pub store: Arc<LmdbStore>,
     pub search: Arc<TantivySearch>,
     idx_counter: Arc<AtomicU32>,
 }
 
 #[async_trait::async_trait]
-impl Persistor<LmdbStore, TantivySearch> for LmdbTantivyPersistance {
+impl Persistor<LmdbStore, TantivySearch> for LmdbTantivyPersistence {
     type Context = String;
     #[tracing::instrument(level = "trace", skip(ctx))]
     async fn new(ctx: String) -> Result<Self, ArunaError> {
@@ -72,7 +75,11 @@ impl Persistor<LmdbStore, TantivySearch> for LmdbTantivyPersistance {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn add_resource(&self, user_id: &Ulid, resource: Resource) -> Result<Vec<u8>, ArunaError> {
+    async fn add_resource(
+        &self,
+        user_id: &Ulid,
+        resource: Resource,
+    ) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let user_id = user_id.clone();
@@ -261,7 +268,11 @@ impl Persistor<LmdbStore, TantivySearch> for LmdbTantivyPersistance {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn update_resource(&self, user_id: &Ulid, resource: Resource) -> Result<Vec<u8>, ArunaError> {
+    async fn update_resource(
+        &self,
+        user_id: &Ulid,
+        resource: Resource,
+    ) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let user_id = user_id.clone();
@@ -335,9 +346,20 @@ impl Persistor<LmdbStore, TantivySearch> for LmdbTantivyPersistance {
 }
 
 // TODO
-impl Authorize for LmdbTantivyPersistance {
+impl Authorize for LmdbTantivyPersistence {
     fn authorize(&self, _user_id: &Ulid, _resource_id: &Ulid) -> bool {
         // TODO: Use casbin here
         true
+    }
+}
+
+#[async_trait::async_trait]
+impl ProtocolHandler for LmdbTantivyPersistence {
+    async fn handle_stream(
+        &self,
+        send_stream: SendStream,
+        recv_stream: RecvStream,
+    ) -> anyhow::Result<()> {
+        todo!()
     }
 }

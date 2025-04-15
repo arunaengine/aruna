@@ -50,7 +50,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     into_axum_response(state.request(request, extract_token(&headers)).await)
 }
@@ -82,7 +82,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     into_axum_response(state.request(request, extract_token(&header)).await)
 }
@@ -111,7 +111,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     match state
         .request(
@@ -154,7 +154,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     match state
         .request(
@@ -197,7 +197,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     match state
         .request(
@@ -240,7 +240,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     match state
         .request(
@@ -283,7 +283,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     match state
         .request(
@@ -326,7 +326,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     match state
         .request(
@@ -369,7 +369,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     match state
         .request(
@@ -412,7 +412,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     match state
         .request(
@@ -458,7 +458,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     into_axum_response(state.request(request, extract_token(&header)).await)
 }
@@ -487,7 +487,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     P: Persistor<St, Se> + 'static,
-    N: Network + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     into_axum_response(state.request(request, extract_token(&headers)).await)
 }

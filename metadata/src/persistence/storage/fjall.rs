@@ -21,6 +21,13 @@ pub struct FjallStore {
     tables: FjallTables,
 }
 
+impl std::fmt::Debug for FjallStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FjallStore")
+            .finish()
+    }
+}
+
 struct FjallTables {
     resources: TransactionalPartitionHandle,
     resource_mappings: TransactionalPartitionHandle,

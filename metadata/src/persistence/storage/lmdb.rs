@@ -11,6 +11,7 @@ use tables::{
 };
 use ulid::Ulid;
 
+#[derive(Debug)]
 pub struct LmdbStore {
     env: Env,
 }

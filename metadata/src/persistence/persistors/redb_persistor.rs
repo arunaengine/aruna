@@ -17,21 +17,24 @@ use crate::{
         },
     },
 };
+use aruna_net::ProtocolHandler;
 use automerge::ActorId;
 use autosurgeon::reconcile;
+use iroh::endpoint::{RecvStream, SendStream};
 use roaring::RoaringBitmap;
 use std::sync::{Arc, atomic::AtomicU32};
 use tokio::join;
 use ulid::Ulid;
 
-pub struct RedbTantivyPersistance {
+#[derive(Debug)]
+pub struct RedbTantivyPersistence {
     pub store: Arc<Redb>,
     pub search: Arc<TantivySearch>,
     idx_counter: Arc<AtomicU32>,
 }
 
 #[async_trait::async_trait]
-impl Persistor<Redb, TantivySearch> for RedbTantivyPersistance {
+impl Persistor<Redb, TantivySearch> for RedbTantivyPersistence {
     type Context = String;
     #[tracing::instrument(level = "trace", skip(ctx))]
     async fn new(ctx: String) -> Result<Self, ArunaError> {
@@ -334,9 +337,20 @@ impl Persistor<Redb, TantivySearch> for RedbTantivyPersistance {
 }
 
 // TODO
-impl Authorize for RedbTantivyPersistance {
+impl Authorize for RedbTantivyPersistence {
     fn authorize(&self, _user_id: &Ulid, _resource_id: &Ulid) -> bool {
         // TODO: Use casbin here
         true
+    }
+}
+
+#[async_trait::async_trait]
+impl ProtocolHandler for RedbTantivyPersistence {
+    async fn handle_stream(
+        &self,
+        send_stream: SendStream,
+        recv_stream: RecvStream,
+    ) -> anyhow::Result<()> {
+        todo!()
     }
 }

@@ -8,3 +8,6 @@ description = "A federated data orchestration network"
 version = "3.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0.98"

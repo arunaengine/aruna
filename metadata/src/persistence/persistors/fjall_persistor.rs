@@ -19,21 +19,24 @@ use crate::{
         },
     },
 };
+use aruna_net::ProtocolHandler;
 use automerge::ActorId;
 use autosurgeon::reconcile;
+use iroh::endpoint::{RecvStream, SendStream};
 use roaring::RoaringBitmap;
 use std::sync::{Arc, atomic::AtomicU32};
 use tokio::join;
 use ulid::Ulid;
 
-pub struct FjallTantivyPersistance {
+#[derive(Debug)]
+pub struct FjallTantivyPersistence {
     pub store: Arc<FjallStore>,
     pub search: Arc<TantivySearch>,
     idx_counter: Arc<AtomicU32>,
 }
 
 #[async_trait::async_trait]
-impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
+impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistence {
     type Context = String;
     #[tracing::instrument(level = "trace", skip(ctx))]
     async fn new(ctx: String) -> Result<Self, ArunaError> {
@@ -335,9 +338,20 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
 }
 
 // TODO
-impl Authorize for FjallTantivyPersistance {
+impl Authorize for FjallTantivyPersistence {
     fn authorize(&self, _user_id: &Ulid, _resource_id: &Ulid) -> bool {
         // TODO: Use casbin here
         true
+    }
+}
+
+#[async_trait::async_trait]
+impl ProtocolHandler for FjallTantivyPersistence {
+    async fn handle_stream(
+        &self,
+        send_stream: SendStream,
+        recv_stream: RecvStream,
+    ) -> anyhow::Result<()> {
+        todo!()
     }
 }

@@ -4,8 +4,8 @@ use metadata::{
     persistence::{
         persistence::Persistor,
         persistors::{
-            fjall_persistor::FjallTantivyPersistance, lmdb_persistor::LmdbTantivyPersistance,
-            redb_persistor::RedbTantivyPersistance,
+            fjall_persistor::FjallTantivyPersistence, lmdb_persistor::LmdbTantivyPersistence,
+            redb_persistor::RedbTantivyPersistence,
         },
         search::tantivy::TantivySearch,
         storage::{fjall::FjallStore, lmdb::LmdbStore, redb::Redb},
@@ -17,24 +17,37 @@ use ulid::Ulid;
 
 pub struct TantivyFjall;
 impl TantivyFjall {
-    pub async fn start()
-    -> Arc<Controller<FjallStore, TantivySearch, NetworkDummy, FjallTantivyPersistance>> {
+    pub async fn start() -> Arc<
+        Controller<
+            FjallStore,
+            TantivySearch,
+            NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
+            FjallTantivyPersistence,
+        >,
+    > {
         let network = NetworkDummy::new(()).await;
-        let persistor = FjallTantivyPersistance::new("./database/fjall_tantivy".to_string())
-            .await
-            .unwrap();
+        let persistor = Arc::new(
+            FjallTantivyPersistence::new("./database/fjall_tantivy".to_string())
+                .await
+                .unwrap(),
+        );
         let controller = Arc::new(Controller::<
             FjallStore,
             TantivySearch,
-            NetworkDummy,
-            FjallTantivyPersistance,
+            NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
+            FjallTantivyPersistence,
         >::new(persistor, network));
         controller
     }
 
     pub async fn create_user(
         controller: Arc<
-            Controller<FjallStore, TantivySearch, NetworkDummy, FjallTantivyPersistance>,
+            Controller<
+                FjallStore,
+                TantivySearch,
+                NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
+                FjallTantivyPersistence,
+            >,
         >,
     ) -> (Ulid, Ulid) {
         let create_user = AddUserRequest {
@@ -53,7 +66,12 @@ impl TantivyFjall {
 
     pub async fn bench_create(
         controller: Arc<
-            Controller<FjallStore, TantivySearch, NetworkDummy, FjallTantivyPersistance>,
+            Controller<
+                FjallStore,
+                TantivySearch,
+                NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
+                FjallTantivyPersistence,
+            >,
         >,
         user1: Ulid,
         user2: Ulid,
@@ -79,7 +97,12 @@ impl TantivyFjall {
 
     pub async fn bench_search(
         controller: Arc<
-            Controller<FjallStore, TantivySearch, NetworkDummy, FjallTantivyPersistance>,
+            Controller<
+                FjallStore,
+                TantivySearch,
+                NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
+                FjallTantivyPersistence,
+            >,
         >,
         user1: Ulid,
         user2: Ulid,
@@ -108,23 +131,38 @@ impl TantivyFjall {
 
 pub struct TantivyHeed;
 impl TantivyHeed {
-    pub async fn start()
-    -> Arc<Controller<LmdbStore, TantivySearch, NetworkDummy, LmdbTantivyPersistance>> {
+    pub async fn start() -> Arc<
+        Controller<
+            LmdbStore,
+            TantivySearch,
+            NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
+            LmdbTantivyPersistence,
+        >,
+    > {
         let network = NetworkDummy::new(()).await;
-        let persistor = LmdbTantivyPersistance::new("./database/heed_tantivy".to_string())
-            .await
-            .unwrap();
+        let persistor = Arc::new(
+            LmdbTantivyPersistence::new("./database/heed_tantivy".to_string())
+                .await
+                .unwrap(),
+        );
         let controller = Arc::new(Controller::<
             LmdbStore,
             TantivySearch,
-            NetworkDummy,
-            LmdbTantivyPersistance,
+            NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
+            LmdbTantivyPersistence,
         >::new(persistor, network));
         controller
     }
 
     pub async fn create_user(
-        controller: Arc<Controller<LmdbStore, TantivySearch, NetworkDummy, LmdbTantivyPersistance>>,
+        controller: Arc<
+            Controller<
+                LmdbStore,
+                TantivySearch,
+                NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
+                LmdbTantivyPersistence,
+            >,
+        >,
     ) -> (Ulid, Ulid) {
         let create_user = AddUserRequest {
             name: "bench_user1".to_string(),
@@ -141,7 +179,14 @@ impl TantivyHeed {
     }
 
     pub async fn bench_create(
-        controller: Arc<Controller<LmdbStore, TantivySearch, NetworkDummy, LmdbTantivyPersistance>>,
+        controller: Arc<
+            Controller<
+                LmdbStore,
+                TantivySearch,
+                NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
+                LmdbTantivyPersistence,
+            >,
+        >,
         user1: Ulid,
         user2: Ulid,
     ) {
@@ -165,7 +210,14 @@ impl TantivyHeed {
     }
 
     pub async fn bench_search(
-        controller: Arc<Controller<LmdbStore, TantivySearch, NetworkDummy, LmdbTantivyPersistance>>,
+        controller: Arc<
+            Controller<
+                LmdbStore,
+                TantivySearch,
+                NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
+                LmdbTantivyPersistence,
+            >,
+        >,
         user1: Ulid,
         user2: Ulid,
     ) {
@@ -193,23 +245,38 @@ impl TantivyHeed {
 
 pub struct TantivyRedb;
 impl TantivyRedb {
-    pub async fn start()
-    -> Arc<Controller<Redb, TantivySearch, NetworkDummy, RedbTantivyPersistance>> {
+    pub async fn start() -> Arc<
+        Controller<
+            Redb,
+            TantivySearch,
+            NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
+            RedbTantivyPersistence,
+        >,
+    > {
         let network = NetworkDummy::new(()).await;
-        let persistor = RedbTantivyPersistance::new("./database/redb_tantivy".to_string())
-            .await
-            .unwrap();
+        let persistor = Arc::new(
+            RedbTantivyPersistence::new("./database/redb_tantivy".to_string())
+                .await
+                .unwrap(),
+        );
         let controller = Arc::new(Controller::<
             Redb,
             TantivySearch,
-            NetworkDummy,
-            RedbTantivyPersistance,
+            NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
+            RedbTantivyPersistence,
         >::new(persistor, network));
         controller
     }
 
     pub async fn create_user(
-        controller: Arc<Controller<Redb, TantivySearch, NetworkDummy, RedbTantivyPersistance>>,
+        controller: Arc<
+            Controller<
+                Redb,
+                TantivySearch,
+                NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
+                RedbTantivyPersistence,
+            >,
+        >,
     ) -> (Ulid, Ulid) {
         let create_user = AddUserRequest {
             name: "bench_user1".to_string(),
@@ -226,7 +293,14 @@ impl TantivyRedb {
     }
 
     pub async fn bench_create(
-        controller: Arc<Controller<Redb, TantivySearch, NetworkDummy, RedbTantivyPersistance>>,
+        controller: Arc<
+            Controller<
+                Redb,
+                TantivySearch,
+                NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
+                RedbTantivyPersistence,
+            >,
+        >,
         user1: Ulid,
         user2: Ulid,
     ) {
@@ -250,7 +324,14 @@ impl TantivyRedb {
     }
 
     pub async fn bench_search(
-        controller: Arc<Controller<Redb, TantivySearch, NetworkDummy, RedbTantivyPersistance>>,
+        controller: Arc<
+            Controller<
+                Redb,
+                TantivySearch,
+                NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
+                RedbTantivyPersistence,
+            >,
+        >,
         user1: Ulid,
         user2: Ulid,
     ) {

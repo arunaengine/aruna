@@ -3,12 +3,11 @@ use crate::{
     error::ArunaError,
     models::models::{Resource, User},
 };
-use automerge::AutoCommit;
-use autosurgeon::Doc;
+use aruna_net::ProtocolHandler;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
-pub trait Persistor<St, Se>: Sized + Send + Sync + Authorize
+pub trait Persistor<St, Se>: Sized + Send + Sync + Authorize + ProtocolHandler
 where
     for<'a> St: Store<'a>,
     Se: Search,

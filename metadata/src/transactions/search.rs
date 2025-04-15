@@ -10,10 +10,10 @@ use super::request::Request;
 
 impl<St, Se, P, N> Request<St, Se, N, P> for SearchRequest
 where
-    for<'a> St: Store<'a>,
-    Se: Search,
-    P: Persistor<St, Se>,
-    N: Network,
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    P: Persistor<St, Se> + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     type Response = SearchResponse;
 

@@ -2690,6 +2690,7 @@ name = "metadata"
 version = "3.0.0"
 dependencies = [
  "ahash",
+ "anyhow",
  "aruna-net",
  "async-trait",
  "automerge",

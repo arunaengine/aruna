@@ -10,6 +10,7 @@ use tantivy::{
     schema::{FAST, Field, INDEXED, OwnedValue, STORED, Schema, TEXT},
 };
 use ulid::Ulid;
+
 pub struct TantivySearch {
     index: Index,
     //writer: std::sync::Mutex<IndexWriter>,
@@ -19,7 +20,18 @@ pub struct TantivySearch {
     fields: Fields,
 }
 
-#[derive(Clone)]
+impl std::fmt::Debug for TantivySearch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TantivySearch")
+            .field("index", &self.index)
+            .field("writer", &self.writer)
+            .field("schema", &self.schema)
+            .field("fields", &self.fields)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Fields {
     ids: Field,
     idx: Field,

@@ -15,6 +15,7 @@ const USER_MAPPINGS: TableDefinition<&[u8], &[u8]> =
 const PUBLIC_MAPPINGS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new(tables::PUBLIC_MAPPINGS_DB_NAME);
 
+#[derive(Debug)]
 pub struct Redb {
     db: Arc<Database>,
 }

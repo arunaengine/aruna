@@ -7,6 +7,7 @@ edition = {workspace = true}
 [dependencies]
 ahash = "0.8.11"
 aruna-net = {path = "../aruna-net"}
+anyhow = {workspace = true}
 automerge = "0.6.0"
 autosurgeon = "0.8.7"
 async-trait = "0.1.87"

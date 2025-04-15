@@ -19,10 +19,10 @@ use ulid::Ulid;
 
 impl<St, Se, P, N> Request<St, Se, N, P> for CreateResourceRequest
 where
-    for<'a> St: Store<'a>,
-    Se: Search,
-    P: Persistor<St, Se>,
-    N: Network,
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    P: Persistor<St, Se> + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     type Response = CreateResourceResponse;
     #[tracing::instrument(level = "trace", skip(controller))]
@@ -79,10 +79,10 @@ where
 
 impl<St, Se, P, N> Request<St, Se, N, P> for GetResourcesRequest
 where
-    for<'a> St: Store<'a>,
-    Se: Search,
-    P: Persistor<St, Se>,
-    N: Network,
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    P: Persistor<St, Se> + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     type Response = GetResourcesResponse;
 
@@ -108,10 +108,10 @@ where
 
 impl<St, Se, P, N> Request<St, Se, N, P> for ResourceUpdateRequests
 where
-    for<'a> St: Store<'a>,
-    Se: Search,
-    P: Persistor<St, Se>,
-    N: Network,
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    P: Persistor<St, Se> + 'static,
+    N: Network<P, St, Se> + 'static,
 {
     type Response = ResourceUpdateResponses;
     #[tracing::instrument(level = "trace", skip(controller))]
