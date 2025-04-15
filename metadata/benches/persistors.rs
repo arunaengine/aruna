@@ -1,6 +1,6 @@
 use metadata::{
     models::requests::{AddUserRequest, CreateResourceRequest, SearchRequest},
-    network::network_trait::NetworkDummy,
+    network::network_trait::{Network, NetworkDummy},
     persistence::{
         persistence::Persistor,
         persistors::{
@@ -19,7 +19,7 @@ pub struct TantivyFjall;
 impl TantivyFjall {
     pub async fn start()
     -> Arc<Controller<FjallStore, TantivySearch, NetworkDummy, FjallTantivyPersistance>> {
-        let network = NetworkDummy {};
+        let network = NetworkDummy::new(());
         let persistor = FjallTantivyPersistance::new("./database/fjall_tantivy".to_string())
             .await
             .unwrap();
@@ -110,7 +110,7 @@ pub struct TantivyHeed;
 impl TantivyHeed {
     pub async fn start()
     -> Arc<Controller<LmdbStore, TantivySearch, NetworkDummy, LmdbTantivyPersistance>> {
-        let network = NetworkDummy {};
+        let network = NetworkDummy::new(());
         let persistor = LmdbTantivyPersistance::new("./database/heed_tantivy".to_string())
             .await
             .unwrap();
@@ -195,7 +195,7 @@ pub struct TantivyRedb;
 impl TantivyRedb {
     pub async fn start()
     -> Arc<Controller<Redb, TantivySearch, NetworkDummy, RedbTantivyPersistance>> {
-        let network = NetworkDummy {};
+        let network = NetworkDummy::new(());
         let persistor = RedbTantivyPersistance::new("./database/redb_tantivy".to_string())
             .await
             .unwrap();

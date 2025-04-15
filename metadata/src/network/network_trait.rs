@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use aruna_net::{FindResult, connection_handler::ProtocolId};
 use iroh::{
-    NodeAddr, NodeId,
-    endpoint::{RecvStream, SendStream},
+    endpoint::{Builder, RecvStream, SendStream}, NodeAddr, NodeId, PublicKey, RelayMode
 };
 use ulid::Ulid;
 
@@ -28,12 +27,13 @@ pub struct NetworkDummy {
     self_id: NodeAddr,
 }
 
+
 #[async_trait::async_trait]
 impl Network for NetworkDummy {
-    type Config = NodeAddr;
+    type Config = ();
     fn new(config: Self::Config) -> Self {
         NetworkDummy {
-            self_id: config
+            self_id: NodeAddr::new(PublicKey::from_bytes(&[0u8;32]).unwrap())
         }
     }
     async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {

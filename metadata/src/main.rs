@@ -1,5 +1,6 @@
 use crate::persistence::persistence::Persistor;
 use api::server::RestServer;
+use network::network_trait::Network;
 use network::network_trait::NetworkDummy;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
@@ -74,7 +75,7 @@ async fn main() {
 "
     );
 
-    let network = NetworkDummy {};
+    let network = NetworkDummy::new(());
     match variant.as_ref() {
         "LMDB" => {
             let persistor = LmdbTantivyPersistance::new(path).await.unwrap();
