@@ -74,7 +74,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn add_resource(&self, user_id: &Ulid, resource: Resource) -> Result<(), ArunaError> {
+    async fn add_resource(&self, user_id: &Ulid, resource: Resource) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let user_id = user_id.clone();
@@ -85,7 +85,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let res_clone = resource.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let mut write_txn = store.create_txn(true)?;
 
             let mut doc = automerge::AutoCommit::new();
@@ -126,7 +126,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
                 store.put(&mut write_txn, PUBLIC_MAPPINGS_DB_NAME, &public_id, &bitmap)?;
             }
             store.commit(write_txn)?;
-            Ok::<(), ArunaError>(())
+            Ok::<Vec<u8>, ArunaError>(res)
         })
         .await
         .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
@@ -137,7 +137,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
         //    Ok::<(), ArunaError>(())
         //});
 
-        Ok(())
+        Ok(result)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -166,7 +166,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn add_user(&self, user: User) -> Result<(), ArunaError> {
+    async fn add_user(&self, user: User) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut write_txn = store.create_txn(true)?;
@@ -187,7 +187,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
 
             // Commit
             store.commit(write_txn)?;
-            Ok::<(), ArunaError>(())
+            Ok::<Vec<u8>, ArunaError>(user)
         })
         .await
         .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
@@ -261,7 +261,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn update_resource(&self, user_id: &Ulid, resource: Resource) -> Result<(), ArunaError> {
+    async fn update_resource(&self, user_id: &Ulid, resource: Resource) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let user_id = user_id.clone();
@@ -272,7 +272,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let res_clone = resource.clone();
 
-        tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             let mut write_txn = store.create_txn(true)?;
 
             let res = store
@@ -319,7 +319,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
                 store.put(&mut write_txn, PUBLIC_MAPPINGS_DB_NAME, &public_id, &bitmap)?;
             }
             store.commit(write_txn)?;
-            Ok::<(), ArunaError>(())
+            Ok::<Vec<u8>, ArunaError>(res)
         })
         .await
         .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
@@ -330,7 +330,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistance {
         //    Ok::<(), ArunaError>(())
         //});
 
-        Ok(())
+        Ok(result)
     }
 }
 

@@ -66,10 +66,13 @@ where
             location: Vec::new(),
             hashes: Vec::new(),
         };
-        let _x = controller
+        let doc = controller
             .persistence
             .add_resource(&user.id, resource.clone())
             .await?;
+        
+
+
         Ok(CreateResourceResponse { resource })
     }
 }

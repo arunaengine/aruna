@@ -9,19 +9,33 @@ use iroh::{
 };
 use crate::error::ArunaError;
 
+pub struct Message {
+    from: [u8; 32],
+    to: [u8; 32],
+    subject: [u8; 32],
+    body: Body,
+}
+
+pub enum Body {
+    CreateUser(Vec<u8>),
+    CreateObject(Vec<u8>),
+    UpdateObject(Vec<u8>),
+}
+
 #[async_trait::async_trait]
 pub trait Network: Sync + Send {
     type Config;
     async fn new(config: Self::Config) -> Self;
-    async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError>;
-    fn spawn_acceptor(self: Self);
-    async fn get_bidi_stream(
-        &self,
-        node_id: NodeId,
-        protocol_id: ProtocolId,
-    ) -> Result<(RecvStream, SendStream), ArunaError>;
-    async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError>;
-    async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError>;
+    async fn broadcast(&self, msg: Message) -> Result<(), ArunaError>;
+    //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError>;
+    //fn spawn_acceptor(self: Self);
+    //async fn get_bidi_stream(
+    //    &self,
+    //    node_id: NodeId,
+    //    protocol_id: ProtocolId,
+    //) -> Result<(RecvStream, SendStream), ArunaError>;
+    //async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError>;
+    //async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError>;
 }
 
 pub struct NetworkDummy {
@@ -31,31 +45,34 @@ pub struct NetworkDummy {
 #[async_trait::async_trait]
 impl Network for NetworkDummy {
     type Config = ();
-    async fn new(config: Self::Config) -> Self {
+    async fn new(_config: Self::Config) -> Self {
         NetworkDummy {
             self_id: NodeAddr::new(PublicKey::from_bytes(&[0u8; 32]).unwrap()),
         }
     }
-    async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
-        Ok(self.self_id.clone())
-    }
-    fn spawn_acceptor(self: Self) {}
-    async fn get_bidi_stream(
-        &self,
-        node_id: NodeId,
-        protocol_id: ProtocolId,
-    ) -> Result<(RecvStream, SendStream), ArunaError> {
-        todo!()
-    }
-    async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError> {
-        Ok(FindResult {
-            value: vec![self.self_id.clone()],
-            nodes: vec![self.self_id.clone()],
-        })
-    }
-    async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError> {
+    async fn broadcast(&self, msg: Message) -> Result<(), ArunaError> {
         Ok(())
     }
+    //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
+    //    Ok(self.self_id.clone())
+    //}
+    //fn spawn_acceptor(self: Self) {}
+    //async fn get_bidi_stream(
+    //    &self,
+    //    node_id: NodeId,
+    //    protocol_id: ProtocolId,
+    //) -> Result<(RecvStream, SendStream), ArunaError> {
+    //    todo!()
+    //}
+    //async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError> {
+    //    Ok(FindResult {
+    //        value: vec![self.self_id.clone()],
+    //        nodes: vec![self.self_id.clone()],
+    //    })
+    //}
+    //async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError> {
+    //    Ok(())
+    //}
 }
 
 pub struct NetworkConfig {
@@ -74,23 +91,27 @@ impl Network for Arc<ConnectionHandler> {
             .await.unwrap()
             //.map_err(|e| ArunaError::NetworkError(e.to_string()))
     }
-    async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
-        self.get_node_addr().await
+
+    async fn broadcast(&self, msg: Message) -> Result<(), ArunaError> {
+        todo!()
     }
-    fn spawn_acceptor(self: Self) {
-        ConnectionHandler::spawn_acceptor(self);
-    }
-    async fn get_bidi_stream(
-        &self,
-        node_id: NodeId,
-        protocol_id: ProtocolId,
-    ) -> Result<(RecvStream, SendStream), ArunaError> {
-        self.get_bidi_stream(node_id, protocol_id).await
-    }
-    async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError> {
-        self.find(key).await
-    }
-    async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError> {
-        self.store(key, value).await
-    }
+    // async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
+    //     self.get_node_addr().await
+    // }
+    // fn spawn_acceptor(self: Self) {
+    //     ConnectionHandler::spawn_acceptor(self);
+    // }
+    // async fn get_bidi_stream(
+    //     &self,
+    //     node_id: NodeId,
+    //     protocol_id: ProtocolId,
+    // ) -> Result<(RecvStream, SendStream), ArunaError> {
+    //     self.get_bidi_stream(node_id, protocol_id).await
+    // }
+    // async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError> {
+    //     self.find(key).await
+    // }
+    // async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError> {
+    //     self.store(key, value).await
+    // }
 }

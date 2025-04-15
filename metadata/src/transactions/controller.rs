@@ -13,7 +13,7 @@ where
     N: Network,
 {
     pub persistence: Arc<P>,
-    pub _network: Arc<N>,
+    pub network: Arc<N>,
     phantom_store: PhantomData<St>,
     phantom_search: PhantomData<Se>,
 }
@@ -29,7 +29,7 @@ where
     pub fn new(persistence: P, network: N) -> Self {
         Self {
             persistence: Arc::new(persistence),
-            _network: Arc::new(network),
+            network: Arc::new(network),
             phantom_store: PhantomData,
             phantom_search: PhantomData,
         }
