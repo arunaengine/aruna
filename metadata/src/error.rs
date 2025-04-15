@@ -81,8 +81,11 @@ pub enum ArunaError {
     #[error("Graph error: {0}")]
     GraphError(String),
     #[response(status = 500)]
-    #[error("Graph error: {0}")]
+    #[error("Tantivy error: {0}")]
     TantivyError(String),
+    #[response(status = 500)]
+    #[error("Network error: {0}")]
+    NetworkError(String),
 }
 
 impl ArunaError {

@@ -75,7 +75,7 @@ async fn main() {
 "
     );
 
-    let network = NetworkDummy::new(());
+    let network = NetworkDummy::new(()).await;
     match variant.as_ref() {
         "LMDB" => {
             let persistor = LmdbTantivyPersistance::new(path).await.unwrap();
