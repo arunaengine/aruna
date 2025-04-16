@@ -419,7 +419,7 @@ impl Kademlia {
             return Err(anyhow!("Network not initialized"));
         };
 
-        let (mut rx, mut sx) = chandler
+        let (mut rx, mut sx) = chandler.clone()
             .get_bidi_stream(target_addr.node_id, KADEMLIA_PROTOCOL_ID)
             .await?;
 

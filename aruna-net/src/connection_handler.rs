@@ -13,8 +13,8 @@ use tokio::{io::AsyncReadExt, io::AsyncWriteExt, sync::RwLock};
 pub trait ProtocolHandler: Send + Sync + Debug {
     async fn handle_stream(
         &self,
-        mut send_stream: SendStream,
-        mut recv_stream: RecvStream,
+        send_stream: SendStream,
+        recv_stream: RecvStream,
     ) -> anyhow::Result<()>;
 }
 
@@ -172,6 +172,31 @@ impl ConnectionHandler {
                     }
                 };
                 self.connections.write().await.insert(node_id, conn.clone());
+
+                self.clone().accept_bidi_stream(conn).await;
+            }
+        });
+    }
+
+    async fn get_or_create_connection(self: Arc<Self>, node_id: NodeId) -> Result<Connection> {
+        {
+            let connections = self.connections.read().await;
+            if let Some(connection) = connections.get(&node_id) {
+                return Ok(connection.clone());
+            }
+        }
+        let mut connections = self.connections.write().await;
+        let connection = self.endpoint.connect(node_id, ARUNA_NET_ALPN).await?;
+
+        self.clone().accept_bidi_stream(connection.clone()).await;
+
+        connections.insert(node_id, connection.clone());
+        Ok(connection)
+    }
+
+    async fn accept_bidi_stream(self: Arc<Self>, conn: Connection) {
+        tokio::spawn(async move {
+            loop {
                 let (rx, mut sx) = match conn.accept_bi().await {
                     Ok((rx, sx)) => (rx, sx),
                     Err(err) => {
@@ -201,21 +226,8 @@ impl ConnectionHandler {
         });
     }
 
-    async fn get_or_create_connection(&self, node_id: NodeId) -> anyhow::Result<Connection> {
-        {
-            let connections = self.connections.read().await;
-            if let Some(connection) = connections.get(&node_id) {
-                return Ok(connection.clone());
-            }
-        }
-        let mut connections = self.connections.write().await;
-        let connection = self.endpoint.connect(node_id, ARUNA_NET_ALPN).await?;
-        connections.insert(node_id, connection.clone());
-        Ok(connection)
-    }
-
     pub async fn get_bidi_stream(
-        &self,
+        self: Arc<Self>,
         node_id: NodeId,
         protocol_id: ProtocolId,
     ) -> anyhow::Result<(RecvStream, SendStream)> {
