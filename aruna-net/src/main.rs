@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 pub async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
-        .add_directive("aruna-net=debug".parse()?);
+        .add_directive("aruna_net=debug".parse()?);
 
     let subscriber = tracing_subscriber::fmt()
         //.with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)

@@ -1,13 +1,13 @@
 use anyhow::{Result, anyhow};
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{NodeAddr, NodeId, PublicKey};
-use log::{info, trace, warn};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tracing::{debug, info, trace, warn};
 use ulid::Ulid;
 
 use crate::connection_handler::{ConnectionHandler, ProtocolHandler};
