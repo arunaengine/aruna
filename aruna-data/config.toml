@@ -1,0 +1,27 @@
+[backend]
+backend_type = "S3"
+encryption=true
+compression=true
+deduplication=true
+
+[backend.access]
+endpoint = "http://localhost:9000"
+region = "us-east-1"
+# Access credentials and bucket should be dynamically set
+bucket = "my-bucket"
+access_key_id = "minioadmin"
+secret_access_key = "minioadmin"
+
+
+# FileSystem example config
+#[backend.access]
+#root = "/data"
+#atomic_write_dir = /tmp
+
+# PostgreSQL example config
+#[backend.access]
+#root = /tmp
+#connection_string = "postgres://postgres@localhost:5432/test"
+#table = "objects"
+#key_field = ""
+#value_field = ""
