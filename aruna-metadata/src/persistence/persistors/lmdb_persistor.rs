@@ -30,6 +30,8 @@ use std::sync::{Arc, atomic::AtomicU32};
 use tokio::{io::AsyncReadExt, join};
 use ulid::Ulid;
 
+use super::utils::{create_mappings, idx_from_cow, update_mappings, visiblity_from_doc};
+
 #[derive(Debug)]
 pub struct LmdbTantivyPersistence {
     pub store: Arc<LmdbStore>,
@@ -286,13 +288,22 @@ impl Persistor<LmdbStore, TantivySearch> for LmdbTantivyPersistence {
         let resource_id = resource.id.to_bytes();
         let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
         // spawn search in its own block and dont await outcome
-        let idx = self
-            .idx_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let res_clone = resource.clone();
 
-        let result = tokio::task::spawn_blocking(move || {
+        let (result, idx) = tokio::task::spawn_blocking(move || {
             let mut write_txn = store.create_txn(true)?;
+
+            let idx = u32::from_be_bytes(
+                store
+                    .get(&write_txn, RESOURCE_MAPPINGS_DB_NAME, &resource_id)?
+                    .ok_or_else(|| ArunaError::NotFound(format!("{} not found", resource.id)))?
+                    .as_ref()
+                    .try_into()
+                    .map_err(|e| ArunaError::ConversionError {
+                        from: "Cow".to_string(),
+                        to: "&[u8;4]".to_string(),
+                    })?,
+            );
 
             let res = store
                 .get(&write_txn, RESOURCE_DB_NAME, &resource_id)?
@@ -388,7 +399,7 @@ impl Persistor<LmdbStore, TantivySearch> for LmdbTantivyPersistence {
             }
 
             store.commit(write_txn)?;
-            Ok::<Vec<u8>, ArunaError>(res)
+            Ok::<(Vec<u8>, u32), ArunaError>((res, idx))
         })
         .await
         .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
@@ -404,11 +415,77 @@ impl Persistor<LmdbStore, TantivySearch> for LmdbTantivyPersistence {
 
     async fn handle_message(&self, msg: MetadataMessage) -> Result<MetadataMessage, ArunaError> {
         match msg.body {
-            crate::network::network_trait::Body::User(items) => {
+            crate::network::network_trait::Body::User(doc) => {
                 todo!()
             }
-            crate::network::network_trait::Body::Object(items) => {
-                todo!()
+            crate::network::network_trait::Body::Object(doc) => {
+                let store = self.store.clone();
+                let search = self.search.clone();
+                let idx_counter = self.idx_counter.clone();
+                let idx = tokio::task::spawn_blocking(move || -> Result<u32, ArunaError> {
+                    let mut wtxn = store.create_txn(true)?;
+                    let mut doc = automerge::AutoCommit::load(doc.as_ref())?;
+                    let (user_id_bytes, _node_pubkey) = doc.get_actor().to_bytes().split_at(16);
+                    let user_id = Ulid::from_bytes(user_id_bytes.try_into().map_err(|e| {
+                        ArunaError::ConversionError {
+                            from: "[u8]".to_string(),
+                            to: "[u8;16]".to_string(),
+                        }
+                    })?);
+                    let foreign_resource: Resource = autosurgeon::hydrate(&doc)?;
+                    let ulid_bytes = foreign_resource.id.to_bytes();
+                    let (idx, visibility, mut merged_resource) =
+                        match store.get(&wtxn, RESOURCE_DB_NAME, &ulid_bytes)? {
+                            Some(existing_doc) => {
+                                let mut existing_resource =
+                                    automerge::AutoCommit::load(existing_doc.as_ref())?;
+                                existing_resource.merge(&mut doc)?;
+                                let idx = idx_from_cow(
+                                    store
+                                        .get(&wtxn, RESOURCE_MAPPINGS_DB_NAME, &ulid_bytes)?
+                                        .ok_or_else(|| {
+                                            ArunaError::NotFound(format!(
+                                                "Idx not found for object with id {}",
+                                                foreign_resource.id
+                                            ))
+                                        })?,
+                                )?;
+
+                                let visibility = visiblity_from_doc(doc)?;
+                                (idx, visibility, existing_resource)
+                            }
+                            None => (
+                                idx_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                                foreign_resource.visibility.clone(),
+                                doc,
+                            ),
+                        };
+
+                    let res = merged_resource.save();
+
+                    store.put(
+                        &mut wtxn,
+                        RESOURCE_DB_NAME,
+                        &foreign_resource.id.to_bytes(),
+                        &res,
+                    )?;
+                    store.put(
+                        &mut wtxn,
+                        RESOURCE_MAPPINGS_DB_NAME,
+                        &foreign_resource.id.to_bytes(),
+                        &idx.to_be_bytes(),
+                    )?;
+                    if visibility != foreign_resource.visibility {
+                        update_mappings(store.as_ref(), &mut wtxn, foreign_resource, &user_id, idx)?;
+                    } else {
+                        create_mappings(&store, &mut wtxn, foreign_resource, &user_id, idx)?;
+                    }
+
+                    store.commit(wtxn)?;
+
+                    Ok::<u32, ArunaError>(idx)
+                })
+                .await;
             }
             crate::network::network_trait::Body::Empty => (),
         };
