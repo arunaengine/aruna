@@ -38,6 +38,13 @@ pub trait Store<'a>: Sync + Send + Sized {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), ArunaError>;
+
+    fn remove(
+        &'a self,
+        txn: &mut Self::Txn,
+        dbname: &str,
+        key: &[u8],
+    ) -> Result<(), ArunaError>;
     fn get<'b>(
         &'a self,
         txn: &'b Self::Txn,

@@ -196,6 +196,28 @@ impl<'a> Store<'a> for LmdbStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, txn, key))]
+    fn remove(
+        &'a self,
+        txn: &mut LmdbTxn<'a>,
+        dbname: &str,
+        key: &[u8],
+    ) -> Result<(), ArunaError> {
+        let mut txn = match txn {
+            LmdbTxn::Read(_ro_txn) => {
+                return Err(ArunaError::DatabaseError("Read txn provided".to_string()));
+            }
+            LmdbTxn::Write(rw_txn) => rw_txn,
+        };
+        let db: Database<Bytes, Bytes> = self
+            .env
+            .open_database(&txn, Some(dbname))?
+            .ok_or_else(|| ArunaError::DatabaseError("Database not found".to_string()))?;
+        db.delete(&mut txn, key)?;
+        Ok(())
+    }
+
+
+    #[tracing::instrument(level = "trace", skip(self, txn, key))]
     fn get<'b>(
         &'a self,
         txn: &'b LmdbTxn<'a>,

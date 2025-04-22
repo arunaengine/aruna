@@ -4,19 +4,22 @@ use crate::{
 };
 use aruna_net::{ConnectionHandler, ConnectionHandlerBuilder};
 use iroh::{NodeAddr, PublicKey, SecretKey};
+use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
 
-pub struct Message {
-    from: [u8; 32],
-    to: [u8; 32],
-    subject: [u8; 32],
-    body: Body,
+#[derive(Serialize, Deserialize)]
+pub struct MetadataMessage {
+    pub from: [u8; 32],
+    pub to: [u8; 32],
+    pub subject: [u8; 32],
+    pub body: Body,
 }
 
+#[derive(Serialize, Deserialize)]
 pub enum Body {
-    CreateUser(Vec<u8>),
-    CreateObject(Vec<u8>),
-    UpdateObject(Vec<u8>),
+    User(Vec<u8>),
+    Object(Vec<u8>),
+    Empty,
 }
 
 #[async_trait::async_trait]
@@ -28,7 +31,8 @@ where
 {
     type Config;
     async fn new(config: Self::Config) -> Self;
-    async fn broadcast(&self, msg: Message) -> Result<(), ArunaError>;
+    async fn get_id(&self) -> Result<Vec<u8>, ArunaError>;
+    async fn broadcast(&self, msg: MetadataMessage) -> Result<(), ArunaError>;
     //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError>;
     //fn spawn_acceptor(self: Self);
     //async fn get_bidi_stream(
@@ -64,7 +68,10 @@ where
             _phantom: PhantomData,
         }
     }
-    async fn broadcast(&self, msg: Message) -> Result<(), ArunaError> {
+    async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
+        Ok(vec![0u8; 32])
+    }
+    async fn broadcast(&self, msg: MetadataMessage) -> Result<(), ArunaError> {
         Ok(())
     }
     //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
@@ -123,10 +130,20 @@ where
             .await
             .unwrap();
         //.map_err(|e| ArunaError::NetworkError(e.to_string()))
-        P2PNetwork { chandler, phantom: PhantomData }
+        P2PNetwork {
+            chandler,
+            phantom: PhantomData,
+        }
+    }
+    async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
+        self.chandler
+            .get_node_addr()
+            .await
+            .map(|addr| addr.node_id.as_bytes().to_vec())
+            .map_err(|e| ArunaError::NetworkError(e.to_string()))
     }
 
-    async fn broadcast(&self, msg: Message) -> Result<(), ArunaError> {
+    async fn broadcast(&self, msg: MetadataMessage) -> Result<(), ArunaError> {
         todo!()
     }
     // async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {

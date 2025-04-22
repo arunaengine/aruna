@@ -23,8 +23,7 @@ pub struct FjallStore {
 
 impl std::fmt::Debug for FjallStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FjallStore")
-            .finish()
+        f.debug_struct("FjallStore").finish()
     }
 }
 
@@ -167,6 +166,46 @@ impl<'a> Store<'a> for FjallStore {
             }
             tables::PUBLIC_MAPPINGS_DB_NAME => {
                 wtxn.insert(&tables.public_mappings, key, value);
+            }
+            _ => {
+                return Err(ArunaError::DatabaseError("Database not found".to_string()));
+            }
+        }
+
+        Ok(())
+    }
+
+
+    fn remove(
+        &'a self,
+        txn: &mut Self::Txn,
+        dbname: &str,
+        key: &[u8],
+    ) -> Result<(), crate::error::ArunaError> {
+        let wtxn = match txn {
+            FjallTxn::Read(_) => {
+                return Err(ArunaError::DatabaseError(
+                    "Only write txns permitted".to_string(),
+                ));
+            }
+            FjallTxn::Write(w) => w,
+        };
+        let tables = &self.tables;
+        match dbname {
+            tables::RESOURCE_DB_NAME => {
+                wtxn.remove(&tables.resources, key);
+            }
+            tables::RESOURCE_MAPPINGS_DB_NAME => {
+                wtxn.remove(&tables.resource_mappings, key);
+            }
+            tables::USER_DB_NAME => {
+                wtxn.remove(&tables.users, key);
+            }
+            tables::USER_MAPPINGS_DB_NAME => {
+                wtxn.remove(&tables.user_mappings, key);
+            }
+            tables::PUBLIC_MAPPINGS_DB_NAME => {
+                wtxn.remove(&tables.public_mappings, key);
             }
             _ => {
                 return Err(ArunaError::DatabaseError("Database not found".to_string()));

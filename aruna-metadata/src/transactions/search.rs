@@ -1,3 +1,4 @@
+use super::request::Request;
 use crate::{
     models::{
         models::User,
@@ -6,7 +7,6 @@ use crate::{
     network::network_trait::Network,
     persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
 };
-use super::request::Request;
 
 impl<St, Se, P, N> Request<St, Se, N, P> for SearchRequest
 where

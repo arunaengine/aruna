@@ -1,10 +1,10 @@
+use super::controller::Controller;
 use crate::{
     error::ArunaError,
     models::models::User,
     network::network_trait::Network,
     persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
 };
-use super::controller::Controller;
 
 pub trait Request<St, Se, N, P>
 where

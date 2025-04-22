@@ -10,4 +10,15 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+ahash = "0.8.11"
 anyhow = "1.0.98"
+async-trait = "0.1.88"
+dotenvy = "0.15.7"
+iroh = "0.34.1"
+iroh-base = "0.34.0"
+postcard = "1.1.1"
+serde = { version = "1.0.218", features = ["derive"] }
+tokio = { version = "1.44.2", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time", "fmt", "registry"] }
+ulid = { version = "1.2.1", features = ["serde"] }

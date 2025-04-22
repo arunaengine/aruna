@@ -149,6 +149,46 @@ impl<'a> Store<'a> for Redb {
         Ok(())
     }
 
+    fn remove(
+        &'a self,
+        txn: &mut Self::Txn,
+        dbname: &str,
+        key: &[u8],
+    ) -> Result<(), crate::error::ArunaError> {
+        let RedbTxn::Write(write_txn) = txn else {
+            return Err(ArunaError::DatabaseError(
+                "Only write txns allowed".to_string(),
+            ));
+        };
+
+        match dbname {
+            tables::RESOURCE_DB_NAME => {
+                let mut resources = write_txn.open_table(RESOURCES)?;
+                resources.remove(key)?;
+            }
+            tables::RESOURCE_MAPPINGS_DB_NAME => {
+                let mut res_mappings = write_txn.open_table(RESOURCE_MAPPINGS)?;
+                res_mappings.remove(key)?;
+            }
+            tables::USER_DB_NAME => {
+                let mut users = write_txn.open_table(USERS)?;
+                users.remove(key)?;
+            }
+            tables::USER_MAPPINGS_DB_NAME => {
+                let mut user_mappings = write_txn.open_table(USER_MAPPINGS)?;
+                user_mappings.remove(key)?;
+            }
+            tables::PUBLIC_MAPPINGS_DB_NAME => {
+                let mut public_mappings = write_txn.open_table(PUBLIC_MAPPINGS)?;
+                public_mappings.remove(key)?;
+            }
+            _ => {
+                return Err(ArunaError::DatabaseError("Database not found".to_string()));
+            }
+        }
+
+        Ok(())
+    }
     fn get<'b>(
         &'a self,
         txn: &'b Self::Txn,

@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
             chandler2.get_node_addr().await?,
         )
         .await?;
-    
+
     debug!(
         "Data location found in Node 1: {:?}",
         chandler1.find(hash).await?

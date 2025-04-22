@@ -68,10 +68,21 @@ where
         };
         let doc = controller
             .persistence
-            .add_resource(&user.id, resource.clone())
+            .add_resource(
+                controller
+                    .network
+                    .get_id()
+                    .await?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_e| ArunaError::ConversionError {
+                        from: "Vec<u8>".to_string(),
+                        to: "&[u8; 32]".to_string(),
+                    })?,
+                &user.id,
+                resource.clone(),
+            )
             .await?;
-        
-
 
         Ok(CreateResourceResponse { resource })
     }
@@ -217,9 +228,22 @@ where
             }
         };
 
-        controller
+        let doc = controller
             .persistence
-            .update_resource(&user.id, resource.clone())
+            .update_resource(
+                controller
+                    .network
+                    .get_id()
+                    .await?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_e| ArunaError::ConversionError {
+                        from: "Vec<u8>".to_string(),
+                        to: "&[u8; 32]".to_string(),
+                    })?,
+                &user.id,
+                resource.clone(),
+            )
             .await?;
 
         Ok(response)

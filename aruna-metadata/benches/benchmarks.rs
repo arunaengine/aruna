@@ -1,4 +1,4 @@
-use metadata::models::requests::{
+use aruna_metadata::models::requests::{
     AddUserRequest, AddUserResponse, CreateResourceRequest, CreateResourceResponse,
 };
 use criterion::{Criterion, criterion_group, criterion_main};

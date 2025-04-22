@@ -4,26 +4,27 @@ version = {workspace = true}
 edition = {workspace = true}
 
 [dependencies]
-ahash = "0.8.11"
-anyhow = "1.0.97"
+ahash = {workspace = true} 
+anyhow = {workspace = true} 
 aruna-net = { path = "../aruna-net" }
-async-trait = "0.1.88"
+async-trait = {workspace = true} 
+dotenvy = {workspace = true}
+iroh = {workspace = true}
+postcard = {workspace = true} 
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = {workspace = true} 
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+
 bao-tree = "0.15.1"
 blake3 = "1.8.1"
 bytes = "1.10.1"
-dotenvy = "0.15.7"
 futures = "0.3.31"
-iroh = "0.34.1"
 iroh-io = "0.6.2"
 lazy_static = "1.5.0"
 md5 = "0.7.0"
 opendal = { version = "0.53.0", features = ["services-s3", "services-http", "services-postgresql", "services-fs"] }
 pithos_lib = "0.6.1"
-postcard = "1.1.1"
-serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.10.8"
-tokio = { version = "1.44.2", features = ["full"] }
 toml = "0.8.20"
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
-ulid = { version = "1.2.1", features = ["serde"] }

@@ -1,4 +1,4 @@
-use metadata::{
+use aruna_metadata::{
     models::requests::{AddUserRequest, CreateResourceRequest, SearchRequest},
     network::network_trait::{Network, NetworkDummy},
     persistence::{

@@ -1,13 +1,11 @@
-use ulid::Ulid;
 use super::request::Request;
 use crate::{
-    models::{
+    error::ArunaError, models::{
         models::User,
         requests::{AddUserRequest, AddUserResponse},
-    },
-    network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    }, network::network_trait::Network, persistence::{persistence::Persistor, search::search::Search, storage::store::Store}
 };
+use ulid::Ulid;
 
 impl<St, Se, P, N> Request<St, Se, N, P> for AddUserRequest
 where
@@ -28,7 +26,22 @@ where
             id: Ulid::new(),
             name: self.name,
         };
-        controller.persistence.add_user(user.clone()).await?;
+        controller
+            .persistence
+            .add_user(
+                controller
+                    .network
+                    .get_id()
+                    .await?
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_e| ArunaError::ConversionError {
+                        from: "Vec<u8>".to_string(),
+                        to: "&[u8; 32]".to_string(),
+                    })?,
+                user.clone(),
+            )
+            .await?;
         Ok(AddUserResponse { user })
     }
 }

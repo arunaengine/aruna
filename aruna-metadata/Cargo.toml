@@ -5,21 +5,28 @@ edition = {workspace = true}
 
 
 [dependencies]
-ahash = "0.8.11"
-aruna-net = {path = "../aruna-net"}
+ahash = {workspace = true}
 anyhow = {workspace = true}
+async-trait = {workspace = true}
+dotenvy = {workspace = true}
+iroh = {workspace = true}
+iroh-base = {workspace = true}
+postcard = {workspace = true}
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = {workspace = true} 
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+
+aruna-net = {path = "../aruna-net"}
 automerge = "0.6.0"
 autosurgeon = "0.8.7"
-async-trait = "0.1.87"
 axum = "0.8.1"
 axum-extra = {version = "0.10.0", features = ["query"]}
 bincode = { version= "2.0.1", features = ["serde"]}
 chrono = { version = "0.4.40", features = ["serde"]}
-dotenvy = "0.15.7"
 fjall = "2.6.7"
 heed = "0.21.0"
-iroh = "0.34.0"
-iroh-base = "0.34.0"
 opentelemetry = "0.27.0"
 opentelemetry-otlp = { version = "0.27.0", features = ["grpc-tonic"]}
 opentelemetry_sdk = { version = "0.27.0", features = ["rt-tokio"]}
@@ -27,16 +34,11 @@ rayon = "1.10.0"
 redb = "2.4.0"
 reqwest = { version = "0.12.15", features = ["json"] }
 roaring = "0.10.10"
-serde = { version = "1.0.218", features = ["derive"] }
 serde_json = "1.0.140"
 tantivy = "0.22.0"
 thiserror = "2.0.12"
-tokio = { version = "1.41.1", features = ["full"] }
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
-tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt", "registry"] }
 tracing-opentelemetry = "0.28.0"
-ulid = { version = "1.2.0", features = ["serde"] }
 utoipa = { version = "5.3.1", features = ["chrono", "axum_extras", "ulid", "url"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.0", features = ["axum"] }

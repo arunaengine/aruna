@@ -1,6 +1,7 @@
 use crate::{
     error::ArunaError,
     models::models::{Resource, User, VisibilityClass},
+    network::network_trait::MetadataMessage,
     persistence::{
         persistence::{Authorize, Persistor},
         search::{
@@ -20,7 +21,7 @@ use crate::{
     },
 };
 use aruna_net::ProtocolHandler;
-use automerge::ActorId;
+use automerge::{ActorId, ReadDoc};
 use autosurgeon::reconcile;
 use iroh::endpoint::{RecvStream, SendStream};
 use roaring::RoaringBitmap;
@@ -77,10 +78,16 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistence {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn add_resource(&self, user_id: &Ulid, resource: Resource) -> Result<Vec<u8>, ArunaError> {
+    async fn add_resource(
+        &self,
+        actor_id: &[u8; 32],
+        user_id: &Ulid,
+        resource: Resource,
+    ) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let user_id = user_id.clone();
+        let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
 
         // spawn search in its own block and dont await outcome
         let idx = self
@@ -91,7 +98,7 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistence {
         let result = tokio::task::spawn_blocking(move || {
             let mut write_txn = store.create_txn(true)?;
 
-            let mut doc = automerge::AutoCommit::new();
+            let mut doc = automerge::AutoCommit::new().with_actor(actor_id);
             autosurgeon::reconcile(&mut doc, resource.clone())?;
             let res = doc.save();
 
@@ -169,15 +176,16 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistence {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn add_user(&self, user: User) -> Result<Vec<u8>, ArunaError> {
+    async fn add_user(&self, actor_id: &[u8; 32], user: User) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
+        let actor_id = ActorId::from([user.id.to_bytes().as_slice(), actor_id.as_slice()].concat());
         let result = tokio::task::spawn_blocking(move || {
             let mut write_txn = store.create_txn(true)?;
 
             // Serialize into &[u8]
             let id = user.id.to_bytes();
 
-            let mut doc = automerge::AutoCommit::new();
+            let mut doc = automerge::AutoCommit::new().with_actor(actor_id);
             autosurgeon::reconcile(&mut doc, user)?;
             let user = doc.save();
 
@@ -264,11 +272,17 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistence {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn update_resource(&self, user_id: &Ulid, resource: Resource) -> Result<Vec<u8>, ArunaError> {
+    async fn update_resource(
+        &self,
+actor_id: &[u8; 32],
+        user_id: &Ulid,
+        resource: Resource,
+    ) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let user_id = user_id.clone();
         let resource_id = resource.id.to_bytes();
+        let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
         // spawn search in its own block and dont await outcome
         let idx = self
             .idx_counter
@@ -282,8 +296,30 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistence {
                 .get(&write_txn, RESOURCE_DB_NAME, &resource_id)?
                 .ok_or_else(|| ArunaError::NotFound(format!("{} not found", resource.id)))?;
 
-            let mut doc = automerge::AutoCommit::load(res.as_ref())?
-                .with_actor(ActorId::from(user_id.to_bytes()));
+            let mut doc = automerge::AutoCommit::load(res.as_ref())?.with_actor(actor_id);
+
+            let visibility = match doc.get(automerge::ROOT, "visibility")?.ok_or_else(|| {
+                ArunaError::DeserializeError("visibility field not found".to_string())
+            })? {
+                (automerge::Value::Scalar(cow), _) => match cow.to_str() {
+                    Some("Private") => VisibilityClass::Private,
+                    Some("Public") => VisibilityClass::Public,
+                    Some("Invisible") => VisibilityClass::Invisible,
+                    _ => {
+                        return Err(ArunaError::ConversionError {
+                            from: "Cow".to_string(),
+                            to: "VisibilityClass".to_string(),
+                        });
+                    }
+                },
+                (_, _) => {
+                    return Err(ArunaError::ConversionError {
+                        from: "Cow".to_string(),
+                        to: "VisibilityClass".to_string(),
+                    });
+                }
+            };
+
             reconcile(&mut doc, resource.clone())?;
             doc.commit();
             let res = doc.save();
@@ -300,27 +336,55 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistence {
                 &resource.id.to_bytes(),
                 &idx.to_be_bytes(),
             )?;
-            if !matches!(resource.visibility, VisibilityClass::Public) {
-                let user_id = user_id.to_bytes();
-                let res = store
-                    .get(&mut write_txn, USER_MAPPINGS_DB_NAME, &user_id)?
-                    .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
-                let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
-                mut_map.insert(idx);
-                let mut bitmap = Vec::new();
-                mut_map.serialize_into(&mut bitmap)?;
-                store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
-            } else {
-                let public_id = Ulid::default().to_bytes();
-                let res = store
-                    .get(&mut write_txn, PUBLIC_MAPPINGS_DB_NAME, &public_id)?
-                    .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
-                let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
-                mut_map.insert(idx);
-                let mut bitmap = Vec::new();
-                mut_map.serialize_into(&mut bitmap)?;
-                store.put(&mut write_txn, PUBLIC_MAPPINGS_DB_NAME, &public_id, &bitmap)?;
+
+            if visibility != resource.visibility {
+                if !matches!(resource.visibility, VisibilityClass::Public) {
+                    // Add to private mappings
+                    let user_id = user_id.to_bytes();
+                    let res = store
+                        .get(&mut write_txn, USER_MAPPINGS_DB_NAME, &user_id)?
+                        .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
+                    let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
+                    mut_map.insert(idx);
+                    let mut bitmap = Vec::new();
+                    mut_map.serialize_into(&mut bitmap)?;
+                    store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
+
+                    // Remove from public mappings
+                    let public_id = Ulid::default().to_bytes();
+                    let res = store
+                        .get(&mut write_txn, PUBLIC_MAPPINGS_DB_NAME, &public_id)?
+                        .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
+                    let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
+                    mut_map.remove(idx);
+                    let mut bitmap = Vec::new();
+                    mut_map.serialize_into(&mut bitmap)?;
+                    store.put(&mut write_txn, PUBLIC_MAPPINGS_DB_NAME, &public_id, &bitmap)?;
+                } else {
+                    // Add to public mappings
+                    let public_id = Ulid::default().to_bytes();
+                    let res = store
+                        .get(&mut write_txn, PUBLIC_MAPPINGS_DB_NAME, &public_id)?
+                        .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
+                    let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
+                    mut_map.insert(idx);
+                    let mut bitmap = Vec::new();
+                    mut_map.serialize_into(&mut bitmap)?;
+                    store.put(&mut write_txn, PUBLIC_MAPPINGS_DB_NAME, &public_id, &bitmap)?;
+
+                    // Remove from private mappings
+                    let user_id = user_id.to_bytes();
+                    let res = store
+                        .get(&mut write_txn, USER_MAPPINGS_DB_NAME, &user_id)?
+                        .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
+                    let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
+                    mut_map.remove(idx);
+                    let mut bitmap = Vec::new();
+                    mut_map.serialize_into(&mut bitmap)?;
+                    store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
+                }
             }
+
             store.commit(write_txn)?;
             Ok::<Vec<u8>, ArunaError>(res)
         })
@@ -334,6 +398,9 @@ impl Persistor<FjallStore, TantivySearch> for FjallTantivyPersistence {
         //});
 
         Ok(result)
+    }
+    async fn handle_message(&self, msg: MetadataMessage) -> Result<MetadataMessage, ArunaError> {
+        todo!()
     }
 }
 

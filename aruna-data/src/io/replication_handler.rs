@@ -244,7 +244,9 @@ impl ReplicationHandler {
         Some(ReplicationMessage {
             id,
             sender: self.get_node_addr().await,
-            msg_type: MessageType::ReplicationChunkResponse { hash: *chunk_hash.as_bytes() },
+            msg_type: MessageType::ReplicationChunkResponse {
+                hash: *chunk_hash.as_bytes(),
+            },
         })
     }
 
@@ -292,7 +294,7 @@ impl ReplicationHandler {
                 id,
                 sender: self.get_node_addr().await,
                 msg_type: MessageType::EndReplicationResponse {
-                    hash: *blake3.as_bytes()
+                    hash: *blake3.as_bytes(),
                 },
             }
         } else {
@@ -332,7 +334,7 @@ impl ReplicationHandler {
         replication_id: Ulid,
         object_path: String,
         replication_node: NodeAddr,
-    ) -> Result<[u8;32]> {
+    ) -> Result<[u8; 32]> {
         debug!("Start replication for object: {}", object_path);
 
         // Get data stream
