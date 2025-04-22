@@ -1,5 +1,5 @@
 [package]
-name = "metadata"
+name = "aruna-metadata"
 version = {workspace = true}
 edition = {workspace = true}
 

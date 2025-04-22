@@ -154,6 +154,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-metadata"
+version = "3.0.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "aruna-net",
+ "async-trait",
+ "automerge",
+ "autosurgeon",
+ "axum 0.8.3",
+ "axum-extra",
+ "bincode 2.0.1",
+ "chrono",
+ "criterion",
+ "dotenvy",
+ "fjall",
+ "heed",
+ "iroh",
+ "iroh-base",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "rayon",
+ "redb",
+ "reqwest",
+ "roaring",
+ "serde",
+ "serde_json",
+ "tantivy",
+ "thiserror 2.0.12",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "ulid",
+ "utoipa",
+ "utoipa-axum",
+ "utoipa-swagger-ui",
+]
+
+[[package]]
 name = "aruna-net"
 version = "0.1.0"
 dependencies = [
@@ -3090,48 +3132,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3f7eed9d3848f8b98834af67102b720745c4ec028fcd0aa0239277e7de374f"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "metadata"
-version = "3.0.0"
-dependencies = [
- "ahash",
- "anyhow",
- "aruna-net",
- "async-trait",
- "automerge",
- "autosurgeon",
- "axum 0.8.3",
- "axum-extra",
- "bincode 2.0.1",
- "chrono",
- "criterion",
- "dotenvy",
- "fjall",
- "heed",
- "iroh",
- "iroh-base",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "rayon",
- "redb",
- "reqwest",
- "roaring",
- "serde",
- "serde_json",
- "tantivy",
- "thiserror 2.0.12",
- "tokio",
- "tower-http",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "ulid",
- "utoipa",
- "utoipa-axum",
- "utoipa-swagger-ui",
 ]
 
 [[package]]
