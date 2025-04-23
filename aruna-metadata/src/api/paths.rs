@@ -2,7 +2,7 @@ use crate::{
     error::ArunaError,
     models::requests::*,
     network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    persistence::{search::search::Search, storage::store::Store},
     transactions::controller::Controller,
 };
 use axum::{
@@ -41,16 +41,15 @@ mod tags {
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn create_resource<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn create_resource<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<CreateResourceRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     into_axum_response(state.request(request, extract_token(&headers)).await)
 }
@@ -73,16 +72,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn get_resource<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn get_resource<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     axum_extra::extract::Query(request): axum_extra::extract::Query<GetResourcesRequest>,
     header: HeaderMap,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     into_axum_response(state.request(request, extract_token(&header)).await)
 }
@@ -102,16 +100,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn update_resource_name<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn update_resource_name<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<UpdateResourceNameRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     match state
         .request(
@@ -145,16 +142,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn update_resource_title<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn update_resource_title<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<UpdateResourceTitleRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     match state
         .request(
@@ -188,16 +184,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn update_resource_description<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn update_resource_description<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<UpdateResourceDescriptionRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     match state
         .request(
@@ -231,16 +226,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn update_resource_visibility<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn update_resource_visibility<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<UpdateResourceVisibilityRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     match state
         .request(
@@ -274,16 +268,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn update_resource_license<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn update_resource_license<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<UpdateResourceLicenseRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     match state
         .request(
@@ -317,16 +310,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn update_resource_labels<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn update_resource_labels<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<UpdateResourceLabelsRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     match state
         .request(
@@ -360,16 +352,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn update_resource_identifiers<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn update_resource_identifiers<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<UpdateResourceIdentifiersRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     match state
         .request(
@@ -403,16 +394,15 @@ where
     tag = RESOURCES,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn update_resource_authors<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn update_resource_authors<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<UpdateResourceAuthorsRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     match state
         .request(
@@ -449,16 +439,15 @@ where
     tag = INFO,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn search<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn search<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     Query(request): Query<SearchRequest>,
     header: HeaderMap,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     into_axum_response(state.request(request, extract_token(&header)).await)
 }
@@ -478,16 +467,15 @@ where
     tag = USERS,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
-pub async fn add_user<St, Se, P, N>(
-    State(state): State<Arc<Controller<St, Se, N, P>>>,
+pub async fn add_user<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<AddUserRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     into_axum_response(state.request(request, extract_token(&headers)).await)
 }

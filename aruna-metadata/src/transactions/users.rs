@@ -1,18 +1,21 @@
 use super::request::Request;
 use crate::{
-    error::ArunaError, models::{
+    error::ArunaError,
+    models::{
         models::User,
         requests::{AddUserRequest, AddUserResponse},
-    }, network::network_trait::Network, persistence::{persistence::Persistor, search::search::Search, storage::store::Store}
+    },
+    network::network_trait::Network,
+    persistence::{search::search::Search, storage::store::Store},
 };
 use ulid::Ulid;
 
-impl<St, Se, P, N> Request<St, Se, N, P> for AddUserRequest
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for AddUserRequest
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     type Response = AddUserResponse;
 
@@ -20,7 +23,7 @@ where
     async fn run_request(
         self,
         _user: Option<User>,
-        controller: &super::controller::Controller<St, Se, N, P>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaError> {
         let user = User {
             id: Ulid::new(),

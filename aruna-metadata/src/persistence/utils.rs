@@ -23,7 +23,7 @@ pub(super) fn idx_from_cow<'a>(cow: Cow<'a, [u8]>) -> Result<u32, ArunaError> {
 }
 
 pub(super) fn visiblity_from_doc(
-    doc: automerge::AutoCommit,
+    doc: &automerge::AutoCommit,
 ) -> Result<VisibilityClass, ArunaError> {
     Ok(
         match doc

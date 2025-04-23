@@ -1,7 +1,7 @@
 use crate::{
     error::ArunaError,
     network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    persistence::{search::search::Search, storage::store::Store},
     transactions::controller::Controller,
 };
 use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};
@@ -17,15 +17,14 @@ pub struct RestServer {}
 
 impl RestServer {
     #[tracing::instrument(level = "trace", skip(handler, rest_port))]
-    pub async fn run<St, Se, P, N>(
-        handler: Arc<Controller<St, Se, N, P>>,
+    pub async fn run<St, Se, N>(
+        handler: Arc<Controller<St, Se, N>>,
         rest_port: u16,
     ) -> Result<(), ArunaError>
     where
         for<'a> St: Store<'a> + 'static,
         Se: Search + 'static,
-        P: Persistor<St, Se> + 'static,
-        N: Network<P, St, Se> + 'static,
+        N: Network + 'static,
     {
         let socket_address = SocketAddr::from(([0, 0, 0, 0], rest_port));
         let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();

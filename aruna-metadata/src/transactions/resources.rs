@@ -13,23 +13,23 @@ use crate::{
         },
     },
     network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    persistence::{persistence::Authorize, search::search::Search, storage::store::Store},
 };
 use ulid::Ulid;
 
-impl<St, Se, P, N> Request<St, Se, N, P> for CreateResourceRequest
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for CreateResourceRequest
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     type Response = CreateResourceResponse;
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         user: Option<User>,
-        controller: &super::controller::Controller<St, Se, N, P>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaError> {
         let Some(user) = user else {
             return Err(crate::error::ArunaError::Unauthorized);
@@ -88,12 +88,12 @@ where
     }
 }
 
-impl<St, Se, P, N> Request<St, Se, N, P> for GetResourcesRequest
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for GetResourcesRequest
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     type Response = GetResourcesResponse;
 
@@ -101,7 +101,7 @@ where
     async fn run_request(
         self,
         user: Option<User>,
-        controller: &super::controller::Controller<St, Se, N, P>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaError> {
         let Some(user) = user else {
             return Err(crate::error::ArunaError::Unauthorized);
@@ -117,19 +117,19 @@ where
     }
 }
 
-impl<St, Se, P, N> Request<St, Se, N, P> for ResourceUpdateRequests
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for ResourceUpdateRequests
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     type Response = ResourceUpdateResponses;
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         user: Option<User>,
-        controller: &super::controller::Controller<St, Se, N, P>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaError> {
         let Some(user) = user else {
             return Err(crate::error::ArunaError::Unauthorized);

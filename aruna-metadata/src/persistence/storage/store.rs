@@ -26,8 +26,8 @@ pub mod tables {
     pub const PUBLIC_MAPPINGS_DB_NAME: &str = "public_mappings";
 }
 
-pub trait Store<'a>: Sync + Send + Sized {
-    type StoreConfig;
+pub trait Store<'a>: Sync + Send + Sized + std::fmt::Debug {
+    type StoreConfig: Send;
     type Txn;
     fn new(config: Self::StoreConfig) -> Result<Self, ArunaError>;
     fn create_txn(&'a self, write: bool) -> Result<Self::Txn, ArunaError>;

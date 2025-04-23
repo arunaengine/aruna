@@ -5,15 +5,15 @@ use crate::{
         requests::{SearchRequest, SearchResponse},
     },
     network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    persistence::{search::search::Search, storage::store::Store},
 };
 
-impl<St, Se, P, N> Request<St, Se, N, P> for SearchRequest
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for SearchRequest
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     type Response = SearchResponse;
 
@@ -21,7 +21,7 @@ where
     async fn run_request(
         self,
         user: Option<User>,
-        controller: &super::controller::Controller<St, Se, N, P>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaError> {
         let user = user.map(|u| u.id);
         let resources = controller.persistence.search(user, self.query).await?;

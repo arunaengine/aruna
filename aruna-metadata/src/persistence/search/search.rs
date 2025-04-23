@@ -2,8 +2,8 @@ use crate::{error::ArunaError, models::models::Resource, persistence::persistenc
 use roaring::RoaringBitmap;
 use ulid::Ulid;
 
-pub trait Search: Sync + Send + Sized {
-    type SearchConfig;
+pub trait Search: Sync + Send + Sized + std::fmt::Debug {
+    type SearchConfig: Send;
     fn new(config: Self::SearchConfig) -> Result<Self, ArunaError>;
     fn search<A: Authorize>(
         &self,

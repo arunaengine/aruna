@@ -7,7 +7,7 @@ use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct MetadataMessage {
     pub from: [u8; 32],
     pub to: [u8; 32],
@@ -15,7 +15,7 @@ pub struct MetadataMessage {
     pub body: Body,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum Body {
     User(Vec<u8>),
     Object(Vec<u8>),
@@ -23,12 +23,7 @@ pub enum Body {
 }
 
 #[async_trait::async_trait]
-pub trait Network<P, St, Se>: Sync + Send
-where
-    for<'a> St: Store<'a> + 'static,
-    Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-{
+pub trait Network: Sync + Send {
     type Config;
     async fn new(config: Self::Config) -> Self;
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError>;
@@ -44,28 +39,16 @@ where
     //async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError>;
 }
 
-pub struct NetworkDummy<P, St, Se>
-where
-    for<'a> St: Store<'a> + 'static,
-    Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-{
+pub struct NetworkDummy {
     self_id: NodeAddr,
-    _phantom: PhantomData<(P, St, Se)>,
 }
 
 #[async_trait::async_trait]
-impl<St, Se, P> Network<P, St, Se> for NetworkDummy<P, St, Se>
-where
-    for<'a> St: Store<'a> + 'static,
-    Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-{
+impl Network for NetworkDummy {
     type Config = ();
     async fn new(_config: Self::Config) -> Self {
         NetworkDummy {
             self_id: NodeAddr::new(PublicKey::from_bytes(&[0u8; 32]).unwrap()),
-            _phantom: PhantomData,
         }
     }
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
@@ -96,32 +79,29 @@ where
     //}
 }
 
-pub struct NetworkConfig<P, St, Se>
+pub struct NetworkConfig<St, Se>
 where
     for<'a> St: Store<'a>,
     Se: Search,
-    P: Persistor<St, Se>,
 {
     pub secret_key: Option<SecretKey>,
     pub socket_addr: SocketAddrV4,
     pub bootstrap_nodes: Vec<NodeAddr>,
-    pub persistor: Arc<P>,
+    pub persistor: Arc<Persistor<St, Se>>,
+}
+
+pub struct P2PNetwork<St, Se> {
+    chandler: Arc<ConnectionHandler>,
     pub phantom: PhantomData<(Se, St)>,
 }
 
-pub struct P2PNetwork<P, St, Se> {
-    chandler: Arc<ConnectionHandler>,
-    pub phantom: PhantomData<(P, Se, St)>,
-}
-
 #[async_trait::async_trait]
-impl<P, St, Se> Network<P, St, Se> for P2PNetwork<P, St, Se>
+impl<St, Se> Network for P2PNetwork<St, Se>
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
 {
-    type Config = NetworkConfig<P, St, Se>;
+    type Config = NetworkConfig<St, Se>;
     async fn new(config: Self::Config) -> Self {
         let chandler = ConnectionHandlerBuilder::new(config.secret_key)
             .add_bind_addr_v4(config.socket_addr)

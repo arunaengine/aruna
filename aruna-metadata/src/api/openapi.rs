@@ -2,7 +2,7 @@ use crate::{
     api::paths::*,
     models::models::{Direction, Permission},
     network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    persistence::{search::search::Search, storage::store::Store},
     transactions::controller::Controller,
 };
 use std::sync::Arc;
@@ -35,12 +35,11 @@ impl Modify for SecurityAddon {
     }
 }
 
-pub fn router<St, Se, P, N>(store: Arc<Controller<St, Se, N, P>>) -> OpenApiRouter
+pub fn router<St, Se, N>(store: Arc<Controller<St, Se, N>>) -> OpenApiRouter
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
-    P: Persistor<St, Se> + 'static,
-    N: Network<P, St, Se> + 'static,
+    N: Network + 'static,
 {
     OpenApiRouter::new()
         .routes(routes!(create_resource))
