@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::borrow::Cow;
 
 use automerge::ReadDoc;
 use roaring::RoaringBitmap;
@@ -51,15 +51,16 @@ pub(super) fn visiblity_from_doc(
     )
 }
 
-pub(super) fn update_mappings<'a, 'b, S: Store<'a> + 'a>(
+pub(super) fn update_mappings<'a, 'b, S>(
     store: &'a S,
-    txn: &'b mut S::Txn,
+    txn: &'b mut <S as Store<'a>>::Txn,
     resource: Resource,
     user_id: &Ulid,
     idx: u32,
 ) -> Result<(), ArunaError>
 where
     'a: 'b,
+    S: Store<'a> + Send + Sync
 {
     if !matches!(resource.visibility, VisibilityClass::Public) {
         // Add to private mappings
@@ -109,15 +110,16 @@ where
     Ok(())
 }
 
-pub(super) fn create_mappings<'a, 'b, S: Store<'a> + 'a>(
-    store: &'a Arc<S>,
-    txn: &'b mut S::Txn,
+pub(super) fn create_mappings<'a, 'b, S>(
+    store: &'a S,
+    txn: &'b mut <S as Store<'a>>::Txn,
     resource: Resource,
     user_id: &Ulid,
     idx: u32,
 ) -> Result<(), ArunaError>
 where
     'a: 'b,
+    S: Store<'a> + Send + Sync + Sized
 {
     if !matches!(resource.visibility, VisibilityClass::Public) {
         // Create private bitmap

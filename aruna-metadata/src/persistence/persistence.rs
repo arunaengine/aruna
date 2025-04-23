@@ -24,36 +24,7 @@ use std::sync::{Arc, atomic::AtomicU32};
 use tokio::{io::AsyncReadExt, join};
 use ulid::Ulid;
 
-// #[async_trait::async_trait]
-// pub trait Persistor<St, Se>: Sized + Send + Sync + Authorize + ProtocolHandler
-// where
-//     for<'a> St: Store<'a>,
-//     Se: Search,
-// {
-//     type Context;
-//     async fn new(ctx: Self::Context) -> Result<Self, ArunaError>;
-//     async fn add_resource(
-//         &self,
-//         actor_id: &[u8; 32],
-//         user_id: &Ulid,
-//         resource: Resource,
-//     ) -> Result<Vec<u8>, ArunaError>;
-//     async fn get_resources(&self, id: Vec<Ulid>) -> Result<Vec<Resource>, ArunaError>;
-//     async fn update_resource(
-//         &self,
-//         actor_id: &[u8; 32],
-//         user_id: &Ulid,
-//         resource: Resource,
-//     ) -> Result<Vec<u8>, ArunaError>;
-//     async fn add_user(&self, actor_id: &[u8; 32], user: User) -> Result<Vec<u8>, ArunaError>;
-//     async fn get_user(&self, id: &Ulid) -> Result<Option<User>, ArunaError>;
-//     async fn search(&self, user: Option<Ulid>, query: String) -> Result<Vec<String>, ArunaError>;
-//     // TODO: Remove clear
-//     async fn clear(&self) -> Result<(), ArunaError>;
-//     async fn handle_message(&self, msg: MetadataMessage) -> Result<MetadataMessage, ArunaError>;
-// }
-
-pub trait Authorize: Send + Sync {
+pub trait Authorize {
     fn authorize(&self, user_id: &Ulid, resource_id: &Ulid) -> bool;
 }
 
@@ -61,10 +32,10 @@ pub trait Authorize: Send + Sync {
 pub struct Persistor<St, Se>
 where
     for<'a> St: Store<'a>,
-    Se: Search + Sized,
+    Se: Search,
 {
-    pub store: Arc<St>,
-    pub search: Arc<Se>,
+    store: Arc<St>,
+    search: Arc<Se>,
     idx_counter: Arc<AtomicU32>,
 }
 
@@ -79,23 +50,6 @@ where
         store_config: <St as Store<'static>>::StoreConfig,
         search_config: Se::SearchConfig,
     ) -> Result<Self, ArunaError> {
-        //let (res_sdx, res_rcv): (
-        //    tokio::sync::mpsc::Sender<Resource>,
-        //    tokio::sync::mpsc::Receiver<Resource>,
-        //) = tokio::sync::mpsc::channel(1000);
-        //let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
-        // let tantivy_path = format!("{ctx}/tantivy");
-        // let search_config = TantivyConfig {
-        //     path: tantivy_path,
-        //     index_buffer: 1_000_000_000,
-        //     resources: res_rcv,
-        // };
-        // let store_path = format!("{ctx}/heed");
-        // let store_config = LmdbConfig {
-        //     path: store_path,
-        //     res_sdx,
-        //     idx_sdx,
-        // };
         let store = tokio::task::spawn_blocking(move || Arc::new(St::new(store_config).unwrap()));
 
         let search = tokio::task::spawn_blocking(move || {
@@ -155,7 +109,7 @@ where
                 &idx.to_be_bytes(),
             )?;
 
-            create_mappings(&store, &mut write_txn, resource, &user_id, idx);
+            create_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx);
 
             store.commit(write_txn)?;
             Ok::<Vec<u8>, ArunaError>(res)
@@ -311,60 +265,65 @@ where
         // Generate actor id
         let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
 
-        let (result, idx) = tokio::task::spawn_blocking(move || {
-            let mut write_txn = store.create_txn(true)?;
+        let (result, idx) =
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, u32), ArunaError> {
+                let mut write_txn = store.create_txn(true)?;
 
-            let idx = idx_from_cow(
-                store
-                    .get(&write_txn, RESOURCE_MAPPINGS_DB_NAME, &resource_id)?
-                    .ok_or_else(|| ArunaError::NotFound(format!("{} not found", resource.id)))?,
-            )?;
+                let idx = idx_from_cow(
+                    store
+                        .get(&write_txn, RESOURCE_MAPPINGS_DB_NAME, &resource_id)?
+                        .ok_or_else(|| {
+                            ArunaError::NotFound(format!("{} not found", resource.id))
+                        })?,
+                )?;
 
-            let res = store
-                .get(&write_txn, RESOURCE_DB_NAME, &resource_id)?
-                .ok_or_else(|| ArunaError::NotFound(format!("{} not found", resource.id)))?;
+                let res = store
+                    .get(&write_txn, RESOURCE_DB_NAME, &resource_id)?
+                    .ok_or_else(|| ArunaError::NotFound(format!("{} not found", resource.id)))?;
 
-            let mut doc = automerge::AutoCommit::load(res.as_ref())?.with_actor(actor_id);
-            let visibility = visiblity_from_doc(&doc)?;
-            reconcile(&mut doc, resource.clone())?;
-            doc.commit();
-            let res = doc.save();
+                let mut doc = automerge::AutoCommit::load(res.as_ref())?.with_actor(actor_id);
+                let visibility = visiblity_from_doc(&doc)?;
+                reconcile(&mut doc, resource.clone())?;
+                doc.commit();
+                let res = doc.save();
 
-            store.put(
-                &mut write_txn,
-                RESOURCE_DB_NAME,
-                &resource.id.to_bytes(),
-                &res,
-            )?;
-            store.put(
-                &mut write_txn,
-                RESOURCE_MAPPINGS_DB_NAME,
-                &resource.id.to_bytes(),
-                &idx.to_be_bytes(),
-            )?;
+                store.put(
+                    &mut write_txn,
+                    RESOURCE_DB_NAME,
+                    &resource.id.to_bytes(),
+                    &res,
+                )?;
+                store.put(
+                    &mut write_txn,
+                    RESOURCE_MAPPINGS_DB_NAME,
+                    &resource.id.to_bytes(),
+                    &idx.to_be_bytes(),
+                )?;
 
-            if visibility != resource.visibility {
-                update_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx)?;
-            }
+                if visibility != resource.visibility {
+                    update_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx)?;
+                }
 
-            store.commit(write_txn)?;
-            Ok::<(Vec<u8>, u32), ArunaError>((res, idx))
-        })
-        .await
-        .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
+                store.commit(write_txn)?;
+                Ok::<(Vec<u8>, u32), ArunaError>((res, idx))
+            })
+            .await
+            .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
 
         search.add_resource(idx, res_clone).await?;
 
         Ok(result)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_message(
         &self,
         msg: MetadataMessage,
     ) -> Result<MetadataMessage, ArunaError> {
         match msg.body {
             crate::network::network_trait::Body::User(_doc) => {
-                todo!()
+                // TODO: Add or merge user
+                ()
             }
             crate::network::network_trait::Body::Object(doc) => {
                 self.handle_object_merges(doc).await?;
@@ -380,6 +339,7 @@ where
         })
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_object_merges(&self, doc: Vec<u8>) -> Result<(), ArunaError> {
         let store = self.store.clone();
         let idx_counter = self.idx_counter.clone();
@@ -447,7 +407,7 @@ where
                 if visibility != foreign_resource.visibility {
                     update_mappings(store.as_ref(), &mut wtxn, foreign_resource, &user_id, idx)?;
                 } else {
-                    create_mappings(&store, &mut wtxn, foreign_resource, &user_id, idx)?;
+                    create_mappings(store.as_ref(), &mut wtxn, foreign_resource, &user_id, idx)?;
                 }
 
                 store.commit(wtxn)?;
@@ -495,16 +455,16 @@ where
 
             match self.handle_message(message).await {
                 Ok(res) => {
-                // TODO: Respond with something if need arises
-                //
-                // Serialize the response
-                // let response_buf = postcard::to_allocvec(&response)
-                //     .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
+                    // TODO: Respond with something if need arises
+                    //
+                    // Serialize the response
+                    // let response_buf = postcard::to_allocvec(&response)
+                    //     .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
 
-                // Send the response
-                // send_stream.write_u32(response_buf.len() as u32).await?;
-                // send_stream.write_all(&response_buf).await?;
-                },
+                    // Send the response
+                    // send_stream.write_u32(response_buf.len() as u32).await?;
+                    // send_stream.write_all(&response_buf).await?;
+                }
                 Err(err) => return Err(anyhow!(err)),
             }
         }

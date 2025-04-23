@@ -66,13 +66,15 @@ where
             location: Vec::new(),
             hashes: Vec::new(),
         };
-        let doc = controller
-            .persistence
-            .add_resource(
+        let actor_id = 
                 controller
                     .network
                     .get_id()
-                    .await?
+                    .await?;
+        let doc = controller
+            .persistence
+            .add_resource(
+                actor_id
                     .as_slice()
                     .try_into()
                     .map_err(|_e| ArunaError::ConversionError {
@@ -228,14 +230,11 @@ where
             }
         };
 
+        let actor_id = controller.network.get_id().await?;
         let doc = controller
             .persistence
             .update_resource(
-                controller
-                    .network
-                    .get_id()
-                    .await?
-                    .as_slice()
+                actor_id.as_slice()
                     .try_into()
                     .map_err(|_e| ArunaError::ConversionError {
                         from: "Vec<u8>".to_string(),

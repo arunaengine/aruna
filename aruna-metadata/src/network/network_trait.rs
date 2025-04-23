@@ -7,7 +7,7 @@ use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MetadataMessage {
     pub from: [u8; 32],
     pub to: [u8; 32],
@@ -15,7 +15,7 @@ pub struct MetadataMessage {
     pub body: Body,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Body {
     User(Vec<u8>),
     Object(Vec<u8>),
@@ -54,7 +54,7 @@ impl Network for NetworkDummy {
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
         Ok(vec![0u8; 32])
     }
-    async fn broadcast(&self, msg: MetadataMessage) -> Result<(), ArunaError> {
+    async fn broadcast(&self, _msg: MetadataMessage) -> Result<(), ArunaError> {
         Ok(())
     }
     //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {

@@ -6,13 +6,14 @@ use network::network_trait::P2PNetwork;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::TracerProvider;
-use persistence::persistors::fjall_persistor::FjallTantivyPersistence;
-use persistence::persistors::lmdb_persistor::LmdbTantivyPersistence;
-use persistence::persistors::redb_persistor::RedbTantivyPersistence;
+use persistence::search::tantivy::TantivyConfig;
 use persistence::search::tantivy::TantivySearch;
 use persistence::storage::fjall::FjallStore;
+use persistence::storage::fjall::FjallConfig;
+use persistence::storage::lmdb::LmdbConfig;
 use persistence::storage::lmdb::LmdbStore;
 use persistence::storage::redb::Redb;
+use persistence::storage::redb::RedbConfig;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::sync::Arc;
@@ -78,26 +79,43 @@ async fn main() {
 "
     );
 
+    let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
+    let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
+    let tantivy_path = format!("{path}/tantivy");
+    let search_config = TantivyConfig {
+        path: tantivy_path,
+        index_buffer: 1_000_000_000,
+        resources: res_rcv,
+    };
     match variant.as_ref() {
         "LMDB" => {
-            let persistor = Arc::new(LmdbTantivyPersistence::new(path).await.unwrap());
-            let network = P2PNetwork::<LmdbTantivyPersistence, LmdbStore, TantivySearch>::new(
-                NetworkConfig::<LmdbTantivyPersistence, LmdbStore, TantivySearch> {
-                    secret_key: None,
-                    socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
-                    bootstrap_nodes: vec![],
-                    persistor: persistor.clone(),
-                    phantom: std::marker::PhantomData,
-                },
-            )
+            let store_path = format!("{path}/heed");
+            let store_config = LmdbConfig {
+                path: store_path,
+                res_sdx,
+                idx_sdx,
+            };
+            let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
+                Persistor::new(idx_rcv, store_config, search_config)
+                    .await
+                    .unwrap(),
+            );
+            let network = P2PNetwork::<LmdbStore, TantivySearch>::new(NetworkConfig::<
+                LmdbStore,
+                TantivySearch,
+            > {
+                secret_key: None,
+                socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
+                bootstrap_nodes: vec![],
+                persistor: persistor.clone(),
+            })
             .await;
             //let network =
             //    NetworkDummy::<LmdbTantivyPersistence, LmdbStore, TantivySearch>::new(()).await;
             let controller = Arc::new(Controller::<
                 LmdbStore,
                 TantivySearch,
-                P2PNetwork<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
-                LmdbTantivyPersistence,
+                P2PNetwork<LmdbStore, TantivySearch>,
             >::new(persistor, network));
 
             tokio::spawn(async move { RestServer::run(controller, port).await })
@@ -106,19 +124,25 @@ async fn main() {
                 .unwrap();
         }
         "REDB" => {
-            let persistor = Arc::new(RedbTantivyPersistence::new(path).await.unwrap());
+            let store_path = format!("{path}/redb");
+            let store_config = RedbConfig {
+                path: store_path,
+                res_sdx,
+                idx_sdx,
+            };
+
+            let persistor = Arc::new(
+                Persistor::new(idx_rcv, store_config, search_config)
+                    .await
+                    .unwrap(),
+            );
 
             let network =
-                P2PNetwork::<RedbTantivyPersistence, Redb, TantivySearch>::new(NetworkConfig::<
-                    RedbTantivyPersistence,
-                    Redb,
-                    TantivySearch,
-                > {
+                P2PNetwork::<Redb, TantivySearch>::new(NetworkConfig::<Redb, TantivySearch> {
                     secret_key: None,
                     socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
                     bootstrap_nodes: vec![],
                     persistor: persistor.clone(),
-                    phantom: std::marker::PhantomData,
                 })
                 .await;
             //let network =
@@ -126,8 +150,7 @@ async fn main() {
             let controller = Arc::new(Controller::<
                 Redb,
                 TantivySearch,
-                P2PNetwork<RedbTantivyPersistence, Redb, TantivySearch>,
-                RedbTantivyPersistence,
+                P2PNetwork<Redb, TantivySearch>,
             >::new(persistor, network));
 
             tokio::spawn(async move { RestServer::run(controller, port).await })
@@ -136,24 +159,32 @@ async fn main() {
                 .unwrap();
         }
         "FJALL" => {
-            let persistor = Arc::new(FjallTantivyPersistence::new(path).await.unwrap());
-            let network = P2PNetwork::<FjallTantivyPersistence, FjallStore, TantivySearch>::new(
-                NetworkConfig::<FjallTantivyPersistence, FjallStore, TantivySearch> {
-                    secret_key: None,
-                    socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
-                    bootstrap_nodes: vec![],
-                    persistor: persistor.clone(),
-                    phantom: std::marker::PhantomData,
-                },
-            )
+            let store_path = format!("{path}/fjall");
+            let store_config = FjallConfig {
+                path: store_path,
+                res_sdx,
+                idx_sdx,
+            };
+            let persistor = Arc::new(
+                Persistor::new(idx_rcv, store_config, search_config)
+                    .await
+                    .unwrap(),
+            );
+            let network = P2PNetwork::<FjallStore, TantivySearch>::new(NetworkConfig::<
+                FjallStore,
+                TantivySearch,
+            > {
+                secret_key: None,
+                socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
+                bootstrap_nodes: vec![],
+                persistor: persistor.clone(),
+            })
             .await;
-            // let network =
-            //     NetworkDummy::<FjallTantivyPersistence, FjallStore, TantivySearch>::new(()).await;
+
             let controller = Arc::new(Controller::<
                 FjallStore,
                 TantivySearch,
-                P2PNetwork<FjallTantivyPersistence, FjallStore, TantivySearch>,
-                FjallTantivyPersistence,
+                P2PNetwork<FjallStore, TantivySearch>,
             >::new(persistor, network));
 
             tokio::spawn(async move { RestServer::run(controller, port).await })

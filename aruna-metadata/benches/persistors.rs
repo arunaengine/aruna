@@ -3,12 +3,12 @@ use aruna_metadata::{
     network::network_trait::{Network, NetworkDummy},
     persistence::{
         persistence::Persistor,
-        persistors::{
-            fjall_persistor::FjallTantivyPersistence, lmdb_persistor::LmdbTantivyPersistence,
-            redb_persistor::RedbTantivyPersistence,
+        search::tantivy::{TantivyConfig, TantivySearch},
+        storage::{
+            fjall::{FjallConfig, FjallStore},
+            lmdb::{LmdbConfig, LmdbStore},
+            redb::{Redb, RedbConfig},
         },
-        search::tantivy::TantivySearch,
-        storage::{fjall::FjallStore, lmdb::LmdbStore, redb::Redb},
     },
     transactions::controller::Controller,
 };
@@ -17,38 +17,37 @@ use ulid::Ulid;
 
 pub struct TantivyFjall;
 impl TantivyFjall {
-    pub async fn start() -> Arc<
-        Controller<
-            FjallStore,
-            TantivySearch,
-            NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
-            FjallTantivyPersistence,
-        >,
-    > {
-        let network = NetworkDummy::new(()).await;
+    pub async fn start() -> Arc<Controller<FjallStore, TantivySearch, NetworkDummy>> {
+        let path = "/dev/shm/fjall_tantivy".to_string();
+        let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
+        let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
+        let tantivy_path = format!("{path}/tantivy");
+        let search_config = TantivyConfig {
+            path: tantivy_path,
+            index_buffer: 1_000_000_000,
+            resources: res_rcv,
+        };
+
+        let store_path = format!("{path}/fjall");
+        let store_config = FjallConfig {
+            path: store_path,
+            res_sdx,
+            idx_sdx,
+        };
         let persistor = Arc::new(
-            FjallTantivyPersistence::new("./database/fjall_tantivy".to_string())
+            Persistor::new(idx_rcv, store_config, search_config)
                 .await
                 .unwrap(),
         );
-        let controller = Arc::new(Controller::<
-            FjallStore,
-            TantivySearch,
-            NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
-            FjallTantivyPersistence,
-        >::new(persistor, network));
+        let network = NetworkDummy::new(()).await;
+        let controller = Arc::new(Controller::<FjallStore, TantivySearch, NetworkDummy>::new(
+            persistor, network,
+        ));
         controller
     }
 
     pub async fn create_user(
-        controller: Arc<
-            Controller<
-                FjallStore,
-                TantivySearch,
-                NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
-                FjallTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<FjallStore, TantivySearch, NetworkDummy>>,
     ) -> (Ulid, Ulid) {
         let create_user = AddUserRequest {
             name: "bench_user1".to_string(),
@@ -65,14 +64,7 @@ impl TantivyFjall {
     }
 
     pub async fn bench_create(
-        controller: Arc<
-            Controller<
-                FjallStore,
-                TantivySearch,
-                NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
-                FjallTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<FjallStore, TantivySearch, NetworkDummy>>,
         user1: Ulid,
         user2: Ulid,
     ) {
@@ -96,14 +88,7 @@ impl TantivyFjall {
     }
 
     pub async fn bench_search(
-        controller: Arc<
-            Controller<
-                FjallStore,
-                TantivySearch,
-                NetworkDummy<FjallTantivyPersistence, FjallStore, TantivySearch>,
-                FjallTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<FjallStore, TantivySearch, NetworkDummy>>,
         user1: Ulid,
         user2: Ulid,
     ) {
@@ -131,38 +116,37 @@ impl TantivyFjall {
 
 pub struct TantivyHeed;
 impl TantivyHeed {
-    pub async fn start() -> Arc<
-        Controller<
-            LmdbStore,
-            TantivySearch,
-            NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
-            LmdbTantivyPersistence,
-        >,
-    > {
-        let network = NetworkDummy::new(()).await;
+    pub async fn start() -> Arc<Controller<LmdbStore, TantivySearch, NetworkDummy>> {
+        let path = "/dev/shm/lmdb_tantivy".to_string();
+        let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
+        let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
+        let tantivy_path = format!("{path}/tantivy");
+        let search_config = TantivyConfig {
+            path: tantivy_path,
+            index_buffer: 1_000_000_000,
+            resources: res_rcv,
+        };
+
+        let store_path = format!("{path}/lmdb");
+        let store_config = LmdbConfig {
+            path: store_path,
+            res_sdx,
+            idx_sdx,
+        };
         let persistor = Arc::new(
-            LmdbTantivyPersistence::new("./database/heed_tantivy".to_string())
+            Persistor::new(idx_rcv, store_config, search_config)
                 .await
                 .unwrap(),
         );
-        let controller = Arc::new(Controller::<
-            LmdbStore,
-            TantivySearch,
-            NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
-            LmdbTantivyPersistence,
-        >::new(persistor, network));
+        let network = NetworkDummy::new(()).await;
+        let controller = Arc::new(Controller::<LmdbStore, TantivySearch, NetworkDummy>::new(
+            persistor, network,
+        ));
         controller
     }
 
     pub async fn create_user(
-        controller: Arc<
-            Controller<
-                LmdbStore,
-                TantivySearch,
-                NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
-                LmdbTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<LmdbStore, TantivySearch, NetworkDummy>>,
     ) -> (Ulid, Ulid) {
         let create_user = AddUserRequest {
             name: "bench_user1".to_string(),
@@ -179,14 +163,7 @@ impl TantivyHeed {
     }
 
     pub async fn bench_create(
-        controller: Arc<
-            Controller<
-                LmdbStore,
-                TantivySearch,
-                NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
-                LmdbTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<LmdbStore, TantivySearch, NetworkDummy>>,
         user1: Ulid,
         user2: Ulid,
     ) {
@@ -210,14 +187,7 @@ impl TantivyHeed {
     }
 
     pub async fn bench_search(
-        controller: Arc<
-            Controller<
-                LmdbStore,
-                TantivySearch,
-                NetworkDummy<LmdbTantivyPersistence, LmdbStore, TantivySearch>,
-                LmdbTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<LmdbStore, TantivySearch, NetworkDummy>>,
         user1: Ulid,
         user2: Ulid,
     ) {
@@ -245,38 +215,37 @@ impl TantivyHeed {
 
 pub struct TantivyRedb;
 impl TantivyRedb {
-    pub async fn start() -> Arc<
-        Controller<
-            Redb,
-            TantivySearch,
-            NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
-            RedbTantivyPersistence,
-        >,
-    > {
-        let network = NetworkDummy::new(()).await;
+    pub async fn start() -> Arc<Controller<Redb, TantivySearch, NetworkDummy>> {
+        let path = "/dev/shm/redb_tantivy".to_string();
+        let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
+        let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
+        let tantivy_path = format!("{path}/tantivy");
+        let search_config = TantivyConfig {
+            path: tantivy_path,
+            index_buffer: 1_000_000_000,
+            resources: res_rcv,
+        };
+
+        let store_path = format!("{path}/redb");
+        let store_config = RedbConfig {
+            path: store_path,
+            res_sdx,
+            idx_sdx,
+        };
         let persistor = Arc::new(
-            RedbTantivyPersistence::new("./database/redb_tantivy".to_string())
+            Persistor::new(idx_rcv, store_config, search_config)
                 .await
                 .unwrap(),
         );
-        let controller = Arc::new(Controller::<
-            Redb,
-            TantivySearch,
-            NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
-            RedbTantivyPersistence,
-        >::new(persistor, network));
+        let network = NetworkDummy::new(()).await;
+        let controller = Arc::new(Controller::<Redb, TantivySearch, NetworkDummy>::new(
+            persistor, network,
+        ));
         controller
     }
 
     pub async fn create_user(
-        controller: Arc<
-            Controller<
-                Redb,
-                TantivySearch,
-                NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
-                RedbTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<Redb, TantivySearch, NetworkDummy>>,
     ) -> (Ulid, Ulid) {
         let create_user = AddUserRequest {
             name: "bench_user1".to_string(),
@@ -293,14 +262,7 @@ impl TantivyRedb {
     }
 
     pub async fn bench_create(
-        controller: Arc<
-            Controller<
-                Redb,
-                TantivySearch,
-                NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
-                RedbTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<Redb, TantivySearch, NetworkDummy>>,
         user1: Ulid,
         user2: Ulid,
     ) {
@@ -324,14 +286,7 @@ impl TantivyRedb {
     }
 
     pub async fn bench_search(
-        controller: Arc<
-            Controller<
-                Redb,
-                TantivySearch,
-                NetworkDummy<RedbTantivyPersistence, Redb, TantivySearch>,
-                RedbTantivyPersistence,
-            >,
-        >,
+        controller: Arc<Controller<Redb, TantivySearch, NetworkDummy>>,
         user1: Ulid,
         user2: Ulid,
     ) {
