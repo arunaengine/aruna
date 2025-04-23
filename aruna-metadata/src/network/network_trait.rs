@@ -6,12 +6,16 @@ use aruna_net::{ConnectionHandler, ConnectionHandlerBuilder};
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
+use tokio::io::AsyncWriteExt;
+use ulid::Ulid;
+
+pub static METADATA_PROTOCOL_ID: u32 = 3;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MetadataMessage {
     pub from: [u8; 32],
     pub to: [u8; 32],
-    pub subject: [u8; 32],
+    pub subject: [u8; 32], //Object or User ID
     pub body: Body,
 }
 
@@ -27,7 +31,7 @@ pub trait Network: Sync + Send {
     type Config;
     async fn new(config: Self::Config) -> Self;
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError>;
-    async fn broadcast(&self, msg: MetadataMessage) -> Result<(), ArunaError>;
+    async fn broadcast(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError>;
     //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError>;
     //fn spawn_acceptor(self: Self);
     //async fn get_bidi_stream(
@@ -54,7 +58,7 @@ impl Network for NetworkDummy {
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
         Ok(vec![0u8; 32])
     }
-    async fn broadcast(&self, _msg: MetadataMessage) -> Result<(), ArunaError> {
+    async fn broadcast(&self, _body: Body, _subject_id: &Ulid) -> Result<(), ArunaError> {
         Ok(())
     }
     //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
@@ -105,7 +109,7 @@ where
     async fn new(config: Self::Config) -> Self {
         let chandler = ConnectionHandlerBuilder::new(config.secret_key)
             .add_bind_addr_v4(config.socket_addr)
-            .add_protocol_handler(3, config.persistor)
+            .add_protocol_handler(METADATA_PROTOCOL_ID, config.persistor)
             .build(config.bootstrap_nodes)
             .await
             .unwrap();
@@ -123,8 +127,42 @@ where
             .map_err(|e| ArunaError::NetworkError(e.to_string()))
     }
 
-    async fn broadcast(&self, msg: MetadataMessage) -> Result<(), ArunaError> {
-        todo!()
+    async fn broadcast(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError> {
+        let id = self.chandler.get_node_addr().await?.node_id;
+        // Calc hash
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(subject_id.to_bytes().as_slice());
+        let id_hash = chunk_hasher.finalize();
+        let nodes = self.chandler.find(*id_hash.as_bytes()).await?.nodes;
+
+        let mut message = MetadataMessage {
+            from: *id.as_bytes(),
+            to: [0u8; 32],
+            subject: *id_hash.as_bytes(),
+            body,
+        };
+
+        // Distribute message to closest nodes
+        for node in nodes {
+            message.to = *node.node_id.as_bytes();
+            let msg = postcard::to_allocvec(&message)?;
+
+            let (_recv, mut sdx) = self
+                .chandler
+                .clone()
+                .get_bidi_stream(node.node_id, METADATA_PROTOCOL_ID)
+                .await?;
+            sdx.write_u32(msg.len() as u32).await?;
+            sdx.write_all(msg.as_slice())
+                .await
+                .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+
+            // TODO: 
+            // - Track Ack via rcv
+            // - Retries?
+            // - Replicate metadata to specific nodes
+        }
+        Ok(())
     }
     // async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
     //     self.get_node_addr().await

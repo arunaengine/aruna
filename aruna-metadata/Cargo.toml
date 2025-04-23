@@ -8,6 +8,7 @@ edition = {workspace = true}
 ahash = {workspace = true}
 anyhow = {workspace = true}
 async-trait = {workspace = true}
+blake3 = {workspace=true}
 dotenvy = {workspace = true}
 iroh = {workspace = true}
 iroh-base = {workspace = true}

@@ -202,3 +202,18 @@ impl From<autosurgeon::ReconcileError> for ArunaError {
         ArunaError::DatabaseError(e.to_string())
     }
 }
+
+impl From<anyhow::Error> for ArunaError {
+    fn from(e: anyhow::Error) -> Self {
+        ArunaError::NetworkError(e.to_string())
+    }
+}
+
+impl From<postcard::Error> for ArunaError {
+    fn from(e: postcard::Error) -> Self {
+        ArunaError::ConversionError {
+            from: e.to_string(),
+            to: "&[u8]".to_string(),
+        }
+    }
+}
