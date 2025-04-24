@@ -5,7 +5,7 @@ use network::network_trait::Network;
 use network::network_trait::P2PNetwork;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use persistence::search::tantivy::TantivyConfig;
 use persistence::search::tantivy::TantivySearch;
 use persistence::storage::fjall::FjallStore;
@@ -38,8 +38,8 @@ async fn main() {
         .build()
         .unwrap();
 
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .build()
         .tracer("aruna1");
     let tracing_env_filter = EnvFilter::try_from_default_env()

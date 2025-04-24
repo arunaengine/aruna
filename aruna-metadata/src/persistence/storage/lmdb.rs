@@ -1,7 +1,7 @@
 use super::store::{Store, tables};
 use crate::{error::ArunaError, models::models::Resource};
 use heed::{
-    BoxedError, Database, Env, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, types::Bytes,
+    types::Bytes, BoxedError, Database, Env, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, WithTls
 };
 use roaring::RoaringBitmap;
 use std::{borrow::Cow, fs};
@@ -17,7 +17,7 @@ pub struct LmdbStore {
 }
 
 pub enum LmdbTxn<'a> {
-    Read(RoTxn<'a>),
+    Read(RoTxn<'a, WithTls>),
     Write(RwTxn<'a>),
 }
 

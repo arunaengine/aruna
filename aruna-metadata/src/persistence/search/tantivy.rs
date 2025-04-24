@@ -1,7 +1,7 @@
 use super::search::Search;
 use crate::{error::ArunaError, models::models::Resource, persistence::persistence::Authorize};
 use roaring::RoaringBitmap;
-use std::{collections::BTreeMap, fs};
+use std::fs;
 use tantivy::{
     Document, Index, IndexReader, IndexWriter, TantivyDocument,
     collector::{FilterCollector, TopDocs},
@@ -244,7 +244,7 @@ impl Search for TantivySearch {
 impl Fields {
     fn create_doc(&self, idx: u32, resource: Resource) -> TantivyDocument {
         let mut doc = TantivyDocument::default();
-        doc.add_bytes(self.ids, resource.id.to_bytes());
+        doc.add_bytes(self.ids, resource.id.to_bytes().as_slice());
         doc.add_u64(self.idx, idx as u64);
         doc.add_text(self.name, resource.name);
         doc.add_text(self.description, resource.description);
@@ -276,16 +276,16 @@ impl Fields {
                 .map(|author| {
                     (
                         "author".to_string(),
-                        OwnedValue::Object(BTreeMap::from([
+                        OwnedValue::Object(vec![
                             ("first".to_string(), OwnedValue::Str(author.first)),
                             ("last".to_string(), OwnedValue::Str(author.last)),
                             ("id".to_string(), OwnedValue::Str(author.id)),
-                        ])),
+                        ]),
                     )
                 })
                 .collect(),
         );
-        doc.add_bytes(self.license, resource.license_id.to_bytes());
+        doc.add_bytes(self.license, resource.license_id.to_bytes().as_slice());
         doc.add_bool(self.locked, resource.locked);
         doc.add_bool(self.deleted, resource.deleted);
         doc
