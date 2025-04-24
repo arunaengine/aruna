@@ -15,7 +15,6 @@ pub trait Search: Sync + Send + Sized + std::fmt::Debug {
         idx: u32,
         resource: Resource,
     ) -> impl Future<Output = Result<(), ArunaError>> + Send;
-    #[allow(dead_code)]
     fn remove(&self, id: Ulid) -> Result<(), ArunaError>;
     fn purge(&self) -> impl std::future::Future<Output = Result<(), ArunaError>> + Send;
 }

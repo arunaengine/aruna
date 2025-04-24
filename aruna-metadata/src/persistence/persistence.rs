@@ -109,7 +109,7 @@ where
                 &idx.to_be_bytes(),
             )?;
 
-            create_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx);
+            create_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx)?;
 
             store.commit(write_txn)?;
             Ok::<Vec<u8>, ArunaError>(res)
@@ -454,7 +454,7 @@ where
                 .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
 
             match self.handle_message(message).await {
-                Ok(res) => {
+                Ok(_res) => {
                     // TODO: Respond with something if need arises
                     //
                     // Serialize the response

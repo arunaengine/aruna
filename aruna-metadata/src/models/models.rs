@@ -6,8 +6,6 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 
-pub const REPLICATION: u8 = 2;
-
 #[derive(
     Clone,
     PartialEq,

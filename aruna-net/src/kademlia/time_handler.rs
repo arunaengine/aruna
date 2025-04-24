@@ -257,6 +257,9 @@ mod tests {
         assert!(handler.is_empty());
 
         // Reinsert with fresh timestamp
+        let new_time = SystemTime::now();
+        handler.insert_with_timestamp(key1, None, new_time);
+        handler.insert_with_timestamp(key2, None, new_time);
         assert_eq!(handler.len(), 2);
 
         // Now they shouldn't be removed by the same threshold

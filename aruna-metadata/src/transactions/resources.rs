@@ -12,7 +12,7 @@ use crate::{
             UpdateResourceVisibilityResponse,
         },
     },
-    network::network_trait::{MetadataMessage, Network},
+    network::network_trait::Network,
     persistence::{persistence::Authorize, search::search::Search, storage::store::Store},
 };
 use ulid::Ulid;
@@ -66,11 +66,11 @@ where
             location: Vec::new(),
             hashes: Vec::new(),
         };
-        let actor_id = controller.network.get_id().await?;
+        let node_id = controller.network.get_id().await?;
         let doc = controller
             .persistence
             .add_resource(
-                actor_id
+                node_id
                     .as_slice()
                     .try_into()
                     .map_err(|_e| ArunaError::ConversionError {
@@ -79,6 +79,14 @@ where
                     })?,
                 &user.id,
                 resource.clone(),
+            )
+            .await?;
+
+        controller
+            .network
+            .broadcast(
+                crate::network::network_trait::Body::Object(doc),
+                &resource.id,
             )
             .await?;
 
@@ -229,16 +237,26 @@ where
         let node_id = controller.network.get_id().await?;
         let doc = controller
             .persistence
-            .update_resource(node_id
-                .as_slice()
-                .try_into()
-                .map_err(|_e| ArunaError::ConversionError {
-                    from: "Vec<u8>".to_string(),
-                    to: "&[u8; 32]".to_string(),
-                })?, &user.id, resource.clone())
+            .update_resource(
+                node_id
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_e| ArunaError::ConversionError {
+                        from: "Vec<u8>".to_string(),
+                        to: "&[u8; 32]".to_string(),
+                    })?,
+                &user.id,
+                resource.clone(),
+            )
             .await?;
-            
-        controller.network.broadcast(crate::network::network_trait::Body::Object(doc), &resource.id).await?;
+
+        controller
+            .network
+            .broadcast(
+                crate::network::network_trait::Body::Object(doc),
+                &resource.id,
+            )
+            .await?;
 
         Ok(response)
     }

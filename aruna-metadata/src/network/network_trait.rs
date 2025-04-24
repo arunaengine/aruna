@@ -56,7 +56,7 @@ impl Network for NetworkDummy {
         }
     }
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
-        Ok(vec![0u8; 32])
+        Ok(self.self_id.node_id.as_bytes().to_vec())
     }
     async fn broadcast(&self, _body: Body, _subject_id: &Ulid) -> Result<(), ArunaError> {
         Ok(())
@@ -157,7 +157,7 @@ where
                 .await
                 .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
 
-            // TODO: 
+            // TODO:
             // - Track Ack via rcv
             // - Retries?
             // - Replicate metadata to specific nodes
