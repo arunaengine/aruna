@@ -60,25 +60,26 @@ pub(super) fn update_mappings<'a, 'b, S>(
 ) -> Result<(), ArunaError>
 where
     'a: 'b,
-    S: Store<'a> + Send + Sync
+    S: Store<'a> + Send + Sync,
 {
     if !matches!(resource.visibility, VisibilityClass::Public) {
         // Add to private mappings
         let user_id = user_id.to_bytes();
-        let res = store
-            .get(txn, USER_MAPPINGS_DB_NAME, &user_id)?
-            .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
-        let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
-        mut_map.insert(idx);
+        let mut map = match store.get(txn, USER_MAPPINGS_DB_NAME, &user_id)? {
+            Some(map) => RoaringBitmap::deserialize_from(map.as_ref())?,
+            None => RoaringBitmap::new(),
+        };
+        //.ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
+        map.insert(idx);
         let mut bitmap = Vec::new();
-        mut_map.serialize_into(&mut bitmap)?;
+        map.serialize_into(&mut bitmap)?;
         store.put(txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
 
         // Remove from public mappings
         let public_id = Ulid::default().to_bytes();
         let res = store
             .get(txn, PUBLIC_MAPPINGS_DB_NAME, &public_id)?
-            .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
+            .ok_or_else(|| ArunaError::NotFound("No public mapping found".to_string()))?;
         let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
         mut_map.remove(idx);
         let mut bitmap = Vec::new();
@@ -89,7 +90,7 @@ where
         let public_id = Ulid::default().to_bytes();
         let res = store
             .get(txn, PUBLIC_MAPPINGS_DB_NAME, &public_id)?
-            .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
+            .ok_or_else(|| ArunaError::NotFound("No public mapping found".to_string()))?;
         let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
         mut_map.insert(idx);
         let mut bitmap = Vec::new();
@@ -98,13 +99,13 @@ where
 
         // Remove from private mappings
         let user_id = user_id.to_bytes();
-        let res = store
-            .get(txn, USER_MAPPINGS_DB_NAME, &user_id)?
-            .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
-        let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
-        mut_map.remove(idx);
+        let mut map = match store.get(txn, USER_MAPPINGS_DB_NAME, &user_id)? {
+            Some(map) => RoaringBitmap::deserialize_from(map.as_ref())?,
+            None => RoaringBitmap::new(),
+        };
+        map.remove(idx);
         let mut bitmap = Vec::new();
-        mut_map.serialize_into(&mut bitmap)?;
+        map.serialize_into(&mut bitmap)?;
         store.put(txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
     }
     Ok(())
@@ -119,18 +120,18 @@ pub(super) fn create_mappings<'a, 'b, S>(
 ) -> Result<(), ArunaError>
 where
     'a: 'b,
-    S: Store<'a> + Send + Sync + Sized
+    S: Store<'a> + Send + Sync + Sized,
 {
     if !matches!(resource.visibility, VisibilityClass::Public) {
         // Create private bitmap
         let user_id = user_id.to_bytes();
-        let res = store
-            .get(txn, USER_MAPPINGS_DB_NAME, &user_id)?
-            .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
-        let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
-        mut_map.insert(idx);
+        let mut map = match store.get(txn, USER_MAPPINGS_DB_NAME, &user_id)? {
+            Some(map) => RoaringBitmap::deserialize_from(map.as_ref())?,
+            None => RoaringBitmap::new(),
+        };
+        map.insert(idx);
         let mut bitmap = Vec::new();
-        mut_map.serialize_into(&mut bitmap)?;
+        map.serialize_into(&mut bitmap)?;
         store.put(txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
     } else {
         // Update public bitmap

@@ -129,7 +129,6 @@ impl Search for TantivySearch {
             let mut buffer: Vec<(u32, Resource)> = Vec::new();
             loop {
                 update_queue_rcv.blocking_recv_many(&mut buffer, 999);
-                //println!("Queued {}", buffer.len());
                 while let Some((idx, resource)) = buffer.pop() {
                     let doc = fields_clone.create_doc(idx, resource);
                     // Let's index one documents!

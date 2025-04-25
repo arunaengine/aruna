@@ -9,7 +9,7 @@ pub mod persistors;
 
 fn e2e_benchmark(c: &mut Criterion) {
     let variant = dotenvy::var("VARIANT").unwrap();
-    let port = dotenvy::var("PORT").unwrap();
+    let port = dotenvy::var("API_PORT").unwrap();
 
     // Isolated runtime for tantivy/heed
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -270,6 +270,6 @@ fn controller_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, controller_benchmark);
-//criterion_group!(benches, e2e_benchmark);
+//criterion_group!(benches, controller_benchmark);
+criterion_group!(benches, e2e_benchmark);
 criterion_main!(benches);

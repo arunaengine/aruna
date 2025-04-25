@@ -1,13 +1,13 @@
 use anyhow::{Result, anyhow};
 use iroh::endpoint::{RecvStream, SendStream};
-use iroh::{NodeAddr, NodeId, PublicKey};
+use iroh::{NodeAddr, NodeId};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, trace, warn};
+use tracing::{error, info, trace, warn};
 use ulid::Ulid;
 
 use crate::connection_handler::{ConnectionHandler, ProtocolHandler};
@@ -125,20 +125,22 @@ impl Kademlia {
             .await
             .replace((node_addr.clone(), chandler));
 
-        // Set up the Kademlia instance
-        self.state
-            .write()
-            .await
-            .node_addresses
-            .insert(node_addr.node_id, node_addr.clone());
-
         // Bootstrap the node if needed
         if !bootstrap_nodes.is_empty() {
             self.bootstrap(bootstrap_nodes).await?;
+        } else {
+            // Set up the Kademlia instance
+            self.state
+                .write()
+                .await
+                .node_addresses
+                .insert(node_addr.node_id, node_addr.clone());
         }
+        println!("BOOTSTRAPED NODES");
 
         // Start the maintenance task
         self.start_maintenance_task();
+        println!("RUNNING MAINTENANCE");
 
         Ok(())
     }
@@ -338,7 +340,7 @@ impl Kademlia {
                 }
 
                 // Find closest nodes to target
-                let closest_nodes = self.find_closest_nodes(&target).await;
+                let closest_nodes = self.find_closest_nodes(&state, &target).await;
 
                 // Create response with values and closest nodes
                 Some(request.create_response(
@@ -407,20 +409,22 @@ impl Kademlia {
         message: KademliaMessage,
         target_addr: NodeAddr,
     ) -> Result<KademliaMessage> {
-        trace!(
+        info!(
             "Sending message: {:?} from node {} to node: {}",
             message,
             self.node_id().await,
             target_addr.node_id
         );
 
-        let guard = self.network.read().await;
-        let Some((_, chandler)) = guard.as_ref() else {
-            return Err(anyhow!("Network not initialized"));
+        let chandler = {
+            let guard = self.network.read().await;
+            let Some((_, chandler)) = guard.as_ref() else {
+                return Err(anyhow!("Network not initialized"));
+            };
+            chandler.clone()
         };
 
         let (mut rx, mut sx) = chandler
-            .clone()
             .get_bidi_stream(target_addr.node_id, KADEMLIA_PROTOCOL_ID)
             .await?;
 
@@ -443,8 +447,11 @@ impl Kademlia {
     }
 
     /// Find the closest nodes to a target from our routing table
-    async fn find_closest_nodes(&self, target: &[u8; 32]) -> Vec<NodeAddr> {
-        let state = self.state.read().await;
+    async fn find_closest_nodes(
+        &self,
+        state: &RwLockReadGuard<'_, KademliaState>,
+        target: &[u8; 32],
+    ) -> Vec<NodeAddr> {
         let distance_to_target = calculate_distance(&self.node_id_bytes().await, target);
         let bucket_idx = get_bucket_index(&distance_to_target);
 
@@ -548,17 +555,17 @@ impl Kademlia {
 
     /// External API: Find operation with choice of mode
     pub async fn find(&self, target: [u8; 32], shortcircuit: bool) -> Result<FindResult> {
-        info!(
-            "Searching key: {:?} @ {} ",
-            PublicKey::from_bytes(&target).unwrap(),
-            self.node_id().await
-        );
+        //info!(
+        //    "Searching key: {:?} @ {} ",
+        //    PublicKey::from_bytes(&target).unwrap(),
+        //    self.node_id().await
+        //);
 
         // First check if we have the value locally
         let mut local_values = Vec::new();
 
+        let state = self.state.read().await;
         if shortcircuit {
-            let state = self.state.read().await;
             trace!(
                 "local nodes: {:?} @ node: {}",
                 state.node_addresses,
@@ -595,14 +602,15 @@ impl Kademlia {
         }
 
         // Find closest nodes without holding a lock for too long
-        let closest_nodes = self.find_closest_nodes(&target).await;
+        let closest_nodes = self.find_closest_nodes(&state, &target).await;
+        drop(state);
 
         // If no nodes found, return empty result
         if closest_nodes.is_empty() {
-            trace!(
-                "No nodes found for target: {:?}",
-                PublicKey::from_bytes(&target).unwrap()
-            );
+            //trace!(
+            //    "No nodes found for target: {:?}",
+            //    PublicKey::from_bytes(&target).unwrap()
+            //);
 
             return Ok(FindResult::empty());
         }
@@ -652,11 +660,6 @@ impl Kademlia {
                 .drain(..std::cmp::min(ALPHA, pending_nodes.len()))
                 .collect::<Vec<_>>();
 
-            // Mark nodes as visited
-            for node in &batch {
-                visited_nodes.insert(node.node_id);
-            }
-
             // Send FindRequest to each node in parallel
             let mut responses = Vec::new();
             for node in batch {
@@ -666,9 +669,12 @@ impl Kademlia {
                     MessageType::FindRequest { target },
                 );
 
-                if let Ok(response) = self.send_message(message, node).await {
-                    responses.push(response);
+                match self.send_message(message, node.clone()).await {
+                    Ok(response) => responses.push(response),
+                    Err(err) => error!("{err}"),
                 }
+
+                visited_nodes.insert(node.node_id);
             }
 
             // Process all responses
@@ -728,11 +734,11 @@ impl Kademlia {
 
     /// External API: Store operation (simplified)
     pub async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<()> {
-        info!(
-            "Storing key: {:?} @ {} ",
-            PublicKey::from_bytes(&key).unwrap(),
-            self.node_id().await
-        );
+        //info!(
+        //    "Storing key: {:?} @ {} ",
+        //    PublicKey::from_bytes(&key).unwrap(),
+        //    self.node_id().await
+        //);
 
         // Store locally first with TTL
         {
@@ -790,9 +796,11 @@ impl Kademlia {
             return Err(anyhow!("No bootstrap nodes provided"));
         }
 
+        let node_addr = self.get_node_addr().await;
         // Add bootstrap nodes to our routing table
         {
             let mut state = self.state.write().await;
+            state.node_addresses.insert(node_addr.node_id, node_addr);
             for addr in bootstrap_nodes.clone() {
                 self.update_node_seen(&mut state, addr).await;
             }

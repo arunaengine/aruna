@@ -1,6 +1,10 @@
 use crate::network::network_trait::NetworkConfig;
 use crate::persistence::persistence::Persistor;
 use api::server::RestServer;
+use iroh::KeyParsingError;
+use iroh::NodeAddr;
+use iroh::PublicKey;
+use iroh::SecretKey;
 use network::network_trait::Network;
 use network::network_trait::P2PNetwork;
 use opentelemetry::trace::TracerProvider as _;
@@ -8,14 +12,15 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use persistence::search::tantivy::TantivyConfig;
 use persistence::search::tantivy::TantivySearch;
-use persistence::storage::fjall::FjallStore;
 use persistence::storage::fjall::FjallConfig;
+use persistence::storage::fjall::FjallStore;
 use persistence::storage::lmdb::LmdbConfig;
 use persistence::storage::lmdb::LmdbStore;
 use persistence::storage::redb::Redb;
 use persistence::storage::redb::RedbConfig;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
@@ -67,16 +72,47 @@ async fn main() {
         .with(fmt_layer)
         .with(telemetry_layer)
         .init();
-
+    if let Ok(file) = dotenvy::var("ENV") {
+        println!("{file}");
+        dotenvy::from_filename_override(file).unwrap();
+    }
     let path = dotenvy::var("DBPATH").unwrap();
-    let port = dotenvy::var("PORT").unwrap().parse().unwrap();
+    let api_port = dotenvy::var("API_PORT").unwrap().parse().unwrap();
+    let p2p_port = dotenvy::var("P2P_PORT").unwrap().parse().unwrap();
+    let p2p_secret_key = if let Some(key) = dotenvy::var("P2P_SECRET_KEY").ok() {
+        if key.is_empty() {
+            None
+        } else {
+            Some(SecretKey::from_str(&key).unwrap())
+        }
+    } else {
+        None
+    };
+    let bootstrap_nodes: Vec<NodeAddr> = match dotenvy::var("BOOTSTRAP_NODES") {
+        Ok(env_var) => env_var
+            .split(";")
+            .map(|key| {
+                Ok(NodeAddr::from_parts(
+                    PublicKey::from_str(key)?,
+                    None,
+                    Some(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 1230).into()),
+                ))
+            })
+            .collect::<Result<Vec<NodeAddr>, KeyParsingError>>()
+            .unwrap(),
+        Err(_) => vec![],
+    };
     let variant = dotenvy::var("VARIANT").unwrap();
 
     println!(
-        "{path}
-{port}
-{variant}
-"
+        "
+STARTING WITH...
+DB_VARIANT: {variant}
+DB: {path}
+API: {api_port}
+P2P: {p2p_port}
+P2P_KEY: {p2p_secret_key:?}
+BOOTSTRAP_NODES: {bootstrap_nodes:?}",
     );
 
     let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
@@ -87,6 +123,7 @@ async fn main() {
         index_buffer: 1_000_000_000,
         resources: res_rcv,
     };
+
     match variant.as_ref() {
         "LMDB" => {
             let store_path = format!("{path}/heed");
@@ -100,25 +137,27 @@ async fn main() {
                     .await
                     .unwrap(),
             );
+            println!("GOT PERSISTOR");
             let network = P2PNetwork::<LmdbStore, TantivySearch>::new(NetworkConfig::<
                 LmdbStore,
                 TantivySearch,
             > {
-                secret_key: None,
-                socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
-                bootstrap_nodes: vec![],
+                secret_key: p2p_secret_key,
+                socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
+                bootstrap_nodes,
                 persistor: persistor.clone(),
             })
             .await;
-            //let network =
-            //    NetworkDummy::<LmdbTantivyPersistence, LmdbStore, TantivySearch>::new(()).await;
+            println!("GOT NETWORK");
+
             let controller = Arc::new(Controller::<
                 LmdbStore,
                 TantivySearch,
                 P2PNetwork<LmdbStore, TantivySearch>,
             >::new(persistor, network));
+            println!("GOT CONTROLLER");
 
-            tokio::spawn(async move { RestServer::run(controller, port).await })
+            tokio::spawn(async move { RestServer::run(controller, api_port).await })
                 .await
                 .unwrap()
                 .unwrap();
@@ -139,21 +178,20 @@ async fn main() {
 
             let network =
                 P2PNetwork::<Redb, TantivySearch>::new(NetworkConfig::<Redb, TantivySearch> {
-                    secret_key: None,
-                    socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
-                    bootstrap_nodes: vec![],
+                    secret_key: p2p_secret_key,
+                    socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
+                    bootstrap_nodes,
                     persistor: persistor.clone(),
                 })
                 .await;
-            //let network =
-            //    NetworkDummy::<RedbTantivyPersistence, Redb, TantivySearch>::new(()).await;
+
             let controller = Arc::new(Controller::<
                 Redb,
                 TantivySearch,
                 P2PNetwork<Redb, TantivySearch>,
             >::new(persistor, network));
 
-            tokio::spawn(async move { RestServer::run(controller, port).await })
+            tokio::spawn(async move { RestServer::run(controller, api_port).await })
                 .await
                 .unwrap()
                 .unwrap();
@@ -174,9 +212,9 @@ async fn main() {
                 FjallStore,
                 TantivySearch,
             > {
-                secret_key: None,
-                socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 8080),
-                bootstrap_nodes: vec![],
+                secret_key: p2p_secret_key,
+                socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
+                bootstrap_nodes,
                 persistor: persistor.clone(),
             })
             .await;
@@ -187,7 +225,7 @@ async fn main() {
                 P2PNetwork<FjallStore, TantivySearch>,
             >::new(persistor, network));
 
-            tokio::spawn(async move { RestServer::run(controller, port).await })
+            tokio::spawn(async move { RestServer::run(controller, api_port).await })
                 .await
                 .unwrap()
                 .unwrap();

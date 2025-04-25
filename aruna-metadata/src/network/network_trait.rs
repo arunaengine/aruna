@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 pub static METADATA_PROTOCOL_ID: u32 = 3;
+pub static REPLICATION_POLICY: usize = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MetadataMessage {
@@ -31,7 +32,8 @@ pub trait Network: Sync + Send {
     type Config;
     async fn new(config: Self::Config) -> Self;
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError>;
-    async fn broadcast(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError>;
+    async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError>;
+    async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaError>;
     //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError>;
     //fn spawn_acceptor(self: Self);
     //async fn get_bidi_stream(
@@ -58,7 +60,10 @@ impl Network for NetworkDummy {
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
         Ok(self.self_id.node_id.as_bytes().to_vec())
     }
-    async fn broadcast(&self, _body: Body, _subject_id: &Ulid) -> Result<(), ArunaError> {
+    async fn replicate(&self, _body: Body, _subject_id: &Ulid) -> Result<(), ArunaError> {
+        Ok(())
+    }
+    async fn store(&self, _subject_id: &Ulid) -> Result<(), ArunaError> {
         Ok(())
     }
     //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
@@ -106,6 +111,7 @@ where
     Se: Search + 'static,
 {
     type Config = NetworkConfig<St, Se>;
+
     async fn new(config: Self::Config) -> Self {
         let chandler = ConnectionHandlerBuilder::new(config.secret_key)
             .add_bind_addr_v4(config.socket_addr)
@@ -119,49 +125,85 @@ where
             phantom: PhantomData,
         }
     }
+
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
         self.chandler
             .get_node_addr()
             .await
-            .map(|addr| addr.node_id.as_bytes().to_vec())
             .map_err(|e| ArunaError::NetworkError(e.to_string()))
+            .map(|addr| addr.node_id.as_bytes().to_vec())
     }
 
-    async fn broadcast(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError> {
-        let id = self.chandler.get_node_addr().await?.node_id;
-        // Calc hash
-        let mut chunk_hasher = blake3::Hasher::new();
-        chunk_hasher.update(subject_id.to_bytes().as_slice());
-        let id_hash = chunk_hasher.finalize();
-        let nodes = self.chandler.find(*id_hash.as_bytes()).await?.nodes;
+    async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError> {
+        let chandler = self.chandler.clone();
+        let subject_id = *subject_id;
+        tokio::spawn(async move {
 
-        let mut message = MetadataMessage {
-            from: *id.as_bytes(),
-            to: [0u8; 32],
-            subject: *id_hash.as_bytes(),
-            body,
-        };
-
-        // Distribute message to closest nodes
-        for node in nodes {
-            message.to = *node.node_id.as_bytes();
-            let msg = postcard::to_allocvec(&message)?;
-
-            let (_recv, mut sdx) = self
-                .chandler
-                .clone()
-                .get_bidi_stream(node.node_id, METADATA_PROTOCOL_ID)
-                .await?;
-            sdx.write_u32(msg.len() as u32).await?;
-            sdx.write_all(msg.as_slice())
-                .await
-                .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+            let node_id = chandler.get_node_addr().await?.node_id;
+            // Calc hash
+            let mut chunk_hasher = blake3::Hasher::new();
+            chunk_hasher.update(subject_id.to_bytes().as_slice());
+            let id_hash = chunk_hasher.finalize();
 
             // TODO:
-            // - Track Ack via rcv
-            // - Retries?
-            // - Replicate metadata to specific nodes
-        }
+            // Dont use find for placing objects,
+            // but find realm nodes and place objects there
+            let nodes = chandler.find(*id_hash.as_bytes()).await?.nodes;
+
+            let mut message = MetadataMessage {
+                from: *node_id.as_bytes(),
+                to: [0u8; 32],
+                subject: *id_hash.as_bytes(),
+                body,
+            };
+
+
+            // Distribute message to closest nodes
+            let mut counter = 0;
+            for node in nodes {
+                if node.node_id == node_id {
+                    continue;
+                }
+                if counter == REPLICATION_POLICY {
+                    break;
+                }
+                message.to = *node.node_id.as_bytes();
+                let msg = postcard::to_allocvec(&message)?;
+
+                let (_recv, mut sdx) = chandler
+                    .clone()
+                    .get_bidi_stream(node.node_id, METADATA_PROTOCOL_ID)
+                    .await?;
+                sdx.write_u32(msg.len() as u32).await?;
+                sdx.write_all(msg.as_slice())
+                    .await
+                    .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+                //chandler.store(*id_hash.as_bytes(), node).await?; // TODO: Move this to handle_stream in persistence
+                counter += 1;
+
+                // TODO:
+                // - [] Retries? -> If err, try again, if failed 5 go next node
+                // - [] Replicate metadata to specific nodes
+                // - [X] Store when create
+                // - [] Store when rcv replicate msg
+            }
+            Ok::<(), ArunaError>(())
+        });
+        Ok(())
+    }
+
+    async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaError> {
+        let chandler = self.chandler.clone();
+        let subject_id = *subject_id;
+        tokio::spawn(async move {
+            let id = chandler.get_node_addr().await?;
+            // Calc hash
+            let mut chunk_hasher = blake3::Hasher::new();
+            chunk_hasher.update(subject_id.to_bytes().as_slice());
+            let id_hash = chunk_hasher.finalize();
+            chandler.store(*id_hash.as_bytes(), id).await?;
+            Ok::<(), ArunaError>(())
+        });
         Ok(())
     }
     // async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
@@ -179,8 +221,5 @@ where
     // }
     // async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError> {
     //     self.find(key).await
-    // }
-    // async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError> {
-    //     self.store(key, value).await
     // }
 }
