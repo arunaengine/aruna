@@ -9,8 +9,10 @@ pub const STALE_NODE_THRESHOLD: Duration = Duration::from_secs(300); // 5 minute
 pub const ARUNA_NET_ALPN: &[u8] = b"aruna-net/0.1.0";
 
 // Module declarations
+pub mod con_actor;
 pub mod connection_handler;
 mod kademlia;
+mod utils;
 
 pub use connection_handler::ConnectionHandler;
 pub use connection_handler::ConnectionHandlerBuilder;

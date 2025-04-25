@@ -1,3 +1,4 @@
+pub mod actor_handle;
 pub mod discovery;
 pub mod k_bucket;
 pub mod kademlia;

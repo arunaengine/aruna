@@ -5,18 +5,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{RwLock, RwLockReadGuard};
-use tokio::task::JoinHandle;
+use tokio::sync::RwLockReadGuard;
 use tracing::{error, info, trace, warn};
 use ulid::Ulid;
 
-use crate::connection_handler::{ConnectionHandler, ProtocolHandler};
+use crate::con_actor::ConnectionActorHandle;
+use crate::connection_handler::CHANNEL_SIZE;
 use crate::kademlia::k_bucket::KBucket;
 use crate::kademlia::messages::{KademliaMessage, MessageType};
 use crate::kademlia::node_info::NodeInfo;
 use crate::kademlia::utils::{calculate_distance, get_bucket_index};
 use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
 
+use super::actor_handle::{KademliaActorHandle, KademliaRequest};
 use super::messages::FindResult;
 use super::time_handler::TimeHandler;
 
@@ -27,6 +28,7 @@ pub const REPUBLISH_INTERVAL: Duration = Duration::from_secs(79200); // 22h
 /// Internal mutable state of Kademlia
 #[derive(Debug)]
 struct KademliaState {
+    node_addr: NodeAddr,
     k_buckets: [KBucket; 256],
     resources: HashMap<[u8; 32], HashSet<NodeId>>, // Multiple (unique) nodes per key with TTL
     node_addresses: HashMap<NodeId, NodeAddr>,
@@ -37,6 +39,7 @@ struct KademliaState {
 impl KademliaState {
     fn new() -> Self {
         Self {
+            node_addr: NodeAddr::default(),
             k_buckets: std::array::from_fn(|_| KBucket::new()),
             resources: HashMap::new(),
             node_addresses: HashMap::new(),
@@ -69,98 +72,101 @@ impl KademliaState {
 
 /// Kademlia distributed hash table implementation with interior mutability
 #[derive(Debug)]
-pub struct Kademlia {
-    network: RwLock<Option<(NodeAddr, Arc<ConnectionHandler>)>>,
-    state: RwLock<KademliaState>,
-    maintenance_handle: RwLock<Option<JoinHandle<()>>>,
+pub struct KademliaActor {
+    network: ConnectionActorHandle,
+    state: KademliaState,
+    receiver: async_channel::Receiver<KademliaRequest>,
 }
 
-#[async_trait::async_trait]
-impl ProtocolHandler for Kademlia {
-    async fn handle_stream(
-        &self,
-        mut send_stream: SendStream,
-        mut recv_stream: RecvStream,
-    ) -> Result<()> {
-        let len = recv_stream.read_u32().await?;
-        let mut buf = vec![0; len as usize];
-        recv_stream.read_exact(&mut buf).await?;
-        let message = postcard::from_bytes::<KademliaMessage>(&buf)
-            .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
+// #[async_trait::async_trait]
+// impl ProtocolHandler for Kademlia {
+//     async fn handle_stream(
+//         &self,
+//         mut send_stream: SendStream,
+//         mut recv_stream: RecvStream,
+//     ) -> Result<()> {
+//         let len = recv_stream.read_u32().await?;
+//         let mut buf = vec![0; len as usize];
+//         recv_stream.read_exact(&mut buf).await?;
+//         let message = postcard::from_bytes::<KademliaMessage>(&buf)
+//             .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
 
-        if let Some(response) = self.handle_message(message).await {
-            // Serialize the response
-            let response_buf = postcard::to_allocvec(&response)
-                .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
+//         if let Some(response) = self.handle_message(message).await {
+//             // Serialize the response
+//             let response_buf = postcard::to_allocvec(&response)
+//                 .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
 
-            // Send the response
-            send_stream.write_u32(response_buf.len() as u32).await?;
-            send_stream.write_all(&response_buf).await?;
-        }
-        Ok(())
-    }
-}
+//             // Send the response
+//             send_stream.write_u32(response_buf.len() as u32).await?;
+//             send_stream.write_all(&response_buf).await?;
+//         }
+//         Ok(())
+//     }
+// }
 
-impl Kademlia {
+impl KademliaActor {
     /// Create a new Kademlia instance
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            network: RwLock::new(None),
-            state: RwLock::new(KademliaState::new()),
-            maintenance_handle: RwLock::new(None),
+    pub async fn new(con: ConnectionActorHandle) -> KademliaActorHandle {
+        let (receiver, sender) = async_channel::bounded(CHANNEL_SIZE);
+        let actor = Self {
+            network: con,
+            state: KademliaState::new(),
+            receiver,
+        };
+        actor.run().await?;
+        KademliaActorHandle::new(sender)
+    }
+
+    pub async fn run(self) -> Result<()> {
+        tokio::spawn(async move {
+            let mut republish_timer = tokio::time::interval(REPUBLISH_INTERVAL);
+            let mut maintenance_timer = tokio::time::interval(Duration::from_secs(3600));
+
+            loop {
+                tokio::select! {
+                    // Maintenance timer
+                    _ = maintenance_timer.tick() => {
+                        self.run_maintenance().await;
+                        info!("Maintenance run for node {}", self.node_id());
+                    }
+
+                    // Republish timer
+                    _ = republish_timer.tick() => {
+                        self.republish_resources().await;
+                        info!("Resources republished for node {}", self.node_id());
+                    }
+
+                    // Handle incoming requests
+                    Some(message) = self.receiver.recv() => {
+                        self.handle_message(message).await;
+                    }
+
+                    // Check for shutdown signal
+                    _ = tokio::signal::ctrl_c() => {
+                        break;
+                    }
+                }
+            }
         })
     }
 
-    pub async fn init(
-        self: Arc<Self>,
-        chandler: Arc<ConnectionHandler>,
-        bootstrap_nodes: Vec<NodeAddr>,
-    ) -> Result<()> {
-        // Get our node address
-        let node_addr = chandler.get_node_addr().await?;
-
-        // Store the connection handler
-        self.network
-            .write()
-            .await
-            .replace((node_addr.clone(), chandler));
-
-        // Bootstrap the node if needed
-        if !bootstrap_nodes.is_empty() {
-            self.bootstrap(bootstrap_nodes).await?;
-        } else {
-            // Set up the Kademlia instance
-            self.state
-                .write()
-                .await
-                .node_addresses
-                .insert(node_addr.node_id, node_addr.clone());
-        }
-        println!("BOOTSTRAPED NODES");
-
-        // Start the maintenance task
-        self.start_maintenance_task();
-        println!("RUNNING MAINTENANCE");
-
-        Ok(())
+    pub fn set_node_addr(&mut self, addr: NodeAddr) {
+        self.state.node_addr = addr;
+        self.state.node_addresses.insert(addr.node_id, addr.clone());
     }
 
-    async fn get_node_addr(&self) -> NodeAddr {
-        let network = self.network.read().await;
-        network
-            .as_ref()
-            .map(|(addr, _)| addr.clone())
-            .expect("Network not initialized")
+    fn get_node_addr(&self) -> &NodeAddr {
+        &self.state.node_addr
     }
 
     /// Get our node ID
-    async fn node_id(&self) -> NodeId {
-        self.get_node_addr().await.node_id
+    fn node_id(&self) -> &NodeId {
+        &self.get_node_addr().node_id
     }
 
     /// Get node ID bytes as owned array
-    async fn node_id_bytes(&self) -> [u8; 32] {
-        self.node_id().await.as_bytes().clone()
+    fn node_id_bytes(&self) -> [u8; 32] {
+        self.node_id().as_bytes().clone()
     }
 
     /// Start periodic maintenance task

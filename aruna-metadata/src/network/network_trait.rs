@@ -138,7 +138,6 @@ where
         let chandler = self.chandler.clone();
         let subject_id = *subject_id;
         tokio::spawn(async move {
-
             let node_id = chandler.get_node_addr().await?.node_id;
             // Calc hash
             let mut chunk_hasher = blake3::Hasher::new();
@@ -156,7 +155,6 @@ where
                 subject: *id_hash.as_bytes(),
                 body,
             };
-
 
             // Distribute message to closest nodes
             let mut counter = 0;

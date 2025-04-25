@@ -1,7 +1,8 @@
 use super::store::{Store, tables};
 use crate::{error::ArunaError, models::models::Resource};
 use heed::{
-    types::Bytes, BoxedError, Database, Env, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, WithTls
+    BoxedError, Database, Env, EnvFlags, EnvOpenOptions, PutFlags, RoTxn, RwTxn, WithTls,
+    types::Bytes,
 };
 use roaring::RoaringBitmap;
 use std::{borrow::Cow, fs};
@@ -196,12 +197,7 @@ impl<'a> Store<'a> for LmdbStore {
     }
 
     #[tracing::instrument(level = "trace", skip(self, txn, key))]
-    fn remove(
-        &'a self,
-        txn: &mut LmdbTxn<'a>,
-        dbname: &str,
-        key: &[u8],
-    ) -> Result<(), ArunaError> {
+    fn remove(&'a self, txn: &mut LmdbTxn<'a>, dbname: &str, key: &[u8]) -> Result<(), ArunaError> {
         let mut txn = match txn {
             LmdbTxn::Read(_ro_txn) => {
                 return Err(ArunaError::DatabaseError("Read txn provided".to_string()));
@@ -215,7 +211,6 @@ impl<'a> Store<'a> for LmdbStore {
         db.delete(&mut txn, key)?;
         Ok(())
     }
-
 
     #[tracing::instrument(level = "trace", skip(self, txn, key))]
     fn get<'b>(

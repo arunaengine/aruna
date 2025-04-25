@@ -1,61 +1,59 @@
-use std::{collections::HashMap, sync::Arc};
-
+use crate::{
+    con_actor::{ConnectionActorHandle, ConnectionRequests, InitActorHandle, ReceiveStreams}, kademlia::{actor_handle::KademliaActorHandle, kademlia::KademliaActor, messages::FindResult}, utils::ChannelPair, ARUNA_NET_ALPN
+};
 use anyhow::Result;
+use futures::stream::FuturesUnordered;
 use iroh::{
     Endpoint, NodeAddr, NodeId, RelayMode, SecretKey,
     endpoint::{Builder, Connection, RecvStream, SendStream},
 };
 use log::warn;
+use std::{collections::HashMap, sync::Arc};
 use std::fmt::Debug;
-use tokio::{io::AsyncReadExt, io::AsyncWriteExt, sync::RwLock};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[async_trait::async_trait]
-pub trait ProtocolHandler: Send + Sync + Debug {
-    async fn handle_stream(
-        &self,
-        send_stream: SendStream,
-        recv_stream: RecvStream,
-    ) -> anyhow::Result<()>;
-}
-
-use crate::{
-    ARUNA_NET_ALPN, Kademlia,
-    kademlia::{discovery::KademliaArc, messages::FindResult},
-};
+pub const CHANNEL_SIZE: usize = 100;
 
 pub type ProtocolId = u32;
 
 pub struct ConnectionHandlerBuilder {
     endpoint: iroh::endpoint::Builder,
-    protocol_handler_map: HashMap<ProtocolId, Arc<dyn ProtocolHandler>>,
-    kademlia: Arc<Kademlia>,
+    command: ChannelPair<ConnectionRequests>,
+    protocol_handler_map: HashMap<ProtocolId, async_channel::Sender<ReceiveStreams>>,
+    kademlia: KademliaActorHandle,
 }
 
 impl ConnectionHandlerBuilder {
-    pub fn new(secret_key: Option<SecretKey>) -> Self {
-        let kademlia = Kademlia::new();
+    pub async fn new(secret_key: Option<SecretKey>) -> Self {
+        let command = ChannelPair::new();
 
-        let kademlia_arc: KademliaArc = KademliaArc {
-            kademlia: kademlia.clone(),
-        };
+        let (kademlia_stream_sender, kademlia_stream_receiver) =
+            async_channel::bounded(CHANNEL_SIZE);
+        let kademlia_actor_handle =
+            ConnectionActorHandle::new(1, command.sender().clone(), kademlia_stream_receiver);
+
+        let kademlia_handle = KademliaActor::new(kademlia_actor_handle).await;
+        let handle_clone = kademlia_handle.clone();
 
         let mut endpoint = Builder::default()
             .alpns(vec![ARUNA_NET_ALPN.to_vec()])
-            .add_discovery(move |_| Some(kademlia_arc))
+            .add_discovery(move |_| Some(handle_clone))
             .relay_mode(RelayMode::Disabled);
 
         if let Some(secret_key) = secret_key {
             endpoint = endpoint.secret_key(secret_key);
         }
 
-        let mut protocol_handler_map: HashMap<ProtocolId, Arc<dyn ProtocolHandler>> =
+        let mut protocol_handler_map: HashMap<ProtocolId, async_channel::Sender<ReceiveStreams>> =
             HashMap::new();
-        protocol_handler_map.insert(1, kademlia.clone());
+
+        protocol_handler_map.insert(1, kademlia_stream_sender);
 
         Self {
             endpoint,
+            command,
             protocol_handler_map,
-            kademlia,
+            kademlia: kademlia_handle,
         }
     }
 
@@ -63,6 +61,7 @@ impl ConnectionHandlerBuilder {
         let endpoint = self.endpoint.relay_mode(relay_mode);
         Self {
             endpoint,
+            command: self.command,
             protocol_handler_map: self.protocol_handler_map,
             kademlia: self.kademlia,
         }
@@ -72,6 +71,7 @@ impl ConnectionHandlerBuilder {
         let endpoint = self.endpoint.bind_addr_v4(bind_addr);
         Self {
             endpoint,
+            command: self.command,
             protocol_handler_map: self.protocol_handler_map,
             kademlia: self.kademlia,
         }
@@ -81,100 +81,192 @@ impl ConnectionHandlerBuilder {
         let endpoint = self.endpoint.bind_addr_v6(bind_addr);
         Self {
             endpoint,
+            command: self.command,
             protocol_handler_map: self.protocol_handler_map,
             kademlia: self.kademlia,
         }
     }
 
-    pub fn add_protocol_handler(
-        self,
-        protocol_id: ProtocolId,
-        protocol_handler: Arc<dyn ProtocolHandler>,
-    ) -> Self {
-        let mut protocol_handler_map = self.protocol_handler_map;
-        protocol_handler_map.insert(protocol_id, protocol_handler);
-        Self {
-            endpoint: self.endpoint,
-            protocol_handler_map,
-            kademlia: self.kademlia,
-        }
-    }
-
-    pub async fn build(self, bootstrap_nodes: Vec<NodeAddr>) -> Result<Arc<ConnectionHandler>> {
+    pub async fn build(self, bootstrap_nodes: Vec<NodeAddr>) -> Result<InitActorHandle> {
         let endpoint = self.endpoint.bind().await?;
-
-        let chandler =
-            ConnectionHandler::new(endpoint, self.protocol_handler_map, self.kademlia.clone());
-
-        self.kademlia
-            .init(chandler.clone(), bootstrap_nodes)
-            .await?;
-
-        Ok(chandler)
+        let init_actor_handle = InitActorHandle::new(self.command.sender().clone());
+        ConnectionHandler::new(
+            endpoint,
+            self.command,
+            self.protocol_handler_map,
+            self.kademlia,
+        )
+        .await;
+        Ok(init_actor_handle)
     }
 }
 
-#[derive(Debug)]
 pub struct ConnectionHandler {
     endpoint: Endpoint,
-    connections: RwLock<HashMap<NodeId, Connection>>,
-    protocol_handler: HashMap<ProtocolId, Arc<dyn ProtocolHandler>>,
-    kademlia: Arc<Kademlia>,
+    connections: HashMap<NodeId, Connection>,
+    command: ChannelPair<ConnectionRequests>,
+    incoming_streams: ChannelPair<ReceiveStreams>,
+    protocol_handler_map: HashMap<ProtocolId, async_channel::Sender<ReceiveStreams>>,
+    kademlia: KademliaActorHandle,
+    receiver_joinset: tokio::task::JoinSet<()>,
 }
 
 impl ConnectionHandler {
-    fn new(
+    async fn new(
         endpoint: Endpoint,
-        protocol_handler: HashMap<ProtocolId, Arc<dyn ProtocolHandler>>,
-        kademlia: Arc<Kademlia>,
-    ) -> Arc<Self> {
-        let self_arc = Arc::new(Self {
+        command: ChannelPair<ConnectionRequests>,
+        protocol_handler_map: HashMap<ProtocolId, async_channel::Sender<ReceiveStreams>>,
+        kademlia: KademliaActorHandle,
+    ) {
+        let handler = Self {
             endpoint,
-            connections: RwLock::new(HashMap::new()),
-            protocol_handler,
+            connections: HashMap::new(),
+            command,
+            incoming_streams: ChannelPair::new(),
+            protocol_handler_map,
             kademlia,
-        });
+            receiver_joinset: tokio::task::JoinSet::new(),
+        };
 
-        self_arc.clone().spawn_acceptor();
-
-        self_arc
+        handler.spawn_acceptor().await;
     }
 
     pub async fn get_node_addr(&self) -> anyhow::Result<NodeAddr> {
         self.endpoint.node_addr().await
     }
 
-    pub fn spawn_acceptor(self: Arc<Self>) {
+    pub async fn spawn_acceptor(mut self) {
         tokio::spawn(async move {
-            let endpoint = self.endpoint.clone();
-            while let Some(incoming) = endpoint.accept().await {
-                let connecting = match incoming.accept() {
-                    Ok(connecting) => connecting,
-                    Err(err) => {
-                        warn!("incoming connection failed: {err:#}");
-                        // we can carry on in these cases:
-                        // this can be caused by retransmitted datagrams
-                        continue;
-                    }
-                };
-                let conn = match connecting.await {
-                    Ok(conn) => conn,
-                    Err(err) => {
-                        warn!("incoming connection failed: {err:#}");
-                        continue;
-                    }
-                };
-                let node_id = match conn.remote_node_id() {
-                    Ok(node_id) => node_id,
-                    Err(err) => {
-                        warn!("cannot retrieve node_id from conn: {err:#}");
-                        continue;
-                    }
-                };
-                self.connections.write().await.insert(node_id, conn.clone());
+            loop {
+                tokio::select!(
+                    command = self.command.receiver().recv() => {
+                        // Handle commands from the command channel
+                    },
+                    Some(incoming) = self.endpoint.accept() => {
+                        // Handle incoming connections here
+                        let connecting = match incoming.accept() {
+                            Ok(connecting) => connecting,
+                            Err(err) => {
+                                warn!("incoming connection failed: {err:#}");
+                                // we can carry on in these cases:
+                                // this can be caused by retransmitted datagrams
+                                continue;
+                            }
+                        };
+                        let conn = match connecting.await {
+                            Ok(conn) => conn,
+                            Err(err) => {
+                                warn!("incoming connection failed: {err:#}");
+                                continue;
+                            }
+                        };
+                        let node_id = match conn.remote_node_id() {
+                            Ok(node_id) => node_id,
+                            Err(err) => {
+                                warn!("cannot retrieve node_id from conn: {err:#}");
+                                continue;
+                            }
+                        };
+                        self.connections.insert(node_id, conn.clone());
 
-                self.clone().accept_bidi_stream(conn).await;
+                        tokio::spawn({});
+
+
+                        bidi_accept_futures.push(Box::pin(async {
+                            let conn = conn.clone();
+                            loop {
+                                let (sx, mut rx) = match conn.accept_bi().await {
+                                    Ok((rx, sx)) => (rx, sx),
+                                    Err(err) => {
+                                        warn!("cannot accept stream: {err:#}");
+                                        continue;
+                                    }
+                                };
+                                let Ok(protocol_id) = rx.read_u32().await else {
+                                    warn!("cannot read protocol id");
+                                    continue;
+                                };
+                    
+                                let protocol_handler = match self.protocol_handler_map.get(&protocol_id) {
+                                    Some(handler) => handler,
+                                    None => {
+                                        warn!("unknown protocol id: {protocol_id}");
+                                        continue;
+                                    }
+                                };
+                                protocol_handler
+                                    .send(ReceiveStreams {
+                                        sender: conn.remote_node_id().unwrap(),
+                                        send_stream: sx,
+                                        recv_stream: rx,
+                                    })
+                                    .await
+                                    .unwrap_or_else(|err| {
+                                        warn!("cannot send stream to handler: {err:#}");
+                                    });
+                            }
+                        }));
+
+                    }
+                )
             }
+
+            // tokio::select!(
+            //     command = self.command_receiver.recv() => {
+            //         match command {
+            //             Ok(ConnectionRequests::CreateStream { protocol_id, receiver, return_channel }) => {
+            //                 let (send_stream, recv_stream) = self.get_bidi_stream(receiver, protocol_id).await.unwrap();
+            //                 return_channel.send((send_stream, recv_stream)).unwrap();
+            //             }
+            //             Ok(ConnectionRequests::GetKademliaActorHandle { return_channel }) => {
+            //                 return_channel.send(self.kademlia.clone()).unwrap();
+            //             }
+            //             Ok(ConnectionRequests::NewActorHandle { protocol_id, return_channel }) => {
+            //                 let (send_stream, recv_stream) = self.get_bidi_stream(receiver, protocol_id).await.unwrap();
+            //                 return_channel.send((send_stream, recv_stream)).unwrap();
+            //             }
+            //             Err(_) => {
+            //                 warn!("command channel closed");
+            //                 break;
+            //             }
+            //         }
+            //     },
+            //     _ = self.endpoint.accept()
+
+            // async {
+            //         loop {
+            //             let incoming = self.endpoint.accept().await;
+            //             if let Some(incoming) = incoming {
+            //                 let connecting = match incoming.accept() {
+            //                     Ok(connecting) => connecting,
+            //                     Err(err) => {
+            //                         warn!("incoming connection failed: {err:#}");
+            //                         // we can carry on in these cases:
+            //                         // this can be caused by retransmitted datagrams
+            //                         continue;
+            //                     }
+            //                 };
+            //                 let conn = match connecting.await {
+            //                     Ok(conn) => conn,
+            //                     Err(err) => {
+            //                         warn!("incoming connection failed: {err:#}");
+            //                         continue;
+            //                     }
+            //                 };
+            //                 let node_id = match conn.remote_node_id() {
+            //                     Ok(node_id) => node_id,
+            //                     Err(err) => {
+            //                         warn!("cannot retrieve node_id from conn: {err:#}");
+            //                         continue;
+            //                     }
+            //                 };
+            //                 self.connections.insert(node_id, conn.clone());
+
+            //                 futures_unordered.push(Box::pin(self.accept_bidi_stream(conn)))
+            //             }
+            //         }
+            //     }
+            // ));
         });
     }
 
@@ -194,36 +286,8 @@ impl ConnectionHandler {
         Ok(connection)
     }
 
-    async fn accept_bidi_stream(self: Arc<Self>, conn: Connection) {
-        tokio::spawn(async move {
-            loop {
-                let (rx, mut sx) = match conn.accept_bi().await {
-                    Ok((rx, sx)) => (rx, sx),
-                    Err(err) => {
-                        warn!("cannot accept stream: {err:#}");
-                        continue;
-                    }
-                };
-                let Ok(protocol_id) = sx.read_u32().await else {
-                    warn!("cannot read protocol id");
-                    continue;
-                };
-
-                let protocol_handler = match self.protocol_handler.get(&protocol_id) {
-                    Some(handler) => handler,
-                    None => {
-                        warn!("unknown protocol id: {protocol_id}");
-                        continue;
-                    }
-                };
-                let protocol_handler = protocol_handler.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = protocol_handler.handle_stream(rx, sx).await {
-                        warn!("cannot handle stream: {err:#}");
-                    }
-                });
-            }
-        });
+    async fn accept_bidi_stream(&self, conn: Connection) {
+        
     }
 
     pub async fn get_bidi_stream(
