@@ -28,9 +28,13 @@ pub const REPUBLISH_INTERVAL: Duration = Duration::from_secs(79200); // 22h
 /// Internal mutable state of Kademlia
 #[derive(Debug)]
 struct KademliaState {
-    node_addr: NodeAddr,
+    // Our node address, should be set at startup, may otherwise be None
+    node_addr: Option<NodeAddr>,
+    // Kademlia routing table with K buckets
     k_buckets: [KBucket; 256],
-    resources: HashMap<[u8; 32], HashSet<NodeId>>, // Multiple (unique) nodes per key with TTL
+    // Resources stored by us and the nodes that have them
+    resources: HashMap<[u8; 32], HashSet<NodeId>>,
+    // Locally known node addresses
     node_addresses: HashMap<NodeId, NodeAddr>,
     local_resources: TimeHandler, // Tracking stored resources by us
     store_timer: TimeHandler,     // Tracking all stored resources
@@ -39,7 +43,7 @@ struct KademliaState {
 impl KademliaState {
     fn new() -> Self {
         Self {
-            node_addr: NodeAddr::default(),
+            node_addr: None,
             k_buckets: std::array::from_fn(|_| KBucket::new()),
             resources: HashMap::new(),
             node_addresses: HashMap::new(),

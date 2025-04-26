@@ -14,8 +14,4 @@ pub mod connection_handler;
 mod kademlia;
 mod utils;
 
-pub use connection_handler::ConnectionHandler;
-pub use connection_handler::ConnectionHandlerBuilder;
-pub use connection_handler::ProtocolHandler;
-pub use kademlia::kademlia::Kademlia;
 pub use kademlia::messages::FindResult;

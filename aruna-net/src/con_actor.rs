@@ -8,25 +8,25 @@ use crate::kademlia::actor_handle::KademliaActorHandle;
 
 pub type ProtocolId = u32;
 
-pub struct ConnectionActorHandle {
+pub struct NetworkActorHandle {
     pub protocol_id: ProtocolId,
-    pub send_channel: async_channel::Sender<ConnectionRequests>,
+    pub send_channel: async_channel::Sender<NetworkRequests>,
     pub recv_channel: async_channel::Receiver<ReceiveStreams>,
 }
 
 pub struct InitActorHandle {
-    pub send_channel: async_channel::Sender<ConnectionRequests>,
+    pub send_channel: async_channel::Sender<NetworkRequests>,
 }
 
 impl InitActorHandle {
-    pub fn new(send_channel: async_channel::Sender<ConnectionRequests>) -> Self {
+    pub fn new(send_channel: async_channel::Sender<NetworkRequests>) -> Self {
         Self { send_channel }
     }
 
     pub async fn get_kademlia_actor_handle(&self) -> Result<KademliaActorHandle, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
-        let message = ConnectionRequests::GetKademliaActorHandle {
+        let message = NetworkRequests::GetKademliaActorHandle {
             return_channel: oneshot_tx,
         };
 
@@ -40,10 +40,10 @@ impl InitActorHandle {
     pub async fn new_actor_handle(
         &self,
         protocol_id: ProtocolId,
-    ) -> Result<ConnectionActorHandle, anyhow::Error> {
+    ) -> Result<NetworkActorHandle, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
-        let message = ConnectionRequests::NewActorHandle {
+        let message = NetworkRequests::NewActorHandle {
             protocol_id,
             return_channel: oneshot_tx,
         };
@@ -56,7 +56,7 @@ impl InitActorHandle {
     }
 }
 
-pub enum ConnectionRequests {
+pub enum NetworkRequests {
     CreateStream {
         protocol_id: ProtocolId,
         receiver: NodeId,
@@ -67,7 +67,7 @@ pub enum ConnectionRequests {
     },
     NewActorHandle {
         protocol_id: ProtocolId,
-        return_channel: oneshot::Sender<ConnectionActorHandle>,
+        return_channel: oneshot::Sender<NetworkActorHandle>,
     },
 }
 
@@ -77,10 +77,10 @@ pub struct ReceiveStreams {
     pub recv_stream: RecvStream,
 }
 
-impl ConnectionActorHandle {
+impl NetworkActorHandle {
     pub fn new(
         protocol_id: ProtocolId,
-        send_channel: async_channel::Sender<ConnectionRequests>,
+        send_channel: async_channel::Sender<NetworkRequests>,
         recv_channel: async_channel::Receiver<ReceiveStreams>,
     ) -> Self {
         Self {
@@ -96,7 +96,7 @@ impl ConnectionActorHandle {
     ) -> Result<(SendStream, RecvStream), anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
-        let message = ConnectionRequests::CreateStream {
+        let message = NetworkRequests::CreateStream {
             protocol_id: self.protocol_id,
             receiver: target,
             return_channel: oneshot_tx,
@@ -112,7 +112,7 @@ impl ConnectionActorHandle {
     pub async fn get_kademlia_actor_handle(&self) -> Result<KademliaActorHandle, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
-        let message = ConnectionRequests::GetKademliaActorHandle {
+        let message = NetworkRequests::GetKademliaActorHandle {
             return_channel: oneshot_tx,
         };
 
@@ -126,10 +126,10 @@ impl ConnectionActorHandle {
     pub async fn new_actor_handle(
         &self,
         protocol_id: ProtocolId,
-    ) -> Result<ConnectionActorHandle, anyhow::Error> {
+    ) -> Result<NetworkActorHandle, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
-        let message = ConnectionRequests::NewActorHandle {
+        let message = NetworkRequests::NewActorHandle {
             protocol_id,
             return_channel: oneshot_tx,
         };

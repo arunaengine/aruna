@@ -27,14 +27,14 @@ pub enum MessageType {
 /// Unified Message structure for Kademlia protocol
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KademliaMessage {
-    pub id: Ulid,              // Message ID (for requests and responses)
-    pub sender: NodeAddr,      // Sender of this message
-    pub msg_type: MessageType, // Type of message with explicit request/response variants
+    pub id: Ulid,                 // Message ID (for requests and responses)
+    pub sender: Option<NodeAddr>, // Sender of this message
+    pub msg_type: MessageType,    // Type of message with explicit request/response variants
 }
 
 impl KademliaMessage {
     /// Create a new request message
-    pub fn new_request(id: Ulid, sender: NodeAddr, msg_type: MessageType) -> Self {
+    pub fn new_request(id: Ulid, sender: Option<NodeAddr>, msg_type: MessageType) -> Self {
         Self {
             id,
             sender,
@@ -43,7 +43,7 @@ impl KademliaMessage {
     }
 
     /// Create a response message for a given request
-    pub fn create_response(&self, sender: NodeAddr, msg_type: MessageType) -> Self {
+    pub fn create_response(&self, sender: Option<NodeAddr>, msg_type: MessageType) -> Self {
         Self {
             id: self.id, // Keep same ID for request/response correlation
             sender,

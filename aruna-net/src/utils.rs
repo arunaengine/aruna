@@ -14,8 +14,17 @@ impl<T> ChannelPair<T> {
     pub fn receiver(&self) -> &async_channel::Receiver<T> {
         &self.receiver
     }
-    
+
     pub fn sender(&self) -> &async_channel::Sender<T> {
         &self.sender
+    }
+}
+
+impl<T> Clone for ChannelPair<T> {
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            receiver: self.receiver.clone(),
+        }
     }
 }

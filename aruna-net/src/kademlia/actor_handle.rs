@@ -28,11 +28,9 @@ impl KademliaActorHandle {
     }
 
     pub async fn find(&self, target: [u8; 32]) -> Result<FindResult> {
-        let request = KademliaMessage::new_request(
-            Ulid::new(),
-            self.sender.clone(),
-            MessageType::FindRequest { target },
-        );
+        // We send a Kademlia request with an empty sender, this will be set by the kademlia actor
+        let request =
+            KademliaMessage::new_request(Ulid::new(), None, MessageType::FindRequest { target });
 
         let response = self.send_request(request).await?;
 
@@ -45,7 +43,7 @@ impl KademliaActorHandle {
     pub async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<()> {
         let request = KademliaMessage::new_request(
             Ulid::new(),
-            self.sender.clone(),
+            None,
             MessageType::StoreRequest { key, value },
         );
 
