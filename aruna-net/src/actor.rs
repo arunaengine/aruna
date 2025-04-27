@@ -1,7 +1,10 @@
 use crate::{
     ARUNA_NET_ALPN,
-    con_actor::{InitActorHandle, NetworkActorHandle, NetworkRequests, ReceiveStreams},
-    kademlia::{actor_handle::KademliaActorHandle, kademlia::KademliaActor},
+    actor_handle::{InitActorHandle, NetworkActorHandle, NetworkRequests, ReceiveStreams},
+    kademlia::{
+        actor::{KADEMLIA_PROTOCOL_ID, KademliaActor},
+        actor_handle::KademliaActorHandle,
+    },
     utils::ChannelPair,
 };
 use anyhow::Result;
@@ -18,40 +21,43 @@ pub const CHANNEL_SIZE: usize = 100;
 
 pub type ProtocolId = u32;
 
-pub struct NetwrokActorBuilder {
+pub struct NetworkActorBuilder {
     endpoint: iroh::endpoint::Builder,
     command: ChannelPair<NetworkRequests>,
     protocol_handler_map: HashMap<ProtocolId, ChannelPair<ReceiveStreams>>,
     kademlia: KademliaActorHandle,
 }
 
-impl NetwrokActorBuilder {
+impl NetworkActorBuilder {
     pub async fn new(secret_key: Option<SecretKey>) -> Self {
         let command = ChannelPair::new();
 
         let kademlia_channel_pair = ChannelPair::new();
         let kademlia_actor_handle = NetworkActorHandle::new(
-            1,
+            KADEMLIA_PROTOCOL_ID,
             command.sender().clone(),
             kademlia_channel_pair.receiver().clone(),
         );
 
-        let kademlia_handle = KademliaActor::new(kademlia_actor_handle).await;
+        let secret_key = secret_key.unwrap_or_else(|| {
+            let mut rng = rand::rngs::OsRng;
+            let secret_key = SecretKey::generate(&mut rng);
+            secret_key
+        });
+
+        let kademlia_handle = KademliaActor::new(secret_key.public(), kademlia_actor_handle).await;
         let handle_clone = kademlia_handle.clone();
 
-        let mut endpoint = Builder::default()
+        let endpoint = Builder::default()
             .alpns(vec![ARUNA_NET_ALPN.to_vec()])
             .add_discovery(move |_| Some(handle_clone))
-            .relay_mode(RelayMode::Disabled);
-
-        if let Some(secret_key) = secret_key {
-            endpoint = endpoint.secret_key(secret_key);
-        }
+            .relay_mode(RelayMode::Disabled)
+            .secret_key(secret_key);
 
         let mut protocol_handler_map: HashMap<ProtocolId, ChannelPair<ReceiveStreams>> =
             HashMap::new();
 
-        protocol_handler_map.insert(1, kademlia_channel_pair);
+        protocol_handler_map.insert(KADEMLIA_PROTOCOL_ID, kademlia_channel_pair);
 
         Self {
             endpoint,
@@ -94,6 +100,7 @@ impl NetwrokActorBuilder {
     pub async fn build(self, bootstrap_nodes: Vec<NodeAddr>) -> Result<InitActorHandle> {
         let endpoint = self.endpoint.bind().await?;
         let init_actor_handle = InitActorHandle::new(self.command.sender().clone());
+        self.kademlia.bootstrap(bootstrap_nodes).await?;
         NetworkActor::new(
             endpoint,
             self.command,
@@ -164,6 +171,10 @@ pub async fn connection_loop(
                     continue;
                 }
             }
+
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
         }
     }
 }
@@ -186,10 +197,6 @@ impl NetworkActor {
         };
 
         handler.spawn_acceptor().await;
-    }
-
-    async fn get_node_addr(&self) -> anyhow::Result<NodeAddr> {
-        self.endpoint.node_addr().await
     }
 
     // This spawns the main acceptor loop

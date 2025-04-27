@@ -1,4 +1,4 @@
-use crate::connection_handler::CHANNEL_SIZE;
+use crate::actor::CHANNEL_SIZE;
 
 pub struct ChannelPair<T> {
     pub sender: async_channel::Sender<T>,

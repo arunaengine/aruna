@@ -4,19 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = {workspace = true}
-async-trait = {workspace = true}
-async-channel = {workspace = true}
-iroh = {workspace = true}
-iroh-base = {workspace = true}
-postcard = {workspace = true}
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+async-channel = { workspace = true }
+iroh = { workspace = true }
+iroh-base = { workspace = true }
+postcard = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
-tracing = {workspace = true} 
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
-futures = {workspace = true}
+futures = { workspace = true }
 futures-util = "0.3.31"
 log = "0.4.27"
 n0-future = "0.1.2"
-rand = "0.9.1"
+rand = "0.8.5"

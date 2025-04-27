@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use aruna_net::connection_handler::ConnectionHandlerBuilder;
+use aruna_net::actor::ConnectionHandlerBuilder;
 
 #[tokio::main]
 pub async fn main() {

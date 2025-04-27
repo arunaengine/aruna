@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::Ok;
-use aruna_net::connection_handler::ConnectionHandlerBuilder;
+use aruna_net::actor::ConnectionHandlerBuilder;
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 

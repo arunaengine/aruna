@@ -20,6 +20,9 @@ pub enum KademliaRequest {
     SetNodeAddr {
         node_addr: NodeAddr,
     },
+    Bootstrap {
+        node_addrs: Vec<NodeAddr>,
+    },
 }
 
 impl KademliaActorHandle {
@@ -53,6 +56,13 @@ impl KademliaActorHandle {
             MessageType::StoreResponse => Ok(()),
             _ => Err(anyhow::anyhow!("Unexpected response type")),
         }
+    }
+
+    pub async fn bootstrap(&self, node_addrs: Vec<NodeAddr>) -> Result<()> {
+        self.sender
+            .send(KademliaRequest::Bootstrap { node_addrs })
+            .await?;
+        Ok(())
     }
 
     async fn send_request(
