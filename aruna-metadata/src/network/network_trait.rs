@@ -2,7 +2,7 @@ use crate::{
     error::ArunaError,
     persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
 };
-use aruna_net::{ConnectionHandler, ConnectionHandlerBuilder};
+use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
@@ -100,7 +100,7 @@ where
 }
 
 pub struct P2PNetwork<St, Se> {
-    chandler: Arc<ConnectionHandler>,
+    chandler: NetworkActorHandle,
     pub phantom: PhantomData<(Se, St)>,
 }
 
@@ -113,12 +113,19 @@ where
     type Config = NetworkConfig<St, Se>;
 
     async fn new(config: Self::Config) -> Self {
-        let chandler = ConnectionHandlerBuilder::new(config.secret_key)
+        let init_handle = NetworkActorBuilder::new(config.secret_key)
+            .await
             .add_bind_addr_v4(config.socket_addr)
-            .add_protocol_handler(METADATA_PROTOCOL_ID, config.persistor)
+            //.add_protocol_handler(METADATA_PROTOCOL_ID, config.persistor)
             .build(config.bootstrap_nodes)
             .await
             .unwrap();
+
+        let chandler = init_handle
+            .new_actor_handle(METADATA_PROTOCOL_ID)
+            .await
+            .unwrap();
+
         //.map_err(|e| ArunaError::NetworkError(e.to_string()))
         P2PNetwork {
             chandler,
@@ -136,6 +143,7 @@ where
 
     async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError> {
         let chandler = self.chandler.clone();
+        let kademlia = chandler.get_kademlia_actor_handle().await?;
         let subject_id = *subject_id;
         tokio::spawn(async move {
             let node_id = chandler.get_node_addr().await?.node_id;
@@ -147,7 +155,7 @@ where
             // TODO:
             // Dont use find for placing objects,
             // but find realm nodes and place objects there
-            let nodes = chandler.find(*id_hash.as_bytes()).await?.nodes;
+            let nodes = kademlia.find(*id_hash.as_bytes()).await?.nodes;
 
             let mut message = MetadataMessage {
                 from: *node_id.as_bytes(),
@@ -168,10 +176,7 @@ where
                 message.to = *node.node_id.as_bytes();
                 let msg = postcard::to_allocvec(&message)?;
 
-                let (_recv, mut sdx) = chandler
-                    .clone()
-                    .get_bidi_stream(node.node_id, METADATA_PROTOCOL_ID)
-                    .await?;
+                let (mut sdx, _recv) = chandler.create_stream(node.node_id).await?;
                 sdx.write_u32(msg.len() as u32).await?;
                 sdx.write_all(msg.as_slice())
                     .await
@@ -191,15 +196,20 @@ where
     }
 
     async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaError> {
-        let chandler = self.chandler.clone();
+        let node_addr = self
+            .chandler
+            .get_node_addr()
+            .await
+            .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+
+        let kademlia = self.chandler.get_kademlia_actor_handle().await?;
         let subject_id = *subject_id;
         tokio::spawn(async move {
-            let id = chandler.get_node_addr().await?;
             // Calc hash
             let mut chunk_hasher = blake3::Hasher::new();
             chunk_hasher.update(subject_id.to_bytes().as_slice());
             let id_hash = chunk_hasher.finalize();
-            chandler.store(*id_hash.as_bytes(), id).await?;
+            kademlia.store(*id_hash.as_bytes(), node_addr).await?;
             Ok::<(), ArunaError>(())
         });
         Ok(())

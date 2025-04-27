@@ -1,16 +1,16 @@
 use crate::util::opendal::get_data_stream;
 use ahash::{HashMap, HashMapExt};
 use anyhow::{Result, anyhow};
-use aruna_net::ConnectionHandler;
-use aruna_net::ProtocolHandler;
+use aruna_net::KademliaActorHandle;
+use aruna_net::actor_handle::NetworkActorHandle;
 use futures::{SinkExt, StreamExt};
+// TODO: We need to replace the old "ProtocolHandler" trait with a loop that handles incoming streams
 use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{NodeAddr, NodeId};
 use opendal::{Buffer, BufferSink, Operator};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::fmt::Formatter;
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -33,10 +33,9 @@ impl std::fmt::Debug for Md5Context {
     }
 }
 
-#[derive(Debug)]
 pub struct ReplicationHandler {
     operator: Operator,
-    network: RwLock<Option<(NodeAddr, Arc<ConnectionHandler>)>>,
+    network: RwLock<Option<(NodeAddr, NetworkActorHandle, KademliaActorHandle)>>,
     pub local_store: RwLock<HashMap<String, ObjectInfo>>, //TODO: Persistent store
     pub object_writers: RwLock<HashMap<String, (StagingObjectInfo, SinkWrapper)>>,
 }
@@ -111,12 +110,13 @@ impl ReplicationHandler {
     pub async fn add_connection_handler(
         &self,
         node_addr: NodeAddr,
-        chandler: Arc<ConnectionHandler>,
+        chandler: NetworkActorHandle,
+        kademlia: KademliaActorHandle,
     ) {
         self.network
             .write()
             .await
-            .replace((node_addr.clone(), chandler));
+            .replace((node_addr.clone(), chandler, kademlia));
     }
 
     pub async fn dummy_sync(&self) -> Result<()> {
@@ -146,7 +146,7 @@ impl ReplicationHandler {
         let network = self.network.read().await;
         network
             .as_ref()
-            .map(|(addr, _)| addr.clone())
+            .map(|(addr, _, _)| addr.clone())
             .expect("Network not initialized")
     }
 
@@ -278,8 +278,8 @@ impl ReplicationHandler {
 
             // Store data location in Kademlia
             let guard = self.network.read().await;
-            if let Some((node_addr, chandler)) = guard.as_ref() {
-                if let Err(err) = chandler.store(*blake3.as_bytes(), node_addr.clone()).await {
+            if let Some((node_addr, _, kademlia)) = guard.as_ref() {
+                if let Err(err) = kademlia.store(*blake3.as_bytes(), node_addr.clone()).await {
                     return Some(ReplicationMessage {
                         id,
                         sender: node_addr.clone(),
@@ -316,8 +316,8 @@ impl ReplicationHandler {
     async fn handle_end_response(&self, sender_addr: NodeAddr, obj_hash: [u8; 32]) {
         // Store data location in Kademlia
         let guard = self.network.read().await;
-        if let Some((_, chandler)) = guard.as_ref() {
-            if let Err(err) = chandler.store(obj_hash, sender_addr).await {
+        if let Some((_, _, kademlia)) = guard.as_ref() {
+            if let Err(err) = kademlia.store(obj_hash, sender_addr).await {
                 warn!("Failed to store data location: {err}");
             }
         }
@@ -344,14 +344,11 @@ impl ReplicationHandler {
 
         // Get connection to specific node
         let guard = self.network.read().await;
-        let Some((_, chandler)) = guard.as_ref() else {
+        let Some((_, chandler, _)) = guard.as_ref() else {
             return Err(anyhow!("Network not initialized"));
         };
 
-        let (mut rx, mut sx) = chandler
-            .clone()
-            .get_bidi_stream(replication_node.node_id, REPLICATION_PROTOCOL_ID)
-            .await?;
+        let (mut sx, mut rx) = chandler.create_stream(replication_node.node_id).await?;
         debug!("Created bidirectional stream.");
 
         // Send init and wait for ack
@@ -442,34 +439,5 @@ impl ReplicationHandler {
         } else {
             Err(anyhow!("That should not happen."))
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl ProtocolHandler for ReplicationHandler {
-    async fn handle_stream(
-        &self,
-        mut send_stream: SendStream,
-        mut recv_stream: RecvStream,
-    ) -> Result<()> {
-        while let Ok(len) = recv_stream.read_u32().await {
-            let mut buf = vec![0; len as usize];
-
-            recv_stream.read_exact(&mut buf).await?;
-            let message = postcard::from_bytes::<ReplicationMessage>(&buf)
-                .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
-
-            if let Some(response) = self.handle_message(message).await {
-                // Serialize the response
-                let response_buf = postcard::to_allocvec(&response)
-                    .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
-
-                // Send the response
-                send_stream.write_u32(response_buf.len() as u32).await?;
-                send_stream.write_all(&response_buf).await?;
-            }
-        }
-
-        Ok(())
     }
 }

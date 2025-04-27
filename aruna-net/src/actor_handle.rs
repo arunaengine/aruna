@@ -8,6 +8,7 @@ use crate::kademlia::actor_handle::KademliaActorHandle;
 
 pub type ProtocolId = u32;
 
+#[derive(Clone, Debug)]
 pub struct NetworkActorHandle {
     pub protocol_id: ProtocolId,
     pub send_channel: async_channel::Sender<NetworkRequests>,
@@ -165,6 +166,20 @@ impl NetworkActorHandle {
         let connection_actor_handle = oneshot_rx.await?;
 
         Ok(connection_actor_handle)
+    }
+
+    pub async fn get_node_addr(&self) -> Result<NodeAddr, anyhow::Error> {
+        let (oneshot_tx, oneshot_rx) = oneshot::channel();
+
+        let message = NetworkRequests::GetNodeAddr {
+            return_channel: oneshot_tx,
+        };
+
+        self.send_channel.send(message).await?;
+
+        let node_addr = oneshot_rx.await?;
+
+        Ok(node_addr)
     }
 
     pub async fn receive(&self) -> Result<ReceiveStreams, anyhow::Error> {
