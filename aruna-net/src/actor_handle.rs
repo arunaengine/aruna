@@ -2,7 +2,7 @@ use iroh::{
     NodeAddr, NodeId,
     endpoint::{RecvStream, SendStream},
 };
-use tokio::sync::oneshot;
+use tokio::{io::AsyncReadExt, sync::oneshot};
 
 use crate::kademlia::actor_handle::KademliaActorHandle;
 
@@ -92,6 +92,15 @@ pub struct ReceiveStreams {
     pub sender: NodeId,
     pub send_stream: SendStream,
     pub recv_stream: RecvStream,
+}
+
+impl ReceiveStreams {
+    pub async fn read_protocol(&mut self) -> Result<ProtocolId, anyhow::Error> {
+        self.recv_stream
+            .read_u32()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read protocol id: {}", e))
+    }
 }
 
 impl NetworkActorHandle {

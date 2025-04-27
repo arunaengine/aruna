@@ -274,6 +274,31 @@ impl NetworkActor {
                     self.handle_incoming(incoming).await;
                 }
 
+                // Handle incoming streams
+                Ok(mut receive_streams) = self.incoming_streams.receiver().recv() => {
+
+                    // Get the protocol id from the stream
+                    let Ok(protocol_id) = receive_streams.read_protocol().await else {
+                        warn!("cannot read protocol id from stream");
+                        continue;
+                    };
+
+                    // Check if the protocol handler exists
+                    match self.protocol_handler_map.get(&protocol_id) {
+                        Some(handler_channel_pair) => {
+                            // If it exists, send the stream to the handler
+                            if handler_channel_pair.sender().send(receive_streams).await.is_err() {
+                                warn!("cannot send stream to handler");
+                                continue;
+                            }
+                        }
+                        None => {
+                            warn!("no protocol handler for protocol id {}", protocol_id);
+                            continue;
+                        }
+                    }
+                }
+
                 // Try to join the receiver joinset
                 Some(Ok(())) = self.receiver_joinset.join_next() => {
                     // If a task has finished, we can continue
