@@ -1,5 +1,5 @@
 use iroh::{
-    NodeId,
+    NodeAddr, NodeId,
     endpoint::{RecvStream, SendStream},
 };
 use tokio::sync::oneshot;
@@ -54,6 +54,20 @@ impl InitActorHandle {
 
         Ok(connection_actor_handle)
     }
+
+    pub async fn get_node_addr(&self) -> Result<NodeAddr, anyhow::Error> {
+        let (oneshot_tx, oneshot_rx) = oneshot::channel();
+
+        let message = NetworkRequests::GetNodeAddr {
+            return_channel: oneshot_tx,
+        };
+
+        self.send_channel.send(message).await?;
+
+        let node_addr = oneshot_rx.await?;
+
+        Ok(node_addr)
+    }
 }
 
 pub enum NetworkRequests {
@@ -68,6 +82,9 @@ pub enum NetworkRequests {
     NewActorHandle {
         protocol_id: ProtocolId,
         return_channel: oneshot::Sender<NetworkActorHandle>,
+    },
+    GetNodeAddr {
+        return_channel: oneshot::Sender<NodeAddr>,
     },
 }
 

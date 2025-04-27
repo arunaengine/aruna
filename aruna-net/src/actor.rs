@@ -254,6 +254,17 @@ impl NetworkActor {
                                     }
                                 }
                             }
+                        },
+                        NetworkRequests::GetNodeAddr { return_channel } => {
+                            // Get the node address and send it to the command channel
+                            let Ok(node_addr) = self.endpoint.node_addr().await else {
+                                warn!("cannot get node address");
+                                continue;
+                            };
+                            if return_channel.send(node_addr).is_err() {
+                                warn!("cannot send node address");
+                                continue;
+                            }
                         }
                     }
                 }
