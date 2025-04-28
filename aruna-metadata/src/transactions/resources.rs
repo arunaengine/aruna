@@ -88,7 +88,8 @@ where
                 crate::network::network_trait::Body::Object(doc),
                 &resource.id,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         Ok(CreateResourceResponse { resource })
     }

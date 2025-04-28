@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use anyhow::Ok;
-use aruna_net::connection_handler::ConnectionHandlerBuilder;
+use aruna_net::actor::NetworkActorBuilder;
 use tracing::debug;
 use tracing_subscriber::EnvFilter;
 
@@ -26,7 +26,8 @@ pub async fn main() -> anyhow::Result<()> {
 
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let chandler1 = ConnectionHandlerBuilder::new(None)
+    let chandler1 = NetworkActorBuilder::new(None)
+        .await
         .add_bind_addr_v4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 31337))
         .build(vec![])
         .await
@@ -35,7 +36,8 @@ pub async fn main() -> anyhow::Result<()> {
     let c1_addr = chandler1.get_node_addr().await?;
     debug!("Node 1 address: {:?}", c1_addr.node_id);
 
-    let chander2 = ConnectionHandlerBuilder::new(None)
+    let chander2 = NetworkActorBuilder::new(None)
+        .await
         .add_bind_addr_v4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 31338))
         .build(vec![c1_addr])
         .await
@@ -43,7 +45,9 @@ pub async fn main() -> anyhow::Result<()> {
     let c2_addr = chander2.get_node_addr().await?;
     debug!("Node 2 address: {:?}", c2_addr.node_id);
 
-    let result = chandler1.find(*c2_addr.node_id.as_bytes()).await?;
+    let kademlia = chandler1.get_kademlia_actor_handle().await?;
+
+    let result = kademlia.find(*c2_addr.node_id.as_bytes()).await?;
 
     debug!("Result: {:?}", result);
     assert_eq!(*result.value.first().unwrap(), c2_addr);

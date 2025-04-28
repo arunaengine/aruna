@@ -175,7 +175,6 @@ impl<'a> Store<'a> for FjallStore {
         Ok(())
     }
 
-
     fn remove(
         &'a self,
         txn: &mut Self::Txn,

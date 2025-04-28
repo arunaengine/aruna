@@ -14,8 +14,6 @@ use crate::{
     models::models::{Resource, User},
     network::network_trait::{Body, MetadataMessage},
 };
-use anyhow::anyhow;
-use aruna_net::ProtocolHandler;
 use automerge::ActorId;
 use autosurgeon::{hydrate, reconcile};
 use iroh::endpoint::{RecvStream, SendStream};
@@ -435,41 +433,41 @@ where
     }
 }
 
-#[async_trait::async_trait]
-impl<St, Se> ProtocolHandler for Persistor<St, Se>
-where
-    for<'a> St: Store<'a> + 'static,
-    Se: Search + 'static,
-{
-    async fn handle_stream(
-        &self,
-        mut _send_stream: SendStream,
-        mut recv_stream: RecvStream,
-    ) -> anyhow::Result<()> {
-        while let Ok(len) = recv_stream.read_u32().await {
-            let mut buf = vec![0; len as usize];
-
-            recv_stream.read_exact(&mut buf).await?;
+// #[async_trait::async_trait]
+// impl<St, Se> ProtocolHandler for Persistor<St, Se>
+// where
+//     for<'a> St: Store<'a> + 'static,
+//     Se: Search + 'static,
+// {
+//     async fn handle_stream(
+//         &self,
+//         mut _send_stream: SendStream,
+//         mut recv_stream: RecvStream,
+//     ) -> anyhow::Result<()> {
+//         while let Ok(len) = recv_stream.read_u32().await {
+//             let mut buf = vec![0; len as usize];
 
             // TODO: 
             // - dispatch into API requests
-            let message = postcard::from_bytes::<MetadataMessage>(&buf)
-                .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
+//             recv_stream.read_exact(&mut buf).await?;
+//             let message = postcard::from_bytes::<MetadataMessage>(&buf)
+//                 .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
+//             match self.handle_message(message).await {
+//                 Ok(_res) => {
+//                     // TODO: Respond with something if need arises
+//                     //
+//                     // Serialize the response
+//                     // let response_buf = postcard::to_allocvec(&response)
+//                     //     .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
 
-            match self.handle_message(message).await {
-                Ok(_res) => {
-                    // Serialize the response
-                    // let response_buf = postcard::to_allocvec(&response)
-                    //     .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
+//                     // Send the response
+//                     // send_stream.write_u32(response_buf.len() as u32).await?;
+//                     // send_stream.write_all(&response_buf).await?;
+//                 }
+//                 Err(err) => return Err(anyhow!(err)),
+//             }
+//         }
 
-                    // Send the response
-                    // send_stream.write_u32(response_buf.len() as u32).await?;
-                    // send_stream.write_all(&response_buf).await?;
-                }
-                Err(err) => return Err(anyhow!(err)),
-            }
-        }
-
-        Ok(())
-    }
-}
+//         Ok(())
+//     }
+// }

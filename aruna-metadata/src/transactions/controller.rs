@@ -2,11 +2,7 @@ use super::request::Request;
 use crate::{
     error::ArunaError,
     network::network_trait::Network,
-    persistence::{
-        persistence::Persistor,
-        search::search::Search,
-        storage::store::Store,
-    },
+    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
 };
 use std::sync::Arc;
 use ulid::Ulid;
