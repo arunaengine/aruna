@@ -71,6 +71,7 @@ impl InitActorHandle {
     }
 }
 
+#[derive(Debug)]
 pub enum NetworkRequests {
     CreateStream {
         protocol_id: ProtocolId,

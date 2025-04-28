@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 pub async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
-        .add_directive("aruna_net=debug".parse()?);
+        .add_directive("aruna_net=trace".parse()?);
 
     let subscriber = tracing_subscriber::fmt()
         //.with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
@@ -46,6 +46,8 @@ pub async fn main() -> anyhow::Result<()> {
     debug!("Node 2 address: {:?}", c2_addr.node_id);
 
     let kademlia = chandler1.get_kademlia_actor_handle().await?;
+
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     let result = kademlia.find(*c2_addr.node_id.as_bytes()).await?;
 

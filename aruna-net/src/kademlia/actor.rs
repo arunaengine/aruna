@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use iroh::{NodeAddr, NodeId};
+use iroh::{NodeAddr, NodeId, PublicKey};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +11,7 @@ use crate::actor_handle::{NetworkActorHandle, ReceiveStreams};
 use crate::kademlia::k_bucket::KBucket;
 use crate::kademlia::messages::{KademliaMessage, MessageType};
 use crate::kademlia::node_info::NodeInfo;
-use crate::kademlia::utils::{calculate_distance, get_bucket_index};
+use crate::kademlia::utils::{calculate_distance, get_bucket_index, viz};
 use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
 
 use super::actor_handle::{KademliaActorHandle, KademliaRequest};
@@ -118,23 +118,15 @@ impl KademliaActor {
                     }
 
                     // Handle incoming streams
-                    Ok(ReceiveStreams { mut recv_stream, .. }) = self.network.receive() => {
-
-                        let Ok(len) = recv_stream.read_u32().await else {
-                            error!("Failed to read stream length");
-                            continue;
-                        };
-                        let mut buf = vec![0; len as usize];
-                        if let Err(e) = recv_stream.read_exact(&mut buf).await {
-                            error!("Failed to read stream: {e:#}");
-                            continue;
+                    Ok(inc_stream) = self.network.receive() => {
+                        match self.handle_incoming_stream(inc_stream).await {
+                            Ok(_) => {
+                                trace!("Handled incoming stream successfully");
+                            }
+                            Err(e) => {
+                                error!("Failed to handle incoming stream: {e:#}");
+                            }
                         }
-
-                        let Ok(message) = postcard::from_bytes::<KademliaMessage>(&buf) else {
-                            error!("Failed to deserialize message");
-                            continue;
-                        };
-                        self.handle_message(message).await;
                     }
 
                     // Check for shutdown signal
@@ -144,6 +136,32 @@ impl KademliaActor {
                 }
             }
         });
+    }
+
+    pub async fn handle_incoming_stream(
+        &mut self,
+        ReceiveStreams {
+            sender,
+            mut send_stream,
+            mut recv_stream,
+        }: ReceiveStreams,
+    ) -> Result<()> {
+        trace!("Received stream from: {:?}", sender);
+
+        let len = recv_stream.read_u32().await?;
+        let mut buf = vec![0; len as usize];
+        recv_stream.read_exact(&mut buf).await?;
+
+        let message = postcard::from_bytes::<KademliaMessage>(&buf)?;
+        let Some(response) = self.handle_message(message).await else {
+            error!("Failed to handle message");
+            return Err(anyhow!("Failed to handle message"));
+        };
+        let buf = postcard::to_allocvec(&response)?;
+        send_stream.write_u32(buf.len() as u32).await?;
+        send_stream.write_all(&buf).await?;
+        send_stream.flush().await?;
+        Ok(())
     }
 
     pub fn set_node_addr(&mut self, addr: NodeAddr) {
@@ -171,8 +189,8 @@ impl KademliaActor {
                 request,
                 response: response_channel,
             } => {
-                let response = self.handle_message(request).await;
-                if let Some(response) = response {
+                let response = self.run_request(request).await;
+                if let Ok(response) = response {
                     let _ = response_channel.send(response);
                 }
             }
@@ -183,6 +201,42 @@ impl KademliaActor {
                 if let Err(e) = self.bootstrap(node_addrs).await {
                     error!("Failed to bootstrap: {e:#}");
                 }
+            }
+        }
+    }
+
+    async fn run_request(&mut self, request: KademliaMessage) -> Result<KademliaMessage> {
+        match &request.msg_type {
+            MessageType::PingRequest { node_addr } => {
+                match self.spawn_ping(node_addr.clone()).await? {
+                    true => Ok(request.create_response(
+                        Some(self.get_node_addr().clone()),
+                        MessageType::PingResponse,
+                    )),
+                    false => Err(anyhow!("Ping failed")),
+                }
+            }
+            MessageType::FindRequest { target } => {
+                let find_result = self.find(*target, true).await?;
+                Ok(request.create_response(
+                    Some(self.get_node_addr().clone()),
+                    MessageType::FindResponse {
+                        value: find_result.value,
+                        nodes: find_result.nodes,
+                    },
+                ))
+            }
+            MessageType::StoreRequest { key, value } => {
+                // Store the key-value pair locally
+                self.store(*key, value.clone()).await?;
+                Ok(request.create_response(
+                    Some(self.get_node_addr().clone()),
+                    MessageType::StoreResponse,
+                ))
+            }
+            _ => {
+                error!("Invalid request type: Response: {:?}", request.msg_type);
+                Err(anyhow!("Invalid request type"))
             }
         }
     }
@@ -289,7 +343,7 @@ impl KademliaActor {
     /// Handle a request message and generate a response
     async fn handle_request(&mut self, request: KademliaMessage) -> Option<KademliaMessage> {
         match request.msg_type {
-            MessageType::PingRequest => {
+            MessageType::PingRequest { .. } => {
                 // Simple ping response
                 Some(request.create_response(
                     Some(self.get_node_addr().clone()),
@@ -410,6 +464,13 @@ impl KademliaActor {
         let response = postcard::from_bytes::<KademliaMessage>(&buf)
             .map_err(|e| anyhow!("Failed to deserialize response: {e:#}"))?;
 
+        info!(
+            "Received response: {:?} from node {} at node: {}",
+            response,
+            self.node_id(),
+            target_addr.node_id
+        );
+
         Ok(response)
     }
 
@@ -509,7 +570,9 @@ impl KademliaActor {
         let message = KademliaMessage::new_request(
             id,
             Some(self.get_node_addr().clone()),
-            MessageType::PingRequest,
+            MessageType::PingRequest {
+                node_addr: target.clone(),
+            },
         );
 
         // Send and wait for response
@@ -521,11 +584,11 @@ impl KademliaActor {
 
     /// External API: Find operation with choice of mode
     pub async fn find(&self, target: [u8; 32], shortcircuit: bool) -> Result<FindResult> {
-        //info!(
-        //    "Searching key: {:?} @ {} ",
-        //    PublicKey::from_bytes(&target).unwrap(),
-        //    self.node_id().await
-        //);
+        info!(
+            "Searching key: {:?} @ {} ",
+            PublicKey::from_bytes(&target).unwrap(),
+            self.node_id()
+        );
 
         // First check if we have the value locally
         let mut local_values = Vec::new();
@@ -566,7 +629,7 @@ impl KademliaActor {
             });
         }
 
-        // Find closest nodes without holding a lock for too long
+        // Find closest nodes
         let closest_nodes = self.find_closest_nodes(&target).await;
 
         // If no nodes found, return empty result
@@ -641,6 +704,8 @@ impl KademliaActor {
                 visited_nodes.insert(node.node_id);
             }
 
+            trace!("Responses: {:?} @ node: {}", responses, self.node_id());
+
             // Process all responses
             let mut found_value_in_batch = false;
 
@@ -697,11 +762,11 @@ impl KademliaActor {
 
     /// External API: Store operation (simplified)
     pub async fn store(&mut self, key: [u8; 32], value: NodeAddr) -> Result<()> {
-        //info!(
-        //    "Storing key: {:?} @ {} ",
-        //    PublicKey::from_bytes(&key).unwrap(),
-        //    self.node_id().await
-        //);
+        info!(
+            "Storing key: {:?} @ {} ",
+            PublicKey::from_bytes(&key).unwrap(),
+            self.node_id()
+        );
 
         // Store locally first with TTL
         {
@@ -746,7 +811,9 @@ impl KademliaActor {
 
         // Wait for all store requests to complete
         for request in futures_util::future::join_all(store_requests).await {
-            let _ = request; // Ignore errors from individual nodes
+            if let Err(err) = request {
+                error!("Failed to store on node: {err:#}");
+            }
         }
 
         Ok(())

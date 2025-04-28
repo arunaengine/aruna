@@ -16,6 +16,7 @@ use iroh::{
 use log::warn;
 use std::collections::HashMap;
 use tokio::{io::AsyncWriteExt, sync::oneshot};
+use tracing::trace;
 
 pub const CHANNEL_SIZE: usize = 100;
 
@@ -99,8 +100,18 @@ impl NetworkActorBuilder {
 
     pub async fn build(self, bootstrap_nodes: Vec<NodeAddr>) -> Result<InitActorHandle> {
         let endpoint = self.endpoint.bind().await?;
+        for node_addr in bootstrap_nodes.iter() {
+            endpoint.add_node_addr(node_addr.clone())?;
+        }
         let init_actor_handle = InitActorHandle::new(self.command.sender().clone());
-        self.kademlia.bootstrap(bootstrap_nodes).await?;
+        if !bootstrap_nodes.is_empty() {
+            self.kademlia
+                .set_node_addr(endpoint.node_addr().await?)
+                .await?;
+            self.kademlia.bootstrap(bootstrap_nodes).await?;
+        } else {
+            warn!("no bootstrap nodes")
+        }
         NetworkActor::new(
             endpoint,
             self.command,
@@ -141,8 +152,13 @@ pub async fn connection_loop(
     create_stream: Receiver<CreateStream>,
 ) {
     loop {
+        trace!("Connection loop");
+
         tokio::select! {
             Ok(CreateStream { protocol_id, return_channel }) = create_stream.recv() => {
+
+                trace!("Creating stream for {protocol_id}");
+
                 let Ok((mut send_stream, recv_stream)) = connection.open_bi().await else {
                     warn!("cannot open stream");
                     continue;
@@ -161,6 +177,10 @@ pub async fn connection_loop(
             }
 
             Ok((send_stream, recv_stream)) = connection.accept_bi() => {
+
+
+                trace!("Received incoming stream");
+
                 let receive_streams = ReceiveStreams {
                     sender: connection.remote_node_id().unwrap(),
                     send_stream,
@@ -203,106 +223,115 @@ impl NetworkActor {
     async fn spawn_acceptor(mut self) {
         tokio::spawn(async move {
             loop {
-                tokio::select!(
+                trace!("Network actor loop @ {}", self.endpoint.node_id());
 
-                // Handle commands from the command channel
-                Ok(command) = self.command.receiver().recv() => {
+                tokio::select! {
+                    biased;
+
+                    // Handle incoming connections
+                    Some(incoming) = self.endpoint.accept() => {
+                        trace!("Received incoming connection at {}", self.endpoint.node_id());
+                        self.handle_incoming(incoming).await;
+                    }
+
                     // Handle commands from the command channel
-                    match command {
-                        NetworkRequests::CreateStream { protocol_id, receiver, return_channel } => {
-                            if self.create_stream(protocol_id, receiver, return_channel).await.is_err() {
-                                warn!("cannot create stream");
-                                continue;
-                            }
-                        }
-                        NetworkRequests::GetKademliaActorHandle { return_channel } => {
-                            if return_channel.send(self.kademlia.clone()).is_err() {
-                                warn!("cannot send kademlia actor handle");
-                                continue;
-                            }
-                        }
-                        NetworkRequests::NewActorHandle { protocol_id, return_channel } => {
+                    Ok(command) = self.command.receiver().recv() => {
 
-                            // Check if the protocol handler exists
-                            match self.protocol_handler_map.get(&protocol_id) {
-                                Some(handler_channel_pair) => {
-                                    // If it exists, create a new copy of the actor handle
-                                    // and send it to the command channel
-                                    let actor_handle = NetworkActorHandle::new(
-                                        protocol_id,
-                                        self.command.sender().clone(),
-                                        handler_channel_pair.receiver().clone(),
-                                    );
-                                    if return_channel.send(actor_handle).is_err() {
-                                        warn!("cannot send protocol handler");
-                                        continue;
-                                    }
-                                }
-                                None => {
-                                    // If it doesn't exist, create a new one
-                                    let pair = ChannelPair::new();
-                                    let handler_receiver = pair.receiver().clone();
-                                    self.protocol_handler_map.insert(protocol_id, pair);
-                                    let actor_handle = NetworkActorHandle::new(
-                                        protocol_id,
-                                        self.command.sender().clone(),
-                                        handler_receiver,
-                                    );
-                                    if return_channel.send(actor_handle).is_err() {
-                                        warn!("cannot send protocol handler");
-                                        continue;
-                                    }
+                        trace!("Received command: {:?}", command);
+                        // Handle commands from the command channel
+                        match command {
+                            NetworkRequests::CreateStream { protocol_id, receiver, return_channel } => {
+                                if self.create_stream(protocol_id, receiver, return_channel).await.is_err() {
+                                    warn!("cannot create stream");
+                                    continue;
                                 }
                             }
-                        },
-                        NetworkRequests::GetNodeAddr { return_channel } => {
-                            // Get the node address and send it to the command channel
-                            let Ok(node_addr) = self.endpoint.node_addr().await else {
-                                warn!("cannot get node address");
-                                continue;
-                            };
-                            if return_channel.send(node_addr).is_err() {
-                                warn!("cannot send node address");
-                                continue;
+                            NetworkRequests::GetKademliaActorHandle { return_channel } => {
+                                if return_channel.send(self.kademlia.clone()).is_err() {
+                                    warn!("cannot send kademlia actor handle");
+                                    continue;
+                                }
+                            }
+                            NetworkRequests::NewActorHandle { protocol_id, return_channel } => {
+
+                                // Check if the protocol handler exists
+                                match self.protocol_handler_map.get(&protocol_id) {
+                                    Some(handler_channel_pair) => {
+                                        // If it exists, create a new copy of the actor handle
+                                        // and send it to the command channel
+                                        let actor_handle = NetworkActorHandle::new(
+                                            protocol_id,
+                                            self.command.sender().clone(),
+                                            handler_channel_pair.receiver().clone(),
+                                        );
+                                        if return_channel.send(actor_handle).is_err() {
+                                            warn!("cannot send protocol handler");
+                                            continue;
+                                        }
+                                    }
+                                    None => {
+                                        // If it doesn't exist, create a new one
+                                        let pair = ChannelPair::new();
+                                        let handler_receiver = pair.receiver().clone();
+                                        self.protocol_handler_map.insert(protocol_id, pair);
+                                        let actor_handle = NetworkActorHandle::new(
+                                            protocol_id,
+                                            self.command.sender().clone(),
+                                            handler_receiver,
+                                        );
+                                        if return_channel.send(actor_handle).is_err() {
+                                            warn!("cannot send protocol handler");
+                                            continue;
+                                        }
+                                    }
+                                }
+                            },
+                            NetworkRequests::GetNodeAddr { return_channel } => {
+                                // Get the node address and send it to the command channel
+                                let Ok(node_addr) = self.endpoint.node_addr().await else {
+                                    warn!("cannot get node address");
+                                    continue;
+                                };
+                                if return_channel.send(node_addr).is_err() {
+                                    warn!("cannot send node address");
+                                    continue;
+                                }
                             }
                         }
                     }
-                }
 
-                // Handle incoming connections
-                Some(incoming) = self.endpoint.accept() => {
-                    self.handle_incoming(incoming).await;
-                }
+                    // Handle incoming streams
+                    Ok(mut receive_streams) = self.incoming_streams.receiver().recv() => {
 
-                // Handle incoming streams
-                Ok(mut receive_streams) = self.incoming_streams.receiver().recv() => {
+                        trace!("Received incoming stream from {}", receive_streams.sender);
 
-                    // Get the protocol id from the stream
-                    let Ok(protocol_id) = receive_streams.read_protocol().await else {
-                        warn!("cannot read protocol id from stream");
-                        continue;
-                    };
-
-                    // Check if the protocol handler exists
-                    match self.protocol_handler_map.get(&protocol_id) {
-                        Some(handler_channel_pair) => {
-                            // If it exists, send the stream to the handler
-                            if handler_channel_pair.sender().send(receive_streams).await.is_err() {
-                                warn!("cannot send stream to handler");
-                                continue;
-                            }
-                        }
-                        None => {
-                            warn!("no protocol handler for protocol id {}", protocol_id);
+                        // Get the protocol id from the stream
+                        let Ok(protocol_id) = receive_streams.read_protocol().await else {
+                            warn!("cannot read protocol id from stream");
                             continue;
+                        };
+
+                        // Check if the protocol handler exists
+                        match self.protocol_handler_map.get(&protocol_id) {
+                            Some(handler_channel_pair) => {
+                                // If it exists, send the stream to the handler
+                                if handler_channel_pair.sender().send(receive_streams).await.is_err() {
+                                    warn!("cannot send stream to handler");
+                                    continue;
+                                }
+                            }
+                            None => {
+                                warn!("no protocol handler for protocol id {}", protocol_id);
+                                continue;
+                            }
                         }
                     }
-                }
 
-                // Try to join the receiver joinset
-                Some(Ok(())) = self.receiver_joinset.join_next() => {
-                    // If a task has finished, we can continue
-                })
+                    // Try to join the receiver joinset
+                    Some(Ok(())) = self.receiver_joinset.join_next() => {
+                        // If a task has finished, we can continue
+                    }
+                }
             }
         });
     }
@@ -313,9 +342,12 @@ impl NetworkActor {
         receiver_id: NodeId,
         return_channel: oneshot::Sender<(SendStream, RecvStream)>,
     ) -> Result<()> {
+        trace!("Creating stream to {receiver_id} with protocol id {protocol_id}");
+
         // Check if a connection already exists
         match self.connections.get(&receiver_id) {
             Some(sender) => {
+                trace!("Reusing existing connection to {receiver_id}");
                 // If a connection exists, send the CreateStream command
                 sender
                     .sender()
@@ -327,28 +359,28 @@ impl NetworkActor {
                 Ok(())
             }
             None => {
+                trace!("Creating new connection to {receiver_id}");
                 // If no connection exists, create a new one
-
-                // 1. Create a connection
-                let conn = match self.endpoint.connect(receiver_id, ARUNA_NET_ALPN).await {
-                    Ok(connecting) => connecting,
-                    Err(err) => {
-                        warn!("cannot connect to {receiver_id}: {err:#}");
-                        return Err(err.into());
-                    }
-                };
 
                 // 2. Create receiver and sender channels
                 let pair = ChannelPair::new();
                 // 3. Insert the new connection into the connections map
                 self.connections.insert(receiver_id, pair.clone());
                 // Spawn a task to handle future incoming streams
-                self.receiver_joinset.spawn({
-                    let create_stream_recv = pair.receiver().clone();
-                    let incoming_streams = self.incoming_streams.sender().clone();
-                    async move {
-                        connection_loop(conn, incoming_streams, create_stream_recv).await;
-                    }
+
+                let incoming_streams = self.incoming_streams.sender().clone();
+                let create_stream_recv = pair.receiver().clone();
+                let endpoint = self.endpoint.clone();
+                self.receiver_joinset.spawn(async move {
+                    // TODO: Timeout connection and send abort signal to actor
+                    let conn = match endpoint.connect(receiver_id, ARUNA_NET_ALPN).await {
+                        Ok(connecting) => connecting,
+                        Err(err) => {
+                            warn!("cannot connect to {receiver_id}: {err:#}");
+                            return;
+                        }
+                    };
+                    connection_loop(conn, incoming_streams, create_stream_recv).await;
                 });
 
                 pair.sender()
@@ -382,6 +414,7 @@ impl NetworkActor {
                 return;
             }
         };
+
         // 3. Get the remote node pubkey
         let node_id = match conn.remote_node_id() {
             Ok(node_id) => node_id,
@@ -390,6 +423,8 @@ impl NetworkActor {
                 return;
             }
         };
+
+        trace!("Incoming connection from {node_id}");
 
         // Create a ChannelPair for CreateStream commands
         let pair = ChannelPair::new();

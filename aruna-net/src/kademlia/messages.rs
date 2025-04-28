@@ -6,7 +6,9 @@ use ulid::Ulid;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MessageType {
     // Request types
-    PingRequest,
+    PingRequest {
+        node_addr: NodeAddr,
+    },
     FindRequest {
         target: [u8; 32],
     },

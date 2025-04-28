@@ -1,3 +1,5 @@
+use iroh::NodeId;
+
 /// XOR distance calculation for Kademlia
 ///
 /// Calculates the XOR distance between two 32-byte IDs
@@ -28,4 +30,20 @@ pub fn get_bucket_index(distance: &[u8; 32]) -> usize {
 
     // If distance is 0 (same node), use last bucket
     255
+}
+
+// Create a unified visualization enum for all types
+pub enum AllTypes {
+    NodeId(iroh::NodeId),
+    NodeAddr(iroh::NodeAddr),
+    Key([u8; 32]),
+}
+
+pub fn viz(input: impl Into<[u8; 32]>) -> String {
+    let input = input.into();
+    let mut result = String::new();
+    for byte in input.iter() {
+        result.push_str(&format!("{:02x}", byte));
+    }
+    result
 }

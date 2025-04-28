@@ -58,6 +58,13 @@ impl KademliaActorHandle {
         }
     }
 
+    pub async fn set_node_addr(&self, node_addr: NodeAddr) -> Result<()> {
+        self.sender
+            .send(KademliaRequest::SetNodeAddr { node_addr })
+            .await?;
+        Ok(())
+    }
+
     pub async fn bootstrap(&self, node_addrs: Vec<NodeAddr>) -> Result<()> {
         self.sender
             .send(KademliaRequest::Bootstrap { node_addrs })
