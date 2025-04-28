@@ -14,9 +14,9 @@ pub static REPLICATION_POLICY: usize = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MetadataMessage {
-    pub from: [u8; 32],
-    pub to: [u8; 32],
-    pub subject: [u8; 32], //Object or User ID
+    pub from: [u8; 32], // Node ID
+    pub to: [u8; 32], // Node ID
+    pub subject: [u8; 32], // Object or User ID
     pub body: Body,
 }
 

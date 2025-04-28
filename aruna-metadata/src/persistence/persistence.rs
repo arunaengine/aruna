@@ -450,13 +450,14 @@ where
             let mut buf = vec![0; len as usize];
 
             recv_stream.read_exact(&mut buf).await?;
+
+            // TODO: 
+            // - dispatch into API requests
             let message = postcard::from_bytes::<MetadataMessage>(&buf)
                 .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
 
             match self.handle_message(message).await {
                 Ok(_res) => {
-                    // TODO: Respond with something if need arises
-                    //
                     // Serialize the response
                     // let response_buf = postcard::to_allocvec(&response)
                     //     .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
