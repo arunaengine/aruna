@@ -18,6 +18,7 @@ use automerge::ActorId;
 use autosurgeon::{hydrate, reconcile};
 use iroh::endpoint::{RecvStream, SendStream};
 use roaring::RoaringBitmap;
+use tracing::trace;
 use std::sync::{Arc, atomic::AtomicU32};
 use tokio::{io::AsyncReadExt, join};
 use ulid::Ulid;
@@ -416,6 +417,7 @@ where
 
         // Update search idx
         self.search.add_resource(idx, resource).await?;
+        trace!("Finished replicate");
 
         Ok(())
     }
@@ -447,8 +449,8 @@ where
 //         while let Ok(len) = recv_stream.read_u32().await {
 //             let mut buf = vec![0; len as usize];
 
-            // TODO: 
-            // - dispatch into API requests
+// TODO:
+// - dispatch into API requests
 //             recv_stream.read_exact(&mut buf).await?;
 //             let message = postcard::from_bytes::<MetadataMessage>(&buf)
 //                 .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;

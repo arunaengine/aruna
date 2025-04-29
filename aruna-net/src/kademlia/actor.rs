@@ -114,7 +114,9 @@ impl KademliaActor {
 
                     // Handle incoming requests
                     Ok(message) = self.receiver.recv() => {
-                        self.handle_actor_request(message).await;
+                        if let Err(err) = tokio::time::timeout(Duration::from_secs(1), self.handle_actor_request(message)).await {
+                                error!("Actor request timeout: {err:#}");
+                        }
                     }
 
                     // Handle incoming streams

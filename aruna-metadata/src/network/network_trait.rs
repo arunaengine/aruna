@@ -157,7 +157,6 @@ where
         let kademlia = chandler.get_kademlia_actor_handle().await?;
         let subject_id = *subject_id;
         tokio::spawn(async move {
-
             let node_id = chandler.get_node_addr().await?.node_id;
             trace!("{node_id}");
 
