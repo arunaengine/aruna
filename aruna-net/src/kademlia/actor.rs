@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow};
 use iroh::{NodeAddr, NodeId, PublicKey};
+use tokio::sync::oneshot;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -11,7 +12,8 @@ use crate::actor_handle::{NetworkActorHandle, ReceiveStreams};
 use crate::kademlia::k_bucket::KBucket;
 use crate::kademlia::messages::{KademliaMessage, MessageType};
 use crate::kademlia::node_info::NodeInfo;
-use crate::kademlia::utils::{calculate_distance, get_bucket_index, viz};
+use crate::kademlia::utils::{calculate_distance, get_bucket_index};
+use crate::utils::ChannelPair;
 use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
 
 use super::actor_handle::{KademliaActorHandle, KademliaRequest};
@@ -78,16 +80,66 @@ pub struct KademliaActor {
     network: NetworkActorHandle,
     state: KademliaState,
     receiver: async_channel::Receiver<KademliaRequest>,
+    message_stream: ChannelPair<StreamMessage>,
+}
+
+pub struct StreamMessage {
+    input: KademliaMessage,
+    return_channel: oneshot::Sender<KademliaMessage>,
+}
+
+
+pub async fn handle_incoming_stream(
+    ReceiveStreams {
+        sender,
+        mut send_stream,
+        mut recv_stream,
+    }: ReceiveStreams,
+    message_stream: async_channel::Sender<StreamMessage>,
+) -> Result<()> {
+    trace!("Received stream from: {:?}", sender);
+
+    let len = recv_stream.read_u32().await?;
+    let mut buf = vec![0; len as usize];
+    recv_stream.read_exact(&mut buf).await?;
+
+    let message = postcard::from_bytes::<KademliaMessage>(&buf)?;
+
+    let (sender, receiver) = oneshot::channel();
+
+    let stream_message = StreamMessage {
+        input: message,
+        return_channel: sender,
+    };
+
+    message_stream
+        .send(stream_message)
+        .await
+        .map_err(|_| anyhow!("Failed to send message to Kademlia actor"))?;
+
+    let response = receiver.await?;
+
+    // let Some(response) = self.handle_message(message).await else {
+    //     error!("Failed to handle message");
+    //     return Err(anyhow!("Failed to handle message"));
+    // };
+    let buf = postcard::to_allocvec(&response)?;
+    send_stream.write_u32(buf.len() as u32).await?;
+    send_stream.write_all(&buf).await?;
+    send_stream.flush().await?;
+    Ok(())
 }
 
 impl KademliaActor {
     /// Create a new Kademlia instance
     pub async fn new(node_id: NodeId, con: NetworkActorHandle) -> KademliaActorHandle {
         let (sender, receiver) = async_channel::bounded(CHANNEL_SIZE);
+        let message_stream = ChannelPair::new();
         let actor = Self {
             network: con,
             state: KademliaState::new(node_id),
             receiver,
+            message_stream,
         };
         actor.run().await;
         KademliaActorHandle::new(sender)
@@ -121,13 +173,24 @@ impl KademliaActor {
 
                     // Handle incoming streams
                     Ok(inc_stream) = self.network.receive() => {
-                        match self.handle_incoming_stream(inc_stream).await {
-                            Ok(_) => {
-                                trace!("Handled incoming stream successfully");
+                        let sender = self.message_stream.sender().clone();
+                        tokio::spawn(
+                            async move {
+                                if let Err(e) = handle_incoming_stream(
+                                    inc_stream,
+                                    sender,
+                                ).await{
+                                    error!("Failed to handle incoming stream: {e:#}");
+                                    return;
+                                }
                             }
-                            Err(e) => {
-                                error!("Failed to handle incoming stream: {e:#}");
-                            }
+                        );
+                    }
+
+                    // Handle incoming messages from the message stream
+                    Ok(stream_message) = self.message_stream.receiver().recv() => {
+                        if let Some(response) = self.handle_message(stream_message.input).await {
+                            let _ = stream_message.return_channel.send(response);
                         }
                     }
 
@@ -140,31 +203,31 @@ impl KademliaActor {
         });
     }
 
-    pub async fn handle_incoming_stream(
-        &mut self,
-        ReceiveStreams {
-            sender,
-            mut send_stream,
-            mut recv_stream,
-        }: ReceiveStreams,
-    ) -> Result<()> {
-        trace!("Received stream from: {:?}", sender);
+    // pub async fn handle_incoming_stream(
+    //     &mut self,
+    //     ReceiveStreams {
+    //         sender,
+    //         mut send_stream,
+    //         mut recv_stream,
+    //     }: ReceiveStreams,
+    // ) -> Result<()> {
+    //     trace!("Received stream from: {:?}", sender);
 
-        let len = recv_stream.read_u32().await?;
-        let mut buf = vec![0; len as usize];
-        recv_stream.read_exact(&mut buf).await?;
+    //     let len = recv_stream.read_u32().await?;
+    //     let mut buf = vec![0; len as usize];
+    //     recv_stream.read_exact(&mut buf).await?;
 
-        let message = postcard::from_bytes::<KademliaMessage>(&buf)?;
-        let Some(response) = self.handle_message(message).await else {
-            error!("Failed to handle message");
-            return Err(anyhow!("Failed to handle message"));
-        };
-        let buf = postcard::to_allocvec(&response)?;
-        send_stream.write_u32(buf.len() as u32).await?;
-        send_stream.write_all(&buf).await?;
-        send_stream.flush().await?;
-        Ok(())
-    }
+    //     let message = postcard::from_bytes::<KademliaMessage>(&buf)?;
+    //     let Some(response) = self.handle_message(message).await else {
+    //         error!("Failed to handle message");
+    //         return Err(anyhow!("Failed to handle message"));
+    //     };
+    //     let buf = postcard::to_allocvec(&response)?;
+    //     send_stream.write_u32(buf.len() as u32).await?;
+    //     send_stream.write_all(&buf).await?;
+    //     send_stream.flush().await?;
+    //     Ok(())
+    // }
 
     pub fn set_node_addr(&mut self, addr: NodeAddr) {
         self.state.node_addr = addr.clone();
