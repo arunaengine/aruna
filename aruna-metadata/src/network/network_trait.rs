@@ -6,7 +6,8 @@ use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{error, trace};
 use ulid::Ulid;
 
 pub static METADATA_PROTOCOL_ID: u32 = 3;
@@ -14,8 +15,8 @@ pub static REPLICATION_POLICY: usize = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MetadataMessage {
-    pub from: [u8; 32], // Node ID
-    pub to: [u8; 32], // Node ID
+    pub from: [u8; 32],    // Node ID
+    pub to: [u8; 32],      // Node ID
     pub subject: [u8; 32], // Object or User ID
     pub body: Body,
 }
@@ -116,7 +117,6 @@ where
         let init_handle = NetworkActorBuilder::new(config.secret_key)
             .await
             .add_bind_addr_v4(config.socket_addr)
-            //.add_protocol_handler(METADATA_PROTOCOL_ID, config.persistor)
             .build(config.bootstrap_nodes)
             .await
             .unwrap();
@@ -126,7 +126,17 @@ where
             .await
             .unwrap();
 
-        //.map_err(|e| ArunaError::NetworkError(e.to_string()))
+        let p2p_network = P2PNetwork {
+            chandler: chandler.clone(),
+            phantom: PhantomData,
+        };
+        tokio::spawn(async move {
+            loop {
+                if let Err(err) = p2p_network.start_actor(config.persistor.clone()).await {
+                    error!("{err}");
+                }
+            }
+        });
         P2PNetwork {
             chandler,
             phantom: PhantomData,
@@ -142,20 +152,26 @@ where
     }
 
     async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError> {
+        trace!("Calling replicate");
         let chandler = self.chandler.clone();
         let kademlia = chandler.get_kademlia_actor_handle().await?;
         let subject_id = *subject_id;
         tokio::spawn(async move {
+
             let node_id = chandler.get_node_addr().await?.node_id;
+            trace!("{node_id}");
+
             // Calc hash
             let mut chunk_hasher = blake3::Hasher::new();
             chunk_hasher.update(subject_id.to_bytes().as_slice());
             let id_hash = chunk_hasher.finalize();
+            trace!("{id_hash}");
 
             // TODO:
             // Dont use find for placing objects,
             // but find realm nodes and place objects there
             let nodes = kademlia.find(*id_hash.as_bytes()).await?.nodes;
+            trace!("{nodes:?}");
 
             let mut message = MetadataMessage {
                 from: *node_id.as_bytes(),
@@ -163,6 +179,7 @@ where
                 subject: *id_hash.as_bytes(),
                 body,
             };
+            trace!("{message:?}");
 
             // Distribute message to closest nodes
             let mut counter = 0;
@@ -230,4 +247,46 @@ where
     // async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError> {
     //     self.find(key).await
     // }
+}
+
+impl<St, Se> P2PNetwork<St, Se>
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+{
+    async fn start_actor(&self, persistor: Arc<Persistor<St, Se>>) -> Result<(), ArunaError> {
+        let mut recv_stream = self.chandler.receive().await?;
+        while let Ok(len) = recv_stream.recv_stream.read_u32().await {
+            trace!("Got something");
+            let mut buf = vec![0; len as usize];
+
+            // TODO:
+            // - dispatch into API requests
+            recv_stream
+                .recv_stream
+                .read_exact(&mut buf)
+                .await
+                .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+            let message = postcard::from_bytes::<MetadataMessage>(&buf).map_err(|e| {
+                ArunaError::NetworkError(format!("Failed to deserialize message: {e:#}"))
+            })?;
+            trace!("{message:?}");
+            match persistor.handle_message(message).await {
+                Ok(_res) => {
+                    // TODO: Respond with something if need arises
+                    //
+                    // Serialize the response
+                    // let response_buf = postcard::to_allocvec(&response)
+                    //     .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
+
+                    // Send the response
+                    // send_stream.write_u32(response_buf.len() as u32).await?;
+                    // send_stream.write_all(&response_buf).await?;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
+    }
 }

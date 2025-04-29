@@ -23,6 +23,7 @@ use std::net::SocketAddrV4;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::trace;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 use transactions::controller::Controller;
@@ -49,15 +50,15 @@ async fn main() {
         .tracer("aruna1");
     let tracing_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
-        .add_directive("aruna_server=trace".parse().unwrap())
+        .add_directive("aruna_metadata=trace".parse().unwrap())
         .add_directive("tower_http=debug".parse().unwrap())
-        .add_directive("synevi_core=trace".parse().unwrap());
+        .add_directive("aruna_net=trace".parse().unwrap());
 
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
-        .add_directive("aruna_server=info".parse().unwrap())
+        .add_directive("aruna_metadata=trace".parse().unwrap())
         .add_directive("tower_http=info".parse().unwrap())
-        .add_directive("synevi_core=info".parse().unwrap());
+        .add_directive("aruna_net=trace".parse().unwrap());
 
     let telemetry_layer = tracing_opentelemetry::layer()
         .with_tracer(provider)
@@ -104,15 +105,8 @@ async fn main() {
     };
     let variant = dotenvy::var("VARIANT").unwrap();
 
-    println!(
-        "
-STARTING WITH...
-DB_VARIANT: {variant}
-DB: {path}
-API: {api_port}
-P2P: {p2p_port}
-P2P_KEY: {p2p_secret_key:?}
-BOOTSTRAP_NODES: {bootstrap_nodes:?}",
+    trace!(
+        "DB_VARIANT: {variant} on {path} API: {api_port} P2P: {p2p_port} P2P_KEY: {p2p_secret_key:?} BOOTSTRAP_NODES: {bootstrap_nodes:?}",
     );
 
     let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
