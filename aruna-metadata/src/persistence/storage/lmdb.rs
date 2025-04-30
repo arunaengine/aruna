@@ -25,8 +25,8 @@ pub enum LmdbTxn<'a> {
 impl<'a> From<&'a LmdbTxn<'a>> for &RoTxn<'a> {
     fn from(value: &'a LmdbTxn<'a>) -> Self {
         match value {
-            LmdbTxn::Read(ro_txn) => &ro_txn,
-            LmdbTxn::Write(rw_txn) => &rw_txn,
+            LmdbTxn::Read(ro_txn) => ro_txn,
+            LmdbTxn::Write(rw_txn) => rw_txn,
         }
     }
 }
@@ -113,10 +113,10 @@ impl<'a> Store<'a> for LmdbStore {
         for res in res {
             let (id, res) = res?;
             let idx = resource_mappings
-                .get(&write_txn, &id)?
+                .get(&write_txn, id)?
                 .expect("No valid mapping found"); // TODO: Remove unwraps and replace with
 
-            let doc = automerge::AutoCommit::load(res.as_ref())?;
+            let doc = automerge::AutoCommit::load(res)?;
             let resource: Resource = autosurgeon::hydrate(&doc)?;
 
             let idx = u32::from_be_bytes(idx.try_into().unwrap());
@@ -183,7 +183,7 @@ impl<'a> Store<'a> for LmdbStore {
         key: &[u8],
         value: &[u8],
     ) -> Result<(), ArunaError> {
-        let mut txn = match txn {
+        let txn = match txn {
             LmdbTxn::Read(_ro_txn) => {
                 return Err(ArunaError::DatabaseError("Read txn provided".to_string()));
             }
@@ -191,14 +191,14 @@ impl<'a> Store<'a> for LmdbStore {
         };
         let db: Database<Bytes, Bytes> = self
             .env
-            .open_database(&txn, Some(dbname))?
+            .open_database(txn, Some(dbname))?
             .ok_or_else(|| ArunaError::DatabaseError("Database not found".to_string()))?;
-        db.put(&mut txn, key, value).map_err(Into::into)
+        db.put(txn, key, value).map_err(Into::into)
     }
 
     #[tracing::instrument(level = "trace", skip(self, txn, key))]
     fn remove(&'a self, txn: &mut LmdbTxn<'a>, dbname: &str, key: &[u8]) -> Result<(), ArunaError> {
-        let mut txn = match txn {
+        let txn = match txn {
             LmdbTxn::Read(_ro_txn) => {
                 return Err(ArunaError::DatabaseError("Read txn provided".to_string()));
             }
@@ -206,9 +206,9 @@ impl<'a> Store<'a> for LmdbStore {
         };
         let db: Database<Bytes, Bytes> = self
             .env
-            .open_database(&txn, Some(dbname))?
+            .open_database(txn, Some(dbname))?
             .ok_or_else(|| ArunaError::DatabaseError("Database not found".to_string()))?;
-        db.delete(&mut txn, key)?;
+        db.delete(txn, key)?;
         Ok(())
     }
 
@@ -228,7 +228,7 @@ impl<'a> Store<'a> for LmdbStore {
             .open_database(txn, Some(dbname))?
             .ok_or_else(|| ArunaError::DatabaseError("Database not found".to_string()))?;
         db.get(txn, key)
-            .map(|r| r.map(|r| Cow::from(r)))
+            .map(|r| r.map(Cow::from))
             .map_err(Into::into)
     }
 

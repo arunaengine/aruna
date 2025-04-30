@@ -49,7 +49,7 @@ pub async fn main() -> anyhow::Result<()> {
 
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-    let result = kademlia.find(*c2_addr.node_id.as_bytes()).await?;
+    let result = kademlia.find(*c2_addr.node_id.as_bytes(), true).await?;
 
     debug!("Result: {:?}", result);
     assert_eq!(*result.value.first().unwrap(), c2_addr);

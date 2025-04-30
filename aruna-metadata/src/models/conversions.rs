@@ -48,7 +48,7 @@ pub mod autosurgeon_ulid {
     ) -> Result<Ulid, HydrateError> {
         let inner = autosurgeon::bytes::ByteVec::hydrate(doc, obj, prop)?;
         Ok(Ulid::from_bytes(inner.as_slice().try_into().map_err(
-            |_| HydrateError::unexpected("&[u8; 16]", format!("Invalid slice of bytes")),
+            |_| HydrateError::unexpected("&[u8; 16]", "Invalid slice of bytes".to_string()),
         )?))
     }
 
@@ -68,7 +68,7 @@ pub mod autosurgeon_date_time {
     ) -> Result<DateTime<Utc>, HydrateError> {
         let inner = <i64>::hydrate(doc, obj, prop)?;
         DateTime::from_timestamp_millis(inner).ok_or_else(|| {
-            HydrateError::unexpected("a valid (millisec) timestamp", format!("Invalid timestamp"))
+            HydrateError::unexpected("a valid (millisec) timestamp", "Invalid timestamp".to_string())
         })
     }
 

@@ -54,7 +54,7 @@ impl<'a> Store<'a> for FjallStore {
         let path = format!("{}/path", config.path);
         let keyspace = Config::new(path)
             .fsync_ms(Some(500))
-            .cache_size(1 * 1024 * 1024 * 1024)
+            .cache_size(1024 * 1024 * 1024)
             .max_open_files(10)
             .open_transactional()?; // or open_transactional for transactional semantics
 
@@ -110,7 +110,7 @@ impl<'a> Store<'a> for FjallStore {
             // Init bitmap with public resources
             let mut value = Vec::new();
             RoaringBitmap::new().serialize_into(&mut value)?;
-            write_txn.insert(&public_mappings, &Ulid::default().to_bytes(), value);
+            write_txn.insert(&public_mappings, Ulid::default().to_bytes(), value);
         }
 
         write_txn.commit()?;
@@ -299,7 +299,7 @@ impl<'a> Store<'a> for FjallStore {
         RoaringBitmap::new().serialize_into(&mut value).unwrap();
         write_txn.insert(
             &self.tables.public_mappings,
-            &Ulid::default().to_bytes(),
+            Ulid::default().to_bytes(),
             value,
         );
         write_txn.commit().unwrap();

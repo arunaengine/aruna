@@ -1,10 +1,7 @@
 use crate::{
     ARUNA_NET_ALPN,
     actor_handle::{InitActorHandle, NetworkActorHandle, NetworkRequests, ReceiveStreams},
-    kademlia::{
-        actor::{KADEMLIA_PROTOCOL_ID, KademliaActor},
-        actor_handle::KademliaActorHandle,
-    },
+    kademlia::kademlia::{KADEMLIA_PROTOCOL_ID, Kademlia},
     utils::ChannelPair,
 };
 use anyhow::Result;
@@ -26,7 +23,7 @@ pub struct NetworkActorBuilder {
     endpoint: iroh::endpoint::Builder,
     command: ChannelPair<NetworkRequests>,
     protocol_handler_map: HashMap<ProtocolId, ChannelPair<ReceiveStreams>>,
-    kademlia: KademliaActorHandle,
+    kademlia: Kademlia,
 }
 
 impl NetworkActorBuilder {
@@ -42,11 +39,11 @@ impl NetworkActorBuilder {
 
         let secret_key = secret_key.unwrap_or_else(|| {
             let mut rng = rand::rngs::OsRng;
-            let secret_key = SecretKey::generate(&mut rng);
-            secret_key
+            
+            SecretKey::generate(&mut rng)
         });
 
-        let kademlia_handle = KademliaActor::new(secret_key.public(), kademlia_actor_handle).await;
+        let kademlia_handle = Kademlia::new(secret_key.public(), kademlia_actor_handle).await;
         let handle_clone = kademlia_handle.clone();
 
         let endpoint = Builder::default()
@@ -104,21 +101,21 @@ impl NetworkActorBuilder {
             endpoint.add_node_addr(node_addr.clone())?;
         }
         let init_actor_handle = InitActorHandle::new(self.command.sender().clone());
-        if !bootstrap_nodes.is_empty() {
-            self.kademlia
-                .set_node_addr(endpoint.node_addr().await?)
-                .await?;
-            self.kademlia.bootstrap(bootstrap_nodes).await?;
-        } else {
-            warn!("no bootstrap nodes")
-        }
+        let node_addr = endpoint.node_addr().await?;
         NetworkActor::new(
             endpoint,
             self.command,
             self.protocol_handler_map,
-            self.kademlia,
+            self.kademlia.clone(),
         )
         .await;
+
+        if !bootstrap_nodes.is_empty() {
+            self.kademlia.set_node_addr(node_addr);
+            self.kademlia.bootstrap(bootstrap_nodes).await?;
+        } else {
+            warn!("no bootstrap nodes")
+        }
         Ok(init_actor_handle)
     }
 }
@@ -141,7 +138,7 @@ pub struct NetworkActor {
     // A map of all registered protocol handlers and their channels to receive incoming streams
     protocol_handler_map: HashMap<ProtocolId, ChannelPair<ReceiveStreams>>,
     // The Kademlia actor handle to send commands and clone it
-    kademlia: KademliaActorHandle,
+    kademlia: Kademlia,
     // A join set that contains all connection loops
     receiver_joinset: tokio::task::JoinSet<()>,
 }
@@ -204,7 +201,7 @@ impl NetworkActor {
         endpoint: Endpoint,
         command: ChannelPair<NetworkRequests>,
         protocol_handler_map: HashMap<ProtocolId, ChannelPair<ReceiveStreams>>,
-        kademlia: KademliaActorHandle,
+        kademlia: Kademlia,
     ) {
         let handler = Self {
             endpoint,
@@ -246,7 +243,7 @@ impl NetworkActor {
                                     continue;
                                 }
                             }
-                            NetworkRequests::GetKademliaActorHandle { return_channel } => {
+                            NetworkRequests::GetKademlia { return_channel } => {
                                 if return_channel.send(self.kademlia.clone()).is_err() {
                                     warn!("cannot send kademlia actor handle");
                                     continue;
@@ -321,7 +318,7 @@ impl NetworkActor {
                                 }
                             }
                             None => {
-                                warn!("no protocol handler for protocol id {}", protocol_id);
+                                warn!("no protocol handler for protocol id {protocol_id}");
                                 continue;
                             }
                         }

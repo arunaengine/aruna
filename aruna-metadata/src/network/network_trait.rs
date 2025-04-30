@@ -142,7 +142,7 @@ where
             // TODO:
             // Dont use find for placing objects,
             // but find realm nodes and place objects there
-            let nodes = kademlia.find(*id_hash.as_bytes()).await?.nodes;
+            let nodes = kademlia.find(*id_hash.as_bytes(), true).await?.nodes;
             trace!("{nodes:?}");
 
             let mut message = MetadataMessage {

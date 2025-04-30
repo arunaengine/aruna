@@ -14,5 +14,5 @@ pub mod actor_handle;
 mod kademlia;
 mod utils;
 
-pub use kademlia::actor_handle::KademliaActorHandle;
+pub use kademlia::kademlia::Kademlia;
 pub use kademlia::messages::FindResult;

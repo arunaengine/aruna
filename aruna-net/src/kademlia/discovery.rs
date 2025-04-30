@@ -7,9 +7,9 @@ use iroh::{
 use n0_future::boxed::BoxStream;
 use tracing::{error, trace};
 
-use super::actor_handle::KademliaActorHandle;
+use super::kademlia::Kademlia;
 
-impl Discovery for KademliaActorHandle {
+impl Discovery for Kademlia {
     fn publish(&self, _data: &NodeData) {}
 
     fn resolve(
@@ -19,12 +19,13 @@ impl Discovery for KademliaActorHandle {
     ) -> Option<BoxStream<anyhow::Result<DiscoveryItem>>> {
         trace!("resolve {:?}", node_id);
 
-        let target = node_id.as_bytes().clone();
+        let target = *node_id.as_bytes();
         let self_clone = self.clone();
+
         let fut = async move {
             trace!("trying to resolve {:?}", target);
 
-            let result = match self_clone.find(target).await {
+            let result = match self_clone.find(target, true).await {
                 Ok(find_result) => {
                     trace!("resolve found {:?}", target);
                     find_result

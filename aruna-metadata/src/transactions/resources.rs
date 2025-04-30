@@ -60,7 +60,7 @@ where
             created_at: time,
             last_modified: time,
             authors: self.authors,
-            license_id: self.license_id.unwrap_or(Ulid::default()),
+            license_id: self.license_id.unwrap_or_default(),
             locked: false,
             deleted: false,
             location: Vec::new(),
@@ -151,10 +151,9 @@ where
         let mut resource = controller
             .persistence
             .get_resources(vec![id])
-            .await?
-            .get(0)
+            .await?.first()
             .cloned()
-            .ok_or_else(|| ArunaError::NotFound(format!("Resource {} not found", id)))?;
+            .ok_or_else(|| ArunaError::NotFound(format!("Resource {id} not found")))?;
         resource.last_modified = updated;
 
         let response = match self {
@@ -190,11 +189,7 @@ where
             }
             ResourceUpdateRequests::Labels(req) => {
                 if !req.labels_to_remove.is_empty() {
-                    resource.labels = resource
-                        .labels
-                        .into_iter()
-                        .filter(|kv| !req.labels_to_remove.contains(kv))
-                        .collect();
+                    resource.labels.retain(|kv| !req.labels_to_remove.contains(kv));
                 }
                 if !req.labels_to_add.is_empty() {
                     resource.labels.extend(req.labels_to_add);
@@ -205,11 +200,7 @@ where
             }
             ResourceUpdateRequests::Identifiers(req) => {
                 if !req.ids_to_remove.is_empty() {
-                    resource.identifiers = resource
-                        .identifiers
-                        .into_iter()
-                        .filter(|id| !req.ids_to_remove.contains(id))
-                        .collect();
+                    resource.identifiers.retain(|id| !req.ids_to_remove.contains(id));
                 }
                 if !req.ids_to_add.is_empty() {
                     resource.identifiers.extend(req.ids_to_add);
@@ -220,11 +211,7 @@ where
             }
             ResourceUpdateRequests::Authors(req) => {
                 if !req.authors_to_remove.is_empty() {
-                    resource.authors = resource
-                        .authors
-                        .into_iter()
-                        .filter(|a| !req.authors_to_remove.contains(a))
-                        .collect();
+                    resource.authors.retain(|a| !req.authors_to_remove.contains(a));
                 }
                 if !req.authors_to_add.is_empty() {
                     resource.authors.extend(req.authors_to_add);

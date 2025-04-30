@@ -80,7 +80,7 @@ async fn main() {
     let path = dotenvy::var("DBPATH").unwrap();
     let api_port = dotenvy::var("API_PORT").unwrap().parse().unwrap();
     let p2p_port = dotenvy::var("P2P_PORT").unwrap().parse().unwrap();
-    let p2p_secret_key = if let Some(key) = dotenvy::var("P2P_SECRET_KEY").ok() {
+    let p2p_secret_key = if let Ok(key) = dotenvy::var("P2P_SECRET_KEY") {
         if key.is_empty() {
             None
         } else {

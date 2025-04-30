@@ -1,4 +1,3 @@
-
 /// XOR distance calculation for Kademlia
 ///
 /// Calculates the XOR distance between two 32-byte IDs
