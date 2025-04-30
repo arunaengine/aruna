@@ -18,9 +18,9 @@ use automerge::ActorId;
 use autosurgeon::{hydrate, reconcile};
 use iroh::endpoint::{RecvStream, SendStream};
 use roaring::RoaringBitmap;
-use tracing::trace;
 use std::sync::{Arc, atomic::AtomicU32};
 use tokio::{io::AsyncReadExt, join};
+use tracing::trace;
 use ulid::Ulid;
 
 pub trait Authorize {

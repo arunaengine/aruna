@@ -4,7 +4,7 @@ use iroh::{
 };
 use tokio::{io::AsyncReadExt, sync::oneshot};
 
-use crate::kademlia::actor_handle::KademliaActorHandle;
+use crate::Kademlia;
 
 pub type ProtocolId = u32;
 
@@ -24,10 +24,10 @@ impl InitActorHandle {
         Self { send_channel }
     }
 
-    pub async fn get_kademlia_actor_handle(&self) -> Result<KademliaActorHandle, anyhow::Error> {
+    pub async fn get_kademlia_actor_handle(&self) -> Result<Kademlia, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
-        let message = NetworkRequests::GetKademliaActorHandle {
+        let message = NetworkRequests::GetKademlia {
             return_channel: oneshot_tx,
         };
 
@@ -78,8 +78,8 @@ pub enum NetworkRequests {
         receiver: NodeId,
         return_channel: oneshot::Sender<(SendStream, RecvStream)>,
     },
-    GetKademliaActorHandle {
-        return_channel: oneshot::Sender<KademliaActorHandle>,
+    GetKademlia {
+        return_channel: oneshot::Sender<Kademlia>,
     },
     NewActorHandle {
         protocol_id: ProtocolId,
@@ -137,10 +137,10 @@ impl NetworkActorHandle {
         Ok((send_stream, recv_stream))
     }
 
-    pub async fn get_kademlia_actor_handle(&self) -> Result<KademliaActorHandle, anyhow::Error> {
+    pub async fn get_kademlia_actor_handle(&self) -> Result<Kademlia, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
-        let message = NetworkRequests::GetKademliaActorHandle {
+        let message = NetworkRequests::GetKademlia {
             return_channel: oneshot_tx,
         };
 

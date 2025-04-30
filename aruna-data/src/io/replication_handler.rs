@@ -1,8 +1,8 @@
 use crate::util::opendal::get_data_stream;
 use ahash::{HashMap, HashMapExt};
 use anyhow::{Result, anyhow};
-use aruna_net::KademliaActorHandle;
 use aruna_net::actor_handle::NetworkActorHandle;
+use aruna_net::Kademlia;
 use futures::{SinkExt, StreamExt};
 // TODO: We need to replace the old "ProtocolHandler" trait with a loop that handles incoming streams
 use iroh::endpoint::{RecvStream, SendStream};
@@ -35,7 +35,7 @@ impl std::fmt::Debug for Md5Context {
 
 pub struct ReplicationHandler {
     operator: Operator,
-    network: RwLock<Option<(NodeAddr, NetworkActorHandle, KademliaActorHandle)>>,
+    network: RwLock<Option<(NodeAddr, NetworkActorHandle, Kademlia)>>,
     pub local_store: RwLock<HashMap<String, ObjectInfo>>, //TODO: Persistent store
     pub object_writers: RwLock<HashMap<String, (StagingObjectInfo, SinkWrapper)>>,
 }
@@ -111,7 +111,7 @@ impl ReplicationHandler {
         &self,
         node_addr: NodeAddr,
         chandler: NetworkActorHandle,
-        kademlia: KademliaActorHandle,
+        kademlia: Kademlia,
     ) {
         self.network
             .write()

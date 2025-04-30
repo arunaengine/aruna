@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
 
     debug!("Node 2 address: {:?}", node_addr2);
 
-    let result = kademlia.find(*node_addr2.node_id.as_bytes()).await?;
+    let result = kademlia.find(*node_addr2.node_id.as_bytes(), true).await?;
 
     debug!("Result: {:?}", result);
 
@@ -117,11 +117,11 @@ async fn main() -> Result<()> {
 
     debug!(
         "Data location found in Node 1: {:?}",
-        kademlia.find(hash).await?
+        kademlia.find(hash, true).await?
     );
     debug!(
         "Data location found in Node 2: {:?}",
-        kademlia2.find(hash).await?
+        kademlia2.find(hash, true).await?
     );
 
     Ok(())
