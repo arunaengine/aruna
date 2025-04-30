@@ -56,9 +56,9 @@ async fn main() {
 
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
-        .add_directive("aruna_metadata=trace".parse().unwrap())
-        .add_directive("tower_http=info".parse().unwrap())
-        .add_directive("aruna_net=trace".parse().unwrap());
+        //.add_directive("aruna_metadata=info".parse().unwrap())
+        .add_directive("tower_http=info".parse().unwrap());
+        //.add_directive("aruna_net=info".parse().unwrap());
 
     let telemetry_layer = tracing_opentelemetry::layer()
         .with_tracer(provider)
@@ -74,7 +74,6 @@ async fn main() {
         .with(telemetry_layer)
         .init();
     if let Ok(file) = dotenvy::var("ENV") {
-        println!("{file}");
         dotenvy::from_filename_override(file).unwrap();
     }
     let path = dotenvy::var("DBPATH").unwrap();
@@ -118,6 +117,29 @@ async fn main() {
         resources: res_rcv,
     };
 
+    use parking_lot::deadlock;
+    use std::time::Duration;
+
+    // Create a background thread which checks for deadlocks every 10s
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+            let deadlocks = deadlock::check_deadlock();
+            if deadlocks.is_empty() {
+                continue;
+            }
+
+            println!("{} deadlocks detected", deadlocks.len());
+            for (i, threads) in deadlocks.iter().enumerate() {
+                println!("Deadlock #{}", i);
+                for t in threads {
+                    println!("Thread Id {:#?}", t.thread_id());
+                    println!("{:#?}", t.backtrace());
+                }
+            }
+        }
+    });
+
     match variant.as_ref() {
         "LMDB" => {
             let store_path = format!("{path}/heed");
@@ -131,7 +153,6 @@ async fn main() {
                     .await
                     .unwrap(),
             );
-            println!("GOT PERSISTOR");
             let network = P2PNetwork::<LmdbStore, TantivySearch>::new(NetworkConfig::<
                 LmdbStore,
                 TantivySearch,
@@ -142,14 +163,12 @@ async fn main() {
                 persistor: persistor.clone(),
             })
             .await;
-            println!("GOT NETWORK");
 
             let controller = Arc::new(Controller::<
                 LmdbStore,
                 TantivySearch,
                 P2PNetwork<LmdbStore, TantivySearch>,
             >::new(persistor, network));
-            println!("GOT CONTROLLER");
 
             tokio::spawn(async move { RestServer::run(controller, api_port).await })
                 .await

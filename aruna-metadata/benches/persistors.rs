@@ -40,7 +40,7 @@ impl TantivyFjall {
                 .unwrap(),
         );
         let network = NetworkDummy::new(()).await;
-        
+
         Arc::new(Controller::<FjallStore, TantivySearch, NetworkDummy>::new(
             persistor, network,
         ))
@@ -139,7 +139,7 @@ impl TantivyHeed {
                 .unwrap(),
         );
         let network = NetworkDummy::new(()).await;
-        
+
         Arc::new(Controller::<LmdbStore, TantivySearch, NetworkDummy>::new(
             persistor, network,
         ))
@@ -238,7 +238,7 @@ impl TantivyRedb {
                 .unwrap(),
         );
         let network = NetworkDummy::new(()).await;
-        
+
         Arc::new(Controller::<Redb, TantivySearch, NetworkDummy>::new(
             persistor, network,
         ))

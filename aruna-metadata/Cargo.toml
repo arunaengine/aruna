@@ -12,6 +12,7 @@ blake3 = {workspace=true}
 dotenvy = {workspace = true}
 iroh = {workspace = true}
 iroh-base = {workspace = true}
+parking_lot = { workspace = true}
 postcard = {workspace = true}
 serde = { workspace = true }
 tokio = { workspace = true }

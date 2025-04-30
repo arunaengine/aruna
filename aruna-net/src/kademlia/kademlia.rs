@@ -46,10 +46,13 @@ impl Kademlia {
         trace!("Received stream from: {:?}", sender);
 
         let len = recv_stream.read_u32().await?;
+        trace!("Message len {len}");
         let mut buf = vec![0; len as usize];
         recv_stream.read_exact(&mut buf).await?;
+        trace!("Read message");
 
         let message = postcard::from_bytes::<KademliaMessage>(&buf)?;
+        trace!("Serialized message {:?} from {:?}", message, sender);
 
         let Some(response) = self.handle_message(message).await else {
             error!("Failed to handle message");
@@ -59,6 +62,7 @@ impl Kademlia {
         send_stream.write_u32(buf.len() as u32).await?;
         send_stream.write_all(&buf).await?;
         send_stream.flush().await?;
+        send_stream.finish()?;
         Ok(())
     }
 
@@ -160,9 +164,7 @@ impl Kademlia {
 
         // Log maintenance results if significant
         if pruned_count > 0 {
-            println!(
-                "Maintenance: pruned {pruned_count} expired resource entries"
-            );
+            println!("Maintenance: pruned {pruned_count} expired resource entries");
         }
     }
 
@@ -182,21 +184,25 @@ impl Kademlia {
 
     /// Handle an incoming Kademlia message
     pub async fn handle_message(&self, message: KademliaMessage) -> Option<KademliaMessage> {
-        trace!("Received message: {:?} @ node: {}", message, self.node_id());
+        trace!("Received message: {:?}", message);
 
         // Update routing table with sender
         if let Some(addr) = message.sender.clone() {
             self.update_node_seen(addr).await;
+            trace!("Updated node");
         }
 
         // Route message based on whether it's a request or response
         if message.is_response() {
             // Handle response (no reply needed)
             self.handle_response(message).await;
+            trace!("Handled response");
             None
         } else {
             // Handle request and generate response
-            self.handle_request(message).await
+            let res = self.handle_request(message).await;
+            trace!("Handled quest");
+            res
         }
     }
 
@@ -255,10 +261,11 @@ impl Kademlia {
             for val in value {
                 self.state.insert_node_addr(val.clone());
             }
+            let self_id = self.node_id();
 
             // Add all returned nodes
             for node in nodes {
-                if node.node_id != self.node_id() {
+                if node.node_id != self_id {
                     self.update_node_seen(node.clone()).await;
                 }
             }
@@ -279,6 +286,11 @@ impl Kademlia {
         );
 
         let (mut sx, mut rx) = self.network.create_stream(target_addr.node_id).await?;
+        trace!(
+            "Created stream to node {} from {}",
+            self.node_id(),
+            target_addr.node_id
+        );
 
         // Serialize the message
         let buf = postcard::to_allocvec(&message)
@@ -287,6 +299,7 @@ impl Kademlia {
         sx.write_u32(buf.len() as u32).await?;
         sx.write_all(&buf).await?;
         sx.flush().await?;
+        sx.finish()?;
 
         trace!("Waiting for response from node: {}", target_addr.node_id);
         // Read the response
@@ -309,17 +322,21 @@ impl Kademlia {
     /// Update a node's info in the appropriate k-bucket
     async fn update_node_seen(&self, addr: NodeAddr) {
         let node_id = addr.node_id;
+        trace!("update node");
+        let self_id = self.node_id();
 
         // Don't track ourselves
-        if node_id == self.node_id() {
+        if node_id == self_id {
             return;
         }
+        trace!("acquired self_id");
 
         // Store in our quick lookup map
         self.state.insert_node_addr(addr.clone());
+        trace!("insert node addr");
 
         // Calculate bucket index
-        let distance = calculate_distance(&self.node_id_bytes(), node_id.as_bytes());
+        let distance = calculate_distance(self_id.as_bytes(), node_id.as_bytes());
         let bucket_idx = get_bucket_index(&distance);
 
         // Create new node info
@@ -330,7 +347,7 @@ impl Kademlia {
             self.state.update_bucket(bucket_idx, node_info.clone())
         {
             // Only ping if it's not us
-            if least_recent_addr.node_id != self.node_id() {
+            if least_recent_addr.node_id != self_id {
                 if let Ok(true) = self.ping(least_recent_addr).await {
                     self.state.refresh_node(bucket_idx, idx);
                 } else {
@@ -362,11 +379,7 @@ impl Kademlia {
 
     /// External API: Find operation with choice of mode
     pub async fn find(&self, target: [u8; 32], shortcircuit: bool) -> Result<FindResult> {
-        info!(
-            "Searching key: {:?} @ {} ",
-            PublicKey::from_bytes(&target).unwrap(),
-            self.node_id()
-        );
+        info!("Searching key: {:?} @ {} ", &target, self.node_id());
 
         // First check if we have the value locally
         let mut local_values = Vec::new();
@@ -413,10 +426,7 @@ impl Kademlia {
 
         // If no nodes found, return empty result
         if closest_nodes.is_empty() {
-            //trace!(
-            //    "No nodes found for target: {:?}",
-            //    PublicKey::from_bytes(&target).unwrap()
-            //);
+            trace!("No nodes found for target: {:?}", &target);
 
             return Ok(FindResult::empty());
         }
@@ -460,6 +470,7 @@ impl Kademlia {
         while !pending_nodes.is_empty() {
             // Check for timeout
             if started_at.elapsed() > REQUEST_TIMEOUT {
+                warn!("Endless loop timeout");
                 break;
             }
 
@@ -548,7 +559,7 @@ impl Kademlia {
 
         info!(
             "Storing key: {:?} @ {} ",
-            PublicKey::from_bytes(&key).unwrap(),
+            PublicKey::from_bytes(&key),
             self_addr.node_id
         );
 

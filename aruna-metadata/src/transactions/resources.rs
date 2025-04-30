@@ -151,7 +151,8 @@ where
         let mut resource = controller
             .persistence
             .get_resources(vec![id])
-            .await?.first()
+            .await?
+            .first()
             .cloned()
             .ok_or_else(|| ArunaError::NotFound(format!("Resource {id} not found")))?;
         resource.last_modified = updated;
@@ -189,7 +190,9 @@ where
             }
             ResourceUpdateRequests::Labels(req) => {
                 if !req.labels_to_remove.is_empty() {
-                    resource.labels.retain(|kv| !req.labels_to_remove.contains(kv));
+                    resource
+                        .labels
+                        .retain(|kv| !req.labels_to_remove.contains(kv));
                 }
                 if !req.labels_to_add.is_empty() {
                     resource.labels.extend(req.labels_to_add);
@@ -200,7 +203,9 @@ where
             }
             ResourceUpdateRequests::Identifiers(req) => {
                 if !req.ids_to_remove.is_empty() {
-                    resource.identifiers.retain(|id| !req.ids_to_remove.contains(id));
+                    resource
+                        .identifiers
+                        .retain(|id| !req.ids_to_remove.contains(id));
                 }
                 if !req.ids_to_add.is_empty() {
                     resource.identifiers.extend(req.ids_to_add);
@@ -211,7 +216,9 @@ where
             }
             ResourceUpdateRequests::Authors(req) => {
                 if !req.authors_to_remove.is_empty() {
-                    resource.authors.retain(|a| !req.authors_to_remove.contains(a));
+                    resource
+                        .authors
+                        .retain(|a| !req.authors_to_remove.contains(a));
                 }
                 if !req.authors_to_add.is_empty() {
                     resource.authors.extend(req.authors_to_add);

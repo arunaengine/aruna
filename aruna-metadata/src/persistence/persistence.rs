@@ -321,7 +321,6 @@ where
         match msg.body {
             crate::network::network_trait::Body::User(_doc) => {
                 // TODO: Add or merge user
-                
             }
             crate::network::network_trait::Body::Object(doc) => {
                 self.handle_object_merges(doc).await?;

@@ -68,7 +68,10 @@ pub mod autosurgeon_date_time {
     ) -> Result<DateTime<Utc>, HydrateError> {
         let inner = <i64>::hydrate(doc, obj, prop)?;
         DateTime::from_timestamp_millis(inner).ok_or_else(|| {
-            HydrateError::unexpected("a valid (millisec) timestamp", "Invalid timestamp".to_string())
+            HydrateError::unexpected(
+                "a valid (millisec) timestamp",
+                "Invalid timestamp".to_string(),
+            )
         })
     }
 

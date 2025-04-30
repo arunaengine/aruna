@@ -1,8 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, RwLock},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
+use parking_lot::RwLock;
 
 use iroh::{NodeAddr, NodeId};
 use tracing::warn;
@@ -82,7 +83,7 @@ impl KademliaStateHandler {
     }
 
     pub fn set_node_addr(&self, node_addr: NodeAddr) {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
         state.node_addr = node_addr.clone();
         state
             .node_addresses
@@ -90,27 +91,26 @@ impl KademliaStateHandler {
     }
 
     pub fn get_node_addr(&self) -> NodeAddr {
-        self.state.read().expect("Poisoned lock").node_addr.clone()
+        self.state.read().node_addr.clone()
     }
 
     pub fn _get_k_buckets(&self) -> [KBucket; 256] {
-        self.state.read().expect("Poisoned lock").k_buckets.clone()
+        self.state.read().k_buckets.clone()
     }
 
     pub fn _get_resources(&self) -> HashMap<[u8; 32], HashSet<NodeId>> {
-        self.state.read().expect("Poisoned lock").resources.clone()
+        self.state.read().resources.clone()
     }
 
     pub fn _get_node_addresses(&self) -> HashMap<NodeId, NodeAddr> {
         self.state
             .read()
-            .expect("Poisoned lock")
             .node_addresses
             .clone()
     }
 
     pub fn get_stale_nodes(&self) -> Vec<Vec<NodeAddr>> {
-        let state = self.state.read().expect("Poisoned lock");
+        let state = self.state.read();
         let mut stale_nodes = Vec::new();
         // Remove stale nodes from all buckets
         for bucket in state.k_buckets.iter() {
@@ -121,7 +121,7 @@ impl KademliaStateHandler {
     }
 
     pub fn insert_node_addr(&self, node_addr: NodeAddr) {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
         state
             .node_addresses
             .insert(node_addr.node_id, node_addr.clone());
@@ -132,33 +132,33 @@ impl KademliaStateHandler {
         bucket_idx: usize,
         node_info: NodeInfo,
     ) -> Option<(NodeAddr, usize)> {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
         state.k_buckets[bucket_idx].update(node_info.clone())
     }
 
     pub fn refresh_node(&self, bucket_idx: usize, node_idx: usize) {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
         state.k_buckets[bucket_idx].refresh_node(node_idx);
     }
 
     pub fn replace_node(&self, bucket_idx: usize, node_idx: usize, node_info: NodeInfo) {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
         state.k_buckets[bucket_idx].replace_node(node_idx, node_info);
     }
 
     pub fn remove_node(&self, bucket_idx: usize, node_id: &NodeId) {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
         state.k_buckets[bucket_idx].remove_node(node_id);
         state.node_addresses.remove(node_id);
     }
 
     pub fn find_node_k_idx(&self, bucket_idx: usize, node_id: &NodeId) -> Option<usize> {
-        let state = self.state.read().expect("Poisoned lock");
+        let state = self.state.read();
         state.k_buckets[bucket_idx].find_node(node_id)
     }
 
     pub fn prune_expired_resources(&self) -> usize {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
         state.prune_expired_resources()
     }
 
@@ -167,7 +167,7 @@ impl KademliaStateHandler {
         node_addr: NodeAddr,
         interval: Duration,
     ) -> Vec<([u8; 32], NodeAddr)> {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
         let Some(republish_threshold) = SystemTime::now().checked_sub(interval) else {
             warn!("Failed to calculate republish threshold");
             return vec![];
@@ -182,7 +182,7 @@ impl KademliaStateHandler {
     }
 
     pub fn find_local_addr(&self, key: &[u8; 32]) -> Option<Vec<NodeAddr>> {
-        let state = self.state.read().expect("Poisoned lock");
+        let state = self.state.read();
         let mut values = Vec::new();
 
         if let Some(entries) = state.resources.get(key) {
@@ -206,7 +206,7 @@ impl KademliaStateHandler {
     }
 
     pub fn store(&self, key: [u8; 32], node_addr: &NodeAddr) {
-        let mut state = self.state.write().expect("Poisoned lock");
+        let mut state = self.state.write();
 
         // Get or create entry for this key
         let entries = state.resources.entry(key).or_default();
@@ -225,8 +225,8 @@ impl KademliaStateHandler {
 
     /// Find the closest nodes to a target from our routing table
     pub fn find_closest_nodes(&self, target: &[u8; 32]) -> Vec<NodeAddr> {
-        let state = self.state.read().expect("Poisoned lock");
-        let addr = self.get_node_addr();
+        let state = self.state.read();
+        let addr = &state.node_addr;
         let self_node_id_bytes = addr.node_id.as_bytes();
 
         let distance_to_target = calculate_distance(self_node_id_bytes, target);
@@ -288,7 +288,7 @@ impl KademliaStateHandler {
         HashMap<NodeId, NodeAddr>,
         HashMap<[u8; 32], HashSet<NodeId>>,
     ) {
-        let state = self.state.read().expect("Poisoned lock");
+        let state = self.state.read();
         (state.node_addresses.clone(), state.resources.clone())
     }
 }

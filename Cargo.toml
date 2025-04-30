@@ -18,6 +18,7 @@ blake3 = "1.8.2"
 dotenvy = "0.15.7"
 iroh = "0.34.1"
 iroh-base = "0.34.0"
+parking_lot = { version = "0.12.3", features = ["deadlock_detection"]}
 postcard = "1.1.1"
 serde = { version = "1.0.218", features = ["derive"] }
 tokio = { version = "1.44.2", features = ["full"] }
@@ -25,3 +26,6 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time", "fmt", "registry"] }
 ulid = { version = "1.2.1", features = ["serde"] }
 futures = "0.3.31"
+
+[profile.release]
+panic = "abort"

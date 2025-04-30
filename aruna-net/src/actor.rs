@@ -11,9 +11,9 @@ use iroh::{
     endpoint::{Builder, Connection, Incoming, RecvStream, SendStream},
 };
 use log::warn;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 use tokio::{io::AsyncWriteExt, sync::oneshot};
-use tracing::trace;
+use tracing::{error, trace};
 
 pub const CHANNEL_SIZE: usize = 100;
 
@@ -39,7 +39,7 @@ impl NetworkActorBuilder {
 
         let secret_key = secret_key.unwrap_or_else(|| {
             let mut rng = rand::rngs::OsRng;
-            
+
             SecretKey::generate(&mut rng)
         });
 
@@ -148,52 +148,72 @@ pub async fn connection_loop(
     incoming_streams: Sender<ReceiveStreams>,
     create_stream: Receiver<CreateStream>,
 ) {
-    loop {
-        trace!("Connection loop");
-
-        tokio::select! {
-            Ok(CreateStream { protocol_id, return_channel }) = create_stream.recv() => {
-
+    let connection_clone = connection.clone();
+    tokio::spawn(async move {
+        loop {
+            let CreateStream {
+                protocol_id,
+                return_channel,
+            } = match create_stream.recv().await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    error!("Error receiving CreateStream: {err:#}");
+                    continue;
+                }
+            };
+            let connection_clone = connection_clone.clone();
+            tokio::spawn(async move {
                 trace!("Creating stream for {protocol_id}");
 
-                let Ok((mut send_stream, recv_stream)) = connection.open_bi().await else {
-                    warn!("cannot open stream");
-                    continue;
+                let (mut send_stream, recv_stream) = match connection_clone.open_bi().await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        warn!("cannot open stream: {err:#}");
+                        return;
+                    }
                 };
 
                 // Write the protocol id to the stream
                 if send_stream.write_u32(protocol_id).await.is_err() {
                     warn!("cannot write protocol id to stream");
-                    continue;
+                    return;
                 }
 
                 if return_channel.send((send_stream, recv_stream)).is_err() {
                     warn!("cannot send stream to handler");
+                    return;
+                }
+            });
+        }
+    });
+
+    tokio::spawn(async move {
+        loop {
+            let (send_stream, recv_stream) = match connection.accept_bi().await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    error!("Error receiving CreateStream: {err:#}");
                     continue;
                 }
-            }
+            };
 
-            Ok((send_stream, recv_stream)) = connection.accept_bi() => {
-
-
+            let sender = connection.remote_node_id().unwrap();
+            let incoming_streams = incoming_streams.clone();
+            tokio::spawn(async move {
                 trace!("Received incoming stream");
 
                 let receive_streams = ReceiveStreams {
-                    sender: connection.remote_node_id().unwrap(),
+                    sender,
                     send_stream,
                     recv_stream,
                 };
                 if incoming_streams.send(receive_streams).await.is_err() {
                     warn!("cannot send stream to handler");
-                    continue;
+                    return;
                 }
-            }
-
-            _ = tokio::signal::ctrl_c() => {
-                break;
-            }
+            });
         }
-    }
+    });
 }
 
 impl NetworkActor {
@@ -303,7 +323,7 @@ impl NetworkActor {
                         trace!("Received incoming stream from {}", receive_streams.sender);
 
                         // Get the protocol id from the stream
-                        let Ok(protocol_id) = receive_streams.read_protocol().await else {
+                        let Ok(Ok(protocol_id)) = tokio::time::timeout(Duration::from_secs(1), receive_streams.read_protocol()).await else {
                             warn!("cannot read protocol id from stream");
                             continue;
                         };

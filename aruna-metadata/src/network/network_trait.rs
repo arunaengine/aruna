@@ -1,11 +1,12 @@
 use crate::{
     error::ArunaError,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store}, transactions::request::Request,
+    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    transactions::request::Request,
 };
 use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
-use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
+use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, trace};
 use ulid::Ulid;
@@ -14,7 +15,8 @@ pub static METADATA_PROTOCOL_ID: u32 = 3;
 pub static REPLICATION_POLICY: usize = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MetadataMessage<R: Request> {
+//pub struct MetadataMessage<R: Request> {
+pub struct MetadataMessage {
     pub from: [u8; 32],    // Node ID
     pub to: [u8; 32],      // Node ID
     pub subject: [u8; 32], // Object or User ID
@@ -171,6 +173,8 @@ where
                     .await
                     .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
                 //chandler.store(*id_hash.as_bytes(), node).await?; // TODO: Move this to handle_stream in persistence
+                sdx.finish()
+                    .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
                 counter += 1;
 
                 // TODO:
@@ -238,6 +242,10 @@ where
                     // Send the response
                     // send_stream.write_u32(response_buf.len() as u32).await?;
                     // send_stream.write_all(&response_buf).await?;
+                    recv_stream
+                        .send_stream
+                        .finish()
+                        .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
                 }
                 Err(err) => return Err(err),
             }

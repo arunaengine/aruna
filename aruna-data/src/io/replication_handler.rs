@@ -163,9 +163,7 @@ impl ReplicationHandler {
                     info!("Received chunk request with chunk nr {chunk_nr}");
                     self.handle_chunk_request(msg.id, chunk).await
                 }
-                MessageType::EndReplicationRequest => {
-                    self.handle_end_request(msg.id).await
-                }
+                MessageType::EndReplicationRequest => self.handle_end_request(msg.id).await,
                 _ => None, // Hm.
             }
         } else {
