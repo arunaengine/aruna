@@ -16,10 +16,9 @@ use crate::{
 };
 use automerge::ActorId;
 use autosurgeon::{hydrate, reconcile};
-use iroh::endpoint::{RecvStream, SendStream};
 use roaring::RoaringBitmap;
 use std::sync::{Arc, atomic::AtomicU32};
-use tokio::{io::AsyncReadExt, join};
+use tokio::join;
 use tracing::trace;
 use ulid::Ulid;
 
@@ -79,7 +78,7 @@ where
     ) -> Result<Vec<u8>, ArunaError> {
         let store = self.store.clone();
         let search = self.search.clone();
-        let user_id = user_id.clone();
+        let user_id = *user_id;
         let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
 
         // spawn search in its own block and dont await outcome
@@ -180,7 +179,7 @@ where
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn get_user(&self, id: &Ulid) -> Result<Option<User>, ArunaError> {
         let store = self.store.clone();
-        let id = id.clone();
+        let id = *id;
         let result = tokio::task::spawn_blocking(move || {
             let read_txn = store.create_txn(false)?;
             let id = id.to_bytes();
@@ -257,7 +256,7 @@ where
         // Clones for spawn_blocking
         let store = self.store.clone();
         let search = self.search.clone();
-        let user_id = user_id.clone();
+        let user_id = *user_id;
         let resource_id = resource.id.to_bytes();
         let res_clone = resource.clone();
 
@@ -322,7 +321,7 @@ where
         match msg.body {
             crate::network::network_trait::Body::User(_doc) => {
                 // TODO: Add or merge user
-                ()
+                
             }
             crate::network::network_trait::Body::Object(doc) => {
                 self.handle_object_merges(doc).await?;

@@ -40,10 +40,10 @@ impl TantivyFjall {
                 .unwrap(),
         );
         let network = NetworkDummy::new(()).await;
-        let controller = Arc::new(Controller::<FjallStore, TantivySearch, NetworkDummy>::new(
+        
+        Arc::new(Controller::<FjallStore, TantivySearch, NetworkDummy>::new(
             persistor, network,
-        ));
-        controller
+        ))
     }
 
     pub async fn create_user(
@@ -139,10 +139,10 @@ impl TantivyHeed {
                 .unwrap(),
         );
         let network = NetworkDummy::new(()).await;
-        let controller = Arc::new(Controller::<LmdbStore, TantivySearch, NetworkDummy>::new(
+        
+        Arc::new(Controller::<LmdbStore, TantivySearch, NetworkDummy>::new(
             persistor, network,
-        ));
-        controller
+        ))
     }
 
     pub async fn create_user(
@@ -238,10 +238,10 @@ impl TantivyRedb {
                 .unwrap(),
         );
         let network = NetworkDummy::new(()).await;
-        let controller = Arc::new(Controller::<Redb, TantivySearch, NetworkDummy>::new(
+        
+        Arc::new(Controller::<Redb, TantivySearch, NetworkDummy>::new(
             persistor, network,
-        ));
-        controller
+        ))
     }
 
     pub async fn create_user(

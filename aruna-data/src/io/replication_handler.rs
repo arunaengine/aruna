@@ -1,11 +1,10 @@
 use crate::util::opendal::get_data_stream;
 use ahash::{HashMap, HashMapExt};
 use anyhow::{Result, anyhow};
-use aruna_net::actor_handle::NetworkActorHandle;
 use aruna_net::Kademlia;
+use aruna_net::actor_handle::NetworkActorHandle;
 use futures::{SinkExt, StreamExt};
 // TODO: We need to replace the old "ProtocolHandler" trait with a loop that handles incoming streams
-use iroh::endpoint::{RecvStream, SendStream};
 use iroh::{NodeAddr, NodeId};
 use opendal::{Buffer, BufferSink, Operator};
 use serde::{Deserialize, Serialize};
@@ -158,14 +157,14 @@ impl ReplicationHandler {
         if msg.is_request() {
             match msg.msg_type {
                 MessageType::InitReplicationRequest { path } => {
-                    self.handle_init_request(msg.id.clone(), path).await
+                    self.handle_init_request(msg.id, path).await
                 }
                 MessageType::ReplicationChunkRequest { chunk_nr, chunk } => {
                     info!("Received chunk request with chunk nr {chunk_nr}");
-                    self.handle_chunk_request(msg.id.clone(), chunk).await
+                    self.handle_chunk_request(msg.id, chunk).await
                 }
-                MessageType::EndReplicationRequest { .. } => {
-                    self.handle_end_request(msg.id.clone()).await
+                MessageType::EndReplicationRequest => {
+                    self.handle_end_request(msg.id).await
                 }
                 _ => None, // Hm.
             }

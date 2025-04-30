@@ -93,15 +93,15 @@ impl KademliaStateHandler {
         self.state.read().expect("Poisoned lock").node_addr.clone()
     }
 
-    pub fn get_k_buckets(&self) -> [KBucket; 256] {
+    pub fn _get_k_buckets(&self) -> [KBucket; 256] {
         self.state.read().expect("Poisoned lock").k_buckets.clone()
     }
 
-    pub fn get_resources(&self) -> HashMap<[u8; 32], HashSet<NodeId>> {
+    pub fn _get_resources(&self) -> HashMap<[u8; 32], HashSet<NodeId>> {
         self.state.read().expect("Poisoned lock").resources.clone()
     }
 
-    pub fn get_node_addresses(&self) -> HashMap<NodeId, NodeAddr> {
+    pub fn _get_node_addresses(&self) -> HashMap<NodeId, NodeAddr> {
         self.state
             .read()
             .expect("Poisoned lock")
@@ -209,7 +209,7 @@ impl KademliaStateHandler {
         let mut state = self.state.write().expect("Poisoned lock");
 
         // Get or create entry for this key
-        let entries = state.resources.entry(key).or_insert_with(HashSet::new);
+        let entries = state.resources.entry(key).or_default();
 
         // Update the entry with new TTL
         entries.insert(node_addr.node_id);
@@ -229,7 +229,7 @@ impl KademliaStateHandler {
         let addr = self.get_node_addr();
         let self_node_id_bytes = addr.node_id.as_bytes();
 
-        let distance_to_target = calculate_distance(&*self_node_id_bytes, target);
+        let distance_to_target = calculate_distance(self_node_id_bytes, target);
         let bucket_idx = get_bucket_index(&distance_to_target);
 
         // Start with the exact bucket
@@ -282,8 +282,12 @@ impl KademliaStateHandler {
         }
     }
 
-
-    pub fn copy_addr_and_resources(&self) -> (HashMap<NodeId, NodeAddr>, HashMap<[u8; 32], HashSet<NodeId>>) {
+    pub fn copy_addr_and_resources(
+        &self,
+    ) -> (
+        HashMap<NodeId, NodeAddr>,
+        HashMap<[u8; 32], HashSet<NodeId>>,
+    ) {
         let state = self.state.read().expect("Poisoned lock");
         (state.node_addresses.clone(), state.resources.clone())
     }

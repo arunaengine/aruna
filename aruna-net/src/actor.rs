@@ -39,8 +39,8 @@ impl NetworkActorBuilder {
 
         let secret_key = secret_key.unwrap_or_else(|| {
             let mut rng = rand::rngs::OsRng;
-            let secret_key = SecretKey::generate(&mut rng);
-            secret_key
+            
+            SecretKey::generate(&mut rng)
         });
 
         let kademlia_handle = Kademlia::new(secret_key.public(), kademlia_actor_handle).await;
@@ -101,20 +101,21 @@ impl NetworkActorBuilder {
             endpoint.add_node_addr(node_addr.clone())?;
         }
         let init_actor_handle = InitActorHandle::new(self.command.sender().clone());
-        if !bootstrap_nodes.is_empty() {
-            self.kademlia
-                .set_node_addr(endpoint.node_addr().await?);
-            self.kademlia.bootstrap(bootstrap_nodes).await?;
-        } else {
-            warn!("no bootstrap nodes")
-        }
+        let node_addr = endpoint.node_addr().await?;
         NetworkActor::new(
             endpoint,
             self.command,
             self.protocol_handler_map,
-            self.kademlia,
+            self.kademlia.clone(),
         )
         .await;
+
+        if !bootstrap_nodes.is_empty() {
+            self.kademlia.set_node_addr(node_addr);
+            self.kademlia.bootstrap(bootstrap_nodes).await?;
+        } else {
+            warn!("no bootstrap nodes")
+        }
         Ok(init_actor_handle)
     }
 }
@@ -317,7 +318,7 @@ impl NetworkActor {
                                 }
                             }
                             None => {
-                                warn!("no protocol handler for protocol id {}", protocol_id);
+                                warn!("no protocol handler for protocol id {protocol_id}");
                                 continue;
                             }
                         }

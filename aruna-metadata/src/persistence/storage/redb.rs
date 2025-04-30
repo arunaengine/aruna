@@ -269,10 +269,11 @@ impl<'a> Store<'a> for Redb {
     }
 
     fn commit(&self, txn: Self::Txn) -> Result<(), crate::error::ArunaError> {
-        Ok(match txn {
+        match txn {
             RedbTxn::Write(w) => w.commit()?,
             RedbTxn::Read(r) => r.close()?,
-        })
+        };
+        Ok(())
     }
 
     fn purge(&self) -> Result<(), ArunaError> {

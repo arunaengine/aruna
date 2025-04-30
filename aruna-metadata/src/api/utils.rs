@@ -12,8 +12,8 @@ pub(super) fn extract_token(header: &HeaderMap) -> Option<String> {
 }
 
 pub fn into_axum_response<T: Serialize>(response: Result<T, ArunaError>) -> impl IntoResponse {
-    let res = response
+    
+    response
         .map(|r| (axum::http::StatusCode::OK, Json(r)).into_response())
-        .unwrap_or_else(|e| e.into_axum_tuple().into_response());
-    res
+        .unwrap_or_else(|e| e.into_axum_tuple().into_response())
 }

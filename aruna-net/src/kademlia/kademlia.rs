@@ -84,13 +84,14 @@ impl Kademlia {
                     // Handle incoming streams
                     Ok(inc_stream) = self.network.receive() => {
                         let self_clone = self.clone();
+
+                        trace!("Received stream from: {:?}", inc_stream.sender);
                         tokio::spawn(
                             async move {
                                 if let Err(e) = self_clone.handle_incoming_stream(
                                     inc_stream,
                                 ).await{
                                     error!("Failed to handle incoming stream: {e:#}");
-                                    return;
                                 }
                             }
                         );
@@ -120,7 +121,7 @@ impl Kademlia {
 
     /// Get node ID bytes as owned array
     fn node_id_bytes(&self) -> [u8; 32] {
-        self.node_id().as_bytes().clone()
+        *self.node_id().as_bytes()
     }
 
     /// Run maintenance to clean up stale nodes and expired keys
@@ -160,8 +161,7 @@ impl Kademlia {
         // Log maintenance results if significant
         if pruned_count > 0 {
             println!(
-                "Maintenance: pruned {} expired resource entries",
-                pruned_count
+                "Maintenance: pruned {pruned_count} expired resource entries"
             );
         }
     }
@@ -288,6 +288,7 @@ impl Kademlia {
         sx.write_all(&buf).await?;
         sx.flush().await?;
 
+        trace!("Waiting for response from node: {}", target_addr.node_id);
         // Read the response
         let len = rx.read_u32().await?;
         let mut buf = vec![0; len as usize];
@@ -440,7 +441,6 @@ impl Kademlia {
 
         let self_addr = self.get_node_addr();
 
-
         // Initialize with our closest nodes, tracking distance
         for node in initial_nodes {
             if node.node_id != self.node_id() {
@@ -500,7 +500,8 @@ impl Kademlia {
 
                     // Process returned nodes for further lookup
                     for node in nodes {
-                        if node.node_id != self_addr.node_id && !visited_nodes.contains(&node.node_id)
+                        if node.node_id != self_addr.node_id
+                            && !visited_nodes.contains(&node.node_id)
                         {
                             let distance = calculate_distance(&target, node.node_id.as_bytes());
                             closest_nodes.insert(distance, node.clone());
@@ -543,7 +544,6 @@ impl Kademlia {
 
     /// External API: Store operation (simplified)
     pub async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<()> {
-
         let self_addr = self.get_node_addr();
 
         info!(
@@ -607,7 +607,7 @@ impl Kademlia {
         }
 
         // Find our own node ID in the network to discover closest nodes
-        let target = node_addr.clone().node_id.as_bytes().clone();
+        let target = *node_addr.clone().node_id.as_bytes();
 
         // Store our node in the network
         self.store(target, node_addr).await?;

@@ -19,7 +19,7 @@ impl Discovery for Kademlia {
     ) -> Option<BoxStream<anyhow::Result<DiscoveryItem>>> {
         trace!("resolve {:?}", node_id);
 
-        let target = node_id.as_bytes().clone();
+        let target = *node_id.as_bytes();
         let self_clone = self.clone();
 
         let fut = async move {
