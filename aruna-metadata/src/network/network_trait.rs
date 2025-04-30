@@ -1,6 +1,6 @@
 use crate::{
     error::ArunaError,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    persistence::{persistence::Persistor, search::search::Search, storage::store::Store}, transactions::request::Request,
 };
 use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
 use iroh::{NodeAddr, PublicKey, SecretKey};
@@ -14,11 +14,13 @@ pub static METADATA_PROTOCOL_ID: u32 = 3;
 pub static REPLICATION_POLICY: usize = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct MetadataMessage {
+pub struct MetadataMessage<R: Request> {
     pub from: [u8; 32],    // Node ID
     pub to: [u8; 32],      // Node ID
     pub subject: [u8; 32], // Object or User ID
     pub body: Body,
+    // TODO:
+    //pub request: R,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -35,15 +37,6 @@ pub trait Network: Sync + Send {
     async fn get_id(&self) -> Result<Vec<u8>, ArunaError>;
     async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError>;
     async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaError>;
-    //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError>;
-    //fn spawn_acceptor(self: Self);
-    //async fn get_bidi_stream(
-    //    &self,
-    //    node_id: NodeId,
-    //    protocol_id: ProtocolId,
-    //) -> Result<(RecvStream, SendStream), ArunaError>;
-    //async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError>;
-    //async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError>;
 }
 
 pub struct NetworkDummy {
@@ -67,26 +60,6 @@ impl Network for NetworkDummy {
     async fn store(&self, _subject_id: &Ulid) -> Result<(), ArunaError> {
         Ok(())
     }
-    //async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
-    //    Ok(self.self_id.clone())
-    //}
-    //fn spawn_acceptor(self: Self) {}
-    //async fn get_bidi_stream(
-    //    &self,
-    //    node_id: NodeId,
-    //    protocol_id: ProtocolId,
-    //) -> Result<(RecvStream, SendStream), ArunaError> {
-    //    todo!()
-    //}
-    //async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError> {
-    //    Ok(FindResult {
-    //        value: vec![self.self_id.clone()],
-    //        nodes: vec![self.self_id.clone()],
-    //    })
-    //}
-    //async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<(), ArunaError> {
-    //    Ok(())
-    //}
 }
 
 pub struct NetworkConfig<St, Se>
@@ -230,22 +203,6 @@ where
         });
         Ok(())
     }
-    // async fn get_node_addr(&self) -> Result<NodeAddr, ArunaError> {
-    //     self.get_node_addr().await
-    // }
-    // fn spawn_acceptor(self: Self) {
-    //     ConnectionHandler::spawn_acceptor(self);
-    // }
-    // async fn get_bidi_stream(
-    //     &self,
-    //     node_id: NodeId,
-    //     protocol_id: ProtocolId,
-    // ) -> Result<(RecvStream, SendStream), ArunaError> {
-    //     self.get_bidi_stream(node_id, protocol_id).await
-    // }
-    // async fn find(&self, key: [u8; 32]) -> Result<FindResult, ArunaError> {
-    //     self.find(key).await
-    // }
 }
 
 impl<St, Se> P2PNetwork<St, Se>
