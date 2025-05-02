@@ -40,6 +40,7 @@ pub struct ReplicationHandler {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct Hashes {
     blake3: String,
     sha256: String,
@@ -276,7 +277,7 @@ impl ReplicationHandler {
             // Store data location in Kademlia
             let guard = self.network.read().await;
             if let Some((node_addr, _, kademlia)) = guard.as_ref() {
-                if let Err(err) = kademlia.store(*blake3.as_bytes(), node_addr.clone()).await {
+                if let Err(err) = kademlia.store(*blake3.as_bytes(), node_addr.clone(), None).await {
                     return Some(ReplicationMessage {
                         id,
                         sender: node_addr.clone(),
@@ -314,7 +315,7 @@ impl ReplicationHandler {
         // Store data location in Kademlia
         let guard = self.network.read().await;
         if let Some((_, _, kademlia)) = guard.as_ref() {
-            if let Err(err) = kademlia.store(obj_hash, sender_addr).await {
+            if let Err(err) = kademlia.store(obj_hash, sender_addr, None).await {
                 warn!("Failed to store data location: {err}");
             }
         }

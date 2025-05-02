@@ -1,12 +1,11 @@
 use crate::{
     error::ArunaError,
     persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
-    transactions::request::Request,
 };
 use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
-use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc, time::Duration};
+use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, trace};
 use ulid::Ulid;
@@ -202,7 +201,7 @@ where
             let mut chunk_hasher = blake3::Hasher::new();
             chunk_hasher.update(subject_id.to_bytes().as_slice());
             let id_hash = chunk_hasher.finalize();
-            kademlia.store(*id_hash.as_bytes(), node_addr).await?;
+            kademlia.store(*id_hash.as_bytes(), node_addr, None).await?;
             Ok::<(), ArunaError>(())
         });
         Ok(())

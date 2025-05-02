@@ -18,6 +18,12 @@ use super::{
     utils::{calculate_distance, get_bucket_index},
 };
 
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
+pub struct KademliaValue {
+    pub node_id: NodeId,
+    signature: Option<Vec<u8>>,
+}
+
 /// Internal mutable state of Kademlia
 #[derive(Debug)]
 struct KademliaState {
@@ -26,7 +32,7 @@ struct KademliaState {
     // Kademlia routing table with K buckets
     k_buckets: [KBucket; 256],
     // Resources stored by us and the nodes that have them
-    resources: HashMap<[u8; 32], HashSet<NodeId>>,
+    resources: HashMap<[u8; 32], HashSet<KademliaValue>>,
     // Locally known node addresses
     node_addresses: HashMap<NodeId, NodeAddr>,
     local_resources: TimeHandler, // Tracking stored resources by us
@@ -59,7 +65,7 @@ impl KademliaState {
                 let Some(node_id) = key.node_id() else {
                     continue;
                 };
-                entries.remove(&node_id);
+                entries.remove(&KademliaValue { node_id, signature: None });
                 if entries.is_empty() {
                     self.resources.remove(&key.key());
                 }
@@ -98,7 +104,7 @@ impl KademliaStateHandler {
         self.state.read().k_buckets.clone()
     }
 
-    pub fn _get_resources(&self) -> HashMap<[u8; 32], HashSet<NodeId>> {
+    pub fn _get_resources(&self) -> HashMap<[u8; 32], HashSet<KademliaValue>> {
         self.state.read().resources.clone()
     }
 
@@ -164,9 +170,8 @@ impl KademliaStateHandler {
 
     pub fn get_republish_sources(
         &self,
-        node_addr: NodeAddr,
         interval: Duration,
-    ) -> Vec<([u8; 32], NodeAddr)> {
+    ) -> Vec<([u8; 32], Option<Vec<u8>>)> {
         let mut state = self.state.write();
         let Some(republish_threshold) = SystemTime::now().checked_sub(interval) else {
             warn!("Failed to calculate republish threshold");
@@ -177,7 +182,7 @@ impl KademliaStateHandler {
             .local_resources
             .remove_older_than(republish_threshold)
             .into_iter()
-            .map(|key| (key.key(), node_addr.clone()))
+            .map(|key| (key.key(), key.signature()))
             .collect::<Vec<_>>()
     }
 
@@ -186,7 +191,7 @@ impl KademliaStateHandler {
         let mut values = Vec::new();
 
         if let Some(entries) = state.resources.get(key) {
-            for node_id in entries {
+            for KademliaValue { node_id, .. } in entries {
                 if let Some(addr) = state.node_addresses.get(node_id) {
                     values.push(addr.clone());
                 }
@@ -205,17 +210,22 @@ impl KademliaStateHandler {
         }
     }
 
-    pub fn store(&self, key: [u8; 32], node_addr: &NodeAddr) {
+    pub fn store(&self, key: [u8; 32], node_addr: &NodeAddr, signature: Option<Vec<u8>>) {
         let mut state = self.state.write();
+
+        let value = KademliaValue {
+            node_id: node_addr.node_id,
+            signature: signature.clone(),
+        };
 
         // Get or create entry for this key
         let entries = state.resources.entry(key).or_default();
 
         // Update the entry with new TTL
-        entries.insert(node_addr.node_id);
+        entries.insert(value);
 
         // Insert the key into the local expiration timer
-        state.store_timer.insert(key, Some(node_addr.node_id));
+        state.store_timer.insert(key, Some(node_addr.node_id), signature);
 
         // Always update the node address mapping
         state
@@ -286,7 +296,7 @@ impl KademliaStateHandler {
         &self,
     ) -> (
         HashMap<NodeId, NodeAddr>,
-        HashMap<[u8; 32], HashSet<NodeId>>,
+        HashMap<[u8; 32], HashSet<KademliaValue>>,
     ) {
         let state = self.state.read();
         (state.node_addresses.clone(), state.resources.clone())

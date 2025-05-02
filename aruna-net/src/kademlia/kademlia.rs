@@ -3,6 +3,7 @@ use super::state::KademliaStateHandler;
 use crate::actor_handle::{NetworkActorHandle, ReceiveStreams};
 use crate::kademlia::messages::{KademliaMessage, MessageType};
 use crate::kademlia::node_info::NodeInfo;
+use crate::kademlia::state::KademliaValue;
 use crate::kademlia::utils::{calculate_distance, get_bucket_index};
 use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
 use anyhow::{Result, anyhow};
@@ -124,7 +125,7 @@ impl Kademlia {
     }
 
     /// Get node ID bytes as owned array
-    fn node_id_bytes(&self) -> [u8; 32] {
+    fn _node_id_bytes(&self) -> [u8; 32] {
         *self.node_id().as_bytes()
     }
 
@@ -174,11 +175,11 @@ impl Kademlia {
         let node_addr = self.get_node_addr().clone();
         let resources_to_republish = self
             .state
-            .get_republish_sources(node_addr, REPUBLISH_INTERVAL);
+            .get_republish_sources(REPUBLISH_INTERVAL);
 
         // Republish each returned local resource
-        for (key, value) in resources_to_republish {
-            let _ = self.store(key, value).await;
+        for (key, signature) in resources_to_republish {
+            let _ = self.store(key, node_addr.clone(), signature).await;
         }
     }
 
@@ -235,8 +236,8 @@ impl Kademlia {
                 ))
             }
 
-            MessageType::StoreRequest { key, ref value } => {
-                self.state.store(key, value);
+            MessageType::StoreRequest { key, ref value, ref signature } => {
+                self.state.store(key, value, signature.clone());
                 // Create response
                 Some(request.create_response(
                     Some(self.get_node_addr().clone()),
@@ -399,7 +400,7 @@ impl Kademlia {
 
             // Check for values in resources
             if let Some(entries) = resources.get(&target) {
-                for node_id in entries {
+                for KademliaValue{node_id, ..} in entries {
                     if let Some(addr) = node_addresses.get(node_id) {
                         local_values.push(addr.clone());
                     }
@@ -554,7 +555,7 @@ impl Kademlia {
     }
 
     /// External API: Store operation (simplified)
-    pub async fn store(&self, key: [u8; 32], value: NodeAddr) -> Result<()> {
+    pub async fn store(&self, key: [u8; 32], value: NodeAddr, signature: Option<Vec<u8>>) -> Result<()> {
         let self_addr = self.get_node_addr();
 
         info!(
@@ -564,7 +565,7 @@ impl Kademlia {
         );
 
         // Store locally first with TTL
-        self.state.store(key, &self_addr);
+        self.state.store(key, &self_addr, signature.clone());
 
         // Find nodes closest to the key
         let find_result = self.find(key, false).await?;
@@ -583,6 +584,7 @@ impl Kademlia {
                     MessageType::StoreRequest {
                         key,
                         value: value.clone(),
+                        signature: signature.clone(),
                     },
                 );
 
@@ -621,7 +623,7 @@ impl Kademlia {
         let target = *node_addr.clone().node_id.as_bytes();
 
         // Store our node in the network
-        self.store(target, node_addr).await?;
+        self.store(target, node_addr, None).await?;
 
         Ok(())
     }

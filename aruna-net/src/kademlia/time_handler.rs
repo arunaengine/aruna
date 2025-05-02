@@ -8,23 +8,26 @@ pub struct Key {
     created: SystemTime,
     key: [u8; 32],
     node_id: Option<NodeId>,
+    signature: Option<Vec<u8>>,
 }
 
 impl Key {
-    pub fn new(key: [u8; 32], node_id: Option<NodeId>) -> Self {
+    pub fn new(key: [u8; 32], node_id: Option<NodeId>, signature: Option<Vec<u8>>) -> Self {
         Self {
             created: SystemTime::now(),
             key,
             node_id,
+            signature,
         }
     }
 
     #[allow(dead_code)]
-    fn with_timestamp(key: [u8; 32], node_id: Option<NodeId>, timestamp: SystemTime) -> Self {
+    fn with_timestamp(key: [u8; 32], node_id: Option<NodeId>, timestamp: SystemTime, signature: Option<Vec<u8>>) -> Self {
         Self {
             created: timestamp,
             key,
             node_id,
+            signature,
         }
     }
 
@@ -34,6 +37,10 @@ impl Key {
 
     pub fn node_id(&self) -> Option<NodeId> {
         self.node_id
+    }
+
+    pub fn signature(&self) -> Option<Vec<u8>> {
+        self.signature.clone()
     }
 }
 
@@ -68,8 +75,8 @@ impl TimeHandler {
     }
 
     // Insert a new key with current timestamp
-    pub fn insert(&mut self, key: [u8; 32], node_id: Option<NodeId>) {
-        let key_obj = Key::new(key, node_id);
+    pub fn insert(&mut self, key: [u8; 32], node_id: Option<NodeId>, signature: Option<Vec<u8>>) {
+        let key_obj = Key::new(key, node_id, signature);
         self.heap.push(Reverse(key_obj));
     }
 
@@ -80,8 +87,9 @@ impl TimeHandler {
         key: [u8; 32],
         node_id: Option<NodeId>,
         timestamp: SystemTime,
+        signature: Option<Vec<u8>>,
     ) {
-        let key_obj = Key::with_timestamp(key, node_id, timestamp);
+        let key_obj = Key::with_timestamp(key, node_id, timestamp, signature);
         self.heap.push(Reverse(key_obj));
     }
 
@@ -152,7 +160,7 @@ mod tests {
         let mut handler = TimeHandler::new();
         let key = create_test_key(1);
 
-        handler.insert(key, None);
+        handler.insert(key, None, None);
         assert_eq!(handler.len(), 1);
         assert!(!handler.is_empty());
 
@@ -172,9 +180,9 @@ mod tests {
         let key2 = create_test_key(2);
 
         // Insert key2 first (older)
-        handler.insert(key2, None);
+        handler.insert(key2, None, None);
         sleep(Duration::from_millis(10)); // Ensure different timestamps
-        handler.insert(key1, None);
+        handler.insert(key1, None, None);
 
         // Should pop key2 first (the oldest)
         let popped = handler.pop_oldest().unwrap();
@@ -206,9 +214,9 @@ mod tests {
         let future = now + Duration::from_secs(10);
 
         // Insert with different timestamps
-        handler.insert_with_timestamp(key1, None, past1);
-        handler.insert_with_timestamp(key2, None, past2); // oldest
-        handler.insert_with_timestamp(key3, None, now);
+        handler.insert_with_timestamp(key1, None, past1, None);
+        handler.insert_with_timestamp(key2, None, past2, None); // oldest
+        handler.insert_with_timestamp(key3, None, now, None);
 
         // Remove older than 'past1'
         let removed = handler.remove_older_than(past1);
@@ -247,8 +255,8 @@ mod tests {
         let old_time = SystemTime::now() - Duration::from_secs(100);
 
         // Insert with old timestamp
-        handler.insert_with_timestamp(key1, None, old_time);
-        handler.insert_with_timestamp(key2, None, old_time);
+        handler.insert_with_timestamp(key1, None, old_time, None);
+        handler.insert_with_timestamp(key2, None, old_time, None);
 
         // Remove old keys
         let threshold = SystemTime::now() - Duration::from_secs(50);
@@ -258,8 +266,8 @@ mod tests {
 
         // Reinsert with fresh timestamp
         let new_time = SystemTime::now();
-        handler.insert_with_timestamp(key1, None, new_time);
-        handler.insert_with_timestamp(key2, None, new_time);
+        handler.insert_with_timestamp(key1, None, new_time, None);
+        handler.insert_with_timestamp(key2, None, new_time, None);
         assert_eq!(handler.len(), 2);
 
         // Now they shouldn't be removed by the same threshold
@@ -279,9 +287,9 @@ mod tests {
         let key2 = create_test_key(2);
         let key3 = create_test_key(3);
 
-        handler.insert_with_timestamp(key1, None, timestamp);
-        handler.insert_with_timestamp(key2, None, timestamp);
-        handler.insert_with_timestamp(key3, None, timestamp);
+        handler.insert_with_timestamp(key1, None, timestamp, None);
+        handler.insert_with_timestamp(key2, None, timestamp, None);
+        handler.insert_with_timestamp(key3, None, timestamp, None);
 
         // They should come out in deterministic order based on key bytes and is_node
         let popped1 = handler.pop_oldest().unwrap();
@@ -307,9 +315,9 @@ mod tests {
         let key3 = create_test_key(3);
 
         // Insert in reverse chronological order
-        handler.insert_with_timestamp(key1, None, now);
-        handler.insert_with_timestamp(key2, None, older);
-        handler.insert_with_timestamp(key3, None, oldest);
+        handler.insert_with_timestamp(key1, None, now, None);
+        handler.insert_with_timestamp(key2, None, older, None);
+        handler.insert_with_timestamp(key3, None, oldest, None);
 
         // Should pop in chronological order (oldest first)
         assert_eq!(handler.pop_oldest().unwrap().key[0], 3);

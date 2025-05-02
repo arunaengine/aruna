@@ -15,6 +15,7 @@ pub enum MessageType {
     StoreRequest {
         key: [u8; 32],
         value: NodeAddr,
+        signature: Option<Vec<u8>>,
     },
 
     // Response types
