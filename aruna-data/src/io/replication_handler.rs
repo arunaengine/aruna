@@ -277,7 +277,10 @@ impl ReplicationHandler {
             // Store data location in Kademlia
             let guard = self.network.read().await;
             if let Some((node_addr, _, kademlia)) = guard.as_ref() {
-                if let Err(err) = kademlia.store(*blake3.as_bytes(), node_addr.clone(), None).await {
+                if let Err(err) = kademlia
+                    .store(*blake3.as_bytes(), node_addr.clone(), None)
+                    .await
+                {
                     return Some(ReplicationMessage {
                         id,
                         sender: node_addr.clone(),

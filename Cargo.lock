@@ -222,6 +222,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-realm"
+version = "0.1.0"
+dependencies = [
+ "aruna-net",
+ "ed25519-dalek",
+ "iroh",
+]
+
+[[package]]
+name = "aruna-storage"
+version = "0.1.0"
+dependencies = [
+ "fjall",
+ "heed",
+ "redb",
+ "thiserror 2.0.12",
+ "tracing",
+]
+
+[[package]]
 name = "asn1-rs"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

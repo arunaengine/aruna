@@ -4,7 +4,7 @@ use super::store::{Store, tables};
 use crate::{
     error::ArunaError,
     models::models::Resource,
-    persistence::storage::store::tables::{
+    storage::store::tables::{
         PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME, RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME,
         USER_MAPPINGS_DB_NAME,
     },

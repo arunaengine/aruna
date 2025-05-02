@@ -173,9 +173,7 @@ impl Kademlia {
     async fn republish_resources(&self) {
         // Get all resources to republish
         let node_addr = self.get_node_addr().clone();
-        let resources_to_republish = self
-            .state
-            .get_republish_sources(REPUBLISH_INTERVAL);
+        let resources_to_republish = self.state.get_republish_sources(REPUBLISH_INTERVAL);
 
         // Republish each returned local resource
         for (key, signature) in resources_to_republish {
@@ -236,7 +234,11 @@ impl Kademlia {
                 ))
             }
 
-            MessageType::StoreRequest { key, ref value, ref signature } => {
+            MessageType::StoreRequest {
+                key,
+                ref value,
+                ref signature,
+            } => {
                 self.state.store(key, value, signature.clone());
                 // Create response
                 Some(request.create_response(
@@ -400,7 +402,7 @@ impl Kademlia {
 
             // Check for values in resources
             if let Some(entries) = resources.get(&target) {
-                for KademliaValue{node_id, ..} in entries {
+                for KademliaValue { node_id, .. } in entries {
                     if let Some(addr) = node_addresses.get(node_id) {
                         local_values.push(addr.clone());
                     }
@@ -555,7 +557,12 @@ impl Kademlia {
     }
 
     /// External API: Store operation (simplified)
-    pub async fn store(&self, key: [u8; 32], value: NodeAddr, signature: Option<Vec<u8>>) -> Result<()> {
+    pub async fn store(
+        &self,
+        key: [u8; 32],
+        value: NodeAddr,
+        signature: Option<Vec<u8>>,
+    ) -> Result<()> {
         let self_addr = self.get_node_addr();
 
         info!(

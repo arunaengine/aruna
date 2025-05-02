@@ -1,0 +1,9 @@
+[package]
+name = "aruna-realm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+aruna-net = {path = "../aruna-net"}
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+iroh = { workspace = true}

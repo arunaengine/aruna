@@ -1,9 +1,9 @@
+use parking_lot::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime},
 };
-use parking_lot::RwLock;
 
 use iroh::{NodeAddr, NodeId};
 use tracing::warn;
@@ -65,7 +65,10 @@ impl KademliaState {
                 let Some(node_id) = key.node_id() else {
                     continue;
                 };
-                entries.remove(&KademliaValue { node_id, signature: None });
+                entries.remove(&KademliaValue {
+                    node_id,
+                    signature: None,
+                });
                 if entries.is_empty() {
                     self.resources.remove(&key.key());
                 }
@@ -109,10 +112,7 @@ impl KademliaStateHandler {
     }
 
     pub fn _get_node_addresses(&self) -> HashMap<NodeId, NodeAddr> {
-        self.state
-            .read()
-            .node_addresses
-            .clone()
+        self.state.read().node_addresses.clone()
     }
 
     pub fn get_stale_nodes(&self) -> Vec<Vec<NodeAddr>> {
@@ -168,10 +168,7 @@ impl KademliaStateHandler {
         state.prune_expired_resources()
     }
 
-    pub fn get_republish_sources(
-        &self,
-        interval: Duration,
-    ) -> Vec<([u8; 32], Option<Vec<u8>>)> {
+    pub fn get_republish_sources(&self, interval: Duration) -> Vec<([u8; 32], Option<Vec<u8>>)> {
         let mut state = self.state.write();
         let Some(republish_threshold) = SystemTime::now().checked_sub(interval) else {
             warn!("Failed to calculate republish threshold");
@@ -225,7 +222,9 @@ impl KademliaStateHandler {
         entries.insert(value);
 
         // Insert the key into the local expiration timer
-        state.store_timer.insert(key, Some(node_addr.node_id), signature);
+        state
+            .store_timer
+            .insert(key, Some(node_addr.node_id), signature);
 
         // Always update the node address mapping
         state

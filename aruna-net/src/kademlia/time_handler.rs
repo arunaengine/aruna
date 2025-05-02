@@ -22,7 +22,12 @@ impl Key {
     }
 
     #[allow(dead_code)]
-    fn with_timestamp(key: [u8; 32], node_id: Option<NodeId>, timestamp: SystemTime, signature: Option<Vec<u8>>) -> Self {
+    fn with_timestamp(
+        key: [u8; 32],
+        node_id: Option<NodeId>,
+        timestamp: SystemTime,
+        signature: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             created: timestamp,
             key,
