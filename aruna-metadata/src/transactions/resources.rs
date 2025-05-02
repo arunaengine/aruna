@@ -1,6 +1,6 @@
 use super::request::Request;
 use crate::{
-    error::ArunaError,
+    error::ArunaMetadataError,
     models::{
         models::{Resource, User},
         requests::{
@@ -13,9 +13,10 @@ use crate::{
         },
     },
     network::network_trait::Network,
-    persistence::{persistence::Authorize, search::search::Search, storage::store::Store},
+    persistence::{persistence::Authorize, search::search::Search},
 };
 use ulid::Ulid;
+use aruna_storage::storage::store::Store;
 
 #[async_trait::async_trait]
 impl<St, Se, N> Request<St, Se, N> for CreateResourceRequest
@@ -30,17 +31,17 @@ where
         self,
         user: Option<User>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Self::Response, crate::error::ArunaError> {
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaError::Unauthorized);
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
         if !controller.persistence.authorize(&user.id, &self.parent_id) {
-            return Err(crate::error::ArunaError::Unauthorized);
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
 
         let time = chrono::Utc::now().timestamp_millis();
         let time = chrono::DateTime::from_timestamp_millis(time).ok_or_else(|| {
-            ArunaError::ConversionError {
+            ArunaMetadataError::ConversionError {
                 from: "i64".to_string(),
                 to: "Chrono::DateTime".to_string(),
             }
@@ -73,7 +74,7 @@ where
                 node_id
                     .as_slice()
                     .try_into()
-                    .map_err(|_e| ArunaError::ConversionError {
+                    .map_err(|_e| ArunaMetadataError::ConversionError {
                         from: "Vec<u8>".to_string(),
                         to: "&[u8; 32]".to_string(),
                     })?,
@@ -109,13 +110,13 @@ where
         self,
         user: Option<User>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Self::Response, crate::error::ArunaError> {
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaError::Unauthorized);
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
         for id in &self.ids {
             if !controller.persistence.authorize(&user.id, id) {
-                return Err(crate::error::ArunaError::Unauthorized);
+                return Err(crate::error::ArunaMetadataError::Unauthorized);
             };
         }
         let persistor = controller.persistence.clone();
@@ -137,12 +138,12 @@ where
         self,
         user: Option<User>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Self::Response, crate::error::ArunaError> {
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaError::Unauthorized);
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
         if !controller.persistence.authorize(&user.id, &self.get_id()) {
-            return Err(crate::error::ArunaError::Unauthorized);
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
 
         let id = self.get_id();
@@ -154,7 +155,7 @@ where
             .await?
             .first()
             .cloned()
-            .ok_or_else(|| ArunaError::NotFound(format!("Resource {id} not found")))?;
+            .ok_or_else(|| ArunaMetadataError::NotFound(format!("Resource {id} not found")))?;
         resource.last_modified = updated;
 
         let response = match self {
@@ -236,7 +237,7 @@ where
                 node_id
                     .as_slice()
                     .try_into()
-                    .map_err(|_e| ArunaError::ConversionError {
+                    .map_err(|_e| ArunaMetadataError::ConversionError {
                         from: "Vec<u8>".to_string(),
                         to: "&[u8; 32]".to_string(),
                     })?,

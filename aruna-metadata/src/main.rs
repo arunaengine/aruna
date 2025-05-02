@@ -1,6 +1,9 @@
 use crate::network::network_trait::NetworkConfig;
 use crate::persistence::persistence::Persistor;
+use crate::persistence::persistence::tables::*;
 use api::server::RestServer;
+use aruna_storage::storage::lmdb::LmdbConfig;
+use aruna_storage::storage::lmdb::LmdbStore;
 use iroh::KeyParsingError;
 use iroh::NodeAddr;
 use iroh::PublicKey;
@@ -12,18 +15,11 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use persistence::search::tantivy::TantivyConfig;
 use persistence::search::tantivy::TantivySearch;
-use persistence::storage::fjall::FjallConfig;
-use persistence::storage::fjall::FjallStore;
-use persistence::storage::lmdb::LmdbConfig;
-use persistence::storage::lmdb::LmdbStore;
-use persistence::storage::redb::Redb;
-use persistence::storage::redb::RedbConfig;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
-use tracing::trace;
+use tracing::{error, trace};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 use transactions::controller::Controller;
@@ -58,7 +54,7 @@ async fn main() {
         .unwrap_or("none".into())
         //.add_directive("aruna_metadata=info".parse().unwrap())
         .add_directive("tower_http=info".parse().unwrap());
-        //.add_directive("aruna_net=info".parse().unwrap());
+    //.add_directive("aruna_net=info".parse().unwrap());
 
     let telemetry_layer = tracing_opentelemetry::layer()
         .with_tracer(provider)
@@ -109,7 +105,6 @@ async fn main() {
     );
 
     let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
-    let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
     let tantivy_path = format!("{path}/tantivy");
     let search_config = TantivyConfig {
         path: tantivy_path,
@@ -129,14 +124,15 @@ async fn main() {
                 continue;
             }
 
-            println!("{} deadlocks detected", deadlocks.len());
+            error!("{} deadlocks detected", deadlocks.len());
             for (i, threads) in deadlocks.iter().enumerate() {
-                println!("Deadlock #{}", i);
+                trace!("Deadlock #{}", i);
                 for t in threads {
-                    println!("Thread Id {:#?}", t.thread_id());
-                    println!("{:#?}", t.backtrace());
+                    trace!("Thread Id {:#?}", t.thread_id());
+                    trace!("{:#?}", t.backtrace());
                 }
             }
+            panic!("Deadlock detected");
         }
     });
 
@@ -145,11 +141,16 @@ async fn main() {
             let store_path = format!("{path}/heed");
             let store_config = LmdbConfig {
                 path: store_path,
-                res_sdx,
-                idx_sdx,
+                databases: vec![
+                    RESOURCE_DB_NAME,
+                    RESOURCE_MAPPINGS_DB_NAME,
+                    USER_DB_NAME,
+                    USER_MAPPINGS_DB_NAME,
+                    PUBLIC_MAPPINGS_DB_NAME,
+                ],
             };
             let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-                Persistor::new(idx_rcv, store_config, search_config)
+                Persistor::new(res_sdx, store_config, search_config)
                     .await
                     .unwrap(),
             );
@@ -175,74 +176,74 @@ async fn main() {
                 .unwrap()
                 .unwrap();
         }
-        "REDB" => {
-            let store_path = format!("{path}/redb");
-            let store_config = RedbConfig {
-                path: store_path,
-                res_sdx,
-                idx_sdx,
-            };
+        // "REDB" => {
+        //     let store_path = format!("{path}/redb");
+        //     let store_config = RedbConfig {
+        //         path: store_path,
+        //         res_sdx,
+        //         idx_sdx,
+        //     };
 
-            let persistor = Arc::new(
-                Persistor::new(idx_rcv, store_config, search_config)
-                    .await
-                    .unwrap(),
-            );
+        //     let persistor = Arc::new(
+        //         Persistor::new(idx_rcv, store_config, search_config)
+        //             .await
+        //             .unwrap(),
+        //     );
 
-            let network =
-                P2PNetwork::<Redb, TantivySearch>::new(NetworkConfig::<Redb, TantivySearch> {
-                    secret_key: p2p_secret_key,
-                    socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
-                    bootstrap_nodes,
-                    persistor: persistor.clone(),
-                })
-                .await;
+        //     let network =
+        //         P2PNetwork::<Redb, TantivySearch>::new(NetworkConfig::<Redb, TantivySearch> {
+        //             secret_key: p2p_secret_key,
+        //             socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
+        //             bootstrap_nodes,
+        //             persistor: persistor.clone(),
+        //         })
+        //         .await;
 
-            let controller = Arc::new(Controller::<
-                Redb,
-                TantivySearch,
-                P2PNetwork<Redb, TantivySearch>,
-            >::new(persistor, network));
+        //     let controller = Arc::new(Controller::<
+        //         Redb,
+        //         TantivySearch,
+        //         P2PNetwork<Redb, TantivySearch>,
+        //     >::new(persistor, network));
 
-            tokio::spawn(async move { RestServer::run(controller, api_port).await })
-                .await
-                .unwrap()
-                .unwrap();
-        }
-        "FJALL" => {
-            let store_path = format!("{path}/fjall");
-            let store_config = FjallConfig {
-                path: store_path,
-                res_sdx,
-                idx_sdx,
-            };
-            let persistor = Arc::new(
-                Persistor::new(idx_rcv, store_config, search_config)
-                    .await
-                    .unwrap(),
-            );
-            let network = P2PNetwork::<FjallStore, TantivySearch>::new(NetworkConfig::<
-                FjallStore,
-                TantivySearch,
-            > {
-                secret_key: p2p_secret_key,
-                socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
-                bootstrap_nodes,
-                persistor: persistor.clone(),
-            })
-            .await;
+        //     tokio::spawn(async move { RestServer::run(controller, api_port).await })
+        //         .await
+        //         .unwrap()
+        //         .unwrap();
+        // }
+        // "FJALL" => {
+        //     let store_path = format!("{path}/fjall");
+        //     let store_config = FjallConfig {
+        //         path: store_path,
+        //         res_sdx,
+        //         idx_sdx,
+        //     };
+        //     let persistor = Arc::new(
+        //         Persistor::new(idx_rcv, store_config, search_config)
+        //             .await
+        //             .unwrap(),
+        //     );
+        //     let network = P2PNetwork::<FjallStore, TantivySearch>::new(NetworkConfig::<
+        //         FjallStore,
+        //         TantivySearch,
+        //     > {
+        //         secret_key: p2p_secret_key,
+        //         socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
+        //         bootstrap_nodes,
+        //         persistor: persistor.clone(),
+        //     })
+        //     .await;
 
-            let controller = Arc::new(Controller::<
-                FjallStore,
-                TantivySearch,
-                P2PNetwork<FjallStore, TantivySearch>,
-            >::new(persistor, network));
+        //     let controller = Arc::new(Controller::<
+        //         FjallStore,
+        //         TantivySearch,
+        //         P2PNetwork<FjallStore, TantivySearch>,
+        //     >::new(persistor, network));
 
-            tokio::spawn(async move { RestServer::run(controller, api_port).await })
-                .await
-                .unwrap()
-                .unwrap();
-        }
+        //     tokio::spawn(async move { RestServer::run(controller, api_port).await })
+        //         .await
+        //         .unwrap()
+        //         .unwrap();
+        // }
         _ => panic!("Invalid variant selected"),
     }
 }

@@ -1,5 +1,5 @@
 use super::search::Search;
-use crate::{error::ArunaError, models::models::Resource, persistence::persistence::Authorize};
+use crate::{error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize};
 use roaring::RoaringBitmap;
 use std::fs;
 use tantivy::{
@@ -60,7 +60,7 @@ pub struct TantivyConfig {
 impl Search for TantivySearch {
     type SearchConfig = TantivyConfig;
     #[tracing::instrument(level = "trace", skip(config))]
-    fn new(mut config: Self::SearchConfig) -> Result<Self, ArunaError> {
+    fn new(mut config: Self::SearchConfig) -> Result<Self, ArunaMetadataError> {
         let (update_queue_sdx, mut update_queue_rcv) = tokio::sync::mpsc::channel(1000);
         // First we need to define a schema ...
 
@@ -107,7 +107,7 @@ impl Search for TantivySearch {
 
         fs::create_dir_all(&config.path)?;
         let dir = MmapDirectory::open(config.path)
-            .map_err(|e| ArunaError::DatabaseError(e.to_string()))?;
+            .map_err(|e| ArunaMetadataError::DatabaseError(e.to_string()))?;
 
         let schema = schema_builder.build();
 
@@ -164,7 +164,7 @@ impl Search for TantivySearch {
         &self,
         universe: RoaringBitmap,
         query: String,
-    ) -> Result<Vec<String>, ArunaError> {
+    ) -> Result<Vec<String>, ArunaMetadataError> {
         let searcher = self.reader.searcher();
         let parser = QueryParser::for_index(
             &self.index,
@@ -208,7 +208,7 @@ impl Search for TantivySearch {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn add_resource(&self, idx: u32, resource: Resource) -> Result<(), ArunaError> {
+    async fn add_resource(&self, idx: u32, resource: Resource) -> Result<(), ArunaMetadataError> {
         //        let mut writer = self.writer.lock().expect("Mutex panicked");
         //        let doc = self.fields.create_doc(idx, resource);
         //        writer.add_document(doc)?;
@@ -219,24 +219,14 @@ impl Search for TantivySearch {
         self.writer
             .send((idx, resource))
             .await
-            .map_err(|e| ArunaError::ServerError(e.to_string()))?;
+            .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
 
         Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    fn remove(&self, _id: Ulid) -> Result<(), ArunaError> {
+    fn remove(&self, _id: Ulid) -> Result<(), ArunaMetadataError> {
         todo!()
-    }
-
-    #[tracing::instrument(level = "trace", skip(self))]
-    async fn purge(&self) -> Result<(), ArunaError> {
-        // let _ = self
-        //     .writer
-        //     .lock()
-        //     .expect("Mutex panicked")
-        //     .delete_all_documents()?;
-        Ok(())
     }
 }
 

@@ -1,20 +1,19 @@
-use crate::{error::ArunaError, models::models::Resource, persistence::persistence::Authorize};
+use crate::{error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize};
 use roaring::RoaringBitmap;
 use ulid::Ulid;
 
 pub trait Search: Sync + Send + Sized + std::fmt::Debug {
     type SearchConfig: Send;
-    fn new(config: Self::SearchConfig) -> Result<Self, ArunaError>;
+    fn new(config: Self::SearchConfig) -> Result<Self, ArunaMetadataError>;
     fn search<A: Authorize>(
         &self,
         universe: RoaringBitmap,
         query: String,
-    ) -> Result<Vec<String>, ArunaError>;
+    ) -> Result<Vec<String>, ArunaMetadataError>;
     fn add_resource(
         &self,
         idx: u32,
         resource: Resource,
-    ) -> impl Future<Output = Result<(), ArunaError>> + Send;
-    fn remove(&self, id: Ulid) -> Result<(), ArunaError>;
-    fn purge(&self) -> impl std::future::Future<Output = Result<(), ArunaError>> + Send;
+    ) -> impl Future<Output = Result<(), ArunaMetadataError>> + Send;
+    fn remove(&self, id: Ulid) -> Result<(), ArunaMetadataError>;
 }

@@ -1,14 +1,6 @@
 use crate::error::ArunaStorageError;
 use std::borrow::Cow;
 
-// pub mod tables {
-//     pub const RESOURCE_DB_NAME: &str = "resources";
-//     pub const RESOURCE_MAPPINGS_DB_NAME: &str = "resource_mappings";
-//     pub const USER_DB_NAME: &str = "users";
-//     pub const USER_MAPPINGS_DB_NAME: &str = "user_mappings";
-//     pub const PUBLIC_MAPPINGS_DB_NAME: &str = "public_mappings";
-// }
-
 pub trait Store<'a>: Sync + Send + Sized + std::fmt::Debug {
     type StoreConfig: Send;
     type Txn;

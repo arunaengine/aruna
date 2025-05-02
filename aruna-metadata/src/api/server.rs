@@ -1,7 +1,7 @@
 use crate::{
-    error::ArunaError,
+    error::ArunaMetadataError,
     network::network_trait::Network,
-    persistence::{search::search::Search, storage::store::Store},
+    persistence::search::search::Search,
     transactions::controller::Controller,
 };
 use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};
@@ -10,7 +10,7 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
-
+use aruna_storage::storage::store::Store;
 use super::openapi::{self, ArunaApi};
 
 pub struct RestServer {}
@@ -20,7 +20,7 @@ impl RestServer {
     pub async fn run<St, Se, N>(
         handler: Arc<Controller<St, Se, N>>,
         rest_port: u16,
-    ) -> Result<(), ArunaError>
+    ) -> Result<(), ArunaMetadataError>
     where
         for<'a> St: Store<'a> + 'static,
         Se: Search + 'static,
@@ -48,7 +48,7 @@ impl RestServer {
             .layer(DefaultBodyLimit::max(1024 * 1024 * 1024));
         axum::serve(listener, app.into_make_service())
             .await
-            .map_err(|e| ArunaError::ServerError(e.to_string()))?;
+            .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
 
         Ok(())
     }

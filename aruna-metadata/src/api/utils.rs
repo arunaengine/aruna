@@ -1,7 +1,7 @@
 use axum::{Json, http::HeaderMap, response::IntoResponse};
 use serde::Serialize;
 
-use crate::error::ArunaError;
+use crate::error::ArunaMetadataError;
 
 pub(super) fn extract_token(header: &HeaderMap) -> Option<String> {
     header
@@ -11,7 +11,7 @@ pub(super) fn extract_token(header: &HeaderMap) -> Option<String> {
         .map(|v| v.to_string())
 }
 
-pub fn into_axum_response<T: Serialize>(response: Result<T, ArunaError>) -> impl IntoResponse {
+pub fn into_axum_response<T: Serialize>(response: Result<T, ArunaMetadataError>) -> impl IntoResponse {
     response
         .map(|r| (axum::http::StatusCode::OK, Json(r)).into_response())
         .unwrap_or_else(|e| e.into_axum_tuple().into_response())

@@ -1,29 +1,31 @@
 use super::{
     search::search::Search,
-    storage::store::{
-        Store,
-        tables::{
-            PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME, RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME,
-            USER_MAPPINGS_DB_NAME,
-        },
-    },
     utils::{create_mappings, idx_from_cow, update_mappings, visiblity_from_doc},
 };
 use crate::{
-    error::ArunaError,
+    error::ArunaMetadataError,
     models::models::{Resource, User},
     network::network_trait::{Body, MetadataMessage},
+    persistence::persistence::tables::*,
 };
+use aruna_storage::storage::store::Store;
 use automerge::ActorId;
 use autosurgeon::{hydrate, reconcile};
 use roaring::RoaringBitmap;
 use std::sync::{Arc, atomic::AtomicU32};
-use tokio::join;
 use tracing::trace;
 use ulid::Ulid;
 
 pub trait Authorize {
     fn authorize(&self, user_id: &Ulid, resource_id: &Ulid) -> bool;
+}
+
+pub mod tables {
+    pub const RESOURCE_DB_NAME: &str = "resources";
+    pub const RESOURCE_MAPPINGS_DB_NAME: &str = "resource_mappings";
+    pub const USER_DB_NAME: &str = "users";
+    pub const USER_MAPPINGS_DB_NAME: &str = "user_mappings";
+    pub const PUBLIC_MAPPINGS_DB_NAME: &str = "public_mappings";
 }
 
 #[derive(Debug)]
@@ -44,23 +46,79 @@ where
 {
     #[tracing::instrument(level = "trace", skip(store_config, search_config))]
     pub async fn new(
-        idx_rcv: tokio::sync::oneshot::Receiver<u32>,
+        res_sdx: tokio::sync::mpsc::Sender<(u32, Resource)>,
         store_config: <St as Store<'static>>::StoreConfig,
         search_config: Se::SearchConfig,
-    ) -> Result<Self, ArunaError> {
-        let store = tokio::task::spawn_blocking(move || Arc::new(St::new(store_config).unwrap()));
-
+    ) -> Result<Self, ArunaMetadataError> {
+        let store = Arc::new(St::new(store_config).unwrap());
         let search = tokio::task::spawn_blocking(move || {
             let search = Se::new(search_config)?;
-            Ok::<Arc<Se>, ArunaError>(Arc::new(search))
+            Ok::<Arc<Se>, ArunaMetadataError>(Arc::new(search))
         });
-        let (store_result, search_result) = join!(store, search);
-        let (store, search) = (store_result.unwrap(), search_result.unwrap().unwrap());
 
-        let waiter = idx_rcv
-            .await
-            .map_err(|e| ArunaError::DatabaseError(e.to_string()))?;
-        let idx_counter = Arc::new(AtomicU32::new(waiter));
+        let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
+
+        let store_clone = store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut txn = store_clone.create_txn(true)?;
+
+            let resource_iter = store_clone.iter_db(&txn, RESOURCE_DB_NAME)?;
+            for resource in resource_iter {
+                let (id, res) = resource;
+                let idx = store_clone
+                    .get(&txn, RESOURCE_MAPPINGS_DB_NAME, id.as_ref())?
+                    .expect("No valid mapping found"); // TODO: Remove unwraps and replace with
+
+                let doc = automerge::AutoCommit::load(res.as_ref())?;
+                let resource: Resource = autosurgeon::hydrate(&doc)?;
+
+                let idx = u32::from_be_bytes(idx.as_ref().try_into().map_err(|_| {
+                    ArunaMetadataError::ConversionError {
+                        from: "Cow<'_, [u8]>".to_string(),
+                        to: "&[u8;4]".to_string(),
+                    }
+                })?);
+                // new idx because this is a local only sorting
+                res_sdx
+                    .blocking_send((idx, resource))
+                    .map_err(|e| ArunaMetadataError::DatabaseError(e.to_string()))?;
+            }
+
+            let idx: u32 = store_clone
+                .iter_db(&txn, RESOURCE_MAPPINGS_DB_NAME)
+                .map_err(|e| ArunaMetadataError::DatabaseError(e.to_string()))?
+                .last()
+                .map(|(_, idx)| u32::from_be_bytes(idx.as_ref().try_into().unwrap()))
+                .unwrap_or(0);
+            idx_sdx
+                .send(idx)
+                .map_err(|e| ArunaMetadataError::DatabaseError(e.to_string()))?;
+
+            if store_clone
+                .get(&txn, PUBLIC_MAPPINGS_DB_NAME, &Ulid::default().to_bytes())?
+                .is_none()
+            {
+                let mut vec = Vec::new();
+                RoaringBitmap::new().serialize_into(&mut vec)?;
+
+                store_clone.put(
+                    &mut txn,
+                    PUBLIC_MAPPINGS_DB_NAME,
+                    &Ulid::default().to_bytes(),
+                    &vec,
+                )?;
+            }
+
+            store_clone
+                .commit(txn)
+                .map_err(|e| ArunaMetadataError::DatabaseError(e.to_string()))?;
+            Ok::<(), ArunaMetadataError>(())
+        });
+
+        let search = search.await.unwrap().unwrap();
+
+
+        let idx_counter = Arc::new(AtomicU32::new(idx_rcv.await.unwrap()));
 
         Ok(Self {
             store,
@@ -75,7 +133,7 @@ where
         actor_id: &[u8; 32],
         user_id: &Ulid,
         resource: Resource,
-    ) -> Result<Vec<u8>, ArunaError> {
+    ) -> Result<Vec<u8>, ArunaMetadataError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let user_id = *user_id;
@@ -110,10 +168,10 @@ where
             create_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx)?;
 
             store.commit(write_txn)?;
-            Ok::<Vec<u8>, ArunaError>(res)
+            Ok::<Vec<u8>, ArunaMetadataError>(res)
         })
         .await
-        .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
 
         search.add_resource(idx, res_clone).await?;
 
@@ -121,7 +179,7 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn get_resources(&self, ids: Vec<Ulid>) -> Result<Vec<Resource>, ArunaError> {
+    pub async fn get_resources(&self, ids: Vec<Ulid>) -> Result<Vec<Resource>, ArunaMetadataError> {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
             let read_txn = store.create_txn(false)?;
@@ -129,7 +187,7 @@ where
             for id in &ids {
                 let byte_id = id.to_bytes();
                 let Some(res) = store.get(&read_txn, RESOURCE_DB_NAME, &byte_id)? else {
-                    return Err(ArunaError::NotFound(format!("{id} not found")));
+                    return Err(ArunaMetadataError::NotFound(format!("{id} not found")));
                 };
 
                 let doc = automerge::AutoCommit::load(res.as_ref())?;
@@ -141,12 +199,16 @@ where
             Ok(result)
         })
         .await
-        .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
         Ok(result)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn add_user(&self, actor_id: &[u8; 32], user: User) -> Result<Vec<u8>, ArunaError> {
+    pub async fn add_user(
+        &self,
+        actor_id: &[u8; 32],
+        user: User,
+    ) -> Result<Vec<u8>, ArunaMetadataError> {
         let store = self.store.clone();
         let actor_id = ActorId::from([user.id.to_bytes().as_slice(), actor_id.as_slice()].concat());
         let result = tokio::task::spawn_blocking(move || {
@@ -169,15 +231,15 @@ where
 
             // Commit
             store.commit(write_txn)?;
-            Ok::<Vec<u8>, ArunaError>(user)
+            Ok::<Vec<u8>, ArunaMetadataError>(user)
         })
         .await
-        .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
         Ok(result)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn get_user(&self, id: &Ulid) -> Result<Option<User>, ArunaError> {
+    pub async fn get_user(&self, id: &Ulid) -> Result<Option<User>, ArunaMetadataError> {
         let store = self.store.clone();
         let id = *id;
         let result = tokio::task::spawn_blocking(move || {
@@ -193,10 +255,10 @@ where
                 None
             };
             store.commit(read_txn)?;
-            Ok::<Option<User>, ArunaError>(user)
+            Ok::<Option<User>, ArunaMetadataError>(user)
         })
         .await
-        .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
         Ok(result)
     }
 
@@ -205,14 +267,14 @@ where
         &self,
         user: Option<Ulid>,
         query: String,
-    ) -> Result<Vec<String>, ArunaError> {
+    ) -> Result<Vec<String>, ArunaMetadataError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let result = tokio::task::spawn_blocking(move || {
             let read_txn = store.create_txn(false)?;
             let id = Ulid::default().to_bytes();
             let Some(bytes) = store.get(&read_txn, PUBLIC_MAPPINGS_DB_NAME, &id)? else {
-                return Err(ArunaError::DatabaseError(
+                return Err(ArunaMetadataError::DatabaseError(
                     "Public universe not found".to_string(),
                 ));
             };
@@ -229,21 +291,8 @@ where
             search.search::<Self>(universe, query)
         })
         .await
-        .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
         Ok(result)
-    }
-
-    #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn clear(&self) -> Result<(), ArunaError> {
-        self.search.purge().await?;
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            store.purge()?;
-            Ok::<(), ArunaError>(())
-        })
-        .await
-        .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
-        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -252,7 +301,7 @@ where
         actor_id: &[u8; 32],
         user_id: &Ulid,
         resource: Resource,
-    ) -> Result<Vec<u8>, ArunaError> {
+    ) -> Result<Vec<u8>, ArunaMetadataError> {
         // Clones for spawn_blocking
         let store = self.store.clone();
         let search = self.search.clone();
@@ -264,20 +313,22 @@ where
         let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
 
         let (result, idx) =
-            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, u32), ArunaError> {
+            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, u32), ArunaMetadataError> {
                 let mut write_txn = store.create_txn(true)?;
 
                 let idx = idx_from_cow(
                     store
                         .get(&write_txn, RESOURCE_MAPPINGS_DB_NAME, &resource_id)?
                         .ok_or_else(|| {
-                            ArunaError::NotFound(format!("{} not found", resource.id))
+                            ArunaMetadataError::NotFound(format!("{} not found", resource.id))
                         })?,
                 )?;
 
                 let res = store
                     .get(&write_txn, RESOURCE_DB_NAME, &resource_id)?
-                    .ok_or_else(|| ArunaError::NotFound(format!("{} not found", resource.id)))?;
+                    .ok_or_else(|| {
+                        ArunaMetadataError::NotFound(format!("{} not found", resource.id))
+                    })?;
 
                 let mut doc = automerge::AutoCommit::load(res.as_ref())?.with_actor(actor_id);
                 let visibility = visiblity_from_doc(&doc)?;
@@ -303,10 +354,10 @@ where
                 }
 
                 store.commit(write_txn)?;
-                Ok::<(Vec<u8>, u32), ArunaError>((res, idx))
+                Ok::<(Vec<u8>, u32), ArunaMetadataError>((res, idx))
             })
             .await
-            .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
+            .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
 
         search.add_resource(idx, res_clone).await?;
 
@@ -317,7 +368,7 @@ where
     pub async fn handle_message(
         &self,
         msg: MetadataMessage,
-    ) -> Result<MetadataMessage, ArunaError> {
+    ) -> Result<MetadataMessage, ArunaMetadataError> {
         match msg.body {
             crate::network::network_trait::Body::User(_doc) => {
                 // TODO: Add or merge user
@@ -337,18 +388,18 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn handle_object_merges(&self, doc: Vec<u8>) -> Result<(), ArunaError> {
+    pub async fn handle_object_merges(&self, doc: Vec<u8>) -> Result<(), ArunaMetadataError> {
         let store = self.store.clone();
         let idx_counter = self.idx_counter.clone();
         let (idx, resource) =
-            tokio::task::spawn_blocking(move || -> Result<(u32, Resource), ArunaError> {
+            tokio::task::spawn_blocking(move || -> Result<(u32, Resource), ArunaMetadataError> {
                 let mut wtxn = store.create_txn(true)?;
 
                 // Parse document, actor_id and ulid
                 let mut doc = automerge::AutoCommit::load(doc.as_ref())?;
                 let (user_id_bytes, _node_pubkey) = doc.get_actor().to_bytes().split_at(16);
                 let user_id = Ulid::from_bytes(user_id_bytes.try_into().map_err(|_e| {
-                    ArunaError::ConversionError {
+                    ArunaMetadataError::ConversionError {
                         from: "[u8]".to_string(),
                         to: "[u8;16]".to_string(),
                     }
@@ -367,7 +418,7 @@ where
                                 store
                                     .get(&wtxn, RESOURCE_MAPPINGS_DB_NAME, &ulid_bytes)?
                                     .ok_or_else(|| {
-                                        ArunaError::NotFound(format!(
+                                        ArunaMetadataError::NotFound(format!(
                                             "Idx not found for object with id {}",
                                             foreign_resource.id
                                         ))
@@ -408,10 +459,10 @@ where
                 }
 
                 store.commit(wtxn)?;
-                Ok::<(u32, Resource), ArunaError>((idx, result))
+                Ok::<(u32, Resource), ArunaMetadataError>((idx, result))
             })
             .await
-            .map_err(|_e| ArunaError::ServerError("Join task error".to_string()))??;
+            .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
 
         // Update search idx
         self.search.add_resource(idx, resource).await?;

@@ -1,10 +1,11 @@
 use super::controller::Controller;
 use crate::{
-    error::ArunaError,
+    error::ArunaMetadataError,
     models::models::User,
     network::network_trait::Network,
-    persistence::{search::search::Search, storage::store::Store},
+    persistence::search::search::Search,
 };
+use aruna_storage::storage::store::Store;
 
 #[async_trait::async_trait]
 pub trait Request<St, Se, N>
@@ -18,5 +19,5 @@ where
         self,
         requester: Option<User>,
         controller: &Controller<St, Se, N>,
-    ) -> Result<Self::Response, ArunaError>;
+    ) -> Result<Self::Response, ArunaMetadataError>;
 }

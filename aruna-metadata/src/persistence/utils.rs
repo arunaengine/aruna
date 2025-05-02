@@ -1,21 +1,18 @@
 use std::borrow::Cow;
-
+use aruna_storage::storage::store::Store;
 use automerge::ReadDoc;
 use roaring::RoaringBitmap;
 use ulid::Ulid;
-
 use crate::{
-    error::ArunaError,
+    error::ArunaMetadataError,
     models::models::{Resource, VisibilityClass},
-    persistence::storage::store::{
-        Store,
+    persistence::persistence::
         tables::{PUBLIC_MAPPINGS_DB_NAME, USER_MAPPINGS_DB_NAME},
-    },
 };
 
-pub(super) fn idx_from_cow<'a>(cow: Cow<'a, [u8]>) -> Result<u32, ArunaError> {
+pub(super) fn idx_from_cow<'a>(cow: Cow<'a, [u8]>) -> Result<u32, ArunaMetadataError> {
     Ok(u32::from_be_bytes(cow.as_ref().try_into().map_err(
-        |_e| ArunaError::ConversionError {
+        |_e| ArunaMetadataError::ConversionError {
             from: "&[u8]".to_string(),
             to: "&[u8; 4]".to_string(),
         },
@@ -24,25 +21,25 @@ pub(super) fn idx_from_cow<'a>(cow: Cow<'a, [u8]>) -> Result<u32, ArunaError> {
 
 pub(super) fn visiblity_from_doc(
     doc: &automerge::AutoCommit,
-) -> Result<VisibilityClass, ArunaError> {
+) -> Result<VisibilityClass, ArunaMetadataError> {
     Ok(
         match doc
             .get(automerge::ROOT, "visibility")?
-            .ok_or_else(|| ArunaError::DeserializeError("visibility field not found".to_string()))?
+            .ok_or_else(|| ArunaMetadataError::DeserializeError("visibility field not found".to_string()))?
         {
             (automerge::Value::Scalar(cow), _) => match cow.to_str() {
                 Some("Private") => VisibilityClass::Private,
                 Some("Public") => VisibilityClass::Public,
                 Some("Invisible") => VisibilityClass::Invisible,
                 _ => {
-                    return Err(ArunaError::ConversionError {
+                    return Err(ArunaMetadataError::ConversionError {
                         from: "Cow".to_string(),
                         to: "VisibilityClass".to_string(),
                     });
                 }
             },
             (_, _) => {
-                return Err(ArunaError::ConversionError {
+                return Err(ArunaMetadataError::ConversionError {
                     from: "Cow".to_string(),
                     to: "VisibilityClass".to_string(),
                 });
@@ -57,7 +54,7 @@ pub(super) fn update_mappings<'a, 'b, S>(
     resource: Resource,
     user_id: &Ulid,
     idx: u32,
-) -> Result<(), ArunaError>
+) -> Result<(), ArunaMetadataError>
 where
     'a: 'b,
     S: Store<'a> + Send + Sync,
@@ -79,7 +76,7 @@ where
         let public_id = Ulid::default().to_bytes();
         let res = store
             .get(txn, PUBLIC_MAPPINGS_DB_NAME, &public_id)?
-            .ok_or_else(|| ArunaError::NotFound("No public mapping found".to_string()))?;
+            .ok_or_else(|| ArunaMetadataError::NotFound("No public mapping found".to_string()))?;
         let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
         mut_map.remove(idx);
         let mut bitmap = Vec::new();
@@ -90,7 +87,7 @@ where
         let public_id = Ulid::default().to_bytes();
         let res = store
             .get(txn, PUBLIC_MAPPINGS_DB_NAME, &public_id)?
-            .ok_or_else(|| ArunaError::NotFound("No public mapping found".to_string()))?;
+            .ok_or_else(|| ArunaMetadataError::NotFound("No public mapping found".to_string()))?;
         let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
         mut_map.insert(idx);
         let mut bitmap = Vec::new();
@@ -117,7 +114,7 @@ pub(super) fn create_mappings<'a, 'b, S>(
     resource: Resource,
     user_id: &Ulid,
     idx: u32,
-) -> Result<(), ArunaError>
+) -> Result<(), ArunaMetadataError>
 where
     'a: 'b,
     S: Store<'a> + Send + Sync + Sized,
@@ -138,7 +135,7 @@ where
         let public_id = Ulid::default().to_bytes();
         let res = store
             .get(txn, PUBLIC_MAPPINGS_DB_NAME, &public_id)?
-            .ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
+            .ok_or_else(|| ArunaMetadataError::NotFound("No user mapping found".to_string()))?;
         let mut mut_map = RoaringBitmap::deserialize_from(res.as_ref())?;
         mut_map.insert(idx);
         let mut bitmap = Vec::new();

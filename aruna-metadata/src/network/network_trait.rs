@@ -1,6 +1,6 @@
 use crate::{
-    error::ArunaError,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    error::ArunaMetadataError,
+    persistence::{persistence::Persistor, search::search::Search},
 };
 use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
 use iroh::{NodeAddr, PublicKey, SecretKey};
@@ -9,6 +9,7 @@ use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, trace};
 use ulid::Ulid;
+use aruna_storage::storage::store::Store;
 
 pub static METADATA_PROTOCOL_ID: u32 = 3;
 pub static REPLICATION_POLICY: usize = 1;
@@ -35,9 +36,9 @@ pub enum Body {
 pub trait Network: Sync + Send {
     type Config;
     async fn new(config: Self::Config) -> Self;
-    async fn get_id(&self) -> Result<Vec<u8>, ArunaError>;
-    async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError>;
-    async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaError>;
+    async fn get_id(&self) -> Result<Vec<u8>, ArunaMetadataError>;
+    async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
+    async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
 }
 
 pub struct NetworkDummy {
@@ -52,13 +53,13 @@ impl Network for NetworkDummy {
             self_id: NodeAddr::new(PublicKey::from_bytes(&[0u8; 32]).unwrap()),
         }
     }
-    async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
+    async fn get_id(&self) -> Result<Vec<u8>, ArunaMetadataError> {
         Ok(self.self_id.node_id.as_bytes().to_vec())
     }
-    async fn replicate(&self, _body: Body, _subject_id: &Ulid) -> Result<(), ArunaError> {
+    async fn replicate(&self, _body: Body, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
         Ok(())
     }
-    async fn store(&self, _subject_id: &Ulid) -> Result<(), ArunaError> {
+    async fn store(&self, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
         Ok(())
     }
 }
@@ -117,15 +118,15 @@ where
         }
     }
 
-    async fn get_id(&self) -> Result<Vec<u8>, ArunaError> {
+    async fn get_id(&self) -> Result<Vec<u8>, ArunaMetadataError> {
         self.chandler
             .get_node_addr()
             .await
-            .map_err(|e| ArunaError::NetworkError(e.to_string()))
+            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))
             .map(|addr| addr.node_id.as_bytes().to_vec())
     }
 
-    async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaError> {
+    async fn replicate(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
         trace!("Calling replicate");
         let chandler = self.chandler.clone();
         let kademlia = chandler.get_kademlia_actor_handle().await?;
@@ -170,10 +171,10 @@ where
                 sdx.write_u32(msg.len() as u32).await?;
                 sdx.write_all(msg.as_slice())
                     .await
-                    .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+                    .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
                 //chandler.store(*id_hash.as_bytes(), node).await?; // TODO: Move this to handle_stream in persistence
                 sdx.finish()
-                    .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+                    .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
                 counter += 1;
 
                 // TODO:
@@ -182,17 +183,17 @@ where
                 // - [X] Store when create
                 // - [] Store when rcv replicate msg
             }
-            Ok::<(), ArunaError>(())
+            Ok::<(), ArunaMetadataError>(())
         });
         Ok(())
     }
 
-    async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaError> {
+    async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
         let node_addr = self
             .chandler
             .get_node_addr()
             .await
-            .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
 
         let kademlia = self.chandler.get_kademlia_actor_handle().await?;
         let subject_id = *subject_id;
@@ -202,7 +203,7 @@ where
             chunk_hasher.update(subject_id.to_bytes().as_slice());
             let id_hash = chunk_hasher.finalize();
             kademlia.store(*id_hash.as_bytes(), node_addr, None).await?;
-            Ok::<(), ArunaError>(())
+            Ok::<(), ArunaMetadataError>(())
         });
         Ok(())
     }
@@ -213,7 +214,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
-    async fn start_actor(&self, persistor: Arc<Persistor<St, Se>>) -> Result<(), ArunaError> {
+    async fn start_actor(&self, persistor: Arc<Persistor<St, Se>>) -> Result<(), ArunaMetadataError> {
         let mut recv_stream = self.chandler.receive().await?;
         while let Ok(len) = recv_stream.recv_stream.read_u32().await {
             trace!("Got something");
@@ -225,9 +226,9 @@ where
                 .recv_stream
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
             let message = postcard::from_bytes::<MetadataMessage>(&buf).map_err(|e| {
-                ArunaError::NetworkError(format!("Failed to deserialize message: {e:#}"))
+                ArunaMetadataError::NetworkError(format!("Failed to deserialize message: {e:#}"))
             })?;
             trace!("{message:?}");
             match persistor.handle_message(message).await {
@@ -244,7 +245,7 @@ where
                     recv_stream
                         .send_stream
                         .finish()
-                        .map_err(|e| ArunaError::NetworkError(e.to_string()))?;
+                        .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
                 }
                 Err(err) => return Err(err),
             }

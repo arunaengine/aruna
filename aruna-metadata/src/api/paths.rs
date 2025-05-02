@@ -1,8 +1,8 @@
 use crate::{
-    error::ArunaError,
+    error::ArunaMetadataError,
     models::requests::*,
     network::network_trait::Network,
-    persistence::{search::search::Search, storage::store::Store},
+    persistence::search::search::Search,
     transactions::controller::Controller,
 };
 use axum::{
@@ -13,6 +13,7 @@ use axum::{
 };
 use std::sync::Arc;
 use tags::*;
+use aruna_storage::storage::store::Store;
 
 use super::utils::{extract_token, into_axum_response};
 
@@ -33,7 +34,7 @@ mod tags {
     request_body = CreateResourceRequest,
     responses(
         (status = 200, body = CreateResourceResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -63,7 +64,7 @@ where
     ),
     responses(
         (status = 200, body = GetResourcesResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         (), // <-- make optional authentication
@@ -92,7 +93,7 @@ where
     request_body = UpdateResourceNameRequest,
     responses(
         (status = 200, body = UpdateResourceNameResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -120,7 +121,7 @@ where
         Ok(ResourceUpdateResponses::Name(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaError::DeserializeError("Internal response serialization error".to_string())
+        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
             .into_axum_tuple()
             .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
@@ -134,7 +135,7 @@ where
     request_body = UpdateResourceTitleRequest,
     responses(
         (status = 200, body = UpdateResourceTitleResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -162,7 +163,7 @@ where
         Ok(ResourceUpdateResponses::Title(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaError::DeserializeError("Internal response serialization error".to_string())
+        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
             .into_axum_tuple()
             .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
@@ -176,7 +177,7 @@ where
     request_body = UpdateResourceDescriptionRequest,
     responses(
         (status = 200, body = UpdateResourceDescriptionResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -204,7 +205,7 @@ where
         Ok(ResourceUpdateResponses::Description(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaError::DeserializeError("Internal response serialization error".to_string())
+        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
             .into_axum_tuple()
             .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
@@ -218,7 +219,7 @@ where
     request_body = UpdateResourceVisibilityRequest,
     responses(
         (status = 200, body = UpdateResourceVisibilityResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -246,7 +247,7 @@ where
         Ok(ResourceUpdateResponses::Visibility(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaError::DeserializeError("Internal response serialization error".to_string())
+        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
             .into_axum_tuple()
             .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
@@ -260,7 +261,7 @@ where
     request_body = UpdateResourceLicenseRequest,
     responses(
         (status = 200, body = UpdateResourceLicenseResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -288,7 +289,7 @@ where
         Ok(ResourceUpdateResponses::License(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaError::DeserializeError("Internal response serialization error".to_string())
+        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
             .into_axum_tuple()
             .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
@@ -302,7 +303,7 @@ where
     request_body = UpdateResourceLabelsRequest,
     responses(
         (status = 200, body = UpdateResourceLabelsResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -330,7 +331,7 @@ where
         Ok(ResourceUpdateResponses::Labels(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaError::DeserializeError("Internal response serialization error".to_string())
+        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
             .into_axum_tuple()
             .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
@@ -344,7 +345,7 @@ where
     request_body = UpdateResourceIdentifiersRequest,
     responses(
         (status = 200, body = UpdateResourceIdentifiersResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -372,7 +373,7 @@ where
         Ok(ResourceUpdateResponses::Identifiers(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaError::DeserializeError("Internal response serialization error".to_string())
+        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
             .into_axum_tuple()
             .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
@@ -386,7 +387,7 @@ where
     request_body = UpdateResourceAuthorsRequest,
     responses(
         (status = 200, body = UpdateResourceAuthorsResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])
@@ -414,7 +415,7 @@ where
         Ok(ResourceUpdateResponses::Authors(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaError::DeserializeError("Internal response serialization error".to_string())
+        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
             .into_axum_tuple()
             .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
@@ -430,7 +431,7 @@ where
     ),
     responses(
         (status = 200, body = SearchResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         (), // <-- make optional authentication
@@ -459,7 +460,7 @@ where
     request_body = AddUserRequest,
     responses(
         (status = 200, body = AddUserResponse),
-        ArunaError,
+        ArunaMetadataError,
     ),
     security(
         ("auth" = [])

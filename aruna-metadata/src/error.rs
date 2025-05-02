@@ -17,7 +17,7 @@ macro_rules! logerr {
 
 #[derive(Debug, Error, IntoResponses, Clone, Serialize)]
 #[allow(dead_code)]
-pub enum ArunaError {
+pub enum ArunaMetadataError {
     // 400 Bad Request
     #[response(status = 400)]
     #[error("Invalid parameter {name}: {error}")]
@@ -48,15 +48,11 @@ pub enum ArunaError {
     //DeserializeError(#[from] bincode::Error),
     DeserializeError(String),
     #[response(status = 500)]
-    #[error("Database: {0} does not exist")]
-    DatabaseDoesNotExist(&'static str),
-    #[response(status = 500)]
     #[error("I/O error: {0}")]
     //IoError(#[from] std::io::Error),
     IoError(String),
     #[response(status = 500)]
     #[error("Database error: {0}")]
-    //DatabaseError(#[from] heed::Error),
     DatabaseError(String),
     #[response(status = 500)]
     #[error("Poisend lock error")]
@@ -88,23 +84,23 @@ pub enum ArunaError {
     NetworkError(String),
 }
 
-impl ArunaError {
+impl ArunaMetadataError {
     pub fn into_axum_tuple(self) -> (axum::http::StatusCode, Json<String>) {
         match self {
-            err @ ArunaError::InvalidParameter { .. } => {
+            err @ ArunaMetadataError::InvalidParameter { .. } => {
                 (StatusCode::BAD_REQUEST, Json(err.to_string()))
             }
-            err @ ArunaError::ParameterNotSpecified { .. } => {
+            err @ ArunaMetadataError::ParameterNotSpecified { .. } => {
                 (StatusCode::BAD_REQUEST, Json(err.to_string()))
             }
-            err @ ArunaError::ConflictParameter { .. } => {
+            err @ ArunaMetadataError::ConflictParameter { .. } => {
                 (StatusCode::CONFLICT, Json(err.to_string()))
             }
-            ArunaError::Forbidden(message) => (StatusCode::FORBIDDEN, Json(message)),
-            ArunaError::Unauthorized => {
+            ArunaMetadataError::Forbidden(message) => (StatusCode::FORBIDDEN, Json(message)),
+            ArunaMetadataError::Unauthorized => {
                 (StatusCode::UNAUTHORIZED, Json("Unauthorized".to_string()))
             }
-            err @ ArunaError::NotFound(_) => (StatusCode::NOT_FOUND, Json(err.to_string())),
+            err @ ArunaMetadataError::NotFound(_) => (StatusCode::NOT_FOUND, Json(err.to_string())),
             _ => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json("Internal server error".to_string()),
@@ -112,108 +108,65 @@ impl ArunaError {
         }
     }
 }
-impl From<std::io::Error> for ArunaError {
+impl From<std::io::Error> for ArunaMetadataError {
     fn from(e: std::io::Error) -> Self {
-        ArunaError::IoError(e.to_string())
+        ArunaMetadataError::IoError(e.to_string())
     }
 }
 
-impl From<heed::Error> for ArunaError {
-    fn from(e: heed::Error) -> Self {
-        ArunaError::DatabaseError(e.to_string())
-    }
-}
-impl From<serde_json::Error> for ArunaError {
+impl From<serde_json::Error> for ArunaMetadataError {
     fn from(e: serde_json::Error) -> Self {
-        ArunaError::ConversionError {
+        ArunaMetadataError::ConversionError {
             from: "serde_json::Error".to_string(),
             to: e.to_string(),
         }
     }
 }
-impl From<TantivyError> for ArunaError {
+impl From<TantivyError> for ArunaMetadataError {
     fn from(e: TantivyError) -> Self {
-        ArunaError::TantivyError(e.to_string())
+        ArunaMetadataError::TantivyError(e.to_string())
     }
 }
 
-impl From<QueryParserError> for ArunaError {
+impl From<QueryParserError> for ArunaMetadataError {
     fn from(e: QueryParserError) -> Self {
-        ArunaError::TantivyError(e.to_string())
+        ArunaMetadataError::TantivyError(e.to_string())
     }
 }
-
-impl From<fjall::Error> for ArunaError {
-    fn from(e: fjall::Error) -> Self {
-        ArunaError::DatabaseError(e.to_string())
-    }
-}
-
-impl From<redb::Error> for ArunaError {
-    fn from(e: redb::Error) -> Self {
-        ArunaError::DatabaseError(e.to_string())
-    }
-}
-
-impl From<redb::DatabaseError> for ArunaError {
-    fn from(e: redb::DatabaseError) -> Self {
-        ArunaError::DatabaseError(e.to_string())
-    }
-}
-
-impl From<redb::TransactionError> for ArunaError {
-    fn from(e: redb::TransactionError) -> Self {
-        ArunaError::DatabaseError(e.to_string())
-    }
-}
-
-impl From<redb::TableError> for ArunaError {
-    fn from(e: redb::TableError) -> Self {
-        ArunaError::DatabaseError(e.to_string())
-    }
-}
-
-impl From<redb::StorageError> for ArunaError {
-    fn from(e: redb::StorageError) -> Self {
-        ArunaError::DatabaseError(e.to_string())
-    }
-}
-
-impl From<redb::CommitError> for ArunaError {
-    fn from(e: redb::CommitError) -> Self {
-        ArunaError::DatabaseError(e.to_string())
-    }
-}
-
-impl From<automerge::AutomergeError> for ArunaError {
+impl From<automerge::AutomergeError> for ArunaMetadataError {
     fn from(e: automerge::AutomergeError) -> Self {
-        ArunaError::DatabaseError(e.to_string())
+        ArunaMetadataError::DatabaseError(e.to_string())
     }
 }
 
-impl From<autosurgeon::HydrateError> for ArunaError {
+impl From<autosurgeon::HydrateError> for ArunaMetadataError {
     fn from(e: autosurgeon::HydrateError) -> Self {
-        ArunaError::DatabaseError(e.to_string())
+        ArunaMetadataError::DatabaseError(e.to_string())
     }
 }
 
-impl From<autosurgeon::ReconcileError> for ArunaError {
+impl From<autosurgeon::ReconcileError> for ArunaMetadataError {
     fn from(e: autosurgeon::ReconcileError) -> Self {
-        ArunaError::DatabaseError(e.to_string())
+        ArunaMetadataError::DatabaseError(e.to_string())
     }
 }
 
-impl From<anyhow::Error> for ArunaError {
+impl From<anyhow::Error> for ArunaMetadataError {
     fn from(e: anyhow::Error) -> Self {
-        ArunaError::NetworkError(e.to_string())
+        ArunaMetadataError::NetworkError(e.to_string())
     }
 }
 
-impl From<postcard::Error> for ArunaError {
+impl From<postcard::Error> for ArunaMetadataError {
     fn from(e: postcard::Error) -> Self {
-        ArunaError::ConversionError {
+        ArunaMetadataError::ConversionError {
             from: e.to_string(),
             to: "&[u8]".to_string(),
         }
+    }
+}
+impl From<aruna_storage::error::ArunaStorageError> for ArunaMetadataError {
+    fn from(e: aruna_storage::error::ArunaStorageError) -> Self {
+        ArunaMetadataError::DatabaseError(e.to_string())
     }
 }

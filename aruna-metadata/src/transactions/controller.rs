@@ -1,11 +1,12 @@
 use super::request::Request;
 use crate::{
-    error::ArunaError,
+    error::ArunaMetadataError,
     network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search, storage::store::Store},
+    persistence::{persistence::Persistor, search::search::Search},
 };
 use std::sync::Arc;
 use ulid::Ulid;
+use aruna_storage::storage::store::Store;
 
 pub struct Controller<St, Se, N>
 where
@@ -35,14 +36,14 @@ where
         &self,
         request: R,
         token: Option<String>,
-    ) -> Result<R::Response, ArunaError> {
+    ) -> Result<R::Response, ArunaMetadataError> {
         // TODO: Replace this with real authorization
         let user = match token {
             Some(id) => {
                 self.persistence
                     .get_user(
                         &Ulid::from_string(&id)
-                            .map_err(|e| ArunaError::DeserializeError(e.to_string()))?,
+                            .map_err(|e| ArunaMetadataError::DeserializeError(e.to_string()))?,
                     )
                     .await?
             }
@@ -50,10 +51,5 @@ where
         };
         let result = request.run_request(user, self).await?;
         Ok(result)
-    }
-
-    #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn clear(&self) -> Result<(), ArunaError> {
-        self.persistence.clear().await
     }
 }

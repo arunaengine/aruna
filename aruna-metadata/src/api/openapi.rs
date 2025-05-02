@@ -2,7 +2,7 @@ use crate::{
     api::paths::*,
     models::models::{Direction, Permission},
     network::network_trait::Network,
-    persistence::{search::search::Search, storage::store::Store},
+    persistence::search::search::Search,
     transactions::controller::Controller,
 };
 use std::sync::Arc;
@@ -12,6 +12,7 @@ use utoipa::{
 };
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
+use aruna_storage::storage::store::Store;
 
 #[derive(OpenApi)]
 #[openapi(
