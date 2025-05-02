@@ -24,7 +24,7 @@ futures = "0.3.31"
 iroh-io = "0.6.2"
 lazy_static = "1.5.0"
 md5 = "0.7.0"
-opendal = { version = "0.53.0", features = ["services-s3", "services-http", "services-postgresql", "services-fs"] }
+opendal = { version = "0.53.1", features = ["services-s3", "services-http", "services-postgresql", "services-fs"] }
 pithos_lib = "0.6.1"
-sha2 = "0.10.8"
-toml = "0.8.20"
+sha2 = "0.10.9"
+toml = "0.8.22"
