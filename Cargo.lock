@@ -228,6 +228,7 @@ dependencies = [
  "aruna-net",
  "ed25519-dalek",
  "iroh",
+ "parking_lot",
 ]
 
 [[package]]

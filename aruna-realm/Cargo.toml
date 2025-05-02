@@ -7,3 +7,4 @@ edition = "2024"
 aruna-net = {path = "../aruna-net"}
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 iroh = { workspace = true}
+parking_lot = { workspace = true}
