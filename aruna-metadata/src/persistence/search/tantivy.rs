@@ -1,5 +1,7 @@
 use super::search::Search;
-use crate::{error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize};
+use crate::{
+    error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize,
+};
 use roaring::RoaringBitmap;
 use std::fs;
 use tantivy::{

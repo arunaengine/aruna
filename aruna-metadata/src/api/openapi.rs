@@ -5,6 +5,7 @@ use crate::{
     persistence::search::search::Search,
     transactions::controller::Controller,
 };
+use aruna_storage::storage::store::Store;
 use std::sync::Arc;
 use utoipa::{
     Modify, OpenApi,
@@ -12,7 +13,6 @@ use utoipa::{
 };
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
-use aruna_storage::storage::store::Store;
 
 #[derive(OpenApi)]
 #[openapi(

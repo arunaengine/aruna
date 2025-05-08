@@ -1,17 +1,15 @@
+use super::openapi::{self, ArunaApi};
 use crate::{
-    error::ArunaMetadataError,
-    network::network_trait::Network,
-    persistence::search::search::Search,
-    transactions::controller::Controller,
+    error::ArunaMetadataError, network::network_trait::Network,
+    persistence::search::search::Search, transactions::controller::Controller,
 };
+use aruna_storage::storage::store::Store;
 use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
-use aruna_storage::storage::store::Store;
-use super::openapi::{self, ArunaApi};
 
 pub struct RestServer {}
 

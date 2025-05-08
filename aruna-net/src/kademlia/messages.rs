@@ -21,7 +21,7 @@ pub enum MessageType {
     // Response types
     PingResponse,
     FindResponse {
-        value: Vec<NodeAddr>, // List of node addresses that do contain the requested value, empty if not found
+        value: Vec<MaybeSignedAddr>, // List of node addresses that do contain the requested value, empty if not found
         nodes: Vec<NodeAddr>,
     },
     StoreResponse,
@@ -67,8 +67,28 @@ impl KademliaMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FindResult {
-    pub value: Vec<NodeAddr>, // The value(s) found, if any
-    pub nodes: Vec<NodeAddr>, // List of N closest nodes
+    pub value: Vec<MaybeSignedAddr>, // The value(s) found, if any
+    pub nodes: Vec<NodeAddr>,        // List of N closest nodes
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MaybeSignedAddr {
+    pub addr: NodeAddr,
+    pub signature: Option<Vec<u8>>,
+}
+
+impl MaybeSignedAddr {
+    pub fn new(addr: NodeAddr, signature: Option<Vec<u8>>) -> Self {
+        Self { addr, signature }
+    }
+
+    pub fn addr(&self) -> &NodeAddr {
+        &self.addr
+    }
+
+    pub fn signature(&self) -> Option<&Vec<u8>> {
+        self.signature.as_ref()
+    }
 }
 
 impl FindResult {

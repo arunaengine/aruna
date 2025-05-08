@@ -16,3 +16,4 @@ mod utils;
 
 pub use kademlia::kademlia::Kademlia;
 pub use kademlia::messages::FindResult;
+pub use kademlia::messages::MaybeSignedAddr;

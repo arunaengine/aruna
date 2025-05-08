@@ -1,14 +1,13 @@
-use std::borrow::Cow;
-use aruna_storage::storage::store::Store;
-use automerge::ReadDoc;
-use roaring::RoaringBitmap;
-use ulid::Ulid;
 use crate::{
     error::ArunaMetadataError,
     models::models::{Resource, VisibilityClass},
-    persistence::persistence::
-        tables::{PUBLIC_MAPPINGS_DB_NAME, USER_MAPPINGS_DB_NAME},
+    persistence::persistence::tables::{PUBLIC_MAPPINGS_DB_NAME, USER_MAPPINGS_DB_NAME},
 };
+use aruna_storage::storage::store::Store;
+use automerge::ReadDoc;
+use roaring::RoaringBitmap;
+use std::borrow::Cow;
+use ulid::Ulid;
 
 pub(super) fn idx_from_cow<'a>(cow: Cow<'a, [u8]>) -> Result<u32, ArunaMetadataError> {
     Ok(u32::from_be_bytes(cow.as_ref().try_into().map_err(
@@ -23,10 +22,9 @@ pub(super) fn visiblity_from_doc(
     doc: &automerge::AutoCommit,
 ) -> Result<VisibilityClass, ArunaMetadataError> {
     Ok(
-        match doc
-            .get(automerge::ROOT, "visibility")?
-            .ok_or_else(|| ArunaMetadataError::DeserializeError("visibility field not found".to_string()))?
-        {
+        match doc.get(automerge::ROOT, "visibility")?.ok_or_else(|| {
+            ArunaMetadataError::DeserializeError("visibility field not found".to_string())
+        })? {
             (automerge::Value::Scalar(cow), _) => match cow.to_str() {
                 Some("Private") => VisibilityClass::Private,
                 Some("Public") => VisibilityClass::Public,

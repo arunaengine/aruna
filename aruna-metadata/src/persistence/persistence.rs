@@ -117,7 +117,6 @@ where
 
         let search = search.await.unwrap().unwrap();
 
-
         let idx_counter = Arc::new(AtomicU32::new(idx_rcv.await.unwrap()));
 
         Ok(Self {

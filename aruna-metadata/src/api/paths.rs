@@ -1,10 +1,8 @@
 use crate::{
-    error::ArunaMetadataError,
-    models::requests::*,
-    network::network_trait::Network,
-    persistence::search::search::Search,
-    transactions::controller::Controller,
+    error::ArunaMetadataError, models::requests::*, network::network_trait::Network,
+    persistence::search::search::Search, transactions::controller::Controller,
 };
+use aruna_storage::storage::store::Store;
 use axum::{
     Json,
     extract::{Query, State},
@@ -13,7 +11,6 @@ use axum::{
 };
 use std::sync::Arc;
 use tags::*;
-use aruna_storage::storage::store::Store;
 
 use super::utils::{extract_token, into_axum_response};
 
@@ -121,9 +118,11 @@ where
         Ok(ResourceUpdateResponses::Name(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
-            .into_axum_tuple()
-            .into_response(),
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
     }
 }
@@ -163,9 +162,11 @@ where
         Ok(ResourceUpdateResponses::Title(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
-            .into_axum_tuple()
-            .into_response(),
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
     }
 }
@@ -205,9 +206,11 @@ where
         Ok(ResourceUpdateResponses::Description(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
-            .into_axum_tuple()
-            .into_response(),
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
     }
 }
@@ -247,9 +250,11 @@ where
         Ok(ResourceUpdateResponses::Visibility(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
-            .into_axum_tuple()
-            .into_response(),
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
     }
 }
@@ -289,9 +294,11 @@ where
         Ok(ResourceUpdateResponses::License(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
-            .into_axum_tuple()
-            .into_response(),
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
     }
 }
@@ -331,9 +338,11 @@ where
         Ok(ResourceUpdateResponses::Labels(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
-            .into_axum_tuple()
-            .into_response(),
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
     }
 }
@@ -373,9 +382,11 @@ where
         Ok(ResourceUpdateResponses::Identifiers(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
-            .into_axum_tuple()
-            .into_response(),
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
     }
 }
@@ -415,9 +426,11 @@ where
         Ok(ResourceUpdateResponses::Authors(res)) => {
             (axum::http::StatusCode::OK, Json(res)).into_response()
         }
-        Ok(_) => ArunaMetadataError::DeserializeError("Internal response serialization error".to_string())
-            .into_axum_tuple()
-            .into_response(),
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
         Err(e) => e.into_axum_tuple().into_response(),
     }
 }

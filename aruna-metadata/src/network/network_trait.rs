@@ -3,13 +3,13 @@ use crate::{
     persistence::{persistence::Persistor, search::search::Search},
 };
 use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
+use aruna_storage::storage::store::Store;
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{marker::PhantomData, net::SocketAddrV4, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, trace};
 use ulid::Ulid;
-use aruna_storage::storage::store::Store;
 
 pub static METADATA_PROTOCOL_ID: u32 = 3;
 pub static REPLICATION_POLICY: usize = 1;
@@ -214,7 +214,10 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
-    async fn start_actor(&self, persistor: Arc<Persistor<St, Se>>) -> Result<(), ArunaMetadataError> {
+    async fn start_actor(
+        &self,
+        persistor: Arc<Persistor<St, Se>>,
+    ) -> Result<(), ArunaMetadataError> {
         let mut recv_stream = self.chandler.receive().await?;
         while let Ok(len) = recv_stream.recv_stream.read_u32().await {
             trace!("Got something");

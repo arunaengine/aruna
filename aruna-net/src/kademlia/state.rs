@@ -13,6 +13,7 @@ use crate::K_BUCKET_SIZE;
 use super::{
     k_bucket::KBucket,
     kademlia::KEY_TTL,
+    messages::MaybeSignedAddr,
     node_info::NodeInfo,
     time_handler::TimeHandler,
     utils::{calculate_distance, get_bucket_index},
@@ -21,7 +22,7 @@ use super::{
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone)]
 pub struct KademliaValue {
     pub node_id: NodeId,
-    signature: Option<Vec<u8>>,
+    pub signature: Option<Vec<u8>>,
 }
 
 /// Internal mutable state of Kademlia
@@ -183,21 +184,21 @@ impl KademliaStateHandler {
             .collect::<Vec<_>>()
     }
 
-    pub fn find_local_addr(&self, key: &[u8; 32]) -> Option<Vec<NodeAddr>> {
+    pub fn find_local_addr(&self, key: &[u8; 32]) -> Option<Vec<MaybeSignedAddr>> {
         let state = self.state.read();
         let mut values = Vec::new();
 
         if let Some(entries) = state.resources.get(key) {
-            for KademliaValue { node_id, .. } in entries {
+            for KademliaValue { node_id, signature } in entries {
                 if let Some(addr) = state.node_addresses.get(node_id) {
-                    values.push(addr.clone());
+                    values.push(MaybeSignedAddr::new(addr.clone(), signature.clone()));
                 }
             }
         }
 
         if values.is_empty() {
             if let Some(addr) = state.node_addresses.get(key) {
-                values.push(addr.clone());
+                values.push(MaybeSignedAddr::new(addr.clone(), None));
                 Some(values)
             } else {
                 None

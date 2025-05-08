@@ -4,9 +4,9 @@ use crate::{
     network::network_trait::Network,
     persistence::{persistence::Persistor, search::search::Search},
 };
+use aruna_storage::storage::store::Store;
 use std::sync::Arc;
 use ulid::Ulid;
-use aruna_storage::storage::store::Store;
 
 pub struct Controller<St, Se, N>
 where

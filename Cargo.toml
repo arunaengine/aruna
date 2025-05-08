@@ -11,7 +11,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 async-channel = "2.3.1"
-ahash = "0.8.11"
+ahash = "0.8.12"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 blake3 = "1.8.2"
@@ -21,11 +21,12 @@ iroh-base = "0.34.0"
 parking_lot = { version = "0.12.3", features = ["deadlock_detection"]}
 postcard = "1.1.1"
 serde = { version = "1.0.218", features = ["derive"] }
-tokio = { version = "1.44.2", features = ["full"] }
+tokio = { version = "1.45.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time", "fmt", "registry"] }
 ulid = { version = "1.2.1", features = ["serde"] }
 futures = "0.3.31"
+thiserror = "2.0.12"
 
 [profile.release]
 panic = "abort"

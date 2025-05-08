@@ -52,6 +52,6 @@ pub async fn main() -> anyhow::Result<()> {
     let result = kademlia.find(*c2_addr.node_id.as_bytes(), true).await?;
 
     debug!("Result: {:?}", result);
-    assert_eq!(*result.value.first().unwrap(), c2_addr);
+    assert_eq!(*result.value.first().unwrap().addr(), c2_addr);
     Ok(())
 }

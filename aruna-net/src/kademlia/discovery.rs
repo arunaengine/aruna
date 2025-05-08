@@ -37,10 +37,14 @@ impl Discovery for Kademlia {
             };
 
             trace!("resolve result {:?}", result);
-            let node_addr = result.value.first().ok_or_else(|| {
-                error!("No nodes found for target {:?}", target);
-                anyhow::anyhow!("No nodes found for target {:?}", target)
-            })?;
+            let node_addr = result
+                .value
+                .first()
+                .ok_or_else(|| {
+                    error!("No nodes found for target {:?}", target);
+                    anyhow::anyhow!("No nodes found for target {:?}", target)
+                })?
+                .addr();
 
             let node_data = NodeData::new(
                 node_addr.relay_url.clone(),
