@@ -228,9 +228,11 @@ dependencies = [
  "iroh",
  "parking_lot",
  "postcard",
+ "rand 0.8.5",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
