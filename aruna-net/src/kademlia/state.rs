@@ -292,7 +292,7 @@ impl KademliaStateHandler {
         }
     }
 
-    pub fn copy_addr_and_resources(
+    pub fn _copy_addr_and_resources(
         &self,
     ) -> (
         HashMap<NodeId, NodeAddr>,

@@ -1,4 +1,6 @@
-use iroh::NodeAddr;
+use std::{collections::HashMap, vec};
+
+use iroh::{NodeAddr, NodeId};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -67,8 +69,8 @@ impl KademliaMessage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FindResult {
-    pub value: Vec<MaybeSignedAddr>, // The value(s) found, if any
-    pub nodes: Vec<NodeAddr>,        // List of N closest nodes
+    pub value_at_nodes: HashMap<NodeId, Vec<MaybeSignedAddr>>, // The value(s) found, if any
+    pub nodes: Vec<NodeAddr>,                                  // List of N closest nodes
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,8 +96,25 @@ impl MaybeSignedAddr {
 impl FindResult {
     pub fn empty() -> Self {
         Self {
-            value: Vec::new(),
+            value_at_nodes: HashMap::default(),
             nodes: Vec::new(),
         }
+    }
+
+    pub fn get_values(&self) -> Vec<MaybeSignedAddr> {
+        self.value_at_nodes
+            .values()
+            .flat_map(|v| v.clone())
+            .collect()
+    }
+
+    pub fn values_at_closest(&self) -> Vec<MaybeSignedAddr> {
+        let mut values = vec![];
+        for node in self.nodes.iter() {
+            if let Some(value) = self.value_at_nodes.get(&node.node_id) {
+                values.extend(value.clone());
+            }
+        }
+        values
     }
 }

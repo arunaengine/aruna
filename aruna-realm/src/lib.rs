@@ -150,14 +150,18 @@ impl Realm {
     async fn get_latest_members(&self) -> Result<HashMap<NodeId, NodeAddr>, error::RealmError> {
         let key = self.key.verifying_key().as_bytes().clone();
 
-        let find_result = self.kademlia.find(key, false).await.map_err(|e| {
-            error::RealmError::KademliaError(format!("Failed to find realm members: {}", e))
-        })?;
+        let find_result = self
+            .kademlia
+            .find_at_closest_nodes(key)
+            .await
+            .map_err(|e| {
+                error::RealmError::KademliaError(format!("Failed to find realm members: {}", e))
+            })?;
 
         let mut members = HashMap::new();
         let mut invalid_signatures = 0;
 
-        for MaybeSignedAddr { addr, signature } in find_result.value {
+        for MaybeSignedAddr { addr, signature } in find_result {
             // Verify the signature before adding the address
             let Some(signature) = signature else {
                 warn!("No signature found for address: {:?}", addr);
@@ -291,7 +295,9 @@ mod tests {
     fn init_tracing() {
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
-                EnvFilter::from_default_env().add_directive("aruna_net=debug".parse().unwrap()),
+                EnvFilter::from_default_env()
+                    .add_directive("aruna_net=debug".parse().unwrap())
+                    .add_directive("aruna_realm=debug".parse().unwrap()),
             )
             .with_test_writer()
             .try_init();
@@ -322,9 +328,6 @@ mod tests {
         let node2_addr = node2.get_node_addr().await.unwrap();
         debug!("Node 2 address: {:?}", node2_addr);
 
-        // Wait for nodes to connect
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
         // Generate a keypair for the realm
         let mut csprng = OsRng;
         let signing_key = SigningKey::generate(&mut csprng);
@@ -349,9 +352,6 @@ mod tests {
         )
         .await
         .unwrap();
-
-        // Wait for node2 to find node1 in the DHT
-        tokio::time::sleep(Duration::from_millis(500)).await;
 
         // Manually update realm2
         realm2.update_now().await.unwrap();
