@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::trace;
 use tracing::{debug, error, info, warn};
 
 mod error;
@@ -91,6 +92,7 @@ impl Realm {
 
     // Verify a signature using the realm's public key
     fn verify_address_signature(&self, addr: &NodeAddr, signature: &[u8]) -> bool {
+        trace!("Verifying address signature for {:?}", addr);
         let addr_bytes = match postcard::to_allocvec(addr) {
             Ok(bytes) => bytes,
             Err(_) => return false,
@@ -126,6 +128,8 @@ impl Realm {
 
         // Convert public key to bytes for use as the DHT key
         let key = self.key.verifying_key().as_bytes().clone();
+
+        trace!("Storing own address in Kademlia: {:?}", own_addr);
 
         // Store in Kademlia
         self.kademlia
@@ -297,9 +301,11 @@ mod tests {
             .with_env_filter(
                 EnvFilter::from_default_env()
                     .add_directive("aruna_net=debug".parse().unwrap())
-                    .add_directive("aruna_realm=debug".parse().unwrap()),
+                    .add_directive("aruna_realm=trace".parse().unwrap()),
             )
             .with_test_writer()
+            .with_file(true)
+            .with_line_number(true)
             .try_init();
     }
 

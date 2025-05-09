@@ -333,8 +333,6 @@ impl Kademlia {
         if node_id == self_id {
             return;
         }
-        trace!("acquired self_id");
-
         // Store in our quick lookup map
         self.state.insert_node_addr(addr.clone());
         trace!("insert node addr");

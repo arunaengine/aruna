@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use iroh::{NodeAddr, NodeId};
 
 /// XOR distance calculation for Kademlia
@@ -106,19 +104,19 @@ impl<const N: usize> Closest<N> {
         self.nodes.iter().map(|(_, node)| node.clone()).collect()
     }
 
-    pub fn is_full(&self) -> bool {
+    pub fn _is_full(&self) -> bool {
         self.nodes.len() >= N
     }
 
-    pub fn len(&self) -> usize {
+    pub fn _len(&self) -> usize {
         self.nodes.len()
     }
 
-    pub fn get(&self, index: usize) -> Option<&NodeAddr> {
+    pub fn _get(&self, index: usize) -> Option<&NodeAddr> {
         self.nodes.get(index).map(|(_, node)| node)
     }
 
-    pub fn contains(&self, node_id: &NodeId) -> bool {
+    pub fn _contains(&self, node_id: &NodeId) -> bool {
         self.nodes.iter().any(|(_, node)| node.node_id == *node_id)
     }
 }
