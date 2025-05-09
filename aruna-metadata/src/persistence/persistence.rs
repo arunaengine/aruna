@@ -5,7 +5,7 @@ use super::{
 use crate::{
     error::ArunaMetadataError,
     models::models::{Resource, User},
-    network::network_trait::{Body, MetadataMessage},
+    network::network_trait::{Body, MetadataMessage, ReplicationSubject},
     persistence::persistence::tables::*,
 };
 use aruna_storage::storage::store::Store;
@@ -365,18 +365,17 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn handle_message(
+    pub async fn handle_replication(
         &self,
-        msg: MetadataMessage,
+        msg: ReplicationSubject
     ) -> Result<MetadataMessage, ArunaMetadataError> {
-        match msg.body {
-            crate::network::network_trait::Body::User(_doc) => {
+        match msg {
+            crate::network::network_trait::ReplicationSubject::User(_doc) => {
                 // TODO: Add or merge user
             }
-            crate::network::network_trait::Body::Object(doc) => {
+            crate::network::network_trait::ReplicationSubject::Object(doc) => {
                 self.handle_object_merges(doc).await?;
             }
-            crate::network::network_trait::Body::Empty => (),
         };
 
         Ok(MetadataMessage {
@@ -483,42 +482,3 @@ where
         true
     }
 }
-
-// #[async_trait::async_trait]
-// impl<St, Se> ProtocolHandler for Persistor<St, Se>
-// where
-//     for<'a> St: Store<'a> + 'static,
-//     Se: Search + 'static,
-// {
-//     async fn handle_stream(
-//         &self,
-//         mut _send_stream: SendStream,
-//         mut recv_stream: RecvStream,
-//     ) -> anyhow::Result<()> {
-//         while let Ok(len) = recv_stream.read_u32().await {
-//             let mut buf = vec![0; len as usize];
-
-// TODO:
-// - dispatch into API requests
-//             recv_stream.read_exact(&mut buf).await?;
-//             let message = postcard::from_bytes::<MetadataMessage>(&buf)
-//                 .map_err(|e| anyhow!("Failed to deserialize message: {e:#}"))?;
-//             match self.handle_message(message).await {
-//                 Ok(_res) => {
-//                     // TODO: Respond with something if need arises
-//                     //
-//                     // Serialize the response
-//                     // let response_buf = postcard::to_allocvec(&response)
-//                     //     .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
-
-//                     // Send the response
-//                     // send_stream.write_u32(response_buf.len() as u32).await?;
-//                     // send_stream.write_all(&response_buf).await?;
-//                 }
-//                 Err(err) => return Err(anyhow!(err)),
-//             }
-//         }
-
-//         Ok(())
-//     }
-// }

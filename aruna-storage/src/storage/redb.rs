@@ -1,4 +1,13 @@
-use std::{borrow::Cow, clone, collections::HashMap, fs, sync::Arc};
+use std::{
+    borrow::Cow,
+    clone,
+    collections::HashMap,
+    fs,
+    sync::{
+        Arc,
+        mpsc::{Receiver, Sender},
+    },
+};
 
 use super::store::Store;
 use crate::error::ArunaStorageError;
@@ -188,23 +197,27 @@ impl<'a> Store<'a> for Redb {
     {
         match txn {
             RedbTxn::Read(txn) => {
-                let table = self
-                    .tables
-                    .get(dbname)
-                    .ok_or_else(|| {
-                        ArunaStorageError::DatabaseError("Table definition not found".to_string())
-                    })?
-                    .clone();
-                let db = txn.open_table(table)?;
-                let iter = db
-                    .iter()?
-                    .filter_map(|kv| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
-                        let (key, value) = kv.ok()?;
-                        let key = Cow::from(key.value().to_vec()).to_owned();
-                        let value = Cow::from(value.value().to_vec()).to_owned();
-                        Some((key, value))
-                    });
-                Ok(Box::new(iter))
+                let table = self.tables.get(dbname).ok_or_else(|| {
+                    ArunaStorageError::DatabaseError("Table definition not found".to_string())
+                })?;
+                let (sdx, rcv) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let db = txn.open_table(*table)?;
+                    let iter =
+                        db.iter()?
+                            .filter_map(|kv| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
+                                let (key, value) = kv.ok()?;
+                                let key = Cow::from(key.value().to_vec()).to_owned();
+                                let value = Cow::from(value.value().to_vec()).to_owned();
+                                Some((key, value))
+                            });
+
+                    for i in iter {
+                        sdx.send(i);
+                    }
+                    Ok::<(), ArunaStorageError>(())
+                });
+                Ok(Box::new(rcv.into_iter()))
             }
             RedbTxn::Write(txn) => {
                 let table = self

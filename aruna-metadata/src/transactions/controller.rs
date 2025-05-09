@@ -25,11 +25,12 @@ where
     N: Network + 'static,
 {
     #[tracing::instrument(level = "trace", skip(persistence, network))]
-    pub fn new(persistence: Arc<Persistor<St, Se>>, network: N) -> Self {
-        Self {
+    pub fn new(persistence: Arc<Persistor<St, Se>>, network: Arc<N>) -> Self {
+        let controller = Self {
             persistence,
-            network: Arc::new(network),
-        }
+            network,
+        };
+        controller
     }
     #[tracing::instrument(level = "trace", skip(self, request, token))]
     pub async fn request<R: Request<St, Se, N>>(
@@ -49,6 +50,7 @@ where
             }
             None => None,
         };
+
         let result = request.run_request(user, self).await?;
         Ok(result)
     }

@@ -2,6 +2,8 @@ use crate::network::network_trait::NetworkConfig;
 use crate::persistence::persistence::Persistor;
 use crate::persistence::persistence::tables::*;
 use api::server::RestServer;
+use aruna_storage::storage::fjall::FjallConfig;
+use aruna_storage::storage::fjall::FjallStore;
 use aruna_storage::storage::lmdb::LmdbConfig;
 use aruna_storage::storage::lmdb::LmdbStore;
 use iroh::KeyParsingError;
@@ -154,22 +156,22 @@ async fn main() {
                     .await
                     .unwrap(),
             );
-            let network = P2PNetwork::<LmdbStore, TantivySearch>::new(NetworkConfig::<
-                LmdbStore,
-                TantivySearch,
-            > {
-                secret_key: p2p_secret_key,
-                socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
-                bootstrap_nodes,
-                persistor: persistor.clone(),
-            })
-            .await;
+            let network = Arc::new(
+                P2PNetwork::new(NetworkConfig {
+                    secret_key: p2p_secret_key,
+                    socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
+                    bootstrap_nodes,
+                })
+                .await,
+            );
 
-            let controller = Arc::new(Controller::<
-                LmdbStore,
-                TantivySearch,
-                P2PNetwork<LmdbStore, TantivySearch>,
-            >::new(persistor, network));
+            let controller = Arc::new(Controller::<LmdbStore, TantivySearch, P2PNetwork>::new(
+                persistor,
+                network.clone(),
+            ));
+            Network::start_actor(network, controller.clone())
+                .await
+                .unwrap();
 
             tokio::spawn(async move { RestServer::run(controller, api_port).await })
                 .await
@@ -210,40 +212,44 @@ async fn main() {
         //         .unwrap()
         //         .unwrap();
         // }
-        // "FJALL" => {
-        //     let store_path = format!("{path}/fjall");
-        //     let store_config = FjallConfig {
-        //         path: store_path,
-        //         res_sdx,
-        //         idx_sdx,
-        //     };
-        //     let persistor = Arc::new(
-        //         Persistor::new(idx_rcv, store_config, search_config)
-        //             .await
-        //             .unwrap(),
-        //     );
-        //     let network = P2PNetwork::<FjallStore, TantivySearch>::new(NetworkConfig::<
-        //         FjallStore,
-        //         TantivySearch,
-        //     > {
-        //         secret_key: p2p_secret_key,
-        //         socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
-        //         bootstrap_nodes,
-        //         persistor: persistor.clone(),
-        //     })
-        //     .await;
+        "FJALL" => {
+            let store_path = format!("{path}/fjall");
+            let store_config = FjallConfig {
+                path: store_path,
+                databases: vec![
+                    RESOURCE_DB_NAME,
+                    RESOURCE_MAPPINGS_DB_NAME,
+                    USER_DB_NAME,
+                    USER_MAPPINGS_DB_NAME,
+                    PUBLIC_MAPPINGS_DB_NAME,
+                ],
+            };
+            let persistor: Arc<Persistor<FjallStore, TantivySearch>> = Arc::new(
+                Persistor::new(res_sdx, store_config, search_config)
+                    .await
+                    .unwrap(),
+            );
+            let network = Arc::new(
+                P2PNetwork::new(NetworkConfig {
+                    secret_key: p2p_secret_key,
+                    socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
+                    bootstrap_nodes,
+                })
+                .await,
+            );
+            let controller = Arc::new(Controller::<FjallStore, TantivySearch, P2PNetwork>::new(
+                persistor,
+                network.clone(),
+            ));
+            Network::start_actor(network, controller.clone())
+                .await
+                .unwrap();
 
-        //     let controller = Arc::new(Controller::<
-        //         FjallStore,
-        //         TantivySearch,
-        //         P2PNetwork<FjallStore, TantivySearch>,
-        //     >::new(persistor, network));
-
-        //     tokio::spawn(async move { RestServer::run(controller, api_port).await })
-        //         .await
-        //         .unwrap()
-        //         .unwrap();
-        // }
+            tokio::spawn(async move { RestServer::run(controller, api_port).await })
+                .await
+                .unwrap()
+                .unwrap();
+        }
         _ => panic!("Invalid variant selected"),
     }
 }

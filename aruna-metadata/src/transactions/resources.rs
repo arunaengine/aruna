@@ -82,15 +82,13 @@ where
                 resource.clone(),
             )
             .await?;
-        //controller.network.store(&resource.id).await.unwrap();
         controller
             .network
             .replicate(
-                crate::network::network_trait::Body::Object(doc),
+                crate::network::network_trait::ReplicationSubject::Object(doc),
                 &resource.id,
             )
-            .await
-            .unwrap();
+            .await?;
 
         Ok(CreateResourceResponse { resource })
     }
@@ -249,7 +247,7 @@ where
         controller
             .network
             .replicate(
-                crate::network::network_trait::Body::Object(doc),
+                crate::network::network_trait::ReplicationSubject::Object(doc),
                 &resource.id,
             )
             .await?;

@@ -1,5 +1,7 @@
 use super::search::Search;
-use crate::{error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize};
+use crate::{
+    error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize,
+};
 use roaring::RoaringBitmap;
 use std::fs;
 use tantivy::{
@@ -186,22 +188,17 @@ impl Search for TantivySearch {
                 self.fields.deleted,
             ],
         );
-        let parsed_query = parser.parse_query(&query).unwrap();
+        let parsed_query = parser.parse_query(&query)?;
         let universe = universe.clone();
         let idx_collector = FilterCollector::new(
             "idx".to_string(),
             move |idx: u64| universe.contains(idx as u32),
             TopDocs::with_limit(100),
         );
-        let result = searcher.search(&parsed_query, &idx_collector).unwrap();
+        let result = searcher.search(&parsed_query, &idx_collector)?;
         let mut docs = Vec::new();
         for (_, addr) in result {
-            docs.push(
-                searcher
-                    .doc::<TantivyDocument>(addr)
-                    .unwrap()
-                    .to_json(&self.schema),
-            );
+            docs.push(searcher.doc::<TantivyDocument>(addr)?.to_json(&self.schema));
         }
 
         Ok(docs)
