@@ -1,9 +1,6 @@
 use super::store::Store;
 use crate::error::ArunaStorageError;
-use heed::{
-    Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls,
-    types::Bytes,
-};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls, types::Bytes};
 use std::{borrow::Cow, fs};
 
 #[derive(Debug)]

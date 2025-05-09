@@ -8,8 +8,8 @@ use crate::{
     network::network_trait::Network,
     persistence::search::search::Search,
 };
-use ulid::Ulid;
 use aruna_storage::storage::store::Store;
+use ulid::Ulid;
 
 #[async_trait::async_trait]
 impl<St, Se, N> Request<St, Se, N> for AddUserRequest

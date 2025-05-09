@@ -1,7 +1,7 @@
 use super::messages::FindResult;
 use super::state::KademliaStateHandler;
 use crate::actor_handle::{NetworkActorHandle, ReceiveStreams};
-use crate::kademlia::messages::{KademliaMessage, MessageType};
+use crate::kademlia::messages::{KademliaMessage, MaybeSignedAddr, MessageType};
 use crate::kademlia::node_info::NodeInfo;
 use crate::kademlia::state::KademliaValue;
 use crate::kademlia::utils::{calculate_distance, get_bucket_index};
@@ -262,7 +262,7 @@ impl Kademlia {
         {
             // Add all value entries if present
             for val in value {
-                self.state.insert_node_addr(val.clone());
+                self.state.insert_node_addr(val.addr().clone());
             }
             let self_id = self.node_id();
 
@@ -402,9 +402,9 @@ impl Kademlia {
 
             // Check for values in resources
             if let Some(entries) = resources.get(&target) {
-                for KademliaValue { node_id, .. } in entries {
+                for KademliaValue { node_id, signature } in entries {
                     if let Some(addr) = node_addresses.get(node_id) {
-                        local_values.push(addr.clone());
+                        local_values.push(MaybeSignedAddr::new(addr.clone(), signature.clone()));
                     }
                 }
             }
@@ -412,7 +412,7 @@ impl Kademlia {
             // Check for exact node ID match (if we didn't find resource values)
             if local_values.is_empty() {
                 if let Some(value) = node_addresses.get(&target) {
-                    local_values.push(value.clone());
+                    local_values.push(MaybeSignedAddr::new(value.clone(), None));
                 }
             }
         }

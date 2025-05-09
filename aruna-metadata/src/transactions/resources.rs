@@ -15,8 +15,8 @@ use crate::{
     network::network_trait::Network,
     persistence::{persistence::Authorize, search::search::Search},
 };
-use ulid::Ulid;
 use aruna_storage::storage::store::Store;
+use ulid::Ulid;
 
 #[async_trait::async_trait]
 impl<St, Se, N> Request<St, Se, N> for CreateResourceRequest
@@ -71,13 +71,12 @@ where
         let doc = controller
             .persistence
             .add_resource(
-                node_id
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_e| ArunaMetadataError::ConversionError {
+                node_id.as_slice().try_into().map_err(|_e| {
+                    ArunaMetadataError::ConversionError {
                         from: "Vec<u8>".to_string(),
                         to: "&[u8; 32]".to_string(),
-                    })?,
+                    }
+                })?,
                 &user.id,
                 resource.clone(),
             )
@@ -232,13 +231,12 @@ where
         let doc = controller
             .persistence
             .update_resource(
-                node_id
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_e| ArunaMetadataError::ConversionError {
+                node_id.as_slice().try_into().map_err(|_e| {
+                    ArunaMetadataError::ConversionError {
                         from: "Vec<u8>".to_string(),
                         to: "&[u8; 32]".to_string(),
-                    })?,
+                    }
+                })?,
                 &user.id,
                 resource.clone(),
             )

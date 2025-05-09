@@ -1,4 +1,6 @@
-use crate::{error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize};
+use crate::{
+    error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize,
+};
 use roaring::RoaringBitmap;
 use ulid::Ulid;
 
