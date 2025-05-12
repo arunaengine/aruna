@@ -276,9 +276,9 @@ impl Network for P2PNetwork {
             .chandler
             .get_kademlia_actor_handle()
             .await?
-            .find(*id_hash.as_bytes(), true)
+            .find_value(*id_hash.as_bytes())
             .await?;
-        if result.value.is_empty() {
+        if result.is_empty() {
             // TODO: Not sure if we need to do this
             // if result.nodes.contains(&node_addr) {
             //     return Ok(true)
@@ -286,7 +286,6 @@ impl Network for P2PNetwork {
             Ok(None)
         } else {
             if result
-                .value
                 .iter()
                 .map(|addr| addr.addr())
                 .any(|addr| addr == &node_addr)
@@ -299,7 +298,7 @@ impl Network for P2PNetwork {
             let id_hash = chunk_hasher.finalize();
 
             // TODO: Choose fastest responding node
-            let node = match result.value.first() {
+            let node = match result.first() {
                 Some(node) => node.addr().node_id,
                 None => return Ok(None),
             };
