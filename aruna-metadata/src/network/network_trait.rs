@@ -213,7 +213,7 @@ impl Network for P2PNetwork {
             // TODO:
             // Dont use find for placing objects,
             // but find realm nodes and place objects there
-            let nodes = kademlia.find(*id_hash.as_bytes(), true).await?.nodes;
+            let nodes = kademlia.find_nodes(*id_hash.as_bytes()).await?;
             trace!("{nodes:?}");
 
             let mut message = MetadataMessage {

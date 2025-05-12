@@ -110,8 +110,8 @@ impl NetworkActorBuilder {
         )
         .await;
 
+        self.kademlia.set_node_addr(node_addr);
         if !bootstrap_nodes.is_empty() {
-            self.kademlia.set_node_addr(node_addr);
             self.kademlia.bootstrap(bootstrap_nodes).await?;
         } else {
             warn!("no bootstrap nodes")

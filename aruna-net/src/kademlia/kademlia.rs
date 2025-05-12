@@ -1,15 +1,16 @@
 use super::messages::FindResult;
 use super::state::KademliaStateHandler;
+use super::utils::Closest;
+use crate::ALPHA;
 use crate::actor_handle::{NetworkActorHandle, ReceiveStreams};
 use crate::kademlia::messages::{KademliaMessage, MaybeSignedAddr, MessageType};
 use crate::kademlia::node_info::NodeInfo;
-use crate::kademlia::state::KademliaValue;
 use crate::kademlia::utils::{calculate_distance, get_bucket_index};
-use crate::{ALPHA, K_BUCKET_SIZE, REQUEST_TIMEOUT};
 use anyhow::{Result, anyhow};
 use iroh::{NodeAddr, NodeId, PublicKey};
-use std::collections::{BTreeMap, HashSet};
-use std::time::{Duration, Instant};
+use n0_future::{FuturesUnordered, StreamExt};
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, trace, warn};
 use ulid::Ulid;
@@ -332,8 +333,6 @@ impl Kademlia {
         if node_id == self_id {
             return;
         }
-        trace!("acquired self_id");
-
         // Store in our quick lookup map
         self.state.insert_node_addr(addr.clone());
         trace!("insert node addr");
@@ -380,49 +379,14 @@ impl Kademlia {
         }
     }
 
-    /// External API: Find operation with choice of mode
-    pub async fn find(&self, target: [u8; 32], shortcircuit: bool) -> Result<FindResult> {
+    /// External API: Find value for key
+    pub async fn find_value(&self, target: [u8; 32]) -> Result<Vec<MaybeSignedAddr>> {
         info!("Searching key: {:?} @ {} ", &target, self.node_id());
 
-        // First check if we have the value locally
-        let mut local_values = Vec::new();
-
-        if shortcircuit {
-            let (node_addresses, resources) = self.state.copy_addr_and_resources();
-            trace!(
-                "local nodes: {:?} @ node: {}",
-                node_addresses,
-                self.node_id()
-            );
-            trace!(
-                "local resources: {:?} @ node: {}",
-                resources,
-                self.node_id()
-            );
-
-            // Check for values in resources
-            if let Some(entries) = resources.get(&target) {
-                for KademliaValue { node_id, signature } in entries {
-                    if let Some(addr) = node_addresses.get(node_id) {
-                        local_values.push(MaybeSignedAddr::new(addr.clone(), signature.clone()));
-                    }
-                }
-            }
-
-            // Check for exact node ID match (if we didn't find resource values)
-            if local_values.is_empty() {
-                if let Some(value) = node_addresses.get(&target) {
-                    local_values.push(MaybeSignedAddr::new(value.clone(), None));
-                }
-            }
-        }
-
-        if !local_values.is_empty() {
-            return Ok(FindResult {
-                value: local_values,
-                nodes: Vec::new(),
-            });
-        }
+        // Check if we have the value locally (and shortcut)
+        if let Some(entries) = self.state.find_local_addr(&target) {
+            return Ok(entries);
+        };
 
         // Find closest nodes
         let closest_nodes = self.state.find_closest_nodes(&target);
@@ -430,13 +394,79 @@ impl Kademlia {
         // If no nodes found, return empty result
         if closest_nodes.is_empty() {
             trace!("No nodes found for target: {:?}", &target);
-
-            return Ok(FindResult::empty());
+            return Ok(vec![]);
         }
 
-        // Now implement the actual find operation
-        self.find_with_nodes(target, closest_nodes, shortcircuit)
-            .await
+        // Now use the actual find operation
+        let result = self.find_with_nodes(target, closest_nodes, true).await?;
+
+        // Convert the result to a vector of MaybeSignedAddr
+        Ok(result.get_values())
+    }
+
+    /// External API: Find operation
+    /// Returns a list of nodes closest to the target key
+    pub async fn find_nodes(&self, target: [u8; 32]) -> Result<Vec<NodeAddr>> {
+        info!(
+            "Searching nodes for key: {:?} @ {} ",
+            &target,
+            self.node_id()
+        );
+
+        // Find closest nodes
+        let closest_nodes = self.state.find_closest_nodes(&target);
+
+        // If no nodes found, return empty result
+        if closest_nodes.is_empty() {
+            trace!("No nodes found for target: {:?}", &target);
+            return Ok(Vec::new());
+        }
+
+        // Now use the actual find operation
+        let result = self.find_with_nodes(target, closest_nodes, false).await?;
+
+        // Return the closest nodes
+        Ok(result.nodes)
+    }
+
+    /// External API: Find at closest nodes
+    /// Returns the value only at the closest nodes
+    pub async fn find_at_closest_nodes(&self, target: [u8; 32]) -> Result<Vec<MaybeSignedAddr>> {
+        info!(
+            "Searching nodes for key: {:?} @ {} ",
+            &target,
+            self.node_id()
+        );
+
+        // Find closest nodes
+        let closest_nodes = self.state.find_closest_nodes(&target);
+
+        // If no nodes found, return empty result
+        if closest_nodes.is_empty() {
+            trace!("No nodes found for target: {:?}", &target);
+            return Ok(Vec::new());
+        }
+
+        // Now use the actual find operation
+        let result = self.find_with_nodes(target, closest_nodes, false).await?;
+
+        // Return the closest nodes
+        Ok(result.values_at_closest())
+    }
+
+    async fn find_message(
+        &self,
+        self_addr: NodeAddr,
+        addr: NodeAddr,
+        command_id: Ulid,
+        target: [u8; 32],
+    ) -> Result<KademliaMessage> {
+        let message = KademliaMessage::new_request(
+            command_id,
+            Some(self_addr.clone()),
+            MessageType::FindRequest { target },
+        );
+        self.send_message(message, addr).await
     }
 
     /// Implementation of find that takes initial nodes
@@ -444,115 +474,80 @@ impl Kademlia {
         &self,
         target: [u8; 32],
         initial_nodes: Vec<NodeAddr>,
-        shortcircuit: bool,
+        shortcircuit: bool, // If true, stop searching after first value found
     ) -> Result<FindResult> {
         // Set up tracking for the find operation
         let mut visited_nodes = HashSet::new();
-        let mut closest_nodes = BTreeMap::new();
-        let mut found_values = Vec::new();
-        let mut pending_nodes = Vec::new();
+        let mut closest_nodes = Closest::<ALPHA>::new(target);
+        let mut found_values_at = HashMap::new();
+
+        let mut futures = FuturesUnordered::new();
 
         let self_addr = self.get_node_addr();
+        let command_id = Ulid::new();
 
         // Initialize with our closest nodes, tracking distance
         for node in initial_nodes {
             if node.node_id != self.node_id() {
-                let distance = calculate_distance(&target, node.node_id.as_bytes());
-                closest_nodes.insert(distance, node.clone());
-                pending_nodes.push(node);
+                visited_nodes.insert(node.node_id.clone());
+                let _ = closest_nodes.add(node.clone());
+                futures.push(tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.find_message(self_addr.clone(), node, command_id.clone(), target.clone()),
+                ));
             }
         }
 
-        // Create ID for all requests in this operation
-        let command_id = Ulid::new();
+        while let Some(result) = futures.next().await {
+            match result {
+                Ok(Ok(response)) => {
+                    if let MessageType::FindResponse { value, nodes } = response.msg_type {
+                        // Add all found values
+                        if !value.is_empty() {
+                            let Some(sender) = response.sender else {
+                                error!("No sender in response");
+                                continue;
+                            };
 
-        // Track start time for timeout
-        let started_at = Instant::now();
+                            found_values_at.insert(sender.node_id, value.clone());
+                            if shortcircuit {
+                                // If we found a value and want to stop searching
+                                return Ok(FindResult {
+                                    value_at_nodes: found_values_at,
+                                    nodes: closest_nodes.get_closest(),
+                                });
+                            }
+                        }
 
-        // Main search loop
-        while !pending_nodes.is_empty() {
-            // Check for timeout
-            if started_at.elapsed() > REQUEST_TIMEOUT {
-                warn!("Endless loop timeout");
-                break;
-            }
-
-            // Get next batch of nodes to query (up to ALPHA)
-            let batch = pending_nodes
-                .drain(..std::cmp::min(ALPHA, pending_nodes.len()))
-                .collect::<Vec<_>>();
-
-            // Send FindRequest to each node in parallel
-            let mut responses = Vec::new();
-            for node in batch {
-                let message = KademliaMessage::new_request(
-                    command_id,
-                    Some(self.get_node_addr().clone()),
-                    MessageType::FindRequest { target },
-                );
-
-                match self.send_message(message, node.clone()).await {
-                    Ok(response) => responses.push(response),
-                    Err(err) => error!("{err}"),
-                }
-
-                visited_nodes.insert(node.node_id);
-            }
-
-            trace!("Responses: {:?} @ node: {}", responses, self_addr.node_id);
-
-            // Process all responses
-            let mut found_value_in_batch = false;
-
-            for response in responses {
-                if let MessageType::FindResponse { value, nodes } = response.msg_type {
-                    // Add all found values
-                    if !value.is_empty() {
-                        found_values.extend(value.clone());
-                        found_value_in_batch = true;
-                    }
-
-                    // Process returned nodes for further lookup
-                    for node in nodes {
-                        if node.node_id != self_addr.node_id
-                            && !visited_nodes.contains(&node.node_id)
-                        {
-                            let distance = calculate_distance(&target, node.node_id.as_bytes());
-                            closest_nodes.insert(distance, node.clone());
-
-                            // Keep only the K closest nodes
-                            while closest_nodes.len() > K_BUCKET_SIZE {
-                                if let Some(max_distance) = closest_nodes.keys().last().cloned() {
-                                    closest_nodes.remove(&max_distance);
+                        // Process returned nodes for further lookup
+                        for node in nodes {
+                            if node.node_id != self_addr.node_id
+                                && !visited_nodes.contains(&node.node_id)
+                            {
+                                // Check if the node is closer
+                                if closest_nodes.add(node.clone()) {
+                                    // Add to pending if we still want to search more
+                                    futures.push(tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        self.find_message(
+                                            self_addr.clone(),
+                                            node,
+                                            command_id.clone(),
+                                            target.clone(),
+                                        ),
+                                    ));
                                 }
                             }
-
-                            // Add to pending if we still want to search more
-                            pending_nodes.push(node);
                         }
                     }
                 }
-            }
-
-            // Check if we should short-circuit
-            if found_value_in_batch && shortcircuit {
-                break;
+                Ok(Err(err)) => error!("Failed to send message: {err:#}"),
+                Err(_) => error!("Timeout while waiting for response"),
             }
         }
-
-        // If values found, return those
-        if !found_values.is_empty() {
-            return Ok(FindResult {
-                value: found_values,
-                nodes: Vec::new(),
-            });
-        }
-
-        // Otherwise return closest nodes
-        let closest = closest_nodes.values().cloned().collect();
         Ok(FindResult {
-            value: Vec::new(),
-            nodes: closest,
+            value_at_nodes: found_values_at,
+            nodes: closest_nodes.get_closest(),
         })
     }
 
@@ -575,15 +570,15 @@ impl Kademlia {
         self.state.store(key, &self_addr, signature.clone());
 
         // Find nodes closest to the key
-        let find_result = self.find(key, false).await?;
+        let find_result = self.find_nodes(key).await?;
 
-        trace!("Closest nodes to store: {:?}", find_result.nodes);
+        trace!("Closest nodes to store: {:?}", find_result);
 
         // Send store message to all closest nodes
         let command_id = Ulid::new();
         let mut store_requests = Vec::new();
 
-        for node in find_result.nodes {
+        for node in find_result {
             if node.node_id != self_addr.node_id {
                 let message = KademliaMessage::new_request(
                     command_id,

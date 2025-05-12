@@ -25,7 +25,7 @@ impl Discovery for Kademlia {
         let fut = async move {
             trace!("trying to resolve {:?}", target);
 
-            let result = match self_clone.find(target, true).await {
+            let result = match self_clone.find_value(target).await {
                 Ok(find_result) => {
                     trace!("resolve found {:?}", target);
                     find_result
@@ -38,7 +38,6 @@ impl Discovery for Kademlia {
 
             trace!("resolve result {:?}", result);
             let node_addr = result
-                .value
                 .first()
                 .ok_or_else(|| {
                     error!("No nodes found for target {:?}", target);

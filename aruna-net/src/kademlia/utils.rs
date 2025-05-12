@@ -1,3 +1,5 @@
+use iroh::{NodeAddr, NodeId};
+
 /// XOR distance calculation for Kademlia
 ///
 /// Calculates the XOR distance between two 32-byte IDs
@@ -45,3 +47,76 @@ pub fn get_bucket_index(distance: &[u8; 32]) -> usize {
 //     }
 //     result
 // }
+
+type Distance = [u8; 32];
+
+pub struct Closest<const N: usize> {
+    target: [u8; 32],
+    nodes: Vec<(Distance, NodeAddr)>,
+}
+
+impl<const N: usize> Closest<N> {
+    pub fn new(target: [u8; 32]) -> Self {
+        Self {
+            target,
+            nodes: Vec::with_capacity(N),
+        }
+    }
+
+    /// Adds a node to the closest set if it's one of the N closest nodes.
+    /// Returns true if the node was added, false otherwise.
+    pub fn add(&mut self, node: NodeAddr) -> bool {
+        // Check if the node already exists
+        for i in 0..self.nodes.len() {
+            if self.nodes[i].1.node_id == node.node_id {
+                // Node with same ID already exists, don't update it
+                return false;
+            }
+        }
+
+        let distance = calculate_distance(&self.target, node.node_id.as_bytes());
+
+        // If we haven't filled up our capacity yet, just add the node
+        if self.nodes.len() < N {
+            self.nodes.push((distance, node));
+            // Sort by distance - using built-in Ord for [u8; 32]
+            self.nodes.sort_by(|a, b| a.0.cmp(&b.0));
+            return true;
+        }
+
+        // If the list is full, check if this node is closer than the furthest one
+        if let Some(furthest) = self.nodes.last() {
+            if distance < furthest.0 {
+                // Replace the furthest node with this closer one
+                self.nodes.pop();
+                self.nodes.push((distance, node));
+                // Re-sort the list
+                self.nodes.sort_by(|a, b| a.0.cmp(&b.0));
+                return true;
+            }
+        }
+
+        // This node wasn't close enough to be included
+        false
+    }
+
+    pub fn get_closest(&self) -> Vec<NodeAddr> {
+        self.nodes.iter().map(|(_, node)| node.clone()).collect()
+    }
+
+    pub fn _is_full(&self) -> bool {
+        self.nodes.len() >= N
+    }
+
+    pub fn _len(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn _get(&self, index: usize) -> Option<&NodeAddr> {
+        self.nodes.get(index).map(|(_, node)| node)
+    }
+
+    pub fn _contains(&self, node_id: &NodeId) -> bool {
+        self.nodes.iter().any(|(_, node)| node.node_id == *node_id)
+    }
+}
