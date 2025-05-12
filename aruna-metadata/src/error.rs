@@ -1,6 +1,6 @@
 use axum::Json;
 use axum::http::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tantivy::TantivyError;
 use tantivy::query::QueryParserError;
 use thiserror::Error;
@@ -15,7 +15,7 @@ macro_rules! logerr {
     };
 }
 
-#[derive(Debug, Error, IntoResponses, Clone, Serialize)]
+#[derive(Debug, Error, IntoResponses, Clone, Serialize, Deserialize, PartialEq)]
 #[allow(dead_code)]
 pub enum ArunaMetadataError {
     // 400 Bad Request

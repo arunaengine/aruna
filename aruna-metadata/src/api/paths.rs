@@ -57,10 +57,10 @@ where
     get,
     path = "/resources",
     params(
-        GetResourcesRequest,
+        GetResourceRequest,
     ),
     responses(
-        (status = 200, body = GetResourcesResponse),
+        (status = 200, body = GetResourceResponse),
         ArunaMetadataError,
     ),
     security(
@@ -72,7 +72,7 @@ where
 #[tracing::instrument(level = "trace", skip(state))]
 pub async fn get_resource<St, Se, N>(
     State(state): State<Arc<Controller<St, Se, N>>>,
-    axum_extra::extract::Query(request): axum_extra::extract::Query<GetResourcesRequest>,
+    axum_extra::extract::Query(request): axum_extra::extract::Query<GetResourceRequest>,
     header: HeaderMap,
 ) -> impl IntoResponse
 where

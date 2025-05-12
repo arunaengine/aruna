@@ -38,20 +38,25 @@ where
         request: R,
         token: Option<String>,
     ) -> Result<R::Response, ArunaMetadataError> {
-        // TODO: Replace this with real authorization
-        let user = match token {
-            Some(id) => {
-                self.persistence
-                    .get_user(
-                        &Ulid::from_string(&id)
-                            .map_err(|e| ArunaMetadataError::DeserializeError(e.to_string()))?,
-                    )
-                    .await?
-            }
-            None => None,
-        };
+        match request.forward_or_return(&token, self).await? {
+            Some(response) => Ok(response),
+            None => {
+                // TODO: Replace this with real authorization
+                let user =
+                    match token {
+                        Some(id) => {
+                            self.persistence
+                                .get_user(&Ulid::from_string(&id).map_err(|e| {
+                                    ArunaMetadataError::DeserializeError(e.to_string())
+                                })?)
+                                .await?
+                        }
+                        None => None,
+                    };
 
-        let result = request.run_request(user, self).await?;
-        Ok(result)
+                let result = request.run_request(user, self).await?;
+                Ok(result)
+            }
+        }
     }
 }

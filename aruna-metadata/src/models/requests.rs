@@ -1,3 +1,5 @@
+use crate::error::ArunaMetadataError;
+
 use super::models::{Author, KeyValue, Resource, ResourceVariant, User, VisibilityClass};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -34,13 +36,13 @@ pub struct CreateResourceResponse {
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,
 )]
-pub struct GetResourcesRequest {
-    pub ids: Vec<Ulid>,
+pub struct GetResourceRequest {
+    pub id: Ulid,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
-pub struct GetResourcesResponse {
-    pub resources: Vec<Resource>,
+pub struct GetResourceResponse {
+    pub resource: Resource,
 }
 
 #[derive(
@@ -50,7 +52,7 @@ pub struct SearchRequest {
     pub query: String,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct SearchResponse {
     pub resources: Vec<String>,
 }
@@ -156,6 +158,7 @@ pub struct UpdateResourceAuthorsRequest {
 pub struct UpdateResourceAuthorsResponse {
     pub resource: Resource,
 }
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub enum ResourceUpdateRequests {
     Name(UpdateResourceNameRequest),
@@ -194,4 +197,17 @@ impl GetInner for ResourceUpdateRequests {
             ResourceUpdateRequests::Authors(req) => req.id,
         }
     }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub enum ForwardRequest {
+    GetResource(GetResourceRequest),
+    UpdateResource(ResourceUpdateRequests),
+    Search(SearchRequest),
+}
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+pub enum ForwardResponse {
+    GetResource(Result<GetResourceResponse, ArunaMetadataError>),
+    UpdateResource(Result<ResourceUpdateResponses, ArunaMetadataError>),
+    Search(Result<SearchResponse, ArunaMetadataError>),
 }

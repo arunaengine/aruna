@@ -1,7 +1,8 @@
 use crate::{
     error::ArunaMetadataError,
+    models::requests::{ForwardRequest, ForwardResponse},
     persistence::search::search::Search,
-    transactions::{controller::Controller, request::Request},
+    transactions::controller::Controller,
 };
 use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
 use aruna_storage::storage::store::Store;
@@ -31,7 +32,10 @@ pub enum Body {
     Replicate(ReplicationSubject),
     Request {
         token: Option<String>,
-        request: Vec<u8>,
+        request: ForwardRequest,
+    },
+    Response {
+        result: ForwardResponse,
     },
     Empty,
 }
@@ -62,7 +66,11 @@ pub trait Network: Sync + Send {
         Se: Search,
         N: Network;
 
-    async fn forward(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
+    async fn forward(
+        &self,
+        body: Body,
+        subject_id: &Ulid,
+    ) -> Result<Option<ForwardResponse>, ArunaMetadataError>;
     async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
     async fn find_in_realm(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn store_in_realm(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
@@ -104,8 +112,12 @@ impl Network for NetworkDummy {
         Ok(())
     }
 
-    async fn forward(&self, _body: Body, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
-        Ok(())
+    async fn forward(
+        &self,
+        _body: Body,
+        _subject_id: &Ulid,
+    ) -> Result<Option<ForwardResponse>, ArunaMetadataError> {
+        Ok(None)
     }
     async fn store(&self, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
         Ok(())
@@ -245,8 +257,91 @@ impl Network for P2PNetwork {
         Ok(())
     }
 
-    async fn forward(&self, body: Body, subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
-        todo!()
+    async fn forward(
+        &self,
+        body: Body,
+        subject_id: &Ulid,
+    ) -> Result<Option<ForwardResponse>, ArunaMetadataError> {
+        let node_addr = self.chandler.get_node_addr().await?;
+
+        // Calc hash
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(subject_id.to_bytes().as_slice());
+        let id_hash = chunk_hasher.finalize();
+
+        // TODO:
+        // Dont use find for placing objects,
+        // but find realm nodes and place objects there
+        let result = self
+            .chandler
+            .get_kademlia_actor_handle()
+            .await?
+            .find(*id_hash.as_bytes(), true)
+            .await?;
+        if result.value.is_empty() {
+            // TODO: Not sure if we need to do this
+            // if result.nodes.contains(&node_addr) {
+            //     return Ok(true)
+            // }
+            Ok(None)
+        } else {
+            if result
+                .value
+                .iter()
+                .map(|addr| addr.addr())
+                .any(|addr| addr == &node_addr)
+            {
+                return Ok(None);
+            }
+
+            let mut chunk_hasher = blake3::Hasher::new();
+            chunk_hasher.update(subject_id.to_bytes().as_slice());
+            let id_hash = chunk_hasher.finalize();
+
+            // TODO: Choose fastest responding node
+            let node = match result.value.first() {
+                Some(node) => node.addr().node_id,
+                None => return Ok(None),
+            };
+
+            let message = MetadataMessage {
+                from: *node_addr.node_id.as_bytes(),
+                to: *node.as_bytes(),
+                subject: *id_hash.as_bytes(),
+                body,
+            };
+            let msg = postcard::to_allocvec(&message)?;
+            let (mut sdx, mut recv) = self.chandler.create_stream(node).await?;
+            sdx.write_u32(msg.len() as u32).await?;
+            sdx.write_all(msg.as_slice())
+                .await
+                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+            sdx.finish()
+                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+
+            let len = recv.read_u32().await?;
+            let mut buf = vec![0; len as usize];
+            recv.read_exact(&mut buf)
+                .await
+                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+            let response = match postcard::from_bytes::<MetadataMessage>(&buf)
+                .map_err(|e| {
+                    ArunaMetadataError::NetworkError(format!(
+                        "Failed to deserialize response: {e:#}"
+                    ))
+                })?
+                .body
+            {
+                Body::Response { result } => result,
+                e @ _ => {
+                    return Err(ArunaMetadataError::NetworkError(format!(
+                        "Got wrong response {e:?}, expected Body::Response"
+                    )));
+                }
+            };
+
+            Ok(Some(response))
+        }
     }
 
     async fn store(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
@@ -313,15 +408,6 @@ impl P2PNetwork {
                         .await
                     {
                         Ok(_res) => {
-                            // TODO: Respond with something if need arises
-                            //
-                            // Serialize the response
-                            // let response_buf = postcard::to_allocvec(&response)
-                            //     .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
-
-                            // Send the response
-                            // send_stream.write_u32(response_buf.len() as u32).await?;
-                            // send_stream.write_all(&response_buf).await?;
                             recv_stream
                                 .send_stream
                                 .finish()
@@ -331,9 +417,41 @@ impl P2PNetwork {
                     }
                 }
                 Body::Request { token, request } => {
-                    todo!()
-                },
-                Body::Empty => todo!(),
+                    let result = match request {
+                        ForwardRequest::GetResource(req) => Body::Response {
+                            result: ForwardResponse::GetResource(
+                                controller.request(req, token).await,
+                            ),
+                        },
+                        ForwardRequest::UpdateResource(req) => Body::Response {
+                            result: ForwardResponse::UpdateResource(
+                                controller.request(req, token).await,
+                            ),
+                        },
+                        ForwardRequest::Search(req) => Body::Response {
+                            result: ForwardResponse::Search(controller.request(req, token).await),
+                        },
+                    };
+
+                    let response = postcard::to_allocvec(&result)?;
+
+                    recv_stream
+                        .send_stream
+                        .write_u32(response.len() as u32)
+                        .await?;
+                    recv_stream
+                        .send_stream
+                        .write_all(&response)
+                        .await
+                        .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+                }
+                Body::Response { .. } => {
+                    // Nothing to do here, there are currently no messages that send responses
+                    // after replication/forwarding back
+                }
+                Body::Empty => {
+                    // TODO: Nothing to do here, maybe remove enum variant
+                }
             }
         }
 

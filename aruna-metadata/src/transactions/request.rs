@@ -18,4 +18,10 @@ where
         requester: Option<User>,
         controller: &Controller<St, Se, N>,
     ) -> Result<Self::Response, ArunaMetadataError>;
+
+    async fn forward_or_return(
+        &self,
+        requester: &Option<String>,
+        controller: &Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, ArunaMetadataError>;
 }

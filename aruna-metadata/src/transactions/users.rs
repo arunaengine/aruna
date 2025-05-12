@@ -20,6 +20,15 @@ where
 {
     type Response = AddUserResponse;
 
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        Ok(None)
+    }
+
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,

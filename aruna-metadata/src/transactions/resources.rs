@@ -4,8 +4,8 @@ use crate::{
     models::{
         models::{Resource, User},
         requests::{
-            CreateResourceRequest, CreateResourceResponse, GetInner, GetResourcesRequest,
-            GetResourcesResponse, ResourceUpdateRequests, ResourceUpdateResponses,
+            CreateResourceRequest, CreateResourceResponse, GetInner, GetResourceRequest,
+            GetResourceResponse, ResourceUpdateRequests, ResourceUpdateResponses,
             UpdateResourceAuthorsResponse, UpdateResourceDescriptionResponse,
             UpdateResourceIdentifiersResponse, UpdateResourceLabelsResponse,
             UpdateResourceLicenseResponse, UpdateResourceNameResponse, UpdateResourceTitleResponse,
@@ -26,6 +26,15 @@ where
     N: Network + 'static,
 {
     type Response = CreateResourceResponse;
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        Ok(None)
+    }
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
@@ -94,13 +103,33 @@ where
 }
 
 #[async_trait::async_trait]
-impl<St, Se, N> Request<St, Se, N> for GetResourcesRequest
+impl<St, Se, N> Request<St, Se, N> for GetResourceRequest
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     N: Network + 'static,
 {
-    type Response = GetResourcesResponse;
+    type Response = GetResourceResponse;
+
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        let body = crate::network::network_trait::Body::Request {
+            token: user.clone(),
+            request: crate::models::requests::ForwardRequest::GetResource(self.clone()),
+        };
+        match controller.network.forward(body, &self.id).await? {
+            Some(result) => match result {
+                crate::models::requests::ForwardResponse::GetResource(response) => {
+                    Ok(Some(response?))
+                }
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
 
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
@@ -111,14 +140,12 @@ where
         let Some(user) = user else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        for id in &self.ids {
-            if !controller.persistence.authorize(&user.id, id) {
-                return Err(crate::error::ArunaMetadataError::Unauthorized);
-            };
-        }
+        if !controller.persistence.authorize(&user.id, &self.id) {
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
+        };
         let persistor = controller.persistence.clone();
-        let res = persistor.get_resources(self.ids).await?;
-        Ok(GetResourcesResponse { resources: res })
+        let resource = persistor.get_resource(self.id).await?;
+        Ok(GetResourceResponse { resource })
     }
 }
 
@@ -130,6 +157,27 @@ where
     N: Network + 'static,
 {
     type Response = ResourceUpdateResponses;
+
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        let body = crate::network::network_trait::Body::Request {
+            token: user.clone(),
+            request: crate::models::requests::ForwardRequest::UpdateResource(self.clone()),
+        };
+        match controller.network.forward(body, &self.get_id()).await? {
+            Some(result) => match result {
+                crate::models::requests::ForwardResponse::UpdateResource(response) => {
+                    Ok(Some(response?))
+                }
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
@@ -146,13 +194,7 @@ where
         let id = self.get_id();
         let updated = chrono::Utc::now();
 
-        let mut resource = controller
-            .persistence
-            .get_resources(vec![id])
-            .await?
-            .first()
-            .cloned()
-            .ok_or_else(|| ArunaMetadataError::NotFound(format!("Resource {id} not found")))?;
+        let mut resource = controller.persistence.get_resource(id).await?;
         resource.last_modified = updated;
 
         let response = match self {

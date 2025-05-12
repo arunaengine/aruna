@@ -178,24 +178,20 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn get_resources(&self, ids: Vec<Ulid>) -> Result<Vec<Resource>, ArunaMetadataError> {
+    pub async fn get_resource(&self, id: Ulid) -> Result<Resource, ArunaMetadataError> {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
             let read_txn = store.create_txn(false)?;
-            let mut result = Vec::new();
-            for id in &ids {
-                let byte_id = id.to_bytes();
-                let Some(res) = store.get(&read_txn, RESOURCE_DB_NAME, &byte_id)? else {
-                    return Err(ArunaMetadataError::NotFound(format!("{id} not found")));
-                };
+            let byte_id = id.to_bytes();
+            let Some(res) = store.get(&read_txn, RESOURCE_DB_NAME, &byte_id)? else {
+                return Err(ArunaMetadataError::NotFound(format!("{id} not found")));
+            };
 
-                let doc = automerge::AutoCommit::load(res.as_ref())?;
-                let resource: Resource = autosurgeon::hydrate(&doc)?;
+            let doc = automerge::AutoCommit::load(res.as_ref())?;
+            let resource: Resource = autosurgeon::hydrate(&doc)?;
 
-                result.push(resource);
-            }
             store.commit(read_txn)?;
-            Ok(result)
+            Ok(resource)
         })
         .await
         .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
@@ -366,7 +362,7 @@ where
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_replication(
         &self,
-        msg: ReplicationSubject
+        msg: ReplicationSubject,
     ) -> Result<MetadataMessage, ArunaMetadataError> {
         match msg {
             crate::network::network_trait::ReplicationSubject::User(_doc) => {
