@@ -54,7 +54,7 @@ pub struct SearchRequest {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct SearchResponse {
-    pub resources: Vec<String>,
+    pub resources: Vec<Resource>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]

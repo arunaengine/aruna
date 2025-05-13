@@ -1,3 +1,5 @@
+use std::array::TryFromSliceError;
+
 use axum::Json;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -154,6 +156,12 @@ impl From<autosurgeon::ReconcileError> for ArunaMetadataError {
 impl From<anyhow::Error> for ArunaMetadataError {
     fn from(e: anyhow::Error) -> Self {
         ArunaMetadataError::NetworkError(e.to_string())
+    }
+}
+
+impl From<TryFromSliceError> for ArunaMetadataError {
+    fn from(e: TryFromSliceError) -> Self {
+        ArunaMetadataError::DeserializeError(e.to_string())
     }
 }
 

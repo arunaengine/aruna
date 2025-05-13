@@ -11,7 +11,7 @@ pub trait Search: Sync + Send + Sized + std::fmt::Debug {
         &self,
         universe: RoaringBitmap,
         query: String,
-    ) -> Result<Vec<String>, ArunaMetadataError>;
+    ) -> Result<Vec<Ulid>, ArunaMetadataError>;
     fn add_resource(
         &self,
         idx: u32,

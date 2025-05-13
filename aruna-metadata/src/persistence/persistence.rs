@@ -262,7 +262,7 @@ where
         &self,
         user: Option<Ulid>,
         query: String,
-    ) -> Result<Vec<String>, ArunaMetadataError> {
+    ) -> Result<Vec<Resource>, ArunaMetadataError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let result = tokio::task::spawn_blocking(move || {
@@ -281,9 +281,20 @@ where
                     universe |= user_universe;
                 }
             };
-            store.commit(read_txn)?;
 
-            search.search::<Self>(universe, query)
+            let ids = search.search::<Self>(universe, query)?;
+
+            let mut result = Vec::new();
+            for res in ids {
+                if let Some(res) = store.get(&read_txn, RESOURCE_DB_NAME, &res.to_bytes())? {
+                    let doc = automerge::AutoCommit::load(res.as_ref())?;
+                    let resource: Resource = autosurgeon::hydrate(&doc)?;
+                    result.push(resource);
+                }
+            }
+
+            store.commit(read_txn)?;
+            Ok(result)
         })
         .await
         .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;

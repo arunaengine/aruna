@@ -3,14 +3,15 @@ use crate::{
     error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize,
 };
 use roaring::RoaringBitmap;
-use std::fs;
+use std::{collections::HashMap, fs};
 use tantivy::{
     Document, Index, IndexReader, IndexWriter, TantivyDocument,
     collector::{FilterCollector, TopDocs},
     directory::MmapDirectory,
     query::QueryParser,
-    schema::{FAST, Field, INDEXED, OwnedValue, STORED, Schema, TEXT},
+    schema::{FAST, Field, INDEXED, OwnedValue, STORED, Schema, TEXT, Value},
 };
+use tracing_subscriber::fmt::writer;
 use ulid::Ulid;
 
 pub struct TantivySearch {
@@ -166,7 +167,7 @@ impl Search for TantivySearch {
         &self,
         universe: RoaringBitmap,
         query: String,
-    ) -> Result<Vec<String>, ArunaMetadataError> {
+    ) -> Result<Vec<Ulid>, ArunaMetadataError> {
         let searcher = self.reader.searcher();
         let parser = QueryParser::for_index(
             &self.index,
@@ -196,12 +197,27 @@ impl Search for TantivySearch {
             TopDocs::with_limit(100),
         );
         let result = searcher.search(&parsed_query, &idx_collector)?;
-        let mut docs = Vec::new();
+        let mut ids = Vec::new();
         for (_, addr) in result {
-            docs.push(searcher.doc::<TantivyDocument>(addr)?.to_json(&self.schema));
+            let doc = searcher.doc::<HashMap<Field, OwnedValue>>(addr)?;
+            match doc.get(&self.fields.ids) {
+                Some(id) => {
+                    let Some(id) = id.as_bytes() else {
+                        return Err(ArunaMetadataError::DeserializeError(
+                            "Id not provided as bytes in searching doc".to_string(),
+                        ));
+                    };
+                    ids.push(Ulid::from_bytes(id.try_into()?))
+                }
+                None => {
+                    return Err(ArunaMetadataError::DeserializeError(
+                        "No id provided in searching doc".to_string(),
+                    ));
+                }
+            };
         }
 
-        Ok(docs)
+        Ok(ids)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
