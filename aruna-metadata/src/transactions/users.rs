@@ -1,6 +1,5 @@
 use super::request::Request;
 use crate::{
-    error::ArunaMetadataError,
     models::{
         models::User,
         requests::{AddUserRequest, AddUserResponse},
@@ -40,10 +39,28 @@ where
             name: self.name,
         };
         let node_id = controller.network.get_addr().await?.node_id;
-        controller
+        let user_doc = controller
             .persistence
             .add_user(node_id.as_bytes(), user.clone())
             .await?;
+
+        // (for now) Replicate users to all member nodes
+        let members = controller
+            .network
+            .get_realm_nodes()
+            .await?
+            .into_iter()
+            .filter(|addr| addr.node_id != node_id);
+        for member in members {
+            controller
+                .network
+                .replicate(
+                    crate::network::network_trait::ReplicationSubject::User(user_doc.clone()),
+                    &user.id,
+                    member,
+                )
+                .await?;
+        }
         Ok(AddUserResponse { user })
     }
 }

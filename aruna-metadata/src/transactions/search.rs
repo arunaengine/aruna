@@ -9,6 +9,7 @@ use crate::{
     persistence::search::search::Search,
 };
 use aruna_storage::storage::store::Store;
+use tracing::{error, trace};
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -20,6 +21,7 @@ where
 {
     type Response = SearchResponse;
 
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn forward_or_return(
         &self,
         user: &Option<String>,
@@ -53,15 +55,17 @@ where
 
                 results.append(&mut self.clone().run_request(user, controller).await?.resources);
             } else {
+                trace!("Asking {node:?} for search");
                 match controller
                     .network
                     .forward(body.clone(), &Ulid::default(), node.clone())
-                    .await?
+                    .await
                 {
-                    crate::models::requests::ForwardResponse::Search(response) => {
+                    Ok(crate::models::requests::ForwardResponse::Search(response)) => {
                         results.append(&mut response?.resources);
                     }
                     e @ _ => {
+                        error!(?e);
                         return Err(ArunaMetadataError::NetworkError(format!(
                             "Got wrong forward response {e:?}"
                         )));
@@ -78,8 +82,10 @@ where
         user: Option<User>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        trace!("got into search");
         let user = user.map(|u| u.id);
         let resources = controller.persistence.search(user, self.query).await?;
+        trace!("return from search");
         Ok(SearchResponse { resources })
     }
 }

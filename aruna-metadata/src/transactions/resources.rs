@@ -12,10 +12,11 @@ use crate::{
             UpdateResourceVisibilityResponse,
         },
     },
-    network::network_trait::Network,
+    network::network_trait::{Network, REPLICATION_POLICY},
     persistence::{persistence::Authorize, search::search::Search},
 };
 use aruna_storage::storage::store::Store;
+use rand::seq::IteratorRandom;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -35,6 +36,7 @@ where
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
         Ok(None)
     }
+
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
@@ -81,13 +83,25 @@ where
             .persistence
             .add_resource(node_id.as_bytes(), &user.id, resource.clone())
             .await?;
-        controller
-            .network
-            .replicate(
-                crate::network::network_trait::ReplicationSubject::Object(doc),
-                &resource.id,
-            )
-            .await?;
+
+        // Choose x = REPLICATION_POLICY random nodes of members
+        // and replicate resource
+        let members = controller.network.get_realm_nodes().await?;
+        let realm_nodes = members
+            .iter()
+            .filter(|addr| addr.node_id != node_id)
+            .choose_multiple(&mut rand::rngs::OsRng, REPLICATION_POLICY);
+
+        for node in realm_nodes {
+            controller
+                .network
+                .replicate(
+                    crate::network::network_trait::ReplicationSubject::Object(doc.clone()),
+                    &resource.id,
+                    node.clone(),
+                )
+                .await?;
+        }
 
         Ok(CreateResourceResponse { resource })
     }
@@ -292,13 +306,24 @@ where
             .update_resource(node_id.as_bytes(), &user.id, resource.clone())
             .await?;
 
-        controller
+        // Replay update only to members that already got the object
+        // In this case replicate functions as replay
+        let members = controller
             .network
-            .replicate(
-                crate::network::network_trait::ReplicationSubject::Object(doc),
-                &resource.id,
-            )
-            .await?;
+            .find_verified(&id)
+            .await?
+            .into_iter()
+            .filter(|addr| addr.node_id != node_id);
+        for member in members {
+            controller
+                .network
+                .replicate(
+                    crate::network::network_trait::ReplicationSubject::Object(doc.clone()),
+                    &resource.id,
+                    member,
+                )
+                .await?;
+        }
 
         Ok(response)
     }

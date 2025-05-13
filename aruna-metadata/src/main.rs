@@ -8,7 +8,6 @@ use aruna_storage::storage::lmdb::LmdbConfig;
 use aruna_storage::storage::lmdb::LmdbStore;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::KeyParsingError;
 use iroh::NodeAddr;
 use iroh::PublicKey;
@@ -20,7 +19,6 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use persistence::search::tantivy::TantivyConfig;
 use persistence::search::tantivy::TantivySearch;
-use rand::rngs::OsRng;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::str::FromStr;
@@ -58,9 +56,9 @@ async fn main() {
 
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
-        //.add_directive("aruna_metadata=info".parse().unwrap())
-        .add_directive("tower_http=info".parse().unwrap());
-    //.add_directive("aruna_net=info".parse().unwrap());
+        .add_directive("aruna_metadata=trace".parse().unwrap())
+        .add_directive("tower_http=info".parse().unwrap())
+        .add_directive("aruna_net=info".parse().unwrap());
 
     let telemetry_layer = tracing_opentelemetry::layer()
         .with_tracer(provider)

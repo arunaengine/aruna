@@ -2,21 +2,22 @@ use crate::{
     error::ArunaMetadataError,
     models::requests::{ForwardRequest, ForwardResponse},
     persistence::search::search::Search,
-    transactions::controller::Controller,
+    transactions::{controller::Controller, request::Request},
 };
 use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
 use aruna_realm::Realm;
 use aruna_storage::storage::store::Store;
 use ed25519_dalek::SigningKey;
 use iroh::{NodeAddr, PublicKey, SecretKey};
+use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddrV4, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, trace};
+use tracing::{error, info, trace, warn};
 use ulid::Ulid;
 
 pub static METADATA_PROTOCOL_ID: u32 = 3;
-pub static REPLICATION_POLICY: usize = 2;
+pub static REPLICATION_POLICY: usize = 1;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 //pub struct MetadataMessage<R: Request> {
@@ -57,6 +58,7 @@ pub trait Network: Sync + Send + Sized {
         &self,
         subject: ReplicationSubject,
         subject_id: &Ulid,
+        target_node: NodeAddr,
     ) -> Result<(), ArunaMetadataError>;
 
     async fn start_actor<St, Se, N>(
@@ -75,6 +77,7 @@ pub trait Network: Sync + Send + Sized {
         target_node: NodeAddr,
     ) -> Result<ForwardResponse, ArunaMetadataError>;
     async fn find(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
+    async fn find_verified(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn get_realm_nodes(&self) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn store(&self, subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError>;
     async fn store_in_realm(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
@@ -103,6 +106,7 @@ impl Network for NetworkDummy {
         &self,
         _subject: ReplicationSubject,
         _subject_id: &Ulid,
+        _target_node: NodeAddr,
     ) -> Result<(), ArunaMetadataError> {
         Ok(())
     }
@@ -123,6 +127,9 @@ impl Network for NetworkDummy {
         Ok(vec![self.get_addr().await?])
     }
 
+    async fn find_verified(&self, _subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
+        Ok(vec![self.get_addr().await?])
+    }
     async fn forward(
         &self,
         _body: Body,
@@ -179,6 +186,7 @@ impl Network for P2PNetwork {
             let self_addr = init_handle.get_node_addr().await?;
             let kademlia = init_handle.get_kademlia_actor_handle().await?;
             let realm = Realm::new(key, self_addr, kademlia).await?;
+            realm.update_now().await?;
             p2p.realm_handler = Some(realm);
         }
         Ok(p2p)
@@ -225,14 +233,41 @@ impl Network for P2PNetwork {
             .map(|m| m.addr().clone())
             .collect())
     }
+
+    async fn find_verified(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
+        let Some(realm) = &self.realm_handler else {
+            warn!("No realm configured!");
+            return self.find(subject_id).await;
+        };
+
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(subject_id.to_bytes().as_slice());
+        let id_hash = chunk_hasher.finalize();
+
+        let members = realm.get_realm_member_addrs();
+        let find_results = self
+            .chandler
+            .get_kademlia_actor_handle()
+            .await?
+            .find_value(*id_hash.as_bytes())
+            .await?
+            .iter()
+            .map(|m| m.addr().clone())
+            .filter(|m| members.contains(m))
+            .collect();
+
+        Ok(find_results)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, subject))]
     async fn replicate(
         &self,
         subject: ReplicationSubject,
         subject_id: &Ulid,
+        target_node: NodeAddr,
     ) -> Result<(), ArunaMetadataError> {
         trace!("Calling replicate");
         let chandler = self.chandler.clone();
-        let realm = self.realm_handler.clone();
         let subject_id = *subject_id;
         tokio::spawn(async move {
             let node_id = chandler.get_node_addr().await?;
@@ -242,51 +277,38 @@ impl Network for P2PNetwork {
             chunk_hasher.update(subject_id.to_bytes().as_slice());
             let id_hash = chunk_hasher.finalize();
 
-            if let Some(realm) = &realm {
-                let members = realm.get_realm_member_addrs();
+            let mut message = MetadataMessage {
+                from: *node_id.node_id.as_bytes(),
+                to: [0u8; 32],
+                subject: *id_hash.as_bytes(),
+                body: Body::Replicate(subject),
+            };
+            trace!("{message:?}");
 
-                let realm_nodes = members
-                    .iter()
-                    .filter(|addr| addr != &&node_id)
-                    .take(REPLICATION_POLICY);
-                trace!("{realm_nodes:?}");
+            // Distribute message to closest nodes
+            message.to = *target_node.node_id.as_bytes();
+            let msg = postcard::to_allocvec(&message)?;
 
-                let mut message = MetadataMessage {
-                    from: *node_id.node_id.as_bytes(),
-                    to: [0u8; 32],
-                    subject: *id_hash.as_bytes(),
-                    body: Body::Replicate(subject),
-                };
-                trace!("{message:?}");
+            let (mut sdx, _recv) = chandler.create_stream(target_node.node_id).await?;
+            sdx.write_u32(msg.len() as u32).await?;
+            sdx.write_all(msg.as_slice())
+                .await
+                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+            //chandler.store(*id_hash.as_bytes(), node).await?; // TODO: Move this to handle_stream in persistence
+            sdx.finish()
+                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
 
-                // Distribute message to closest nodes
-                let mut counter = 0;
-                for node in realm_nodes {
-                    message.to = *node.node_id.as_bytes();
-                    let msg = postcard::to_allocvec(&message)?;
-
-                    let (mut sdx, _recv) = chandler.create_stream(node.node_id).await?;
-                    sdx.write_u32(msg.len() as u32).await?;
-                    sdx.write_all(msg.as_slice())
-                        .await
-                        .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-                    //chandler.store(*id_hash.as_bytes(), node).await?; // TODO: Move this to handle_stream in persistence
-                    sdx.finish()
-                        .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-                    counter += 1;
-
-                    // TODO:
-                    // - [] Retries? -> If err, try again, if failed 5 go next node
-                    // - [] Replicate metadata to specific nodes
-                    // - [X] Store when create
-                    // - [] Store when rcv replicate msg
-                }
-            }
+            // TODO:
+            // - [] Retries? -> If err, try again, if failed 5 go next node
+            // - [] Replicate metadata to specific nodes
+            // - [X] Store when create
+            // - [] Store when rcv replicate msg
             Ok::<(), ArunaMetadataError>(())
         });
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, subject_id))]
     async fn forward(
         &self,
         body: Body,
@@ -306,6 +328,9 @@ impl Network for P2PNetwork {
             subject: *id_hash.as_bytes(),
             body,
         };
+
+        trace!("Serialized");
+
         let msg = postcard::to_allocvec(&message)?;
         let (mut sdx, mut recv) = self.chandler.create_stream(target_node.node_id).await?;
         sdx.write_u32(msg.len() as u32).await?;
@@ -315,7 +340,10 @@ impl Network for P2PNetwork {
         sdx.finish()
             .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
 
+        trace!("Sent, waiting for response");
+
         let len = recv.read_u32().await?;
+        trace!(?len);
         let mut buf = vec![0; len as usize];
         recv.read_exact(&mut buf)
             .await
@@ -333,11 +361,12 @@ impl Network for P2PNetwork {
                 )));
             }
         };
+        trace!("Got response");
 
         Ok(response)
     }
 
-    async fn store(&self, subject_id: &[u8;32]) -> Result<(), ArunaMetadataError> {
+    async fn store(&self, subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError> {
         let node_addr = self
             .chandler
             .get_node_addr()
@@ -356,7 +385,18 @@ impl Network for P2PNetwork {
 
     async fn get_realm_nodes(&self) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
         match &self.realm_handler {
-            Some(realm) => Ok(realm.get_realm_member_addrs()),
+            Some(realm) => {
+                let query = realm.get_realm_member_addrs();
+                // try one refresh if no members are found
+                let members = if query.len() <= 1 {
+                    realm.update_now().await?;
+                    realm.get_realm_member_addrs()
+                } else {
+                    query
+                };
+                info!(?members);
+                Ok(members)
+            }
             None => Ok(vec![self.get_addr().await?]),
         }
     }
@@ -412,23 +452,49 @@ impl P2PNetwork {
                     }
                 }
                 Body::Request { token, request } => {
-                    let result = match request {
+                    let user = match token {
+                        Some(id) => {
+                            match controller
+                                .persistence
+                                .get_user(&Ulid::from_string(&id).map_err(|e| {
+                                    ArunaMetadataError::DeserializeError(e.to_string())
+                                })?)
+                                .await
+                            {
+                                Ok(user) => user,
+                                Err(e) => {
+                                    error!(?e);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    let body = match request {
                         ForwardRequest::GetResource(req) => Body::Response {
                             result: ForwardResponse::GetResource(
-                                controller.request(req, token).await,
+                                req.run_request(user, controller).await,
                             ),
                         },
                         ForwardRequest::UpdateResource(req) => Body::Response {
                             result: ForwardResponse::UpdateResource(
-                                controller.request(req, token).await,
+                                req.run_request(user, controller).await,
                             ),
                         },
                         ForwardRequest::Search(req) => Body::Response {
-                            result: ForwardResponse::Search(controller.request(req, token).await),
+                            result: ForwardResponse::Search(
+                                req.run_request(user, controller).await,
+                            ),
                         },
                     };
+                    let message = MetadataMessage {
+                        from: message.to,
+                        to: message.from,
+                        subject: message.subject,
+                        body,
+                    };
 
-                    let response = postcard::to_allocvec(&result)?;
+                    let response = postcard::to_allocvec(&message)?;
 
                     recv_stream
                         .send_stream

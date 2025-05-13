@@ -365,8 +365,8 @@ where
         msg: ReplicationSubject,
     ) -> Result<MetadataMessage, ArunaMetadataError> {
         match msg {
-            crate::network::network_trait::ReplicationSubject::User(_doc) => {
-                // TODO: Add or merge user
+            crate::network::network_trait::ReplicationSubject::User(doc) => {
+                self.handle_user_merges(doc).await?;
             }
             crate::network::network_trait::ReplicationSubject::Object(doc) => {
                 self.handle_object_merges(doc).await?;
@@ -379,6 +379,47 @@ where
             subject: [0u8; 32],
             body: Body::Empty,
         })
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn handle_user_merges(&self, doc: Vec<u8>) -> Result<(), ArunaMetadataError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), ArunaMetadataError> {
+            let mut wtxn = store.create_txn(true)?;
+
+            // Parse document, actor_id and ulid
+            let mut doc = automerge::AutoCommit::load(doc.as_ref())?;
+            let foreign_user: User = autosurgeon::hydrate(&doc)?;
+            let ulid_bytes = foreign_user.id.to_bytes();
+
+            // Decide if merge or create
+            let mut merged_resource = match store.get(&wtxn, USER_DB_NAME, &ulid_bytes)? {
+                Some(existing_doc) => {
+                    let mut existing_user = automerge::AutoCommit::load(existing_doc.as_ref())?;
+                    existing_user.merge(&mut doc)?;
+                    existing_user
+                }
+                None => {
+                    let mut bitmap = Vec::new();
+                    RoaringBitmap::new().serialize_into(&mut bitmap)?;
+
+                    // Write in store
+                    store.put(&mut wtxn, USER_MAPPINGS_DB_NAME, &ulid_bytes, &bitmap)?;
+                    doc
+                }
+            };
+            let res = merged_resource.save();
+
+            // Persist
+            store.put(&mut wtxn, USER_DB_NAME, &ulid_bytes, &res)?;
+
+            store.commit(wtxn)?;
+            Ok::<(), ArunaMetadataError>(())
+        })
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
