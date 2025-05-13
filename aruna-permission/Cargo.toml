@@ -8,6 +8,7 @@ aruna-net = { path = "../aruna-net" }
 aruna-realm = { path = "../aruna-realm" }
 aruna-storage = { path = "../aruna-storage" }
 casbin = "2.10.1"
+ulid = { workspace = true }
 rand = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
