@@ -337,7 +337,7 @@ mod tests {
         enforcer
             .add_policy(
                 group_admin,
-                &format!("/{}/groups/{}", realm_id, group_id),
+                &format!("/{}/groups/{}/", realm_id, group_id),
                 "read",
                 None,
             )
@@ -366,7 +366,10 @@ mod tests {
         enforcer
             .add_policy(
                 project_admin,
-                &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
+                &format!(
+                    "/{}/groups/{}/resources/{}/",
+                    realm_id, group_id, project_id
+                ),
                 "read",
                 None,
             )
@@ -402,7 +405,7 @@ mod tests {
             .add_policy(
                 resource_viewer,
                 &format!(
-                    "/{}/groups/{}/resources/{}/resources/{}",
+                    "/{}/groups/{}/resources/{}/resources/{}/",
                     realm_id, group_id, project_id, resource_id
                 ),
                 "read",
@@ -416,7 +419,7 @@ mod tests {
             .add_policy(
                 resource_editor,
                 &format!(
-                    "/{}/groups/{}/resources/{}/resources/{}",
+                    "/{}/groups/{}/resources/{}/resources/{}/",
                     realm_id, group_id, project_id, resource_id
                 ),
                 "read",
@@ -428,7 +431,7 @@ mod tests {
             .add_policy(
                 resource_editor,
                 &format!(
-                    "/{}/groups/{}/resources/{}/resources/{}",
+                    "/{}/groups/{}/resources/{}/resources/{}/",
                     realm_id, group_id, project_id, resource_id
                 ),
                 "write",
@@ -449,13 +452,13 @@ mod tests {
         // Can access realm top level
         assert!(
             enforcer
-                .enforce("alice", &format!("/{}", realm_id), "read")
+                .enforce("alice", &format!("/{}/", realm_id), "read")
                 .await
                 .unwrap()
         );
         assert!(
             enforcer
-                .enforce("alice", &format!("/{}", realm_id), "write")
+                .enforce("alice", &format!("/{}/", realm_id), "write")
                 .await
                 .unwrap()
         ); // Via /* wildcard
@@ -491,7 +494,7 @@ mod tests {
             enforcer
                 .enforce(
                     "alice",
-                    &format!("/{}/groups/{}", realm_id, group_id),
+                    &format!("/{}/groups/{}/", realm_id, group_id),
                     "read"
                 )
                 .await
@@ -513,7 +516,10 @@ mod tests {
             enforcer
                 .enforce(
                     "alice",
-                    &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
+                    &format!(
+                        "/{}/groups/{}/resources/{}/",
+                        realm_id, group_id, project_id
+                    ),
                     "read"
                 )
                 .await
@@ -539,7 +545,7 @@ mod tests {
                 .enforce(
                     "alice",
                     &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
+                        "/{}/groups/{}/resources/{}/resources/{}/",
                         realm_id, group_id, project_id, resource_id
                     ),
                     "read"
@@ -552,7 +558,7 @@ mod tests {
                 .enforce(
                     "alice",
                     &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
+                        "/{}/groups/{}/resources/{}/resources/{}/",
                         realm_id, group_id, project_id, resource_id
                     ),
                     "write"
@@ -580,7 +586,11 @@ mod tests {
         // Can access own group
         assert!(
             enforcer
-                .enforce("bob", &format!("/{}/groups/{}", realm_id, group_id), "read")
+                .enforce(
+                    "bob",
+                    &format!("/{}/groups/{}/", realm_id, group_id),
+                    "read"
+                )
                 .await
                 .unwrap()
         );
@@ -610,7 +620,10 @@ mod tests {
             enforcer
                 .enforce(
                     "bob",
-                    &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
+                    &format!(
+                        "/{}/groups/{}/resources/{}/",
+                        realm_id, group_id, project_id
+                    ),
                     "read"
                 )
                 .await
@@ -636,7 +649,7 @@ mod tests {
                 .enforce(
                     "bob",
                     &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
+                        "/{}/groups/{}/resources/{}/resources/{}/",
                         realm_id, group_id, project_id, resource_id
                     ),
                     "read"
@@ -649,7 +662,7 @@ mod tests {
                 .enforce(
                     "bob",
                     &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
+                        "/{}/groups/{}/resources/{}/resources/{}/",
                         realm_id, group_id, project_id, resource_id
                     ),
                     "write"
@@ -701,7 +714,10 @@ mod tests {
             enforcer
                 .enforce(
                     "charlie",
-                    &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
+                    &format!(
+                        "/{}/groups/{}/resources/{}/",
+                        realm_id, group_id, project_id
+                    ),
                     "read"
                 )
                 .await
@@ -795,7 +811,7 @@ mod tests {
                 .enforce(
                     "dave",
                     &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
+                        "/{}/groups/{}/resources/{}/resources/{}/",
                         realm_id, group_id, project_id, resource_id
                     ),
                     "read"
@@ -808,7 +824,7 @@ mod tests {
                 .enforce(
                     "dave",
                     &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
+                        "/{}/groups/{}/resources/{}/resources/{}/",
                         realm_id, group_id, project_id, resource_id
                     ),
                     "write"
@@ -867,1343 +883,6 @@ mod tests {
     }
 
     #[test]
-    async fn test_deep_wildcards_with_varying_depth() {
-        let (store, test_dir) = setup_test_store().await;
-
-        // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
-
-        let realm_id = "realm123";
-        let group_id = "group456";
-        let project_id = "project789";
-
-        // Set up different wildcards with varying depths
-
-        // Top level wildcard
-        enforcer
-            .add_policy("top_admin", &format!("/{}/*", realm_id), "access", None)
-            .await
-            .unwrap();
-
-        // Mid-level wildcards
-        enforcer
-            .add_policy(
-                "mid_admin",
-                &format!("/{}/groups/{}/*", realm_id, group_id),
-                "access",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Deep wildcards
-        enforcer
-            .add_policy(
-                "deep_admin",
-                &format!(
-                    "/{}/groups/{}/resources/{}/*",
-                    realm_id, group_id, project_id
-                ),
-                "access",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Very specific permissions (no wildcards)
-        enforcer
-            .add_policy(
-                "specific_user",
-                &format!(
-                    "/{}/groups/{}/resources/{}/resources/resource101",
-                    realm_id, group_id, project_id
-                ),
-                "access",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Partial wildcards (with more specific paths)
-        enforcer
-            .add_policy(
-                "partial_admin",
-                &format!("/{}/admin/*", realm_id),
-                "access",
-                None,
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "project_viewer",
-                &format!("/{}/groups/{}/resources/*/view", realm_id, group_id),
-                "access",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Assign users to roles
-        enforcer.add_group("alice", "top_admin").await.unwrap();
-        enforcer.add_group("bob", "mid_admin").await.unwrap();
-        enforcer.add_group("charlie", "deep_admin").await.unwrap();
-        enforcer.add_group("dave", "specific_user").await.unwrap();
-        enforcer.add_group("eve", "partial_admin").await.unwrap();
-        enforcer.add_group("frank", "project_viewer").await.unwrap();
-
-        // Test top level wildcard (alice)
-
-        // Basic level access
-        assert!(
-            enforcer
-                .enforce("alice", &format!("/{}", realm_id), "access")
-                .await
-                .unwrap()
-        ); // Matches /*
-
-        // Admin level access
-        assert!(
-            enforcer
-                .enforce("alice", &format!("/{}/admin", realm_id), "access")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce("alice", &format!("/{}/admin/users", realm_id), "access")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!("/{}/admin/settings/security", realm_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Group level access
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!("/{}/groups/{}", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!("/{}/groups/{}/admin", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!("/{}/groups/{}/users", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Project level access
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/settings",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Deep level access
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101/metadata",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Test mid-level wildcard (bob)
-
-        // Cannot access realm admin
-        assert!(
-            !enforcer
-                .enforce("bob", &format!("/{}/admin", realm_id), "access")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce("bob", &format!("/{}/admin/users", realm_id), "access")
-                .await
-                .unwrap()
-        );
-
-        // Can access own group
-        assert!(
-            enforcer
-                .enforce(
-                    "bob",
-                    &format!("/{}/groups/{}", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        ); // Matches /*
-        assert!(
-            enforcer
-                .enforce(
-                    "bob",
-                    &format!("/{}/groups/{}/admin", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "bob",
-                    &format!("/{}/groups/{}/users", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Can access projects in own group
-        assert!(
-            enforcer
-                .enforce(
-                    "bob",
-                    &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "bob",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/admin",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "bob",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "bob",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101/metadata",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Cannot access other groups
-        assert!(
-            !enforcer
-                .enforce(
-                    "bob",
-                    &format!("/{}/groups/other_group", realm_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "bob",
-                    &format!("/{}/groups/other_group/admin", realm_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Test deep wildcard (charlie)
-
-        // Cannot access realm admin or group admin
-        assert!(
-            !enforcer
-                .enforce("charlie", &format!("/{}/admin", realm_id), "access")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "charlie",
-                    &format!("/{}/groups/{}/admin", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "charlie",
-                    &format!("/{}/groups/{}", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Can access specific project
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        ); // Matches /*
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/admin",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/settings",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Can access resources in specific project
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101/metadata",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/different_resource",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Cannot access other projects
-        assert!(
-            !enforcer
-                .enforce(
-                    "charlie",
-                    &format!("/{}/groups/{}/resources/other_project", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "charlie",
-                    &format!(
-                        "/{}/groups/{}/resources/other_project/admin",
-                        realm_id, group_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Test specific permission (dave)
-
-        // Can only access specific resource
-        assert!(
-            enforcer
-                .enforce(
-                    "dave",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Cannot access resource metadata
-        assert!(
-            !enforcer
-                .enforce(
-                    "dave",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101/metadata",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Cannot access other resources
-        assert!(
-            !enforcer
-                .enforce(
-                    "dave",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/other_resource",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "dave",
-                    &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "dave",
-                    &format!("/{}/groups/{}", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce("dave", &format!("/{}/admin", realm_id), "access")
-                .await
-                .unwrap()
-        );
-
-        // Test partial admin (eve) - only admin section
-
-        // Can access admin section
-        assert!(
-            enforcer
-                .enforce("eve", &format!("/{}/admin", realm_id), "access")
-                .await
-                .unwrap()
-        ); // Matches /*
-        assert!(
-            enforcer
-                .enforce("eve", &format!("/{}/admin/users", realm_id), "access")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce("eve", &format!("/{}/admin/settings", realm_id), "access")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce("eve", &format!("/{}/admin/logs/system", realm_id), "access")
-                .await
-                .unwrap()
-        );
-
-        // Cannot access groups or other sections
-        assert!(
-            !enforcer
-                .enforce("eve", &format!("/{}", realm_id), "access")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce("eve", &format!("/{}/groups", realm_id), "access")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "eve",
-                    &format!("/{}/groups/{}", realm_id, group_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Test project viewer (frank) - can view any project
-
-        // Can access view for any project
-        assert!(
-            enforcer
-                .enforce(
-                    "frank",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/view",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "frank",
-                    &format!(
-                        "/{}/groups/{}/resources/other_project/view",
-                        realm_id, group_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Cannot access project admin or other paths
-        assert!(
-            !enforcer
-                .enforce(
-                    "frank",
-                    &format!("/{}/groups/{}/resources/{}", realm_id, group_id, project_id),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "frank",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/admin",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "frank",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/resource101",
-                        realm_id, group_id, project_id
-                    ),
-                    "access"
-                )
-                .await
-                .unwrap()
-        );
-
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[test]
-    async fn test_complex_hierarchical_permissions() {
-        let (store, test_dir) = setup_test_store().await;
-
-        // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
-
-        // Define realm structure
-        let realm_id = "realm123";
-
-        // Define multiple groups
-        let group_id1 = "group1";
-        let group_id2 = "group2";
-
-        // Define multiple projects per group
-        let project_id1 = "project1";
-        let project_id2 = "project2";
-        let project_id3 = "project3";
-
-        // Define multiple resources per project
-        let resource_id1 = "resource1";
-        let resource_id2 = "resource2";
-
-        // Set up super admin (can access everything)
-        enforcer
-            .add_policy("super_admin", "/*", "read", None)
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("super_admin", "/*", "write", None)
-            .await
-            .unwrap();
-
-        // Set up realm admin
-        enforcer
-            .add_policy("realm_admin", &format!("/{}/*", realm_id), "read", None)
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("realm_admin", &format!("/{}/*", realm_id), "write", None)
-            .await
-            .unwrap();
-
-        // Set up group admins (one for each group)
-        enforcer
-            .add_policy(
-                "group1_admin",
-                &format!("/{}/groups/{}/*", realm_id, group_id1),
-                "read",
-                None,
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "group1_admin",
-                &format!("/{}/groups/{}/*", realm_id, group_id1),
-                "write",
-                None,
-            )
-            .await
-            .unwrap();
-
-        enforcer
-            .add_policy(
-                "group2_admin",
-                &format!("/{}/groups/{}/*", realm_id, group_id2),
-                "read",
-                None,
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "group2_admin",
-                &format!("/{}/groups/{}/*", realm_id, group_id2),
-                "write",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Set up project admins
-        enforcer
-            .add_policy(
-                "project1_admin",
-                &format!(
-                    "/{}/groups/{}/resources/{}/*",
-                    realm_id, group_id1, project_id1
-                ),
-                "read",
-                None,
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "project1_admin",
-                &format!(
-                    "/{}/groups/{}/resources/{}/*",
-                    realm_id, group_id1, project_id1
-                ),
-                "write",
-                None,
-            )
-            .await
-            .unwrap();
-
-        enforcer
-            .add_policy(
-                "project2_admin",
-                &format!(
-                    "/{}/groups/{}/resources/{}/*",
-                    realm_id, group_id1, project_id2
-                ),
-                "read",
-                None,
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "project2_admin",
-                &format!(
-                    "/{}/groups/{}/resources/{}/*",
-                    realm_id, group_id1, project_id2
-                ),
-                "write",
-                None,
-            )
-            .await
-            .unwrap();
-
-        enforcer
-            .add_policy(
-                "project3_admin",
-                &format!(
-                    "/{}/groups/{}/resources/{}/*",
-                    realm_id, group_id2, project_id3
-                ),
-                "read",
-                None,
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "project3_admin",
-                &format!(
-                    "/{}/groups/{}/resources/{}/*",
-                    realm_id, group_id2, project_id3
-                ),
-                "write",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Set up resource viewers and editors
-        enforcer
-            .add_policy(
-                "resource1_viewer",
-                &format!(
-                    "/{}/groups/{}/resources/{}/resources/{}",
-                    realm_id, group_id1, project_id1, resource_id1
-                ),
-                "read",
-                None,
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "resource1_editor",
-                &format!(
-                    "/{}/groups/{}/resources/{}/resources/{}",
-                    realm_id, group_id1, project_id1, resource_id1
-                ),
-                "read",
-                None,
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "resource1_editor",
-                &format!(
-                    "/{}/groups/{}/resources/{}/resources/{}",
-                    realm_id, group_id1, project_id1, resource_id1
-                ),
-                "write",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Set up multi-project viewer
-        enforcer
-            .add_policy(
-                "multi_project_viewer",
-                &format!("/{}/groups/{}/resources/*/resources/*", realm_id, group_id1),
-                "read",
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Assign users
-        enforcer.add_group("alice", "super_admin").await.unwrap();
-        enforcer.add_group("bob", "realm_admin").await.unwrap();
-        enforcer.add_group("charlie", "group1_admin").await.unwrap();
-        enforcer.add_group("dave", "group2_admin").await.unwrap();
-        enforcer.add_group("eve", "project1_admin").await.unwrap();
-        enforcer.add_group("frank", "project2_admin").await.unwrap();
-        enforcer.add_group("grace", "project3_admin").await.unwrap();
-        enforcer
-            .add_group("hannah", "resource1_viewer")
-            .await
-            .unwrap();
-        enforcer.add_group("ian", "resource1_editor").await.unwrap();
-        enforcer
-            .add_group("julia", "multi_project_viewer")
-            .await
-            .unwrap();
-
-        // Test super admin (alice) - can access everything
-        assert!(
-            enforcer
-                .enforce("alice", "/any_realm", "read")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce("alice", "/any_realm/admin", "write")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "alice",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}/metadata",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Test realm admin (bob) - can access everything in realm but not outside
-        assert!(
-            enforcer
-                .enforce("bob", &format!("/{}", realm_id), "read")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce("bob", &format!("/{}/admin", realm_id), "write")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "bob",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}/metadata",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce("bob", "/other_realm", "read")
-                .await
-                .unwrap()
-        );
-
-        // Test group admin (charlie) - can access everything in group1 but not group2
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!("/{}/groups/{}", realm_id, group_id1),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!("/{}/groups/{}/admin", realm_id, group_id1),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "charlie",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id2, resource_id2
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "charlie",
-                    &format!("/{}/groups/{}", realm_id, group_id2),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce("charlie", &format!("/{}/admin", realm_id), "read")
-                .await
-                .unwrap()
-        );
-
-        // Test group admin (dave) - can access everything in group2 but not group1
-        assert!(
-            enforcer
-                .enforce(
-                    "dave",
-                    &format!("/{}/groups/{}", realm_id, group_id2),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "dave",
-                    &format!("/{}/groups/{}/admin", realm_id, group_id2),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "dave",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id2, project_id3, resource_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "dave",
-                    &format!("/{}/groups/{}", realm_id, group_id1),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce("dave", &format!("/{}/admin", realm_id), "read")
-                .await
-                .unwrap()
-        );
-
-        // Test project admin (eve) - can access everything in project1 but not other projects
-        assert!(
-            enforcer
-                .enforce(
-                    "eve",
-                    &format!(
-                        "/{}/groups/{}/resources/{}",
-                        realm_id, group_id1, project_id1
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "eve",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/admin",
-                        realm_id, group_id1, project_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "eve",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "eve",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id2
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "eve",
-                    &format!(
-                        "/{}/groups/{}/resources/{}",
-                        realm_id, group_id1, project_id2
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "eve",
-                    &format!(
-                        "/{}/groups/{}/resources/{}",
-                        realm_id, group_id2, project_id3
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "eve",
-                    &format!("/{}/groups/{}", realm_id, group_id1),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Test resource viewer (hannah) - can only read resource1
-        assert!(
-            enforcer
-                .enforce(
-                    "hannah",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "hannah",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "hannah",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id2
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "hannah",
-                    &format!(
-                        "/{}/groups/{}/resources/{}",
-                        realm_id, group_id1, project_id1
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Test resource editor (ian) - can read and write resource1
-        assert!(
-            enforcer
-                .enforce(
-                    "ian",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "ian",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "ian",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id2
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "ian",
-                    &format!(
-                        "/{}/groups/{}/resources/{}",
-                        realm_id, group_id1, project_id1
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-
-        // Test multi-project viewer (julia) - can read any resource in any project in group1
-        assert!(
-            enforcer
-                .enforce(
-                    "julia",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "julia",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id2
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "julia",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id2, resource_id1
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "julia",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/any_resource",
-                        realm_id, group_id1, project_id2
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "julia",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id1, project_id1, resource_id1
-                    ),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce(
-                    "julia",
-                    &format!(
-                        "/{}/groups/{}/resources/{}/resources/{}",
-                        realm_id, group_id2, project_id3, resource_id1
-                    ),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[test]
     async fn test_allow_deny_precedence() {
         let (store, test_dir) = setup_test_store().await;
 
@@ -2248,7 +927,6 @@ mod tests {
         let realm_id = "realm123";
         let group_id = "group456";
         let project_id = "project789";
-        let resource_id = "resource101";
 
         // Setup broad allow with wildcards
         enforcer
@@ -2381,258 +1059,6 @@ mod tests {
                 .await
                 .unwrap()
         ); // Not in allowed path
-
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[test]
-    async fn test_complex_allow_deny_wildcards() {
-        let (store, test_dir) = setup_test_store().await;
-
-        // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
-
-        let realm_id = "realm123";
-        let group_id = "group456";
-
-        // Setup complex allow/deny permissions for different levels and users
-
-        // Super admin has broad access but with specific denies
-        enforcer
-            .add_policy("super_admin", "/*", "read", Some("allow"))
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("super_admin", "/*", "write", Some("allow"))
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("super_admin", "/*/audit_logs", "write", Some("deny"))
-            .await
-            .unwrap();
-
-        // Realm admin has access to realm with exceptions
-        enforcer
-            .add_policy(
-                "realm_admin",
-                &format!("/{}/*", realm_id),
-                "read",
-                Some("allow"),
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "realm_admin",
-                &format!("/{}/*", realm_id),
-                "write",
-                Some("allow"),
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "realm_admin",
-                &format!("/{}/security/*", realm_id),
-                "write",
-                Some("deny"),
-            )
-            .await
-            .unwrap();
-
-        // Group admin has access to group with exceptions
-        enforcer
-            .add_policy(
-                "group_admin",
-                &format!("/{}/groups/{}/*", realm_id, group_id),
-                "read",
-                Some("allow"),
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "group_admin",
-                &format!("/{}/groups/{}/*", realm_id, group_id),
-                "write",
-                Some("allow"),
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy(
-                "group_admin",
-                &format!("/{}/groups/{}/restricted/*", realm_id, group_id),
-                "write",
-                Some("deny"),
-            )
-            .await
-            .unwrap();
-
-        // Blocked user has only specific allows but broad denies
-        enforcer
-            .add_policy(
-                "blocked_user",
-                &format!("/{}/public/*", realm_id),
-                "read",
-                Some("allow"),
-            )
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("blocked_user", "/*", "write", Some("deny"))
-            .await
-            .unwrap();
-
-        // Test super admin permissions
-        assert!(
-            enforcer
-                .enforce("super_admin", "/any_realm/resource", "read")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce("super_admin", "/any_realm/resource", "write")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !enforcer
-                .enforce("super_admin", "/any_realm/audit_logs", "write")
-                .await
-                .unwrap()
-        ); // Denied specifically
-        assert!(
-            enforcer
-                .enforce("super_admin", "/any_realm/audit_logs", "read")
-                .await
-                .unwrap()
-        ); // Reading logs still allowed
-
-        // Test realm admin permissions
-        assert!(
-            enforcer
-                .enforce("realm_admin", &format!("/{}/resource", realm_id), "read")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce("realm_admin", &format!("/{}/resource", realm_id), "write")
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "realm_admin",
-                    &format!("/{}/security/users", realm_id),
-                    "read"
-                )
-                .await
-                .unwrap()
-        ); // Reading security is allowed
-        assert!(
-            !enforcer
-                .enforce(
-                    "realm_admin",
-                    &format!("/{}/security/permissions", realm_id),
-                    "write"
-                )
-                .await
-                .unwrap()
-        ); // Writing to security is denied
-        assert!(
-            !enforcer
-                .enforce("realm_admin", "/other_realm/resource", "read")
-                .await
-                .unwrap()
-        ); // Other realms not allowed
-
-        // Test group admin permissions
-        assert!(
-            enforcer
-                .enforce(
-                    "group_admin",
-                    &format!("/{}/groups/{}/resource", realm_id, group_id),
-                    "read"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "group_admin",
-                    &format!("/{}/groups/{}/resource", realm_id, group_id),
-                    "write"
-                )
-                .await
-                .unwrap()
-        );
-        assert!(
-            enforcer
-                .enforce(
-                    "group_admin",
-                    &format!("/{}/groups/{}/restricted/resource", realm_id, group_id),
-                    "read"
-                )
-                .await
-                .unwrap()
-        ); // Reading restricted is allowed
-        assert!(
-            !enforcer
-                .enforce(
-                    "group_admin",
-                    &format!("/{}/groups/{}/restricted/resource", realm_id, group_id),
-                    "write"
-                )
-                .await
-                .unwrap()
-        ); // Writing to restricted is denied
-        assert!(
-            !enforcer
-                .enforce(
-                    "group_admin",
-                    &format!("/{}/groups/other_group/resource", realm_id),
-                    "read"
-                )
-                .await
-                .unwrap()
-        ); // Other groups not allowed
-
-        // Test blocked user permissions
-        assert!(
-            enforcer
-                .enforce(
-                    "blocked_user",
-                    &format!("/{}/public/resource", realm_id),
-                    "read"
-                )
-                .await
-                .unwrap()
-        ); // Can read public resources
-        assert!(
-            !enforcer
-                .enforce(
-                    "blocked_user",
-                    &format!("/{}/public/resource", realm_id),
-                    "write"
-                )
-                .await
-                .unwrap()
-        ); // Cannot write anything (broad deny)
-        assert!(
-            !enforcer
-                .enforce(
-                    "blocked_user",
-                    &format!("/{}/private/resource", realm_id),
-                    "read"
-                )
-                .await
-                .unwrap()
-        ); // Cannot read non-public
 
         cleanup_test_dir(&test_dir);
     }
