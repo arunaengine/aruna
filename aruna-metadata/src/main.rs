@@ -6,6 +6,9 @@ use aruna_storage::storage::fjall::FjallConfig;
 use aruna_storage::storage::fjall::FjallStore;
 use aruna_storage::storage::lmdb::LmdbConfig;
 use aruna_storage::storage::lmdb::LmdbStore;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::KeyParsingError;
 use iroh::NodeAddr;
 use iroh::PublicKey;
@@ -17,6 +20,7 @@ use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use persistence::search::tantivy::TantivyConfig;
 use persistence::search::tantivy::TantivySearch;
+use rand::rngs::OsRng;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::str::FromStr;
@@ -82,6 +86,15 @@ async fn main() {
             None
         } else {
             Some(SecretKey::from_str(&key).unwrap())
+        }
+    } else {
+        None
+    };
+    let realm_key = if let Ok(key) = dotenvy::var("REALM_KEY") {
+        if key.is_empty() {
+            None
+        } else {
+            Some(SigningKey::from_pkcs8_pem(&key).unwrap())
         }
     } else {
         None
@@ -161,8 +174,10 @@ async fn main() {
                     secret_key: p2p_secret_key,
                     socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
                     bootstrap_nodes,
+                    realm_key,
                 })
-                .await,
+                .await
+                .unwrap(),
             );
 
             let controller = Arc::new(Controller::<LmdbStore, TantivySearch, P2PNetwork>::new(
@@ -234,8 +249,10 @@ async fn main() {
                     secret_key: p2p_secret_key,
                     socket_addr: SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), p2p_port),
                     bootstrap_nodes,
+                    realm_key,
                 })
-                .await,
+                .await
+                .unwrap(),
             );
             let controller = Arc::new(Controller::<FjallStore, TantivySearch, P2PNetwork>::new(
                 persistor,

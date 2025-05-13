@@ -1,5 +1,6 @@
 use super::request::Request;
 use crate::{
+    error::ArunaMetadataError,
     models::{
         models::User,
         requests::{SearchRequest, SearchResponse},
@@ -28,13 +29,47 @@ where
             token: user.clone(),
             request: crate::models::requests::ForwardRequest::Search(self.clone()),
         };
-        match controller.network.forward(body, &Ulid::new()).await? {
-            Some(result) => match result {
-                crate::models::requests::ForwardResponse::Search(response) => Ok(Some(response?)),
-                _ => Ok(None),
-            },
-            None => Ok(None),
+
+        let self_addr = controller.network.get_addr().await?;
+        let nodes = controller.network.get_realm_nodes().await?;
+
+        let mut results = Vec::new();
+
+        for node in nodes {
+            if node == self_addr {
+                // TODO: Replace this with real authorization
+                let user =
+                    match user {
+                        Some(id) => {
+                            controller
+                                .persistence
+                                .get_user(&Ulid::from_string(&id).map_err(|e| {
+                                    ArunaMetadataError::DeserializeError(e.to_string())
+                                })?)
+                                .await?
+                        }
+                        None => None,
+                    };
+
+                results.append(&mut self.clone().run_request(user, controller).await?.resources);
+            } else {
+                match controller
+                    .network
+                    .forward(body.clone(), &Ulid::default(), node.clone())
+                    .await?
+                {
+                    crate::models::requests::ForwardResponse::Search(response) => {
+                        results.append(&mut response?.resources);
+                    }
+                    e @ _ => {
+                        return Err(ArunaMetadataError::NetworkError(format!(
+                            "Got wrong forward response {e:?}"
+                        )));
+                    }
+                }
+            }
         }
+        Ok(Some(SearchResponse { resources: results }))
     }
 
     #[tracing::instrument(level = "trace", skip(controller))]

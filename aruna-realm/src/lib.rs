@@ -9,7 +9,7 @@ use std::time::Duration;
 use tracing::trace;
 use tracing::{debug, error, info, warn};
 
-mod error;
+pub mod error;
 
 #[derive(Clone)]
 pub struct Realm {

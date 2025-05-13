@@ -39,21 +39,10 @@ where
             id: Ulid::new(),
             name: self.name,
         };
+        let node_id = controller.network.get_addr().await?.node_id;
         controller
             .persistence
-            .add_user(
-                controller
-                    .network
-                    .get_id()
-                    .await?
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_e| ArunaMetadataError::ConversionError {
-                        from: "Vec<u8>".to_string(),
-                        to: "&[u8; 32]".to_string(),
-                    })?,
-                user.clone(),
-            )
+            .add_user(node_id.as_bytes(), user.clone())
             .await?;
         Ok(AddUserResponse { user })
     }

@@ -170,3 +170,8 @@ impl From<aruna_storage::error::ArunaStorageError> for ArunaMetadataError {
         ArunaMetadataError::DatabaseError(e.to_string())
     }
 }
+impl From<aruna_realm::error::RealmError> for ArunaMetadataError {
+    fn from(e: aruna_realm::error::RealmError) -> Self {
+        ArunaMetadataError::NetworkError(e.to_string())
+    }
+}

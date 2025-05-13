@@ -76,19 +76,10 @@ where
             location: Vec::new(),
             hashes: Vec::new(),
         };
-        let node_id = controller.network.get_id().await?;
+        let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
-            .add_resource(
-                node_id.as_slice().try_into().map_err(|_e| {
-                    ArunaMetadataError::ConversionError {
-                        from: "Vec<u8>".to_string(),
-                        to: "&[u8; 32]".to_string(),
-                    }
-                })?,
-                &user.id,
-                resource.clone(),
-            )
+            .add_resource(node_id.as_bytes(), &user.id, resource.clone())
             .await?;
         controller
             .network
@@ -120,14 +111,27 @@ where
             token: user.clone(),
             request: crate::models::requests::ForwardRequest::GetResource(self.clone()),
         };
-        match controller.network.forward(body, &self.id).await? {
-            Some(result) => match result {
+        let self_addr = controller.network.get_addr().await?;
+        let nodes = controller.network.find(&self.id).await?;
+
+        if nodes.is_empty() || nodes.contains(&self_addr) {
+            Ok(None)
+        } else {
+            let Some(first_node) = nodes.first() else {
+                return Ok(None);
+            };
+            match controller
+                .network
+                .forward(body, &self.id, first_node.clone())
+                .await?
+            {
                 crate::models::requests::ForwardResponse::GetResource(response) => {
                     Ok(Some(response?))
                 }
-                _ => Ok(None),
-            },
-            None => Ok(None),
+                e @ _ => Err(ArunaMetadataError::NetworkError(format!(
+                    "Got wrong forward response {e:?}"
+                ))),
+            }
         }
     }
 
@@ -167,14 +171,27 @@ where
             token: user.clone(),
             request: crate::models::requests::ForwardRequest::UpdateResource(self.clone()),
         };
-        match controller.network.forward(body, &self.get_id()).await? {
-            Some(result) => match result {
+        let self_addr = controller.network.get_addr().await?;
+        let nodes = controller.network.find(&self.get_id()).await?;
+
+        if nodes.is_empty() || nodes.contains(&self_addr) {
+            Ok(None)
+        } else {
+            let Some(first_node) = nodes.first() else {
+                return Ok(None);
+            };
+            match controller
+                .network
+                .forward(body, &self.get_id(), first_node.clone())
+                .await?
+            {
                 crate::models::requests::ForwardResponse::UpdateResource(response) => {
                     Ok(Some(response?))
                 }
-                _ => Ok(None),
-            },
-            None => Ok(None),
+                e @ _ => Err(ArunaMetadataError::NetworkError(format!(
+                    "Got wrong forward response {e:?}"
+                ))),
+            }
         }
     }
 
@@ -269,19 +286,10 @@ where
             }
         };
 
-        let node_id = controller.network.get_id().await?;
+        let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
-            .update_resource(
-                node_id.as_slice().try_into().map_err(|_e| {
-                    ArunaMetadataError::ConversionError {
-                        from: "Vec<u8>".to_string(),
-                        to: "&[u8; 32]".to_string(),
-                    }
-                })?,
-                &user.id,
-                resource.clone(),
-            )
+            .update_resource(node_id.as_bytes(), &user.id, resource.clone())
             .await?;
 
         controller

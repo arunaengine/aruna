@@ -1,5 +1,5 @@
 use aruna_metadata::models::requests::{
-    AddUserRequest, AddUserResponse, CreateResourceRequest, CreateResourceResponse,
+    AddUserRequest, AddUserResponse, CreateResourceRequest, CreateResourceResponse, SearchRequest,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 //use persistors::{TantivyFjall, TantivyHeed, TantivyRedb};
@@ -53,7 +53,7 @@ fn e2e_benchmark(c: &mut Criterion) {
         (client, base_url, user1, user2)
     });
 
-    c.bench_function(format!("benches/e2e/{variant}").as_ref(), |b| {
+    c.bench_function(format!("benches/e2e/create/{variant}").as_ref(), |b| {
         b.to_async(&rt).iter(|| async {
             let url = format!("{base_url}/resources");
             for i in 0..10_000 {
@@ -93,6 +93,7 @@ fn e2e_benchmark(c: &mut Criterion) {
             }
         })
     });
+
 }
 
 fn controller_benchmark(c: &mut Criterion) {
