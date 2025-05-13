@@ -1,33 +1,28 @@
 use aruna_storage::storage::store::Store;
 use async_trait::async_trait;
-use casbin::{Adapter, CoreApi, DefaultModel, MgmtApi, Model, RbacApi};
-use casbin::{Error, Filter};
+use casbin::Filter;
+use casbin::error::AdapterError;
+use casbin::{CoreApi, DefaultModel, MgmtApi, Model, RbacApi};
 use error::ArunaPermissionHandlerError;
 use serde::{Deserialize, Serialize};
 
 mod error;
 
-/// The ABAC model configuration as a static string
 pub static MODEL_CONF: &str = r#"
-# Request definition
 [request_definition]
 r = sub, obj, act
 
-# Policy definition
 [policy_definition]
 p = sub, obj, act, eft
 
-# Role definition
 [role_definition]
 g = _, _
 
-# Policy effect
 [policy_effect]
 e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 
-# Matchers
 [matchers]
-m = g(r.sub, p.sub) || keyMatch2(r.sub, p.sub) && keyMatch2(r.obj, p.obj) && r.act == p.act
+m = g(r.sub, p.sub) && keyMatch2(r.obj, p.obj) && (r.act == p.act || (p.act == "write" && r.act == "read"))
 "#;
 
 /// The Rule struct that bundles the policy rule components
@@ -60,16 +55,11 @@ impl Rule {
 pub struct StoreAdapter<S: for<'a> Store<'a>> {
     store: S,
     db_name: &'static str,
-    is_filtered: bool,
 }
 
 impl<S: for<'a> Store<'a>> StoreAdapter<S> {
     pub fn new(store: S, db_name: &'static str) -> Self {
-        Self {
-            store,
-            db_name,
-            is_filtered: false,
-        }
+        Self { store, db_name }
     }
 
     /// Internal helper to convert a Rule to bytes for storage using postcard
@@ -149,11 +139,7 @@ impl<S: for<'a> Store<'a> + Send + Sync> casbin::Adapter for StoreAdapter<S> {
 
             if let Some(ref mut ast_map) = m.get_mut_model().get_mut(sec) {
                 if let Some(ref mut ast) = ast_map.get_mut(ptype) {
-                    let mut policy = Vec::new();
-                    policy.push(ptype.to_owned());
-                    policy.extend(rule.rule.clone());
-
-                    ast.get_mut_policy().insert(policy);
+                    ast.get_mut_policy().insert(rule.rule);
                 }
             }
         }
@@ -163,74 +149,17 @@ impl<S: for<'a> Store<'a> + Send + Sync> casbin::Adapter for StoreAdapter<S> {
 
     async fn load_filtered_policy<'f>(
         &mut self,
-        m: &mut dyn Model,
-        f: Filter<'f>,
+        _m: &mut dyn Model,
+        _f: Filter<'f>,
     ) -> casbin::Result<()> {
-        let rules = self.load_rules().await?;
-        self.is_filtered = false; // Start with false, will be updated if any filtering happens
-
-        for rule in rules {
-            let sec = rule.sec.as_str();
-            let ptype = rule.ptype.as_str();
-
-            // Skip rules that don't match the filter
-            let mut should_add = true;
-
-            if !f.p.is_empty() && sec == "p" {
-                if !f.p.contains(&ptype) {
-                    should_add = false;
-                } else {
-                    for (idx, value) in f.p.iter().enumerate() {
-                        if !value.is_empty() && idx < rule.rule.len() && &rule.rule[idx] != value {
-                            should_add = false;
-                            break;
-                        }
-                    }
-                }
-                // If we're filtering, update the filtered flag
-                if !should_add {
-                    self.is_filtered = true;
-                    continue;
-                }
-            }
-
-            if !f.g.is_empty() && sec == "g" {
-                if !f.g.contains(&ptype) {
-                    should_add = false;
-                } else {
-                    for (idx, value) in f.g.iter().enumerate() {
-                        if !value.is_empty() && idx < rule.rule.len() && &rule.rule[idx] != value {
-                            should_add = false;
-                            break;
-                        }
-                    }
-                }
-                // If we're filtering, update the filtered flag
-                if !should_add {
-                    self.is_filtered = true;
-                    continue;
-                }
-            }
-
-            // Add the rule to the model
-            if should_add {
-                if let Some(ref mut ast_map) = m.get_mut_model().get_mut(sec) {
-                    if let Some(ref mut ast) = ast_map.get_mut(ptype) {
-                        let mut policy = Vec::new();
-                        policy.push(ptype.to_owned());
-                        policy.extend(rule.rule.clone());
-
-                        ast.get_mut_policy().insert(policy);
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        println!("Filtered policy loading is not supported yet");
+        return Err(casbin::Error::AdapterError(AdapterError(
+            "Filtered policies are not supported yet".to_string().into(),
+        )));
     }
 
     fn is_filtered(&self) -> bool {
-        self.is_filtered
+        false
     }
 
     async fn save_policy(&mut self, m: &mut dyn Model) -> casbin::Result<()> {
@@ -242,14 +171,7 @@ impl<S: for<'a> Store<'a> + Send + Sync> casbin::Adapter for StoreAdapter<S> {
             for (ptype, ast) in ast_map {
                 // Following the in-memory adapter pattern
                 for policy in ast.get_policy() {
-                    // The first element is always the policy type, which we already have
-                    let rule_tokens = if policy.len() > 1 {
-                        policy[1..].to_vec()
-                    } else {
-                        Vec::new()
-                    };
-
-                    let rule = Rule::new(sec, ptype, rule_tokens);
+                    let rule = Rule::new(sec, ptype, policy.to_vec());
                     self.save_rule(&rule).await?;
                 }
             }
@@ -308,40 +230,16 @@ impl<S: for<'a> Store<'a> + Send + Sync> casbin::Adapter for StoreAdapter<S> {
 
     async fn remove_filtered_policy(
         &mut self,
-        sec: &str,
-        ptype: &str,
-        field_index: usize,
-        field_values: Vec<String>,
+        _sec: &str,
+        _ptype: &str,
+        _field_index: usize,
+        _field_values: Vec<String>,
     ) -> casbin::Result<bool> {
-        // Load all rules
-        let rules = self.load_rules().await?;
-        let mut removed = false;
+        println!("Tried to remove filtered policy");
 
-        for rule in rules {
-            if rule.sec == sec && rule.ptype == ptype {
-                let mut matched = true;
-
-                for (i, field_value) in field_values.iter().enumerate() {
-                    let field_idx = field_index + i;
-                    if field_idx < rule.rule.len() {
-                        if !field_value.is_empty() && rule.rule[field_idx] != *field_value {
-                            matched = false;
-                            break;
-                        }
-                    } else {
-                        matched = false;
-                        break;
-                    }
-                }
-
-                if matched {
-                    self.remove_rule(&rule).await?;
-                    removed = true;
-                }
-            }
-        }
-
-        Ok(removed)
+        return Err(casbin::Error::AdapterError(AdapterError(
+            "Filtered policies are not supported yet".to_string().into(),
+        )));
     }
 
     async fn clear_policy(&mut self) -> casbin::Result<()> {
@@ -396,9 +294,21 @@ impl Enforcer {
     }
 
     /// Remove a policy rule
-    pub async fn remove_policy(&mut self, sub: &str, obj: &str, act: &str) -> casbin::Result<bool> {
-        let rule = vec![sub.to_owned(), obj.to_owned(), act.to_owned()];
-        self.inner.remove_policy(rule).await
+    pub async fn remove_policy(
+        &mut self,
+        sub: &str,
+        obj: &str,
+        act: &str,
+        eft: &str,
+    ) -> casbin::Result<bool> {
+        let rule = vec![
+            sub.to_owned(),
+            obj.to_owned(),
+            act.to_owned(),
+            eft.to_owned(),
+        ];
+        let result = self.inner.remove_policy(rule).await;
+        result
     }
 
     /// Add a role assignment

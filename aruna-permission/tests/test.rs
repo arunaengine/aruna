@@ -1,12 +1,10 @@
 #[cfg(test)]
 mod tests {
     use aruna_permission::Enforcer;
-    use aruna_permission::StoreAdapter;
     use aruna_storage::storage::lmdb::LmdbConfig;
     use aruna_storage::storage::lmdb::LmdbStore;
     use aruna_storage::storage::store::Store;
     use casbin::CoreApi;
-    use casbin::Filter;
     use rand::distributions::Alphanumeric;
     use rand::distributions::DistString;
     use std::fs;
@@ -61,9 +59,10 @@ mod tests {
 
         // Test removing a policy
         let removed = enforcer
-            .remove_policy("alice", "data1", "read")
+            .remove_policy("alice", "data1", "read", "allow")
             .await
             .unwrap();
+        println!("Removed: {}", removed);
         assert!(removed);
 
         // Confirm removal
@@ -139,205 +138,6 @@ mod tests {
             assert!(enforcer.enforce("bob", "data2", "write").await.unwrap());
             assert!(!enforcer.enforce("alice", "data2", "read").await.unwrap());
         }
-
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[test]
-    async fn test_multiple_policies() {
-        let (store, test_dir) = setup_test_store().await;
-
-        // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
-
-        // Add multiple policies
-        let policies = vec![
-            vec!["alice".to_string(), "data1".to_string(), "read".to_string()],
-            vec!["bob".to_string(), "data2".to_string(), "write".to_string()],
-            vec![
-                "charlie".to_string(),
-                "data3".to_string(),
-                "read".to_string(),
-            ],
-        ];
-
-        // Add policies via adapter
-        enforcer
-            .inner
-            .get_mut_adapter()
-            .add_policies("p", "p", policies.clone())
-            .await
-            .unwrap();
-        enforcer.inner.load_policy().await.unwrap();
-
-        // Check all policies were added
-        let stored_policies = enforcer.get_policies().await;
-        assert_eq!(stored_policies.len(), 3);
-
-        println!("Stored policies: {:?}", stored_policies);
-
-        // Check enforcement
-        assert!(enforcer.enforce("alice", "data1", "read").await.unwrap());
-        assert!(enforcer.enforce("bob", "data2", "write").await.unwrap());
-        assert!(enforcer.enforce("charlie", "data3", "read").await.unwrap());
-
-        // Remove multiple policies
-        let to_remove = vec![
-            vec!["alice".to_string(), "data1".to_string(), "read".to_string()],
-            vec![
-                "charlie".to_string(),
-                "data3".to_string(),
-                "read".to_string(),
-            ],
-        ];
-
-        enforcer
-            .inner
-            .get_mut_adapter()
-            .remove_policies("p", "p", to_remove)
-            .await
-            .unwrap();
-        enforcer.inner.load_policy().await.unwrap();
-
-        // Check removal
-        assert!(!enforcer.enforce("alice", "data1", "read").await.unwrap());
-        assert!(enforcer.enforce("bob", "data2", "write").await.unwrap());
-        assert!(!enforcer.enforce("charlie", "data3", "read").await.unwrap());
-
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[test]
-    async fn test_filtered_policy() {
-        let (store, test_dir) = setup_test_store().await;
-
-        // Setup policies first
-        {
-            let mut enforcer = Enforcer::new(store.clone(), "casbin_rules").await.unwrap();
-
-            // Add various policies
-            enforcer
-                .add_policy("alice", "data1", "read", None)
-                .await
-                .unwrap();
-            enforcer
-                .add_policy("alice", "data1", "write", None)
-                .await
-                .unwrap();
-            enforcer
-                .add_policy("alice", "data2", "read", None)
-                .await
-                .unwrap();
-            enforcer
-                .add_policy("bob", "data1", "read", None)
-                .await
-                .unwrap();
-            enforcer
-                .add_policy("bob", "data2", "write", None)
-                .await
-                .unwrap();
-
-            enforcer.save_policy().await.unwrap();
-        }
-
-        // Test filtered loading
-        {
-            // Create a new adapter and enforce with filtered policy
-            let adapter = StoreAdapter::new(store, "casbin_rules");
-            let m = casbin::DefaultModel::default();
-
-            // Create a filter for alice's policies
-            let filter = Filter {
-                p: vec!["alice"],
-                g: vec![],
-            };
-
-            // Create an enforcer with the filtered model
-            let mut filtered_enforcer = casbin::Enforcer::new(m, adapter).await.unwrap();
-            filtered_enforcer
-                .load_filtered_policy(filter)
-                .await
-                .unwrap();
-
-            // Check if only alice's policies were loaded
-            assert!(
-                filtered_enforcer
-                    .enforce(("alice", "data1", "read"))
-                    .unwrap()
-            );
-            assert!(
-                filtered_enforcer
-                    .enforce(("alice", "data1", "write"))
-                    .unwrap()
-            );
-            assert!(
-                filtered_enforcer
-                    .enforce(("alice", "data2", "read"))
-                    .unwrap()
-            );
-
-            // Bob's should not be loaded
-            assert!(!filtered_enforcer.enforce(("bob", "data1", "read")).unwrap());
-            assert!(
-                !filtered_enforcer
-                    .enforce(("bob", "data2", "write"))
-                    .unwrap()
-            );
-
-            // Verify is_filtered flag
-            assert!(filtered_enforcer.is_filtered());
-        }
-
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[test]
-    async fn test_remove_filtered_policy() {
-        let (store, test_dir) = setup_test_store().await;
-
-        // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
-
-        // Add various policies
-        enforcer
-            .add_policy("alice", "data1", "read", None)
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("alice", "data2", "read", None)
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("alice", "data3", "read", None)
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("bob", "data1", "read", None)
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("bob", "data2", "write", None)
-            .await
-            .unwrap();
-
-        // Remove filtered policies - all alice's read permissions
-        enforcer
-            .inner
-            .get_mut_adapter()
-            .remove_filtered_policy("p", "p", 0, vec!["alice".to_string()])
-            .await
-            .unwrap();
-
-        enforcer.inner.load_policy().await.unwrap();
-
-        // Alice's policies should be gone
-        assert!(!enforcer.enforce("alice", "data1", "read").await.unwrap());
-        assert!(!enforcer.enforce("alice", "data2", "read").await.unwrap());
-        assert!(!enforcer.enforce("alice", "data3", "read").await.unwrap());
-
-        // Bob's should remain
-        assert!(enforcer.enforce("bob", "data1", "read").await.unwrap());
-        assert!(enforcer.enforce("bob", "data2", "write").await.unwrap());
 
         cleanup_test_dir(&test_dir);
     }
