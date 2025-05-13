@@ -36,6 +36,29 @@ mod tests {
     }
 
     #[test]
+    async fn test_group_membership() {
+        let (store, test_dir) = setup_test_store().await;
+
+        // Create enforcer
+        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+
+        // Add groups
+        enforcer.add_group("alice", "admin").await.unwrap();
+        enforcer.add_group("bob", "editor").await.unwrap();
+
+        // Check group membership
+        assert!(enforcer.has_group("alice", "admin").await);
+        assert!(!enforcer.has_group("alice", "editor").await);
+        assert!(enforcer.has_group("bob", "editor").await);
+        assert!(!enforcer.has_group("bob", "admin").await);
+
+        assert!(enforcer.get_groups_for_user("alice").await.first().unwrap() == "admin");
+        assert!(enforcer.get_users_for_group("admin").await.first().unwrap() == "alice");
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
     async fn test_basic_policy_crud() {
         let (store, test_dir) = setup_test_store().await;
 
@@ -279,16 +302,16 @@ mod tests {
         ); // direct
 
         // Test role retrieval
-        let alice_roles = enforcer.get_roles_for_user("alice").await;
+        let alice_roles = enforcer.get_groups_for_user("alice").await;
         assert_eq!(alice_roles.len(), 1);
         assert!(alice_roles.contains(&"editor".to_string()));
 
-        let bob_roles = enforcer.get_roles_for_user("bob").await;
+        let bob_roles = enforcer.get_groups_for_user("bob").await;
         assert_eq!(bob_roles.len(), 2); // manager + inherited editor
         assert!(bob_roles.contains(&"manager".to_string()));
         assert!(bob_roles.contains(&"editor".to_string()));
 
-        let charlie_roles = enforcer.get_roles_for_user("charlie").await;
+        let charlie_roles = enforcer.get_groups_for_user("charlie").await;
         assert_eq!(charlie_roles.len(), 3); // admin + inherited manager + inherited editor
         assert!(charlie_roles.contains(&"admin".to_string()));
         assert!(charlie_roles.contains(&"manager".to_string()));

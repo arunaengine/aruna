@@ -347,13 +347,13 @@ impl Enforcer {
     }
 
     /// Get all roles that a user has
-    pub async fn get_roles_for_user(&self, user: &str) -> Vec<String> {
+    pub async fn get_groups_for_user(&self, user: &str) -> Vec<String> {
         self.inner.get_implicit_roles_for_user(user, None)
     }
 
     /// Get all users that have a role
-    pub async fn get_users_for_role(&self, role: &str) -> Vec<String> {
-        self.inner.get_users_for_role(role, None)
+    pub async fn get_users_for_group(&self, group: &str) -> Vec<String> {
+        self.inner.get_users_for_role(group, None)
     }
 
     /// Get all permissions for a user
