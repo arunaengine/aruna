@@ -11,6 +11,7 @@ use tantivy::{
     query::QueryParser,
     schema::{FAST, Field, INDEXED, OwnedValue, STORED, Schema, TEXT, Value},
 };
+use tracing::trace;
 use tracing_subscriber::fmt::writer;
 use ulid::Ulid;
 
@@ -200,6 +201,10 @@ impl Search for TantivySearch {
         let mut ids = Vec::new();
         for (_, addr) in result {
             let doc = searcher.doc::<HashMap<Field, OwnedValue>>(addr)?;
+
+            let explanation = parsed_query.explain(&searcher, addr)?;
+            trace!(?explanation);
+
             match doc.get(&self.fields.ids) {
                 Some(id) => {
                     let Some(id) = id.as_bytes() else {

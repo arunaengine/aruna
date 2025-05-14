@@ -6,21 +6,22 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use persistors::{TantivyFjall, TantivyHeed};
 use rand::seq::IteratorRandom;
 use std::time::Duration;
+use tokio::task::JoinSet;
 
 pub mod persistors;
 
 fn e2e_benchmark(c: &mut Criterion) {
     let variant = dotenvy::var("VARIANT").unwrap();
-    //let port = dotenvy::var("API_PORT").unwrap();
+    let port = dotenvy::var("API_PORT").unwrap();
 
     // Isolated runtime for tantivy/heed
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
-    let (client, base_url, user1, user2) = rt.block_on(async {
+    let (client, user1, user2) = rt.block_on(async {
         let client = reqwest::Client::new();
-        let base_url = format!("http://localhost:8080/api/v3");
+        let base_url = format!("http://localhost:{port}/api/v3");
 
         let request = AddUserRequest {
             name: "bench_user1".to_string(),
@@ -53,7 +54,7 @@ fn e2e_benchmark(c: &mut Criterion) {
         let user2 = response.user.id;
         println!("{}", user2.to_string());
 
-        (client, base_url, user1, user2)
+        (client, user1, user2)
     });
 
     c.bench_function(format!("benches/e2e/create/{variant}").as_ref(), |b| {
@@ -64,43 +65,58 @@ fn e2e_benchmark(c: &mut Criterion) {
                 format!("http://localhost:8082/api/v3/resources"),
                 format!("http://localhost:8083/api/v3/resources"),
             ];
+
+            let mut join_set = JoinSet::new();
             //for i in 0..10_000 {
             for i in 0..100 {
                 let create_resource = CreateResourceRequest {
                     name: format!("res{i}"),
                     ..Default::default()
                 };
+                let client = client.clone();
+
+                //let url = base_urls.iter().next().unwrap().clone();
+                let url = base_urls
+                    .iter()
+                    .choose(&mut rand::rngs::OsRng)
+                    .unwrap()
+                    .clone();
                 //if i < 4999 {
                 if i < 49 {
-                    let _response: CreateResourceResponse = client
-                        .post(base_urls.iter().choose(&mut rand::rngs::OsRng).unwrap())
-                        .header::<&str, &str>(
-                            "Authorization",
-                            format!("Bearer {}", user1.to_string()).as_ref(),
-                        )
-                        .json(&create_resource)
-                        .send()
-                        .await
-                        .unwrap()
-                        .json()
-                        .await
-                        .unwrap();
+                    join_set.spawn(async move {
+                        let _response: CreateResourceResponse = client
+                            .post(url)
+                            .header::<&str, &str>(
+                                "Authorization",
+                                format!("Bearer {}", user1.to_string()).as_ref(),
+                            )
+                            .json(&create_resource)
+                            .send()
+                            .await
+                            .unwrap()
+                            .json()
+                            .await
+                            .unwrap();
+                    });
                 } else {
-                    let _response: CreateResourceResponse = client
-                        .post(base_urls.iter().choose(&mut rand::rngs::OsRng).unwrap())
-                        .header::<&str, &str>(
-                            "Authorization",
-                            format!("Bearer {}", user2.to_string()).as_ref(),
-                        )
-                        .json(&create_resource)
-                        .send()
-                        .await
-                        .unwrap()
-                        .json()
-                        .await
-                        .unwrap();
+                    join_set.spawn(async move {
+                        let _response: CreateResourceResponse = client
+                            .post(url)
+                            .header::<&str, &str>(
+                                "Authorization",
+                                format!("Bearer {}", user2.to_string()).as_ref(),
+                            )
+                            .json(&create_resource)
+                            .send()
+                            .await
+                            .unwrap()
+                            .json()
+                            .await
+                            .unwrap();
+                    });
                 }
             }
+            join_set.join_all().await;
         })
     });
 }

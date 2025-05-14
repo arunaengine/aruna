@@ -1,6 +1,7 @@
 use super::store::Store;
 use crate::error::ArunaStorageError;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls, types::Bytes};
+use tracing::trace;
 use std::{borrow::Cow, fs};
 
 #[derive(Debug, Clone)]
@@ -131,6 +132,7 @@ impl<'a> Store<'a> for LmdbStore {
 
     #[tracing::instrument(level = "trace", skip(self))]
     fn create_txn(&'a self, write: bool) -> Result<LmdbTxn<'a>, ArunaStorageError> {
+        trace!("Opening transaction");
         Ok(if write {
             LmdbTxn::Write(self.env.write_txn()?)
         } else {
@@ -206,6 +208,7 @@ impl<'a> Store<'a> for LmdbStore {
 
     #[tracing::instrument(level = "trace", skip(self, txn))]
     fn commit(&self, txn: LmdbTxn<'_>) -> Result<(), ArunaStorageError> {
+        trace!("Closing transaction");
         match txn {
             LmdbTxn::Read(ro_txn) => ro_txn.commit(),
             LmdbTxn::Write(rw_txn) => rw_txn.commit(),

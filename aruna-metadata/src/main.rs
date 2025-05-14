@@ -57,6 +57,7 @@ async fn main() {
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("aruna_metadata=trace".parse().unwrap())
+        .add_directive("aruna_storage=trace".parse().unwrap())
         .add_directive("tower_http=info".parse().unwrap())
         .add_directive("aruna_net=info".parse().unwrap());
 

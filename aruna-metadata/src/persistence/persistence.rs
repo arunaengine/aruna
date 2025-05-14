@@ -435,6 +435,7 @@ where
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_object_merges(&self, doc: Vec<u8>) -> Result<(), ArunaMetadataError> {
+        trace!("Handle object merge");
         let store = self.store.clone();
         let idx_counter = self.idx_counter.clone();
         let (idx, resource) =
