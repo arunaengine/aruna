@@ -8,10 +8,11 @@ mod tests {
     use rand::distributions::Alphanumeric;
     use rand::distributions::DistString;
     use std::fs;
+    use std::sync::Arc;
     use tokio::test;
 
     // Helper function to setup a test store
-    async fn setup_test_store() -> (LmdbStore, String) {
+    async fn setup_test_store() -> (Arc<LmdbStore>, String) {
         // Create a unique test directory for each test
         let test_id = Alphanumeric.sample_string(&mut rand::thread_rng(), 8);
         let test_dir = format!("/dev/shm/test_{}", test_id);
@@ -25,7 +26,7 @@ mod tests {
             databases: vec![db_name],
         };
 
-        let store = LmdbStore::new(store_config).expect("Failed to create LMDB store");
+        let store = Arc::new(LmdbStore::new(store_config).expect("Failed to create LMDB store"));
 
         (store, test_dir)
     }

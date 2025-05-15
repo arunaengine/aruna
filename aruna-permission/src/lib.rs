@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aruna_storage::storage::store::Store;
 use async_trait::async_trait;
 use casbin::Filter;
@@ -53,12 +55,12 @@ impl Rule {
 
 /// The Casbin adapter that uses the generic Store trait
 pub struct StoreAdapter<S: for<'a> Store<'a>> {
-    store: S,
+    store: Arc<S>,
     db_name: &'static str,
 }
 
 impl<S: for<'a> Store<'a>> StoreAdapter<S> {
-    pub fn new(store: S, db_name: &'static str) -> Self {
+    pub fn new(store: Arc<S>, db_name: &'static str) -> Self {
         Self { store, db_name }
     }
 
@@ -254,7 +256,7 @@ pub struct Enforcer {
 
 impl Enforcer {
     /// Create a new Enforcer with the provided store
-    pub async fn new<S>(store: S, db_name: &'static str) -> casbin::Result<Self>
+    pub async fn new<S>(store: Arc<S>, db_name: &'static str) -> casbin::Result<Self>
     where
         S: for<'a> Store<'a> + Send + Sync + 'static,
     {
@@ -365,5 +367,11 @@ impl Enforcer {
     pub async fn get_users_for_permission(&self, obj: &str, act: &str) -> Vec<String> {
         let perm = vec![obj.to_owned(), act.to_owned()];
         self.inner.get_implicit_users_for_permission(perm).await
+    }
+}
+
+impl std::fmt::Debug for Enforcer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Enforcer").finish()
     }
 }
