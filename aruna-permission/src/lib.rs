@@ -1,16 +1,10 @@
-use std::sync::Arc;
-
 use aruna_storage::storage::store::Store;
-use async_trait::async_trait;
-use casbin::Filter;
-use casbin::error::AdapterError;
-use casbin::{CoreApi, DefaultModel, MgmtApi, Model, RbacApi};
-use error::ArunaPermissionHandlerError;
-use serde::{Deserialize, Serialize};
+use casbin::MemoryAdapter;
+use casbin::{CoreApi, DefaultModel, MgmtApi, RbacApi};
 
 mod error;
 
-pub static MODEL_CONF: &str = r#"
+pub const MODEL_CONF: &str = r#"
 [request_definition]
 r = sub, obj, act
 
@@ -27,241 +21,19 @@ e = some(where (p.eft == allow)) && !some(where (p.eft == deny))
 m = g(r.sub, p.sub) && keyMatch2(r.obj, p.obj) && (r.act == p.act || (p.act == "write" && r.act == "read"))
 "#;
 
-/// The Rule struct that bundles the policy rule components
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Rule {
-    pub sec: String,
-    pub ptype: String,
-    pub rule: Vec<String>,
-}
-
-impl Rule {
-    pub fn new(sec: &str, ptype: &str, rule: Vec<String>) -> Self {
-        Self {
-            sec: sec.to_owned(),
-            ptype: ptype.to_owned(),
-            rule,
-        }
-    }
-
-    /// Generate a unique hash key for this rule
-    pub fn hash_key(&self) -> [u8; 32] {
-        let key_string = format!("{}:{}:{}", self.sec, self.ptype, self.rule.join(":"));
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(key_string.as_bytes());
-        hasher.finalize().into()
-    }
-}
-
-/// The Casbin adapter that uses the generic Store trait
-pub struct StoreAdapter<S: for<'a> Store<'a>> {
-    store: Arc<S>,
-    db_name: &'static str,
-}
-
-impl<S: for<'a> Store<'a>> StoreAdapter<S> {
-    pub fn new(store: Arc<S>, db_name: &'static str) -> Self {
-        Self { store, db_name }
-    }
-
-    /// Internal helper to convert a Rule to bytes for storage using postcard
-    fn rule_to_bytes(&self, rule: &Rule) -> Result<Vec<u8>, ArunaPermissionHandlerError> {
-        postcard::to_allocvec(rule).map_err(ArunaPermissionHandlerError::from)
-    }
-
-    /// Internal helper to convert bytes from storage to Rule using postcard
-    fn bytes_to_rule(&self, bytes: &[u8]) -> Result<Rule, ArunaPermissionHandlerError> {
-        postcard::from_bytes(bytes).map_err(ArunaPermissionHandlerError::from)
-    }
-
-    /// Load all rules from the store
-    async fn load_rules(&self) -> Result<Vec<Rule>, ArunaPermissionHandlerError> {
-        let txn = self.store.create_txn(false)?;
-        let iter = self.store.iter_db(&txn, self.db_name)?;
-
-        let mut rules = Vec::new();
-        for (_, value) in iter {
-            let rule = self.bytes_to_rule(&value)?;
-            rules.push(rule);
-        }
-
-        self.store.commit(txn)?;
-        Ok(rules)
-    }
-
-    /// Save a single rule to the store
-    async fn save_rule(&self, rule: &Rule) -> Result<(), ArunaPermissionHandlerError> {
-        let mut txn = self.store.create_txn(true)?;
-        let key = rule.hash_key();
-        let value = self.rule_to_bytes(rule)?;
-
-        self.store.put(&mut txn, self.db_name, &key, &value)?;
-        self.store.commit(txn)?;
-
-        Ok(())
-    }
-
-    /// Remove a single rule from the store
-    async fn remove_rule(&self, rule: &Rule) -> Result<(), ArunaPermissionHandlerError> {
-        let mut txn = self.store.create_txn(true)?;
-        let key = rule.hash_key();
-
-        self.store.remove(&mut txn, self.db_name, &key)?;
-        self.store.commit(txn)?;
-
-        Ok(())
-    }
-
-    /// Clear all rules from the store
-    async fn clear_rules(&self) -> Result<(), ArunaPermissionHandlerError> {
-        let txn = self.store.create_txn(false)?;
-        let iter = self.store.iter_db(&txn, self.db_name)?;
-
-        let keys: Vec<Vec<u8>> = iter.map(|(k, _)| k.to_vec()).collect();
-        self.store.commit(txn)?;
-
-        let mut txn = self.store.create_txn(true)?;
-        for key in keys {
-            self.store.remove(&mut txn, self.db_name, &key)?;
-        }
-        self.store.commit(txn)?;
-
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl<S: for<'a> Store<'a> + Send + Sync> casbin::Adapter for StoreAdapter<S> {
-    async fn load_policy(&mut self, m: &mut dyn Model) -> casbin::Result<()> {
-        let rules = self.load_rules().await?;
-
-        for rule in rules {
-            let sec = rule.sec.as_str();
-            let ptype = rule.ptype.as_str();
-
-            if let Some(ref mut ast_map) = m.get_mut_model().get_mut(sec) {
-                if let Some(ref mut ast) = ast_map.get_mut(ptype) {
-                    ast.get_mut_policy().insert(rule.rule);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn load_filtered_policy<'f>(
-        &mut self,
-        _m: &mut dyn Model,
-        _f: Filter<'f>,
-    ) -> casbin::Result<()> {
-        println!("Filtered policy loading is not supported yet");
-        return Err(casbin::Error::AdapterError(AdapterError(
-            "Filtered policies are not supported yet".to_string().into(),
-        )));
-    }
-
-    fn is_filtered(&self) -> bool {
-        false
-    }
-
-    async fn save_policy(&mut self, m: &mut dyn Model) -> casbin::Result<()> {
-        // Clear the database first
-        self.clear_rules().await?;
-
-        // Save each policy rule to the store
-        for (sec, ast_map) in m.get_model() {
-            for (ptype, ast) in ast_map {
-                // Following the in-memory adapter pattern
-                for policy in ast.get_policy() {
-                    let rule = Rule::new(sec, ptype, policy.to_vec());
-                    self.save_rule(&rule).await?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn add_policy(
-        &mut self,
-        sec: &str,
-        ptype: &str,
-        rule: Vec<String>,
-    ) -> casbin::Result<bool> {
-        let rule = Rule::new(sec, ptype, rule);
-        self.save_rule(&rule).await?;
-        Ok(true)
-    }
-
-    async fn add_policies(
-        &mut self,
-        sec: &str,
-        ptype: &str,
-        rules: Vec<Vec<String>>,
-    ) -> casbin::Result<bool> {
-        for rule_tokens in rules {
-            let rule = Rule::new(sec, ptype, rule_tokens);
-            self.save_rule(&rule).await?;
-        }
-        Ok(true)
-    }
-
-    async fn remove_policy(
-        &mut self,
-        sec: &str,
-        ptype: &str,
-        rule: Vec<String>,
-    ) -> casbin::Result<bool> {
-        let rule = Rule::new(sec, ptype, rule);
-        self.remove_rule(&rule).await?;
-        Ok(true)
-    }
-
-    async fn remove_policies(
-        &mut self,
-        sec: &str,
-        ptype: &str,
-        rules: Vec<Vec<String>>,
-    ) -> casbin::Result<bool> {
-        for rule_tokens in rules {
-            let rule = Rule::new(sec, ptype, rule_tokens);
-            self.remove_rule(&rule).await?;
-        }
-        Ok(true)
-    }
-
-    async fn remove_filtered_policy(
-        &mut self,
-        _sec: &str,
-        _ptype: &str,
-        _field_index: usize,
-        _field_values: Vec<String>,
-    ) -> casbin::Result<bool> {
-        println!("Tried to remove filtered policy");
-
-        return Err(casbin::Error::AdapterError(AdapterError(
-            "Filtered policies are not supported yet".to_string().into(),
-        )));
-    }
-
-    async fn clear_policy(&mut self) -> casbin::Result<()> {
-        self.clear_rules().await.map_err(Into::into)
-    }
-}
+pub const DBNAME: &str = "casbin";
 
 /// The custom Enforcer struct that integrates the StoreAdapter
-pub struct Enforcer {
+pub struct Enforcer<'a, S: Store<'a> + Send + Sync + 'static> {
     pub inner: casbin::Enforcer,
+    pub store: &'a S,
 }
 
-impl Enforcer {
+impl<'a, S: Store<'a>> Enforcer<'a, S> {
     /// Create a new Enforcer with the provided store
-    pub async fn new<S>(store: Arc<S>, db_name: &'static str) -> casbin::Result<Self>
-    where
-        S: for<'a> Store<'a> + Send + Sync + 'static,
-    {
+    pub async fn new(store: &'a S) -> casbin::Result<Self> {
         // Create the adapter
-        let adapter = StoreAdapter::new(store, db_name);
+        let adapter = MemoryAdapter::default();
 
         // Create the casbin enforcer
         let mut inner =
@@ -270,7 +42,7 @@ impl Enforcer {
         // Load the policy
         inner.load_policy().await?;
 
-        Ok(Self { inner })
+        Ok(Self { inner, store })
     }
 
     /// Check if a request is permitted
@@ -285,6 +57,7 @@ impl Enforcer {
         obj: &str,
         act: &str,
         eft: Option<&str>,
+        txn: &mut <S as Store<'a>>::Txn,
     ) -> casbin::Result<bool> {
         let mut rule = vec![sub.to_owned(), obj.to_owned(), act.to_owned()];
         if let Some(eft) = eft {
@@ -292,7 +65,38 @@ impl Enforcer {
         } else {
             rule.push("allow".to_owned());
         }
-        self.inner.add_policy(rule).await
+        let key = format!("p:{}", rule.join(":"));
+        let result = self.inner.add_policy(rule).await;
+
+        self.store
+            .put(txn, DBNAME, key.as_bytes(), &[])
+            .map_err(|e| casbin::Error::AdapterError(casbin::error::AdapterError(e.into())))?;
+
+        result
+    }
+
+    pub async fn load_policy(&mut self, txn: &<S as Store<'a>>::Txn) -> casbin::Result<()> {
+        for (key, _) in self
+            .store
+            .iter_db(txn, DBNAME)
+            .map_err(|e| casbin::Error::AdapterError(casbin::error::AdapterError(e.into())))?
+        {
+            let key = String::from_utf8(key.to_vec()).unwrap();
+            if key.starts_with("p:") {
+                let rule = key[2..]
+                    .split(':')
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>();
+                self.inner.add_policy(rule).await?;
+            } else if key.starts_with("g:") {
+                let rule = key[2..]
+                    .split(':')
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>(); 
+                self.inner.add_named_grouping_policy("g", rule).await?;
+            }
+        }
+        self.inner.load_policy().await
     }
 
     /// Remove a policy rule
@@ -302,6 +106,7 @@ impl Enforcer {
         obj: &str,
         act: &str,
         eft: &str,
+        txn: &mut <S as Store<'a>>::Txn,
     ) -> casbin::Result<bool> {
         let rule = vec![
             sub.to_owned(),
@@ -309,22 +114,53 @@ impl Enforcer {
             act.to_owned(),
             eft.to_owned(),
         ];
+        let key = format!("p:{}", rule.join(":"));
         let result = self.inner.remove_policy(rule).await;
+
+        self.store
+            .remove(txn, DBNAME, key.as_bytes())
+            .map_err(|e| casbin::Error::AdapterError(casbin::error::AdapterError(e.into())))?;
+
         result
     }
 
     /// Add a role assignment
-    pub async fn add_group(&mut self, user: &str, role: &str) -> casbin::Result<bool> {
-        self.inner
+    pub async fn add_group(
+        &mut self,
+        user: &str,
+        role: &str,
+        txn: &mut <S as Store<'a>>::Txn,
+    ) -> casbin::Result<bool> {
+        let key = format!("g:{}:{}", user, role);
+
+        let result = self
+            .inner
             .add_named_grouping_policy("g", vec![user.to_owned(), role.to_owned()])
-            .await
+            .await;
+
+        self.store
+            .put(txn, DBNAME, key.as_bytes(), &[])
+            .map_err(|e| casbin::Error::AdapterError(casbin::error::AdapterError(e.into())))?;
+        result
     }
 
     /// Remove a role assignment
-    pub async fn remove_group(&mut self, user: &str, role: &str) -> casbin::Result<bool> {
-        self.inner
+    pub async fn remove_group(
+        &mut self,
+        user: &str,
+        role: &str,
+        txn: &mut <S as Store<'a>>::Txn,
+    ) -> casbin::Result<bool> {
+        let key = format!("g:{}:{}", user, role);
+        let result = self
+            .inner
             .remove_named_grouping_policy("g", vec![user.to_owned(), role.to_owned()])
-            .await
+            .await;
+
+        self.store
+            .remove(txn, DBNAME, key.as_bytes())
+            .map_err(|e| casbin::Error::AdapterError(casbin::error::AdapterError(e.into())))?;
+        result
     }
 
     /// Get all policies
@@ -367,11 +203,5 @@ impl Enforcer {
     pub async fn get_users_for_permission(&self, obj: &str, act: &str) -> Vec<String> {
         let perm = vec![obj.to_owned(), act.to_owned()];
         self.inner.get_implicit_users_for_permission(perm).await
-    }
-}
-
-impl std::fmt::Debug for Enforcer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Enforcer").finish()
     }
 }

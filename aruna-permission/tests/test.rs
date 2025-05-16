@@ -1,18 +1,17 @@
 #[cfg(test)]
 mod tests {
+    use aruna_permission::DBNAME;
     use aruna_permission::Enforcer;
     use aruna_storage::storage::lmdb::LmdbConfig;
     use aruna_storage::storage::lmdb::LmdbStore;
     use aruna_storage::storage::store::Store;
-    use casbin::CoreApi;
     use rand::distributions::Alphanumeric;
     use rand::distributions::DistString;
     use std::fs;
-    use std::sync::Arc;
     use tokio::test;
 
     // Helper function to setup a test store
-    async fn setup_test_store() -> (Arc<LmdbStore>, String) {
+    async fn setup_test_store() -> (LmdbStore, String) {
         // Create a unique test directory for each test
         let test_id = Alphanumeric.sample_string(&mut rand::thread_rng(), 8);
         let test_dir = format!("/dev/shm/test_{}", test_id);
@@ -20,14 +19,12 @@ mod tests {
         // Create the directory
         fs::create_dir_all(&test_dir).expect("Failed to create test directory");
 
-        let db_name = "casbin_rules";
         let store_config = LmdbConfig {
             path: test_dir.clone(),
-            databases: vec![db_name],
+            databases: vec![DBNAME],
         };
 
-        let store = Arc::new(LmdbStore::new(store_config).expect("Failed to create LMDB store"));
-
+        let store = LmdbStore::new(store_config).expect("Failed to create LMDB store");
         (store, test_dir)
     }
 
@@ -40,12 +37,16 @@ mod tests {
     async fn test_group_membership() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         // Add groups
-        enforcer.add_group("alice", "admin").await.unwrap();
-        enforcer.add_group("bob", "editor").await.unwrap();
+        enforcer
+            .add_group("alice", "admin", &mut txn)
+            .await
+            .unwrap();
+        enforcer.add_group("bob", "editor", &mut txn).await.unwrap();
 
         // Check group membership
         assert!(enforcer.has_group("alice", "admin").await);
@@ -56,19 +57,21 @@ mod tests {
         assert!(enforcer.get_groups_for_user("alice").await.first().unwrap() == "admin");
         assert!(enforcer.get_users_for_group("admin").await.first().unwrap() == "alice");
 
+        txn.commit().unwrap();
+
         cleanup_test_dir(&test_dir);
     }
-
     #[test]
     async fn test_basic_policy_crud() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         // Test adding a policy
         let added = enforcer
-            .add_policy("alice", "data1", "read", None)
+            .add_policy("alice", "data1", "read", None, &mut txn)
             .await
             .unwrap();
         assert!(added);
@@ -83,7 +86,7 @@ mod tests {
 
         // Test removing a policy
         let removed = enforcer
-            .remove_policy("alice", "data1", "read", "allow")
+            .remove_policy("alice", "data1", "read", "allow", &mut txn)
             .await
             .unwrap();
         println!("Removed: {}", removed);
@@ -93,6 +96,8 @@ mod tests {
         let not_allowed_after_removal = enforcer.enforce("alice", "data1", "read").await.unwrap();
         assert!(!not_allowed_after_removal);
 
+        txn.commit().unwrap();
+
         cleanup_test_dir(&test_dir);
     }
 
@@ -100,21 +105,25 @@ mod tests {
     async fn test_role_assignments() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         // Setup a role-based policy
         enforcer
-            .add_policy("admin", "data", "read", None)
+            .add_policy("admin", "data", "read", None, &mut txn)
             .await
             .unwrap();
         enforcer
-            .add_policy("admin", "data", "write", None)
+            .add_policy("admin", "data", "write", None, &mut txn)
             .await
             .unwrap();
 
         // Add alice to admin role
-        enforcer.add_group("alice", "admin").await.unwrap();
+        enforcer
+            .add_group("alice", "admin", &mut txn)
+            .await
+            .unwrap();
 
         // Check if role assignment works
         assert!(enforcer.has_group("alice", "admin").await);
@@ -124,10 +133,15 @@ mod tests {
         assert!(enforcer.enforce("alice", "data", "write").await.unwrap());
 
         // Remove role
-        enforcer.remove_group("alice", "admin").await.unwrap();
+        enforcer
+            .remove_group("alice", "admin", &mut txn)
+            .await
+            .unwrap();
 
         // Permissions should be revoked
         assert!(!enforcer.enforce("alice", "data", "read").await.unwrap());
+
+        txn.commit().unwrap();
 
         cleanup_test_dir(&test_dir);
     }
@@ -138,69 +152,37 @@ mod tests {
 
         // First enforcer instance
         {
-            let mut enforcer = Enforcer::new(store.clone(), "casbin_rules").await.unwrap();
+            let mut txn = store.create_txn(true).unwrap();
+            let mut enforcer = Enforcer::new(&store).await.unwrap();
 
             enforcer
-                .add_policy("alice", "data1", "read", None)
+                .add_policy("alice", "data1", "read", None, &mut txn)
                 .await
                 .unwrap();
             enforcer
-                .add_policy("bob", "data2", "write", None)
+                .add_policy("bob", "data2", "write", None, &mut txn)
                 .await
                 .unwrap();
 
             // Save explicitly
             enforcer.save_policy().await.unwrap();
+
+            txn.commit().unwrap();
         }
 
         // Second enforcer instance - should load the saved policies
         {
-            let enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+            let txn = store.create_txn(false).unwrap();
+            let mut enforcer = Enforcer::new(&store).await.unwrap();
+            enforcer.load_policy(&txn).await.unwrap();
 
             // Test persistence
             assert!(enforcer.enforce("alice", "data1", "read").await.unwrap());
             assert!(enforcer.enforce("bob", "data2", "write").await.unwrap());
             assert!(!enforcer.enforce("alice", "data2", "read").await.unwrap());
+
+            txn.commit().unwrap();
         }
-
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[test]
-    async fn test_clear_policy() {
-        let (store, test_dir) = setup_test_store().await;
-
-        // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
-
-        // Add policies
-        enforcer
-            .add_policy("alice", "data1", "read", None)
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("bob", "data2", "write", None)
-            .await
-            .unwrap();
-
-        // Add roles
-        enforcer.add_group("alice", "admin").await.unwrap();
-
-        // Clear all policies
-        enforcer
-            .inner
-            .get_mut_adapter()
-            .clear_policy()
-            .await
-            .unwrap();
-        enforcer.inner.load_policy().await.unwrap();
-
-        // All policies should be gone
-        assert!(!enforcer.enforce("alice", "data1", "read").await.unwrap());
-        assert!(!enforcer.enforce("bob", "data2", "write").await.unwrap());
-
-        // Role assignments should be gone too
-        assert!(!enforcer.has_group("alice", "admin").await);
 
         cleanup_test_dir(&test_dir);
     }
@@ -209,47 +191,63 @@ mod tests {
     async fn test_nested_groups() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         // Set up a role hierarchy
         // editor <- manager <- admin
         // Set permissions for each role
         enforcer
-            .add_policy("editor", "articles", "read", None)
+            .add_policy("editor", "articles", "read", None, &mut txn)
             .await
             .unwrap();
         enforcer
-            .add_policy("editor", "articles", "edit", None)
-            .await
-            .unwrap();
-
-        enforcer
-            .add_policy("manager", "articles", "publish", None)
-            .await
-            .unwrap();
-        enforcer
-            .add_policy("manager", "users", "view", None)
+            .add_policy("editor", "articles", "edit", None, &mut txn)
             .await
             .unwrap();
 
         enforcer
-            .add_policy("admin", "users", "edit", None)
+            .add_policy("manager", "articles", "publish", None, &mut txn)
             .await
             .unwrap();
         enforcer
-            .add_policy("admin", "system", "config", None)
+            .add_policy("manager", "users", "view", None, &mut txn)
+            .await
+            .unwrap();
+
+        enforcer
+            .add_policy("admin", "users", "edit", None, &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_policy("admin", "system", "config", None, &mut txn)
             .await
             .unwrap();
 
         // Set up the role hierarchy
-        enforcer.add_group("manager", "editor").await.unwrap(); // managers inherit editor permissions
-        enforcer.add_group("admin", "manager").await.unwrap(); // admins inherit manager permissions
+        enforcer
+            .add_group("manager", "editor", &mut txn)
+            .await
+            .unwrap(); // managers inherit editor permissions
+        enforcer
+            .add_group("admin", "manager", &mut txn)
+            .await
+            .unwrap(); // admins inherit manager permissions
 
         // Assign users to roles
-        enforcer.add_group("alice", "editor").await.unwrap();
-        enforcer.add_group("bob", "manager").await.unwrap();
-        enforcer.add_group("charlie", "admin").await.unwrap();
+        enforcer
+            .add_group("alice", "editor", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("bob", "manager", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("charlie", "admin", &mut txn)
+            .await
+            .unwrap();
 
         // Test editor permissions
         assert!(enforcer.enforce("alice", "articles", "read").await.unwrap());
@@ -318,6 +316,8 @@ mod tests {
         assert!(charlie_roles.contains(&"manager".to_string()));
         assert!(charlie_roles.contains(&"editor".to_string()));
 
+        txn.commit().unwrap();
+
         cleanup_test_dir(&test_dir);
     }
 
@@ -325,8 +325,9 @@ mod tests {
     async fn test_hierarchical_wildcards() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         // Define roles
         let realm_admin = "realm_admin";
@@ -345,15 +346,33 @@ mod tests {
 
         // Realm admin can access everything in the realm
         enforcer
-            .add_policy(realm_admin, &format!("/{}", realm_id), "read", None)
+            .add_policy(
+                realm_admin,
+                &format!("/{}", realm_id),
+                "read",
+                None,
+                &mut txn,
+            )
             .await
             .unwrap();
         enforcer
-            .add_policy(realm_admin, &format!("/{}/*", realm_id), "read", None)
+            .add_policy(
+                realm_admin,
+                &format!("/{}/*", realm_id),
+                "read",
+                None,
+                &mut txn,
+            )
             .await
             .unwrap();
         enforcer
-            .add_policy(realm_admin, &format!("/{}/*", realm_id), "write", None)
+            .add_policy(
+                realm_admin,
+                &format!("/{}/*", realm_id),
+                "write",
+                None,
+                &mut txn,
+            )
             .await
             .unwrap();
 
@@ -364,6 +383,7 @@ mod tests {
                 &format!("/{}/groups/{}/", realm_id, group_id),
                 "read",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
@@ -373,6 +393,7 @@ mod tests {
                 &format!("/{}/groups/{}/*", realm_id, group_id),
                 "read",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
@@ -382,6 +403,7 @@ mod tests {
                 &format!("/{}/groups/{}/*", realm_id, group_id),
                 "write",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
@@ -396,6 +418,7 @@ mod tests {
                 ),
                 "read",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
@@ -408,6 +431,7 @@ mod tests {
                 ),
                 "read",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
@@ -420,6 +444,7 @@ mod tests {
                 ),
                 "write",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
@@ -434,6 +459,7 @@ mod tests {
                 ),
                 "read",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
@@ -448,6 +474,7 @@ mod tests {
                 ),
                 "read",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
@@ -460,16 +487,32 @@ mod tests {
                 ),
                 "write",
                 None,
+                &mut txn,
             )
             .await
             .unwrap();
 
         // Assign users to roles
-        enforcer.add_group("alice", realm_admin).await.unwrap();
-        enforcer.add_group("bob", group_admin).await.unwrap();
-        enforcer.add_group("charlie", project_admin).await.unwrap();
-        enforcer.add_group("dave", resource_viewer).await.unwrap();
-        enforcer.add_group("eve", resource_editor).await.unwrap();
+        enforcer
+            .add_group("alice", realm_admin, &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("bob", group_admin, &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("charlie", project_admin, &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("dave", resource_viewer, &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("eve", resource_editor, &mut txn)
+            .await
+            .unwrap();
 
         // Test realm admin permissions (alice)
 
@@ -903,6 +946,8 @@ mod tests {
                 .unwrap()
         );
 
+        txn.commit().unwrap();
+
         cleanup_test_dir(&test_dir);
     }
 
@@ -910,22 +955,23 @@ mod tests {
     async fn test_allow_deny_precedence() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         // Setup basic allow policies
         enforcer
-            .add_policy("alice", "data1", "read", Some("allow"))
+            .add_policy("alice", "data1", "read", Some("allow"), &mut txn)
             .await
             .unwrap();
         enforcer
-            .add_policy("bob", "data2", "write", Some("allow"))
+            .add_policy("bob", "data2", "write", Some("allow"), &mut txn)
             .await
             .unwrap();
 
         // Setup explicit deny policy that overrides an allow
         enforcer
-            .add_policy("alice", "data1", "read", Some("deny"))
+            .add_policy("alice", "data1", "read", Some("deny"), &mut txn)
             .await
             .unwrap();
 
@@ -938,6 +984,8 @@ mod tests {
         // Test default deny (no policy)
         assert!(!enforcer.enforce("alice", "data3", "read").await.unwrap());
 
+        txn.commit().unwrap();
+
         cleanup_test_dir(&test_dir);
     }
 
@@ -945,8 +993,9 @@ mod tests {
     async fn test_hierarchical_allow_deny() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         let realm_id = "realm123";
         let group_id = "group456";
@@ -959,6 +1008,7 @@ mod tests {
                 &format!("/{}/*", realm_id),
                 "access",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -970,6 +1020,7 @@ mod tests {
                 &format!("/{}/restricted", realm_id),
                 "access",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -979,6 +1030,7 @@ mod tests {
                 &format!("/{}/groups/{}/restricted", realm_id, group_id),
                 "access",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -990,6 +1042,7 @@ mod tests {
                 &format!("/{}/groups/{}/*", realm_id, group_id),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1002,6 +1055,7 @@ mod tests {
                 ),
                 "read",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1084,6 +1138,8 @@ mod tests {
                 .unwrap()
         ); // Not in allowed path
 
+        txn.commit().unwrap();
+
         cleanup_test_dir(&test_dir);
     }
 
@@ -1091,17 +1147,27 @@ mod tests {
     async fn test_nested_allow_deny_inheritance() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         let realm_id = "realm123";
         let group_id = "group456";
         let project_id = "project789";
 
         // Set up role hierarchy
-        enforcer.add_group("user", "reader").await.unwrap();
-        enforcer.add_group("editor", "reader").await.unwrap();
-        enforcer.add_group("admin", "editor").await.unwrap();
+        enforcer
+            .add_group("user", "reader", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("editor", "reader", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("admin", "editor", &mut txn)
+            .await
+            .unwrap();
 
         // Set up base permissions
         enforcer
@@ -1110,6 +1176,7 @@ mod tests {
                 &format!("/{}/groups/*/resources/*/resources/*", realm_id),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1119,6 +1186,7 @@ mod tests {
                 &format!("/{}/groups/*/resources/*/resources/*", realm_id),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1128,6 +1196,7 @@ mod tests {
                 &format!("/{}/groups/*/resources/*/admin", realm_id),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1142,6 +1211,7 @@ mod tests {
                 ),
                 "read",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1151,6 +1221,7 @@ mod tests {
                 &format!("/{}/groups/{}/resources/*/locked", realm_id, group_id),
                 "write",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1160,6 +1231,7 @@ mod tests {
                 &format!("/{}/groups/*/security", realm_id),
                 "write",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1349,6 +1421,8 @@ mod tests {
                 .unwrap()
         ); // Security denied specifically for admin
 
+        txn.commit().unwrap();
+
         cleanup_test_dir(&test_dir);
     }
 
@@ -1356,8 +1430,9 @@ mod tests {
     async fn test_allow_deny_realworld_scenario() {
         let (store, test_dir) = setup_test_store().await;
 
+        let mut txn = store.create_txn(true).unwrap();
         // Create enforcer
-        let mut enforcer = Enforcer::new(store, "casbin_rules").await.unwrap();
+        let mut enforcer = Enforcer::new(&store).await.unwrap();
 
         let realm_id = "org123";
         let group_id1 = "engineering";
@@ -1375,6 +1450,7 @@ mod tests {
                 &format!("/{}/*", realm_id),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1384,6 +1460,7 @@ mod tests {
                 &format!("/{}/*", realm_id),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1393,6 +1470,7 @@ mod tests {
                 &format!("/{}/security/keys", realm_id),
                 "read",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap(); // Even org admin can't read keys
@@ -1404,6 +1482,7 @@ mod tests {
                 &format!("/{}/security/*", realm_id),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1413,6 +1492,7 @@ mod tests {
                 &format!("/{}/security/*", realm_id),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1422,6 +1502,7 @@ mod tests {
                 &format!("/{}/admin/audit", realm_id),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1431,6 +1512,7 @@ mod tests {
                 &format!("/{}/groups/*/admin/audit", realm_id),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1442,6 +1524,7 @@ mod tests {
                 &format!("/{}/groups/{}/*", realm_id, group_id1),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1451,6 +1534,7 @@ mod tests {
                 &format!("/{}/groups/{}/*", realm_id, group_id1),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1460,6 +1544,7 @@ mod tests {
                 &format!("/{}/groups/{}/admin/budget", realm_id, group_id1),
                 "write",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1474,6 +1559,7 @@ mod tests {
                 ),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1486,6 +1572,7 @@ mod tests {
                 ),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1498,6 +1585,7 @@ mod tests {
                 ),
                 "write",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1511,6 +1599,7 @@ mod tests {
                 ),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1523,6 +1612,7 @@ mod tests {
                 ),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1535,6 +1625,7 @@ mod tests {
                 ),
                 "write",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1546,6 +1637,7 @@ mod tests {
                 &format!("/{}/groups/{}/*", realm_id, group_id2),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1555,6 +1647,7 @@ mod tests {
                 &format!("/{}/groups/{}/*", realm_id, group_id2),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1564,6 +1657,7 @@ mod tests {
                 &format!("/{}/groups/{}/admin/budget", realm_id, group_id2),
                 "write",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1578,6 +1672,7 @@ mod tests {
                 ),
                 "read",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1590,6 +1685,7 @@ mod tests {
                 ),
                 "write",
                 Some("allow"),
+                &mut txn,
             )
             .await
             .unwrap();
@@ -1602,22 +1698,50 @@ mod tests {
                 ),
                 "write",
                 Some("deny"),
+                &mut txn,
             )
             .await
             .unwrap();
 
         // Team member assignments
-        enforcer.add_group("alice", "org_admin").await.unwrap();
-        enforcer.add_group("bob", "security_admin").await.unwrap();
-        enforcer.add_group("charlie", "eng_lead").await.unwrap();
-        enforcer.add_group("dave", "dev_webapp").await.unwrap();
-        enforcer.add_group("eve", "dev_api").await.unwrap();
-        enforcer.add_group("frank", "marketing_lead").await.unwrap();
-        enforcer.add_group("grace", "campaign_mgr").await.unwrap();
+        enforcer
+            .add_group("alice", "org_admin", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("bob", "security_admin", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("charlie", "eng_lead", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("dave", "dev_webapp", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("eve", "dev_api", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("frank", "marketing_lead", &mut txn)
+            .await
+            .unwrap();
+        enforcer
+            .add_group("grace", "campaign_mgr", &mut txn)
+            .await
+            .unwrap();
 
         // Special cross-team assignments
-        enforcer.add_group("eve", "dev_webapp").await.unwrap(); // Eve works on both API and webapp
-        enforcer.add_group("bob", "eng_lead").await.unwrap(); // Bob is both security admin and engineering lead
+        enforcer
+            .add_group("eve", "dev_webapp", &mut txn)
+            .await
+            .unwrap(); // Eve works on both API and webapp
+        enforcer
+            .add_group("bob", "eng_lead", &mut txn)
+            .await
+            .unwrap(); // Bob is both security admin and engineering lead
 
         // Test org admin permissions (alice)
         assert!(
@@ -1859,6 +1983,8 @@ mod tests {
                 .await
                 .unwrap()
         ); // Budget denied
+
+        txn.commit().unwrap();
 
         cleanup_test_dir(&test_dir);
     }
