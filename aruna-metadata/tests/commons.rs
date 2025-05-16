@@ -1,7 +1,7 @@
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicU16},
 };
 
 use anyhow::Result;
@@ -24,6 +24,7 @@ use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 
+pub static SUBSCRIBERS: AtomicU16 = AtomicU16::new(0);
 const TEST_CONFIG: TestConfig = TestConfig {
     socket_addr: "127.0.0.1",
     path: "/dev/shm",
@@ -49,14 +50,16 @@ pub async fn init_lmdb_servers(
     let realm_key = Some(SigningKey::generate(&mut OsRng));
     let mut base_urls = Vec::new();
 
+    let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
-    let tantivy_path = format!("{}/node_{}/tantivy", TEST_CONFIG.path, 0);
+    let tantivy_path = format!("{}/{}/node_{}/tantivy", TEST_CONFIG.path, subscriber, 0);
     let search_config = TantivyConfig {
         path: tantivy_path,
         index_buffer: 1_000_000_000,
         resources: res_rcv,
     };
-    let store_path = format!("{}/node_{}/heed", TEST_CONFIG.path, 0);
+    let store_path = format!("{}/{}/node_{}/heed", TEST_CONFIG.path, subscriber, 0);
     let store_config = LmdbConfig {
         path: store_path,
         databases: vec![
@@ -78,7 +81,7 @@ pub async fn init_lmdb_servers(
             secret_key: None,
             socket_addr: SocketAddrV4::new(
                 Ipv4Addr::from_str(TEST_CONFIG.socket_addr).unwrap(),
-                TEST_CONFIG.p2p_port + offset + 0,
+                TEST_CONFIG.p2p_port + offset + subscriber,
             ),
             bootstrap_nodes: vec![],
             realm_key: realm_key.clone(),
@@ -95,7 +98,7 @@ pub async fn init_lmdb_servers(
         .await
         .unwrap();
 
-    let api_port = TEST_CONFIG.api_port + offset + 0;
+    let api_port = TEST_CONFIG.api_port + offset + subscriber;
     let controller_clone = controller.clone();
     tokio::spawn(async move { RestServer::run(controller_clone, api_port).await });
 
@@ -103,14 +106,15 @@ pub async fn init_lmdb_servers(
     base_urls.push((controller, format!("http://localhost:{}/api/v3", api_port)));
 
     for node in 1..5 {
+        let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
-        let tantivy_path = format!("{}/node_{}/tantivy", TEST_CONFIG.path, node);
+        let tantivy_path = format!("{}/{}/node_{}/tantivy", TEST_CONFIG.path, subscriber, node);
         let search_config = TantivyConfig {
             path: tantivy_path,
             index_buffer: 1_000_000_000,
             resources: res_rcv,
         };
-        let store_path = format!("{}/node_{}/heed", TEST_CONFIG.path, node);
+        let store_path = format!("{}/{}/node_{}/heed", TEST_CONFIG.path, subscriber, node);
         let store_config = LmdbConfig {
             path: store_path,
             databases: vec![
@@ -132,7 +136,7 @@ pub async fn init_lmdb_servers(
                 secret_key: None,
                 socket_addr: SocketAddrV4::new(
                     Ipv4Addr::from_str(TEST_CONFIG.socket_addr).unwrap(),
-                    TEST_CONFIG.p2p_port + offset + node,
+                    TEST_CONFIG.p2p_port + offset + subscriber,
                 ),
                 bootstrap_nodes: vec![bootstrap_addr.clone()],
                 realm_key: realm_key.clone(),
@@ -149,7 +153,7 @@ pub async fn init_lmdb_servers(
             .await
             .unwrap();
 
-        let api_port = TEST_CONFIG.api_port + offset + node;
+        let api_port = TEST_CONFIG.api_port + offset + subscriber;
         let controller_clone = controller.clone();
         tokio::spawn(async move { RestServer::run(controller_clone, api_port).await });
         base_urls.push((controller, format!("http://localhost:{}/api/v3", api_port)));

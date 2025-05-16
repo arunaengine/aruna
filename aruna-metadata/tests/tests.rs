@@ -9,8 +9,6 @@ mod tests {
             GetResourceResponse,
         },
     };
-    use ulid::Ulid;
-
     use crate::commons::init_lmdb_servers;
     const OFFSET: u16 = 0;
 
