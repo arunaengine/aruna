@@ -1,8 +1,8 @@
 use super::store::Store;
 use crate::error::ArunaStorageError;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, RoTxn, RwTxn, WithTls, types::Bytes};
-use tracing::trace;
 use std::{borrow::Cow, fs};
+use tracing::trace;
 
 #[derive(Debug, Clone)]
 pub struct LmdbStore {
@@ -64,66 +64,6 @@ impl<'a> Store<'a> for LmdbStore {
         for dbname in config.databases {
             env.create_database::<Bytes, Bytes>(&mut write_txn, Some(dbname))?;
         }
-
-        // let resources: Database<heed::types::Bytes, heed::types::Bytes> =
-        //     env.create_database(&mut write_txn, Some(RESOURCE_DB_NAME))?;
-        // let resource_mappings: Database<heed::types::Bytes, heed::types::Bytes> =
-        //     env.create_database(&mut write_txn, Some(RESOURCE_MAPPINGS_DB_NAME))?;
-        // env.create_database::<heed::types::Bytes, heed::types::Bytes>(
-        //     &mut write_txn,
-        //     Some(USER_DB_NAME),
-        // )?;
-        // env.create_database::<heed::types::Bytes, heed::types::Bytes>(
-        //     &mut write_txn,
-        //     Some(USER_MAPPINGS_DB_NAME),
-        // )?;
-        // let public_mapping: Database<heed::types::Bytes, heed::types::Bytes> =
-        //     env.create_database(&mut write_txn, Some(PUBLIC_MAPPINGS_DB_NAME))?;
-
-        // // Send resources to search
-        // let res = resources.iter(&write_txn)?;
-        // for res in res {
-        //     let (id, res) = res?;
-        //     let idx = resource_mappings
-        //         .get(&write_txn, id)?
-        //         .expect("No valid mapping found"); // TODO: Remove unwraps and replace with
-
-        //     let doc = automerge::AutoCommit::load(res)?;
-        //     let resource: Resource = autosurgeon::hydrate(&doc)?;
-
-        //     let idx = u32::from_be_bytes(idx.try_into().unwrap());
-        //     // new idx because this is a local only sorting
-        //     config
-        //         .res_sdx
-        //         .blocking_send((idx, resource))
-        //         .map_err(|e| ArunaError::DatabaseError(e.to_string()))?;
-        // }
-
-        // // Send idx to persistor
-        // match resource_mappings.last(&write_txn)? {
-        //     Some((_id, idx)) => {
-        //         let (idx, _) = bincode::serde::decode_from_slice(idx, bincode::config::standard())
-        //             .map_err(|e| ArunaError::DeserializeError(e.to_string()))?;
-        //         config
-        //             .idx_sdx
-        //             .send(idx)
-        //             .map_err(|e| ArunaError::DatabaseError(format!("Send error {e}")))?
-        //     }
-        //     None => config
-        //         .idx_sdx
-        //         .send(0u32)
-        //         .map_err(|e| ArunaError::DatabaseError(format!("Send error {e}")))?,
-        // }
-
-        // // Init bitmap with public resources
-        // let mut value = Vec::new();
-        // RoaringBitmap::new().serialize_into(&mut value)?;
-        // public_mapping.put_with_flags(
-        //     &mut write_txn,
-        //     PutFlags::NO_DUP_DATA,
-        //     &Ulid::default().to_bytes(),
-        //     &value,
-        // )?;
 
         // Commit & return
         write_txn.commit()?;
@@ -232,6 +172,29 @@ impl<'a> Store<'a> for LmdbStore {
             .ok_or_else(|| ArunaStorageError::DatabaseError("Database not found".to_string()))?;
 
         Ok(Box::new(db.iter(txn)?.filter_map(|iter| {
+            // The trait signature for BytesDecode / BytesEncode contains an result return type
+            // In our case its safe to skip since it will always return Ok
+            let (key, value) = iter.ok()?;
+            Some((Cow::from(key.to_vec()), Cow::from(value.to_vec())))
+        })))
+    }
+
+    fn iter_over_prefix<'b>(
+        &'a self,
+        txn: &'b Self::Txn,
+        dbname: &'static str,
+        prefix: String,
+    ) -> Result<Box<dyn Iterator<Item = (Cow<'b, [u8]>, Cow<'b, [u8]>)> + 'b>, ArunaStorageError>
+    where
+        'a: 'b,
+    {
+        let txn = txn.into();
+        let db: Database<Bytes, Bytes> = self
+            .env
+            .open_database(txn, Some(dbname))?
+            .ok_or_else(|| ArunaStorageError::DatabaseError("Database not found".to_string()))?;
+
+        Ok(Box::new(db.prefix_iter(txn, prefix.as_bytes())?.filter_map(|iter| {
             // The trait signature for BytesDecode / BytesEncode contains an result return type
             // In our case its safe to skip since it will always return Ok
             let (key, value) = iter.ok()?;

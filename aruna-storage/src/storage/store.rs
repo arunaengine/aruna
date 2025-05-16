@@ -37,4 +37,14 @@ pub trait Store<'a>: Sync + Send + Sized + std::fmt::Debug {
     ) -> Result<Box<dyn Iterator<Item = (Cow<'b, [u8]>, Cow<'b, [u8]>)> + 'b>, ArunaStorageError>
     where
         'a: 'b;
+
+    fn iter_over_prefix<'b>(
+        &'a self,
+        txn: &'b Self::Txn,
+        dbname: &'static str,
+        prefix: String,
+    ) -> Result<Box<dyn Iterator<Item = (Cow<'b, [u8]>, Cow<'b, [u8]>)> + 'b>, ArunaStorageError>
+    where
+        'a: 'b;
+
 }

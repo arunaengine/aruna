@@ -30,9 +30,7 @@ pub enum FjallTxn<'a> {
 
 impl<'a> Store<'a> for FjallStore {
     type StoreConfig = FjallConfig;
-
     type Txn = FjallTxn<'a>;
-    // type Txn = ();
 
     fn new(config: Self::StoreConfig) -> Result<Self, crate::error::ArunaStorageError> {
         let path = format!("{}/path", config.path);
@@ -205,6 +203,49 @@ impl<'a> Store<'a> for FjallStore {
             },
             FjallTxn::Write(w) => match self.tables.get(dbname) {
                 Some(handle) => Ok(Box::new(w.iter(&handle).filter_map(
+                    |slices| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
+                        let (key, value) = slices.ok()?;
+                        let key = Cow::from(key.as_ref().to_vec()).to_owned();
+                        let value = Cow::from(value.as_ref().to_vec()).to_owned();
+                        Some((key, value))
+                    },
+                ))),
+                None => {
+                    return Err(ArunaStorageError::DatabaseError(
+                        "Database not found".to_string(),
+                    ));
+                }
+            },
+        }
+    }
+
+    fn iter_over_prefix<'b>(
+        &'a self,
+        txn: &'b Self::Txn,
+        dbname: &'static str,
+        prefix: String,
+    ) -> Result<Box<dyn Iterator<Item = (Cow<'b, [u8]>, Cow<'b, [u8]>)> + 'b>, ArunaStorageError>
+    where
+        'a: 'b,
+    {
+        match txn {
+            FjallTxn::Read(r) => match self.tables.get(dbname) {
+                Some(handle) => Ok(Box::new(r.prefix(&handle, prefix).filter_map(
+                    |slices| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
+                        let (key, value) = slices.ok()?;
+                        let key = Cow::from(key.as_ref().to_vec()).to_owned();
+                        let value = Cow::from(value.as_ref().to_vec()).to_owned();
+                        Some((key, value))
+                    },
+                ))),
+                None => {
+                    return Err(ArunaStorageError::DatabaseError(
+                        "Database not found".to_string(),
+                    ));
+                }
+            },
+            FjallTxn::Write(w) => match self.tables.get(dbname) {
+                Some(handle) => Ok(Box::new(w.prefix(&handle, prefix).filter_map(
                     |slices| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
                         let (key, value) = slices.ok()?;
                         let key = Cow::from(key.as_ref().to_vec()).to_owned();
