@@ -4,27 +4,40 @@ version = {workspace = true}
 edition = {workspace = true}
 
 [dependencies]
-ahash = {workspace = true} 
+ahash = {workspace = true}
 anyhow = {workspace = true} 
 aruna-net = { path = "../aruna-net" }
-async-trait = {workspace = true} 
-blake3 = {workspace = true}
-dotenvy = {workspace = true}
-iroh = {workspace = true}
-postcard = {workspace = true} 
-serde = { workspace = true }
-tokio = { workspace = true }
-tracing = {workspace = true} 
-tracing-subscriber = { workspace = true }
-ulid = { workspace = true }
-
+aruna-storage = { path = "../aruna-storage" }
+async-trait = {workspace = true}
 bao-tree = "0.15.1"
+bincode = { version= "2.0.1", features = ["serde"]}
+blake3 = {workspace = true}
 bytes = "1.10.1"
+dotenvy = {workspace = true}
 futures = "0.3.31"
+futures-core = "0.3.31"
+futures-util = "0.3.31"
+http = "1.3.1"
+hyper = {version = "1.6.0", features = ["full"]}
+hyper-util = { version = "0.1.11", features = [
+    "server",
+    "http1",
+    "http2",
+    "tokio",
+    "service",
+]}
+iroh = {workspace = true}
 iroh-io = "0.6.2"
 lazy_static = "1.5.0"
 md5 = "0.7.0"
 opendal = { version = "0.53.1", features = ["services-s3", "services-http", "services-postgresql", "services-fs"] }
-pithos_lib = "0.6.1"
+postcard = {workspace = true}
+s3s = "0.11.0"
+serde = { workspace = true }
 sha2 = "0.10.9"
+tokio = { workspace = true }
+tonic = { version = "0.12.3", features = ["tls", "tls-roots"] }
 toml = "0.8.22"
+tracing = {workspace = true} 
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
