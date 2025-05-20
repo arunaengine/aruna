@@ -1,12 +1,16 @@
 use anyhow::Result;
+use aruna_data::api_s3::auth::UserAccess;
+use aruna_data::api_s3::s3server::S3Server;
+use aruna_data::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICATION_PROTOCOL_ID};
+use aruna_data::io::io_handler::{IOHandler, LOCATION_DB_NAME};
 use aruna_data::{config::config::Config, util::opendal::get_operator};
 use aruna_net::actor::NetworkActorBuilder;
+use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
+use aruna_storage::storage::store::Store;
+use lazy_static::lazy_static;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
-
-use aruna_data::io::replication_handler::{REPLICATION_PROTOCOL_ID, ReplicationHandler};
-use lazy_static::lazy_static;
-use tracing::{Level, debug, error};
+use tracing::{Level, debug, error, info};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
 
@@ -53,76 +57,82 @@ async fn main() -> Result<()> {
             "Connection to {} backend succeeded",
             CONFIG.backend.backend_type
         ),
-        //Err(err) => info!(format!("Connection to backend failed: {}", err)),
         Err(err) => error!("Connection to backend failed: {}", err),
     }
 
     // Create an endpoint, it allows creating and accepting connections in the iroh p2p world
-    let repl_handler_01 = Arc::new(ReplicationHandler::new(operator));
-    let chandler1 = NetworkActorBuilder::new(None)
+    let network_handle_01 = NetworkActorBuilder::new(None)
         .await
         .add_bind_addr_v4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 31337))
         .build(vec![])
         .await?;
-
-    let node_addr = chandler1.get_node_addr().await?;
-    let chandler1 = chandler1.new_actor_handle(REPLICATION_PROTOCOL_ID).await?;
-    let kademlia = chandler1.get_kademlia_actor_handle().await?;
-
-    repl_handler_01
-        .add_connection_handler(node_addr.clone(), chandler1, kademlia.clone())
-        .await;
-    let _ = repl_handler_01.dummy_sync().await;
-
+    let node_addr = network_handle_01.get_node_addr().await?;
     debug!("Node 1 address: {:?}", node_addr);
-
-    // Node 2
-    let mut conf2 = CONFIG.backend.access.clone();
-    conf2.insert("bucket".to_string(), "another-bucket".to_string());
-    let operator2 = get_operator(&CONFIG.backend.backend_type, conf2).await?;
-    let repl_handler_02 = Arc::new(ReplicationHandler::new(operator2));
-    let chandler2 = NetworkActorBuilder::new(None)
-        .await
-        .add_bind_addr_v4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 31338))
-        .build(vec![node_addr.clone()])
+    let actor_handle = network_handle_01
+        .new_actor_handle(REPLICATION_PROTOCOL_ID)
         .await?;
+    let kademlia = actor_handle.get_kademlia_actor_handle().await?;
 
-    let node_addr2 = chandler2.get_node_addr().await?;
-    let chandler2 = chandler2.new_actor_handle(REPLICATION_PROTOCOL_ID).await?;
-    let kademlia2 = chandler2.get_kademlia_actor_handle().await?;
-    repl_handler_02
-        .add_connection_handler(node_addr2.clone(), chandler2, kademlia2.clone())
-        .await;
+    let lmdb_config = LmdbConfig {
+        path: CONFIG.persistence.path.to_string(),
+        databases: vec![ACCESS_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME],
+    };
 
-    debug!("Node 2 address: {:?}", node_addr2);
+    let io_handler = IOHandler::<LmdbStore>::new(
+        node_addr.clone(),
+        operator,
+        actor_handle,
+        kademlia,
+        lmdb_config,
+    )
+    .await?;
 
-    let result = kademlia.find_value(*node_addr2.node_id.as_bytes()).await?;
+    //TODO: Remove later
+    create_dummy_access(io_handler.store.clone()).await?;
 
-    debug!("Result: {:?}", result);
+    let s3server = S3Server::new(CONFIG.frontend.clone(), io_handler, node_addr.node_id).await?;
 
-    let hash = repl_handler_01
-        .replicate_object_to_node(
-            Ulid::new(),
-            repl_handler_01
-                .local_store
-                .read()
-                .await
-                .get("360a1b94a7f997552cda3856869f6d24")
-                .unwrap()
-                .file_path
-                .to_string(),
-            node_addr2,
-        )
-        .await?;
+    s3server.run().await?;
 
-    debug!(
-        "Data location found in Node 1: {:?}",
-        kademlia.find_value(hash).await?
-    );
-    debug!(
-        "Data location found in Node 2: {:?}",
-        kademlia2.find_value(hash).await?
-    );
+    info!("Waiting for ctrl-c to abort.");
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn create_dummy_access<St>(store: Arc<St>) -> Result<()>
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    // Just put a dummy user with default credentials into the store
+    let store_clone = store.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut write_txn = store_clone.create_txn(true)?;
+
+        let access = UserAccess {
+            user_id: "minioadmin".to_string(),
+            group_id: "01JVKSAX4V95AJ0DFYK65B9WDS".to_string(),
+            secret: "minioadmin".to_string(),
+        };
+
+        // Store object info with blake3 hash as key
+        store_clone.put(
+            &mut write_txn,
+            ACCESS_DB_NAME,
+            "minioadmin".as_bytes(), // Currently user id
+            &bincode::serde::encode_to_vec(access, bincode::config::standard())?,
+        )?;
+
+        store_clone.commit(write_txn)?;
+
+        Ok::<(), anyhow::Error>(())
+    });
 
     Ok(())
 }
