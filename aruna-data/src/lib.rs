@@ -5,4 +5,4 @@ pub mod config;
 pub mod io;
 pub mod util;
 
-pub use io::replication_handler::ReplicationHandler;
+pub use io::io_handler::IOHandler;
