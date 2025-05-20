@@ -22,7 +22,7 @@ async-channel = "2.3.1"
 ahash = "0.8.12"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
-blake3 = "1.8.2"
+blake3 = {  version = "1.8.2", features = ["serde"] }
 dotenvy = "0.15.7"
 iroh = "0.35.0"
 iroh-base = "0.35.0"
