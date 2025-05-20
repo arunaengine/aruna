@@ -3,6 +3,7 @@ use casbin::MemoryAdapter;
 use casbin::{CoreApi, DefaultModel, MgmtApi, RbacApi};
 
 mod error;
+mod paths;
 
 pub const MODEL_CONF: &str = r#"
 [request_definition]
@@ -92,7 +93,7 @@ impl<'a, S: Store<'a>> Enforcer<'a, S> {
                 let rule = key[2..]
                     .split(':')
                     .map(|s| s.to_string())
-                    .collect::<Vec<_>>(); 
+                    .collect::<Vec<_>>();
                 self.inner.add_named_grouping_policy("g", rule).await?;
             }
         }

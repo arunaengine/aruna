@@ -7,6 +7,8 @@ edition = "2024"
 aruna-net = { path = "../aruna-net" }
 aruna-realm = { path = "../aruna-realm" }
 aruna-storage = { path = "../aruna-storage" }
+nom = "8.0.0"
+base64 = "0.22.1"
 casbin = { workspace = true }
 ulid = { workspace = true }
 rand = { workspace = true }
