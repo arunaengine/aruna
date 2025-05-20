@@ -268,7 +268,7 @@ where
     }
 
     pub async fn read_data(operator: &Operator, path: &str) -> anyhow::Result<FuturesBytesStream> {
-        let reader = get_reader(operator, path, Some(4 * 1024 * 1024), Some(8)).await?;
+        let reader = get_reader(operator, path, Some(4 * 1024 * 1024), None).await?;
         Ok(reader.into_bytes_stream(..).await?)
     }
 

@@ -44,7 +44,7 @@ impl S3 for ArunaS3Service {
     ) -> S3Result<S3Response<GetObjectOutput>> {
         // Extract access key id from provided credentials
         let access_key = extract_access_key(&req)?;
-        
+
         //
         let store_clone = self.backend.store.clone();
         let info = tokio::task::spawn_blocking(move || {
@@ -87,10 +87,9 @@ impl S3 for ArunaS3Service {
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
         //TODO: Create operator for backend (if necessary)
-        // - How to handle different backends dynamically? Only S3 would be easy.
+        // - How to handle different backends dynamically?
 
-        //TODO: Fetch reader stream
-        //let path = req.input.key.to_string();
+        // Fetch reader stream
         let filename = Path::new(&info.file_path)
             .file_name()
             .ok_or_else(|| s3_error!(InvalidKeyPath, "Path is not a file"))?
