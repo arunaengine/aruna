@@ -1,9 +1,10 @@
 use anyhow::Result;
 use opendal::layers::{LoggingLayer, RetryLayer};
-use opendal::{Builder, FuturesAsyncReader, FuturesBytesStream, Operator, services};
+use opendal::{Builder, FuturesAsyncReader, FuturesBytesStream, Operator, Reader, services};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
+
 #[derive(Debug, Serialize, Deserialize)]
 // Currently supported backends
 pub enum Backend {
@@ -44,19 +45,40 @@ pub fn init_service<B: Builder>(cfg: HashMap<String, String>) -> Result<Operator
     Ok(op)
 }
 
+pub async fn get_reader(
+    operator: &Operator,
+    path: &str,
+    concurrent: Option<usize>,
+    chunk_size: Option<usize>,
+) -> Result<Reader> {
+    let mut builder = operator.reader_with(path);
+
+    if let Some(concurrent) = concurrent {
+        builder = builder.concurrent(concurrent);
+    }
+    if let Some(chunk_size) = chunk_size {
+        builder = builder.chunk(chunk_size);
+    }
+
+    Ok(builder.await?)
+}
+
 pub async fn get_data_stream(
     operator: &Operator,
     path: &str,
     concurrent: Option<usize>,
     chunk_size: Option<usize>,
 ) -> Result<FuturesBytesStream> {
-    Ok(operator
-        .reader_with(path)
-        .concurrent(concurrent.unwrap_or(1))
-        .chunk(chunk_size.unwrap_or(5 * 1024 * 1024))
-        .await?
-        .into_bytes_stream(..)
-        .await?)
+    let mut builder = operator.reader_with(path);
+
+    if let Some(concurrent) = concurrent {
+        builder = builder.concurrent(concurrent);
+    }
+    if let Some(chunk_size) = chunk_size {
+        builder = builder.chunk(chunk_size);
+    }
+
+    Ok(builder.await?.into_bytes_stream(..).await?)
 }
 
 pub async fn get_data_async_reader(
@@ -65,11 +87,14 @@ pub async fn get_data_async_reader(
     concurrent: Option<usize>,
     chunk_size: Option<usize>,
 ) -> Result<FuturesAsyncReader> {
-    Ok(operator
-        .reader_with(path)
-        .concurrent(concurrent.unwrap_or(1))
-        .chunk(chunk_size.unwrap_or(5 * 1024 * 1024))
-        .await?
-        .into_futures_async_read(..)
-        .await?)
+    let mut builder = operator.reader_with(path);
+
+    if let Some(concurrent) = concurrent {
+        builder = builder.concurrent(concurrent);
+    }
+    if let Some(chunk_size) = chunk_size {
+        builder = builder.chunk(chunk_size);
+    }
+
+    Ok(builder.await?.into_futures_async_read(..).await?)
 }
