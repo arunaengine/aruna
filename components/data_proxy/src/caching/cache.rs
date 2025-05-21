@@ -160,7 +160,7 @@ impl Cache {
             debug!("initialized notification handler");
         };
 
-        cache.handle_temp_locations(temp_locations).await?;
+        //cache.handle_temp_locations(temp_locations).await?;
         Ok(cache)
     }
 
