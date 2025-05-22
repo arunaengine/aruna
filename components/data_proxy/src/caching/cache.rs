@@ -278,10 +278,18 @@ impl Cache {
 
         debug!("retrieve all locations");
 
+        let all_bindings = LocationBinding::get_all(&client)
+            .await?
+            .into_iter()
+            .map(|e| (e.object_id, e))
+            .collect::<HashMap<_, _>>();
+
+        debug!("retrieve all bindings");
+
         for object in database_objects {
             let mut location = None;
             if object.object_type == ObjectType::Object {
-                let binding = LocationBinding::get_by_object_id(&object.id, &client).await?;
+                let binding = all_bindings.get(&object.id);
                 if let Some(binding) = binding {
                     location = all_locations.remove(&binding.location_id);
                 }

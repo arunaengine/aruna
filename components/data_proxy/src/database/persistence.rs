@@ -259,7 +259,7 @@ impl LocationBinding {
         Ok(())
     }
 
-    pub async fn _get_all(client: &Client) -> Result<Vec<Self>> {
+    pub async fn get_all(client: &Client) -> Result<Vec<Self>> {
         let query = "SELECT * FROM location_bindings;".to_string();
         let prepared = client.prepare(&query).await.map_err(|e| {
             error!(error = ?e, msg = e.to_string());
