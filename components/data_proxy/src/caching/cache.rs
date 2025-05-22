@@ -276,6 +276,8 @@ impl Cache {
             .map(|e| (e.id, e))
             .collect::<HashMap<_, _>>();
 
+        debug!("retrieve all locations");
+
         for object in database_objects {
             let mut location = None;
             if object.object_type == ObjectType::Object {
@@ -321,11 +323,23 @@ impl Cache {
                 self.paths.insert(object.name.clone(), object.id);
             }
         }
+        debug!("synced objects");
 
-        for (id, _) in all_locations {
-            ObjectLocation::delete(&id, &client).await?;
+        let chunk_size = 10000;
+        let mut current_locs = Vec::new();
+        for (id, _) in all_locations.into_iter() {
+            current_locs.push(id);
+            if current_locs.len() >= chunk_size {
+                ObjectLocation::delete_many_by_ids(&client, &current_locs).await?;
+                trace!("deleted {} dangling locations", current_locs.len());
+                current_locs.clear();
+            }
         }
-
+        if !current_locs.is_empty() {
+            ObjectLocation::delete_many_by_ids(&client, &current_locs).await?;
+            trace!("deleted {} dangling locations", current_locs.len());
+        }
+        debug!("deleted all dangling locations");
         debug!("synced resources");
         Ok((database, temp_locations))
     }
@@ -338,34 +352,41 @@ impl Cache {
         let Some(backend) = &self.backend else {
             bail!("No backend found")
         };
+        let cache = self.get_cache().await?.clone();
+        let backend = backend.clone();
 
-        let cache = self.get_cache().await?;
+        tokio::spawn(async move {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
 
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+            for (object, temp_location) in temp_locations {
+                let sem = semaphore.clone();
+                let backend = backend.clone();
+                let cache = cache.clone();
+                trace!(?object, ?temp_location, "finalizing missing temp location");
+                tokio::spawn(
+                    async move {
+                        let Ok(permit) = sem.acquire().await else {
+                            error!("Failed to acquire semaphore permit");
+                            return;
+                        };
 
-        for (object, temp_location) in temp_locations {
-            let sem = semaphore.clone();
-            let backend = backend.clone();
-            let cache = cache.clone();
-            trace!(?object, ?temp_location, "finalizing missing temp location");
-            tokio::spawn(
-                async move {
-                    let Ok(permit) = sem.acquire().await else {
-                        error!("Failed to acquire semaphore permit");
-                        return;
-                    };
-
-                    if let Err(e) =
-                        DataHandler::finalize_location(object, cache, backend, temp_location, None)
-                            .await
-                    {
-                        error!(error = ?e, "Failed to finalize location");
+                        if let Err(e) = DataHandler::finalize_location(
+                            object,
+                            cache,
+                            backend,
+                            temp_location,
+                            None,
+                        )
+                        .await
+                        {
+                            error!(error = ?e, "Failed to finalize location");
+                        }
+                        drop(permit);
                     }
-                    drop(permit);
-                }
-                .instrument(info_span!("finalize_location")),
-            );
-        }
+                    .instrument(info_span!("finalize_location")),
+                );
+            }
+        });
         Ok(())
     }
 

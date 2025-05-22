@@ -10,6 +10,7 @@ use tracing::debug;
 use tracing::error;
 
 use crate::structs::LocationBinding;
+use crate::structs::ObjectLocation;
 use crate::structs::UploadPart;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -227,6 +228,15 @@ pub async fn delete_parts_by_object_id(client: &Client, object_id: &DieselUlid) 
     let prepared = client.prepare(query).await?;
     client.execute(&prepared, &[&object_id.to_string()]).await?;
     Ok(())
+}
+
+impl ObjectLocation {
+    pub async fn delete_many_by_ids(client: &Client, ids: &[DieselUlid]) -> Result<()> {
+        let query = "DELETE FROM object_locations WHERE id = ANY($1::UUID[]);";
+        let prepared = client.prepare(query).await?;
+        client.execute(&prepared, &[&ids]).await?;
+        Ok(())
+    }
 }
 
 impl LocationBinding {
