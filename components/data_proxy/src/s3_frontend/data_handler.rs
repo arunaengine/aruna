@@ -75,6 +75,10 @@ impl DataHandler {
                 e
             })?
         };
+        if parents.get(0).is_none() {
+            error!(?parents, "No parent found");
+            return Err(anyhow!("No parent found"));
+        }
 
         let mut new_location = backend
             .initialize_location(&object, None, parents, false)

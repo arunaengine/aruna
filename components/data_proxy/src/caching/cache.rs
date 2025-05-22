@@ -766,6 +766,14 @@ impl Cache {
     #[tracing::instrument(level = "trace", skip(self, object))]
     pub async fn upsert_object(&self, object: Object) -> Result<()> {
         trace!(?object, "upserting object");
+
+        if let Ok((rwlock_object, _)) = self.get_resource(&object.id).await {
+            let cache_object = rwlock_object.read().await;
+            if *cache_object == object {
+                return Ok(());
+            }
+        }
+
         if let Some(persistence) = self.persistence.read().await.as_ref() {
             let mut client = persistence.get_client().await?;
             let transaction = client.transaction().await?;
