@@ -86,7 +86,12 @@ impl DataHandler {
             .await?;
 
         if new_location.bucket == "-" {
-            error!(?parents, ?new_location, "Invalid location in bucket");
+            error!(
+                ?parents,
+                ?new_location,
+                ?object,
+                "Invalid location in bucket"
+            );
             return Err(anyhow!("Invalid location in bucket"));
         }
 
