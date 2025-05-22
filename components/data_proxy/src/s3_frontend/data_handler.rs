@@ -28,6 +28,7 @@ use tracing::debug;
 use tracing::error;
 use tracing::info_span;
 use tracing::trace;
+use tracing::warn;
 use tracing::Instrument;
 
 #[derive(Debug)]
@@ -81,8 +82,13 @@ impl DataHandler {
         }
 
         let mut new_location = backend
-            .initialize_location(&object, None, parents, false)
+            .initialize_location(&object, None, parents.clone(), false)
             .await?;
+
+        if new_location.bucket == "-" {
+            error!(?parents, ?new_location, "Invalid location in bucket");
+            return Err(anyhow!("Invalid location in bucket"));
+        }
 
         debug!(?before_location, ?new_location, "Finalizing location");
 
