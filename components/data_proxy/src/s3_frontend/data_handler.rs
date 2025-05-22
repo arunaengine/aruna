@@ -110,6 +110,14 @@ impl DataHandler {
 
         trace!(part_lens = ?part_lens, "Part lengths");
 
+        if part_lens.is_empty() {
+            error!("No part lengths found");
+            if let Err(e) = cleanup_location(&object, before_location, new_location, cache).await {
+                error!(error = ?e, msg = "Failed to clean up location");
+            }
+            return Err(anyhow!("No part lengths found"));
+        }
+
         let aswr_handle = tokio::spawn(
             async move {
                 let (tx, rx) = async_channel::bounded(10);
@@ -216,38 +224,11 @@ impl DataHandler {
         {
             Ok(_) => {}
             Err(e) => {
-                let object_id = object.id;
                 error!(location = ?before_location, object = ?object, error = ?e, msg = "Failed to get multipart for location");
-                if object.object_status == Status::Initializing {
-                    let upload_id = before_location
-                        .upload_id
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("Missing upload_id"))?
-                        .to_string();
-                    debug!("Object is in initializing state, cleaning up upload_id: {upload_id}");
-                    cache
-                        .delete_parts_by_upload_id(upload_id)
-                        .await
-                        .map_err(|e| {
-                            error!(error = ?e, msg = "Failed to delete parts");
-                            e
-                        })?;
-                    cache
-                        .delete_location_with_mappings(object_id, before_location)
-                        .await
-                        .map_err(|e| {
-                            error!(error = ?e, msg = "Failed to delete location with mappings");
-                            e
-                        })?;
-                    cache
-                        .delete_location_with_mappings(object_id, new_location)
-                        .await
-                        .map_err(|e| {
-                            error!(error = ?e, msg = "Failed to delete location with mappings");
-                            e
-                        })?;
-                } else {
-                    error!(?object_id, "Object is not in initializing state");
+                if let Err(e) =
+                    cleanup_location(&object, before_location, new_location, cache).await
+                {
+                    error!(error = ?e, msg = "Failed to clean up location");
                 }
                 return Err(e);
             }
@@ -303,4 +284,45 @@ impl DataHandler {
 
         Ok(())
     }
+}
+
+async fn cleanup_location(
+    object: &Object,
+    before_location: ObjectLocation,
+    new_location: ObjectLocation,
+    cache: Arc<Cache>,
+) -> Result<()> {
+    let object_id = object.id;
+    if object.object_status == Status::Initializing {
+        let upload_id = before_location
+            .upload_id
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing upload_id"))?
+            .to_string();
+        debug!("Object is in initializing state, cleaning up upload_id: {upload_id}");
+        cache
+            .delete_parts_by_upload_id(upload_id)
+            .await
+            .map_err(|e| {
+                error!(error = ?e, msg = "Failed to delete parts");
+                e
+            })?;
+        cache
+            .delete_location_with_mappings(object_id, before_location)
+            .await
+            .map_err(|e| {
+                error!(error = ?e, msg = "Failed to delete location with mappings");
+                e
+            })?;
+        cache
+            .delete_location_with_mappings(object_id, new_location)
+            .await
+            .map_err(|e| {
+                error!(error = ?e, msg = "Failed to delete location with mappings");
+                e
+            })?;
+    } else {
+        error!(?object_id, "Object is not in initializing state");
+    }
+    Ok(())
 }

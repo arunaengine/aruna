@@ -11,6 +11,7 @@ use anyhow::anyhow;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
+use aws_sdk_s3::config::RequestChecksumCalculation;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_sdk_s3::{
     config::Region,
@@ -70,10 +71,19 @@ impl S3Backend {
             Some(force_path_style) => aws_sdk_s3::config::Builder::from(&config)
                 .region(Region::new("RegionOne"))
                 .force_path_style(*force_path_style)
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                )
+                .clone()
                 .endpoint_url(&s3_endpoint)
                 .build(),
             _ => aws_sdk_s3::config::Builder::from(&config)
                 .region(Region::new("RegionOne"))
+                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+                .response_checksum_validation(
+                    aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
+                )
                 .endpoint_url(&s3_endpoint)
                 .build(),
         };

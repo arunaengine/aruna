@@ -160,7 +160,7 @@ impl Cache {
             debug!("initialized notification handler");
         };
 
-        //cache.handle_temp_locations(temp_locations).await?;
+        cache.handle_temp_locations(temp_locations).await?;
         Ok(cache)
     }
 
@@ -270,12 +270,18 @@ impl Cache {
 
         let mut temp_locations = vec![];
 
+        let mut all_locations = ObjectLocation::get_all(&client)
+            .await?
+            .into_iter()
+            .map(|e| (e.id, e))
+            .collect::<HashMap<_, _>>();
+
         for object in database_objects {
             let mut location = None;
             if object.object_type == ObjectType::Object {
                 let binding = LocationBinding::get_by_object_id(&object.id, &client).await?;
                 if let Some(binding) = binding {
-                    location = Some(ObjectLocation::get(&binding.location_id, &client).await?);
+                    location = all_locations.remove(&binding.location_id);
                 }
             }
             if let Some(before_location) = &location {
@@ -316,6 +322,10 @@ impl Cache {
             }
         }
 
+        for (id, _) in all_locations {
+            ObjectLocation::delete(&id, &client).await?;
+        }
+
         debug!("synced resources");
         Ok((database, temp_locations))
     }
@@ -330,18 +340,28 @@ impl Cache {
         };
 
         let cache = self.get_cache().await?;
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+
         for (object, temp_location) in temp_locations {
+            let sem = semaphore.clone();
             let backend = backend.clone();
             let cache = cache.clone();
             trace!(?object, ?temp_location, "finalizing missing temp location");
             tokio::spawn(
                 async move {
+                    let Ok(permit) = sem.acquire().await else {
+                        error!("Failed to acquire semaphore permit");
+                        return;
+                    };
+
                     if let Err(e) =
                         DataHandler::finalize_location(object, cache, backend, temp_location, None)
                             .await
                     {
                         error!(error = ?e, "Failed to finalize location");
                     }
+                    drop(permit);
                 }
                 .instrument(info_span!("finalize_location")),
             );
