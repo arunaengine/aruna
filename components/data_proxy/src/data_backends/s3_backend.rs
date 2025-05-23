@@ -26,6 +26,7 @@ use http_body_util::StreamBody;
 use hyper::body::Frame;
 use rand::random;
 use tracing::error;
+use tracing::trace;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -76,21 +77,11 @@ impl S3Backend {
                 .response_checksum_validation(
                     aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
                 )
-                .stalled_stream_protection(
-                    StalledStreamProtectionConfig::enabled()
-                        .upload_enabled(false)
-                        .build(),
-                )
                 .clone()
                 .endpoint_url(&s3_endpoint)
                 .build(),
             _ => aws_sdk_s3::config::Builder::from(&config)
                 .region(Region::new("RegionOne"))
-                .stalled_stream_protection(
-                    StalledStreamProtectionConfig::enabled()
-                        .upload_enabled(false)
-                        .build(),
-                )
                 .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
                 .response_checksum_validation(
                     aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
@@ -180,9 +171,10 @@ impl StorageBackend for S3Backend {
                 return Err(err.into());
             }
         };
+        let id = location.id.to_string();
 
         while let Some(bytes) = object_request.body.next().await {
-            //trace!(len = ?bytes.as_ref().map(|e| e.len()), "Sending bytes");
+            trace!(len = ?bytes.as_ref().map(|e| e.len()), ?id, "Sending bytes");
             sender
                 .send(Ok(bytes.map_err(|e| {
                     error!(error = ?e, msg = e.to_string());

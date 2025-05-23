@@ -3,6 +3,7 @@ use crate::data_backends::storage_backend::StorageBackend;
 use crate::s3_frontend::utils::buffered_s3_sink::BufferedS3Sink;
 use crate::structs::Object;
 use crate::structs::ObjectLocation;
+use crate::structs::VersionVariant;
 use anyhow::anyhow;
 use anyhow::Result;
 use aruna_rust_api::api::storage::models::v2::Hash;
@@ -28,7 +29,6 @@ use tracing::debug;
 use tracing::error;
 use tracing::info_span;
 use tracing::trace;
-use tracing::warn;
 use tracing::Instrument;
 
 #[derive(Debug)]
@@ -71,7 +71,14 @@ impl DataHandler {
         let parents = if let Some(levels) = path_level {
             levels
         } else {
-            cache.get_single_parent(&object.id).await.map_err(|e| {
+            let mut object_id = object.id.clone();
+            if let Some(version) = &object.versions {
+                version.iter().next().map(|v| match v {
+                    VersionVariant::IsVersion(id) => object_id = id.clone(),
+                    _ => {}
+                });
+            }
+            cache.get_single_parent(&object_id).await.map_err(|e| {
                 error!(error = ?e, msg = e.to_string());
                 e
             })?
