@@ -42,7 +42,7 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_json = { version = "1.0.140", features = ["raw_value"] }
 sha2 = {version = "0.10.8", features = ["std", "asm", "sha2-asm"]}
 time = "0.3.41"
-tokio = { version = "1.44.2", features = ["full"] }
+tokio = { version = "1.44.2", features = ["full", "tracing"] }
 tokio-postgres = { version = "0.7.13", features = ["with-uuid-1", "with-serde_json-1", "with-chrono-0_4"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tonic = { version = "0.11.0", features = ["tls", "tls-roots"] }

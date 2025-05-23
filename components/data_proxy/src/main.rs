@@ -20,7 +20,8 @@ use tonic::transport::Server;
 use tracing::error;
 use tracing::info_span;
 use tracing::trace;
-use tracing::Instrument;
+use tracing::Instrument as _;
+use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 mod bundler;
@@ -76,24 +77,29 @@ async fn main() -> Result<()> {
 
     dotenvy::from_filename(".env").ok();
 
-    let filter = EnvFilter::try_from_default_env()
+
+    let tokio_env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or("none".into())
+        .add_directive("tokio=trace".parse().unwrap())
+        .add_directive("runtime=trace".parse().unwrap());
+
+    let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("data_proxy=trace".parse()?);
 
-    let subscriber = tracing_subscriber::fmt()
-        //.with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
-        // Use a more compact, abbreviated log format
-        .compact()
-        // Set LOG_LEVEL to
-        .with_env_filter(filter)
-        // Display source code file paths
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_file(true)
-        // Display source code line numbers
         .with_line_number(true)
         .with_target(false)
-        .finish();
+        .with_filter(logging_env_filter);
 
-    tracing::subscriber::set_global_default(subscriber)?;
+    let console_layer = console_subscriber::spawn().with_filter(tokio_env_filter);
+
+    tracing_subscriber::registry()
+        .with(fmt_layer)
+        .with(console_layer)
+        .init();
 
     trace!("init storage backend");
 

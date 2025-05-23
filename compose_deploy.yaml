@@ -130,7 +130,7 @@ services:
       MEILISEARCH_HOST: http://meili:7700
       NATS_HOST: nats:4222
   proxy_01:
-    image: harbor.computational.bio.uni-giessen.de/aruna/arunadataproxy:2.0.1
+    image: data_proxy
     depends_on:
       load_database:
         condition: service_completed_successfully
@@ -144,7 +144,7 @@ services:
     volumes:
       - proxy_config_01:/run/config/
   proxy_02:
-    image: harbor.computational.bio.uni-giessen.de/aruna/arunadataproxy:2.0.1
+    image: data_proxy
     depends_on:
       load_database:
         condition: service_completed_successfully
