@@ -160,7 +160,7 @@ impl Cache {
             debug!("initialized notification handler");
         };
 
-        //cache.handle_temp_locations(temp_locations).await?;
+        cache.handle_temp_locations(temp_locations).await?;
         Ok(cache)
     }
 
@@ -364,7 +364,7 @@ impl Cache {
         let backend = backend.clone();
 
         tokio::spawn(async move {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(100));
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
 
             for (object, temp_location) in temp_locations {
                 let sem = semaphore.clone();

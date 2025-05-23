@@ -6,7 +6,6 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::fmt::{Debug, Display, Formatter};
 use tokio_postgres::Client;
-use tracing::debug;
 use tracing::error;
 
 use crate::structs::LocationBinding;
@@ -114,7 +113,7 @@ pub trait WithGenericBytes<
             })
             .collect::<Result<Vec<Self>>>()?)
     }
-    async fn get(id: &X, client: &Client) -> Result<Self>
+    async fn _get(id: &X, client: &Client) -> Result<Self>
     where
         Self: WithGenericBytes<X, T>,
     {
@@ -277,7 +276,10 @@ impl LocationBinding {
             })
             .collect::<Vec<Self>>())
     }
-    pub async fn get_by_object_id(object_id: &DieselUlid, client: &Client) -> Result<Option<Self>> {
+    pub async fn _get_by_object_id(
+        object_id: &DieselUlid,
+        client: &Client,
+    ) -> Result<Option<Self>> {
         let query = "SELECT * FROM location_bindings WHERE object_id = $1;".to_string();
         let prepared = client.prepare(&query).await.map_err(|e| {
             error!(error = ?e, msg = e.to_string());

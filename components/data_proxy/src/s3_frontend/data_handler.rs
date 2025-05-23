@@ -13,7 +13,7 @@ use diesel_ulid::DieselUlid;
 use md5::{Digest, Md5};
 use pithos_lib::streamreadwrite::GenericStreamReadWriter;
 use pithos_lib::transformer::ReadWriter;
-use pithos_lib::transformers::decrypt_with_parts::ChaCha20DecParts;
+use pithos_lib::transformers::decrypt_resilient::ChaChaResilient;
 use pithos_lib::transformers::encrypt::ChaCha20Enc;
 use pithos_lib::transformers::footer::FooterGenerator;
 use pithos_lib::transformers::hashing_transformer::HashingTransformer;
@@ -118,17 +118,8 @@ impl DataHandler {
         let new_location_clone = new_location.clone();
         let is_compressed = before_location.file_format.is_compressed();
 
-        let mut part_lens = Vec::new();
         let parts = cache.get_parts(&upload_id);
-        for part in parts {
-            let full_chunks = (part.size / (65536 + 28)) * (65536 + 28);
-            if full_chunks != 0 {
-                part_lens.push(full_chunks);
-            }
-            if part.size % (65536 + 28) != 0 {
-                part_lens.push(part.size - full_chunks);
-            }
-        }
+        let part_lens = parts.iter().map(|part| part.size).collect::<Vec<_>>();
 
         trace!(part_lens = ?part_lens, "Part lengths");
 
@@ -162,7 +153,7 @@ impl DataHandler {
                 tracing::debug!(part_lens = ?part_lens, "Part lengths");
 
                 if let Some(key) = clone_key {
-                    asr = asr.add_transformer(ChaCha20DecParts::new_with_lengths(key, part_lens));
+                    asr = asr.add_transformer(ChaChaResilient::new_with_lengths(key, part_lens));
                 }
 
                 if is_compressed {

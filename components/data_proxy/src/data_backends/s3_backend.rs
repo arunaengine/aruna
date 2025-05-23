@@ -12,7 +12,6 @@ use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use aws_sdk_s3::config::RequestChecksumCalculation;
-use aws_sdk_s3::config::StalledStreamProtectionConfig;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_sdk_s3::{
     config::Region,
