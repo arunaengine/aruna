@@ -77,7 +77,6 @@ async fn main() -> Result<()> {
 
     dotenvy::from_filename(".env").ok();
 
-
     let tokio_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("tokio=trace".parse().unwrap())
@@ -86,7 +85,6 @@ async fn main() -> Result<()> {
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("data_proxy=trace".parse()?);
-
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_file(true)
