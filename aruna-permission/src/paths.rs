@@ -4,10 +4,8 @@ use nom::{
     Err as NomErr, IResult, Parser,
     branch::alt,
     bytes::complete::{tag, take_while1},
-    combinator::{map, opt},
+    combinator::map,
     error::{Error as NomError, ErrorKind},
-    multi::many0,
-    sequence::preceded,
 };
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
@@ -560,6 +558,22 @@ impl Display for Path {
         }
 
         Ok(())
+    }
+}
+
+impl Into<Vec<u8>> for &Path {
+    fn into(self) -> Vec<u8> {
+        self.to_string().into()
+    }
+}
+
+impl TryFrom<&[u8]> for Path {
+    type Error = PathError;
+
+    fn try_from(value: &[u8]) -> Result<Self> {
+        let input = std::str::from_utf8(value)
+            .map_err(|_| PathError::ParseError("Invalid UTF-8 in path".to_string()))?;
+        Self::parse(input)
     }
 }
 
