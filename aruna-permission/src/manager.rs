@@ -2,32 +2,12 @@ use std::fmt::Display;
 
 use aruna_storage::storage::store::Store;
 use blake3::Hash as Blake3Hash;
-use thiserror::Error;
 use ulid::Ulid;
 
+use crate::error::{PermissionError, Result};
 use crate::{casbin::Enforcer, paths::Path};
 
 pub const RESOURCE_DB: &str = "resources";
-
-#[derive(Error, Debug)]
-pub enum PermissionError {
-    #[error("Permission denied for resource")]
-    PermissionDenied,
-    #[error("Resource not found: {0}")]
-    ResourceNotFound(String),
-    #[error("Role not found: {0}")]
-    RoleNotFound(String),
-    #[error("Storage error: {0}")]
-    StorageError(#[from] aruna_storage::error::ArunaStorageError),
-    #[error("Casbin error: {0}")]
-    CasbinError(#[from] casbin::Error),
-    #[error("Path error: {0}")]
-    PathError(#[from] crate::paths::PathError),
-    #[error("Postcard error: {0}")]
-    PostcardError(#[from] postcard::Error),
-}
-
-pub type Result<T> = std::result::Result<T, PermissionError>;
 
 /// Resource identifier that can be either a ULID or Blake3 hash
 #[derive(Debug, Clone, PartialEq)]
