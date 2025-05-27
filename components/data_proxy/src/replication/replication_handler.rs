@@ -525,10 +525,12 @@ impl ReplicationHandler {
                                                 _ => {}
                                             });
                                         }
-                                        cache.get_single_parent(&current_version_id).await.map_err(|e| {
-                                            error!(error = ?e, msg = e.to_string());
-                                            e
-                                        })?
+                                        cache.get_single_parent(&current_version_id).await.map_err(
+                                            |e| {
+                                                error!(error = ?e, msg = e.to_string());
+                                                e
+                                            },
+                                        )?
                                     };
                                     backend
                                         .initialize_location(
