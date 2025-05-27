@@ -1,4 +1,4 @@
-use crate::structs::FileFormat;
+use crate::structs::{FileFormat, VersionVariant};
 use crate::CONFIG;
 use crate::{
     caching::cache::Cache, data_backends::storage_backend::StorageBackend,
@@ -24,7 +24,7 @@ use pithos_lib::{streamreadwrite::GenericStreamReadWriter, transformer::ReadWrit
 use std::{str::FromStr, sync::Arc};
 use tokio::pin;
 use tokio::sync::RwLock;
-use tracing::{info_span, trace, Instrument};
+use tracing::{error, info_span, trace, Instrument};
 
 pub struct ReplicationMessage {
     pub direction: Direction,
@@ -515,11 +515,26 @@ impl ReplicationHandler {
                                     trace!("skipping object");
                                     continue;
                                 } else {
+                                    let parent = {
+                                        let mut current_version_id = object_id.clone();
+                                        if let Some(version) = &object.versions {
+                                            version.iter().next().map(|v| match v {
+                                                VersionVariant::IsVersion(id) => {
+                                                    current_version_id = id.clone()
+                                                }
+                                                _ => {}
+                                            });
+                                        }
+                                        cache.get_single_parent(&current_version_id).await.map_err(|e| {
+                                            error!(error = ?e, msg = e.to_string());
+                                            e
+                                        })?
+                                    };
                                     backend
                                         .initialize_location(
                                             &object,
                                             object_state.read().await.get_size(),
-                                            cache.get_single_parent(&object.id).await?,
+                                            parent,
                                             false,
                                         )
                                         .await
