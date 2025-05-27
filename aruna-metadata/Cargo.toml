@@ -29,7 +29,6 @@ automerge = "0.6.1"
 autosurgeon = "0.8.7"
 axum = "0.8.4"
 axum-extra = {version = "0.10.1", features = ["query"]}
-bincode = { version= "2.0.1", features = ["serde"]}
 chrono = { version = "0.4.41", features = ["serde"]}
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "pem"] } # TODO: Move into workspace deps
 opentelemetry = "0.29.1"

@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     error::ArunaMetadataError,
-    models::models::{Resource, User},
+    models::models::{Group, Resource, User},
     network::network_trait::{Body, MetadataMessage, ReplicationSubject},
     persistence::persistence::tables::*,
 };
@@ -24,6 +24,7 @@ pub mod tables {
     pub const RESOURCE_DB_NAME: &str = "resources";
     pub const RESOURCE_MAPPINGS_DB_NAME: &str = "resource_mappings";
     pub const USER_DB_NAME: &str = "users";
+    pub const GROUPS_DB_NAME: &str = "groups";
     pub const USER_MAPPINGS_DB_NAME: &str = "user_mappings";
     pub const PUBLIC_MAPPINGS_DB_NAME: &str = "public_mappings";
 }
@@ -366,6 +367,51 @@ where
             .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
 
         search.add_resource(idx, res_clone).await?;
+
+        Ok(result)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn add_group(
+        &self,
+        actor_id: &[u8; 32],
+        user_id: &Ulid,
+        group: Group,
+    ) -> Result<Vec<u8>, ArunaMetadataError> {
+        // Clones for spawn_blocking
+        let store = self.store.clone();
+        let user_id = *user_id;
+
+        // Generate actor id
+        let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
+
+        let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ArunaMetadataError> {
+            let mut write_txn = store.create_txn(true)?;
+
+            // Serialize into &[u8]
+            let id = group.id.to_bytes();
+
+            let mut doc = automerge::AutoCommit::new().with_actor(actor_id);
+
+            autosurgeon::reconcile(&mut doc, group)?;
+            let group = doc.save();
+
+            let mut bitmap = Vec::new();
+            RoaringBitmap::new().serialize_into(&mut bitmap)?;
+
+            // Write in store
+            store.put(&mut write_txn, GROUPS_DB_NAME, &id, &group)?;
+
+            todo!("add group to permission handler");
+            todo!("add roles to permission handler");
+            //store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
+
+            // Commit
+            store.commit(write_txn)?;
+            Ok::<Vec<u8>, ArunaMetadataError>(group)
+        })
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
 
         Ok(result)
     }

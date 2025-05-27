@@ -466,7 +466,7 @@ where
     into_axum_response(state.request(request, extract_token(&header)).await)
 }
 
-/// Create a new resource
+/// Add a new user
 #[utoipa::path(
     post,
     path = "/users",
@@ -482,6 +482,34 @@ where
 )]
 #[tracing::instrument(level = "trace", skip(state))]
 pub async fn add_user<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    headers: HeaderMap,
+    Json(request): Json<AddUserRequest>,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+
+/// Add a new group
+#[utoipa::path(
+    post,
+    path = "/groups",
+    request_body = AddGroupRequest,
+    responses(
+        (status = 200, body = AddGroupResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = USERS,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn add_group<St, Se, N>(
     State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<AddUserRequest>,

@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+
 use super::conversions::autosurgeon_date_time;
 use super::conversions::autosurgeon_ulid;
 use autosurgeon::{Hydrate, Reconcile};
@@ -225,4 +228,28 @@ pub struct User {
     #[key]
     pub id: Ulid,
     pub name: String,
+}
+
+
+#[derive(
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Debug,
+    Serialize,
+    Deserialize,
+    ToSchema,
+    Default,
+    Reconcile,
+    Hydrate,
+)]
+pub struct Group {
+    #[autosurgeon(with = "autosurgeon_ulid")]
+    #[key]
+    pub id: Ulid,
+    pub name: String,
+    pub roles: Vec<String>,
+    pub members: BTreeMap<String, Vec<String>>, // User to role mappings
 }

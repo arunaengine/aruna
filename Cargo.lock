@@ -176,7 +176,6 @@ dependencies = [
  "autosurgeon",
  "axum 0.8.4",
  "axum-extra",
- "bincode 2.0.1",
  "blake3",
  "chrono",
  "criterion",

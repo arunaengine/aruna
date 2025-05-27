@@ -1,12 +1,11 @@
 use crate::error::ArunaMetadataError;
 
-use super::models::{Resource, User};
+use super::models::{Group, Resource, User};
 
 impl TryFrom<&[u8]> for Resource {
     type Error = ArunaMetadataError;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let (res, _) = bincode::serde::decode_from_slice(value, bincode::config::standard())
-            .map_err(|e| ArunaMetadataError::DeserializeError(e.to_string()))?;
+        let res = postcard::from_bytes(value)?;
         Ok(res)
     }
 }
@@ -14,17 +13,15 @@ impl TryFrom<&[u8]> for Resource {
 impl TryFrom<Resource> for Vec<u8> {
     type Error = ArunaMetadataError;
     fn try_from(value: Resource) -> Result<Self, Self::Error> {
-        let key = bincode::serde::encode_to_vec(value, bincode::config::standard())
-            .map_err(|e| ArunaMetadataError::DeserializeError(e.to_string()))?;
-        Ok(key)
+        let res = postcard::to_allocvec(&value)?;
+        Ok(res)
     }
 }
 
 impl TryFrom<&[u8]> for User {
     type Error = ArunaMetadataError;
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
-        let (res, _) = bincode::serde::decode_from_slice(value, bincode::config::standard())
-            .map_err(|e| ArunaMetadataError::DeserializeError(e.to_string()))?;
+        let res = postcard::from_bytes(value)?;
         Ok(res)
     }
 }
@@ -32,8 +29,23 @@ impl TryFrom<&[u8]> for User {
 impl TryFrom<User> for Vec<u8> {
     type Error = ArunaMetadataError;
     fn try_from(value: User) -> Result<Self, Self::Error> {
-        let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())
-            .map_err(|e| ArunaMetadataError::DeserializeError(e.to_string()))?;
+        let res = postcard::to_allocvec(&value)?;
+        Ok(res)
+    }
+}
+
+impl TryFrom<&[u8]> for Group {
+    type Error = ArunaMetadataError;
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        let res = postcard::from_bytes(value)?;
+        Ok(res)
+    }
+}
+
+impl TryFrom<Group> for Vec<u8> {
+    type Error = ArunaMetadataError;
+    fn try_from(value: Group) -> Result<Self, Self::Error> {
+        let bytes = postcard::to_allocvec(&value)?;
         Ok(bytes)
     }
 }

@@ -1,6 +1,8 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 use crate::error::ArunaMetadataError;
 
-use super::models::{Author, KeyValue, Resource, ResourceVariant, User, VisibilityClass};
+use super::models::{Author, Group, KeyValue, Resource, ResourceVariant, User, VisibilityClass};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
@@ -66,6 +68,40 @@ pub struct AddUserRequest {
 pub struct AddUserResponse {
     pub user: User,
 }
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddGroupRequest {
+    pub name: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddGroupResponse {
+    pub group: Group,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddRolesToGroupRequest {
+    pub roles: BTreeMap<String, String>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddRolesToGroupResponse {}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddUserToGroupRequest {
+    pub name: BTreeMap<Ulid, Vec<String>>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddUserToGroupResponse {}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddResourcesToGroupRequest {
+    pub resources: Vec<Ulid>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct AddResourcesToGroupResponse {}
 
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
