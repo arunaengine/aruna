@@ -129,11 +129,11 @@ dependencies = [
 name = "aruna-data"
 version = "3.0.0"
 dependencies = [
- "ahash",
  "anyhow",
  "aruna-net",
  "aruna-storage",
  "async-trait",
+ "axum 0.8.4",
  "bao-tree",
  "bincode 2.0.1",
  "blake3",
@@ -154,12 +154,17 @@ dependencies = [
  "s3s",
  "serde",
  "sha2",
+ "thiserror 2.0.12",
  "tokio",
  "toml",
  "tonic",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "ulid",
+ "utoipa",
+ "utoipa-axum",
+ "utoipa-swagger-ui",
 ]
 
 [[package]]
