@@ -1,0 +1,33 @@
+use crate::io::controller::Controller;
+use crate::error::ArunaDataError;
+use aruna_storage::storage::store::Store;
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
+use utoipa::ToSchema;
+
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
+)]
+pub struct User {
+    pub id: Ulid,
+    pub name: String,
+}
+
+#[async_trait::async_trait]
+pub trait Request<St>
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    type Response;
+    async fn run_request(
+        self,
+        requester: Option<User>,
+        controller: &Controller<St>,
+    ) -> Result<Self::Response, ArunaDataError>;
+
+    async fn forward_or_return(
+        &self,
+        requester: &Option<String>,
+        controller: &Controller<St>,
+    ) -> Result<Option<Self::Response>, ArunaDataError>;
+}

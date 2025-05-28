@@ -23,12 +23,16 @@ ahash = "0.8.12"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 blake3 = {  version = "1.8.2", features = ["serde"] }
+casbin = "2.10.1"
 dotenvy = "0.15.7"
+futures = "0.3.31"
 iroh = "0.35.0"
 iroh-base = "0.35.0"
 parking_lot = { version = "0.12.3", features = ["deadlock_detection"] }
 postcard = "1.1.1"
+rand = "0.8.5"
 serde = { version = "1.0.218", features = ["derive"] }
+thiserror = "2.0.12"
 tokio = { version = "1.45.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = [
@@ -38,10 +42,9 @@ tracing-subscriber = { version = "0.3.19", features = [
     "registry",
 ] }
 ulid = { version = "1.2.1", features = ["serde"] }
-futures = "0.3.31"
-thiserror = "2.0.12"
-rand = "0.8.5"
-casbin = "2.10.1"
+utoipa = { version = "5.3.1", features = ["chrono", "axum_extras", "ulid", "url"] }
+utoipa-axum = "0.2.0"
+utoipa-swagger-ui = { version = "9.0.1", features = ["axum"] }
 
 [profile.release]
 panic = "abort"

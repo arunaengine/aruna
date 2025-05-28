@@ -1,6 +1,8 @@
 use anyhow::Result;
+use aruna_data::api_json::server::RestServer;
 use aruna_data::api_s3::auth::UserAccess;
 use aruna_data::api_s3::s3server::S3Server;
+use aruna_data::io::controller::Controller;
 use aruna_data::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICATION_PROTOCOL_ID};
 use aruna_data::io::io_handler::{IOHandler, LOCATION_DB_NAME};
 use aruna_data::{config::config::Config, util::opendal::get_operator};
@@ -12,7 +14,6 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::Arc;
 use tracing::{Level, debug, error, info};
 use tracing_subscriber::EnvFilter;
-use ulid::Ulid;
 
 lazy_static! {
     static ref CONFIG: Config = {
@@ -89,10 +90,18 @@ async fn main() -> Result<()> {
 
     //TODO: Remove later
     create_dummy_access(io_handler.store.clone()).await?;
+    
+    let s3server = S3Server::new(
+        CONFIG.frontend.clone(),
+        io_handler.clone(),
+        node_addr.node_id,
+    )
+    .await?;
 
-    let s3server = S3Server::new(CONFIG.frontend.clone(), io_handler, node_addr.node_id).await?;
-
-    s3server.run().await?;
+    let controller = Arc::new(Controller::<LmdbStore>::new(io_handler));
+    
+    tokio::spawn(async move { RestServer::run(controller, 50056).await }).await??;
+    tokio::spawn(async move { s3server.run().await }).await??;
 
     info!("Waiting for ctrl-c to abort.");
     loop {
