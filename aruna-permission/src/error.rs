@@ -8,6 +8,8 @@ pub enum ArunaPermissionHandlerError {
     ConversionError(#[from] postcard::Error),
     #[error("Storage error: {0}")]
     StorageError(#[from] aruna_storage::error::ArunaStorageError),
+    #[error("Casbin helper error: {0}")]
+    CasbinHelperError(String),
 }
 
 impl From<ArunaPermissionHandlerError> for casbin::Error {
@@ -33,6 +35,8 @@ pub enum PermissionError {
     PathError(#[from] crate::paths::PathError),
     #[error("Postcard error: {0}")]
     PostcardError(#[from] postcard::Error),
+    #[error("Aruna permission handler error: {0}")]
+    ArunaPermissionHandlerError(#[from] ArunaPermissionHandlerError),
 }
 
 pub type Result<T> = std::result::Result<T, PermissionError>;
