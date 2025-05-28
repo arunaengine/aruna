@@ -9,7 +9,6 @@ use aruna_realm::Realm;
 use aruna_storage::storage::store::Store;
 use ed25519_dalek::SigningKey;
 use iroh::{NodeAddr, PublicKey, SecretKey};
-use rand::seq::IteratorRandom;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddrV4, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,6 +44,7 @@ pub enum Body {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ReplicationSubject {
+    Group(Vec<u8>),
     User(Vec<u8>),
     Object(Vec<u8>),
 }
@@ -507,6 +507,7 @@ impl P2PNetwork {
                         .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
                 }
                 Body::Response { .. } => {
+                    todo!("Backchannel for updated merged docs or sync protocol");
                     // Nothing to do here, there are currently no messages that send responses
                     // after replication/forwarding back
                 }

@@ -37,6 +37,12 @@ pub struct PermissionManager<'a, S: Store<'a> + Send + Sync + 'static> {
     pub enforcer: Enforcer<'a, S>,
 }
 
+impl<'a, S: Store<'a>> std::fmt::Debug for PermissionManager<'a, S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FjallStore").finish()
+    }
+}
+
 impl<'a, S: Store<'a>> PermissionManager<'a, S> {
     pub async fn new(store: &'a S) -> Result<Self> {
         let enforcer = Enforcer::new(store).await?;

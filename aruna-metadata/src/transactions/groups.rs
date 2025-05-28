@@ -5,13 +5,16 @@ use crate::{
     models::{
         models::{Group, User},
         requests::{
-            AddGroupRequest, AddGroupResponse, AddResourcesToGroupRequest, AddResourcesToGroupResponse, AddRolesToGroupRequest, AddRolesToGroupResponse, AddUserToGroupRequest, AddUserToGroupResponse
+            AddGroupRequest, AddGroupResponse, AddResourcesToGroupRequest,
+            AddResourcesToGroupResponse, AddRolesToGroupRequest, AddRolesToGroupResponse,
+            AddUserToGroupRequest, AddUserToGroupResponse,
         },
     },
-    network::network_trait::Network,
+    network::network_trait::{Network, REPLICATION_POLICY},
     persistence::search::search::Search,
 };
 use aruna_storage::storage::store::Store;
+use rand::seq::IteratorRandom;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -41,13 +44,38 @@ where
         let Some(user) = user else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
+        let group_id = Ulid::new();
         let group = Group {
-            id: Ulid::new(),
+            id: group_id,
             name: self.name,
             roles: vec!["admin".to_string(), "member".to_string()],
             members: BTreeMap::from([(user.id.to_string(), vec!["admin".to_string()])]),
         };
-        todo!();
+        let node_id = controller.network.get_addr().await?.node_id;
+        let group_doc = controller
+            .persistence
+            .add_group(node_id.as_bytes(), &user.id, group.clone())
+            .await?;
+
+        // Choose x = REPLICATION_POLICY random nodes of members
+        // and replicate resource
+        let members = controller
+            .network
+            .get_realm_nodes()
+            .await?
+            .into_iter()
+            .filter(|addr| addr.node_id != node_id);
+        for node in members {
+            controller
+                .network
+                .replicate(
+                    crate::network::network_trait::ReplicationSubject::Group(group_doc.clone()),
+                    &group_id,
+                    node.clone(),
+                )
+                .await?;
+        }
+
         Ok(AddGroupResponse { group })
     }
 }
@@ -107,7 +135,6 @@ where
         todo!()
     }
 }
-
 
 #[async_trait::async_trait]
 impl<St, Se, N> Request<St, Se, N> for AddResourcesToGroupRequest

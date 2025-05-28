@@ -1,23 +1,23 @@
 [package]
 name = "aruna-metadata"
-version = {workspace = true}
-edition = {workspace = true}
+version = { workspace = true }
+edition = { workspace = true }
 
 
 [dependencies]
-ahash = {workspace = true}
-anyhow = {workspace = true}
-async-trait = {workspace = true}
-blake3 = {workspace=true}
-dotenvy = {workspace = true}
-iroh = {workspace = true}
-iroh-base = {workspace = true}
-parking_lot = { workspace = true}
-postcard = {workspace = true}
+ahash = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace=true }
+dotenvy = { workspace = true }
+iroh = { workspace = true }
+iroh-base = { workspace = true }
+parking_lot = { workspace = true }
+postcard = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
-tracing = {workspace = true} 
+tracing = { workspace = true } 
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 thiserror = { workspace = true }
@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 aruna-net = {path = "../aruna-net"}
 aruna-storage = {path = "../aruna-storage"}
 aruna-realm = {path = "../aruna-realm"}
+aruna-permission = {path = "../aruna-permission"}
 automerge = "0.6.1"
 autosurgeon = "0.8.7"
 axum = "0.8.4"
@@ -47,7 +48,7 @@ utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.1", features = ["axum"] }
 
 [dev-dependencies]
-criterion = { version = "0.5.1", features = ["html_reports", "async_tokio"] }
+criterion = { version = "0.6.0", features = ["html_reports", "async_tokio"] }
 
 [[bench]]
 name = "benchmarks"

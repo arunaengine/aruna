@@ -182,3 +182,10 @@ impl From<aruna_realm::error::RealmError> for ArunaMetadataError {
         ArunaMetadataError::NetworkError(e.to_string())
     }
 }
+
+impl From<aruna_permission::error::PermissionError> for ArunaMetadataError {
+    fn from(e: aruna_permission::error::PermissionError) -> Self {
+        tracing::trace!(?e);
+        ArunaMetadataError::Unauthorized
+    }
+}
