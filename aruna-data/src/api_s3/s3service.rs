@@ -15,27 +15,39 @@ use std::sync::Arc;
 use tracing::{debug, error};
 use ulid::Ulid;
 
-pub struct ArunaS3Service {
-    backend: Arc<IOHandler<LmdbStore>>,
+pub struct ArunaS3Service<St>
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    backend: Arc<IOHandler<St>>,
     node_id: NodeId,
 }
 
-impl Debug for ArunaS3Service {
+impl<St> Debug for ArunaS3Service<St>
+where
+    for<'a> St: Store<'a>,
+{
     #[tracing::instrument(level = "trace", skip(self, f))]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArunaS3Service").finish()
     }
 }
 
-impl ArunaS3Service {
+impl<St> ArunaS3Service<St>
+where
+    for<'a> St: Store<'a> + 'static,
+{
     #[tracing::instrument(level = "trace", skip(backend))]
-    pub async fn new(backend: Arc<IOHandler<LmdbStore>>, node_id: NodeId) -> Result<Self> {
+    pub async fn new(backend: Arc<IOHandler<St>>, node_id: NodeId) -> Result<Self> {
         Ok(ArunaS3Service { backend, node_id })
     }
 }
 
 #[async_trait::async_trait]
-impl S3 for ArunaS3Service {
+impl<St> S3 for ArunaS3Service<St>
+where
+    for<'a> St: Store<'a> + 'static,
+{
     #[tracing::instrument(err)]
     #[allow(clippy::blocks_in_conditions)]
     async fn get_object(
