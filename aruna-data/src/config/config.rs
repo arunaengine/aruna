@@ -31,13 +31,27 @@ pub struct BackendConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct Frontend {
+    pub openapi_frontend: OpenApiFrontend,
+    pub s3_frontend: S3Frontend,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub struct OpenApiFrontend {
+    pub address: String,
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub struct S3Frontend {
     pub server: String,
     pub hostname: String,
     pub cors_exception: Option<String>,
 }
 
-impl S3Host for Frontend {
-    fn parse_host_header<'a>(&'a self, host: &'a str) -> S3Result<VirtualHost<'a>> {
+impl S3Host for S3Frontend {
+    fn parse_host_header<'a>(&'a self, _host: &'a str) -> S3Result<VirtualHost<'a>> {
         Ok(VirtualHost::new(self.server.clone()))
     }
 }

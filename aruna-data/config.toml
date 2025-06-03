@@ -28,7 +28,11 @@ secret_access_key = "minioadmin"
 #key_field = ""
 #value_field = ""
 
-[frontend]
+[frontend.openapi_frontend]
+address = "0.0.0.0"
+port = 50056
+
+[frontend.s3_frontend]
 server = "0.0.0.0:1337"
 hostname = "localhost:1337"
 cors_exception = "http://localhost:3000"

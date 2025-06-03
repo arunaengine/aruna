@@ -49,6 +49,8 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     debug!(config = ?*CONFIG);
+    let rest_addr = Ipv4Addr::from_str(&CONFIG.frontend.openapi_frontend.address)?;
+
     // Dummy access conf which is provided by user/request/node
     let conf = CONFIG.backend.access.clone();
     let operator = get_operator(&CONFIG.backend.backend_type, conf).await?;
