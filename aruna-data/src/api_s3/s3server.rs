@@ -1,12 +1,9 @@
 use super::s3service::ArunaS3Service;
 use crate::IOHandler;
 use crate::api_s3::auth::AuthProvider;
-use crate::config::config::Frontend;
+use crate::config::config::S3Frontend;
 use anyhow::Result;
-use aruna_net::Kademlia;
-use aruna_net::actor_handle::NetworkActorHandle;
 use aruna_storage::storage::lmdb::LmdbStore;
-use aruna_storage::storage::store::Store;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
 use http::HeaderValue;
@@ -16,15 +13,13 @@ use hyper::service::Service;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use iroh::{NodeAddr, NodeId};
-use opendal::Operator;
+use iroh::NodeId;
+use s3s::Body;
 use s3s::S3Error;
-use s3s::auth::{S3Auth, SecretKey};
 use s3s::s3_error;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
 use s3s::service::SharedS3Service;
-use s3s::{Body, S3Result};
 use std::convert::Infallible;
 use std::future::Ready;
 use std::future::ready;
@@ -32,11 +27,11 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing::{debug, error};
+use ulid::Ulid;
 
 pub struct S3Server {
     s3service: S3Service,
     address: String,
-    node_id: NodeId,
 }
 
 #[derive(Clone)]
@@ -47,30 +42,40 @@ impl S3Server {
     pub async fn new(
         //address: impl Into<String> + Copy,
         //hostname: impl Into<String>,
-        frontend: Frontend,
+        frontend: S3Frontend,
         backend: Arc<IOHandler<LmdbStore>>,
         node_id: NodeId,
+        realm_id: Ulid,
     ) -> Result<Self> {
-        let s3service = ArunaS3Service::new(backend.clone(), node_id).await.map_err(|e| {
-            error!(error = ?e, msg = e.to_string());
-            tonic::Status::unauthenticated(e.to_string())
-        })?;
+        let s3service = ArunaS3Service::new(backend.clone(), node_id)
+            .await
+            .map_err(|e| {
+                error!(error = ?e, msg = e.to_string());
+                tonic::Status::unauthenticated(e.to_string())
+            })?;
 
         let local_address = frontend.server.clone();
+
+        let authenticate = AuthProvider {
+            store: backend.store.clone(),
+            realm_id,
+        };
+        let authorize = AuthProvider {
+            store: backend.store.clone(),
+            realm_id,
+        };
 
         let service = {
             let mut b = S3ServiceBuilder::new(s3service);
             b.set_host(frontend);
-            b.set_auth(AuthProvider {
-                store: backend.store.clone()
-            });
+            b.set_auth(authenticate);
+            b.set_access(authorize);
             b.build()
         };
 
         Ok(Self {
             s3service: service,
             address: local_address,
-            node_id,
         })
     }
     #[tracing::instrument(level = "trace", skip(self))]
