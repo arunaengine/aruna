@@ -149,20 +149,71 @@ where
         &self,
         user: &Option<String>,
         _controller: &Controller<St>,
-    ) -> Result<Option<Self::Response>, crate::error::ArunaDataError> {
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
         Ok(None)
     }
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn run_request(
+        self,
+        user: Option<User>,
+        _controller: &Controller<St>,
+    ) -> Result<Self::Response, ArunaDataError> {
+        let Some(_user) = user else {
+            return Err(ArunaDataError::Unauthorized);
+        };
+
+        Ok(DeleteS3CredentialsResponse {})
+    }
+}
+
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
+)]
+pub struct RegisterDataRequest {
+    group_id: String,
+    backend_path: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct RegisterDataResponse {
+    path: String,
+}
+
+#[async_trait::async_trait]
+impl<St> Request<St> for RegisterDataRequest
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    type Response = RegisterDataResponse;
 
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         user: Option<User>,
         controller: &Controller<St>,
-    ) -> Result<Self::Response, crate::error::ArunaDataError> {
+    ) -> Result<Self::Response, ArunaDataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaDataError::Unauthorized);
+            return Err(ArunaDataError::Unauthorized);
         };
 
-        Ok(DeleteS3CredentialsResponse {})
+        let frontend_path = controller
+            .io_handler
+            .register_backend_data(&self.backend_path, user.group)
+            .await
+            .map_err(|e| ArunaDataError::IoError(e.to_string()))?;
+
+        Ok(RegisterDataResponse {
+            path: frontend_path,
+        })
+    }
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &Controller<St>,
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
+        Ok(None)
     }
 }

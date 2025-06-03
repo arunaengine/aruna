@@ -9,6 +9,7 @@ use tags::*;
 
 mod tags {
     pub const USERS: &str = "users";
+    pub const RESOURCES: &str = "resources";
 }
 
 /// Create new credentials for a user
@@ -71,6 +72,30 @@ where
 )]
 #[tracing::instrument(level = "trace", skip(state))]
 pub async fn delete_s3_credentials<St>(
+    State(state): State<Arc<Controller<St>>>,
+    headers: HeaderMap,
+    Json(request): Json<DeleteS3CredentialsRequest>,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+
+/// Register already existing data resource
+#[utoipa::path(
+    post,
+    path = "/data/register",
+    request_body = RegisterDataRequest,
+    responses(
+        (status = 200, body = RegisterDataResponse), ArunaDataError),
+    security(
+        ("auth" = [])
+    ),
+    tag = RESOURCES,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn register_data<St>(
     State(state): State<Arc<Controller<St>>>,
     headers: HeaderMap,
     Json(request): Json<DeleteS3CredentialsRequest>,

@@ -7,6 +7,7 @@ use crate::util::opendal::{get_data_async_reader, get_data_stream, get_reader};
 use anyhow::anyhow;
 use aruna_net::Kademlia;
 use aruna_net::actor_handle::{NetworkActorHandle, ReceiveStreams};
+use aruna_permission::manager::{PermissionManager, ResourceId};
 use aruna_storage::storage::store::Store;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -258,6 +259,78 @@ where
         Ok(info)
     }
 
+    pub async fn register_backend_data(&self, path: &str, group: Ulid) -> anyhow::Result<String> {
+        // Check if backend path resource exists
+        self.operator.exists(path).await?;
+        let meta = self.operator.stat(path).await?;
+
+        let mut hasher = Hasher::new();
+        let mut reader =
+            get_data_stream(&self.operator, path, None, Some(BLOCK_SIZE.bytes())).await?;
+
+        while let Some(bytes) = reader.next().await {
+            hasher.update(&bytes?);
+        }
+        let hashes = hasher.finalize()?;
+
+        //TODO: Register resource in permission manager
+        let perm_path = aruna_permission::paths::PathBuilder::new()
+            .realm_id(Ulid::new()) //TODO
+            .group_data(
+                group,
+                "bucket".to_string(), //TODO
+                "key".to_string(), //TODO
+                hashes.blake3,
+            ) 
+            .build()?;
+
+        // Register resource
+        let location = ObjectInfo {
+            id: Ulid::new(),
+            staging: false,
+            compressed: false,
+            encrypted: false,
+            file_path: path.to_string(),
+            file_size: meta.content_length(),
+            file_hashes: hashes.clone(),
+        };
+
+        let mut manager = PermissionManager::new().await?;
+        let store_clone = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut write_txn = store_clone.create_txn(true)?;
+            manager.add_resource(
+                ResourceId::Ulid(location.id),
+                &perm_path,
+                store_clone.as_ref(),
+                &mut write_txn,
+            )?;
+
+            // Store content hash --> location
+            store_clone.put(
+                &mut write_txn,
+                LOCATION_DB_NAME,
+                hashes.blake3.as_bytes(), //&info.id.to_bytes(),
+                &bincode::serde::encode_to_vec(location, bincode::config::standard())?,
+            )?;
+
+            //TODO: Store frontend path ?
+            store_clone.commit(write_txn)?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+
+        //TODO: Store mapping of frontend path <--> blake3 hash ?
+
+        // Publish content hash location via Kademlia
+        self.kademlia
+            .store(*hashes.blake3.as_bytes(), self.node_addr.clone(), None)
+            .await?;
+
+        Ok("".to_string())
+    }
+
     pub async fn read_data(operator: &Operator, path: &str) -> anyhow::Result<FuturesBytesStream> {
         let reader = get_reader(operator, path, Some(4 * 1024 * 1024), None).await?;
         Ok(reader.into_bytes_stream(..).await?)
@@ -268,7 +341,7 @@ where
         path: &str,
         range: Range<u64>,
     ) -> anyhow::Result<FuturesBytesStream> {
-        let reader = get_reader(&operator, path, Some(4 * 1024 * 1024), Some(8)).await?;
+        let reader = get_reader(&operator, path, Some(4 * 1024 * 1024), None).await?;
         Ok(reader.into_bytes_stream(range).await?)
     }
 
