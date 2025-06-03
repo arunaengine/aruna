@@ -54,7 +54,7 @@ pub trait Network: Sync + Send + Sized {
     type Config;
     async fn new(config: Self::Config) -> Result<Self, ArunaMetadataError>;
     async fn get_addr(&self) -> Result<NodeAddr, ArunaMetadataError>;
-    async fn replicate(
+    async fn sync(
         &self,
         subject: ReplicationSubject,
         subject_id: &Ulid,
@@ -102,7 +102,7 @@ impl Network for NetworkDummy {
         Ok(self.self_id.clone())
     }
 
-    async fn replicate(
+    async fn sync(
         &self,
         _subject: ReplicationSubject,
         _subject_id: &Ulid,
@@ -260,7 +260,7 @@ impl Network for P2PNetwork {
     }
 
     #[tracing::instrument(level = "trace", skip(self, subject))]
-    async fn replicate(
+    async fn sync(
         &self,
         subject: ReplicationSubject,
         subject_id: &Ulid,

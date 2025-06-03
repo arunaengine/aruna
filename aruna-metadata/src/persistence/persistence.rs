@@ -7,11 +7,17 @@ use crate::{
     models::models::{Group, Resource, User},
     persistence::persistence::tables::*,
 };
+use ahash::RandomState;
 use aruna_storage::storage::store::Store;
-use automerge::ActorId;
+use automerge::{ActorId, AutoCommit, sync::State};
 use autosurgeon::reconcile;
+use iroh::PublicKey;
+use parking_lot::Mutex;
 use roaring::RoaringBitmap;
-use std::sync::{Arc, atomic::AtomicU32};
+use std::{
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicU32},
+};
 use ulid::Ulid;
 
 pub trait Authorize {
@@ -36,6 +42,8 @@ where
     pub(super) store: Arc<St>,
     pub(super) search: Arc<Se>,
     pub(super) idx_counter: Arc<AtomicU32>,
+    pub(super) connection_states:
+        Arc<Mutex<HashMap<Ulid, HashMap<PublicKey, State, RandomState>, RandomState>>>,
 }
 
 impl<Se, St> Persistor<St, Se>
@@ -122,6 +130,7 @@ where
             store,
             search,
             idx_counter,
+            connection_states: Arc::new(Mutex::new(HashMap::default())),
         })
     }
 
@@ -131,7 +140,7 @@ where
         actor_id: &[u8; 32],
         user_id: &Ulid,
         resource: Resource,
-    ) -> Result<Vec<u8>, ArunaMetadataError> {
+    ) -> Result<AutoCommit, ArunaMetadataError> {
         let store = self.store.clone();
         let search = self.search.clone();
         let user_id = *user_id;
@@ -166,7 +175,7 @@ where
             create_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx)?;
 
             store.commit(write_txn)?;
-            Ok::<Vec<u8>, ArunaMetadataError>(res)
+            Ok::<AutoCommit, ArunaMetadataError>(doc)
         })
         .await
         .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
@@ -202,7 +211,7 @@ where
         &self,
         actor_id: &[u8; 32],
         user: User,
-    ) -> Result<Vec<u8>, ArunaMetadataError> {
+    ) -> Result<AutoCommit, ArunaMetadataError> {
         let store = self.store.clone();
         let actor_id = ActorId::from([user.id.to_bytes().as_slice(), actor_id.as_slice()].concat());
         let result = tokio::task::spawn_blocking(move || {
@@ -225,7 +234,7 @@ where
 
             // Commit
             store.commit(write_txn)?;
-            Ok::<Vec<u8>, ArunaMetadataError>(user)
+            Ok::<AutoCommit, ArunaMetadataError>(doc)
         })
         .await
         .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
@@ -306,7 +315,7 @@ where
         actor_id: &[u8; 32],
         user_id: &Ulid,
         resource: Resource,
-    ) -> Result<Vec<u8>, ArunaMetadataError> {
+    ) -> Result<AutoCommit, ArunaMetadataError> {
         // Clones for spawn_blocking
         let store = self.store.clone();
         let search = self.search.clone();
@@ -317,8 +326,8 @@ where
         // Generate actor id
         let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
 
-        let (result, idx) =
-            tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, u32), ArunaMetadataError> {
+        let (result, idx) = tokio::task::spawn_blocking(
+            move || -> Result<(AutoCommit, u32), ArunaMetadataError> {
                 let mut write_txn = store.create_txn(true)?;
 
                 let idx = idx_from_cow(
@@ -359,10 +368,11 @@ where
                 }
 
                 store.commit(write_txn)?;
-                Ok::<(Vec<u8>, u32), ArunaMetadataError>((res, idx))
-            })
-            .await
-            .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+                Ok::<(AutoCommit, u32), ArunaMetadataError>((doc, idx))
+            },
+        )
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
 
         search.add_resource(idx, res_clone).await?;
 
@@ -375,7 +385,7 @@ where
         actor_id: &[u8; 32],
         user_id: &Ulid,
         group: Group,
-    ) -> Result<Vec<u8>, ArunaMetadataError> {
+    ) -> Result<AutoCommit, ArunaMetadataError> {
         // Clones for spawn_blocking
         let store = self.store.clone();
         let user_id = *user_id;
@@ -383,33 +393,34 @@ where
         // Generate actor id
         let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
 
-        let result = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ArunaMetadataError> {
-            let mut write_txn = store.create_txn(true)?;
+        let result =
+            tokio::task::spawn_blocking(move || -> Result<AutoCommit, ArunaMetadataError> {
+                let mut write_txn = store.create_txn(true)?;
 
-            // Serialize into &[u8]
-            let id = group.id.to_bytes();
+                // Serialize into &[u8]
+                let id = group.id.to_bytes();
 
-            let mut doc = automerge::AutoCommit::new().with_actor(actor_id);
+                let mut doc = automerge::AutoCommit::new().with_actor(actor_id);
 
-            autosurgeon::reconcile(&mut doc, group)?;
-            let group = doc.save();
+                autosurgeon::reconcile(&mut doc, group)?;
+                let group = doc.save();
 
-            let mut bitmap = Vec::new();
-            RoaringBitmap::new().serialize_into(&mut bitmap)?;
+                let mut bitmap = Vec::new();
+                RoaringBitmap::new().serialize_into(&mut bitmap)?;
 
-            // Write in store
-            store.put(&mut write_txn, GROUPS_DB_NAME, &id, &group)?;
+                // Write in store
+                store.put(&mut write_txn, GROUPS_DB_NAME, &id, &group)?;
 
-            todo!("add group to permission handler");
-            todo!("add roles to permission handler");
-            //store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
+                todo!("add group to permission handler");
+                todo!("add roles to permission handler");
+                //store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
 
-            // Commit
-            store.commit(write_txn)?;
-            Ok::<Vec<u8>, ArunaMetadataError>(group)
-        })
-        .await
-        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+                // Commit
+                store.commit(write_txn)?;
+                Ok::<AutoCommit, ArunaMetadataError>(doc)
+            })
+            .await
+            .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
 
         Ok(result)
     }

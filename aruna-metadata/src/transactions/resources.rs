@@ -91,11 +91,12 @@ where
             .iter()
             .filter(|addr| addr.node_id != node_id)
             .choose_multiple(&mut rand::rngs::OsRng, REPLICATION_POLICY);
+        let states = 
 
         for node in realm_nodes {
             controller
                 .network
-                .replicate(
+                .sync(
                     crate::network::network_trait::ReplicationSubject::Object(doc.clone()),
                     &resource.id,
                     node.clone(),
@@ -317,7 +318,7 @@ where
         for member in members {
             controller
                 .network
-                .replicate(
+                .sync(
                     crate::network::network_trait::ReplicationSubject::Object(doc.clone()),
                     &resource.id,
                     member,

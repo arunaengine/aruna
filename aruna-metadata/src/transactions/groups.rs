@@ -68,7 +68,7 @@ where
         for node in members {
             controller
                 .network
-                .replicate(
+                .sync(
                     crate::network::network_trait::ReplicationSubject::Group(group_doc.clone()),
                     &group_id,
                     node.clone(),

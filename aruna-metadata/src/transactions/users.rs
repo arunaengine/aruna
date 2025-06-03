@@ -54,7 +54,7 @@ where
         for member in members {
             controller
                 .network
-                .replicate(
+                .sync(
                     crate::network::network_trait::ReplicationSubject::User(user_doc.clone()),
                     &user.id,
                     member,

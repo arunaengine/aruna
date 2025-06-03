@@ -10,7 +10,9 @@ use crate::{
     network::network_trait::{Body, MetadataMessage, ReplicationSubject},
 };
 use aruna_storage::storage::store::Store;
+use automerge::sync::State;
 use autosurgeon::hydrate;
+use iroh::{NodeId, PublicKey};
 use roaring::RoaringBitmap;
 use tracing::trace;
 use ulid::Ulid;
@@ -20,6 +22,31 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn get_states(
+        &self,
+        doc_id: Ulid,
+        nodes: Vec<NodeId>,
+    ) -> Result<Vec<(PublicKey, State)>, ArunaMetadataError> {
+        let mut lock = self.connection_states.lock();
+
+        let mut states = Vec::new();
+        match lock.get_mut(&doc_id) {
+            Some(persisted) => {
+                for node in nodes {
+                    let state = persisted.entry(node).or_insert(State::new());
+                    states.push((node, state.clone()));
+                }
+            }
+            None => {
+                for node in nodes {
+                    states.push((node, State::new()))
+                }
+            }
+        }
+        drop(lock);
+        Ok(states)
+    }
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_replication(
         &self,
