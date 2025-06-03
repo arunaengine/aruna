@@ -2,7 +2,8 @@ use crate::io::messages::{MessageType, ReplicationMessage};
 use crate::util::bao_tree::{
     FuturesAsyncReaderWrapper, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper,
 };
-use crate::util::opendal::{get_data_async_reader, get_reader};
+use crate::util::hash::Hasher;
+use crate::util::opendal::{get_data_async_reader, get_data_stream, get_reader};
 use anyhow::anyhow;
 use aruna_net::Kademlia;
 use aruna_net::actor_handle::{NetworkActorHandle, ReceiveStreams};
@@ -18,7 +19,6 @@ use opendal::{FuturesBytesStream, Operator};
 use s3s::StdError;
 use s3s::stream::ByteStream;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use std::io::ErrorKind;
 use std::ops::Range;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ pub const PATH_LOCATION_DB_NAME: &str = "path_locations_mapping";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hashes {
-    pub blake3: String,
+    pub blake3: blake3::Hash,
     pub sha256: String,
     pub md5: String,
 }
@@ -190,9 +190,7 @@ where
     where
         S: ByteStream<Item = Result<Bytes, StdError>> + Send + Sync + Unpin + 'static,
     {
-        let mut blake3 = blake3::Hasher::new();
-        let mut sha256 = sha2::Sha256::new();
-        let mut md5 = md5::Context::new();
+        let mut hasher = Hasher::new();
         let mut written_bytes = 0;
         let mut writer = self
             .operator
@@ -207,17 +205,15 @@ where
 
             // Write first, then update
             writer.write_all(&bytes).await?;
-
-            blake3.update(&bytes);
-            sha256.update(&bytes);
-            md5.consume(&bytes);
+            hasher.update(&bytes);
             written_bytes = written_bytes + bytes.len();
         }
         writer.flush().await?;
         writer.close().await?;
 
         // Store some technical metadata in persistence
-        let blake3_hash = blake3.finalize();
+        let hashes = hasher.finalize()?;
+        let blake3_hash = hashes.blake3.clone();
         let info = ObjectInfo {
             id: Ulid::new(),
             staging: true,
@@ -225,11 +221,7 @@ where
             encrypted: false,  //TODO
             file_path: backend_path.clone(),
             file_size: written_bytes as u64,
-            file_hashes: Hashes {
-                blake3: blake3_hash.to_string(),
-                sha256: format!("{:x}", sha256.finalize()),
-                md5: format!("{:x}", md5.compute()),
-            },
+            file_hashes: hashes,
         };
         debug!("New Object: {:#?}", info);
 
@@ -253,7 +245,6 @@ where
                 frontend_path.as_bytes(),
                 blake3_hash.as_bytes(),
             )?;
-
             store_clone.commit(write_txn)?;
 
             Ok::<(), anyhow::Error>(())
