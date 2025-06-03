@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use aruna_data::api_json::server::RestServer;
 use aruna_data::api_s3::auth::UserAccess;
 use aruna_data::api_s3::s3server::S3Server;
@@ -7,13 +7,18 @@ use aruna_data::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICAT
 use aruna_data::io::io_handler::{IOHandler, LOCATION_DB_NAME};
 use aruna_data::{config::config::Config, util::opendal::get_operator};
 use aruna_net::actor::NetworkActorBuilder;
+use aruna_permission::manager::RESOURCE_DB;
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
+use futures_util::TryFutureExt;
 use lazy_static::lazy_static;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{Level, debug, error, info};
+use tokio::try_join;
+use tracing::{Level, debug, error};
 use tracing_subscriber::EnvFilter;
+use ulid::Ulid;
 
 lazy_static! {
     static ref CONFIG: Config = {
@@ -78,46 +83,54 @@ async fn main() -> Result<()> {
 
     let lmdb_config = LmdbConfig {
         path: CONFIG.persistence.path.to_string(),
-        databases: vec![ACCESS_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME],
+        databases: vec![
+            ACCESS_DB_NAME,
+            LOCATION_DB_NAME,
+            PATH_LOCATION_DB_NAME,
+            RESOURCE_DB,
+        ],
     };
+    let lmdb_store = Arc::new(LmdbStore::new(lmdb_config)?);
 
     let io_handler = IOHandler::<LmdbStore>::new(
         node_addr.clone(),
         operator,
         actor_handle,
         kademlia,
-        lmdb_config,
+        lmdb_store,
     )
     .await?;
 
     //TODO: Remove later
-    create_dummy_access(io_handler.store.clone()).await?;
-    
+    //create_dummy_access(io_handler.store.clone()).await?;
+
     let s3server = S3Server::new(
-        CONFIG.frontend.clone(),
+        CONFIG.frontend.s3_frontend.clone(),
         io_handler.clone(),
         node_addr.node_id,
+        Ulid::from_string(&CONFIG.general.realm_id)?,
     )
     .await?;
 
     let controller = Arc::new(Controller::<LmdbStore>::new(io_handler));
-    
-    tokio::spawn(async move { RestServer::run(controller, 50056).await }).await??;
-    tokio::spawn(async move { s3server.run().await }).await??;
+    let rest_handle = tokio::spawn(async move {
+        RestServer::run(controller, rest_addr, CONFIG.frontend.openapi_frontend.port).await
+    })
+    .map_err(|e| {
+        error!(error = ?e, msg = e.to_string());
+        anyhow!("an error occurred {e}")
+    });
 
-    info!("Waiting for ctrl-c to abort.");
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                break;
-            }
+    match try_join!(s3server.run(), rest_handle) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            error!("{}", err);
+            Err(err)
         }
     }
-
-    Ok(())
 }
 
-async fn create_dummy_access<St>(store: Arc<St>) -> Result<()>
+async fn _create_dummy_access<St>(store: Arc<St>) -> Result<()>
 where
     for<'a> St: Store<'a> + 'static,
 {
@@ -126,20 +139,20 @@ where
     tokio::task::spawn_blocking(move || {
         let mut write_txn = store_clone.create_txn(true)?;
 
-        let access = UserAccess {
-            user_id: "minioadmin".to_string(),
-            group_id: "01JVKSAX4V95AJ0DFYK65B9WDS".to_string(),
-            secret: "minioadmin".to_string(),
+        let access_info = UserAccess {
+            user_id: Ulid::from_string("01JWB4X5TY0K776QDDCHGK3KT2")?,
+            group_id: Ulid::from_string("01JWB4XFCRJX53Q839QMHPGSXH")?,
+            secret: "PT97PKZjFdtj59umdqHuU54rTauknd".to_string(),
         };
 
         // Store object info with blake3 hash as key
         store_clone.put(
             &mut write_txn,
             ACCESS_DB_NAME,
-            "minioadmin".as_bytes(), // Currently user id
-            &bincode::serde::encode_to_vec(access, bincode::config::standard())?,
+            access_info.user_id.to_string().as_bytes(), // Currently user id
+            &bincode::serde::encode_to_vec(access_info, bincode::config::standard())?,
         )?;
-
+        
         store_clone.commit(write_txn)?;
 
         Ok::<(), anyhow::Error>(())
