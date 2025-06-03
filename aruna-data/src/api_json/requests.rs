@@ -1,6 +1,12 @@
 use crate::io::controller::Controller;
 use crate::api_json::request::{Request, User};
+use crate::api_s3::auth::UserAccess;
+use crate::error::ArunaDataError;
+use crate::io::controller::Controller;
+use crate::io::io_handler::ACCESS_DB_NAME;
 use aruna_storage::storage::store::Store;
+use rand::distributions::Alphanumeric;
+use rand::{Rng, thread_rng};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
@@ -8,7 +14,9 @@ use utoipa::ToSchema;
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
 )]
-pub struct CreateS3CredentialsRequest {}
+pub struct CreateS3CredentialsRequest {
+    group_id: String,
+}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateS3CredentialsResponse {
@@ -28,7 +36,7 @@ where
         &self,
         user: &Option<String>,
         _controller: &Controller<St>,
-    ) -> Result<Option<Self::Response>, crate::error::ArunaDataError> {
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
         Ok(None)
     }
 
@@ -37,14 +45,42 @@ where
         self,
         user: Option<User>,
         controller: &Controller<St>,
-    ) -> Result<Self::Response, crate::error::ArunaDataError> {
+    ) -> Result<Self::Response, ArunaDataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaDataError::Unauthorized);
+            return Err(ArunaDataError::Unauthorized);
         };
 
+        let access_info = UserAccess {
+            user_id: user.id,
+            group_id: user.group,
+            secret: thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(30)
+                .map(char::from)
+                .collect::<String>(),
+        };
+
+        let store_clone = controller.io_handler.store.clone();
+        let access_info_clone = access_info.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut write_txn = store_clone.create_txn(true)?;
+
+            // Store object info with blake3 hash as key
+            store_clone.put(
+                &mut write_txn,
+                ACCESS_DB_NAME,
+                user.id.to_string().as_bytes(),
+                &bincode::serde::encode_to_vec(access_info_clone, bincode::config::standard())?,
+            )?;
+
+            store_clone.commit(write_txn)?;
+
+            Ok::<(), anyhow::Error>(())
+        });
+
         Ok(CreateS3CredentialsResponse {
-            access_key_id: todo!(),
-            secret_access_key: todo!(),
+            access_key_id: access_info.user_id,
+            secret_access_key: access_info.secret.to_string(),
         })
     }
 }

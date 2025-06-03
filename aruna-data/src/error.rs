@@ -70,7 +70,7 @@ pub enum ArunaDataError {
 }
 
 impl ArunaDataError {
-    pub fn into_axum_tuple(self) -> (axum::http::StatusCode, Json<String>) {
+    pub fn into_axum_tuple(self) -> (StatusCode, Json<String>) {
         match self {
             err @ ArunaDataError::InvalidParameter { .. } => {
                 (StatusCode::BAD_REQUEST, Json(err.to_string()))
@@ -96,5 +96,23 @@ impl ArunaDataError {
 impl From<std::io::Error> for ArunaDataError {
     fn from(e: std::io::Error) -> Self {
         ArunaDataError::IoError(e.to_string())
+    }
+}
+
+impl From<ulid::DecodeError> for ArunaDataError {
+    fn from(e: ulid::DecodeError) -> Self {
+        ArunaDataError::InvalidParameter {
+            name: "Ulid".to_string(),
+            error: e.to_string(),
+        }
+    }
+}
+
+impl From<aruna_permission::paths::PathError> for ArunaDataError {
+    fn from(e: aruna_permission::paths::PathError) -> Self {
+        ArunaDataError::InvalidParameter {
+            name: "path".to_string(),
+            error: e.to_string(),
+        }
     }
 }
