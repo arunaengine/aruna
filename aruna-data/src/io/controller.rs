@@ -1,7 +1,10 @@
 use crate::api_json::request::{Request, User};
 use crate::{IOHandler, error::ArunaDataError};
+use aruna_permission::manager::PermissionManager;
 use aruna_storage::storage::store::Store;
 use std::sync::Arc;
+use tracing::debug;
+use ulid::Ulid;
 
 pub struct Controller<St>
 where
@@ -29,20 +32,23 @@ where
             Some(response) => Ok(response),
             None => {
                 // TODO: Replace this with real authentication
+                debug!("token: {:#?}", token);
                 let user = match token {
-                    Some(_id) => {
-                        /*TODO: Proper authentication
-                        self.io_handler
-                            .store
-                            .get_user(
-                                &Ulid::from_string(&id)
-                                    .map_err(|e| ArunaDataError::DeserializeError(e.to_string()))?,
+                    Some(_token) => {
+                        //TODO: Validate token signature
+                        let _manager = PermissionManager::new().await.map_err(|e| {
+                            ArunaDataError::ServerError(
+                                "Failed to create permission manger".to_string(),
                             )
-                            .await?
-                        */
+                        })?;
+                        //let (user, group_id) = manager.validate_token(&token).await?;
+                        
+                        
+                        //TODO: Properly fetch user info from store
                         Some(User {
-                            id: Default::default(),
-                            name: "".to_string(),
+                            id: Ulid::from_string("01JWB4X5TY0K776QDDCHGK3KT2")?,
+                            group: Ulid::from_string("01JWB4XFCRJX53Q839QMHPGSXH")?,
+                            name: "John Doe".to_string(),
                         })
                     }
                     None => None,
