@@ -1,8 +1,11 @@
+[general]
+realm_id = "01JWRB29J0Q2M3YTJGR24P5N31"
+
 [persistence]
 path = "/tmp/node1/heed"
 
 [backend]
-backend_type = "S3" # "FS", "PSQL", "HTTP", ...
+backend_type = "S3" # "FS", "PSQL", "HTTP", "Memory", ...
 encryption = false
 compression = false
 deduplication = false
@@ -17,12 +20,12 @@ secret_access_key = "minioadmin"
 
 # FileSystem example config
 #[backend.access]
-#root = "/data"
-#atomic_write_dir = /tmp
+#root = "/aruna"
+#atomic_write_dir = /aruna/tmp
 
 # PostgreSQL example config
 #[backend.access]
-#root = /tmp
+#root = /aruna
 #connection_string = "postgres://postgres@localhost:5432/test"
 #table = "objects"
 #key_field = ""

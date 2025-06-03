@@ -131,6 +131,7 @@ version = "3.0.0"
 dependencies = [
  "anyhow",
  "aruna-net",
+ "aruna-permission",
  "aruna-storage",
  "async-trait",
  "axum 0.8.4",
@@ -151,6 +152,7 @@ dependencies = [
  "md5",
  "opendal",
  "postcard",
+ "rand 0.8.5",
  "s3s",
  "serde",
  "sha2",

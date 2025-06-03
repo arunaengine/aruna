@@ -7,9 +7,16 @@ use crate::util::opendal::Backend;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
+    pub general: General,
     pub persistence: Persistence,
     pub backend: BackendConfig,
     pub frontend: Frontend,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub struct General {
+    pub realm_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
