@@ -16,6 +16,7 @@ use crate::{
     persistence::{persistence::Authorize, search::search::Search},
 };
 use aruna_storage::storage::store::Store;
+use automerge::sync::{Message, SyncDoc};
 use rand::seq::IteratorRandom;
 use ulid::Ulid;
 
@@ -79,7 +80,7 @@ where
             hashes: Vec::new(),
         };
         let node_id = controller.network.get_addr().await?.node_id;
-        let doc = controller
+        let mut doc = controller
             .persistence
             .add_resource(node_id.as_bytes(), &user.id, resource.clone())
             .await?;
@@ -88,20 +89,49 @@ where
         // and replicate resource
         let members = controller.network.get_realm_nodes().await?;
         let realm_nodes = members
-            .iter()
+            .into_iter()
             .filter(|addr| addr.node_id != node_id)
             .choose_multiple(&mut rand::rngs::OsRng, REPLICATION_POLICY);
-        let states = 
 
         for node in realm_nodes {
-            controller
-                .network
-                .sync(
-                    crate::network::network_trait::ReplicationSubject::Object(doc.clone()),
-                    &resource.id,
-                    node.clone(),
-                )
-                .await?;
+            'sync: loop {
+                let sync_message = controller
+                    .persistence
+                    .generate_sync_message(&resource.id, &mut doc, node.node_id.clone())
+                    .await?;
+                match sync_message {
+                    Some(msg) => {
+                        if let Some(response) = controller
+                            .network
+                            .sync(
+                                crate::network::network_trait::ReplicationSubject::Object(Some(
+                                    msg,
+                                )),
+                                &resource.id,
+                                node.clone(),
+                            )
+                            .await?
+                        {
+                            controller
+                                .persistence
+                                .receive_sync_message(
+                                    &resource.id,
+                                    &mut doc,
+                                    Message::decode(&response)?,
+                                    node.node_id.clone(),
+                                )
+                                .await?;
+                        };
+                    }
+                    None => {
+                        controller
+                            .persistence
+                            .handle_object_merges(doc.save())
+                            .await?;
+                        break 'sync;
+                    }
+                }
+            }
         }
 
         Ok(CreateResourceResponse { resource })
@@ -302,7 +332,7 @@ where
         };
 
         let node_id = controller.network.get_addr().await?.node_id;
-        let doc = controller
+        let mut doc = controller
             .persistence
             .update_resource(node_id.as_bytes(), &user.id, resource.clone())
             .await?;
@@ -315,15 +345,46 @@ where
             .await?
             .into_iter()
             .filter(|addr| addr.node_id != node_id);
-        for member in members {
-            controller
-                .network
-                .sync(
-                    crate::network::network_trait::ReplicationSubject::Object(doc.clone()),
-                    &resource.id,
-                    member,
-                )
-                .await?;
+
+        for node in members {
+            'sync: loop {
+                let sync_message = controller
+                    .persistence
+                    .generate_sync_message(&resource.id, &mut doc, node.node_id.clone())
+                    .await?;
+                match sync_message {
+                    Some(msg) => {
+                        if let Some(response) = controller
+                            .network
+                            .sync(
+                                crate::network::network_trait::ReplicationSubject::Object(Some(
+                                    msg,
+                                )),
+                                &resource.id,
+                                node.clone(),
+                            )
+                            .await?
+                        {
+                            controller
+                                .persistence
+                                .receive_sync_message(
+                                    &resource.id,
+                                    &mut doc,
+                                    Message::decode(&response)?,
+                                    node.node_id.clone(),
+                                )
+                                .await?;
+                        };
+                    }
+                    None => {
+                        controller
+                            .persistence
+                            .handle_object_merges(doc.save())
+                            .await?;
+                        break 'sync;
+                    }
+                }
+            }
         }
 
         Ok(response)

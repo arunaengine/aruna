@@ -31,22 +31,29 @@ pub struct MetadataMessage {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Body {
-    Replicate(ReplicationSubject),
+    Replicate {
+        id: Ulid,
+        sync_message: ReplicationSubject,
+    },
     Request {
         token: Option<String>,
         request: ForwardRequest,
     },
-    Response {
-        result: ForwardResponse,
-    },
+    Response(Response),
     Empty,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum Response {
+    ForwardResponse(ForwardResponse),
+    SyncResponse(Option<Vec<u8>>),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ReplicationSubject {
-    Group(Vec<u8>),
-    User(Vec<u8>),
-    Object(Vec<u8>),
+    Group(Option<Vec<u8>>),
+    User(Option<Vec<u8>>),
+    Object(Option<Vec<u8>>),
 }
 
 #[async_trait::async_trait]
@@ -59,7 +66,7 @@ pub trait Network: Sync + Send + Sized {
         subject: ReplicationSubject,
         subject_id: &Ulid,
         target_node: NodeAddr,
-    ) -> Result<(), ArunaMetadataError>;
+    ) -> Result<Option<Vec<u8>>, ArunaMetadataError>;
 
     async fn start_actor<St, Se, N>(
         self: Arc<Self>,
@@ -107,8 +114,8 @@ impl Network for NetworkDummy {
         _subject: ReplicationSubject,
         _subject_id: &Ulid,
         _target_node: NodeAddr,
-    ) -> Result<(), ArunaMetadataError> {
-        Ok(())
+    ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
+        Ok(None)
     }
 
     async fn start_actor<St, Se, N>(
@@ -265,47 +272,65 @@ impl Network for P2PNetwork {
         subject: ReplicationSubject,
         subject_id: &Ulid,
         target_node: NodeAddr,
-    ) -> Result<(), ArunaMetadataError> {
-        trace!("Calling replicate");
-        let chandler = self.chandler.clone();
-        let subject_id = *subject_id;
-        tokio::spawn(async move {
-            let node_id = chandler.get_node_addr().await?;
+    ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
+        let node_id = self.chandler.get_node_addr().await?;
 
-            // Calc hash
-            let mut chunk_hasher = blake3::Hasher::new();
-            chunk_hasher.update(subject_id.to_bytes().as_slice());
-            let id_hash = chunk_hasher.finalize();
+        // Calc hash
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(subject_id.to_bytes().as_slice());
+        let id_hash = chunk_hasher.finalize();
 
-            let mut message = MetadataMessage {
-                from: *node_id.node_id.as_bytes(),
-                to: [0u8; 32],
-                subject: *id_hash.as_bytes(),
-                body: Body::Replicate(subject),
-            };
-            trace!("{message:?}");
+        let mut message = MetadataMessage {
+            from: *node_id.node_id.as_bytes(),
+            to: [0u8; 32],
+            subject: *id_hash.as_bytes(),
+            body: Body::Replicate {
+                id: *subject_id,
+                sync_message: subject,
+            },
+        };
+        trace!("{message:?}");
 
-            // Distribute message to closest nodes
-            message.to = *target_node.node_id.as_bytes();
-            let msg = postcard::to_allocvec(&message)?;
+        // Distribute message to closest nodes
+        message.to = *target_node.node_id.as_bytes();
+        let msg = postcard::to_allocvec(&message)?;
 
-            let (mut sdx, _recv) = chandler.create_stream(target_node.node_id).await?;
-            sdx.write_u32(msg.len() as u32).await?;
-            sdx.write_all(msg.as_slice())
-                .await
-                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-            //chandler.store(*id_hash.as_bytes(), node).await?; // TODO: Move this to handle_stream in persistence
-            sdx.finish()
-                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+        let (mut sdx, mut recv) = self.chandler.create_stream(target_node.node_id).await?;
+        sdx.write_u32(msg.len() as u32).await?;
+        sdx.write_all(msg.as_slice())
+            .await
+            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+        //chandler.store(*id_hash.as_bytes(), node).await?; // TODO: Move this to handle_stream in persistence
+        sdx.finish()
+            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
 
-            // TODO:
-            // - [] Retries? -> If err, try again, if failed 5 go next node
-            // - [] Replicate metadata to specific nodes
-            // - [X] Store when create
-            // - [] Store when rcv replicate msg
-            Ok::<(), ArunaMetadataError>(())
-        });
-        Ok(())
+        let len = recv.read_u32().await?;
+        trace!(?len);
+        let mut buf = vec![0; len as usize];
+        recv.read_exact(&mut buf)
+            .await
+            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+        let response = match postcard::from_bytes::<MetadataMessage>(&buf)
+            .map_err(|e| {
+                ArunaMetadataError::NetworkError(format!("Failed to deserialize response: {e:#}"))
+            })?
+            .body
+        {
+            Body::Response(Response::SyncResponse(result)) => result,
+            e @ _ => {
+                return Err(ArunaMetadataError::NetworkError(format!(
+                    "Got wrong response {e:?}, expected Body::Response"
+                )));
+            }
+        };
+        trace!("Got response");
+
+        // TODO:
+        // - [] Retries? -> If err, try again, if failed 5 go next node
+        // - [] Replicate metadata to specific nodes
+        // - [X] Store when create
+        // - [] Store when rcv replicate msg
+        Ok(response)
     }
 
     #[tracing::instrument(level = "trace", skip(self, subject_id))]
@@ -354,7 +379,7 @@ impl Network for P2PNetwork {
             })?
             .body
         {
-            Body::Response { result } => result,
+            Body::Response(Response::ForwardResponse(result)) => result,
             e @ _ => {
                 return Err(ArunaMetadataError::NetworkError(format!(
                     "Got wrong response {e:?}, expected Body::Response"
@@ -394,7 +419,6 @@ impl Network for P2PNetwork {
                 } else {
                     query
                 };
-                info!(?members);
                 Ok(members)
             }
             None => Ok(vec![self.get_addr().await?]),
@@ -409,7 +433,6 @@ impl Network for P2PNetwork {
 impl P2PNetwork {
     pub async fn dispatch_messages<St, Se, N>(
         &self,
-        //controller: Arc<Controller<St, Se, N>>,
         controller: &Controller<St, Se, N>,
     ) -> Result<(), ArunaMetadataError>
     where
@@ -434,18 +457,33 @@ impl P2PNetwork {
             })?;
             trace!("{message:?}");
             match message.body {
-                Body::Replicate(replication_subject) => {
+                Body::Replicate { id, sync_message } => {
+                    let node_id = PublicKey::from_bytes(&message.from).map_err(|e| {
+                        ArunaMetadataError::ConversionError {
+                            from: "&[u8]".to_string(),
+                            to: "PublicKey".to_string(),
+                        }
+                    })?;
                     match controller
                         .persistence
-                        .handle_replication(replication_subject)
+                        .handle_replication(node_id, id, sync_message)
                         .await
                     {
-                        Ok(_res) => {
+                        Ok(res) => {
+                            let response = postcard::to_allocvec(&MetadataMessage {
+                                from: message.to,
+                                to: message.from,
+                                subject: message.subject,
+                                body: Body::Response(Response::SyncResponse(res)),
+                            })?;
+                            recv_stream.send_stream.write_u32(response.len() as u32).await?;
+                            recv_stream.send_stream.write_all(response.as_slice())
+                                .await
+                                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
                             recv_stream
                                 .send_stream
                                 .finish()
                                 .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-
                             self.store(&message.subject).await?;
                         }
                         Err(err) => return Err(err),
@@ -471,21 +509,19 @@ impl P2PNetwork {
                         None => None,
                     };
                     let body = match request {
-                        ForwardRequest::GetResource(req) => Body::Response {
-                            result: ForwardResponse::GetResource(
+                        ForwardRequest::GetResource(req) => {
+                            Body::Response(Response::ForwardResponse(ForwardResponse::GetResource(
                                 req.run_request(user, controller).await,
-                            ),
-                        },
-                        ForwardRequest::UpdateResource(req) => Body::Response {
-                            result: ForwardResponse::UpdateResource(
+                            )))
+                        }
+                        ForwardRequest::UpdateResource(req) => Body::Response(
+                            Response::ForwardResponse(ForwardResponse::UpdateResource(
                                 req.run_request(user, controller).await,
-                            ),
-                        },
-                        ForwardRequest::Search(req) => Body::Response {
-                            result: ForwardResponse::Search(
-                                req.run_request(user, controller).await,
-                            ),
-                        },
+                            )),
+                        ),
+                        ForwardRequest::Search(req) => Body::Response(Response::ForwardResponse(
+                            ForwardResponse::Search(req.run_request(user, controller).await),
+                        )),
                     };
                     let message = MetadataMessage {
                         from: message.to,

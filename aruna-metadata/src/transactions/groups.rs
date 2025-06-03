@@ -14,6 +14,7 @@ use crate::{
     persistence::search::search::Search,
 };
 use aruna_storage::storage::store::Store;
+use automerge::sync::Message;
 use rand::seq::IteratorRandom;
 use ulid::Ulid;
 
@@ -52,7 +53,7 @@ where
             members: BTreeMap::from([(user.id.to_string(), vec!["admin".to_string()])]),
         };
         let node_id = controller.network.get_addr().await?.node_id;
-        let group_doc = controller
+        let mut group_doc = controller
             .persistence
             .add_group(node_id.as_bytes(), &user.id, group.clone())
             .await?;
@@ -66,14 +67,44 @@ where
             .into_iter()
             .filter(|addr| addr.node_id != node_id);
         for node in members {
-            controller
-                .network
-                .sync(
-                    crate::network::network_trait::ReplicationSubject::Group(group_doc.clone()),
-                    &group_id,
-                    node.clone(),
-                )
-                .await?;
+            'sync: loop {
+                let sync_message = controller
+                    .persistence
+                    .generate_sync_message(&group.id, &mut group_doc, node.node_id.clone())
+                    .await?;
+                match sync_message {
+                    Some(msg) => {
+                        if let Some(response) = controller
+                            .network
+                            .sync(
+                                crate::network::network_trait::ReplicationSubject::Object(Some(
+                                    msg,
+                                )),
+                                &group.id,
+                                node.clone(),
+                            )
+                            .await?
+                        {
+                            controller
+                                .persistence
+                                .receive_sync_message(
+                                    &group.id,
+                                    &mut group_doc,
+                                    Message::decode(&response)?,
+                                    node.node_id.clone(),
+                                )
+                                .await?;
+                        };
+                    }
+                    None => {
+                        controller
+                            .persistence
+                            .handle_group_merges(group_doc.save())
+                            .await?;
+                        break 'sync;
+                    }
+                }
+            }
         }
 
         Ok(AddGroupResponse { group })

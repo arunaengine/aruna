@@ -1,5 +1,6 @@
 use std::array::TryFromSliceError;
 
+use automerge::sync::ReadMessageError;
 use axum::Json;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -187,5 +188,14 @@ impl From<aruna_permission::error::PermissionError> for ArunaMetadataError {
     fn from(e: aruna_permission::error::PermissionError) -> Self {
         tracing::trace!(?e);
         ArunaMetadataError::Unauthorized
+    }
+}
+
+impl From<ReadMessageError> for ArunaMetadataError {
+    fn from(e: ReadMessageError) -> Self {
+        ArunaMetadataError::ConversionError {
+            from: "Vec<u8>".to_string(),
+            to: "automerge::Message".to_string(),
+        }
     }
 }

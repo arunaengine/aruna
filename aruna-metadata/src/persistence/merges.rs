@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use super::{
     persistence::Persistor,
     persistence::tables::*,
@@ -10,11 +12,14 @@ use crate::{
     network::network_trait::{Body, MetadataMessage, ReplicationSubject},
 };
 use aruna_storage::storage::store::Store;
-use automerge::sync::State;
+use automerge::{
+    AutoCommit,
+    sync::{Message, State, SyncDoc},
+};
 use autosurgeon::hydrate;
-use iroh::{NodeId, PublicKey};
+use iroh::{NodeAddr, PublicKey};
 use roaring::RoaringBitmap;
-use tracing::trace;
+use tracing::{trace, warn};
 use ulid::Ulid;
 
 impl<Se, St> Persistor<St, Se>
@@ -23,53 +28,142 @@ where
     Se: Search + 'static,
 {
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn get_states(
+    pub async fn generate_sync_message(
         &self,
-        doc_id: Ulid,
-        nodes: Vec<NodeId>,
-    ) -> Result<Vec<(PublicKey, State)>, ArunaMetadataError> {
+        doc_id: &Ulid,
+        doc: &mut AutoCommit,
+        node: PublicKey,
+    ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
         let mut lock = self.connection_states.lock();
 
-        let mut states = Vec::new();
-        match lock.get_mut(&doc_id) {
+        let msg = match lock.get_mut(&doc_id) {
             Some(persisted) => {
-                for node in nodes {
-                    let state = persisted.entry(node).or_insert(State::new());
-                    states.push((node, state.clone()));
-                }
+                let mut state = persisted.entry(node).or_insert(State::new());
+                let msg = doc
+                    .sync()
+                    .generate_sync_message(&mut state)
+                    .map(|msg| msg.encode());
+                msg
             }
             None => {
-                for node in nodes {
-                    states.push((node, State::new()))
-                }
+                let mut state = State::new();
+                let mut map = HashMap::default();
+                let msg = doc.sync().generate_sync_message(&mut state);
+                //.map(|msg| msg.encode());
+                trace!(?doc);
+                trace!(?msg);
+                map.insert(node, state.clone());
+                lock.insert(*doc_id, map);
+                msg.map(|msg| msg.encode())
             }
-        }
+        };
         drop(lock);
-        Ok(states)
+        Ok(msg)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn receive_sync_message(
+        &self,
+        doc_id: &Ulid,
+        doc: &mut AutoCommit,
+        message: Message,
+        node: PublicKey,
+    ) -> Result<(), ArunaMetadataError> {
+        let mut lock = self.connection_states.lock();
+
+        match lock.get_mut(&doc_id) {
+            Some(persisted) => {
+                let mut state = persisted.entry(node).or_insert(State::new());
+                doc.sync().receive_sync_message(&mut state, message)?;
+            }
+            None => {
+                let mut state = State::new();
+                let mut map = HashMap::default();
+                trace!(?message);
+                trace!(before = "before", ?doc);
+                doc.sync().receive_sync_message(&mut state, message)?;
+                trace!(after = "after", ?doc);
+                map.insert(node, state);
+                lock.insert(*doc_id, map);
+            }
+        };
+        drop(lock);
+        Ok(())
     }
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_replication(
         &self,
+        node: PublicKey,
+        subject_id: Ulid,
         msg: ReplicationSubject,
-    ) -> Result<MetadataMessage, ArunaMetadataError> {
-        match msg {
-            crate::network::network_trait::ReplicationSubject::User(doc) => {
-                self.handle_user_merges(doc).await?;
+    ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
+        let response = match msg {
+            crate::network::network_trait::ReplicationSubject::User(message) => {
+                trace!("Handle user");
+                let mut doc = self.get_or_create_doc(subject_id, USER_DB_NAME).await?;
+                if let Some(message) = &message {
+                    self.receive_sync_message(
+                        &subject_id,
+                        &mut doc,
+                        Message::decode(message)?,
+                        node.clone(),
+                    )
+                    .await?;
+                }
+                let response = self
+                    .generate_sync_message(&subject_id, &mut doc, node.clone())
+                    .await?;
+                trace!("Handled sync");
+                if response.is_none() && message.is_none() {
+                    self.handle_user_merges(doc.save()).await?;
+                }
+                trace!("Handled merge");
+                response
             }
-            crate::network::network_trait::ReplicationSubject::Object(doc) => {
-                self.handle_object_merges(doc).await?;
+            crate::network::network_trait::ReplicationSubject::Object(message) => {
+                let mut doc = self.get_or_create_doc(subject_id, RESOURCE_DB_NAME).await?;
+
+                if let Some(message) = &message {
+                    self.receive_sync_message(
+                        &subject_id,
+                        &mut doc,
+                        Message::decode(message)?,
+                        node.clone(),
+                    )
+                    .await?;
+                }
+                let response = self
+                    .generate_sync_message(&subject_id, &mut doc, node.clone())
+                    .await?;
+                if response.is_none() && message.is_none() {
+                    warn!("SYNCING NOW TO DISK");
+                    self.handle_object_merges(doc.save()).await?;
+                }
+                response
             }
-            crate::network::network_trait::ReplicationSubject::Group(doc) => {
-                self.handle_group_merges(doc).await?;
+            crate::network::network_trait::ReplicationSubject::Group(message) => {
+                let mut doc = self.get_or_create_doc(subject_id, GROUPS_DB_NAME).await?;
+
+                if let Some(message) = &message {
+                    self.receive_sync_message(
+                        &subject_id,
+                        &mut doc,
+                        Message::decode(message)?,
+                        node.clone(),
+                    )
+                    .await?;
+                }
+                let response = self
+                    .generate_sync_message(&subject_id, &mut doc, node.clone())
+                    .await?;
+                if response.is_none() && message.is_none() {
+                    self.handle_group_merges(doc.save()).await?;
+                }
+                response
             }
         };
-
-        Ok(MetadataMessage {
-            from: [0u8; 32],
-            to: [0u8; 32],
-            subject: [0u8; 32],
-            body: Body::Empty,
-        })
+        trace!("Got response");
+        Ok(response)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -80,12 +174,17 @@ where
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_user_merges(&self, doc: Vec<u8>) -> Result<(), ArunaMetadataError> {
         let store = self.store.clone();
+        trace!("Here");
         tokio::task::spawn_blocking(move || -> Result<(), ArunaMetadataError> {
             let mut wtxn = store.create_txn(true)?;
+            trace!("There");
 
             // Parse document, actor_id and ulid
             let mut doc = automerge::AutoCommit::load(doc.as_ref())?;
+            trace!("Yes");
+            trace!(?doc);
             let foreign_user: User = autosurgeon::hydrate(&doc)?;
+            println!("Could recreate doc");
             let ulid_bytes = foreign_user.id.to_bytes();
 
             // Decide if merge or create
@@ -104,6 +203,8 @@ where
                     doc
                 }
             };
+
+            println!("Could merge doc");
             let res = merged_resource.save();
 
             // Persist
@@ -201,5 +302,26 @@ where
         trace!("Finished replicate");
 
         Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn get_or_create_doc(
+        &self,
+        subject_id: Ulid,
+        table: &'static str,
+    ) -> Result<AutoCommit, ArunaMetadataError> {
+        let store = self.store.clone();
+        let doc = tokio::task::spawn_blocking(move || -> Result<AutoCommit, ArunaMetadataError> {
+            let txn = store.create_txn(false)?;
+            let doc = match store.get(&txn, table, &subject_id.to_bytes())? {
+                Some(doc) => AutoCommit::load(doc.as_ref())?,
+                None => AutoCommit::new(),
+            };
+            store.commit(txn)?;
+            Ok::<AutoCommit, ArunaMetadataError>(doc)
+        })
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+        Ok(doc)
     }
 }

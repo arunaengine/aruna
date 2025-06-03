@@ -8,6 +8,7 @@ use crate::{
     persistence::search::search::Search,
 };
 use aruna_storage::storage::store::Store;
+use automerge::sync::Message;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -39,7 +40,7 @@ where
             name: self.name,
         };
         let node_id = controller.network.get_addr().await?.node_id;
-        let user_doc = controller
+        let mut user_doc = controller
             .persistence
             .add_user(node_id.as_bytes(), user.clone())
             .await?;
@@ -51,16 +52,56 @@ where
             .await?
             .into_iter()
             .filter(|addr| addr.node_id != node_id);
-        for member in members {
-            controller
-                .network
-                .sync(
-                    crate::network::network_trait::ReplicationSubject::User(user_doc.clone()),
-                    &user.id,
-                    member,
-                )
-                .await?;
+
+        for node in members {
+            'sync: loop {
+                let sync_message = controller
+                    .persistence
+                    .generate_sync_message(&user.id, &mut user_doc, node.node_id.clone())
+                    .await?;
+                match sync_message {
+                    Some(msg) => {
+                        if let Some(response) = controller
+                            .network
+                            .sync(
+                                crate::network::network_trait::ReplicationSubject::User(Some(msg)),
+                                &user.id,
+                                node.clone(),
+                            )
+                            .await?
+                        {
+                            controller
+                                .persistence
+                                .receive_sync_message(
+                                    &user.id,
+                                    &mut user_doc,
+                                    Message::decode(&response)?,
+                                    node.node_id.clone(),
+                                )
+                                .await?;
+                        }
+                    }
+                    None => {
+                        todo!("CHANGE THIS TO KEEP RECEIVING");
+                        controller
+                            .network
+                            .sync(
+                                crate::network::network_trait::ReplicationSubject::User(None),
+                                &user.id,
+                                node.clone(),
+                            )
+                            .await?;
+
+                        controller
+                            .persistence
+                            .handle_user_merges(user_doc.save())
+                            .await?;
+                        break 'sync;
+                    }
+                }
+            }
         }
+
         Ok(AddUserResponse { user })
     }
 }

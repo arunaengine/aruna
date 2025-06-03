@@ -2,6 +2,7 @@ pub mod commons;
 
 #[cfg(test)]
 mod tests {
+    use crate::commons::init_lmdb_servers;
     use aruna_metadata::models::{
         models::Resource,
         requests::{
@@ -9,11 +10,11 @@ mod tests {
             GetResourceResponse,
         },
     };
-    use crate::commons::init_lmdb_servers;
     const OFFSET: u16 = 0;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_create() {
+
         let servers = init_lmdb_servers(OFFSET).await.unwrap();
         println!("Init servers");
 

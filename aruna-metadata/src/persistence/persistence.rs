@@ -18,6 +18,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicU32},
 };
+use tracing::trace;
 use ulid::Ulid;
 
 pub trait Authorize {
