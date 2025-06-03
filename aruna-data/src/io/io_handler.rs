@@ -53,7 +53,7 @@ pub struct ObjectInfo {
 #[derive(Debug, Clone)]
 pub struct IOHandler<St>
 where
-    for<'a> St: Store<'a>,
+    for<'a> St: Store<'a> + 'static,
 {
     node_addr: NodeAddr,
     pub operator: Operator,
@@ -66,20 +66,20 @@ impl<St> IOHandler<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(store_config))]
+    #[tracing::instrument(level = "trace", skip(node_addr, operator, network, kademlia, store))]
     pub async fn new(
         node_addr: NodeAddr,
         operator: Operator,
         network: NetworkActorHandle,
         kademlia: Kademlia,
-        store_config: <St as Store<'static>>::StoreConfig,
+        store: Arc<St>,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let repl_handler = Arc::new(Self {
             node_addr,
             operator,
             network,
             kademlia,
-            store: Arc::new(St::new(store_config)?),
+            store,
         });
 
         repl_handler.clone().run().await;
@@ -123,7 +123,7 @@ where
     pub async fn handle_incoming_p2p_stream(
         &self,
         ReceiveStreams {
-            sender,
+            sender: _sender,
             mut send_stream,
             mut recv_stream,
         }: ReceiveStreams,
@@ -157,12 +157,14 @@ where
             decode_ranges(rx_wrapper, ranges, &mut writer, &mut ob).await?;
             writer.writer.close().await?;
             debug!("Decoded all chunks and wrote them into the backend");
+
+            //TODO: Store location + Register permission
         } else {
             error!("Stream did not start with init message");
             return Err(Box::new(std::io::Error::new(
                 ErrorKind::InvalidData,
                 "Stream did not start with init message",
-            ))); //Err(anyhow!("Stream did not start with init message"));
+            )));
         }
 
         send_stream.finish()?;

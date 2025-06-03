@@ -1,4 +1,3 @@
-use crate::io::controller::Controller;
 use crate::api_json::request::{Request, User};
 use crate::api_s3::auth::UserAccess;
 use crate::error::ArunaDataError;
@@ -92,7 +91,7 @@ pub struct GetS3CredentialsRequest {}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct GetS3CredentialsResponse {
-    pub access_key_id: Ulid,
+    pub access_key_id: String,
     pub secret_access_key: String,
 }
 
@@ -108,23 +107,25 @@ where
         &self,
         user: &Option<String>,
         _controller: &Controller<St>,
-    ) -> Result<Option<Self::Response>, crate::error::ArunaDataError> {
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
         Ok(None)
     }
 
-    #[tracing::instrument(level = "trace", skip(controller))]
+    #[tracing::instrument(level = "trace", skip(_controller))]
     async fn run_request(
         self,
         user: Option<User>,
-        controller: &Controller<St>,
-    ) -> Result<Self::Response, crate::error::ArunaDataError> {
-        let Some(user) = user else {
-            return Err(crate::error::ArunaDataError::Unauthorized);
+        _controller: &Controller<St>,
+    ) -> Result<Self::Response, ArunaDataError> {
+        let Some(_user) = user else {
+            return Err(ArunaDataError::Unauthorized);
         };
 
+        //TODO: Fetch
+        
         Ok(GetS3CredentialsResponse {
-            access_key_id: todo!(),
-            secret_access_key: todo!(),
+            access_key_id: "TODO".to_string(),
+            secret_access_key: "TODO".to_string(),
         })
     }
 }
