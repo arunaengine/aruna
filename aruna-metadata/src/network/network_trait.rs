@@ -1,6 +1,7 @@
 use crate::{
     error::ArunaMetadataError,
     models::requests::{ForwardRequest, ForwardResponse},
+    network::util::send_message,
     persistence::{
         persistence::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
         search::search::Search,
@@ -17,9 +18,10 @@ use ed25519_dalek::SigningKey;
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddrV4, sync::Arc};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, trace, warn};
 use ulid::Ulid;
+
+use super::util::read_message;
 
 pub static METADATA_PROTOCOL_ID: u32 = 3;
 pub static REPLICATION_POLICY: usize = 1;
@@ -325,29 +327,11 @@ impl Network for P2PNetwork {
                 sync_message: subject,
             },
         };
-        trace!("{message:?}");
 
-        // Distribute message to closest nodes
         message.to = *target_node.node_id.as_bytes();
-        let msg = postcard::to_allocvec(&message)?;
+        send_message(message, sdx).await?;
 
-        sdx.write_u32(msg.len() as u32).await?;
-        sdx.write_all(msg.as_slice())
-            .await
-            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-
-        let len = recv.read_u32().await?;
-        trace!(?len);
-        let mut buf = vec![0; len as usize];
-        recv.read_exact(&mut buf)
-            .await
-            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-        let response = match postcard::from_bytes::<MetadataMessage>(&buf)
-            .map_err(|e| {
-                ArunaMetadataError::NetworkError(format!("Failed to deserialize response: {e:#}"))
-            })?
-            .body
-        {
+        let response = match read_message(recv).await?.body {
             Body::Response(Response::SyncResponse(result)) => result,
             e @ _ => {
                 return Err(ArunaMetadataError::NetworkError(format!(
@@ -357,11 +341,6 @@ impl Network for P2PNetwork {
         };
         trace!("Got response");
 
-        // TODO:
-        // - [] Retries? -> If err, try again, if failed 5 go next node
-        // - [] Replicate metadata to specific nodes
-        // - [X] Store when create
-        // - [] Store when rcv replicate msg
         Ok(response)
     }
 
@@ -386,31 +365,13 @@ impl Network for P2PNetwork {
             body,
         };
 
-        trace!("Serialized");
-
-        let msg = postcard::to_allocvec(&message)?;
         let (mut sdx, mut recv) = self.chandler.create_stream(target_node.node_id).await?;
-        sdx.write_u32(msg.len() as u32).await?;
-        sdx.write_all(msg.as_slice())
-            .await
-            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+
+        send_message(message, &mut sdx).await?;
         sdx.finish()
             .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
 
-        trace!("Sent, waiting for response");
-
-        let len = recv.read_u32().await?;
-        trace!(?len);
-        let mut buf = vec![0; len as usize];
-        recv.read_exact(&mut buf)
-            .await
-            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-        let response = match postcard::from_bytes::<MetadataMessage>(&buf)
-            .map_err(|e| {
-                ArunaMetadataError::NetworkError(format!("Failed to deserialize response: {e:#}"))
-            })?
-            .body
-        {
+        let response = match read_message(&mut recv).await?.body {
             Body::Response(Response::ForwardResponse(result)) => result,
             e @ _ => {
                 return Err(ArunaMetadataError::NetworkError(format!(
@@ -480,6 +441,117 @@ impl Network for P2PNetwork {
 }
 
 impl P2PNetwork {
+    async fn handle_replication_messages<St, Se, N>(
+        &self,
+        message: MetadataMessage,
+        sync_message: ReplicationSubject,
+        subject_id: Ulid,
+        recv_stream: &mut ReceiveStreams,
+        controller: &Controller<St, Se, N>,
+    ) -> Result<(), ArunaMetadataError>
+    where
+        for<'a> St: Store<'a>,
+        Se: Search,
+        N: Network,
+    {
+        // Init sync
+        let node_id = PublicKey::from_bytes(&message.from).map_err(|_e| {
+            ArunaMetadataError::ConversionError {
+                from: "&[u8]".to_string(),
+                to: "PublicKey".to_string(),
+            }
+        })?;
+        let table = match sync_message {
+            ReplicationSubject::Group(_) => GROUPS_DB_NAME,
+            ReplicationSubject::User(_) => USER_DB_NAME,
+            ReplicationSubject::Object(_) => RESOURCE_DB_NAME,
+        };
+        let mut doc = controller
+            .persistence
+            .get_or_create_doc(subject_id, table)
+            .await?;
+
+        // Poll sync response
+        let sync_response = controller
+            .persistence
+            .handle_replication(node_id, subject_id, sync_message, &mut doc)
+            .await?;
+
+        // Send response either with Some(_) or None
+        send_message(
+            MetadataMessage {
+                from: message.to,
+                to: message.from,
+                subject: message.subject,
+                body: Body::Response(Response::SyncResponse(sync_response)),
+            },
+            &mut recv_stream.send_stream,
+        )
+        .await?;
+
+        // Start sync loop
+        'inner: loop {
+            let MetadataMessage {
+                from,
+                to,
+                subject,
+                body: Body::Replicate { id, sync_message },
+            } = read_message(&mut recv_stream.recv_stream).await?
+            else {
+                return Err(ArunaMetadataError::ServerError(
+                    "Unexpected Message type".to_string(),
+                ));
+            };
+
+            let sync_response = controller
+                .persistence
+                .handle_replication(node_id, id, sync_message.clone(), &mut doc)
+                .await?;
+
+            send_message(
+                MetadataMessage {
+                    from: to,
+                    to: from,
+                    subject,
+                    body: Body::Response(Response::SyncResponse(sync_response.clone())),
+                },
+                &mut recv_stream.send_stream,
+            )
+            .await?;
+
+            if sync_response.is_none() {
+                match sync_message {
+                    ReplicationSubject::Group(None) => {
+                        controller
+                            .persistence
+                            .handle_group_merges(doc.save())
+                            .await?;
+                    }
+                    ReplicationSubject::User(None) => {
+                        controller
+                            .persistence
+                            .handle_user_merges(doc.save())
+                            .await?;
+                    }
+                    ReplicationSubject::Object(None) => {
+                        controller
+                            .persistence
+                            .handle_user_merges(doc.save())
+                            .await?;
+                    }
+                    _ => continue,
+                }
+                recv_stream
+                    .send_stream
+                    .finish()
+                    .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+                self.store(&subject).await?;
+                break 'inner;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn dispatch_messages<St, Se, N>(
         &self,
         recv_stream: &mut ReceiveStreams,
@@ -490,139 +562,19 @@ impl P2PNetwork {
         Se: Search,
         N: Network,
     {
-        while let Ok(len) = recv_stream.recv_stream.read_u32().await {
-            trace!("Got something");
-            let mut buf = vec![0; len as usize];
+        while let Ok(msg) = read_message(&mut recv_stream.recv_stream).await {
+            trace!("Received message: {:?}", msg);
 
-            // TODO:
-            // - dispatch into API requests
-            recv_stream
-                .recv_stream
-                .read_exact(&mut buf)
-                .await
-                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-            let message = postcard::from_bytes::<MetadataMessage>(&buf).map_err(|e| {
-                ArunaMetadataError::NetworkError(format!("Failed to deserialize message: {e:#}"))
-            })?;
-            trace!("{message:?}");
-            match message.body {
+            match &msg.body {
                 Body::Replicate { id, sync_message } => {
-                    let node_id = PublicKey::from_bytes(&message.from).map_err(|_e| {
-                        ArunaMetadataError::ConversionError {
-                            from: "&[u8]".to_string(),
-                            to: "PublicKey".to_string(),
-                        }
-                    })?;
-                    let table = match sync_message {
-                        ReplicationSubject::Group(_) => GROUPS_DB_NAME,
-                        ReplicationSubject::User(_) => USER_DB_NAME,
-                        ReplicationSubject::Object(_) => RESOURCE_DB_NAME,
-                    };
-                    let mut doc = controller.persistence.get_or_create_doc(id, table).await?;
-
-                    let sync_response = controller
-                        .persistence
-                        .handle_replication(node_id, id, sync_message, &mut doc)
-                        .await?;
-                    let message = postcard::to_allocvec(&MetadataMessage {
-                        from: message.to,
-                        to: message.from,
-                        subject: message.subject,
-                        body: Body::Response(Response::SyncResponse(sync_response)),
-                    })?;
-                    recv_stream
-                        .send_stream
-                        .write_u32(message.len() as u32)
-                        .await?;
-                    recv_stream
-                        .send_stream
-                        .write_all(message.as_slice())
-                        .await
-                        .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-
-                    //self.store(&message.subject).await?;
-                    'inner: loop {
-                        let len = recv_stream.recv_stream.read_u32().await?;
-                        let mut buf = vec![0; len as usize];
-                        recv_stream
-                            .recv_stream
-                            .read_exact(&mut buf)
-                            .await
-                            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-
-                        let MetadataMessage {
-                            from,
-                            to,
-                            subject,
-                            body: Body::Replicate { id, sync_message },
-                        } = postcard::from_bytes::<MetadataMessage>(&buf).map_err(|e| {
-                            ArunaMetadataError::NetworkError(format!(
-                                "Failed to deserialize message: {e:#}"
-                            ))
-                        })?
-                        else {
-                            return Err(ArunaMetadataError::ServerError(
-                                "Unexpected Message type".to_string(),
-                            ));
-                        };
-                        let node_id = PublicKey::from_bytes(&from).map_err(|_e| {
-                            ArunaMetadataError::ConversionError {
-                                from: "&[u8]".to_string(),
-                                to: "PublicKey".to_string(),
-                            }
-                        })?;
-
-                        let sync_response = controller
-                            .persistence
-                            .handle_replication(node_id, id, sync_message.clone(), &mut doc)
-                            .await?;
-
-                        let response = postcard::to_allocvec(&MetadataMessage {
-                            from: to,
-                            to: from,
-                            subject,
-                            body: Body::Response(Response::SyncResponse(sync_response.clone())),
-                        })?;
-                        recv_stream
-                            .send_stream
-                            .write_u32(response.len() as u32)
-                            .await?;
-                        recv_stream
-                            .send_stream
-                            .write_all(response.as_slice())
-                            .await
-                            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-
-                        if sync_response.is_none() {
-                            match sync_message {
-                                ReplicationSubject::Group(None) => {
-                                    controller
-                                        .persistence
-                                        .handle_group_merges(doc.save())
-                                        .await?;
-                                }
-                                ReplicationSubject::User(None) => {
-                                    controller
-                                        .persistence
-                                        .handle_user_merges(doc.save())
-                                        .await?;
-                                }
-                                ReplicationSubject::Object(None) => {
-                                    controller
-                                        .persistence
-                                        .handle_user_merges(doc.save())
-                                        .await?;
-                                }
-                                _ => continue,
-                            }
-                            recv_stream
-                                .send_stream
-                                .finish()
-                                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-                            self.store(&subject).await?;
-                            break 'inner;
-                        }
-                    }
+                    self.handle_replication_messages(
+                        msg.clone(),
+                        sync_message.clone(),
+                        *id,
+                        recv_stream,
+                        controller,
+                    )
+                    .await?;
                 }
                 Body::Request { token, request } => {
                     let user = match token {
@@ -646,36 +598,30 @@ impl P2PNetwork {
                     let body = match request {
                         ForwardRequest::GetResource(req) => {
                             Body::Response(Response::ForwardResponse(ForwardResponse::GetResource(
-                                req.run_request(user, controller).await,
+                                req.clone().run_request(user, controller).await,
                             )))
                         }
                         ForwardRequest::UpdateResource(req) => Body::Response(
                             Response::ForwardResponse(ForwardResponse::UpdateResource(
-                                req.run_request(user, controller).await,
+                                req.clone().run_request(user, controller).await,
                             )),
                         ),
-                        ForwardRequest::Search(req) => Body::Response(Response::ForwardResponse(
-                            ForwardResponse::Search(req.run_request(user, controller).await),
-                        )),
+                        ForwardRequest::Search(req) => {
+                            Body::Response(Response::ForwardResponse(ForwardResponse::Search(
+                                req.clone().run_request(user, controller).await,
+                            )))
+                        }
                     };
-                    let message = MetadataMessage {
-                        from: message.to,
-                        to: message.from,
-                        subject: message.subject,
-                        body,
-                    };
-
-                    let response = postcard::to_allocvec(&message)?;
-
-                    recv_stream
-                        .send_stream
-                        .write_u32(response.len() as u32)
-                        .await?;
-                    recv_stream
-                        .send_stream
-                        .write_all(&response)
-                        .await
-                        .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+                    send_message(
+                        MetadataMessage {
+                            from: msg.to,
+                            to: msg.from,
+                            subject: msg.subject,
+                            body,
+                        },
+                        &mut recv_stream.send_stream,
+                    )
+                    .await?;
                 }
                 Body::Response { .. } => {
                     todo!("Backchannel for updated merged docs or sync protocol");
