@@ -358,13 +358,13 @@ impl PermissionManager {
     }
 
     /// Convenience method: Remove role from user with both prepare and commit
-    pub async fn remove_role_from_user<'a, 'b: 'a, S: Store<'a> + 'static>(
+    pub async fn remove_role_from_user<'a, S: Store<'a> + 'static>(
         &mut self,
         group_id: Ulid,
         user_id: Ulid,
         role_name: &str,
         store: &'a S,
-        txn: &'b mut <S as Store<'a>>::Txn,
+        txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<()> {
         let prepare =
             self.remove_role_from_user_prepare(group_id, user_id, role_name, store, txn)?;
@@ -380,7 +380,7 @@ impl PermissionManager {
         action: &str,
         effect: Option<&str>,
         store: &'a S,
-        txn: &'a mut <S as Store<'a>>::Txn,
+        txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<()> {
         let prepare =
             self.add_policy_to_role_prepare(group_id, role_name, path, action, effect, store, txn)?;
