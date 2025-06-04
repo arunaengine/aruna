@@ -16,6 +16,7 @@ use crate::{
 use aruna_storage::storage::store::Store;
 use automerge::sync::Message;
 use rand::seq::IteratorRandom;
+use tracing::trace;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -67,44 +68,48 @@ where
             .into_iter()
             .filter(|addr| addr.node_id != node_id);
         for node in members {
+            let mut stream = controller.network.create_stream(node.node_id).await?;
             'sync: loop {
                 let sync_message = controller
                     .persistence
-                    .generate_sync_message(&group.id, &mut group_doc, node.node_id.clone())
+                    .generate_sync_message(&user.id, &mut group_doc, node.node_id.clone())
                     .await?;
-                match sync_message {
-                    Some(msg) => {
-                        if let Some(response) = controller
-                            .network
-                            .sync(
-                                crate::network::network_trait::ReplicationSubject::Object(Some(
-                                    msg,
-                                )),
-                                &group.id,
-                                node.clone(),
-                            )
-                            .await?
-                        {
-                            controller
-                                .persistence
-                                .receive_sync_message(
-                                    &group.id,
-                                    &mut group_doc,
-                                    Message::decode(&response)?,
-                                    node.node_id.clone(),
-                                )
-                                .await?;
-                        };
-                    }
-                    None => {
-                        controller
-                            .persistence
-                            .handle_group_merges(group_doc.save())
-                            .await?;
-                        break 'sync;
-                    }
+
+                let recv_message = controller
+                    .network
+                    .sync(
+                        &mut stream,
+                        crate::network::network_trait::ReplicationSubject::Group(
+                            sync_message.clone(),
+                        ),
+                        &user.id,
+                        node.clone(),
+                    )
+                    .await?;
+
+                if let Some(response) = &recv_message {
+                    controller
+                        .persistence
+                        .receive_sync_message(
+                            &user.id,
+                            &mut group_doc,
+                            Message::decode(response)?,
+                            node.node_id.clone(),
+                        )
+                        .await?;
+                }
+                if sync_message.is_none() && recv_message.is_none() {
+                    break 'sync;
                 }
             }
+
+            trace!("PERSIST TO DISK");
+            controller
+                .persistence
+                .handle_group_merges(group_doc.save())
+                .await?;
+
+            controller.network.finish_stream(stream).await?;
         }
 
         Ok(AddGroupResponse { group })

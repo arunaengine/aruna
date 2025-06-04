@@ -2,19 +2,23 @@ pub mod commons;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::commons::init_lmdb_servers;
-    use aruna_metadata::models::{
-        models::Resource,
-        requests::{
-            AddUserRequest, AddUserResponse, CreateResourceRequest, CreateResourceResponse,
-            GetResourceResponse,
+    use aruna_metadata::{
+        models::{
+            models::Resource,
+            requests::{
+                AddUserRequest, AddUserResponse, CreateResourceRequest, CreateResourceResponse,
+                GetResourceResponse,
+            },
         },
+        network::network_trait::Network,
     };
     const OFFSET: u16 = 0;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_create() {
-
         let servers = init_lmdb_servers(OFFSET).await.unwrap();
         println!("Init servers");
 
@@ -53,7 +57,10 @@ mod tests {
         let user2 = response.user.id;
         println!("{}", user2.to_string());
 
+        std::thread::sleep(Duration::from_secs(5));
+
         for (controller, _) in servers.iter() {
+            println!("{}", controller.network.get_addr().await.unwrap().node_id);
             assert!(
                 controller
                     .persistence
@@ -113,6 +120,8 @@ mod tests {
             .unwrap()
             .resource;
         let object_id2 = object2.id;
+
+        std::thread::sleep(Duration::from_secs(5));
 
         for (_, base_url) in servers.iter() {
             let response: GetResourceResponse = client

@@ -9,7 +9,7 @@ use super::{
 use crate::{
     error::ArunaMetadataError,
     models::models::{Resource, User},
-    network::network_trait::{Body, MetadataMessage, ReplicationSubject},
+    network::network_trait::ReplicationSubject,
 };
 use aruna_storage::storage::store::Store;
 use automerge::{
@@ -17,9 +17,9 @@ use automerge::{
     sync::{Message, State, SyncDoc},
 };
 use autosurgeon::hydrate;
-use iroh::{NodeAddr, PublicKey};
+use iroh::PublicKey;
 use roaring::RoaringBitmap;
-use tracing::{trace, warn};
+use tracing::trace;
 use ulid::Ulid;
 
 impl<Se, St> Persistor<St, Se>
@@ -48,13 +48,13 @@ where
             None => {
                 let mut state = State::new();
                 let mut map = HashMap::default();
-                let msg = doc.sync().generate_sync_message(&mut state);
-                //.map(|msg| msg.encode());
-                trace!(?doc);
-                trace!(?msg);
+                let msg = doc
+                    .sync()
+                    .generate_sync_message(&mut state)
+                    .map(|msg| msg.encode());
                 map.insert(node, state.clone());
                 lock.insert(*doc_id, map);
-                msg.map(|msg| msg.encode())
+                msg
             }
         };
         drop(lock);
@@ -79,10 +79,7 @@ where
             None => {
                 let mut state = State::new();
                 let mut map = HashMap::default();
-                trace!(?message);
-                trace!(before = "before", ?doc);
                 doc.sync().receive_sync_message(&mut state, message)?;
-                trace!(after = "after", ?doc);
                 map.insert(node, state);
                 lock.insert(*doc_id, map);
             }
@@ -96,65 +93,58 @@ where
         node: PublicKey,
         subject_id: Ulid,
         msg: ReplicationSubject,
+        doc: &mut AutoCommit,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
         let response = match msg {
             crate::network::network_trait::ReplicationSubject::User(message) => {
-                trace!("Handle user");
-                let mut doc = self.get_or_create_doc(subject_id, USER_DB_NAME).await?;
                 if let Some(message) = &message {
+                    trace!("Sync message from {node}");
                     self.receive_sync_message(
                         &subject_id,
-                        &mut doc,
+                        doc,
                         Message::decode(message)?,
                         node.clone(),
                     )
                     .await?;
                 }
                 let response = self
-                    .generate_sync_message(&subject_id, &mut doc, node.clone())
+                    .generate_sync_message(&subject_id, doc, node.clone())
                     .await?;
-                trace!("Handled sync");
                 if response.is_none() && message.is_none() {
                     self.handle_user_merges(doc.save()).await?;
                 }
-                trace!("Handled merge");
                 response
             }
             crate::network::network_trait::ReplicationSubject::Object(message) => {
-                let mut doc = self.get_or_create_doc(subject_id, RESOURCE_DB_NAME).await?;
-
                 if let Some(message) = &message {
                     self.receive_sync_message(
                         &subject_id,
-                        &mut doc,
+                        doc,
                         Message::decode(message)?,
                         node.clone(),
                     )
                     .await?;
                 }
                 let response = self
-                    .generate_sync_message(&subject_id, &mut doc, node.clone())
+                    .generate_sync_message(&subject_id, doc, node.clone())
                     .await?;
                 if response.is_none() && message.is_none() {
-                    warn!("SYNCING NOW TO DISK");
                     self.handle_object_merges(doc.save()).await?;
                 }
                 response
             }
             crate::network::network_trait::ReplicationSubject::Group(message) => {
-                let mut doc = self.get_or_create_doc(subject_id, GROUPS_DB_NAME).await?;
-
                 if let Some(message) = &message {
                     self.receive_sync_message(
                         &subject_id,
-                        &mut doc,
+                        doc,
                         Message::decode(message)?,
                         node.clone(),
                     )
                     .await?;
                 }
                 let response = self
-                    .generate_sync_message(&subject_id, &mut doc, node.clone())
+                    .generate_sync_message(&subject_id, doc, node.clone())
                     .await?;
                 if response.is_none() && message.is_none() {
                     self.handle_group_merges(doc.save()).await?;
@@ -162,7 +152,6 @@ where
                 response
             }
         };
-        trace!("Got response");
         Ok(response)
     }
 
@@ -184,7 +173,6 @@ where
             trace!("Yes");
             trace!(?doc);
             let foreign_user: User = autosurgeon::hydrate(&doc)?;
-            println!("Could recreate doc");
             let ulid_bytes = foreign_user.id.to_bytes();
 
             // Decide if merge or create
@@ -204,7 +192,6 @@ where
                 }
             };
 
-            println!("Could merge doc");
             let res = merged_resource.save();
 
             // Persist
@@ -305,7 +292,7 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn get_or_create_doc(
+    pub async fn get_or_create_doc(
         &self,
         subject_id: Ulid,
         table: &'static str,

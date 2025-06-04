@@ -1,10 +1,16 @@
 use crate::{
     error::ArunaMetadataError,
     models::requests::{ForwardRequest, ForwardResponse},
-    persistence::search::search::Search,
+    persistence::{
+        persistence::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
+        search::search::Search,
+    },
     transactions::{controller::Controller, request::Request},
 };
-use aruna_net::{actor::NetworkActorBuilder, actor_handle::NetworkActorHandle};
+use aruna_net::{
+    actor::NetworkActorBuilder,
+    actor_handle::{NetworkActorHandle, ReceiveStreams},
+};
 use aruna_realm::Realm;
 use aruna_storage::storage::store::Store;
 use ed25519_dalek::SigningKey;
@@ -12,7 +18,7 @@ use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddrV4, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, info, trace, warn};
+use tracing::{error, trace, warn};
 use ulid::Ulid;
 
 pub static METADATA_PROTOCOL_ID: u32 = 3;
@@ -59,10 +65,12 @@ pub enum ReplicationSubject {
 #[async_trait::async_trait]
 pub trait Network: Sync + Send + Sized {
     type Config;
+    type Stream: Send + Sync + Sized;
     async fn new(config: Self::Config) -> Result<Self, ArunaMetadataError>;
     async fn get_addr(&self) -> Result<NodeAddr, ArunaMetadataError>;
     async fn sync(
         &self,
+        stream: &mut Self::Stream,
         subject: ReplicationSubject,
         subject_id: &Ulid,
         target_node: NodeAddr,
@@ -83,6 +91,8 @@ pub trait Network: Sync + Send + Sized {
         subject_id: &Ulid,
         target_node: NodeAddr,
     ) -> Result<ForwardResponse, ArunaMetadataError>;
+    async fn create_stream(&self, target: PublicKey) -> Result<Self::Stream, ArunaMetadataError>;
+    async fn finish_stream(&self, stream: Self::Stream) -> Result<(), ArunaMetadataError>;
     async fn find(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn find_verified(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn get_realm_nodes(&self) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
@@ -97,6 +107,7 @@ pub struct NetworkDummy {
 #[async_trait::async_trait]
 impl Network for NetworkDummy {
     type Config = ();
+    type Stream = ();
     async fn new(_config: Self::Config) -> Result<Self, ArunaMetadataError> {
         Ok(NetworkDummy {
             self_id: NodeAddr::new(
@@ -109,8 +120,16 @@ impl Network for NetworkDummy {
         Ok(self.self_id.clone())
     }
 
+    async fn create_stream(&self, _target: PublicKey) -> Result<Self::Stream, ArunaMetadataError> {
+        Ok(())
+    }
+
+    async fn finish_stream(&self, _stream: Self::Stream) -> Result<(), ArunaMetadataError> {
+        Ok(())
+    }
     async fn sync(
         &self,
+        _stream: &mut Self::Stream,
         _subject: ReplicationSubject,
         _subject_id: &Ulid,
         _target_node: NodeAddr,
@@ -175,6 +194,7 @@ pub struct P2PNetwork {
 #[async_trait::async_trait]
 impl Network for P2PNetwork {
     type Config = NetworkConfig;
+    type Stream = ReceiveStreams;
 
     async fn new(config: Self::Config) -> Result<Self, ArunaMetadataError> {
         let init_handle = NetworkActorBuilder::new(config.secret_key)
@@ -212,9 +232,23 @@ impl Network for P2PNetwork {
         let controller = controller.clone();
         tokio::spawn(async move {
             loop {
-                if let Err(err) = network.dispatch_messages::<St, Se, N>(&controller).await {
-                    error!("{err}");
-                }
+                let mut recv_stream = match self.chandler.receive().await {
+                    Ok(s) => s,
+                    Err(err) => {
+                        error!("{err}");
+                        continue;
+                    }
+                };
+                let controller = controller.clone();
+                let network = network.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = network
+                        .dispatch_messages::<St, Se, N>(&mut recv_stream, controller.as_ref())
+                        .await
+                    {
+                        error!("{err}");
+                    }
+                });
             }
         });
         Ok(())
@@ -266,13 +300,15 @@ impl Network for P2PNetwork {
         Ok(find_results)
     }
 
-    #[tracing::instrument(level = "trace", skip(self, subject))]
+    #[tracing::instrument(level = "trace", skip(self, subject, stream))]
     async fn sync(
         &self,
+        stream: &mut Self::Stream,
         subject: ReplicationSubject,
         subject_id: &Ulid,
         target_node: NodeAddr,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
+        let (sdx, recv) = (&mut stream.send_stream, &mut stream.recv_stream);
         let node_id = self.chandler.get_node_addr().await?;
 
         // Calc hash
@@ -295,13 +331,9 @@ impl Network for P2PNetwork {
         message.to = *target_node.node_id.as_bytes();
         let msg = postcard::to_allocvec(&message)?;
 
-        let (mut sdx, mut recv) = self.chandler.create_stream(target_node.node_id).await?;
         sdx.write_u32(msg.len() as u32).await?;
         sdx.write_all(msg.as_slice())
             .await
-            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-        //chandler.store(*id_hash.as_bytes(), node).await?; // TODO: Move this to handle_stream in persistence
-        sdx.finish()
             .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
 
         let len = recv.read_u32().await?;
@@ -428,11 +460,29 @@ impl Network for P2PNetwork {
     async fn store_in_realm(&self, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
         todo!()
     }
+
+    async fn create_stream(&self, target: PublicKey) -> Result<Self::Stream, ArunaMetadataError> {
+        let (send, rcv) = self.chandler.create_stream(target).await?;
+        Ok(ReceiveStreams {
+            sender: target,
+            send_stream: send,
+            recv_stream: rcv,
+        })
+    }
+
+    async fn finish_stream(&self, mut stream: Self::Stream) -> Result<(), ArunaMetadataError> {
+        stream
+            .send_stream
+            .finish()
+            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+        Ok(())
+    }
 }
 
 impl P2PNetwork {
     pub async fn dispatch_messages<St, Se, N>(
         &self,
+        recv_stream: &mut ReceiveStreams,
         controller: &Controller<St, Se, N>,
     ) -> Result<(), ArunaMetadataError>
     where
@@ -440,7 +490,6 @@ impl P2PNetwork {
         Se: Search,
         N: Network,
     {
-        let mut recv_stream = self.chandler.receive().await?;
         while let Ok(len) = recv_stream.recv_stream.read_u32().await {
             trace!("Got something");
             let mut buf = vec![0; len as usize];
@@ -458,35 +507,121 @@ impl P2PNetwork {
             trace!("{message:?}");
             match message.body {
                 Body::Replicate { id, sync_message } => {
-                    let node_id = PublicKey::from_bytes(&message.from).map_err(|e| {
+                    let node_id = PublicKey::from_bytes(&message.from).map_err(|_e| {
                         ArunaMetadataError::ConversionError {
                             from: "&[u8]".to_string(),
                             to: "PublicKey".to_string(),
                         }
                     })?;
-                    match controller
+                    let table = match sync_message {
+                        ReplicationSubject::Group(_) => GROUPS_DB_NAME,
+                        ReplicationSubject::User(_) => USER_DB_NAME,
+                        ReplicationSubject::Object(_) => RESOURCE_DB_NAME,
+                    };
+                    let mut doc = controller.persistence.get_or_create_doc(id, table).await?;
+
+                    let sync_response = controller
                         .persistence
-                        .handle_replication(node_id, id, sync_message)
+                        .handle_replication(node_id, id, sync_message, &mut doc)
+                        .await?;
+                    let message = postcard::to_allocvec(&MetadataMessage {
+                        from: message.to,
+                        to: message.from,
+                        subject: message.subject,
+                        body: Body::Response(Response::SyncResponse(sync_response)),
+                    })?;
+                    recv_stream
+                        .send_stream
+                        .write_u32(message.len() as u32)
+                        .await?;
+                    recv_stream
+                        .send_stream
+                        .write_all(message.as_slice())
                         .await
-                    {
-                        Ok(res) => {
-                            let response = postcard::to_allocvec(&MetadataMessage {
-                                from: message.to,
-                                to: message.from,
-                                subject: message.subject,
-                                body: Body::Response(Response::SyncResponse(res)),
-                            })?;
-                            recv_stream.send_stream.write_u32(response.len() as u32).await?;
-                            recv_stream.send_stream.write_all(response.as_slice())
-                                .await
-                                .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+                        .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+
+                    //self.store(&message.subject).await?;
+                    'inner: loop {
+                        let len = recv_stream.recv_stream.read_u32().await?;
+                        let mut buf = vec![0; len as usize];
+                        recv_stream
+                            .recv_stream
+                            .read_exact(&mut buf)
+                            .await
+                            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+
+                        let MetadataMessage {
+                            from,
+                            to,
+                            subject,
+                            body: Body::Replicate { id, sync_message },
+                        } = postcard::from_bytes::<MetadataMessage>(&buf).map_err(|e| {
+                            ArunaMetadataError::NetworkError(format!(
+                                "Failed to deserialize message: {e:#}"
+                            ))
+                        })?
+                        else {
+                            return Err(ArunaMetadataError::ServerError(
+                                "Unexpected Message type".to_string(),
+                            ));
+                        };
+                        let node_id = PublicKey::from_bytes(&from).map_err(|_e| {
+                            ArunaMetadataError::ConversionError {
+                                from: "&[u8]".to_string(),
+                                to: "PublicKey".to_string(),
+                            }
+                        })?;
+
+                        let sync_response = controller
+                            .persistence
+                            .handle_replication(node_id, id, sync_message.clone(), &mut doc)
+                            .await?;
+
+                        let response = postcard::to_allocvec(&MetadataMessage {
+                            from: to,
+                            to: from,
+                            subject,
+                            body: Body::Response(Response::SyncResponse(sync_response.clone())),
+                        })?;
+                        recv_stream
+                            .send_stream
+                            .write_u32(response.len() as u32)
+                            .await?;
+                        recv_stream
+                            .send_stream
+                            .write_all(response.as_slice())
+                            .await
+                            .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
+
+                        if sync_response.is_none() {
+                            match sync_message {
+                                ReplicationSubject::Group(None) => {
+                                    controller
+                                        .persistence
+                                        .handle_group_merges(doc.save())
+                                        .await?;
+                                }
+                                ReplicationSubject::User(None) => {
+                                    controller
+                                        .persistence
+                                        .handle_user_merges(doc.save())
+                                        .await?;
+                                }
+                                ReplicationSubject::Object(None) => {
+                                    controller
+                                        .persistence
+                                        .handle_user_merges(doc.save())
+                                        .await?;
+                                }
+                                _ => continue,
+                            }
                             recv_stream
                                 .send_stream
                                 .finish()
                                 .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-                            self.store(&message.subject).await?;
+                            self.store(&subject).await?;
+                            break 'inner;
                         }
-                        Err(err) => return Err(err),
                     }
                 }
                 Body::Request { token, request } => {
@@ -552,7 +687,6 @@ impl P2PNetwork {
                 }
             }
         }
-
         Ok(())
     }
 }
