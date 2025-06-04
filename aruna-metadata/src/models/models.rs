@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use super::conversions::autosurgeon_date_time;
 use super::conversions::autosurgeon_ulid;
+use automerge::AutoCommit;
 use autosurgeon::{Hydrate, Reconcile};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -230,6 +231,22 @@ pub struct User {
     pub name: String,
 }
 
+#[derive(Clone)]
+pub enum TypedDoc {
+    Resource(AutoCommit),
+    Group(AutoCommit),
+    User(AutoCommit),
+}
+
+impl TypedDoc {
+    pub fn get_inner(&self) -> AutoCommit {
+        match self {
+            TypedDoc::Resource(x) => x,
+            TypedDoc::Group(x) => x,
+            TypedDoc::User(x) => x,
+        }.clone()
+    }
+}
 
 #[derive(
     Clone,

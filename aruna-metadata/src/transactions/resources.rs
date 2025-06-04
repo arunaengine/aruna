@@ -16,9 +16,7 @@ use crate::{
     persistence::{persistence::Authorize, search::search::Search},
 };
 use aruna_storage::storage::store::Store;
-use automerge::sync::Message;
 use rand::seq::IteratorRandom;
-use tracing::trace;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -94,49 +92,13 @@ where
             .filter(|addr| addr.node_id != node_id)
             .choose_multiple(&mut rand::rngs::OsRng, REPLICATION_POLICY);
 
-        for node in realm_nodes {
-            let res_doc = doc.clone();
-            let network = controller.network.clone();
-            let persistence = controller.persistence.clone();
-            tokio::spawn(async move {
-                let mut stream = network.create_stream(node.node_id).await?;
-                let mut doc = res_doc;
-                'sync: loop {
-                    let sync_message = persistence
-                        .generate_sync_message(&user.id, &mut doc, node.node_id.clone())
-                        .await?;
-
-                    let recv_message = network
-                        .sync(
-                            &mut stream,
-                            crate::network::network_trait::ReplicationSubject::Object(
-                                sync_message.clone(),
-                            ),
-                            &user.id,
-                            node.clone(),
-                        )
-                        .await?;
-
-                    if let Some(response) = &recv_message {
-                        persistence
-                            .receive_sync_message(
-                                &user.id,
-                                &mut doc,
-                                Message::decode(response)?,
-                                node.node_id.clone(),
-                            )
-                            .await?;
-                    }
-                    if sync_message.is_none() && recv_message.is_none() {
-                        break 'sync;
-                    }
-                }
-                trace!("PERSIST TO DISK");
-                persistence.handle_object_merges(doc.save()).await?;
-                network.finish_stream(stream).await?;
-                Ok::<(), ArunaMetadataError>(())
-            });
-        }
+        controller
+            .sync_loop(
+                crate::models::models::TypedDoc::Resource(doc),
+                resource.id,
+                realm_nodes.into_iter(),
+            )
+            .await?;
 
         Ok(CreateResourceResponse { resource })
     }
@@ -336,7 +298,7 @@ where
         };
 
         let node_id = controller.network.get_addr().await?.node_id;
-        let mut doc = controller
+        let doc = controller
             .persistence
             .update_resource(node_id.as_bytes(), &user.id, resource.clone())
             .await?;
@@ -350,51 +312,13 @@ where
             .into_iter()
             .filter(|addr| addr.node_id != node_id);
 
-        for node in members {
-            let mut stream = controller.network.create_stream(node.node_id).await?;
-            'sync: loop {
-                let sync_message = controller
-                    .persistence
-                    .generate_sync_message(&user.id, &mut doc, node.node_id.clone())
-                    .await?;
-
-                trace!("Sync message to {}", node.node_id);
-                let recv_message = controller
-                    .network
-                    .sync(
-                        &mut stream,
-                        crate::network::network_trait::ReplicationSubject::Object(
-                            sync_message.clone(),
-                        ),
-                        &user.id,
-                        node.clone(),
-                    )
-                    .await?;
-
-                if let Some(response) = &recv_message {
-                    controller
-                        .persistence
-                        .receive_sync_message(
-                            &user.id,
-                            &mut doc,
-                            Message::decode(response)?,
-                            node.node_id.clone(),
-                        )
-                        .await?;
-                }
-                if sync_message.is_none() && recv_message.is_none() {
-                    break 'sync;
-                }
-            }
-
-            trace!("PERSIST TO DISK");
-            controller
-                .persistence
-                .handle_object_merges(doc.save())
-                .await?;
-
-            controller.network.finish_stream(stream).await?;
-        }
+        controller
+            .sync_loop(
+                crate::models::models::TypedDoc::Resource(doc),
+                resource.id,
+                members,
+            )
+            .await?;
 
         Ok(response)
     }
