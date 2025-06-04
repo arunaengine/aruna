@@ -11,6 +11,7 @@ use aruna_permission::manager::RESOURCE_DB;
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
 use futures_util::TryFutureExt;
+use iroh::SecretKey;
 use lazy_static::lazy_static;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
@@ -54,6 +55,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     debug!(config = ?*CONFIG);
+    let node_key = SecretKey::from_str(&CONFIG.general.node_key)?;
     let rest_addr = Ipv4Addr::from_str(&CONFIG.frontend.openapi_frontend.address)?;
 
     // Dummy access conf which is provided by user/request/node
@@ -69,7 +71,7 @@ async fn main() -> Result<()> {
     }
 
     // Create an endpoint, it allows creating and accepting connections in the iroh p2p world
-    let network_handle_01 = NetworkActorBuilder::new(None)
+    let network_handle_01 = NetworkActorBuilder::new(Some(node_key))
         .await
         .add_bind_addr_v4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 31337))
         .build(vec![])

@@ -1,5 +1,6 @@
 [general]
 realm_id = "01JWRB29J0Q2M3YTJGR24P5N31"
+node_key = "358ea489d2f7d91466eff6edbb7d69b507346dc199d963915138865c03ffe1db"
 
 [persistence]
 path = "/tmp/node1/heed"
