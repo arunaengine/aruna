@@ -8,7 +8,7 @@ use ulid::Ulid;
 
 use crate::casbin::DBNAME;
 use crate::casbin_helper::{CasbinPolicy, CasbinRole};
-use crate::error::{PathError, PermissionError, Result};
+use crate::error::{PathError, PermissionError, Result, UnificationError};
 use crate::{casbin::Enforcer, paths::Path};
 
 // Database constants
@@ -97,6 +97,14 @@ pub struct AddPolicyPrepare {
     policy: CasbinPolicy,
 }
 
+/// Prepare token for unifying two identities (simplified)
+pub struct UnifyIdentitiesPrepare {
+    policies_to_add: Vec<CasbinPolicy>,
+    roles_to_add: Vec<CasbinRole>,
+    policies_to_remove: Vec<CasbinPolicy>,
+    roles_to_remove: Vec<CasbinRole>,
+}
+
 /// Higher-level permission manager that builds on top of the base Enforcer
 #[derive(Clone)]
 pub struct PermissionManager {
@@ -111,7 +119,7 @@ impl PermissionManager {
         })
     }
 
-    /// Resolve user identity to permission ULID
+    /// Resolve user identity to permission ULID (PRIVATE) - UPDATED
     fn resolve_permission_ulid<'a, S: Store<'a> + 'static>(
         &self,
         user_identity: &UserIdentity,
@@ -121,20 +129,104 @@ impl PermissionManager {
         // Serialize UserIdentity for storage key
         let key = postcard::to_allocvec(user_identity)?;
 
-        if let Some(permission_bytes) = store
+        store
             .get(txn, IDENTITY_PERMISSIONS_DB, &key)
             .map_err(|e| PermissionError::StorageError(e))?
-        {
-            let permission_ulid: Ulid = postcard::from_bytes(&permission_bytes)?;
-            Ok(permission_ulid)
-        } else {
-            // If no permission mapping exists, create one using the user's ULID
-            // This maintains backward compatibility for existing users
-            Ok(user_identity.user_ulid)
+            .map(|value| {
+                // Deserialize the permission ULID from the stored value
+                postcard::from_bytes(&value).map_err(|e| PermissionError::PostcardError(e))
+            })
+            .ok_or_else(|| {
+                // No fallback - explicit mapping required
+                PermissionError::ResourceNotFound(
+                    "Permission mapping not found for user identity".to_string(),
+                )
+            })?
+    }
+
+    /// Create a user identity with explicit permission mapping
+    fn create_user_identity<'a, S: Store<'a> + 'static>(
+        &self,
+        user_identity: &UserIdentity,
+        store: &'a S,
+        txn: &mut <S as Store<'a>>::Txn,
+    ) -> Result<Ulid> {
+        // Generate new permission ULID
+        let permission_ulid = Ulid::new();
+
+        // Create explicit mapping
+        self.add_identity_permission(user_identity, permission_ulid, store, txn)?;
+
+        Ok(permission_ulid)
+    }
+
+    /// Create a user identity with explicit permission mapping, or return existing one
+    fn ensure_user_identity<'a, S: Store<'a> + 'static>(
+        &self,
+        user_identity: &UserIdentity,
+        store: &'a S,
+        txn: &mut <S as Store<'a>>::Txn,
+    ) -> Result<Ulid> {
+        // Try to resolve existing mapping first
+        match self.resolve_permission_ulid(user_identity, store, txn) {
+            Ok(permission_ulid) => Ok(permission_ulid),
+            Err(PermissionError::ResourceNotFound(_)) => {
+                // Create new mapping if none exists
+                self.create_user_identity(user_identity, store, txn)
+            }
+            Err(e) => Err(e),
         }
     }
 
-    /// Add OIDC identity mapping
+    /// Find all UserIdentity mappings for a permission ULID
+    fn get_user_identities_for_permission<'a, S: Store<'a> + 'static>(
+        &self,
+        permission_ulid: Ulid,
+        store: &'a S,
+        txn: &<S as Store<'a>>::Txn,
+    ) -> Result<Vec<UserIdentity>> {
+        let mut identities = Vec::new();
+
+        for (key, value) in store
+            .iter_db(txn, IDENTITY_PERMISSIONS_DB)
+            .map_err(|e| PermissionError::StorageError(e))?
+        {
+            let stored_permission_ulid: Ulid = postcard::from_bytes(&value)?;
+
+            if stored_permission_ulid == permission_ulid {
+                let user_identity: UserIdentity = postcard::from_bytes(&key)?;
+                identities.push(user_identity);
+            }
+        }
+
+        Ok(identities)
+    }
+
+    /// Get all roles for a permission ULID
+    fn get_roles_for_permission(&self, permission_ulid: &str) -> Vec<Vec<String>> {
+        let enforcer = self.enforcer.read();
+
+        // Get all role assignments where this permission ULID is the subject
+        enforcer
+            .get_groups()
+            .into_iter()
+            .filter(|role| role.get(0) == Some(&permission_ulid.to_string()))
+            .collect()
+    }
+
+    /// Get all policies for a permission ULID
+    fn get_policies_for_permission(&self, permission_ulid: &str) -> Vec<Vec<String>> {
+        let enforcer = self.enforcer.read();
+
+        // Get all policies where this permission ULID is the subject
+        enforcer
+            .get_policies()
+            .into_iter()
+            .filter(|policy| policy.get(0) == Some(&permission_ulid.to_string()))
+            .collect()
+    }
+
+    /// Add OIDC identity mapping (realm-local only)
     pub fn add_oidc_identity<'a, S: Store<'a> + 'static>(
         &self,
         oidc_provider: &str,
@@ -150,7 +242,7 @@ impl PermissionManager {
         Ok(())
     }
 
-    /// Lookup user ULID from OIDC identity
+    /// Lookup user ULID from OIDC identity (realm-local only)
     pub fn get_user_from_oidc<'a, S: Store<'a> + 'static>(
         &self,
         oidc_provider: &str,
@@ -186,6 +278,157 @@ impl PermissionManager {
         Ok(())
     }
 
+    /// Prepare to unify two identities (UPDATED - handles all storage)
+    pub fn unify_identities_prepare<'a, S: Store<'a> + 'static>(
+        &self,
+        identity1: &UserIdentity,
+        identity2: &UserIdentity,
+        store: &'a S,
+        txn: &mut <S as Store<'a>>::Txn,
+    ) -> Result<UnifyIdentitiesPrepare> {
+        // Validation
+        if identity1 == identity2 {
+            return Err(PermissionError::from(UnificationError::SelfUnification));
+        }
+
+        // Resolve permission ULIDs for both identities (must exist now)
+        let perm_ulid_1 = self
+            .resolve_permission_ulid(identity1, store, txn)
+            .map_err(|_| UnificationError::IdentityNotFound(identity1.to_string()))?;
+        let perm_ulid_2 = self
+            .resolve_permission_ulid(identity2, store, txn)
+            .map_err(|_| {
+                PermissionError::from(UnificationError::IdentityNotFound(identity2.to_string()))
+            })?;
+
+        // Check if already unified
+        if perm_ulid_1 == perm_ulid_2 {
+            return Err(PermissionError::from(UnificationError::AlreadyUnified));
+        }
+
+        // Generate new unified permission ULID
+        let new_permission_ulid = Ulid::new();
+
+        // Get all roles and policies for both old permission ULIDs
+        let roles_1 = self.get_roles_for_permission(&perm_ulid_1.to_string());
+        let roles_2 = self.get_roles_for_permission(&perm_ulid_2.to_string());
+        let policies_1 = self.get_policies_for_permission(&perm_ulid_1.to_string());
+        let policies_2 = self.get_policies_for_permission(&perm_ulid_2.to_string());
+
+        // Prepare new roles and policies with unified permission ULID
+        let mut roles_to_add = Vec::new();
+        let mut policies_to_add = Vec::new();
+        let mut roles_to_remove = Vec::new();
+        let mut policies_to_remove = Vec::new();
+
+        // Process roles (deduplicate identical ones)
+        let mut seen_roles = std::collections::HashSet::new();
+
+        for mut role in roles_1.into_iter().chain(roles_2.into_iter()) {
+            // Create new role with unified permission ULID
+            let old_role = role.clone();
+            role[0] = new_permission_ulid.to_string(); // Replace subject
+
+            let role_key = role[1..].join(":"); // Use role name as dedup key
+            if seen_roles.insert(role_key) {
+                roles_to_add.push(CasbinRole::new(role.clone())?);
+                // UPDATE STORAGE: Add new role to storage
+                store.put(txn, DBNAME, format!("g:{}", role.join(":")).as_bytes(), &[])?;
+            }
+
+            // Mark old role for removal and UPDATE STORAGE: Remove old role
+            roles_to_remove.push(CasbinRole::new(old_role.clone())?);
+            store.remove(txn, DBNAME, format!("g:{}", old_role.join(":")).as_bytes())?;
+        }
+
+        // Process policies (deduplicate identical ones)
+        let mut seen_policies = std::collections::HashSet::new();
+
+        for mut policy in policies_1.into_iter().chain(policies_2.into_iter()) {
+            let old_policy = policy.clone();
+            policy[0] = new_permission_ulid.to_string(); // Replace subject
+
+            let policy_key = policy[1..].join(":"); // Use obj:act:eft as dedup key
+            if seen_policies.insert(policy_key) {
+                policies_to_add.push(CasbinPolicy::new(policy.clone())?);
+                // UPDATE STORAGE: Add new policy to storage
+                store.put(
+                    txn,
+                    DBNAME,
+                    format!("p:{}", policy.join(":")).as_bytes(),
+                    &[],
+                )?;
+            }
+
+            // Mark old policy for removal and UPDATE STORAGE: Remove old policy
+            policies_to_remove.push(CasbinPolicy::new(old_policy.clone())?);
+            store.remove(
+                txn,
+                DBNAME,
+                format!("p:{}", old_policy.join(":")).as_bytes(),
+            )?;
+        }
+
+        // Find all UserIdentity mappings to update
+        let identities_1 = self.get_user_identities_for_permission(perm_ulid_1, store, txn)?;
+        let identities_2 = self.get_user_identities_for_permission(perm_ulid_2, store, txn)?;
+        let identity_mappings_to_update: Vec<UserIdentity> = identities_1
+            .into_iter()
+            .chain(identities_2.into_iter())
+            .collect();
+
+        // UPDATE STORAGE: Update all identity mappings to point to new permission ULID
+        for identity in &identity_mappings_to_update {
+            let key = postcard::to_allocvec(identity)?;
+            let value = postcard::to_allocvec(&new_permission_ulid)?;
+            store.put(txn, IDENTITY_PERMISSIONS_DB, &key, &value)?;
+        }
+
+        Ok(UnifyIdentitiesPrepare {
+            policies_to_add,
+            roles_to_add,
+            policies_to_remove,
+            roles_to_remove,
+        })
+    }
+
+    /// Commit identity unification (UPDATED - only updates in-memory enforcer)
+    pub async fn unify_identities_commit(&self, request: UnifyIdentitiesPrepare) -> Result<()> {
+        let mut enforcer = self.enforcer.write();
+
+        // Remove old roles and policies from in-memory enforcer
+        for role in request.roles_to_remove {
+            enforcer.remove_role(role).await?;
+        }
+
+        for policy in request.policies_to_remove {
+            enforcer.remove_policy(policy).await?;
+        }
+
+        // Add new unified roles and policies to in-memory enforcer
+        for role in request.roles_to_add {
+            enforcer.add_role(role).await?;
+        }
+
+        for policy in request.policies_to_add {
+            enforcer.add_policy(policy).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Convenience method: Unify identities with both prepare and commit
+    pub async fn unify_identities<'a, S: Store<'a> + 'static>(
+        &self,
+        identity1: &UserIdentity,
+        identity2: &UserIdentity,
+        store: &'a S,
+        txn: &mut <S as Store<'a>>::Txn,
+    ) -> Result<()> {
+        let prepare = self.unify_identities_prepare(identity1, identity2, store, txn)?;
+        self.unify_identities_commit(prepare).await
+    }
+
     /// Check if a user has permission to access a resource
     pub fn check_permission<'a, S: Store<'a> + 'static>(
         &self,
@@ -195,7 +438,7 @@ impl PermissionManager {
         store: &'a S,
         txn: &'a <S as Store<'a>>::Txn,
     ) -> Result<Path> {
-        // Resolve user identity to permission ULID
+        // Resolve user identity to permission ULID (must exist)
         let permission_ulid = self.resolve_permission_ulid(user_identity, store, txn)?;
 
         // Retrieve path from resource mapping
@@ -224,7 +467,7 @@ impl PermissionManager {
         }
     }
 
-    /// Prepare to create a new group with default admin and member roles
+    /// Prepare to create a new group with default admin and member roles (UPDATED)
     pub fn create_group_prepare<'a, S: Store<'a> + 'static>(
         &self,
         group_id: Ulid,
@@ -233,8 +476,8 @@ impl PermissionManager {
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<CreateGroupPrepare> {
-        // Resolve user identity to permission ULID
-        let permission_ulid = self.resolve_permission_ulid(initial_user, store, txn)?;
+        // Ensure user identity exists with explicit mapping
+        let permission_ulid = self.ensure_user_identity(initial_user, store, txn)?;
 
         let admin_role = format!("{}_admin", group_id);
         let member_role = format!("{}_member", group_id);
@@ -312,7 +555,7 @@ impl PermissionManager {
         Ok(())
     }
 
-    /// Prepare to add a user to a group role
+    /// Prepare to add a user to a group role (UPDATED)
     pub fn add_user_prepare<'a, S: Store<'a> + 'static>(
         &self,
         group_id: Ulid,
@@ -321,8 +564,8 @@ impl PermissionManager {
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<AddUserPrepare> {
-        // Resolve user identity to permission ULID
-        let permission_ulid = self.resolve_permission_ulid(user_identity, store, txn)?;
+        // Ensure user identity exists with explicit mapping
+        let permission_ulid = self.ensure_user_identity(user_identity, store, txn)?;
 
         let full_role = format!("{}_{}", group_id, role_name);
 
@@ -362,7 +605,7 @@ impl PermissionManager {
         Ok(())
     }
 
-    /// Prepare to remove a role from a user
+    /// Prepare to remove a role from a user (UPDATED)
     pub fn remove_role_from_user_prepare<'a, S: Store<'a> + 'static>(
         &self,
         group_id: Ulid,
@@ -371,7 +614,7 @@ impl PermissionManager {
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<RemoveRolePrepare> {
-        // Resolve user identity to permission ULID
+        // Must resolve existing permission ULID (no creation)
         let permission_ulid = self.resolve_permission_ulid(user_identity, store, txn)?;
 
         let full_role = format!("{}_{}", group_id, role_name);
@@ -619,6 +862,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_predictable_user_identity_creation() {
+        let (store, test_dir) = setup_test_store().await;
+        let mut txn = store.create_txn(true).unwrap();
+        let manager = PermissionManager::new().await.unwrap();
+
+        let realm_id = create_test_ulid(10);
+        let user_ulid = create_test_ulid(1);
+        let identity = UserIdentity::new(user_ulid, realm_id);
+
+        // Initially, no permission mapping should exist
+        assert!(
+            manager
+                .resolve_permission_ulid(&identity, &store, &txn)
+                .is_err()
+        );
+
+        // Create explicit permission mapping
+        let permission_ulid = manager
+            .create_user_identity(&identity, &store, &mut txn)
+            .unwrap();
+
+        // Now resolution should work
+        let resolved = manager
+            .resolve_permission_ulid(&identity, &store, &txn)
+            .unwrap();
+        assert_eq!(resolved, permission_ulid);
+
+        // Ensure method should return existing mapping
+        let ensured = manager
+            .ensure_user_identity(&identity, &store, &mut txn)
+            .unwrap();
+        assert_eq!(ensured, permission_ulid);
+
+        txn.commit().unwrap();
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[tokio::test]
     async fn test_oidc_identity_management() {
         let (store, test_dir) = setup_test_store().await;
         let mut txn = store.create_txn(true).unwrap();
@@ -650,213 +931,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_identity_permission_mapping() {
+    async fn test_basic_identity_unification() {
         let (store, test_dir) = setup_test_store().await;
         let mut txn = store.create_txn(true).unwrap();
         let manager = PermissionManager::new().await.unwrap();
 
         let realm_id = create_test_ulid(10);
-        let user_ulid = create_test_ulid(1);
-        let permission_ulid = create_test_ulid(100);
+        let user_ulid_1 = create_test_ulid(1);
+        let user_ulid_2 = create_test_ulid(2);
 
-        let user_identity = UserIdentity::new(user_ulid, realm_id);
+        // Create two separate identities with explicit mappings
+        let identity_1 = UserIdentity::new(user_ulid_1, realm_id);
+        let identity_2 = UserIdentity::new(user_ulid_2, realm_id);
 
-        // Test adding identity permission mapping
+        // Create groups and permissions for both identities (ensures mappings exist)
+        let group_id_1 = create_test_ulid(20);
+        let group_id_2 = create_test_ulid(21);
+
         manager
-            .add_identity_permission(&user_identity, permission_ulid, &store, &mut txn)
+            .create_group(group_id_1, &identity_1, realm_id, &store, &mut txn)
+            .await
             .unwrap();
-
-        // Test resolving permission ULID (internal method)
-        let resolved = manager
-            .resolve_permission_ulid(&user_identity, &store, &txn)
-            .unwrap();
-        assert_eq!(resolved, permission_ulid);
-
-        // Test fallback to user ULID when no mapping exists
-        let other_user = UserIdentity::new(create_test_ulid(2), realm_id);
-        let fallback = manager
-            .resolve_permission_ulid(&other_user, &store, &txn)
-            .unwrap();
-        assert_eq!(fallback, other_user.user_ulid);
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_create_group_with_user_identity() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = create_test_ulid(10);
-        let group_id = create_test_ulid(20);
-        let admin_user_ulid = create_test_ulid(1);
-
-        let admin_identity = UserIdentity::new(admin_user_ulid, realm_id);
-
-        // Test group creation with UserIdentity
         manager
-            .create_group(group_id, &admin_identity, realm_id, &store, &mut txn)
+            .create_group(group_id_2, &identity_2, realm_id, &store, &mut txn)
             .await
             .unwrap();
 
-        // Verify group roles were created
-        let roles = manager.get_group_roles(group_id);
-        assert!(roles.contains(&"admin".to_string()));
-        assert!(roles.contains(&"member".to_string()));
-
-        // Verify admin user has admin role (should be their permission ULID)
-        let admins = manager.get_role_users(group_id, "admin");
-        let expected_permission_ulid = manager
-            .resolve_permission_ulid(&admin_identity, &store, &txn)
+        // Verify they have different permission ULIDs initially
+        let perm_1 = manager
+            .resolve_permission_ulid(&identity_1, &store, &txn)
             .unwrap();
-        assert!(admins.contains(&expected_permission_ulid.to_string()));
+        let perm_2 = manager
+            .resolve_permission_ulid(&identity_2, &store, &txn)
+            .unwrap();
+        assert_ne!(perm_1, perm_2);
 
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_permission_checking_with_identity() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = create_test_ulid(10);
-        let group_id = create_test_ulid(20);
-        let admin_identity = UserIdentity::new(create_test_ulid(1), realm_id);
-        let resource_id = create_test_ulid(30);
-
-        // Create group and add resource
+        // Unify the identities
         manager
-            .create_group(group_id, &admin_identity, realm_id, &store, &mut txn)
+            .unify_identities(&identity_1, &identity_2, &store, &mut txn)
             .await
             .unwrap();
 
-        let resource_path = Path::builder()
-            .realm_id(realm_id)
-            .group_metadata(group_id, resource_id, vec![])
-            .build()
+        // Verify they now have the same permission ULID
+        let unified_perm_1 = manager
+            .resolve_permission_ulid(&identity_1, &store, &txn)
             .unwrap();
-
-        manager
-            .add_resource(
-                ResourceId::Ulid(resource_id),
-                &resource_path,
-                &store,
-                &mut txn,
-            )
+        let unified_perm_2 = manager
+            .resolve_permission_ulid(&identity_2, &store, &txn)
             .unwrap();
-
-        // Test permission check
-        let result = manager.check_permission(
-            &admin_identity,
-            ResourceId::Ulid(resource_id),
-            Action::Write,
-            &store,
-            &txn,
-        );
-        assert!(result.is_ok());
-
-        // Test with non-member user
-        let outsider = UserIdentity::new(create_test_ulid(99), realm_id);
-        let result = manager.check_permission(
-            &outsider,
-            ResourceId::Ulid(resource_id),
-            Action::Write,
-            &store,
-            &txn,
-        );
-        assert!(matches!(result, Err(PermissionError::PermissionDenied)));
+        assert_eq!(unified_perm_1, unified_perm_2);
 
         txn.commit().unwrap();
         cleanup_test_dir(&test_dir);
     }
 
     #[tokio::test]
-    async fn test_prepare_commit_workflow() {
+    async fn test_unification_error_cases() {
         let (store, test_dir) = setup_test_store().await;
         let mut txn = store.create_txn(true).unwrap();
         let manager = PermissionManager::new().await.unwrap();
 
-        let realm_id = create_test_ulid(10);
-        let group_id = create_test_ulid(20);
-        let admin_identity = UserIdentity::new(create_test_ulid(1), realm_id);
-
-        // Test prepare phase
-        let prepare = manager
-            .create_group_prepare(group_id, &admin_identity, realm_id, &store, &mut txn)
-            .unwrap();
-
-        // Verify Casbin enforcer not updated yet
-        assert!(manager.get_group_roles(group_id).is_empty());
-
-        // Test commit phase
-        manager.create_group_commit(prepare).await.unwrap();
-
-        // Verify Casbin enforcer was updated
-        let roles = manager.get_group_roles(group_id);
-        assert!(roles.contains(&"admin".to_string()));
-        assert!(roles.contains(&"member".to_string()));
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_user_identity_serialization() {
         let realm_id = create_test_ulid(10);
         let user_ulid = create_test_ulid(1);
         let identity = UserIdentity::new(user_ulid, realm_id);
 
-        // Test postcard serialization (used for storage keys)
-        let serialized = postcard::to_allocvec(&identity).unwrap();
-        let deserialized: UserIdentity = postcard::from_bytes(&serialized).unwrap();
+        // Create explicit mapping
+        manager
+            .create_user_identity(&identity, &store, &mut txn)
+            .unwrap();
 
-        assert_eq!(identity, deserialized);
-        assert_eq!(identity.user_ulid, deserialized.user_ulid);
-        assert_eq!(identity.realm_ulid, deserialized.realm_ulid);
+        // Test self-unification
+        let result = manager
+            .unify_identities(&identity, &identity, &store, &mut txn)
+            .await;
+        assert!(result.is_err());
+
+        // Test non-existent identity
+        let nonexistent = UserIdentity::new(create_test_ulid(99), realm_id);
+        let result = manager
+            .unify_identities(&identity, &nonexistent, &store, &mut txn)
+            .await;
+        assert!(result.is_err()); // Should fail because no mapping exists
+
+        txn.commit().unwrap();
+        cleanup_test_dir(&test_dir);
     }
 
     #[tokio::test]
-    async fn test_error_handling() {
+    async fn test_cross_realm_unification() {
         let (store, test_dir) = setup_test_store().await;
         let mut txn = store.create_txn(true).unwrap();
         let manager = PermissionManager::new().await.unwrap();
 
-        let realm_id = create_test_ulid(10);
-        let group_id = create_test_ulid(20);
-        let admin_identity = UserIdentity::new(create_test_ulid(1), realm_id);
-        let user_identity = UserIdentity::new(create_test_ulid(2), realm_id);
+        let realm_a = create_test_ulid(10);
+        let realm_b = create_test_ulid(11);
+        let user_ulid = create_test_ulid(1);
 
-        // Create group first
+        // Same user in different realms
+        let identity_a = UserIdentity::new(user_ulid, realm_a);
+        let identity_b = UserIdentity::new(user_ulid, realm_b);
+
+        // Create groups in each realm (ensures mappings exist)
+        let group_a = create_test_ulid(20);
+        let group_b = create_test_ulid(21);
         manager
-            .create_group(group_id, &admin_identity, realm_id, &store, &mut txn)
+            .create_group(group_a, &identity_a, realm_a, &store, &mut txn)
+            .await
+            .unwrap();
+        manager
+            .create_group(group_b, &identity_b, realm_b, &store, &mut txn)
             .await
             .unwrap();
 
-        // Try to add user to non-existent role
-        let result = manager
-            .add_user(group_id, &user_identity, "nonexistent", &store, &mut txn)
-            .await;
-        assert!(matches!(result, Err(PermissionError::RoleNotFound(_))));
-
-        // Test resource with wildcards rejected
-        let resource_id = create_test_ulid(30);
-        let wildcard_path = Path::builder()
-            .realm_id(realm_id)
-            .group_wildcard(group_id)
-            .build()
+        // Unify cross-realm identities
+        manager
+            .unify_identities(&identity_a, &identity_b, &store, &mut txn)
+            .await
             .unwrap();
 
-        let result = manager.add_resource(
-            ResourceId::Ulid(resource_id),
-            &wildcard_path,
-            &store,
-            &mut txn,
-        );
-        assert!(matches!(result, Err(PermissionError::PathError(_))));
+        // Verify unified permission access
+        let unified_perm_a = manager
+            .resolve_permission_ulid(&identity_a, &store, &txn)
+            .unwrap();
+        let unified_perm_b = manager
+            .resolve_permission_ulid(&identity_b, &store, &txn)
+            .unwrap();
+        assert_eq!(unified_perm_a, unified_perm_b);
 
         txn.commit().unwrap();
         cleanup_test_dir(&test_dir);

@@ -27,6 +27,17 @@ pub enum PathError {
     InvalidAssumption(String),
 }
 
+/// Error types for unification operations
+#[derive(Error, Debug)]
+pub enum UnificationError {
+    #[error("Identity not found: {0}")]
+    IdentityNotFound(String),
+    #[error("Identities already unified")]
+    AlreadyUnified,
+    #[error("Cannot unify identity with itself")]
+    SelfUnification,
+}
+
 #[derive(Error, Debug)]
 pub enum ArunaPermissionHandlerError {
     #[error("Failed to convert permission: {0}")]
@@ -62,6 +73,8 @@ pub enum PermissionError {
     PostcardError(#[from] postcard::Error),
     #[error("Aruna permission handler error: {0}")]
     ArunaPermissionHandlerError(#[from] ArunaPermissionHandlerError),
+    #[error("Unification error: {0}")]
+    UnificationError(#[from] UnificationError),
 }
 
 pub type Result<T> = std::result::Result<T, PermissionError>;
