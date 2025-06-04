@@ -3,6 +3,7 @@ use crate::IOHandler;
 use crate::api_s3::auth::AuthProvider;
 use crate::config::config::S3Frontend;
 use anyhow::Result;
+use aruna_permission::manager::PermissionManager;
 use aruna_storage::storage::lmdb::LmdbStore;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -14,6 +15,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use iroh::NodeId;
+use parking_lot::RwLock;
 use s3s::Body;
 use s3s::S3Error;
 use s3s::s3_error;
@@ -38,12 +40,11 @@ pub struct S3Server {
 pub struct WrappingService(SharedS3Service);
 
 impl S3Server {
-    #[tracing::instrument(level = "trace", skip(backend))]
+    #[tracing::instrument(level = "trace", skip(frontend, backend, permission_manager))]
     pub async fn new(
-        //address: impl Into<String> + Copy,
-        //hostname: impl Into<String>,
         frontend: S3Frontend,
         backend: Arc<IOHandler<LmdbStore>>,
+        permission_manager: Arc<RwLock<PermissionManager>>,
         node_id: NodeId,
         realm_id: Ulid,
     ) -> Result<Self> {
@@ -56,20 +57,17 @@ impl S3Server {
 
         let local_address = frontend.server.clone();
 
-        let authenticate = AuthProvider {
+        let auth = AuthProvider {
             store: backend.store.clone(),
-            realm_id,
-        };
-        let authorize = AuthProvider {
-            store: backend.store.clone(),
+            permission_manager,
             realm_id,
         };
 
         let service = {
             let mut b = S3ServiceBuilder::new(s3service);
             b.set_host(frontend);
-            b.set_auth(authenticate);
-            b.set_access(authorize);
+            b.set_auth(auth.clone());
+            b.set_access(auth);
             b.build()
         };
 

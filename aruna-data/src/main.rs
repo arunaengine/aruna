@@ -8,17 +8,19 @@ use aruna_data::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICAT
 use aruna_data::io::io_handler::{IOHandler, LOCATION_DB_NAME};
 use aruna_data::{config::config::Config, util::opendal::get_operator};
 use aruna_net::actor::NetworkActorBuilder;
-use aruna_permission::manager::RESOURCE_DB;
+use aruna_permission::manager::{PermissionManager, RESOURCE_DB};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
 use futures_util::TryFutureExt;
 use iroh::SecretKey;
 use lazy_static::lazy_static;
+use parking_lot::{RwLock, deadlock};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::try_join;
-use tracing::{Level, debug, error};
+use tracing::{Level, debug, error, trace};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
 
@@ -60,15 +62,18 @@ async fn main() -> Result<()> {
     let rest_addr = Ipv4Addr::from_str(&CONFIG.frontend.openapi_frontend.address)?;
 
     // Dummy access conf which is provided by user/request/node
-    let conf = CONFIG.backend.access.clone();
-    let operator = get_operator(&CONFIG.backend.backend_type, conf).await?;
+    let op_conf = CONFIG.backend.access.clone();
+    let operator = get_operator(&CONFIG.backend.backend_type, op_conf).await?;
 
     match operator.check().await {
         Ok(_) => debug!(
             "Connection to {} backend succeeded",
             CONFIG.backend.backend_type
         ),
-        Err(err) => error!("Connection to backend failed: {}", err),
+        Err(err) => {
+            error!("Connection to backend failed: {}", err);
+            //anyhow::bail!("Connection to backend failed: {}", err);
+        }
     }
 
     // Create an endpoint, it allows creating and accepting connections in the iroh p2p world
@@ -91,10 +96,21 @@ async fn main() -> Result<()> {
             LOCATION_DB_NAME,
             PATH_LOCATION_DB_NAME,
             RESOURCE_DB,
+            "casbin",
         ],
     };
     let lmdb_store = Arc::new(LmdbStore::new(lmdb_config)?);
 
+    // Init PermissionManager and load policies from persistence
+    let permission_manager = Arc::new(RwLock::new(PermissionManager::new().await?));
+    let mut read_txn = lmdb_store.create_txn(false)?;
+    permission_manager
+        .write()
+        .load_policies(lmdb_store.as_ref(), &mut read_txn)
+        .await?;
+    lmdb_store.commit(read_txn)?;
+
+    // Create and run IOHandler
     let io_handler = IOHandler::<LmdbStore>::new(
         node_addr.clone(),
         operator,
@@ -104,18 +120,45 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    //TODO: Remove later
-    //create_dummy_access(io_handler.store.clone()).await?;
+    let realm_ulid = Ulid::from_string(&CONFIG.general.realm_id)?;
+    create_dummy_access(
+        io_handler.store.clone(),
+        realm_ulid,
+        permission_manager.clone(),
+    )
+    .await?; //TODO: Remove later
+
+    // Create a background thread which checks for deadlocks every 10s
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_secs(10));
+            let deadlocks = deadlock::check_deadlock();
+            if deadlocks.is_empty() {
+                continue;
+            }
+
+            error!("{} deadlocks detected", deadlocks.len());
+            for (i, threads) in deadlocks.iter().enumerate() {
+                trace!("Deadlock #{}", i);
+                for t in threads {
+                    trace!("Thread Id {:#?}", t.thread_id());
+                    trace!("{:#?}", t.backtrace());
+                }
+            }
+            panic!("Deadlock detected");
+        }
+    });
 
     let s3server = S3Server::new(
         CONFIG.frontend.s3_frontend.clone(),
         io_handler.clone(),
+        permission_manager.clone(),
         node_addr.node_id,
-        Ulid::from_string(&CONFIG.general.realm_id)?,
+        realm_ulid,
     )
     .await?;
 
-    let controller = Arc::new(Controller::<LmdbStore>::new(io_handler));
+    let controller = Arc::new(Controller::<LmdbStore>::new(io_handler, permission_manager));
     let rest_handle = tokio::spawn(async move {
         RestServer::run(controller, rest_addr, CONFIG.frontend.openapi_frontend.port).await
     })
@@ -133,33 +176,53 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn _create_dummy_access<St>(store: Arc<St>) -> Result<()>
+async fn create_dummy_access<St>(
+    store: Arc<St>,
+    realm_id: Ulid,
+    manager: Arc<RwLock<PermissionManager>>,
+) -> Result<()>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    // Just put a dummy user with default credentials into the store
-    let store_clone = store.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut write_txn = store_clone.create_txn(true)?;
+    // Create a dummy user with some permissions and credentials
+    let user_id = Ulid::from_string("01JWB4X5TY0K776QDDCHGK3KT2")?;
+    let group_id = Ulid::from_string("01JWB4XFCRJX53Q839QMHPGSXH")?;
 
-        let access_info = UserAccess {
-            user_id: Ulid::from_string("01JWB4X5TY0K776QDDCHGK3KT2")?,
-            group_id: Ulid::from_string("01JWB4XFCRJX53Q839QMHPGSXH")?,
-            secret: "PT97PKZjFdtj59umdqHuU54rTauknd".to_string(),
-        };
+    let mut write_txn = store.create_txn(true)?;
+    manager
+        .write()
+        .create_group(group_id, user_id, realm_id, store.as_ref(), &mut write_txn)
+        .await?;
+    manager
+        .write()
+        .add_user(group_id, user_id, "admin", store.as_ref(), &mut write_txn)
+        .await?;
 
-        // Store object info with blake3 hash as key
-        store_clone.put(
-            &mut write_txn,
-            ACCESS_DB_NAME,
-            access_info.user_id.to_string().as_bytes(), // Currently user id
-            &bincode::serde::encode_to_vec(access_info, bincode::config::standard())?,
-        )?;
-        
-        store_clone.commit(write_txn)?;
+    let access_info = UserAccess {
+        user_id,
+        group_id,
+        secret: "PT97PKZjFdtj59umdqHuU54rTauknd".to_string(),
+    };
+    store.put(
+        &mut write_txn,
+        ACCESS_DB_NAME,
+        &xor_ulids(&user_id, &group_id),
+        &bincode::serde::encode_to_vec(access_info, bincode::config::standard())?,
+    )?;
 
-        Ok::<(), anyhow::Error>(())
-    });
+    let access_info = UserAccess {
+        user_id,
+        group_id: Ulid::from_string("01JWX8CR80KRHW5XFVKHPJ6Z5D")?, // Other group
+        secret: "gSVpgA2sFFPv06yiS87kEhKGe8IL02".to_string(),
+    };
+    store.put(
+        &mut write_txn,
+        ACCESS_DB_NAME,
+        &xor_ulids(&user_id, &access_info.group_id),
+        &bincode::serde::encode_to_vec(access_info, bincode::config::standard())?,
+    )?;
+
+    store.commit(write_txn)?;
 
     Ok(())
 }
