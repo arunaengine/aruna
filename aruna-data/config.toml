@@ -6,7 +6,7 @@ node_key = "358ea489d2f7d91466eff6edbb7d69b507346dc199d963915138865c03ffe1db"
 path = "/tmp/node1/heed"
 
 [backend]
-backend_type = "S3" # "FS", "PSQL", "HTTP", "Memory", ...
+backend_type = "S3" #"Postgres", "FS", "HTTP", "Memory", ...
 encryption = false
 compression = false
 deduplication = false
@@ -26,11 +26,19 @@ secret_access_key = "minioadmin"
 
 # PostgreSQL example config
 #[backend.access]
-#root = /aruna
-#connection_string = "postgres://postgres@localhost:5432/test"
-#table = "objects"
-#key_field = ""
-#value_field = ""
+#connection_string = "postgres://postgres:mysecretpassword@localhost:5432/test"
+#table = "aruna"
+#key_field = "path"
+#value_field = "data"
+
+# Http read-only example config
+#[backend.access]
+#endpoint = "https://zenodo.org"
+#root = "records"
+
+# In memory example config
+#[backend.access]
+#root = "/aruna"
 
 [frontend.openapi_frontend]
 address = "0.0.0.0"
