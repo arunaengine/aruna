@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::PathBuilder;
 use aruna_storage::storage::store::Store;
+use parking_lot::RwLock;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::path::S3Path;
@@ -21,11 +22,13 @@ pub struct UserAccess {
     //filter
 }
 
+#[derive(Clone)]
 pub struct AuthProvider<St>
 where
     for<'a> St: Store<'a>,
 {
     pub(crate) store: Arc<St>,
+    pub(crate) permission_manager: Arc<RwLock<PermissionManager>>,
     pub(crate) realm_id: Ulid,
 }
 
@@ -86,11 +89,9 @@ where
         .build()
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
-        let manager = PermissionManager::new()
-            .await
-            .map_err(|e| s3_error!(UnauthorizedAccess, "{}", e))?;
-
-        let allowed = manager
+        let allowed = self
+            .permission_manager
+            .write()
             .enforcer
             .enforce(
                 &user_access.user_id.to_string(),
@@ -101,7 +102,10 @@ where
         debug!("{} allowed: {}", cx.s3_op().name(), allowed);
 
         match allowed {
-            true => Ok(()),
+            true => {
+                cx.extensions_mut().insert(user_access);
+                Ok(())
+            }
             false => Err(s3_error!(UnauthorizedAccess, "Permission denied")),
         }
     }

@@ -1,4 +1,5 @@
 use crate::api_json::request::{Request, User};
+use crate::api_json::util::xor_ulids;
 use crate::api_s3::auth::UserAccess;
 use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
@@ -68,7 +69,7 @@ where
             store_clone.put(
                 &mut write_txn,
                 ACCESS_DB_NAME,
-                user.id.to_string().as_bytes(),
+                &xor_ulids(&user.id, &user.group),
                 &bincode::serde::encode_to_vec(access_info_clone, bincode::config::standard())?,
             )?;
 
@@ -122,7 +123,7 @@ where
         };
 
         //TODO: Fetch
-        
+
         Ok(GetS3CredentialsResponse {
             access_key_id: "TODO".to_string(),
             secret_access_key: "TODO".to_string(),

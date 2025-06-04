@@ -1,13 +1,4 @@
 use aruna_permission::manager::Action;
-use s3s::{S3Error, S3Request, s3_error};
-
-pub fn extract_access_key<T>(req: &S3Request<T>) -> Result<String, S3Error> {
-    if let Some(access_key) = &req.credentials {
-        Ok(access_key.access_key.clone())
-    } else {
-        Err(s3_error!(UnauthorizedAccess, "Credentials missing"))
-    }
-}
 
 pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
     match operation_name {

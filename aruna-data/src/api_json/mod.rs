@@ -3,4 +3,4 @@ mod paths;
 pub mod request;
 mod requests;
 pub mod server;
-mod util;
+pub mod util;
