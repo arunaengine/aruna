@@ -2,6 +2,31 @@ use casbin::error::AdapterError;
 use thiserror::Error;
 use tracing::error;
 
+/// Custom error type for path operations.
+#[derive(Error, Debug)]
+pub enum PathError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid ULID: {0}")]
+    InvalidUlid(#[from] ulid::DecodeError),
+
+    #[error("Invalid Blake3 hash: {0}")]
+    InvalidHash(String),
+
+    #[error("Invalid base64: {0}")]
+    InvalidBase64(#[from] base64::DecodeError),
+
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+
+    #[error("Building error: {0}")]
+    BuildError(String),
+
+    #[error("Invalid assumption: {0}")]
+    InvalidAssumption(String),
+}
+
 #[derive(Error, Debug)]
 pub enum ArunaPermissionHandlerError {
     #[error("Failed to convert permission: {0}")]
@@ -32,7 +57,7 @@ pub enum PermissionError {
     #[error("Casbin error: {0}")]
     CasbinError(#[from] casbin::Error),
     #[error("Path error: {0}")]
-    PathError(#[from] crate::paths::PathError),
+    PathError(#[from] PathError),
     #[error("Postcard error: {0}")]
     PostcardError(#[from] postcard::Error),
     #[error("Aruna permission handler error: {0}")]

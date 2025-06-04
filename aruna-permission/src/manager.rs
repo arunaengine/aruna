@@ -1,14 +1,42 @@
 use aruna_storage::storage::store::Store;
 use blake3::Hash as Blake3Hash;
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::fmt::Display;
+use std::sync::Arc;
 use ulid::Ulid;
 
 use crate::casbin::DBNAME;
 use crate::casbin_helper::{CasbinPolicy, CasbinRole};
-use crate::error::{PermissionError, Result};
+use crate::error::{PathError, PermissionError, Result};
 use crate::{casbin::Enforcer, paths::Path};
 
+// Database constants
 pub const RESOURCE_DB: &str = "resources";
+pub const OIDC_IDENTITIES_DB: &str = "oidc_identities";
+pub const IDENTITY_PERMISSIONS_DB: &str = "identity_permissions";
+
+/// User identity consisting of user ULID and realm ULID
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UserIdentity {
+    pub user_ulid: Ulid,
+    pub realm_ulid: Ulid,
+}
+
+impl UserIdentity {
+    pub fn new(user_ulid: Ulid, realm_ulid: Ulid) -> Self {
+        Self {
+            user_ulid,
+            realm_ulid,
+        }
+    }
+}
+
+impl Display for UserIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.user_ulid, self.realm_ulid)
+    }
+}
 
 /// Resource identifier that can be either a ULID or Blake3 hash
 #[derive(Debug, Clone, PartialEq)]
@@ -70,25 +98,106 @@ pub struct AddPolicyPrepare {
 }
 
 /// Higher-level permission manager that builds on top of the base Enforcer
+#[derive(Clone)]
 pub struct PermissionManager {
-    pub enforcer: Enforcer,
+    pub enforcer: Arc<RwLock<Enforcer>>,
 }
 
 impl PermissionManager {
     pub async fn new() -> Result<Self> {
         let enforcer = Enforcer::new().await?;
-        Ok(Self { enforcer })
+        Ok(Self {
+            enforcer: Arc::new(RwLock::new(enforcer)),
+        })
+    }
+
+    /// Resolve user identity to permission ULID
+    fn resolve_permission_ulid<'a, S: Store<'a> + 'static>(
+        &self,
+        user_identity: &UserIdentity,
+        store: &'a S,
+        txn: &<S as Store<'a>>::Txn,
+    ) -> Result<Ulid> {
+        // Serialize UserIdentity for storage key
+        let key = postcard::to_allocvec(user_identity)?;
+
+        if let Some(permission_bytes) = store
+            .get(txn, IDENTITY_PERMISSIONS_DB, &key)
+            .map_err(|e| PermissionError::StorageError(e))?
+        {
+            let permission_ulid: Ulid = postcard::from_bytes(&permission_bytes)?;
+            Ok(permission_ulid)
+        } else {
+            // If no permission mapping exists, create one using the user's ULID
+            // This maintains backward compatibility for existing users
+            Ok(user_identity.user_ulid)
+        }
+    }
+
+    /// Add OIDC identity mapping
+    pub fn add_oidc_identity<'a, S: Store<'a> + 'static>(
+        &self,
+        oidc_provider: &str,
+        oidc_sub: &str,
+        user_ulid: Ulid,
+        store: &'a S,
+        txn: &mut <S as Store<'a>>::Txn,
+    ) -> Result<()> {
+        let key = format!("{}:{}", oidc_provider, oidc_sub);
+        let value = postcard::to_allocvec(&user_ulid)?;
+
+        store.put(txn, OIDC_IDENTITIES_DB, key.as_bytes(), &value)?;
+        Ok(())
+    }
+
+    /// Lookup user ULID from OIDC identity
+    pub fn get_user_from_oidc<'a, S: Store<'a> + 'static>(
+        &self,
+        oidc_provider: &str,
+        oidc_sub: &str,
+        store: &'a S,
+        txn: &'a <S as Store<'a>>::Txn,
+    ) -> Result<Option<Ulid>> {
+        let key = format!("{}:{}", oidc_provider, oidc_sub);
+
+        if let Some(user_bytes) = store
+            .get(txn, OIDC_IDENTITIES_DB, key.as_bytes())
+            .map_err(|e| PermissionError::StorageError(e))?
+        {
+            let user_ulid: Ulid = postcard::from_bytes(&user_bytes)?;
+            Ok(Some(user_ulid))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Add identity to permission mapping
+    pub fn add_identity_permission<'a, S: Store<'a> + 'static>(
+        &self,
+        user_identity: &UserIdentity,
+        permission_ulid: Ulid,
+        store: &'a S,
+        txn: &mut <S as Store<'a>>::Txn,
+    ) -> Result<()> {
+        let key = postcard::to_allocvec(user_identity)?;
+        let value = postcard::to_allocvec(&permission_ulid)?;
+
+        store.put(txn, IDENTITY_PERMISSIONS_DB, &key, &value)?;
+        Ok(())
     }
 
     /// Check if a user has permission to access a resource
     pub fn check_permission<'a, S: Store<'a> + 'static>(
         &self,
+        user_identity: &UserIdentity,
         resource_id: ResourceId,
-        user_id: Ulid,
         action: Action,
         store: &'a S,
         txn: &'a <S as Store<'a>>::Txn,
     ) -> Result<Path> {
+        // Resolve user identity to permission ULID
+        let permission_ulid = self.resolve_permission_ulid(user_identity, store, txn)?;
+
         // Retrieve path from resource mapping
         let key = resource_id.to_string();
         let path_bytes = store
@@ -98,10 +207,15 @@ impl PermissionManager {
 
         let path = Path::try_from(path_bytes.as_ref())?;
 
-        // Check permission
-        let allowed =
-            self.enforcer
-                .enforce(&user_id.to_string(), &path.to_string(), &action.to_string())?;
+        // Check permission using the enforcer (read lock)
+        let allowed = {
+            let enforcer = self.enforcer.read();
+            enforcer.enforce(
+                &permission_ulid.to_string(),
+                &path.to_string(),
+                &action.to_string(),
+            )?
+        };
 
         if allowed {
             Ok(path)
@@ -112,13 +226,16 @@ impl PermissionManager {
 
     /// Prepare to create a new group with default admin and member roles
     pub fn create_group_prepare<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         group_id: Ulid,
-        initial_user_id: Ulid,
+        initial_user: &UserIdentity,
         realm_id: Ulid,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<CreateGroupPrepare> {
+        // Resolve user identity to permission ULID
+        let permission_ulid = self.resolve_permission_ulid(initial_user, store, txn)?;
+
         let admin_role = format!("{}_admin", group_id);
         let member_role = format!("{}_member", group_id);
 
@@ -162,7 +279,7 @@ impl PermissionManager {
             &[],
         )?;
 
-        let member_role_mapping = vec![initial_user_id.to_string(), admin_role];
+        let member_role_mapping = vec![permission_ulid.to_string(), admin_role];
 
         store.put(
             txn,
@@ -181,13 +298,15 @@ impl PermissionManager {
     }
 
     /// Commit a group creation operation
-    pub async fn create_group_commit(&mut self, request: CreateGroupPrepare) -> Result<()> {
+    pub async fn create_group_commit(&self, request: CreateGroupPrepare) -> Result<()> {
+        let mut enforcer = self.enforcer.write();
+
         for policy in request.policy {
-            self.enforcer.add_policy(policy).await?;
+            enforcer.add_policy(policy).await?;
         }
 
         for role in request.role {
-            self.enforcer.add_role(role).await?;
+            enforcer.add_role(role).await?;
         }
 
         Ok(())
@@ -195,17 +314,24 @@ impl PermissionManager {
 
     /// Prepare to add a user to a group role
     pub fn add_user_prepare<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         group_id: Ulid,
-        user_id: Ulid,
+        user_identity: &UserIdentity,
         role_name: &str,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<AddUserPrepare> {
+        // Resolve user identity to permission ULID
+        let permission_ulid = self.resolve_permission_ulid(user_identity, store, txn)?;
+
         let full_role = format!("{}_{}", group_id, role_name);
 
         // Check if role exists by checking if it has any policies
-        let policies = self.enforcer.get_policies();
+        let policies = {
+            let enforcer = self.enforcer.read();
+            enforcer.get_policies()
+        };
+
         let role_exists = policies
             .iter()
             .filter_map(|p| p.get(0))
@@ -215,7 +341,7 @@ impl PermissionManager {
             return Err(PermissionError::RoleNotFound(full_role));
         }
 
-        let role_mapping = vec![user_id.to_string(), full_role];
+        let role_mapping = vec![permission_ulid.to_string(), full_role];
 
         store.put(
             txn,
@@ -230,22 +356,26 @@ impl PermissionManager {
     }
 
     /// Commit adding a user to a role
-    pub async fn add_user_commit(&mut self, request: AddUserPrepare) -> Result<()> {
-        self.enforcer.add_role(request.role).await?;
+    pub async fn add_user_commit(&self, request: AddUserPrepare) -> Result<()> {
+        let mut enforcer = self.enforcer.write();
+        enforcer.add_role(request.role).await?;
         Ok(())
     }
 
     /// Prepare to remove a role from a user
     pub fn remove_role_from_user_prepare<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         group_id: Ulid,
-        user_id: Ulid,
+        user_identity: &UserIdentity,
         role_name: &str,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<RemoveRolePrepare> {
+        // Resolve user identity to permission ULID
+        let permission_ulid = self.resolve_permission_ulid(user_identity, store, txn)?;
+
         let full_role = format!("{}_{}", group_id, role_name);
-        let role_mapping = vec![user_id.to_string(), full_role];
+        let role_mapping = vec![permission_ulid.to_string(), full_role];
 
         store.remove(
             txn,
@@ -259,14 +389,15 @@ impl PermissionManager {
     }
 
     /// Commit removing a role from a user
-    pub async fn remove_role_from_user_commit(&mut self, request: RemoveRolePrepare) -> Result<()> {
-        self.enforcer.remove_role(request.role).await?;
+    pub async fn remove_role_from_user_commit(&self, request: RemoveRolePrepare) -> Result<()> {
+        let mut enforcer = self.enforcer.write();
+        enforcer.remove_role(request.role).await?;
         Ok(())
     }
 
     /// Prepare to add a policy to a role
     pub fn add_policy_to_role_prepare<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         group_id: Ulid,
         role_name: &str,
         path: &Path,
@@ -298,19 +429,26 @@ impl PermissionManager {
     }
 
     /// Commit adding a policy to a role
-    pub async fn add_policy_to_role_commit(&mut self, request: AddPolicyPrepare) -> Result<()> {
-        self.enforcer.add_policy(request.policy).await?;
+    pub async fn add_policy_to_role_commit(&self, request: AddPolicyPrepare) -> Result<()> {
+        let mut enforcer = self.enforcer.write();
+        enforcer.add_policy(request.policy).await?;
         Ok(())
     }
 
     /// Add a resource mapping from ID to path
     pub fn add_resource<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         resource_id: ResourceId,
         path: &Path,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<()> {
+        if path.has_wildcards() {
+            return Err(PermissionError::PathError(PathError::InvalidAssumption(
+                "Resource paths should not contain wildcards".to_string(),
+            )));
+        }
+
         let key = resource_id.to_string();
         let path_bytes: Vec<u8> = path.into();
 
@@ -321,7 +459,7 @@ impl PermissionManager {
 
     /// Remove a resource mapping
     pub fn remove_resource<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         resource_id: ResourceId,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
@@ -333,47 +471,47 @@ impl PermissionManager {
 
     /// Convenience method: Create group with both prepare and commit
     pub async fn create_group<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         group_id: Ulid,
-        initial_user_id: Ulid,
+        initial_user: &UserIdentity,
         realm_id: Ulid,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<()> {
-        let prepare = self.create_group_prepare(group_id, initial_user_id, realm_id, store, txn)?;
+        let prepare = self.create_group_prepare(group_id, initial_user, realm_id, store, txn)?;
         self.create_group_commit(prepare).await
     }
 
     /// Convenience method: Add user with both prepare and commit
     pub async fn add_user<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         group_id: Ulid,
-        user_id: Ulid,
+        user_identity: &UserIdentity,
         role_name: &str,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<()> {
-        let prepare = self.add_user_prepare(group_id, user_id, role_name, store, txn)?;
+        let prepare = self.add_user_prepare(group_id, user_identity, role_name, store, txn)?;
         self.add_user_commit(prepare).await
     }
 
     /// Convenience method: Remove role from user with both prepare and commit
     pub async fn remove_role_from_user<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         group_id: Ulid,
-        user_id: Ulid,
+        user_identity: &UserIdentity,
         role_name: &str,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<()> {
         let prepare =
-            self.remove_role_from_user_prepare(group_id, user_id, role_name, store, txn)?;
+            self.remove_role_from_user_prepare(group_id, user_identity, role_name, store, txn)?;
         self.remove_role_from_user_commit(prepare).await
     }
 
     /// Convenience method: Add policy to role with both prepare and commit
     pub async fn add_policy_to_role<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         group_id: Ulid,
         role_name: &str,
         path: &Path,
@@ -390,7 +528,10 @@ impl PermissionManager {
     /// Get all roles for a group
     pub fn get_group_roles(&self, group_id: Ulid) -> Vec<String> {
         let prefix = format!("{}_", group_id);
-        let policies = self.enforcer.get_policies();
+        let policies = {
+            let enforcer = self.enforcer.read();
+            enforcer.get_policies()
+        };
 
         policies
             .iter()
@@ -402,17 +543,19 @@ impl PermissionManager {
             .collect()
     }
 
-    /// Get all users in a group role
+    /// Get all users in a group role (returns permission ULIDs)
     pub fn get_role_users(&self, group_id: Ulid, role_name: &str) -> Vec<String> {
         let full_role = format!("{}_{}", group_id, role_name);
-        self.enforcer.get_users_for_role(&full_role)
+        let enforcer = self.enforcer.read();
+        enforcer.get_users_for_role(&full_role)
     }
 
     /// Get all policies for a role
     pub fn get_role_policies(&self, group_id: Ulid, role_name: &str) -> Vec<Vec<String>> {
         let full_role = format!("{}_{}", group_id, role_name);
+        let enforcer = self.enforcer.read();
 
-        self.enforcer
+        enforcer
             .get_policies()
             .into_iter()
             .filter_map(|p| {
@@ -427,11 +570,12 @@ impl PermissionManager {
 
     /// Load existing policies from storage
     pub async fn load_policies<'a, S: Store<'a> + 'static>(
-        &mut self,
+        &self,
         store: &'a S,
         txn: &'a <S as Store<'a>>::Txn,
     ) -> Result<()> {
-        self.enforcer.load_policy(store, txn).await?;
+        let mut enforcer = self.enforcer.write();
+        enforcer.load_policy(store, txn).await?;
         Ok(())
     }
 }
@@ -439,43 +583,213 @@ impl PermissionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::casbin::DBNAME;
-    use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
+    use aruna_storage::storage::{
+        lmdb::{LmdbConfig, LmdbStore},
+        store::Store,
+    };
+    use ulid::Ulid;
 
-    async fn setup_test_store() -> (LmdbStore, String) {
-        let test_id = ulid::Ulid::new().to_string();
-        let test_dir = format!("/dev/shm/test_mgr_{}", test_id);
+    pub async fn setup_test_store() -> (LmdbStore, String) {
+        let test_id = Ulid::new().to_string();
+        let test_dir = format!("/dev/shm/test_perm_{}", test_id);
         std::fs::create_dir_all(&test_dir).unwrap();
 
         let config = LmdbConfig {
             path: test_dir.clone(),
-            databases: vec![DBNAME, RESOURCE_DB],
+            databases: vec![
+                crate::DBNAME,
+                crate::RESOURCE_DB,
+                crate::OIDC_IDENTITIES_DB,
+                crate::IDENTITY_PERMISSIONS_DB,
+            ],
         };
 
         let store = LmdbStore::new(config).unwrap();
         (store, test_dir)
     }
 
-    fn cleanup_test_dir(path: &str) {
+    pub fn cleanup_test_dir(path: &str) {
         std::fs::remove_dir_all(path).unwrap_or(());
     }
 
+    pub fn create_test_ulid(suffix: u8) -> Ulid {
+        let mut bytes = [0u8; 16];
+        bytes[15] = suffix;
+        Ulid::from_bytes(bytes)
+    }
+
     #[tokio::test]
-    async fn test_create_group_prepare_commit() {
+    async fn test_oidc_identity_management() {
         let (store, test_dir) = setup_test_store().await;
         let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
+        let manager = PermissionManager::new().await.unwrap();
 
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
+        let user_ulid = create_test_ulid(1);
+        let provider = "google";
+        let sub = "user123@example.com";
+
+        // Test adding OIDC identity
+        manager
+            .add_oidc_identity(provider, sub, user_ulid, &store, &mut txn)
+            .unwrap();
+
+        // Test retrieving OIDC identity
+        let found_user = manager
+            .get_user_from_oidc(provider, sub, &store, &txn)
+            .unwrap();
+        assert_eq!(found_user, Some(user_ulid));
+
+        // Test non-existent OIDC identity
+        let not_found = manager
+            .get_user_from_oidc("github", "unknown", &store, &txn)
+            .unwrap();
+        assert_eq!(not_found, None);
+
+        txn.commit().unwrap();
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_identity_permission_mapping() {
+        let (store, test_dir) = setup_test_store().await;
+        let mut txn = store.create_txn(true).unwrap();
+        let manager = PermissionManager::new().await.unwrap();
+
+        let realm_id = create_test_ulid(10);
+        let user_ulid = create_test_ulid(1);
+        let permission_ulid = create_test_ulid(100);
+
+        let user_identity = UserIdentity::new(user_ulid, realm_id);
+
+        // Test adding identity permission mapping
+        manager
+            .add_identity_permission(&user_identity, permission_ulid, &store, &mut txn)
+            .unwrap();
+
+        // Test resolving permission ULID (internal method)
+        let resolved = manager
+            .resolve_permission_ulid(&user_identity, &store, &txn)
+            .unwrap();
+        assert_eq!(resolved, permission_ulid);
+
+        // Test fallback to user ULID when no mapping exists
+        let other_user = UserIdentity::new(create_test_ulid(2), realm_id);
+        let fallback = manager
+            .resolve_permission_ulid(&other_user, &store, &txn)
+            .unwrap();
+        assert_eq!(fallback, other_user.user_ulid);
+
+        txn.commit().unwrap();
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_create_group_with_user_identity() {
+        let (store, test_dir) = setup_test_store().await;
+        let mut txn = store.create_txn(true).unwrap();
+        let manager = PermissionManager::new().await.unwrap();
+
+        let realm_id = create_test_ulid(10);
+        let group_id = create_test_ulid(20);
+        let admin_user_ulid = create_test_ulid(1);
+
+        let admin_identity = UserIdentity::new(admin_user_ulid, realm_id);
+
+        // Test group creation with UserIdentity
+        manager
+            .create_group(group_id, &admin_identity, realm_id, &store, &mut txn)
+            .await
+            .unwrap();
+
+        // Verify group roles were created
+        let roles = manager.get_group_roles(group_id);
+        assert!(roles.contains(&"admin".to_string()));
+        assert!(roles.contains(&"member".to_string()));
+
+        // Verify admin user has admin role (should be their permission ULID)
+        let admins = manager.get_role_users(group_id, "admin");
+        let expected_permission_ulid = manager
+            .resolve_permission_ulid(&admin_identity, &store, &txn)
+            .unwrap();
+        assert!(admins.contains(&expected_permission_ulid.to_string()));
+
+        txn.commit().unwrap();
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_permission_checking_with_identity() {
+        let (store, test_dir) = setup_test_store().await;
+        let mut txn = store.create_txn(true).unwrap();
+        let manager = PermissionManager::new().await.unwrap();
+
+        let realm_id = create_test_ulid(10);
+        let group_id = create_test_ulid(20);
+        let admin_identity = UserIdentity::new(create_test_ulid(1), realm_id);
+        let resource_id = create_test_ulid(30);
+
+        // Create group and add resource
+        manager
+            .create_group(group_id, &admin_identity, realm_id, &store, &mut txn)
+            .await
+            .unwrap();
+
+        let resource_path = Path::builder()
+            .realm_id(realm_id)
+            .group_metadata(group_id, resource_id, vec![])
+            .build()
+            .unwrap();
+
+        manager
+            .add_resource(
+                ResourceId::Ulid(resource_id),
+                &resource_path,
+                &store,
+                &mut txn,
+            )
+            .unwrap();
+
+        // Test permission check
+        let result = manager.check_permission(
+            &admin_identity,
+            ResourceId::Ulid(resource_id),
+            Action::Write,
+            &store,
+            &txn,
+        );
+        assert!(result.is_ok());
+
+        // Test with non-member user
+        let outsider = UserIdentity::new(create_test_ulid(99), realm_id);
+        let result = manager.check_permission(
+            &outsider,
+            ResourceId::Ulid(resource_id),
+            Action::Write,
+            &store,
+            &txn,
+        );
+        assert!(matches!(result, Err(PermissionError::PermissionDenied)));
+
+        txn.commit().unwrap();
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_commit_workflow() {
+        let (store, test_dir) = setup_test_store().await;
+        let mut txn = store.create_txn(true).unwrap();
+        let manager = PermissionManager::new().await.unwrap();
+
+        let realm_id = create_test_ulid(10);
+        let group_id = create_test_ulid(20);
+        let admin_identity = UserIdentity::new(create_test_ulid(1), realm_id);
 
         // Test prepare phase
         let prepare = manager
-            .create_group_prepare(group_id, admin_user, realm_id, &store, &mut txn)
+            .create_group_prepare(group_id, &admin_identity, realm_id, &store, &mut txn)
             .unwrap();
 
-        // Verify storage was updated but Casbin enforcer wasn't yet
+        // Verify Casbin enforcer not updated yet
         assert!(manager.get_group_roles(group_id).is_empty());
 
         // Test commit phase
@@ -486,477 +800,63 @@ mod tests {
         assert!(roles.contains(&"admin".to_string()));
         assert!(roles.contains(&"member".to_string()));
 
-        let admins = manager.get_role_users(group_id, "admin");
-        assert!(admins.contains(&admin_user.to_string()));
-
         txn.commit().unwrap();
         cleanup_test_dir(&test_dir);
     }
 
     #[tokio::test]
-    async fn test_add_user_prepare_commit() {
+    async fn test_user_identity_serialization() {
+        let realm_id = create_test_ulid(10);
+        let user_ulid = create_test_ulid(1);
+        let identity = UserIdentity::new(user_ulid, realm_id);
+
+        // Test postcard serialization (used for storage keys)
+        let serialized = postcard::to_allocvec(&identity).unwrap();
+        let deserialized: UserIdentity = postcard::from_bytes(&serialized).unwrap();
+
+        assert_eq!(identity, deserialized);
+        assert_eq!(identity.user_ulid, deserialized.user_ulid);
+        assert_eq!(identity.realm_ulid, deserialized.realm_ulid);
+    }
+
+    #[tokio::test]
+    async fn test_error_handling() {
         let (store, test_dir) = setup_test_store().await;
         let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
+        let manager = PermissionManager::new().await.unwrap();
 
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-        let member_user = Ulid::new();
+        let realm_id = create_test_ulid(10);
+        let group_id = create_test_ulid(20);
+        let admin_identity = UserIdentity::new(create_test_ulid(1), realm_id);
+        let user_identity = UserIdentity::new(create_test_ulid(2), realm_id);
 
         // Create group first
         manager
-            .create_group(group_id, admin_user, realm_id, &store, &mut txn)
-            .await
-            .unwrap();
-
-        // Test prepare phase for adding member
-        let prepare = manager
-            .add_user_prepare(group_id, member_user, "member", &store, &mut txn)
-            .unwrap();
-
-        // Verify user not yet in role in Casbin
-        let members_before = manager.get_role_users(group_id, "member");
-        assert!(!members_before.contains(&member_user.to_string()));
-
-        // Test commit phase
-        manager.add_user_commit(prepare).await.unwrap();
-
-        // Verify user is now in role
-        let members_after = manager.get_role_users(group_id, "member");
-        assert!(members_after.contains(&member_user.to_string()));
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_add_user_prepare_invalid_role() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-        let member_user = Ulid::new();
-
-        // Create group first
-        manager
-            .create_group(group_id, admin_user, realm_id, &store, &mut txn)
-            .await
-            .unwrap();
-
-        // Test prepare phase with invalid role
-        let result =
-            manager.add_user_prepare(group_id, member_user, "nonexistent", &store, &mut txn);
-
-        assert!(matches!(result, Err(PermissionError::RoleNotFound(_))));
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_remove_role_prepare_commit() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-        let member_user = Ulid::new();
-
-        // Create group and add member
-        manager
-            .create_group(group_id, admin_user, realm_id, &store, &mut txn)
-            .await
-            .unwrap();
-        manager
-            .add_user(group_id, member_user, "member", &store, &mut txn)
-            .await
-            .unwrap();
-
-        // Verify member is in role
-        let members_before = manager.get_role_users(group_id, "member");
-        assert!(members_before.contains(&member_user.to_string()));
-
-        // Test prepare phase for removing role
-        let prepare = manager
-            .remove_role_from_user_prepare(group_id, member_user, "member", &store, &mut txn)
-            .unwrap();
-
-        // Member should still be in role in Casbin before commit
-        let members_middle = manager.get_role_users(group_id, "member");
-        assert!(members_middle.contains(&member_user.to_string()));
-
-        // Test commit phase
-        manager.remove_role_from_user_commit(prepare).await.unwrap();
-
-        // Verify member is no longer in role
-        let members_after = manager.get_role_users(group_id, "member");
-        assert!(!members_after.contains(&member_user.to_string()));
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_add_policy_prepare_commit() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-
-        // Create group first
-        manager
-            .create_group(group_id, admin_user, realm_id, &store, &mut txn)
-            .await
-            .unwrap();
-
-        // Create a custom path for testing
-        let custom_path = Path::builder()
-            .realm_id(realm_id)
-            .group_metadata_wildcard(group_id)
-            .build()
-            .unwrap();
-
-        // Test prepare phase for adding policy
-        let prepare = manager
-            .add_policy_to_role_prepare(
-                group_id,
-                "custom_role",
-                &custom_path,
-                "read",
-                Some("allow"),
-                &store,
-                &mut txn,
-            )
-            .unwrap();
-
-        // Policy should not be in Casbin yet
-        let policies_before = manager.get_role_policies(group_id, "custom_role");
-        assert!(policies_before.is_empty());
-
-        // Test commit phase
-        manager.add_policy_to_role_commit(prepare).await.unwrap();
-
-        // Policy should now be in Casbin
-        let policies_after = manager.get_role_policies(group_id, "custom_role");
-        assert_eq!(policies_after.len(), 1);
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_add_resource_prepare_commit() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-        let resource_id = Ulid::new();
-
-        // Create group first
-        manager
-            .create_group(group_id, admin_user, realm_id, &store, &mut txn)
-            .await
-            .unwrap();
-
-        let resource_path = Path::builder()
-            .realm_id(realm_id)
-            .group_metadata(group_id, resource_id, vec![])
-            .build()
-            .unwrap();
-
-        // Test prepare phase
-        manager
-            .add_resource(
-                ResourceId::Ulid(resource_id),
-                &resource_path,
-                &store,
-                &mut txn,
-            )
-            .unwrap();
-
-        // Verify resource can be accessed after commit
-        let result = manager.check_permission(
-            ResourceId::Ulid(resource_id),
-            admin_user,
-            Action::Write,
-            &store,
-            &txn,
-        );
-        assert!(result.is_ok());
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_remove_resource_prepare_commit() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-        let resource_id = Ulid::new();
-
-        // Create group and add resource
-        manager
-            .create_group(group_id, admin_user, realm_id, &store, &mut txn)
-            .await
-            .unwrap();
-
-        let resource_path = Path::builder()
-            .realm_id(realm_id)
-            .group_metadata(group_id, resource_id, vec![])
-            .build()
-            .unwrap();
-
-        manager
-            .add_resource(
-                ResourceId::Ulid(resource_id),
-                &resource_path,
-                &store,
-                &mut txn,
-            )
-            .unwrap();
-
-        // Verify resource exists
-        let result_before = manager.check_permission(
-            ResourceId::Ulid(resource_id),
-            admin_user,
-            Action::Write,
-            &store,
-            &txn,
-        );
-        assert!(result_before.is_ok());
-
-        // Test prepare phase
-        manager
-            .remove_resource(ResourceId::Ulid(resource_id), &store, &mut txn)
-            .unwrap();
-
-        txn.commit().unwrap();
-
-        // Verify resource is gone after commit
-        let txn = store.create_txn(false).unwrap();
-        let result_after = manager.check_permission(
-            ResourceId::Ulid(resource_id),
-            admin_user,
-            Action::Write,
-            &store,
-            &txn,
-        );
-        assert!(matches!(
-            result_after,
-            Err(PermissionError::ResourceNotFound(_))
-        ));
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_convenience_methods_still_work() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-        let member_user = Ulid::new();
-
-        // Test convenience method for create_group
-        manager
-            .create_group(group_id, admin_user, realm_id, &store, &mut txn)
-            .await
-            .unwrap();
-
-        // Test convenience method for add_user
-        manager
-            .add_user(group_id, member_user, "member", &store, &mut txn)
-            .await
-            .unwrap();
-
-        // Verify operations worked
-        let roles = manager.get_group_roles(group_id);
-        assert!(roles.contains(&"admin".to_string()));
-        assert!(roles.contains(&"member".to_string()));
-
-        let members = manager.get_role_users(group_id, "member");
-        assert!(members.contains(&member_user.to_string()));
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_complex_prepare_commit_workflow() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-        let editor_user = Ulid::new();
-        let viewer_user = Ulid::new();
-
-        // Prepare multiple operations but don't commit yet
-        let group_prepare = manager
-            .create_group_prepare(group_id, admin_user, realm_id, &store, &mut txn)
-            .unwrap();
-
-        let editor_prepare = manager
-            .add_user_prepare(group_id, editor_user, "member", &store, &mut txn)
-            .unwrap();
-
-        let custom_path = Path::builder()
-            .realm_id(realm_id)
-            .group_metadata_wildcard(group_id)
-            .build()
-            .unwrap();
-
-        let policy_prepare = manager
-            .add_policy_to_role_prepare(
-                group_id,
-                "viewer",
-                &custom_path,
-                "read",
-                Some("allow"),
-                &store,
-                &mut txn,
-            )
-            .unwrap();
-
-        // At this point, storage is updated but Casbin enforcer is not
-        assert!(manager.get_group_roles(group_id).is_empty());
-
-        manager
-            .add_policy_to_role_commit(policy_prepare)
-            .await
-            .unwrap();
-
-        let viewer_prepare = manager
-            .add_user_prepare(group_id, viewer_user, "viewer", &store, &mut txn)
-            .unwrap();
-
-        // Commit all operations
-        manager.create_group_commit(group_prepare).await.unwrap();
-        manager.add_user_commit(editor_prepare).await.unwrap();
-        manager.add_user_commit(viewer_prepare).await.unwrap();
-
-        // Verify all operations took effect
-        let roles = manager.get_group_roles(group_id);
-        assert!(roles.contains(&"admin".to_string()));
-        assert!(roles.contains(&"member".to_string()));
-        assert!(roles.contains(&"viewer".to_string()));
-
-        let members = manager.get_role_users(group_id, "member");
-        assert!(members.contains(&editor_user.to_string()));
-
-        let viewers = manager.get_role_users(group_id, "viewer");
-        assert!(viewers.contains(&viewer_user.to_string()));
-
-        let viewer_policies = manager.get_role_policies(group_id, "viewer");
-        assert_eq!(viewer_policies.len(), 1);
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_batch_operations_with_prepare_commit() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group1_id = Ulid::new();
-        let group2_id = Ulid::new();
-        let admin1 = Ulid::new();
-        let admin2 = Ulid::new();
-        let shared_user = Ulid::new();
-
-        // Prepare multiple group creations
-        let group1_prepare = manager
-            .create_group_prepare(group1_id, admin1, realm_id, &store, &mut txn)
-            .unwrap();
-
-        let group2_prepare = manager
-            .create_group_prepare(group2_id, admin2, realm_id, &store, &mut txn)
-            .unwrap();
-
-        // Prepare adding shared user to both groups
-        let user1_prepare = manager
-            .add_user_prepare(group1_id, shared_user, "member", &store, &mut txn)
-            .unwrap();
-
-        let user2_prepare = manager
-            .add_user_prepare(group2_id, shared_user, "member", &store, &mut txn)
-            .unwrap();
-
-        // Verify nothing is in Casbin yet
-        assert!(manager.get_group_roles(group1_id).is_empty());
-        assert!(manager.get_group_roles(group2_id).is_empty());
-
-        // Commit all operations as a batch
-        manager.create_group_commit(group1_prepare).await.unwrap();
-        manager.create_group_commit(group2_prepare).await.unwrap();
-        manager.add_user_commit(user1_prepare).await.unwrap();
-        manager.add_user_commit(user2_prepare).await.unwrap();
-
-        // Verify all operations succeeded
-        assert!(!manager.get_group_roles(group1_id).is_empty());
-        assert!(!manager.get_group_roles(group2_id).is_empty());
-
-        let group1_members = manager.get_role_users(group1_id, "member");
-        let group2_members = manager.get_role_users(group2_id, "member");
-        assert!(group1_members.contains(&shared_user.to_string()));
-        assert!(group2_members.contains(&shared_user.to_string()));
-
-        txn.commit().unwrap();
-        cleanup_test_dir(&test_dir);
-    }
-
-    #[tokio::test]
-    async fn test_error_handling_in_prepare_operations() {
-        let (store, test_dir) = setup_test_store().await;
-        let mut txn = store.create_txn(true).unwrap();
-        let mut manager = PermissionManager::new().await.unwrap();
-
-        let realm_id = Ulid::new();
-        let group_id = Ulid::new();
-        let admin_user = Ulid::new();
-        let member_user = Ulid::new();
-
-        // First create a group
-        manager
-            .create_group(group_id, admin_user, realm_id, &store, &mut txn)
+            .create_group(group_id, &admin_identity, realm_id, &store, &mut txn)
             .await
             .unwrap();
 
         // Try to add user to non-existent role
-        let result =
-            manager.add_user_prepare(group_id, member_user, "nonexistent_role", &store, &mut txn);
+        let result = manager
+            .add_user(group_id, &user_identity, "nonexistent", &store, &mut txn)
+            .await;
         assert!(matches!(result, Err(PermissionError::RoleNotFound(_))));
 
-        // Verify the error didn't affect existing state
-        let roles = manager.get_group_roles(group_id);
-        assert!(roles.contains(&"admin".to_string()));
-        assert!(roles.contains(&"member".to_string()));
+        // Test resource with wildcards rejected
+        let resource_id = create_test_ulid(30);
+        let wildcard_path = Path::builder()
+            .realm_id(realm_id)
+            .group_wildcard(group_id)
+            .build()
+            .unwrap();
+
+        let result = manager.add_resource(
+            ResourceId::Ulid(resource_id),
+            &wildcard_path,
+            &store,
+            &mut txn,
+        );
+        assert!(matches!(result, Err(PermissionError::PathError(_))));
 
         txn.commit().unwrap();
         cleanup_test_dir(&test_dir);

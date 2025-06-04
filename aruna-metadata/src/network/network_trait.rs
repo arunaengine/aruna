@@ -418,6 +418,7 @@ impl P2PNetwork {
         N: Network,
     {
         let mut recv_stream = self.chandler.receive().await?;
+
         while let Ok(len) = recv_stream.recv_stream.read_u32().await {
             trace!("Got something");
             let mut buf = vec![0; len as usize];
