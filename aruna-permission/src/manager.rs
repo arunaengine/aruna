@@ -291,20 +291,61 @@ impl PermissionManager {
             return Err(PermissionError::from(UnificationError::SelfUnification));
         }
 
-        // Resolve permission ULIDs for both identities (must exist now)
-        let perm_ulid_1 = self
-            .resolve_permission_ulid(identity1, store, txn)
-            .map_err(|_| UnificationError::IdentityNotFound(identity1.to_string()))?;
-        let perm_ulid_2 = self
-            .resolve_permission_ulid(identity2, store, txn)
-            .map_err(|_| {
-                PermissionError::from(UnificationError::IdentityNotFound(identity2.to_string()))
-            })?;
+        // Try to resolve both permission ULIDs
+        let perm_ulid_1_result = self.resolve_permission_ulid(identity1, store, txn);
+        let perm_ulid_2_result = self.resolve_permission_ulid(identity2, store, txn);
 
-        // Check if already unified
-        if perm_ulid_1 == perm_ulid_2 {
-            return Err(PermissionError::from(UnificationError::AlreadyUnified));
+        match (&perm_ulid_1_result, &perm_ulid_2_result) {
+            (Ok(perm_ulid_1), Ok(perm_ulid_2)) => {
+                // Case 3: Both exist - check if already unified, then use complex migration logic
+                if perm_ulid_1 == perm_ulid_2 {
+                    return Err(PermissionError::from(UnificationError::AlreadyUnified));
+                }
+                // Continue with complex migration logic below...
+            }
+            (Ok(perm_ulid_1), Err(_)) => {
+                // Case 1: Only identity1 exists - map identity2 to existing perm_ulid_1
+                self.add_identity_permission(identity2, perm_ulid_1.clone(), store, txn)?;
+                // Return empty migration (no policies/roles to move)
+                return Ok(UnifyIdentitiesPrepare {
+                    policies_to_add: Vec::new(),
+                    roles_to_add: Vec::new(),
+                    policies_to_remove: Vec::new(),
+                    roles_to_remove: Vec::new(),
+                });
+            }
+            (Err(_), Ok(perm_ulid_2)) => {
+                // Case 2: Only identity2 exists - map identity1 to existing perm_ulid_2
+                self.add_identity_permission(identity1, perm_ulid_2.clone(), store, txn)?;
+                // Return empty migration (no policies/roles to move)
+                return Ok(UnifyIdentitiesPrepare {
+                    policies_to_add: Vec::new(),
+                    roles_to_add: Vec::new(),
+                    policies_to_remove: Vec::new(),
+                    roles_to_remove: Vec::new(),
+                });
+            }
+            (Err(_), Err(_)) => {
+                // Case 4: Neither exists - this should be an error
+                return Err(PermissionError::from(UnificationError::IdentityNotFound(
+                    "Neither identity has an existing permission mapping".to_string(),
+                )));
+            }
         }
+
+        // Complex migration logic for Case 3 (both identities exist with different permission ULIDs)
+        let Ok(perm_ulid_1) = perm_ulid_1_result else {
+            // This should never occur due to earlier checks, but handle gracefully
+            return Err(PermissionError::from(UnificationError::IdentityNotFound(
+                "Failed to resolve permission ULID for identity1".to_string(),
+            )));
+        };
+        let Ok(perm_ulid_2) = perm_ulid_2_result else {
+            // This should never occur due to earlier checks, but handle gracefully
+            return Err(PermissionError::from(UnificationError::IdentityNotFound(
+                "Failed to resolve permission ULID for identity2".to_string(),
+            )));
+        };
 
         // Generate new unified permission ULID
         let new_permission_ulid = Ulid::new();
@@ -1011,7 +1052,7 @@ mod tests {
         let result = manager
             .unify_identities(&identity, &nonexistent, &store, &mut txn)
             .await;
-        assert!(result.is_err()); // Should fail because no mapping exists
+        assert!(result.is_ok()); // Should not fail because one mapping exists
 
         txn.commit().unwrap();
         cleanup_test_dir(&test_dir);
