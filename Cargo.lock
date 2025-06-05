@@ -251,6 +251,7 @@ dependencies = [
  "blake3",
  "casbin",
  "ed25519-dalek",
+ "hex",
  "iroh",
  "jsonwebtoken",
  "nom 8.0.0",

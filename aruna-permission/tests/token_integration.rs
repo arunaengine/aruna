@@ -1,3 +1,4 @@
+use aruna_permission::paths::RealmKey;
 use aruna_permission::token::{Ed25519KeyPair, OidcTrustConfig, TokenSystem};
 use aruna_permission::*;
 use aruna_storage::storage::{
@@ -34,7 +35,7 @@ async fn setup_test_systems() -> (
     let store = LmdbStore::new(config).unwrap();
 
     // Create token system for realm A with trusted OIDC issuers
-    let realm_a = create_test_ulid(10);
+    let realm_a = create_test_realm_key(10);
     let oidc_trust_config = OidcTrustConfig::TrustedIssuers(vec![
         "https://accounts.google.com".to_string(),
         "https://github.com/login/oauth".to_string(),
@@ -72,6 +73,12 @@ fn create_test_ulid(suffix: u8) -> Ulid {
     let mut bytes = [0u8; 16];
     bytes[15] = suffix;
     Ulid::from_bytes(bytes)
+}
+
+fn create_test_realm_key(suffix: u8) -> RealmKey {
+    let mut key = [0u8; 32];
+    key[31] = suffix;
+    key
 }
 
 pub async fn setup_test_store() -> (LmdbStore, String) {
@@ -160,20 +167,24 @@ async fn test_clean_separation_workflow() {
         .unwrap();
 
     // Verify both users have access to the shared resource
-    let alice_access = permission_manager.check_permission(
-        &alice_identity,
-        ResourceId::Ulid(resource_id),
-        Action::Write,
-        &store,
-        &txn,
-    );
-    let bob_access = permission_manager.check_permission(
-        &bob_identity,
-        ResourceId::Ulid(resource_id),
-        Action::Write,
-        &store,
-        &txn,
-    );
+    let alice_access = permission_manager
+        .check_permission(
+            &alice_identity,
+            ResourceId::Ulid(resource_id),
+            Action::Write,
+            &store,
+            &txn,
+        )
+        .await;
+    let bob_access = permission_manager
+        .check_permission(
+            &bob_identity,
+            ResourceId::Ulid(resource_id),
+            Action::Write,
+            &store,
+            &txn,
+        )
+        .await;
 
     assert!(alice_access.is_ok());
     assert!(bob_access.is_ok());
@@ -184,8 +195,8 @@ async fn test_clean_separation_workflow() {
 
 #[tokio::test]
 async fn test_cross_realm_token_handling() {
-    let realm_a = create_test_ulid(10);
-    let realm_b = create_test_ulid(11);
+    let realm_a = create_test_realm_key(10);
+    let realm_b = create_test_realm_key(11);
 
     let oidc_trust_config_a =
         OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
@@ -289,6 +300,7 @@ async fn test_cross_realm_token_handling() {
                 &store,
                 &txn
             )
+            .await
             .is_ok()
     );
     assert!(
@@ -300,6 +312,7 @@ async fn test_cross_realm_token_handling() {
                 &store,
                 &txn
             )
+            .await
             .is_ok()
     );
 
@@ -331,7 +344,7 @@ async fn test_cross_realm_token_handling() {
 
 #[tokio::test]
 async fn test_token_identity_extraction() {
-    let realm_ulid = create_test_ulid(10);
+    let realm_ulid = create_test_realm_key(10);
     let oidc_trust_config =
         OidcTrustConfig::TrustedIssuers(vec!["https://login.microsoftonline.com".to_string()]);
     let mut token_system = TokenSystem::new(realm_ulid, oidc_trust_config);
@@ -412,7 +425,7 @@ async fn test_token_identity_extraction() {
 
 #[tokio::test]
 async fn test_typical_usage_pattern() {
-    let realm_ulid = create_test_ulid(10);
+    let realm_ulid = create_test_realm_key(10);
     let oidc_trust_config =
         OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
     let mut token_system = TokenSystem::new(realm_ulid, oidc_trust_config);
@@ -465,13 +478,15 @@ async fn test_typical_usage_pattern() {
         .unwrap();
 
     // 4. Check permissions
-    let access_result = permission_manager.check_permission(
-        &user_identity,
-        ResourceId::Ulid(doc_id),
-        Action::Write,
-        &store,
-        &txn,
-    );
+    let access_result = permission_manager
+        .check_permission(
+            &user_identity,
+            ResourceId::Ulid(doc_id),
+            Action::Write,
+            &store,
+            &txn,
+        )
+        .await;
 
     assert!(access_result.is_ok());
 
@@ -492,7 +507,7 @@ async fn test_typical_usage_pattern() {
     // === Cross-realm scenario ===
 
     // 7. Same user in different realm
-    let other_realm = create_test_ulid(11);
+    let other_realm = create_test_realm_key(11);
     let other_oidc_trust_config =
         OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
     let mut other_token_system = TokenSystem::new(other_realm, other_oidc_trust_config);
@@ -524,7 +539,7 @@ async fn test_typical_usage_pattern() {
 
 #[tokio::test]
 async fn test_oidc_lookup_operations() {
-    let realm_ulid = create_test_ulid(10);
+    let realm_ulid = create_test_realm_key(10);
     let oidc_trust_config = OidcTrustConfig::TrustAll;
     let token_system = TokenSystem::new(realm_ulid, oidc_trust_config);
 
@@ -579,7 +594,7 @@ async fn test_ed25519_key_generation_and_usage() {
     assert!(verifying_pem.contains("BEGIN PUBLIC KEY"));
 
     // Test token generation and validation with Ed25519
-    let realm_ulid = create_test_ulid(1);
+    let realm_ulid = create_test_realm_key(1);
     let user_ulid = create_test_ulid(2);
     let mut token_system = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
 

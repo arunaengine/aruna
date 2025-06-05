@@ -1,3 +1,4 @@
+use aruna_permission::paths::RealmKey;
 use aruna_permission::{Action, Path, PermissionManager, ResourceId, UserIdentity};
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
@@ -34,6 +35,12 @@ pub fn create_test_ulid(suffix: u8) -> Ulid {
     Ulid::from_bytes(bytes)
 }
 
+pub fn create_test_realm_key(suffix: u8) -> RealmKey {
+    let mut key = [0u8; 32];
+    key[31] = suffix;
+    key
+}
+
 #[tokio::test]
 async fn test_complete_oidc_workflow() {
     let (store, test_dir) = setup_test_store().await;
@@ -41,7 +48,7 @@ async fn test_complete_oidc_workflow() {
     let manager = PermissionManager::new().await.unwrap();
 
     // Simulate OIDC login flow
-    let realm_id = Ulid::new();
+    let realm_id = create_test_realm_key(1);
     let oidc_provider = "google";
     let oidc_sub = "user123@example.com";
 
@@ -52,7 +59,6 @@ async fn test_complete_oidc_workflow() {
         .unwrap();
 
     let user_identity = UserIdentity::new(user_ulid, realm_id);
-    println!("✓ User registered: {}", user_identity);
 
     // Step 2: User creates their first group
     let group_id = Ulid::new();
@@ -60,7 +66,6 @@ async fn test_complete_oidc_workflow() {
         .create_group(group_id, &user_identity, realm_id, &store, &mut txn)
         .await
         .unwrap();
-    println!("✓ Group created: {}", group_id);
 
     // Step 3: User adds some resources to their group
     let document_id = Ulid::new();
@@ -78,7 +83,6 @@ async fn test_complete_oidc_workflow() {
             &mut txn,
         )
         .unwrap();
-    println!("✓ Resource added: {}", document_path);
 
     // Step 4: User invites another user to the group
     let invited_user_ulid = Ulid::new();
@@ -100,43 +104,45 @@ async fn test_complete_oidc_workflow() {
         .add_user(group_id, &invited_identity, "member", &store, &mut txn)
         .await
         .unwrap();
-    println!("✓ User invited: {}", invited_identity);
 
     // Step 5: Test permission checking
 
     // Original user should have admin access
-    let admin_result = manager.check_permission(
-        &user_identity,
-        ResourceId::Ulid(document_id),
-        Action::Write,
-        &store,
-        &txn,
-    );
+    let admin_result = manager
+        .check_permission(
+            &user_identity,
+            ResourceId::Ulid(document_id),
+            Action::Write,
+            &store,
+            &txn,
+        )
+        .await;
     assert!(admin_result.is_ok());
-    println!("✓ Admin access confirmed");
 
     // Invited user should have member access
-    let member_result = manager.check_permission(
-        &invited_identity,
-        ResourceId::Ulid(document_id),
-        Action::Write,
-        &store,
-        &txn,
-    );
+    let member_result = manager
+        .check_permission(
+            &invited_identity,
+            ResourceId::Ulid(document_id),
+            Action::Write,
+            &store,
+            &txn,
+        )
+        .await;
     assert!(member_result.is_ok());
-    println!("✓ Member access confirmed");
 
     // Outside user should be denied
     let outsider = UserIdentity::new(Ulid::new(), realm_id);
-    let outsider_result = manager.check_permission(
-        &outsider,
-        ResourceId::Ulid(document_id),
-        Action::Write,
-        &store,
-        &txn,
-    );
+    let outsider_result = manager
+        .check_permission(
+            &outsider,
+            ResourceId::Ulid(document_id),
+            Action::Write,
+            &store,
+            &txn,
+        )
+        .await;
     assert!(outsider_result.is_err());
-    println!("✓ Access control working");
 
     // Step 6: Simulate subsequent login (OIDC lookup)
 
@@ -149,12 +155,11 @@ async fn test_complete_oidc_workflow() {
     // Reconstruct their identity
     let logged_in_identity = UserIdentity::new(found_user.unwrap(), realm_id);
     assert_eq!(logged_in_identity, user_identity);
-    println!("✓ Login flow completed");
 
     // Step 7: Test cross-realm functionality
 
     // Same user joins another realm
-    let other_realm_id = Ulid::new();
+    let other_realm_id = create_test_realm_key(2);
     let cross_realm_identity = UserIdentity::new(user_ulid, other_realm_id);
 
     // Create different permission mapping for other realm
@@ -181,12 +186,8 @@ async fn test_complete_oidc_workflow() {
         .await
         .unwrap();
 
-    println!("✓ Cross-realm functionality working");
-
     txn.commit().unwrap();
     cleanup_test_dir(&test_dir);
-
-    println!("\n🎉 Complete OIDC workflow test passed!");
 }
 
 #[tokio::test]
@@ -195,7 +196,7 @@ async fn test_permission_unification_scenario() {
     let mut txn = store.create_txn(true).unwrap();
     let manager = PermissionManager::new().await.unwrap();
 
-    let realm_id = Ulid::new();
+    let realm_id = create_test_realm_key(1);
     let user_ulid = Ulid::new();
 
     // Scenario: User has multiple OIDC accounts that should be unified
@@ -232,8 +233,6 @@ async fn test_permission_unification_scenario() {
     assert_eq!(github_lookup, Some(user_ulid));
     assert_eq!(microsoft_lookup, Some(user_ulid));
 
-    println!("✓ Permission unification test passed!");
-
     txn.commit().unwrap();
     cleanup_test_dir(&test_dir);
 }
@@ -245,8 +244,8 @@ async fn test_realm_sovereignty() {
     let manager = PermissionManager::new().await.unwrap();
 
     // Two separate realms with their own sovereignty
-    let realm_a = Ulid::new();
-    let realm_b = Ulid::new();
+    let realm_a = create_test_realm_key(1);
+    let realm_b = create_test_realm_key(2);
 
     // Same user ULID in both realms (cross-realm user)
     let user_ulid = Ulid::new();
@@ -321,26 +320,28 @@ async fn test_realm_sovereignty() {
     // Test realm sovereignty: User should only access resources in their respective realms
 
     // Identity A should access Resource A
-    let result_a_a = manager.check_permission(
-        &identity_a,
-        ResourceId::Ulid(resource_a),
-        Action::Write,
-        &store,
-        &txn,
-    );
+    let result_a_a = manager
+        .check_permission(
+            &identity_a,
+            ResourceId::Ulid(resource_a),
+            Action::Write,
+            &store,
+            &txn,
+        )
+        .await;
     assert!(result_a_a.is_ok());
 
     // Identity B should access Resource B
-    let result_b_b = manager.check_permission(
-        &identity_b,
-        ResourceId::Ulid(resource_b),
-        Action::Write,
-        &store,
-        &txn,
-    );
+    let result_b_b = manager
+        .check_permission(
+            &identity_b,
+            ResourceId::Ulid(resource_b),
+            Action::Write,
+            &store,
+            &txn,
+        )
+        .await;
     assert!(result_b_b.is_ok());
-
-    println!("✓ Realm sovereignty maintained");
 
     txn.commit().unwrap();
     cleanup_test_dir(&test_dir);
@@ -354,7 +355,7 @@ async fn test_concurrent_operations() {
     let (store, test_dir) = setup_test_store().await;
     let manager = Arc::new(PermissionManager::new().await.unwrap());
 
-    let realm_id = create_test_ulid(10);
+    let realm_id = create_test_realm_key(10);
     let group_id = create_test_ulid(20);
     let admin_identity = UserIdentity::new(create_test_ulid(1), realm_id);
 
@@ -372,14 +373,14 @@ async fn test_concurrent_operations() {
 
     let task1 = task::spawn(async move {
         for _ in 0..50 {
-            let roles = manager1.get_group_roles(group_id);
+            let roles = manager1.get_group_roles(group_id).await;
             assert!(!roles.is_empty());
         }
     });
 
     let task2 = task::spawn(async move {
         for _ in 0..50 {
-            let roles = manager2.get_group_roles(group_id);
+            let roles = manager2.get_group_roles(group_id).await;
             assert!(!roles.is_empty());
         }
     });
@@ -388,8 +389,6 @@ async fn test_concurrent_operations() {
     let (result1, result2) = tokio::join!(task1, task2);
     result1.unwrap();
     result2.unwrap();
-
-    println!("✓ Concurrent operations test passed!");
 
     cleanup_test_dir(&test_dir);
 }

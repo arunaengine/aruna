@@ -1,30 +1,33 @@
 use aruna_storage::storage::store::Store;
 use blake3::Hash as Blake3Hash;
-use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use ulid::Ulid;
 
 use crate::casbin::DBNAME;
 use crate::casbin_helper::{CasbinPolicy, CasbinRole};
 use crate::error::{PathError, PermissionError, Result, UnificationError};
-use crate::{casbin::Enforcer, paths::Path};
+use crate::{
+    casbin::Enforcer,
+    paths::{Path, RealmKey},
+};
 
 // Database constants
 pub const RESOURCE_DB: &str = "resources";
 pub const OIDC_IDENTITIES_DB: &str = "oidc_identities";
 pub const IDENTITY_PERMISSIONS_DB: &str = "identity_permissions";
 
-/// User identity consisting of user ULID and realm ULID
+/// User identity consisting of user ULID and realm key
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub user_ulid: Ulid,
-    pub realm_ulid: Ulid,
+    pub realm_ulid: RealmKey,
 }
 
 impl UserIdentity {
-    pub fn new(user_ulid: Ulid, realm_ulid: Ulid) -> Self {
+    pub fn new(user_ulid: Ulid, realm_ulid: RealmKey) -> Self {
         Self {
             user_ulid,
             realm_ulid,
@@ -34,7 +37,7 @@ impl UserIdentity {
 
 impl Display for UserIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.user_ulid, self.realm_ulid)
+        write!(f, "{}@{}", self.user_ulid, hex::encode(self.realm_ulid))
     }
 }
 
@@ -203,8 +206,8 @@ impl PermissionManager {
     }
 
     /// Get all roles for a permission ULID
-    fn get_roles_for_permission(&self, permission_ulid: &str) -> Vec<Vec<String>> {
-        let enforcer = self.enforcer.read();
+    async fn get_roles_for_permission(&self, permission_ulid: &str) -> Vec<Vec<String>> {
+        let enforcer = self.enforcer.read().await;
 
         // Get all role assignments where this permission ULID is the subject
         enforcer
@@ -215,8 +218,8 @@ impl PermissionManager {
     }
 
     /// Get all policies for a permission ULID
-    fn get_policies_for_permission(&self, permission_ulid: &str) -> Vec<Vec<String>> {
-        let enforcer = self.enforcer.read();
+    async fn get_policies_for_permission(&self, permission_ulid: &str) -> Vec<Vec<String>> {
+        let enforcer = self.enforcer.read().await;
 
         // Get all policies where this permission ULID is the subject
         enforcer
@@ -279,7 +282,7 @@ impl PermissionManager {
     }
 
     /// Prepare to unify two identities (UPDATED - handles all storage)
-    pub fn unify_identities_prepare<'a, S: Store<'a> + 'static>(
+    pub async fn unify_identities_prepare<'a, S: Store<'a> + 'static>(
         &self,
         identity1: &UserIdentity,
         identity2: &UserIdentity,
@@ -351,10 +354,18 @@ impl PermissionManager {
         let new_permission_ulid = Ulid::new();
 
         // Get all roles and policies for both old permission ULIDs
-        let roles_1 = self.get_roles_for_permission(&perm_ulid_1.to_string());
-        let roles_2 = self.get_roles_for_permission(&perm_ulid_2.to_string());
-        let policies_1 = self.get_policies_for_permission(&perm_ulid_1.to_string());
-        let policies_2 = self.get_policies_for_permission(&perm_ulid_2.to_string());
+        let roles_1 = self
+            .get_roles_for_permission(&perm_ulid_1.to_string())
+            .await;
+        let roles_2 = self
+            .get_roles_for_permission(&perm_ulid_2.to_string())
+            .await;
+        let policies_1 = self
+            .get_policies_for_permission(&perm_ulid_1.to_string())
+            .await;
+        let policies_2 = self
+            .get_policies_for_permission(&perm_ulid_2.to_string())
+            .await;
 
         // Prepare new roles and policies with unified permission ULID
         let mut roles_to_add = Vec::new();
@@ -435,7 +446,7 @@ impl PermissionManager {
 
     /// Commit identity unification (UPDATED - only updates in-memory enforcer)
     pub async fn unify_identities_commit(&self, request: UnifyIdentitiesPrepare) -> Result<()> {
-        let mut enforcer = self.enforcer.write();
+        let mut enforcer = self.enforcer.write().await;
 
         // Remove old roles and policies from in-memory enforcer
         for role in request.roles_to_remove {
@@ -466,12 +477,14 @@ impl PermissionManager {
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<()> {
-        let prepare = self.unify_identities_prepare(identity1, identity2, store, txn)?;
+        let prepare = self
+            .unify_identities_prepare(identity1, identity2, store, txn)
+            .await?;
         self.unify_identities_commit(prepare).await
     }
 
     /// Check if a user has permission to access a resource
-    pub fn check_permission<'a, S: Store<'a> + 'static>(
+    pub async fn check_permission<'a, S: Store<'a> + 'static>(
         &self,
         user_identity: &UserIdentity,
         resource_id: ResourceId,
@@ -493,7 +506,7 @@ impl PermissionManager {
 
         // Check permission using the enforcer (read lock)
         let allowed = {
-            let enforcer = self.enforcer.read();
+            let enforcer = self.enforcer.read().await;
             enforcer.enforce(
                 &permission_ulid.to_string(),
                 &path.to_string(),
@@ -513,7 +526,7 @@ impl PermissionManager {
         &self,
         group_id: Ulid,
         initial_user: &UserIdentity,
-        realm_id: Ulid,
+        realm_id: RealmKey,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<CreateGroupPrepare> {
@@ -583,7 +596,7 @@ impl PermissionManager {
 
     /// Commit a group creation operation
     pub async fn create_group_commit(&self, request: CreateGroupPrepare) -> Result<()> {
-        let mut enforcer = self.enforcer.write();
+        let mut enforcer = self.enforcer.write().await;
 
         for policy in request.policy {
             enforcer.add_policy(policy).await?;
@@ -610,21 +623,6 @@ impl PermissionManager {
 
         let full_role = format!("{}_{}", group_id, role_name);
 
-        // Check if role exists by checking if it has any policies
-        let policies = {
-            let enforcer = self.enforcer.read();
-            enforcer.get_policies()
-        };
-
-        let role_exists = policies
-            .iter()
-            .filter_map(|p| p.get(0))
-            .any(|r| r == &full_role);
-
-        if !role_exists && role_name != "admin" && role_name != "member" {
-            return Err(PermissionError::RoleNotFound(full_role));
-        }
-
         let role_mapping = vec![permission_ulid.to_string(), full_role];
 
         store.put(
@@ -641,7 +639,7 @@ impl PermissionManager {
 
     /// Commit adding a user to a role
     pub async fn add_user_commit(&self, request: AddUserPrepare) -> Result<()> {
-        let mut enforcer = self.enforcer.write();
+        let mut enforcer = self.enforcer.write().await;
         enforcer.add_role(request.role).await?;
         Ok(())
     }
@@ -674,7 +672,7 @@ impl PermissionManager {
 
     /// Commit removing a role from a user
     pub async fn remove_role_from_user_commit(&self, request: RemoveRolePrepare) -> Result<()> {
-        let mut enforcer = self.enforcer.write();
+        let mut enforcer = self.enforcer.write().await;
         enforcer.remove_role(request.role).await?;
         Ok(())
     }
@@ -714,7 +712,7 @@ impl PermissionManager {
 
     /// Commit adding a policy to a role
     pub async fn add_policy_to_role_commit(&self, request: AddPolicyPrepare) -> Result<()> {
-        let mut enforcer = self.enforcer.write();
+        let mut enforcer = self.enforcer.write().await;
         enforcer.add_policy(request.policy).await?;
         Ok(())
     }
@@ -758,7 +756,7 @@ impl PermissionManager {
         &self,
         group_id: Ulid,
         initial_user: &UserIdentity,
-        realm_id: Ulid,
+        realm_id: RealmKey,
         store: &'a S,
         txn: &mut <S as Store<'a>>::Txn,
     ) -> Result<()> {
@@ -810,10 +808,10 @@ impl PermissionManager {
     }
 
     /// Get all roles for a group
-    pub fn get_group_roles(&self, group_id: Ulid) -> Vec<String> {
+    pub async fn get_group_roles(&self, group_id: Ulid) -> Vec<String> {
         let prefix = format!("{}_", group_id);
         let policies = {
-            let enforcer = self.enforcer.read();
+            let enforcer = self.enforcer.read().await;
             enforcer.get_policies()
         };
 
@@ -828,16 +826,16 @@ impl PermissionManager {
     }
 
     /// Get all users in a group role (returns permission ULIDs)
-    pub fn get_role_users(&self, group_id: Ulid, role_name: &str) -> Vec<String> {
+    pub async fn get_role_users(&self, group_id: Ulid, role_name: &str) -> Vec<String> {
         let full_role = format!("{}_{}", group_id, role_name);
-        let enforcer = self.enforcer.read();
+        let enforcer = self.enforcer.read().await;
         enforcer.get_users_for_role(&full_role)
     }
 
     /// Get all policies for a role
-    pub fn get_role_policies(&self, group_id: Ulid, role_name: &str) -> Vec<Vec<String>> {
+    pub async fn get_role_policies(&self, group_id: Ulid, role_name: &str) -> Vec<Vec<String>> {
         let full_role = format!("{}_{}", group_id, role_name);
-        let enforcer = self.enforcer.read();
+        let enforcer = self.enforcer.read().await;
 
         enforcer
             .get_policies()
@@ -858,7 +856,7 @@ impl PermissionManager {
         store: &'a S,
         txn: &'a <S as Store<'a>>::Txn,
     ) -> Result<()> {
-        let mut enforcer = self.enforcer.write();
+        let mut enforcer = self.enforcer.write().await;
         enforcer.load_policy(store, txn).await?;
         Ok(())
     }
@@ -902,13 +900,19 @@ mod tests {
         Ulid::from_bytes(bytes)
     }
 
+    pub fn create_test_realm_key(suffix: u8) -> RealmKey {
+        let mut key = [0u8; 32];
+        key[31] = suffix;
+        key
+    }
+
     #[tokio::test]
     async fn test_predictable_user_identity_creation() {
         let (store, test_dir) = setup_test_store().await;
         let mut txn = store.create_txn(true).unwrap();
         let manager = PermissionManager::new().await.unwrap();
 
-        let realm_id = create_test_ulid(10);
+        let realm_id = create_test_realm_key(10);
         let user_ulid = create_test_ulid(1);
         let identity = UserIdentity::new(user_ulid, realm_id);
 
@@ -977,7 +981,7 @@ mod tests {
         let mut txn = store.create_txn(true).unwrap();
         let manager = PermissionManager::new().await.unwrap();
 
-        let realm_id = create_test_ulid(10);
+        let realm_id = create_test_realm_key(10);
         let user_ulid_1 = create_test_ulid(1);
         let user_ulid_2 = create_test_ulid(2);
 
@@ -1032,7 +1036,7 @@ mod tests {
         let mut txn = store.create_txn(true).unwrap();
         let manager = PermissionManager::new().await.unwrap();
 
-        let realm_id = create_test_ulid(10);
+        let realm_id = create_test_realm_key(10);
         let user_ulid = create_test_ulid(1);
         let identity = UserIdentity::new(user_ulid, realm_id);
 
@@ -1064,8 +1068,8 @@ mod tests {
         let mut txn = store.create_txn(true).unwrap();
         let manager = PermissionManager::new().await.unwrap();
 
-        let realm_a = create_test_ulid(10);
-        let realm_b = create_test_ulid(11);
+        let realm_a = create_test_realm_key(10);
+        let realm_b = create_test_realm_key(11);
         let user_ulid = create_test_ulid(1);
 
         // Same user in different realms

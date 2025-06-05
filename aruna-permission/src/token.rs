@@ -10,19 +10,20 @@ use ulid::Ulid;
 
 use crate::error::{PermissionError, Result};
 use crate::manager::UserIdentity;
+use crate::paths::RealmKey;
 
 /// JWT Claims for realm identity tokens
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealmTokenClaims {
     /// User ULID within the realm
     pub user_ulid: String,
-    /// Realm ULID that issued this token
+    /// Realm key (hex encoded) that issued this token
     pub realm_ulid: String,
     /// Standard JWT issued at time
     pub iat: u64,
     /// Standard JWT expiration time
     pub exp: u64,
-    /// Standard JWT issuer (aruna@realm_id format)
+    /// Standard JWT issuer (aruna@realm_key format)
     pub iss: String,
     /// Standard JWT subject (user identifier)
     pub sub: String,
@@ -36,12 +37,14 @@ impl RealmTokenClaims {
             .unwrap()
             .as_secs();
 
+        let realm_hex = hex::encode(user_identity.realm_ulid);
+
         Self {
             user_ulid: user_identity.user_ulid.to_string(),
-            realm_ulid: user_identity.realm_ulid.to_string(),
+            realm_ulid: realm_hex.clone(),
             iat: now,
             exp: now + (expiration_hours * 3600),
-            iss: format!("aruna@{}", user_identity.realm_ulid),
+            iss: format!("aruna@{}", realm_hex),
             sub: user_identity.user_ulid.to_string(),
         }
     }
@@ -51,11 +54,21 @@ impl RealmTokenClaims {
         let user_ulid = Ulid::from_string(&self.user_ulid).map_err(|_| {
             PermissionError::ResourceNotFound("Invalid user ULID in token".to_string())
         })?;
-        let realm_ulid = Ulid::from_string(&self.realm_ulid).map_err(|_| {
-            PermissionError::ResourceNotFound("Invalid realm ULID in token".to_string())
+
+        let realm_bytes = hex::decode(&self.realm_ulid).map_err(|_| {
+            PermissionError::ResourceNotFound("Invalid realm key in token".to_string())
         })?;
 
-        Ok(UserIdentity::new(user_ulid, realm_ulid))
+        if realm_bytes.len() != 32 {
+            return Err(PermissionError::ResourceNotFound(
+                "Invalid realm key length in token".to_string(),
+            ));
+        }
+
+        let mut realm_key = [0u8; 32];
+        realm_key.copy_from_slice(&realm_bytes);
+
+        Ok(UserIdentity::new(user_ulid, realm_key))
     }
 
     /// Check if token is expired
@@ -188,23 +201,23 @@ impl Ed25519KeyPair {
 
 /// Simple token system for identity management
 pub struct TokenSystem {
-    /// Local realm ULID
-    local_realm_ulid: Ulid,
+    /// Local realm key
+    local_realm_key: RealmKey,
     /// Static configuration for trusted OIDC issuers
     oidc_trust_config: OidcTrustConfig,
     /// OIDC provider public keys (issuer -> public_key_pem as String)
     oidc_public_keys: HashMap<String, String>,
-    /// Realm Ed25519 verifying keys for verification (realm_ulid -> verifying_key_pem as String)
-    realm_public_keys: HashMap<Ulid, String>,
+    /// Realm Ed25519 verifying keys for verification (realm_key -> verifying_key_pem as String)
+    realm_public_keys: HashMap<RealmKey, String>,
     /// Default token expiration in hours
     default_expiration_hours: u64,
 }
 
 impl TokenSystem {
     /// Create new token system for a specific realm
-    pub fn new(local_realm_ulid: Ulid, oidc_trust_config: OidcTrustConfig) -> Self {
+    pub fn new(local_realm_key: RealmKey, oidc_trust_config: OidcTrustConfig) -> Self {
         Self {
-            local_realm_ulid,
+            local_realm_key,
             oidc_trust_config,
             oidc_public_keys: HashMap::new(),
             realm_public_keys: HashMap::new(),
@@ -218,7 +231,7 @@ impl TokenSystem {
     }
 
     /// Add realm Ed25519 verifying key for verification (expects PEM format)
-    pub fn add_realm_public_key(&mut self, realm_ulid: Ulid, verifying_key_pem: String) {
+    pub fn add_realm_public_key(&mut self, realm_ulid: RealmKey, verifying_key_pem: String) {
         self.realm_public_keys.insert(realm_ulid, verifying_key_pem);
     }
 
@@ -261,7 +274,7 @@ impl TokenSystem {
             self.get_user_from_oidc(oidc_provider, oidc_sub, store, txn)?
         {
             // Return existing identity
-            return Ok(UserIdentity::new(existing_user_ulid, self.local_realm_ulid));
+            return Ok(UserIdentity::new(existing_user_ulid, self.local_realm_key));
         }
 
         // No existing mapping found, create new user
@@ -271,7 +284,7 @@ impl TokenSystem {
         self.add_oidc_identity(oidc_provider, oidc_sub, user_ulid, store, txn)?;
 
         // Create UserIdentity for local realm
-        let user_identity = UserIdentity::new(user_ulid, self.local_realm_ulid);
+        let user_identity = UserIdentity::new(user_ulid, self.local_realm_key);
 
         Ok(user_identity)
     }
@@ -442,7 +455,7 @@ impl TokenSystem {
         signing_key_pem: &str,
     ) -> Result<String> {
         // Only generate tokens for users in our local realm
-        if user_identity.realm_ulid != self.local_realm_ulid {
+        if user_identity.realm_ulid != self.local_realm_key {
             return Err(PermissionError::ResourceNotFound(
                 "Cannot generate token for foreign realm user".to_string(),
             ));
@@ -485,11 +498,21 @@ impl TokenSystem {
             ));
         }
 
-        // Extract realm ULID from issuer
-        let realm_ulid = if let Some(realm_str) = unverified.claims.iss.strip_prefix("aruna@") {
-            Ulid::from_string(realm_str).map_err(|_| {
-                PermissionError::ResourceNotFound("Invalid realm ULID in issuer".to_string())
-            })?
+        // Extract realm key from issuer
+        let realm_key = if let Some(realm_hex) = unverified.claims.iss.strip_prefix("aruna@") {
+            let realm_bytes = hex::decode(realm_hex).map_err(|_| {
+                PermissionError::ResourceNotFound("Invalid realm key in issuer".to_string())
+            })?;
+
+            if realm_bytes.len() != 32 {
+                return Err(PermissionError::ResourceNotFound(
+                    "Invalid realm key length in issuer".to_string(),
+                ));
+            }
+
+            let mut realm_key = [0u8; 32];
+            realm_key.copy_from_slice(&realm_bytes);
+            realm_key
         } else {
             return Err(PermissionError::ResourceNotFound(
                 "Invalid Aruna token issuer format".to_string(),
@@ -497,7 +520,7 @@ impl TokenSystem {
         };
 
         // Get Ed25519 verifying key for verification
-        let verifying_key_pem = self.realm_public_keys.get(&realm_ulid).ok_or_else(|| {
+        let verifying_key_pem = self.realm_public_keys.get(&realm_key).ok_or_else(|| {
             PermissionError::ResourceNotFound("Realm public key not found".to_string())
         })?;
 
@@ -541,6 +564,12 @@ mod tests {
         Ulid::from_bytes(bytes)
     }
 
+    fn create_test_realm_key(suffix: u8) -> RealmKey {
+        let mut key = [0u8; 32];
+        key[31] = suffix;
+        key
+    }
+
     #[test]
     fn test_ed25519_key_pair_generation() {
         let key_pair = Ed25519KeyPair::generate();
@@ -570,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_realm_token_claims() {
-        let realm_ulid = create_test_ulid(1);
+        let realm_ulid = create_test_realm_key(1);
         let user_ulid = create_test_ulid(2);
         let user_identity = UserIdentity::new(user_ulid, realm_ulid);
 
@@ -578,13 +607,13 @@ mod tests {
         let recovered_identity = claims.to_user_identity().unwrap();
 
         assert_eq!(recovered_identity, user_identity);
-        assert_eq!(claims.iss, format!("aruna@{}", realm_ulid));
+        assert_eq!(claims.iss, format!("aruna@{}", hex::encode(realm_ulid)));
         assert!(!claims.is_expired());
     }
 
     #[test]
     fn test_token_system_creation() {
-        let realm_ulid = create_test_ulid(1);
+        let realm_ulid = create_test_realm_key(1);
         let trust_config =
             OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
 
@@ -611,12 +640,12 @@ ZwIDAQAB
         let verifying_pem = key_pair.verifying_key_pem().unwrap();
         token_system.add_realm_public_key(realm_ulid, verifying_pem);
 
-        assert_eq!(token_system.local_realm_ulid, realm_ulid);
+        assert_eq!(token_system.local_realm_key, realm_ulid);
     }
 
     #[test]
     fn test_ed25519_token_round_trip() {
-        let realm_ulid = create_test_ulid(1);
+        let realm_ulid = create_test_realm_key(1);
         let user_ulid = create_test_ulid(2);
         let mut token_system = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
 
@@ -644,8 +673,8 @@ ZwIDAQAB
 
     #[test]
     fn test_cross_realm_token_validation() {
-        let realm_a = create_test_ulid(1);
-        let realm_b = create_test_ulid(2);
+        let realm_a = create_test_realm_key(1);
+        let realm_b = create_test_realm_key(2);
         let user_ulid = create_test_ulid(10);
 
         let mut token_system_a = TokenSystem::new(realm_a, OidcTrustConfig::TrustAll);
@@ -676,8 +705,8 @@ ZwIDAQAB
 
     #[test]
     fn test_token_generation_foreign_realm() {
-        let realm_a = create_test_ulid(1);
-        let realm_b = create_test_ulid(2);
+        let realm_a = create_test_realm_key(1);
+        let realm_b = create_test_realm_key(2);
         let user_ulid = create_test_ulid(10);
         let token_system = TokenSystem::new(realm_a, OidcTrustConfig::TrustAll);
 
@@ -692,7 +721,7 @@ ZwIDAQAB
 
     #[test]
     fn test_token_validation_without_public_key() {
-        let realm_ulid = create_test_ulid(1);
+        let realm_ulid = create_test_realm_key(1);
         let user_ulid = create_test_ulid(2);
         let mut token_system_generator = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
 
