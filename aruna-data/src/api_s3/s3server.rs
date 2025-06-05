@@ -15,7 +15,6 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use iroh::NodeId;
-use parking_lot::RwLock;
 use s3s::Body;
 use s3s::S3Error;
 use s3s::s3_error;
@@ -44,7 +43,7 @@ impl S3Server {
     pub async fn new(
         frontend: S3Frontend,
         backend: Arc<IOHandler<LmdbStore>>,
-        permission_manager: Arc<RwLock<PermissionManager>>,
+        permission_manager: PermissionManager,
         node_id: NodeId,
         realm_id: Ulid,
     ) -> Result<Self> {

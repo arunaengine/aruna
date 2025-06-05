@@ -2,7 +2,6 @@ use crate::api_json::request::{Request, User};
 use crate::{IOHandler, error::ArunaDataError};
 use aruna_permission::manager::PermissionManager;
 use aruna_storage::storage::store::Store;
-use parking_lot::RwLock;
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -11,7 +10,7 @@ where
     for<'a> St: Store<'a> + 'static,
 {
     pub io_handler: Arc<IOHandler<St>>,
-    pub permission_manager: Arc<RwLock<PermissionManager>>,
+    pub permission_manager: PermissionManager,
 }
 
 impl<St> Controller<St>
@@ -19,10 +18,7 @@ where
     for<'a> St: Store<'a> + 'static,
 {
     #[tracing::instrument(level = "trace", skip(io_handler, permission_manager))]
-    pub fn new(
-        io_handler: Arc<IOHandler<St>>,
-        permission_manager: Arc<RwLock<PermissionManager>>,
-    ) -> Self {
+    pub fn new(io_handler: Arc<IOHandler<St>>, permission_manager: PermissionManager) -> Self {
         let controller = Self {
             io_handler,
             permission_manager,

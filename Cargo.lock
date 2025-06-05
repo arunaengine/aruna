@@ -151,7 +151,6 @@ dependencies = [
  "lazy_static",
  "md5",
  "opendal",
- "parking_lot",
  "postcard",
  "rand 0.8.5",
  "s3s",

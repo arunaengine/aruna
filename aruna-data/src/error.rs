@@ -108,8 +108,8 @@ impl From<ulid::DecodeError> for ArunaDataError {
     }
 }
 
-impl From<aruna_permission::paths::PathError> for ArunaDataError {
-    fn from(e: aruna_permission::paths::PathError) -> Self {
+impl From<aruna_permission::error::PathError> for ArunaDataError {
+    fn from(e: aruna_permission::error::PathError) -> Self {
         ArunaDataError::InvalidParameter {
             name: "path".to_string(),
             error: e.to_string(),
