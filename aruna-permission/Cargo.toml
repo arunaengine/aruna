@@ -15,6 +15,7 @@ rand = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 iroh = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }
@@ -22,3 +23,7 @@ tokio = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+jsonwebtoken = "9.3.1"
+
+[dev-dependencies]
+# Additional test dependencies if needed

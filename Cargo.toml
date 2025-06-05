@@ -22,18 +22,19 @@ async-channel = "2.3.1"
 ahash = "0.8.12"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
-blake3 = {  version = "1.8.2", features = ["serde"] }
+blake3 = { version = "1.8.2", features = ["serde"] }
 casbin = "2.10.1"
 dotenvy = "0.15.7"
 futures = "0.3.31"
 iroh = "0.35.0"
 iroh-base = "0.35.0"
-parking_lot = { version = "0.12.3", features = ["deadlock_detection"] }
+parking_lot = { version = "0.12.4", features = ["deadlock_detection"] }
 postcard = "1.1.1"
 rand = "0.8.5"
 serde = { version = "1.0.218", features = ["derive"] }
+serde_json = "1.0.140"
 thiserror = "2.0.12"
-tokio = { version = "1.45.0", features = ["full"] }
+tokio = { version = "1.45.1", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = [
     "env-filter",

@@ -36,5 +36,6 @@ where
         .routes(routes!(create_s3_credentials))
         .routes(routes!(get_s3_credentials))
         .routes(routes!(delete_s3_credentials))
+        .routes(routes!(register_data))
         .with_state(store)
 }

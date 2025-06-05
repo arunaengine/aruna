@@ -2,12 +2,50 @@ use casbin::error::AdapterError;
 use thiserror::Error;
 use tracing::error;
 
+/// Custom error type for path operations.
+#[derive(Error, Debug)]
+pub enum PathError {
+    #[error("Parse error: {0}")]
+    ParseError(String),
+
+    #[error("Invalid ULID: {0}")]
+    InvalidUlid(#[from] ulid::DecodeError),
+
+    #[error("Invalid Blake3 hash: {0}")]
+    InvalidHash(String),
+
+    #[error("Invalid base64: {0}")]
+    InvalidBase64(#[from] base64::DecodeError),
+
+    #[error("Validation error: {0}")]
+    ValidationError(String),
+
+    #[error("Building error: {0}")]
+    BuildError(String),
+
+    #[error("Invalid assumption: {0}")]
+    InvalidAssumption(String),
+}
+
+/// Error types for unification operations
+#[derive(Error, Debug)]
+pub enum UnificationError {
+    #[error("Identity not found: {0}")]
+    IdentityNotFound(String),
+    #[error("Identities already unified")]
+    AlreadyUnified,
+    #[error("Cannot unify identity with itself")]
+    SelfUnification,
+}
+
 #[derive(Error, Debug)]
 pub enum ArunaPermissionHandlerError {
     #[error("Failed to convert permission: {0}")]
     ConversionError(#[from] postcard::Error),
     #[error("Storage error: {0}")]
     StorageError(#[from] aruna_storage::error::ArunaStorageError),
+    #[error("Casbin helper error: {0}")]
+    CasbinHelperError(String),
 }
 
 impl From<ArunaPermissionHandlerError> for casbin::Error {
@@ -30,9 +68,13 @@ pub enum PermissionError {
     #[error("Casbin error: {0}")]
     CasbinError(#[from] casbin::Error),
     #[error("Path error: {0}")]
-    PathError(#[from] crate::paths::PathError),
+    PathError(#[from] PathError),
     #[error("Postcard error: {0}")]
     PostcardError(#[from] postcard::Error),
+    #[error("Aruna permission handler error: {0}")]
+    ArunaPermissionHandlerError(#[from] ArunaPermissionHandlerError),
+    #[error("Unification error: {0}")]
+    UnificationError(#[from] UnificationError),
 }
 
 pub type Result<T> = std::result::Result<T, PermissionError>;

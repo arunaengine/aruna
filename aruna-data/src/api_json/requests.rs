@@ -1,6 +1,12 @@
-use crate::io::controller::Controller;
 use crate::api_json::request::{Request, User};
+use crate::api_json::util::xor_ulids;
+use crate::api_s3::auth::UserAccess;
+use crate::error::ArunaDataError;
+use crate::io::controller::Controller;
+use crate::io::io_handler::ACCESS_DB_NAME;
 use aruna_storage::storage::store::Store;
+use rand::distributions::Alphanumeric;
+use rand::{Rng, thread_rng};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
@@ -8,7 +14,9 @@ use utoipa::ToSchema;
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
 )]
-pub struct CreateS3CredentialsRequest {}
+pub struct CreateS3CredentialsRequest {
+    group_id: String,
+}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateS3CredentialsResponse {
@@ -28,7 +36,7 @@ where
         &self,
         user: &Option<String>,
         _controller: &Controller<St>,
-    ) -> Result<Option<Self::Response>, crate::error::ArunaDataError> {
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
         Ok(None)
     }
 
@@ -37,14 +45,42 @@ where
         self,
         user: Option<User>,
         controller: &Controller<St>,
-    ) -> Result<Self::Response, crate::error::ArunaDataError> {
+    ) -> Result<Self::Response, ArunaDataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaDataError::Unauthorized);
+            return Err(ArunaDataError::Unauthorized);
         };
 
+        let access_info = UserAccess {
+            user_id: user.id,
+            group_id: user.group,
+            secret: thread_rng()
+                .sample_iter(&Alphanumeric)
+                .take(30)
+                .map(char::from)
+                .collect::<String>(),
+        };
+
+        let store_clone = controller.io_handler.store.clone();
+        let access_info_clone = access_info.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut write_txn = store_clone.create_txn(true)?;
+
+            // Store object info with blake3 hash as key
+            store_clone.put(
+                &mut write_txn,
+                ACCESS_DB_NAME,
+                &xor_ulids(&user.id, &user.group),
+                &bincode::serde::encode_to_vec(access_info_clone, bincode::config::standard())?,
+            )?;
+
+            store_clone.commit(write_txn)?;
+
+            Ok::<(), anyhow::Error>(())
+        });
+
         Ok(CreateS3CredentialsResponse {
-            access_key_id: todo!(),
-            secret_access_key: todo!(),
+            access_key_id: access_info.user_id,
+            secret_access_key: access_info.secret.to_string(),
         })
     }
 }
@@ -56,7 +92,7 @@ pub struct GetS3CredentialsRequest {}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct GetS3CredentialsResponse {
-    pub access_key_id: Ulid,
+    pub access_key_id: String,
     pub secret_access_key: String,
 }
 
@@ -72,23 +108,25 @@ where
         &self,
         user: &Option<String>,
         _controller: &Controller<St>,
-    ) -> Result<Option<Self::Response>, crate::error::ArunaDataError> {
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
         Ok(None)
     }
 
-    #[tracing::instrument(level = "trace", skip(controller))]
+    #[tracing::instrument(level = "trace", skip(_controller))]
     async fn run_request(
         self,
         user: Option<User>,
-        controller: &Controller<St>,
-    ) -> Result<Self::Response, crate::error::ArunaDataError> {
-        let Some(user) = user else {
-            return Err(crate::error::ArunaDataError::Unauthorized);
+        _controller: &Controller<St>,
+    ) -> Result<Self::Response, ArunaDataError> {
+        let Some(_user) = user else {
+            return Err(ArunaDataError::Unauthorized);
         };
 
+        //TODO: Fetch
+
         Ok(GetS3CredentialsResponse {
-            access_key_id: todo!(),
-            secret_access_key: todo!(),
+            access_key_id: "TODO".to_string(),
+            secret_access_key: "TODO".to_string(),
         })
     }
 }
@@ -113,20 +151,71 @@ where
         &self,
         user: &Option<String>,
         _controller: &Controller<St>,
-    ) -> Result<Option<Self::Response>, crate::error::ArunaDataError> {
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
         Ok(None)
     }
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn run_request(
+        self,
+        user: Option<User>,
+        _controller: &Controller<St>,
+    ) -> Result<Self::Response, ArunaDataError> {
+        let Some(_user) = user else {
+            return Err(ArunaDataError::Unauthorized);
+        };
+
+        Ok(DeleteS3CredentialsResponse {})
+    }
+}
+
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
+)]
+pub struct RegisterDataRequest {
+    group_id: String,
+    backend_path: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct RegisterDataResponse {
+    path: String,
+}
+
+#[async_trait::async_trait]
+impl<St> Request<St> for RegisterDataRequest
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    type Response = RegisterDataResponse;
 
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         user: Option<User>,
         controller: &Controller<St>,
-    ) -> Result<Self::Response, crate::error::ArunaDataError> {
+    ) -> Result<Self::Response, ArunaDataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaDataError::Unauthorized);
+            return Err(ArunaDataError::Unauthorized);
         };
 
-        Ok(DeleteS3CredentialsResponse {})
+        let frontend_path = controller
+            .io_handler
+            .register_backend_data(&self.backend_path, user.group)
+            .await
+            .map_err(|e| ArunaDataError::IoError(e.to_string()))?;
+
+        Ok(RegisterDataResponse {
+            path: frontend_path,
+        })
+    }
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &Controller<St>,
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
+        Ok(None)
     }
 }

@@ -1,8 +1,7 @@
 use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
-use crate::api_s3::util::extract_access_key;
-use crate::io::io_handler::{ACCESS_DB_NAME, LOCATION_DB_NAME, ObjectInfo, PATH_LOCATION_DB_NAME};
-use anyhow::{Result, anyhow};
+use crate::io::io_handler::{LOCATION_DB_NAME, ObjectInfo, PATH_LOCATION_DB_NAME};
+use anyhow::Result;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
 use futures_util::TryStreamExt;
@@ -12,82 +11,82 @@ use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 use ulid::Ulid;
 
-pub struct ArunaS3Service {
-    backend: Arc<IOHandler<LmdbStore>>,
+pub struct ArunaS3Service<St>
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    backend: Arc<IOHandler<St>>,
     node_id: NodeId,
 }
 
-impl Debug for ArunaS3Service {
+impl<St> Debug for ArunaS3Service<St>
+where
+    for<'a> St: Store<'a>,
+{
     #[tracing::instrument(level = "trace", skip(self, f))]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ArunaS3Service").finish()
     }
 }
 
-impl ArunaS3Service {
+impl<St> ArunaS3Service<St>
+where
+    for<'a> St: Store<'a> + 'static,
+{
     #[tracing::instrument(level = "trace", skip(backend))]
-    pub async fn new(backend: Arc<IOHandler<LmdbStore>>, node_id: NodeId) -> Result<Self> {
+    pub async fn new(backend: Arc<IOHandler<St>>, node_id: NodeId) -> Result<Self> {
         Ok(ArunaS3Service { backend, node_id })
     }
 }
 
 #[async_trait::async_trait]
-impl S3 for ArunaS3Service {
+impl<St> S3 for ArunaS3Service<St>
+where
+    for<'a> St: Store<'a> + 'static,
+{
     #[tracing::instrument(err)]
     #[allow(clippy::blocks_in_conditions)]
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        // Extract access key id from provided credentials
-        let access_key = extract_access_key(&req)?;
+        debug!("Received GET Request: {:#?}", req);
+        // Extract access check result
+        let UserAccess { group_id, .. } =
+            req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+                error!(error = "Missing user context");
+                s3_error!(UnexpectedContent, "Missing user context")
+            })?;
 
-        //
+        // Extend provided path
+        let frontend_path = format!("{}/{}/{}", group_id, req.input.bucket, req.input.key);
+
+        // Fetch object info
         let store_clone = self.backend.store.clone();
         let info = tokio::task::spawn_blocking(move || {
-            let mut read_txn = store_clone
+            let read_txn = store_clone
                 .create_txn(false)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
-
-            // Fetch access info for user
-            let user_access: UserAccess = if let Some(info_raw) =
-                store_clone.get(&mut read_txn, ACCESS_DB_NAME, access_key.as_bytes())?
-            {
-                bincode::serde::decode_from_slice(&*info_raw, bincode::config::standard())?.0
-            } else {
-                return Err(anyhow!("No access info found"));
-            };
-
-            //TODO: Check permissions
-
-            let full_path = format!(
-                "{}/{}/{}",
-                user_access.group_id, req.input.bucket, req.input.key
-            );
-
             let hash = store_clone
-                .get(&read_txn, PATH_LOCATION_DB_NAME, full_path.as_bytes())
+                .get(&read_txn, PATH_LOCATION_DB_NAME, frontend_path.as_bytes())
                 .map_err(|e| s3_error!(InternalError, "{}", e))?
                 .ok_or_else(|| s3_error!(NoSuchKey, "No such key"))?;
             let info_raw = store_clone
                 .get(&read_txn, LOCATION_DB_NAME, &hash)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?
                 .ok_or_else(|| s3_error!(NoSuchKey, "No such key"))?;
-            let info: (ObjectInfo, usize) =
+            let (info, _): (ObjectInfo, usize) =
                 bincode::serde::decode_from_slice(&*info_raw, bincode::config::standard())
                     .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
-            Ok::<ObjectInfo, anyhow::Error>(info.0)
+            Ok::<ObjectInfo, anyhow::Error>(info)
         })
         .await
         .map_err(|e| s3_error!(InternalError, "{}", e))?
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
-
-        //TODO: Create operator for backend (if necessary)
-        // - How to handle different backends dynamically?
 
         // Fetch reader stream
         let filename = Path::new(&info.file_path)
@@ -105,7 +104,7 @@ impl S3 for ArunaS3Service {
             s3_error!(InternalError, "Internal processing error: {e}")
         })));
 
-        //TODO: Set response fields
+        //TODO: Set more response fields (?)
         let output = GetObjectOutput {
             body,
             content_disposition: Some(format!(r#"attachment;filename="{}""#, filename)),
@@ -114,7 +113,6 @@ impl S3 for ArunaS3Service {
             version_id: None,
             ..Default::default()
         };
-        debug!(?output);
 
         Ok(S3Response::new(output))
     }
@@ -126,40 +124,20 @@ impl S3 for ArunaS3Service {
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         debug!("Received PUT Request: {:#?}", req);
+        // Extract access check result
+        let UserAccess { group_id, .. } =
+            req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+                error!(error = "Missing user context");
+                s3_error!(UnexpectedContent, "Missing user context")
+            })?;
 
-        // Extract access key id from provided credentials
-        let access_key = extract_access_key(&req)?;
-
-        // Fetch user access info
-        let store_clone = self.backend.store.clone();
-        let info = tokio::task::spawn_blocking(move || {
-            let mut read_txn = store_clone.create_txn(false)?;
-
-            // Fetch access info for user
-            let info = if let Some(info_raw) =
-                store_clone.get(&mut read_txn, ACCESS_DB_NAME, access_key.as_bytes())?
-            {
-                bincode::serde::decode_from_slice(&*info_raw, bincode::config::standard())?.0
-            } else {
-                return Err(anyhow!("No access info found"));
-            };
-
-            //TODO: Check permissions ?
-
-            Ok::<UserAccess, anyhow::Error>(info)
-        })
-        .await
-        .map_err(|e| s3_error!(InternalError, "{}", e))?
-        .map_err(|e| s3_error!(InternalError, "{}", e))?;
-
-        //TODO: Path concept :/
+        // Create paths
         let path_ulid = Ulid::new();
         let backend_path = format!(
-            "{}/{}/{}/{}/{}/{}",
-            "aruna", self.node_id, info.group_id, path_ulid, req.input.bucket, req.input.key
+            "{}/{}/{}/{}/{}",
+            self.node_id, group_id, path_ulid, req.input.bucket, req.input.key
         );
-        let extended_frontend_path =
-            format!("{}/{}/{}", info.group_id, req.input.bucket, req.input.key);
+        let extended_frontend_path = format!("{}/{}/{}", group_id, req.input.bucket, req.input.key);
 
         // Check if frontend path is already occupied
         let store_clone = self.backend.store.clone();
@@ -179,6 +157,13 @@ impl S3 for ArunaS3Service {
         .await
         .map_err(|e| s3_error!(InternalError, "{}", e))?
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        if exists {
+            warn!(
+                "Frontend path: {} is already occupied and will be overwritten.",
+                extended_frontend_path
+            )
+        }
 
         // Stream data into backend
         let object_info = match req.input.body {

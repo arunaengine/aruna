@@ -2,10 +2,12 @@ use crate::io::messages::{MessageType, ReplicationMessage};
 use crate::util::bao_tree::{
     FuturesAsyncReaderWrapper, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper,
 };
-use crate::util::opendal::{get_data_async_reader, get_reader};
+use crate::util::hash::Hasher;
+use crate::util::opendal::{get_data_async_reader, get_data_stream, get_reader};
 use anyhow::anyhow;
 use aruna_net::Kademlia;
 use aruna_net::actor_handle::{NetworkActorHandle, ReceiveStreams};
+use aruna_permission::manager::{PermissionManager, ResourceId};
 use aruna_storage::storage::store::Store;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -18,7 +20,6 @@ use opendal::{FuturesBytesStream, Operator};
 use s3s::StdError;
 use s3s::stream::ByteStream;
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use std::io::ErrorKind;
 use std::ops::Range;
 use std::sync::Arc;
@@ -33,7 +34,7 @@ pub const PATH_LOCATION_DB_NAME: &str = "path_locations_mapping";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hashes {
-    pub blake3: String,
+    pub blake3: blake3::Hash,
     pub sha256: String,
     pub md5: String,
 }
@@ -52,7 +53,7 @@ pub struct ObjectInfo {
 #[derive(Debug, Clone)]
 pub struct IOHandler<St>
 where
-    for<'a> St: Store<'a>,
+    for<'a> St: Store<'a> + 'static,
 {
     node_addr: NodeAddr,
     pub operator: Operator,
@@ -65,20 +66,20 @@ impl<St> IOHandler<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(store_config))]
+    #[tracing::instrument(level = "trace", skip(node_addr, operator, network, kademlia, store))]
     pub async fn new(
         node_addr: NodeAddr,
         operator: Operator,
         network: NetworkActorHandle,
         kademlia: Kademlia,
-        store_config: <St as Store<'static>>::StoreConfig,
+        store: Arc<St>,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let repl_handler = Arc::new(Self {
             node_addr,
             operator,
             network,
             kademlia,
-            store: Arc::new(St::new(store_config)?),
+            store,
         });
 
         repl_handler.clone().run().await;
@@ -122,7 +123,7 @@ where
     pub async fn handle_incoming_p2p_stream(
         &self,
         ReceiveStreams {
-            sender,
+            sender: _sender,
             mut send_stream,
             mut recv_stream,
         }: ReceiveStreams,
@@ -156,12 +157,14 @@ where
             decode_ranges(rx_wrapper, ranges, &mut writer, &mut ob).await?;
             writer.writer.close().await?;
             debug!("Decoded all chunks and wrote them into the backend");
+
+            //TODO: Store location + Register permission
         } else {
             error!("Stream did not start with init message");
             return Err(Box::new(std::io::Error::new(
                 ErrorKind::InvalidData,
                 "Stream did not start with init message",
-            ))); //Err(anyhow!("Stream did not start with init message"));
+            )));
         }
 
         send_stream.finish()?;
@@ -190,9 +193,7 @@ where
     where
         S: ByteStream<Item = Result<Bytes, StdError>> + Send + Sync + Unpin + 'static,
     {
-        let mut blake3 = blake3::Hasher::new();
-        let mut sha256 = sha2::Sha256::new();
-        let mut md5 = md5::Context::new();
+        let mut hasher = Hasher::new();
         let mut written_bytes = 0;
         let mut writer = self
             .operator
@@ -207,17 +208,15 @@ where
 
             // Write first, then update
             writer.write_all(&bytes).await?;
-
-            blake3.update(&bytes);
-            sha256.update(&bytes);
-            md5.consume(&bytes);
+            hasher.update(&bytes);
             written_bytes = written_bytes + bytes.len();
         }
         writer.flush().await?;
         writer.close().await?;
 
         // Store some technical metadata in persistence
-        let blake3_hash = blake3.finalize();
+        let hashes = hasher.finalize()?;
+        let blake3_hash = hashes.blake3.clone();
         let info = ObjectInfo {
             id: Ulid::new(),
             staging: true,
@@ -225,11 +224,7 @@ where
             encrypted: false,  //TODO
             file_path: backend_path.clone(),
             file_size: written_bytes as u64,
-            file_hashes: Hashes {
-                blake3: blake3_hash.to_string(),
-                sha256: format!("{:x}", sha256.finalize()),
-                md5: format!("{:x}", md5.compute()),
-            },
+            file_hashes: hashes,
         };
         debug!("New Object: {:#?}", info);
 
@@ -253,7 +248,6 @@ where
                 frontend_path.as_bytes(),
                 blake3_hash.as_bytes(),
             )?;
-
             store_clone.commit(write_txn)?;
 
             Ok::<(), anyhow::Error>(())
@@ -267,6 +261,78 @@ where
         Ok(info)
     }
 
+    pub async fn register_backend_data(&self, path: &str, group: Ulid) -> anyhow::Result<String> {
+        // Check if backend path resource exists
+        self.operator.exists(path).await?;
+        let meta = self.operator.stat(path).await?;
+
+        let mut hasher = Hasher::new();
+        let mut reader =
+            get_data_stream(&self.operator, path, None, Some(BLOCK_SIZE.bytes())).await?;
+
+        while let Some(bytes) = reader.next().await {
+            hasher.update(&bytes?);
+        }
+        let hashes = hasher.finalize()?;
+
+        //TODO: Register resource in permission manager
+        let perm_path = aruna_permission::paths::PathBuilder::new()
+            .realm_id(Ulid::new()) //TODO
+            .group_data(
+                group,
+                "bucket".to_string(), //TODO
+                "key".to_string(), //TODO
+                hashes.blake3,
+            ) 
+            .build()?;
+
+        // Register resource
+        let location = ObjectInfo {
+            id: Ulid::new(),
+            staging: false,
+            compressed: false,
+            encrypted: false,
+            file_path: path.to_string(),
+            file_size: meta.content_length(),
+            file_hashes: hashes.clone(),
+        };
+
+        let mut manager = PermissionManager::new().await?;
+        let store_clone = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut write_txn = store_clone.create_txn(true)?;
+            manager.add_resource(
+                ResourceId::Ulid(location.id),
+                &perm_path,
+                store_clone.as_ref(),
+                &mut write_txn,
+            )?;
+
+            // Store content hash --> location
+            store_clone.put(
+                &mut write_txn,
+                LOCATION_DB_NAME,
+                hashes.blake3.as_bytes(), //&info.id.to_bytes(),
+                &bincode::serde::encode_to_vec(location, bincode::config::standard())?,
+            )?;
+
+            //TODO: Store frontend path ?
+            store_clone.commit(write_txn)?;
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+
+        //TODO: Store mapping of frontend path <--> blake3 hash ?
+
+        // Publish content hash location via Kademlia
+        self.kademlia
+            .store(*hashes.blake3.as_bytes(), self.node_addr.clone(), None)
+            .await?;
+
+        Ok("".to_string())
+    }
+
     pub async fn read_data(operator: &Operator, path: &str) -> anyhow::Result<FuturesBytesStream> {
         let reader = get_reader(operator, path, Some(4 * 1024 * 1024), None).await?;
         Ok(reader.into_bytes_stream(..).await?)
@@ -277,7 +343,7 @@ where
         path: &str,
         range: Range<u64>,
     ) -> anyhow::Result<FuturesBytesStream> {
-        let reader = get_reader(&operator, path, Some(4 * 1024 * 1024), Some(8)).await?;
+        let reader = get_reader(&operator, path, Some(4 * 1024 * 1024), None).await?;
         Ok(reader.into_bytes_stream(range).await?)
     }
 

@@ -1,4 +1,3 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use blake3::Hash as Blake3Hash;
 use nom::{
     Err as NomErr, IResult, Parser,
@@ -9,30 +8,9 @@ use nom::{
 };
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
-use thiserror::Error;
 use ulid::Ulid;
 
-/// Custom error type for path operations.
-#[derive(Error, Debug)]
-pub enum PathError {
-    #[error("Parse error: {0}")]
-    ParseError(String),
-
-    #[error("Invalid ULID: {0}")]
-    InvalidUlid(#[from] ulid::DecodeError),
-
-    #[error("Invalid Blake3 hash: {0}")]
-    InvalidHash(String),
-
-    #[error("Invalid base64: {0}")]
-    InvalidBase64(#[from] base64::DecodeError),
-
-    #[error("Validation error: {0}")]
-    ValidationError(String),
-
-    #[error("Building error: {0}")]
-    BuildError(String),
-}
+use crate::error::PathError;
 
 /// Result type for path operations.
 pub type Result<T> = std::result::Result<T, PathError>;
@@ -60,6 +38,10 @@ pub enum PathComponent {
     Resources,
     /// Data resources section: `/d`
     Data,
+    /// Bucket name for data resources
+    Bucket(String),
+    /// Key name for data resources (can be a key prefix for wildcards)
+    Key(String),
     /// Content hash for data resources
     ContentHash(Blake3Hash),
     /// Metadata resources section: `/m`
@@ -249,13 +231,37 @@ impl Path {
                         }
                     }
                     PathComponent::Data => {
-                        // Data must be followed by ContentHash or Wildcard
+                        // Data must be followed by Bucket or Wildcard
                         if !matches!(
                             next,
-                            Some(PathComponent::ContentHash(_)) | Some(PathComponent::Wildcard)
+                            Some(PathComponent::Bucket(_)) | Some(PathComponent::Wildcard)
                         ) {
                             return Err(PathError::ValidationError(
-                                "Data must be followed by a content hash or /*".to_string(),
+                                "Data must be followed by a bucket name or /*".to_string(),
+                            ));
+                        }
+                    }
+                    PathComponent::Bucket(_) => {
+                        // Bucket can be followed by Key or Wildcard
+                        if !matches!(
+                            next,
+                            Some(PathComponent::Key(_)) | Some(PathComponent::Wildcard) | None
+                        ) {
+                            return Err(PathError::ValidationError(
+                                "Bucket must be followed by a key or /*".to_string(),
+                            ));
+                        }
+                    }
+                    PathComponent::Key(_) => {
+                        // Key can be followed by ContentHash or Wildcard
+                        if !matches!(
+                            next,
+                            Some(PathComponent::ContentHash(_))
+                                | Some(PathComponent::Wildcard)
+                                | None
+                        ) {
+                            return Err(PathError::ValidationError(
+                                "Key must be followed by a content hash or /*".to_string(),
                             ));
                         }
                     }
@@ -426,24 +432,86 @@ impl PathBuilder {
         self
     }
 
-    /// Adds a group data resource section to the path.
-    pub fn group_data(mut self, group_id: Ulid, content_hash: Blake3Hash) -> Self {
+    /// Adds a group data resource section to the path with bucket, key, and content hash.
+    pub fn group_data(
+        mut self,
+        group_id: Ulid,
+        bucket: String,
+        key: String,
+        content_hash: Blake3Hash,
+    ) -> Self {
         self.components.push(PathComponent::Group);
         self.components.push(PathComponent::GroupId(group_id));
         self.components.push(PathComponent::Resources);
         self.components.push(PathComponent::Data);
+        self.components.push(PathComponent::Bucket(bucket));
+        self.components.push(PathComponent::Key(key));
         self.components
             .push(PathComponent::ContentHash(content_hash));
         self
     }
 
-    /// Adds a group data wildcard section to the path.
+    /// Adds a group data wildcard section to the path (all data resources).
     pub fn group_data_wildcard(mut self, group_id: Ulid) -> Self {
         self.components.push(PathComponent::Group);
         self.components.push(PathComponent::GroupId(group_id));
         self.components.push(PathComponent::Resources);
         self.components.push(PathComponent::Data);
         self.components.push(PathComponent::Wildcard);
+        self
+    }
+
+    /// Adds a group data bucket wildcard section to the path (all keys in a specific bucket).
+    pub fn group_data_bucket_wildcard(mut self, group_id: Ulid, bucket: String) -> Self {
+        self.components.push(PathComponent::Group);
+        self.components.push(PathComponent::GroupId(group_id));
+        self.components.push(PathComponent::Resources);
+        self.components.push(PathComponent::Data);
+        self.components.push(PathComponent::Bucket(bucket));
+        self.components.push(PathComponent::Wildcard);
+        self
+    }
+
+    /// Adds a group data bucket section to the path (all keys in a specific bucket).
+    pub fn group_data_bucket(mut self, group_id: Ulid, bucket: String) -> Self {
+        self.components.push(PathComponent::Group);
+        self.components.push(PathComponent::GroupId(group_id));
+        self.components.push(PathComponent::Resources);
+        self.components.push(PathComponent::Data);
+        self.components.push(PathComponent::Bucket(bucket));
+        self
+    }
+
+    /// Adds a group data key prefix wildcard section to the path (all keys with a prefix in a bucket).
+    pub fn group_data_key_prefix_wildcard(
+        mut self,
+        group_id: Ulid,
+        bucket: String,
+        key_prefix: String,
+    ) -> Self {
+        self.components.push(PathComponent::Group);
+        self.components.push(PathComponent::GroupId(group_id));
+        self.components.push(PathComponent::Resources);
+        self.components.push(PathComponent::Data);
+        self.components.push(PathComponent::Bucket(bucket));
+        self.components.push(PathComponent::Key(key_prefix));
+        self.components.push(PathComponent::Wildcard);
+        self
+    }
+
+    /// Adds a group data key prefix section to the path (all keys with a prefix in a bucket).
+    pub fn group_data_key_prefix(
+        mut self,
+        group_id: Ulid,
+        bucket: String,
+        key_prefix: String,
+    ) -> Self {
+        self.components.push(PathComponent::Group);
+        self.components.push(PathComponent::GroupId(group_id));
+        self.components.push(PathComponent::Resources);
+        self.components.push(PathComponent::Data);
+        self.components.push(PathComponent::Bucket(bucket));
+        self.components.push(PathComponent::Key(key_prefix));
         self
     }
 
@@ -546,9 +614,10 @@ impl Display for Path {
                 PathComponent::GroupAdmin => write!(f, "/a")?,
                 PathComponent::Resources => write!(f, "/r")?,
                 PathComponent::Data => write!(f, "/d")?,
+                PathComponent::Bucket(bucket) => write!(f, "/{}", bucket)?,
+                PathComponent::Key(key) => write!(f, "/{}", key)?,
                 PathComponent::ContentHash(content_hash) => {
-                    let encoded = URL_SAFE_NO_PAD.encode(content_hash.as_bytes());
-                    write!(f, "/{}", encoded)?;
+                    write!(f, "#{}", content_hash.to_hex())?;
                 }
                 PathComponent::Metadata => write!(f, "/m")?,
                 PathComponent::ProjectId(project_id) => write!(f, "/{}", project_id)?,
@@ -584,6 +653,19 @@ fn is_valid_ulid_char(c: char) -> bool {
     c.is_ascii_alphanumeric() && !c.is_ascii_lowercase()
 }
 
+/// Validates if a character is valid for bucket names.
+/// Bucket names follow S3 naming rules: alphanumeric, hyphens, underscores, dots.
+fn is_valid_bucket_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.'
+}
+
+/// Validates if a character is valid for S3 key names.
+/// S3 keys can contain most printable ASCII characters except the delimiter '#'
+fn is_valid_key_char(c: char) -> bool {
+    // Allow most printable ASCII characters except our delimiter '#'
+    c.is_ascii() && c.is_ascii_graphic() && c != '#'
+}
+
 /// Parses a ULID.
 fn ulid_parser(input: &str) -> IResult<&str, Ulid> {
     let (input, ulid_str) = take_while1(is_valid_ulid_char).parse(input)?;
@@ -594,23 +676,41 @@ fn ulid_parser(input: &str) -> IResult<&str, Ulid> {
     }
 }
 
-/// Parses a base64 encoded Blake3 hash.
-fn blake3_hash_parser(input: &str) -> IResult<&str, Blake3Hash> {
+/// Parses a bucket name (no slashes allowed).
+fn bucket_parser(input: &str) -> IResult<&str, String> {
+    let (input, bucket_str) = take_while1(is_valid_bucket_char).parse(input)?;
+    Ok((input, bucket_str.to_string()))
+}
+
+/// Parses a key name that can contain slashes and other characters.
+/// Stops at '#' delimiter or wildcard '/*'.
+fn key_parser(input: &str) -> IResult<&str, String> {
+    // Check for wildcard first
+    if input.starts_with("/*") {
+        return Err(NomErr::Error(NomError::new(input, ErrorKind::Tag)));
+    }
+
+    // Parse key until we hit '#' delimiter or end of input
+    let (input, key_str) = take_while1(is_valid_key_char).parse(input)?;
+
+    // Edge case: if the key ends with '/*', we treat it as a wildcard
+    if key_str.ends_with("/*") {
+        return Ok(("/*", key_str[..key_str.len() - 2].to_string()));
+    }
+
+    Ok((input, key_str.to_string()))
+}
+
+/// Parses the delimiter '#' followed by a base64-encoded Blake3 hash.
+fn content_hash_delimiter_parser(input: &str) -> IResult<&str, Blake3Hash> {
+    let (input, _) = tag("#").parse(input)?;
     let (input, hash_str) =
         take_while1(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_').parse(input)?;
 
-    match URL_SAFE_NO_PAD.decode(hash_str) {
-        Ok(bytes) => {
-            if bytes.len() == 32 {
-                let mut hash_bytes = [0u8; 32];
-                hash_bytes.copy_from_slice(&bytes);
-                Ok((input, Blake3Hash::from_bytes(hash_bytes)))
-            } else {
-                Err(NomErr::Error(NomError::new(input, ErrorKind::LengthValue)))
-            }
-        }
-        Err(_) => Err(NomErr::Error(NomError::new(input, ErrorKind::AlphaNumeric))),
-    }
+    let hash = Blake3Hash::from_str(hash_str)
+        .map_err(|_| NomErr::Error(NomError::new(input, ErrorKind::AlphaNumeric)))?;
+
+    Ok((input, hash))
 }
 
 /// Parser for a wildcard component.
@@ -761,14 +861,46 @@ fn path_parser(input: &str) -> IResult<&str, Vec<PathComponent>> {
 
                     match resource_type {
                         PathComponent::Data => {
-                            // After /r/d we can have a content hash or /*
+                            // After /r/d we can have a bucket or /*
                             if let Ok((input, wildcard)) = wildcard_parser.parse(remaining) {
                                 components.push(wildcard);
                                 return Ok((input, components));
                             }
 
                             let (input, _) = tag("/").parse(remaining)?;
-                            let (input, hash) = blake3_hash_parser(input)?;
+                            let (input, bucket) = bucket_parser(input)?;
+                            components.push(PathComponent::Bucket(bucket));
+
+                            remaining = input;
+
+                            // After bucket we can have a key or /*
+                            if remaining.is_empty() {
+                                return Ok((remaining, components));
+                            }
+
+                            if let Ok((input, wildcard)) = wildcard_parser.parse(remaining) {
+                                components.push(wildcard);
+                                return Ok((input, components));
+                            }
+
+                            let (input, _) = tag("/").parse(remaining)?;
+                            let (input, key) = key_parser(input)?;
+                            components.push(PathComponent::Key(key));
+
+                            remaining = input;
+
+                            // After key we can have a content hash with delimiter or /*
+                            if remaining.is_empty() {
+                                return Ok((remaining, components));
+                            }
+
+                            if let Ok((input, wildcard)) = wildcard_parser.parse(remaining) {
+                                components.push(wildcard);
+                                return Ok((input, components));
+                            }
+
+                            // Parse content hash with '#' delimiter
+                            let (input, hash) = content_hash_delimiter_parser(remaining)?;
                             components.push(PathComponent::ContentHash(hash));
 
                             remaining = input;
@@ -851,11 +983,6 @@ mod tests {
         // Create a deterministic hash for tests
         let hash = blake3::hash(s.as_bytes());
         hash
-    }
-
-    // Helper function to encode a Blake3 hash as base64
-    fn encode_hash(hash: &Blake3Hash) -> String {
-        URL_SAFE_NO_PAD.encode(hash.as_bytes())
     }
 
     #[test]
@@ -958,13 +1085,44 @@ mod tests {
         assert!(!path.has_wildcards());
     }
 
+    // New tests for bucket/key functionality
     #[test]
-    fn test_parse_group_data() {
+    fn test_parse_group_data_with_bucket_key_hash() {
         let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+        let bucket = "my-bucket";
+        let key = "documents/file.txt";
         let hash = create_test_hash("test-content");
-        let encoded_hash = encode_hash(&hash);
-        let path_str = format!("{}/g/{}/r/d/{}", realm_id, group_id, encoded_hash);
+        let encoded_hash = hash.to_hex();
+        let path_str = format!(
+            "{}/g/{}/r/d/{}/{}#{}",
+            realm_id, group_id, bucket, key, encoded_hash
+        );
+
+        dbg!(&path_str);
+
+        let path = Path::parse(&path_str).unwrap();
+        assert_eq!(path.realm_id(), Some(realm_id));
+        assert_eq!(path.components().len(), 8);
+        assert_eq!(path.components()[0], PathComponent::RealmId(realm_id));
+        assert_eq!(path.components()[1], PathComponent::Group);
+        assert_eq!(path.components()[2], PathComponent::GroupId(group_id));
+        assert_eq!(path.components()[3], PathComponent::Resources);
+        assert_eq!(path.components()[4], PathComponent::Data);
+        assert_eq!(
+            path.components()[5],
+            PathComponent::Bucket(bucket.to_string())
+        );
+        assert_eq!(path.components()[6], PathComponent::Key(key.to_string()));
+        assert_eq!(path.components()[7], PathComponent::ContentHash(hash));
+        assert!(!path.has_wildcards());
+    }
+
+    #[test]
+    fn test_parse_group_data_wildcard() {
+        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+        let path_str = format!("{}/g/{}/r/d/*", realm_id, group_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -974,8 +1132,62 @@ mod tests {
         assert_eq!(path.components()[2], PathComponent::GroupId(group_id));
         assert_eq!(path.components()[3], PathComponent::Resources);
         assert_eq!(path.components()[4], PathComponent::Data);
-        assert_eq!(path.components()[5], PathComponent::ContentHash(hash));
-        assert!(!path.has_wildcards());
+        assert_eq!(path.components()[5], PathComponent::Wildcard);
+        assert!(path.has_wildcards());
+    }
+
+    #[test]
+    fn test_parse_group_data_bucket_wildcard() {
+        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+        let bucket = "my-bucket";
+        let path_str = format!("{}/g/{}/r/d/{}/*", realm_id, group_id, bucket);
+
+        let path = Path::parse(&path_str).unwrap();
+        assert_eq!(path.realm_id(), Some(realm_id));
+        assert_eq!(path.components().len(), 7);
+        assert_eq!(path.components()[0], PathComponent::RealmId(realm_id));
+        assert_eq!(path.components()[1], PathComponent::Group);
+        assert_eq!(path.components()[2], PathComponent::GroupId(group_id));
+        assert_eq!(path.components()[3], PathComponent::Resources);
+        assert_eq!(path.components()[4], PathComponent::Data);
+        assert_eq!(
+            path.components()[5],
+            PathComponent::Bucket(bucket.to_string())
+        );
+        assert_eq!(path.components()[6], PathComponent::Wildcard);
+        assert!(path.has_wildcards());
+    }
+
+    #[test]
+    fn test_parse_group_data_key_prefix_wildcard() {
+        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+        let bucket = "my-bucket";
+        let key_prefix = "documents";
+        let path_str = format!(
+            "{}/g/{}/r/d/{}/{}/*",
+            realm_id, group_id, bucket, key_prefix
+        );
+
+        let path = Path::parse(&path_str).unwrap();
+        assert_eq!(path.realm_id(), Some(realm_id));
+        assert_eq!(path.components().len(), 8);
+        assert_eq!(path.components()[0], PathComponent::RealmId(realm_id));
+        assert_eq!(path.components()[1], PathComponent::Group);
+        assert_eq!(path.components()[2], PathComponent::GroupId(group_id));
+        assert_eq!(path.components()[3], PathComponent::Resources);
+        assert_eq!(path.components()[4], PathComponent::Data);
+        assert_eq!(
+            path.components()[5],
+            PathComponent::Bucket(bucket.to_string())
+        );
+        assert_eq!(
+            path.components()[6],
+            PathComponent::Key(key_prefix.to_string())
+        );
+        assert_eq!(path.components()[7], PathComponent::Wildcard);
+        assert!(path.has_wildcards());
     }
 
     #[test]
@@ -1133,24 +1345,6 @@ mod tests {
     }
 
     #[test]
-    fn test_wildcard_data() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let path_str = format!("{}/g/{}/r/d/*", realm_id, group_id);
-
-        let path = Path::parse(&path_str).unwrap();
-        assert_eq!(path.realm_id(), Some(realm_id));
-        assert_eq!(path.components().len(), 6);
-        assert_eq!(path.components()[0], PathComponent::RealmId(realm_id));
-        assert_eq!(path.components()[1], PathComponent::Group);
-        assert_eq!(path.components()[2], PathComponent::GroupId(group_id));
-        assert_eq!(path.components()[3], PathComponent::Resources);
-        assert_eq!(path.components()[4], PathComponent::Data);
-        assert_eq!(path.components()[5], PathComponent::Wildcard);
-        assert!(path.has_wildcards());
-    }
-
-    #[test]
     fn test_wildcard_metadata() {
         let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
@@ -1213,107 +1407,43 @@ mod tests {
         assert!(path.has_wildcards());
     }
 
+    // New builder tests for bucket/key functionality
     #[test]
-    fn test_builder_admin_wildcards() {
+    fn test_builder_group_data_with_bucket_key() {
         let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+        let bucket = "my-bucket".to_string();
+        let key = "documents/file.txt".to_string();
+        let hash = create_test_hash("test-content");
 
-        // Test admin wildcard
         let path = Path::builder()
             .realm_id(realm_id)
-            .admin()
-            .wildcard()
-            .build()
-            .unwrap();
-
-        assert_eq!(path.to_string(), format!("{}/a/*", realm_id));
-        assert!(path.has_wildcards());
-
-        // Test admin groups wildcard
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .admin_groups()
-            .wildcard()
-            .build()
-            .unwrap();
-
-        assert_eq!(path.to_string(), format!("{}/a/g/*", realm_id));
-        assert!(path.has_wildcards());
-
-        // Test admin policies wildcard
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .admin_policies()
-            .wildcard()
-            .build()
-            .unwrap();
-
-        assert_eq!(path.to_string(), format!("{}/a/p/*", realm_id));
-        assert!(path.has_wildcards());
-
-        // Test admin policy wildcard
-        let policy_id = create_test_ulid("01H1VECTFR1111111111111111");
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .admin_policy(policy_id)
-            .wildcard()
+            .group_data(group_id, bucket.clone(), key.clone(), hash)
             .build()
             .unwrap();
 
         assert_eq!(
             path.to_string(),
-            format!("{}/a/p/{}/*", realm_id, policy_id)
+            format!(
+                "{}/g/{}/r/d/{}/{}#{}",
+                realm_id,
+                group_id,
+                bucket,
+                key,
+                hash.to_hex()
+            )
         );
-        assert!(path.has_wildcards());
+        assert!(!path.has_wildcards());
     }
 
     #[test]
-    fn test_builder_group_wildcards() {
+    fn test_builder_group_data_wildcards() {
         let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+        let bucket = "my-bucket".to_string();
+        let key_prefix = "documents".to_string();
 
-        // Test group wildcard
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .group(group_id)
-            .wildcard()
-            .build()
-            .unwrap();
-
-        assert_eq!(path.to_string(), format!("{}/g/{}/*", realm_id, group_id));
-        assert!(path.has_wildcards());
-
-        // Test group admin wildcard
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .group_admin(group_id)
-            .wildcard()
-            .build()
-            .unwrap();
-
-        assert_eq!(path.to_string(), format!("{}/g/{}/a/*", realm_id, group_id));
-        assert!(path.has_wildcards());
-    }
-
-    #[test]
-    fn test_builder_resource_wildcards() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-
-        // Test resources wildcard
-        let components = vec![
-            PathComponent::RealmId(realm_id),
-            PathComponent::Group,
-            PathComponent::GroupId(group_id),
-            PathComponent::Resources,
-            PathComponent::Wildcard,
-        ];
-
-        let path = Path { components };
-
-        assert_eq!(path.to_string(), format!("{}/g/{}/r/*", realm_id, group_id));
-        assert!(path.has_wildcards());
-
-        // Test data wildcard using the builder's specialized methods
+        // Test data wildcard
         let path = Path::builder()
             .realm_id(realm_id)
             .group_data_wildcard(group_id)
@@ -1326,167 +1456,235 @@ mod tests {
         );
         assert!(path.has_wildcards());
 
-        // Test metadata wildcard using the builder's specialized methods
+        // Test bucket wildcard
         let path = Path::builder()
             .realm_id(realm_id)
-            .group_metadata_wildcard(group_id)
+            .group_data_bucket_wildcard(group_id, bucket.clone())
             .build()
             .unwrap();
 
         assert_eq!(
             path.to_string(),
-            format!("{}/g/{}/r/m/*", realm_id, group_id)
+            format!("{}/g/{}/r/d/{}/*", realm_id, group_id, bucket)
         );
         assert!(path.has_wildcards());
 
-        // Test project wildcard using the builder's specialized methods
-        let project_id = create_test_ulid("01H1VECTFR3333333333333333");
+        // Test key prefix wildcard
         let path = Path::builder()
             .realm_id(realm_id)
-            .group_metadata_project_wildcard(group_id, project_id)
-            .build()
-            .unwrap();
-
-        assert_eq!(
-            path.to_string(),
-            format!("{}/g/{}/r/m/{}/*", realm_id, group_id, project_id)
-        );
-        assert!(path.has_wildcards());
-
-        // Test metadata path wildcard using the builder's specialized methods
-        let object_id = create_test_ulid("01H1VECTFR4444444444444444");
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .group_metadata_specific_path_wildcard(group_id, project_id, vec![object_id])
+            .group_data_key_prefix_wildcard(group_id, bucket.clone(), key_prefix.clone())
             .build()
             .unwrap();
 
         assert_eq!(
             path.to_string(),
             format!(
-                "{}/g/{}/r/m/{}/{}/*",
-                realm_id, group_id, project_id, object_id
+                "{}/g/{}/r/d/{}/{}/*",
+                realm_id, group_id, bucket, key_prefix
             )
         );
         assert!(path.has_wildcards());
     }
 
     #[test]
-    fn test_path_validation() {
+    fn test_path_validation_bucket_key() {
         let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
 
-        // Test invalid path with wildcard not at the end
+        // Test invalid path with bucket but no key and no wildcard (this is now valid)
         let components = vec![
             PathComponent::RealmId(realm_id),
-            PathComponent::Admin,
-            PathComponent::Wildcard,
-            PathComponent::Groups, // Invalid: component after wildcard
-        ];
-
-        let path = Path { components };
-        assert!(path.validate().is_err());
-
-        // Test invalid path with incorrect sequence
-        let components = vec![
-            PathComponent::RealmId(realm_id),
-            PathComponent::Admin,
-            PathComponent::Data, // Invalid: Data not valid after Admin
-        ];
-
-        let path = Path { components };
-        assert!(path.validate().is_err());
-
-        // Test invalid path starting with Group (no RealmId)
-        let components = vec![
-            PathComponent::Group, // Invalid: path must start with RealmId
+            PathComponent::Group,
             PathComponent::GroupId(group_id),
+            PathComponent::Resources,
+            PathComponent::Data,
+            PathComponent::Bucket("my-bucket".to_string()),
         ];
 
         let path = Path { components };
-        assert!(path.validate().is_err());
+        assert!(path.validate().is_ok());
+
+        // Test invalid path with key but no content hash and no wildcard (this is now valid)
+        let components = vec![
+            PathComponent::RealmId(realm_id),
+            PathComponent::Group,
+            PathComponent::GroupId(group_id),
+            PathComponent::Resources,
+            PathComponent::Data,
+            PathComponent::Bucket("my-bucket".to_string()),
+            PathComponent::Key("my-key".to_string()),
+        ];
+
+        let path = Path { components };
+        assert!(path.validate().is_ok());
+
+        // Test valid path with wildcard after data
+        let components = vec![
+            PathComponent::RealmId(realm_id),
+            PathComponent::Group,
+            PathComponent::GroupId(group_id),
+            PathComponent::Resources,
+            PathComponent::Data,
+            PathComponent::Wildcard,
+        ];
+
+        let path = Path { components };
+        assert!(path.validate().is_ok());
+
+        // Test valid path with wildcard after bucket
+        let components = vec![
+            PathComponent::RealmId(realm_id),
+            PathComponent::Group,
+            PathComponent::GroupId(group_id),
+            PathComponent::Resources,
+            PathComponent::Data,
+            PathComponent::Bucket("my-bucket".to_string()),
+            PathComponent::Wildcard,
+        ];
+
+        let path = Path { components };
+        assert!(path.validate().is_ok());
+
+        // Test valid path with wildcard after key
+        let components = vec![
+            PathComponent::RealmId(realm_id),
+            PathComponent::Group,
+            PathComponent::GroupId(group_id),
+            PathComponent::Resources,
+            PathComponent::Data,
+            PathComponent::Bucket("my-bucket".to_string()),
+            PathComponent::Key("my-key".to_string()),
+            PathComponent::Wildcard,
+        ];
+
+        let path = Path { components };
+        assert!(path.validate().is_ok());
     }
 
     #[test]
-    fn test_to_string() {
+    fn test_to_string_with_bucket_key() {
         let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let project_id = create_test_ulid("01H1VECTFR3333333333333333");
-        let folder_id = create_test_ulid("01H1VECTFR4444444444444444");
-        let policy_id = create_test_ulid("01H1VECTFR1111111111111111");
+        let bucket = "my-bucket".to_string();
+        let key = "documents/file.txt".to_string();
         let hash = create_test_hash("test-content");
 
-        // Test realm only path
-        let path = Path::builder().realm_id(realm_id).build().unwrap();
-        assert_eq!(path.to_string(), realm_id.to_string());
-
-        // Test admin path
-        let path = Path::builder().realm_id(realm_id).admin().build().unwrap();
-        assert_eq!(path.to_string(), format!("{}/a", realm_id));
-
-        // Test admin groups path
+        // Test complete data path with bucket/key/hash
         let path = Path::builder()
             .realm_id(realm_id)
-            .admin_groups()
-            .build()
-            .unwrap();
-        assert_eq!(path.to_string(), format!("{}/a/g", realm_id));
-
-        // Test admin policies path
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .admin_policies()
-            .build()
-            .unwrap();
-        assert_eq!(path.to_string(), format!("{}/a/p", realm_id));
-
-        // Test admin policy path
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .admin_policy(policy_id)
-            .build()
-            .unwrap();
-        assert_eq!(path.to_string(), format!("{}/a/p/{}", realm_id, policy_id));
-
-        // Test group path
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .group(group_id)
-            .build()
-            .unwrap();
-        assert_eq!(path.to_string(), format!("{}/g/{}", realm_id, group_id));
-
-        // Test group admin path
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .group_admin(group_id)
-            .build()
-            .unwrap();
-        assert_eq!(path.to_string(), format!("{}/g/{}/a", realm_id, group_id));
-
-        // Test group data path
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .group_data(group_id, hash)
-            .build()
-            .unwrap();
-        assert_eq!(
-            path.to_string(),
-            format!("{}/g/{}/r/d/{}", realm_id, group_id, encode_hash(&hash))
-        );
-
-        // Test group metadata path
-        let path = Path::builder()
-            .realm_id(realm_id)
-            .group_metadata(group_id, project_id, vec![folder_id])
+            .group_data(group_id, bucket.clone(), key.clone(), hash)
             .build()
             .unwrap();
         assert_eq!(
             path.to_string(),
             format!(
-                "{}/g/{}/r/m/{}/{}",
-                realm_id, group_id, project_id, folder_id
+                "{}/g/{}/r/d/{}/{}#{}",
+                realm_id,
+                group_id,
+                bucket,
+                key,
+                hash.to_hex()
             )
         );
+
+        // Test data wildcard
+        let path = Path::builder()
+            .realm_id(realm_id)
+            .group_data_wildcard(group_id)
+            .build()
+            .unwrap();
+        assert_eq!(
+            path.to_string(),
+            format!("{}/g/{}/r/d/*", realm_id, group_id)
+        );
+
+        // Test bucket wildcard
+        let path = Path::builder()
+            .realm_id(realm_id)
+            .group_data_bucket_wildcard(group_id, bucket.clone())
+            .build()
+            .unwrap();
+        assert_eq!(
+            path.to_string(),
+            format!("{}/g/{}/r/d/{}/*", realm_id, group_id, bucket)
+        );
+
+        // Test key prefix wildcard
+        let key_prefix = "docs".to_string();
+        let path = Path::builder()
+            .realm_id(realm_id)
+            .group_data_key_prefix_wildcard(group_id, bucket.clone(), key_prefix.clone())
+            .build()
+            .unwrap();
+        assert_eq!(
+            path.to_string(),
+            format!(
+                "{}/g/{}/r/d/{}/{}/*",
+                realm_id, group_id, bucket, key_prefix
+            )
+        );
+    }
+
+    #[test]
+    fn test_new_format_with_slashes_in_keys() {
+        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+        let bucket = "my-bucket";
+        let key = "folder1/folder2/file.txt"; // Key with slashes
+        let hash = create_test_hash("test-content");
+        let encoded_hash = hash.to_hex();
+
+        // New format: bucket/key#hash
+        let path_str = format!(
+            "{}/g/{}/r/d/{}/{}#{}",
+            realm_id, group_id, bucket, key, encoded_hash
+        );
+
+        let path = Path::parse(&path_str).unwrap();
+        assert_eq!(path.realm_id(), Some(realm_id));
+        assert_eq!(path.components().len(), 8);
+        assert_eq!(
+            path.components()[5],
+            PathComponent::Bucket(bucket.to_string())
+        );
+        assert_eq!(path.components()[6], PathComponent::Key(key.to_string()));
+        assert_eq!(path.components()[7], PathComponent::ContentHash(hash));
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+
+        // Case 1: <bucket>/key_part1/keypart2 (key with slashes, no hash)
+        // This would be: realm/g/group/r/d/bucket/key_part1/keypart2/*
+        let path_str = format!("{}/g/{}/r/d/my-bucket/docs/subfolder/*", realm_id, group_id);
+        let path = Path::parse(&path_str).unwrap();
+        assert!(path.has_wildcards());
+
+        // Case 2: <bucket>/* (bucket with wildcard)
+        let path_str = format!("{}/g/{}/r/d/my-bucket/*", realm_id, group_id);
+        let path = Path::parse(&path_str).unwrap();
+        assert!(path.has_wildcards());
+
+        // Case 3: <bucket>/keypart1/keypart2/* (bucket with key wildcard)
+        let path_str = format!("{}/g/{}/r/d/my-bucket/docs/files/*", realm_id, group_id);
+        let path = Path::parse(&path_str).unwrap();
+        assert!(path.has_wildcards());
+
+        // Case 4: <bucket>/keypart1/keypart2#hash (bucket and key with content hash)
+        let hash = create_test_hash("test");
+        let encoded_hash = hash.to_hex();
+        let path_str = format!(
+            "{}/g/{}/r/d/my-bucket/docs/file.txt#{}",
+            realm_id, group_id, encoded_hash
+        );
+        let path = Path::parse(&path_str).unwrap();
+        assert!(!path.has_wildcards());
+        assert_eq!(
+            path.components()[6],
+            PathComponent::Key("docs/file.txt".to_string())
+        );
+        assert_eq!(path.components()[7], PathComponent::ContentHash(hash));
     }
 }

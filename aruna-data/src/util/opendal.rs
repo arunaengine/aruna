@@ -10,6 +10,7 @@ use std::fmt::Display;
 pub enum Backend {
     S3,
     HTTP,
+    Memory,
     Postgres,
     FileSystem,
 }
@@ -19,6 +20,7 @@ impl Display for Backend {
         match self {
             Backend::S3 => write!(f, "s3"),
             Backend::HTTP => write!(f, "http"),
+            Backend::Memory => write!(f, "memory"),
             Backend::Postgres => write!(f, "postgres"),
             Backend::FileSystem => write!(f, "filesystem"),
         }
@@ -29,6 +31,7 @@ pub async fn get_operator(backend: &Backend, config: HashMap<String, String>) ->
     let op = match backend {
         Backend::S3 => init_service::<services::S3>(config)?,
         Backend::HTTP => init_service::<services::Http>(config)?,
+        Backend::Memory => init_service::<services::Memory>(config)?,
         Backend::Postgres => init_service::<services::Postgresql>(config)?,
         Backend::FileSystem => init_service::<services::Fs>(config)?,
     };

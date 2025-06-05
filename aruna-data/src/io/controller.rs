@@ -1,22 +1,32 @@
 use crate::api_json::request::{Request, User};
 use crate::{IOHandler, error::ArunaDataError};
+use aruna_permission::manager::PermissionManager;
 use aruna_storage::storage::store::Store;
+use parking_lot::RwLock;
 use std::sync::Arc;
+use ulid::Ulid;
 
 pub struct Controller<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
     pub io_handler: Arc<IOHandler<St>>,
+    pub permission_manager: Arc<RwLock<PermissionManager>>,
 }
 
 impl<St> Controller<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(io_handler))]
-    pub fn new(io_handler: Arc<IOHandler<St>>) -> Self {
-        let controller = Self { io_handler };
+    #[tracing::instrument(level = "trace", skip(io_handler, permission_manager))]
+    pub fn new(
+        io_handler: Arc<IOHandler<St>>,
+        permission_manager: Arc<RwLock<PermissionManager>>,
+    ) -> Self {
+        let controller = Self {
+            io_handler,
+            permission_manager,
+        };
         controller
     }
     #[tracing::instrument(level = "trace", skip(self, request, token))]
@@ -28,21 +38,16 @@ where
         match request.forward_or_return(&token, self).await? {
             Some(response) => Ok(response),
             None => {
-                // TODO: Replace this with real authentication
                 let user = match token {
-                    Some(_id) => {
-                        /*TODO: Proper authentication
-                        self.io_handler
-                            .store
-                            .get_user(
-                                &Ulid::from_string(&id)
-                                    .map_err(|e| ArunaDataError::DeserializeError(e.to_string()))?,
-                            )
-                            .await?
-                        */
+                    Some(_token) => {
+                        //TODO: Validate token signature
+                        //let (user, group_id) = self.permission_manager.validate_token(&token).await?;
+
+                        //TODO: Properly fetch user info from store
                         Some(User {
-                            id: Default::default(),
-                            name: "".to_string(),
+                            id: Ulid::from_string("01JWB4X5TY0K776QDDCHGK3KT2")?,
+                            group: Ulid::from_string("01JWB4XFCRJX53Q839QMHPGSXH")?,
+                            name: "John Doe".to_string(),
                         })
                     }
                     None => None,

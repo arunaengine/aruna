@@ -1,5 +1,5 @@
-use crate::io::controller::Controller;
 use crate::error::ArunaDataError;
+use crate::io::controller::Controller;
 use aruna_storage::storage::store::Store;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -11,6 +11,7 @@ use utoipa::ToSchema;
 pub struct User {
     pub id: Ulid,
     pub name: String,
+    pub group: Ulid,
 }
 
 #[async_trait::async_trait]
