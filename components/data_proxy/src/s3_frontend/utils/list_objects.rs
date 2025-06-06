@@ -42,6 +42,7 @@ pub async fn list_response(
     bucket_name: &str,
     start_at: &str,
     max_keys: usize,
+    v1: bool, // If true, returns raw path marker instead of continuation token
 ) -> Result<(BTreeSet<Contents>, BTreeSet<String>, Option<String>)> {
     let mut keys: BTreeSet<Contents> = BTreeSet::default();
     let mut common_prefixes: BTreeSet<String> = BTreeSet::default();
@@ -53,7 +54,11 @@ pub async fn list_response(
                 // Breaks with next path to start at after max_keys is reached
                 let num_keys = keys.len() + common_prefixes.len();
                 if num_keys == max_keys {
-                    new_continuation_token = Some(general_purpose::STANDARD_NO_PAD.encode(path));
+                    new_continuation_token = if v1 {
+                        Some(path)
+                    } else {
+                        Some(general_purpose::STANDARD_NO_PAD.encode(path))
+                    };
                     break;
                 }
 
@@ -85,7 +90,11 @@ pub async fn list_response(
                 // Breaks with next path to start at after max_keys is reached
                 let num_keys = keys.len() + common_prefixes.len();
                 if num_keys == max_keys {
-                    new_continuation_token = Some(general_purpose::STANDARD_NO_PAD.encode(path));
+                    new_continuation_token = if v1 {
+                        Some(path)
+                    } else {
+                        Some(general_purpose::STANDARD_NO_PAD.encode(path))
+                    };
                     break;
                 }
 
@@ -111,7 +120,11 @@ pub async fn list_response(
                 // Breaks with next path to start at after max_keys is reached
                 let num_keys = keys.len() + common_prefixes.len();
                 if num_keys == max_keys {
-                    new_continuation_token = Some(general_purpose::STANDARD_NO_PAD.encode(path));
+                    new_continuation_token = if v1 {
+                        Some(path)
+                    } else {
+                        Some(general_purpose::STANDARD_NO_PAD.encode(path))
+                    };
                     break;
                 }
 
@@ -135,7 +148,11 @@ pub async fn list_response(
                 // Breaks with next path to start at after max_keys is reached
                 let num_keys = keys.len() + common_prefixes.len();
                 if num_keys == max_keys {
-                    new_continuation_token = Some(general_purpose::STANDARD_NO_PAD.encode(path));
+                    new_continuation_token = if v1 {
+                        Some(path)
+                    } else {
+                        Some(general_purpose::STANDARD_NO_PAD.encode(path))
+                    };
                     break;
                 }
 

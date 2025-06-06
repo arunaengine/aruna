@@ -878,6 +878,7 @@ impl S3 for ArunaS3Service {
             project_name,
             &start_after,
             max_keys,
+            false
         )
         .await
         .map_err(|_| {
