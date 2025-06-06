@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 aruna-net = { path = "../aruna-net" }
-ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+ed25519-dalek = { workspace = true }
 iroh = { workspace = true }
 parking_lot = { workspace = true }
 thiserror = { workspace = true }

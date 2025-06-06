@@ -24,6 +24,7 @@ anyhow = "1.0.98"
 async-trait = "0.1.88"
 blake3 = { version = "1.8.2", features = ["serde"] }
 dotenvy = "0.15.7"
+ed25519-dalek = { version = "2.1.1", features = ["rand_core", "pem"] }
 iroh = "0.35.0"
 iroh-base = "0.35.0"
 parking_lot = { version = "0.12.4", features = ["deadlock_detection"] }
