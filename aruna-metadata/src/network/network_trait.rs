@@ -100,10 +100,12 @@ pub trait Network: Sync + Send + Sized {
     async fn get_realm_nodes(&self) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn store(&self, subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError>;
     async fn store_in_realm(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
+    async fn get_realm_key(&self) -> Result<[u8; 32], ArunaMetadataError>;
 }
 
 pub struct NetworkDummy {
     self_id: NodeAddr,
+    realm_key: [u8; 32],
 }
 
 #[async_trait::async_trait]
@@ -116,6 +118,7 @@ impl Network for NetworkDummy {
                 PublicKey::from_bytes(&[0u8; 32])
                     .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?,
             ),
+            realm_key: [0u8; 32],
         })
     }
     async fn get_addr(&self) -> Result<NodeAddr, ArunaMetadataError> {
@@ -178,6 +181,10 @@ impl Network for NetworkDummy {
 
     async fn store_in_realm(&self, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
         Ok(())
+    }
+
+    async fn get_realm_key(&self) -> Result<[u8; 32], ArunaMetadataError> {
+        Ok(self.realm_key)
     }
 }
 
@@ -302,6 +309,14 @@ impl Network for P2PNetwork {
         Ok(find_results)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
+    async fn get_realm_key(&self) -> Result<Option<[u8; 32]>, ArunaMetadataError> {
+        todo!()
+        //Ok(self
+        //    .realm_handler
+        //    .as_ref()
+        //    .map(|r| r.realm_public_key().as_bytes().clone()))
+    }
     #[tracing::instrument(level = "trace", skip(self, subject, stream))]
     async fn sync(
         &self,
@@ -579,19 +594,20 @@ impl P2PNetwork {
                 Body::Request { token, request } => {
                     let user = match token {
                         Some(id) => {
-                            match controller
-                                .persistence
-                                .get_user(&Ulid::from_string(&id).map_err(|e| {
-                                    ArunaMetadataError::DeserializeError(e.to_string())
-                                })?)
-                                .await
-                            {
-                                Ok(user) => user,
-                                Err(e) => {
-                                    error!(?e);
-                                    return Err(e);
-                                }
-                            }
+                            todo!("Get UserIdentity from token")
+                            //match controller
+                            //    .persistence
+                            //    .get_user(&Ulid::from_string(&id).map_err(|e| {
+                            //        ArunaMetadataError::DeserializeError(e.to_string())
+                            //    })?)
+                            //    .await
+                            //{
+                            //    Ok(user) => user,
+                            //    Err(e) => {
+                            //        error!(?e);
+                            //        return Err(e);
+                            //    }
+                            //}
                         }
                         None => None,
                     };

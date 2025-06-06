@@ -8,11 +8,15 @@ use crate::{
     persistence::persistence::tables::*,
 };
 use ahash::RandomState;
+use aruna_permission::{
+    PermissionManager, TokenSystem, UserIdentity, manager::CreateGroupPrepare,
+    token::OidcTrustConfig,
+};
 use aruna_storage::storage::store::Store;
 use automerge::{ActorId, AutoCommit, sync::State};
 use autosurgeon::reconcile;
 use iroh::PublicKey;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::{
     collections::HashMap,
@@ -34,7 +38,6 @@ pub mod tables {
     pub const PUBLIC_MAPPINGS_DB_NAME: &str = "public_mappings";
 }
 
-#[derive(Debug)]
 pub struct Persistor<St, Se>
 where
     for<'a> St: Store<'a>,
@@ -45,6 +48,8 @@ where
     pub(super) idx_counter: Arc<AtomicU32>,
     pub(super) connection_states:
         Arc<Mutex<HashMap<Ulid, HashMap<PublicKey, State, RandomState>, RandomState>>>,
+    pub(super) permission_manager: PermissionManager,
+    //pub(super) token_handler: Arc<RwLock<TokenSystem>>,
 }
 
 impl<Se, St> Persistor<St, Se>
@@ -57,8 +62,11 @@ where
         res_sdx: tokio::sync::mpsc::Sender<(u32, Resource)>,
         store_config: <St as Store<'static>>::StoreConfig,
         search_config: Se::SearchConfig,
+        //realm_id: Ulid,
+        //oidc_trust_config: OidcTrustConfig,
     ) -> Result<Self, ArunaMetadataError> {
-        let store = Arc::new(St::new(store_config).unwrap());
+        let store = Arc::new(St::new(store_config)?);
+        let permission_manager = PermissionManager::new().await?;
         let search = tokio::task::spawn_blocking(move || {
             let search = Se::new(search_config)?;
             Ok::<Arc<Se>, ArunaMetadataError>(Arc::new(search))
@@ -132,6 +140,7 @@ where
             search,
             idx_counter,
             connection_states: Arc::new(Mutex::new(HashMap::default())),
+            permission_manager,
         })
     }
 
@@ -384,18 +393,29 @@ where
     pub async fn add_group(
         &self,
         actor_id: &[u8; 32],
-        user_id: &Ulid,
+        realm_key: &[u8; 32],
+        user: &UserIdentity,
         group: Group,
     ) -> Result<AutoCommit, ArunaMetadataError> {
         // Clones for spawn_blocking
         let store = self.store.clone();
-        let user_id = *user_id;
+        let permission = self.permission_manager.clone();
+        let group_id = group.id;
+        let realm_id = todo!("wait for merge");
+        let user = user.clone();
 
         // Generate actor id
-        let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
+        let actor_id = ActorId::from(
+            [
+                user.user_ulid.to_bytes().as_slice(),
+                user.realm_ulid.to_bytes().as_slice(),
+                actor_id.as_slice(),
+            ]
+            .concat(),
+        );
 
-        let result =
-            tokio::task::spawn_blocking(move || -> Result<AutoCommit, ArunaMetadataError> {
+        let (commit_handle, result) = tokio::task::spawn_blocking(
+            move || -> Result<(CreateGroupPrepare, AutoCommit), ArunaMetadataError> {
                 let mut write_txn = store.create_txn(true)?;
 
                 // Serialize into &[u8]
@@ -404,24 +424,34 @@ where
                 let mut doc = automerge::AutoCommit::new().with_actor(actor_id);
 
                 autosurgeon::reconcile(&mut doc, group)?;
-                let group = doc.save();
+                let group_doc = doc.save();
 
                 let mut bitmap = Vec::new();
                 RoaringBitmap::new().serialize_into(&mut bitmap)?;
 
                 // Write in store
-                store.put(&mut write_txn, GROUPS_DB_NAME, &id, &group)?;
+                store.put(&mut write_txn, GROUPS_DB_NAME, &id, &group_doc)?;
 
-                todo!("add group to permission handler");
-                todo!("add roles to permission handler");
+                let handle = permission.create_group_prepare(
+                    group_id,
+                    &user,
+                    realm_id,
+                    store.as_ref(),
+                    &mut write_txn,
+                )?;
+
                 //store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
 
                 // Commit
                 store.commit(write_txn)?;
-                Ok::<AutoCommit, ArunaMetadataError>(doc)
-            })
-            .await
-            .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+                Ok::<(CreateGroupPrepare, AutoCommit), ArunaMetadataError>((handle, doc))
+            },
+        )
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+        //self.permission_manager
+        //    .create_group_commit(commit_handle)
+        //    .await?;
 
         Ok(result)
     }
@@ -433,7 +463,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
-    fn authorize(&self, _user_id: &Ulid, _resource_id: &Ulid) -> bool {
+    fn authorize(&self, user_identity: &Ulid, _resource_id: &Ulid) -> bool {
         // TODO: Use casbin here
         true
     }

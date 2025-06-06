@@ -8,6 +8,7 @@ use crate::{
     network::network_trait::Network,
     persistence::search::search::Search,
 };
+use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use tracing::{error, trace};
 use ulid::Ulid;
@@ -42,13 +43,14 @@ where
                 // TODO: Replace this with real authorization
                 let user =
                     match user {
-                        Some(id) => {
-                            controller
-                                .persistence
-                                .get_user(&Ulid::from_string(&id).map_err(|e| {
-                                    ArunaMetadataError::DeserializeError(e.to_string())
-                                })?)
-                                .await?
+                        Some(token) => {
+                        todo!();
+                            //controller
+                            //    .persistence
+                            //    .get_user(&Ulid::from_string(&id).map_err(|e| {
+                            //        ArunaMetadataError::DeserializeError(e.to_string())
+                            //    })?)
+                            //    .await?
                         }
                         None => None,
                     };
@@ -79,11 +81,11 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         trace!("got into search");
-        let user = user.map(|u| u.id);
+        let user = user.map(|u| u.user_ulid);
         let resources = controller.persistence.search(user, self.query).await?;
         trace!("return from search");
         Ok(SearchResponse { resources })

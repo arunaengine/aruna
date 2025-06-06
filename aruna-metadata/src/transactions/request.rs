@@ -1,8 +1,9 @@
 use super::controller::Controller;
 use crate::{
-    error::ArunaMetadataError, models::models::User, network::network_trait::Network,
+    error::ArunaMetadataError, network::network_trait::Network,
     persistence::search::search::Search,
 };
+use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 
 #[async_trait::async_trait]
@@ -15,7 +16,7 @@ where
     type Response;
     async fn run_request(
         self,
-        requester: Option<User>,
+        requester: Option<UserIdentity>,
         controller: &Controller<St, Se, N>,
     ) -> Result<Self::Response, ArunaMetadataError>;
 

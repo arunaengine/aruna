@@ -2,7 +2,7 @@ use super::request::Request;
 use crate::{
     error::ArunaMetadataError,
     models::{
-        models::{Resource, User},
+        models::Resource,
         requests::{
             CreateResourceRequest, CreateResourceResponse, GetInner, GetResourceRequest,
             GetResourceResponse, ResourceUpdateRequests, ResourceUpdateResponses,
@@ -15,6 +15,7 @@ use crate::{
     network::network_trait::{Network, REPLICATION_POLICY},
     persistence::{persistence::Authorize, search::search::Search},
 };
+use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use rand::seq::IteratorRandom;
 use ulid::Ulid;
@@ -40,13 +41,13 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        if !controller.persistence.authorize(&user.id, &self.parent_id) {
+        if !controller.persistence.authorize(&user.user_ulid, &self.parent_id) {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
 
@@ -81,7 +82,7 @@ where
         let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
-            .add_resource(node_id.as_bytes(), &user.id, resource.clone())
+            .add_resource(node_id.as_bytes(), &user.user_ulid, resource.clone())
             .await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
@@ -149,13 +150,13 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        if !controller.persistence.authorize(&user.id, &self.id) {
+        if !controller.persistence.authorize(&user.user_ulid, &self.id) {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
         let persistor = controller.persistence.clone();
@@ -209,13 +210,13 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        if !controller.persistence.authorize(&user.id, &self.get_id()) {
+        if !controller.persistence.authorize(&user.user_ulid, &self.get_id()) {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
 
@@ -300,7 +301,7 @@ where
         let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
-            .update_resource(node_id.as_bytes(), &user.id, resource.clone())
+            .update_resource(node_id.as_bytes(), &user.user_ulid, resource.clone())
             .await?;
 
         // Replay update only to members that already got the object

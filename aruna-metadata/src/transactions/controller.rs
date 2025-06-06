@@ -46,17 +46,17 @@ where
             Some(response) => Ok(response),
             None => {
                 // TODO: Replace this with real authorization
-                let user =
-                    match token {
-                        Some(id) => {
-                            self.persistence
-                                .get_user(&Ulid::from_string(&id).map_err(|e| {
-                                    ArunaMetadataError::DeserializeError(e.to_string())
-                                })?)
-                                .await?
-                        }
-                        None => None,
-                    };
+                let user = match token {
+                    Some(token) => {
+                        todo!("Get UserIdentity from token")
+                        //self.persistence
+                        //    .get_user(&Ulid::from_string(&id).map_err(|e| {
+                        //        ArunaMetadataError::DeserializeError(e.to_string())
+                        //    })?)
+                        //    .await?
+                    }
+                    None => None,
+                };
 
                 let result = request.run_request(user, self).await?;
                 Ok(result)

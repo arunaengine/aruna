@@ -13,6 +13,7 @@ use crate::{
     network::network_trait::Network,
     persistence::search::search::Search,
 };
+use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use ulid::Ulid;
 
@@ -34,10 +35,10 @@ where
         Ok(None)
     }
 
-    #[tracing::instrument(level = "trace", skip(controller))]
+    #[tracing::instrument(level = "trace", skip(controller, user))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
@@ -48,12 +49,13 @@ where
             id: group_id,
             name: self.name,
             roles: vec!["admin".to_string(), "member".to_string()],
-            members: BTreeMap::from([(user.id.to_string(), vec!["admin".to_string()])]),
+            members: BTreeMap::from([(user.user_ulid.to_string(), vec!["admin".to_string()])]),
         };
         let node_id = controller.network.get_addr().await?.node_id;
+        let realm_id = controller.network.get_realm_key().await?;
         let group_doc = controller
             .persistence
-            .add_group(node_id.as_bytes(), &user.id, group.clone())
+            .add_group(node_id.as_bytes(),realm_id, &user, group.clone())
             .await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
@@ -98,7 +100,7 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         todo!()
@@ -126,7 +128,7 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         todo!()
@@ -154,7 +156,7 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         todo!()

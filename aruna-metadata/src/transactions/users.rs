@@ -7,6 +7,7 @@ use crate::{
     network::network_trait::Network,
     persistence::search::search::Search,
 };
+use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use ulid::Ulid;
 
@@ -31,7 +32,7 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        _user: Option<User>,
+        _user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let user = User {
