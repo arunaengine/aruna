@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use aruna_net::Kademlia;
 use aruna_net::actor_handle::{NetworkActorHandle, ReceiveStreams};
 use aruna_permission::manager::{PermissionManager, ResourceId};
+use aruna_permission::paths::{Path, RealmKey};
 use aruna_storage::storage::store::Store;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -51,6 +52,7 @@ pub struct ObjectInfo {
 }
 
 #[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IOHandler<St>
 where
     for<'a> St: Store<'a> + 'static,
@@ -61,6 +63,7 @@ where
     kademlia: Kademlia,
     pub store: Arc<St>,
     pub permission_manager: PermissionManager,
+    realm_key: RealmKey,
 }
 
 impl<St> IOHandler<St>
@@ -78,6 +81,7 @@ where
         kademlia: Kademlia,
         store: Arc<St>,
         permission_manager: PermissionManager,
+        realm_key: RealmKey,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let repl_handler = Arc::new(Self {
             node_addr,
@@ -86,6 +90,7 @@ where
             kademlia,
             store,
             permission_manager,
+            realm_key,
         });
 
         repl_handler.clone().run().await;
@@ -283,7 +288,7 @@ where
 
         //TODO: Register resource in permission manager
         let perm_path = aruna_permission::paths::PathBuilder::new()
-            .realm_id(Ulid::new()) //TODO
+            .realm_id(self.realm_key) 
             .group_data(
                 group,
                 "bucket".to_string(), //TODO

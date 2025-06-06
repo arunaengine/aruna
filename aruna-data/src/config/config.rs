@@ -16,7 +16,7 @@ pub struct Config {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct General {
-    pub realm_id: String,
+    pub realm_key: String,
     pub node_key: String,
 }
 

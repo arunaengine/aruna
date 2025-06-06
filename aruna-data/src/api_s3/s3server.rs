@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing::{debug, error};
-use ulid::Ulid;
+use aruna_permission::paths::RealmKey;
 
 pub struct S3Server {
     s3service: S3Service,
@@ -45,7 +45,7 @@ impl S3Server {
         backend: Arc<IOHandler<LmdbStore>>,
         permission_manager: PermissionManager,
         node_id: NodeId,
-        realm_id: Ulid,
+        realm_id: RealmKey,
     ) -> Result<Self> {
         let s3service = ArunaS3Service::new(backend.clone(), node_id)
             .await
@@ -59,7 +59,7 @@ impl S3Server {
         let auth = AuthProvider {
             store: backend.store.clone(),
             permission_manager,
-            realm_id,
+            realm_key: realm_id,
         };
 
         let service = {
