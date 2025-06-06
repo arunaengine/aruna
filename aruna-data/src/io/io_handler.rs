@@ -28,7 +28,7 @@ use tracing::{debug, error, trace};
 use ulid::Ulid;
 
 pub const REPLICATION_PROTOCOL_ID: u32 = 2;
-pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16);
+pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); //2^16 bytes
 pub const ACCESS_DB_NAME: &str = "user_access";
 pub const LOCATION_DB_NAME: &str = "locations";
 pub const PATH_LOCATION_DB_NAME: &str = "path_locations_mapping";
@@ -51,7 +51,6 @@ pub struct ObjectInfo {
     pub file_hashes: Hashes,
 }
 
-#[derive(Debug, Clone)]
 #[derive(Clone)]
 pub struct IOHandler<St>
 where
@@ -109,7 +108,7 @@ where
                     Ok(inc_stream) = self.network.receive() => {
                         let self_clone = self.clone();
 
-                        trace!("Received stream from: {:?}", inc_stream.sender);
+                        trace!("{:?} Received stream from: {:?}", self.node_addr, inc_stream.sender);
                         tokio::spawn(
                             async move {
                                 if let Err(e) = self_clone.handle_incoming_p2p_stream(
@@ -251,7 +250,7 @@ where
         while let Some(bytes) = data_stream.next().await {
             let bytes = bytes?;
 
-            // Write first, then update
+            // Write first, then update hashes and written bytes
             writer.write_all(&bytes).await?;
             hasher.update(&bytes);
             written_bytes = written_bytes + bytes.len();
@@ -259,7 +258,7 @@ where
         writer.flush().await?;
         writer.close().await?;
 
-        // Store some technical metadata in persistence
+        // Store some technical metadata in persistence and publish content-hash
         let hashes = hasher.finalize()?;
         let blake3_hash = hashes.blake3.clone();
         let info = ObjectInfo {
@@ -271,46 +270,21 @@ where
             file_size: written_bytes as u64,
             file_hashes: hashes,
         };
-        debug!("New Object: {:#?}", info);
 
-        let store_clone = self.store.clone();
-        let info_clone = info.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut write_txn = store_clone.create_txn(true)?;
-
-            // Store object info with blake3 hash as key
-            store_clone.put(
-                &mut write_txn,
-                LOCATION_DB_NAME,
-                blake3_hash.as_bytes(), //&info.id.to_bytes(),
-                &bincode::serde::encode_to_vec(info_clone, bincode::config::standard())?,
-            )?;
-
-            // Store mapping of frontend path <--> blake3 hash
-            store_clone.put(
-                &mut write_txn,
-                PATH_LOCATION_DB_NAME,
-                frontend_path.as_bytes(),
-                blake3_hash.as_bytes(),
-            )?;
-            store_clone.commit(write_txn)?;
-
-            Ok::<(), anyhow::Error>(())
-        });
-
-        // Publish content hash location via Kademlia
-        self.kademlia
-            .store(*blake3_hash.as_bytes(), self.node_addr.clone(), None)
-            .await?;
+        self.store_location(&info, Some(frontend_path), None)?;
+        self.publish_hash(blake3_hash).await?;
 
         Ok(info)
     }
 
     pub async fn register_backend_data(&self, path: &str, group: Ulid) -> anyhow::Result<String> {
-        // Check if backend path resource exists
-        self.operator.exists(path).await?;
+        // Check if backend path resource exists by fetching stats
         let meta = self.operator.stat(path).await?;
 
+        //TODO: Parse path -> (..)
+        //let (frontend_path, backend_path) = self.parse_path(path)?;
+
+        //TODO: Wrap in tokio::spawn without await
         let mut hasher = Hasher::new();
         let mut reader =
             get_data_stream(&self.operator, path, None, Some(BLOCK_SIZE.bytes())).await?;
@@ -326,12 +300,12 @@ where
             .group_data(
                 group,
                 "bucket".to_string(), //TODO
-                "key".to_string(), //TODO
+                "key".to_string(),    //TODO
                 hashes.blake3,
-            ) 
+            )
             .build()?;
 
-        // Register resource
+        // Store location +
         let location = ObjectInfo {
             id: Ulid::new(),
             staging: false,
@@ -342,38 +316,9 @@ where
             file_hashes: hashes.clone(),
         };
 
-        let mut manager = PermissionManager::new().await?;
-        let store_clone = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut write_txn = store_clone.create_txn(true)?;
-            manager.add_resource(
-                ResourceId::Ulid(location.id),
-                &perm_path,
-                store_clone.as_ref(),
-                &mut write_txn,
-            )?;
-
-            // Store content hash --> location
-            store_clone.put(
-                &mut write_txn,
-                LOCATION_DB_NAME,
-                hashes.blake3.as_bytes(), //&info.id.to_bytes(),
-                &bincode::serde::encode_to_vec(location, bincode::config::standard())?,
-            )?;
-
-            //TODO: Store frontend path ?
-            store_clone.commit(write_txn)?;
-
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-
-        //TODO: Store mapping of frontend path <--> blake3 hash ?
-
-        // Publish content hash location via Kademlia
-        self.kademlia
-            .store(*hashes.blake3.as_bytes(), self.node_addr.clone(), None)
-            .await?;
+        //TODO: Store frontend path mapping?
+        self.store_location(&location, None, Some(perm_path))?;
+        self.publish_hash(hashes.blake3).await?;
 
         Ok("".to_string())
     }
@@ -464,7 +409,7 @@ where
         Ok(())
     }
 
-    async fn store_location(
+    fn store_location(
         &self,
         location: &ObjectInfo,
         frontend_path: Option<String>,
@@ -500,8 +445,14 @@ where
                 &mut write_txn,
             )?
         }
-
         self.store.commit(write_txn)?;
+
         Ok(())
+    }
+
+    async fn publish_hash(&self, hash: blake3::Hash) -> anyhow::Result<()> {
+        self.kademlia
+            .store(*hash.as_bytes(), self.get_node_addr(), None)
+            .await
     }
 }
