@@ -894,7 +894,7 @@ impl Cache {
         };
 
         self.multi_parts
-            .retain(|_, v| v.first().map_or(true, |e| e.object_id != id));
+            .retain(|_, v| v.first().is_none_or(|e| e.object_id != id));
 
         let object = old.1 .0.read().await;
         for p in self

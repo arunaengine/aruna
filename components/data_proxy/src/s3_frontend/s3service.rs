@@ -181,7 +181,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let response = CompleteMultipartUploadOutput {
-            e_tag: Some(format!("-{}", object.id.to_string())),
+            e_tag: Some(format!("-{}", object.id)),
             ..Default::default()
         };
 
@@ -997,7 +997,7 @@ impl S3 for ArunaS3Service {
             project_name,
             &start_after,
             max_keys,
-            false
+            false,
         )
         .await
         .map_err(|_| {
