@@ -7,6 +7,7 @@ use fjall::{
     TransactionalPartitionHandle, WriteTransaction,
 };
 
+#[derive(Clone)]
 pub struct FjallStore {
     keyspace: TransactionalKeyspace,
     //tables: FjallTables,

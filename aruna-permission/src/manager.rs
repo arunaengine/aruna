@@ -489,8 +489,7 @@ impl PermissionManager {
         user_identity: &UserIdentity,
         resource_id: ResourceId,
         action: Action,
-        store: Arc<S>,
-        //txn: &'a <S as Store<'a>>::Txn,
+        store: &S,
     ) -> Result<Path>
     where
         for<'a> S: Store<'a> + 'static,
@@ -503,7 +502,7 @@ impl PermissionManager {
                 let txn = store.create_txn(false)?;
                 // Resolve user identity to permission ULID (must exist)
                 let permission_ulid =
-                    manager.resolve_permission_ulid(&user_identity, store.as_ref(), &txn)?;
+                    manager.resolve_permission_ulid(&user_identity, &store, &txn)?;
 
                 // Retrieve path from resource mapping
                 let key = resource_id.to_string();

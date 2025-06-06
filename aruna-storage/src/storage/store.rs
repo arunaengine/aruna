@@ -1,7 +1,7 @@
 use crate::error::ArunaStorageError;
 use std::borrow::Cow;
 
-pub trait Store<'a>: Sync + Send + Sized + std::fmt::Debug {
+pub trait Store<'a>: Sync + Send + Sized + std::fmt::Debug + Clone {
     type StoreConfig: Send;
     type Txn;
     fn new(config: Self::StoreConfig) -> Result<Self, ArunaStorageError>;

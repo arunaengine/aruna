@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use aruna_permission::paths::RealmKey;
 use aruna_permission::token::{Ed25519KeyPair, OidcTrustConfig, TokenSystem};
 use aruna_permission::*;
@@ -16,7 +14,7 @@ const GITHUB_PUBLIC_KEY: &str = include_str!("../tests/test_github_priv.pem.pub"
 async fn setup_test_systems() -> (
     TokenSystem,
     PermissionManager,
-    Arc<LmdbStore>,
+    LmdbStore,
     String,
     Ed25519KeyPair,
 ) {
@@ -34,7 +32,7 @@ async fn setup_test_systems() -> (
         ],
     };
 
-    let store = Arc::new(LmdbStore::new(config).unwrap());
+    let store = LmdbStore::new(config).unwrap();
 
     // Create token system for realm A with trusted OIDC issuers
     let realm_a = create_test_realm_key(10);
@@ -83,7 +81,7 @@ fn create_test_realm_key(suffix: u8) -> RealmKey {
     key
 }
 
-pub async fn setup_test_store() -> (Arc<LmdbStore>, String) {
+pub async fn setup_test_store() -> (LmdbStore, String) {
     let test_id = Ulid::new().to_string();
     let test_dir = format!("/dev/shm/test_perm_{}", test_id);
     std::fs::create_dir_all(&test_dir).unwrap();
@@ -98,7 +96,7 @@ pub async fn setup_test_store() -> (Arc<LmdbStore>, String) {
         ],
     };
 
-    let store = Arc::new(LmdbStore::new(config).unwrap());
+    let store = LmdbStore::new(config).unwrap();
     (store, test_dir)
 }
 
@@ -117,7 +115,7 @@ async fn test_clean_separation_workflow() {
         .register_user_from_oidc_claims(
             "https://accounts.google.com",
             "alice@example.com",
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .unwrap();
@@ -126,7 +124,7 @@ async fn test_clean_separation_workflow() {
         .register_user_from_oidc_claims(
             "https://github.com/login/oauth",
             "bob_dev",
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .unwrap();
@@ -139,7 +137,7 @@ async fn test_clean_separation_workflow() {
             group_id,
             &alice_identity,
             alice_identity.realm_ulid,
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .await
@@ -147,7 +145,7 @@ async fn test_clean_separation_workflow() {
 
     // Step 3: Add Bob to Alice's group through permission system
     permission_manager
-        .add_user(group_id, &bob_identity, "member", store.as_ref(), &mut txn)
+        .add_user(group_id, &bob_identity, "member", &store, &mut txn)
         .await
         .unwrap();
 
@@ -163,7 +161,7 @@ async fn test_clean_separation_workflow() {
         .add_resource(
             ResourceId::Ulid(resource_id),
             &resource_path,
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .unwrap();
@@ -174,7 +172,7 @@ async fn test_clean_separation_workflow() {
             &alice_identity,
             ResourceId::Ulid(resource_id),
             Action::Write,
-            store.clone(),
+            &store,
         )
         .await;
     let bob_access = permission_manager
@@ -182,7 +180,7 @@ async fn test_clean_separation_workflow() {
             &bob_identity,
             ResourceId::Ulid(resource_id),
             Action::Write,
-            store.clone(),
+            &store,
         )
         .await;
 
@@ -239,11 +237,11 @@ async fn test_cross_realm_token_handling() {
     let alice_sub = "alice@example.com";
 
     let alice_realm_a = token_system_a
-        .register_user_from_oidc_claims(alice_provider, alice_sub, store.as_ref(), &mut txn)
+        .register_user_from_oidc_claims(alice_provider, alice_sub, &store, &mut txn)
         .unwrap();
 
     let alice_realm_b = token_system_b
-        .register_user_from_oidc_claims(alice_provider, alice_sub, store.as_ref(), &mut txn)
+        .register_user_from_oidc_claims(alice_provider, alice_sub, &store, &mut txn)
         .unwrap();
 
     assert_eq!(alice_realm_a.realm_ulid, realm_a);
@@ -254,17 +252,17 @@ async fn test_cross_realm_token_handling() {
     let group_b = create_test_ulid(21);
 
     permission_manager
-        .create_group(group_a, &alice_realm_a, realm_a, store.as_ref(), &mut txn)
+        .create_group(group_a, &alice_realm_a, realm_a, &store, &mut txn)
         .await
         .unwrap();
     permission_manager
-        .create_group(group_b, &alice_realm_b, realm_b, store.as_ref(), &mut txn)
+        .create_group(group_b, &alice_realm_b, realm_b, &store, &mut txn)
         .await
         .unwrap();
 
     // Unify identities across realms at permission level
     permission_manager
-        .unify_identities(&alice_realm_a, &alice_realm_b, store.as_ref(), &mut txn)
+        .unify_identities(&alice_realm_a, &alice_realm_b, &store, &mut txn)
         .await
         .unwrap();
 
@@ -284,10 +282,10 @@ async fn test_cross_realm_token_handling() {
         .unwrap();
 
     permission_manager
-        .add_resource(ResourceId::Ulid(resource_a), &path_a, store.as_ref(), &mut txn)
+        .add_resource(ResourceId::Ulid(resource_a), &path_a, &store, &mut txn)
         .unwrap();
     permission_manager
-        .add_resource(ResourceId::Ulid(resource_b), &path_b, store.as_ref(), &mut txn)
+        .add_resource(ResourceId::Ulid(resource_b), &path_b, &store, &mut txn)
         .unwrap();
 
     // Verify cross-realm access works after unification
@@ -297,7 +295,7 @@ async fn test_cross_realm_token_handling() {
                 &alice_realm_a,
                 ResourceId::Ulid(resource_b),
                 Action::Write,
-                store.clone(),
+                &store,
             )
             .await
             .is_ok()
@@ -308,7 +306,7 @@ async fn test_cross_realm_token_handling() {
                 &alice_realm_b,
                 ResourceId::Ulid(resource_a),
                 Action::Write,
-                store.clone(),
+                &store,
             )
             .await
             .is_ok()
@@ -327,10 +325,10 @@ async fn test_cross_realm_token_handling() {
 
     // Verify tokens can be validated in their respective realms
     let verified_identity_a = token_system_a
-        .get_identity(&alice_realm_a_token, store.as_ref(), &mut txn)
+        .get_identity(&alice_realm_a_token, &store, &mut txn)
         .unwrap();
     let verified_identity_b = token_system_b
-        .get_identity(&alice_realm_b_token, store.as_ref(), &mut txn)
+        .get_identity(&alice_realm_b_token, &store, &mut txn)
         .unwrap();
 
     assert_eq!(verified_identity_a.user_ulid, alice_realm_a.user_ulid);
@@ -366,7 +364,7 @@ async fn test_token_identity_extraction() {
         .register_user_from_oidc_claims(
             "https://login.microsoftonline.com",
             "user@company.com",
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .unwrap();
@@ -378,7 +376,7 @@ async fn test_token_identity_extraction() {
         .register_user_from_oidc_claims(
             "https://login.microsoftonline.com",
             "user@company.com",
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .unwrap();
@@ -393,7 +391,7 @@ async fn test_token_identity_extraction() {
         .register_user_from_oidc_claims(
             "https://login.microsoftonline.com",
             "different_user",
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .unwrap();
@@ -411,7 +409,7 @@ async fn test_token_identity_extraction() {
         .unwrap();
 
     let parsed_identity = token_system
-        .get_identity(&aruna_token, store.as_ref(), &mut txn)
+        .get_identity(&aruna_token, &store, &mut txn)
         .unwrap();
 
     assert_eq!(parsed_identity.user_ulid, identity_from_oidc.user_ulid);
@@ -449,7 +447,7 @@ async fn test_typical_usage_pattern() {
         .register_user_from_oidc_claims(
             "https://accounts.google.com",
             "user@example.com",
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .unwrap();
@@ -459,7 +457,7 @@ async fn test_typical_usage_pattern() {
     // 2. Use identity for permission operations
     let group_id = create_test_ulid(20);
     permission_manager
-        .create_group(group_id, &user_identity, realm_ulid, store.as_ref(), &mut txn)
+        .create_group(group_id, &user_identity, realm_ulid, &store, &mut txn)
         .await
         .unwrap();
 
@@ -472,7 +470,7 @@ async fn test_typical_usage_pattern() {
         .unwrap();
 
     permission_manager
-        .add_resource(ResourceId::Ulid(doc_id), &doc_path, store.as_ref(), &mut txn)
+        .add_resource(ResourceId::Ulid(doc_id), &doc_path, &store, &mut txn)
         .unwrap();
 
     // 4. Check permissions
@@ -481,7 +479,7 @@ async fn test_typical_usage_pattern() {
             &user_identity,
             ResourceId::Ulid(doc_id),
             Action::Write,
-            store.clone(),
+            &store,
         )
         .await;
 
@@ -495,7 +493,7 @@ async fn test_typical_usage_pattern() {
 
     // 6. Token verification workflow
     let verified_identity = token_system
-        .get_identity(&aruna_token, store.as_ref(), &mut txn)
+        .get_identity(&aruna_token, &store, &mut txn)
         .unwrap();
 
     assert_eq!(verified_identity.user_ulid, user_identity.user_ulid);
@@ -517,7 +515,7 @@ async fn test_typical_usage_pattern() {
         .register_user_from_oidc_claims(
             "https://accounts.google.com",
             "user@example.com",
-            store.as_ref(),
+            &store,
             &mut txn,
         )
         .unwrap();
@@ -526,7 +524,7 @@ async fn test_typical_usage_pattern() {
 
     // 8. Unify identities across realms for seamless access
     permission_manager
-        .unify_identities(&user_identity, &other_identity, store.as_ref(), &mut txn)
+        .unify_identities(&user_identity, &other_identity, &store, &mut txn)
         .await
         .unwrap();
 
@@ -549,29 +547,29 @@ async fn test_oidc_lookup_operations() {
 
     // Initially no OIDC mapping exists
     let lookup_result = token_system
-        .get_user_from_oidc(provider, subject, store.as_ref(), &txn)
+        .get_user_from_oidc(provider, subject, &store, &txn)
         .unwrap();
     assert!(lookup_result.is_none());
 
     // Add OIDC identity mapping
     token_system
-        .add_oidc_identity(provider, subject, user_ulid, store.as_ref(), &mut txn)
+        .add_oidc_identity(provider, subject, user_ulid, &store, &mut txn)
         .unwrap();
 
     // Lookup should now return the mapped user ULID
     let lookup_result = token_system
-        .get_user_from_oidc(provider, subject, store.as_ref(), &txn)
+        .get_user_from_oidc(provider, subject, &store, &txn)
         .unwrap();
     assert_eq!(lookup_result, Some(user_ulid));
 
     // Verify isolation: different provider/subject combinations return None
     let different_provider_result = token_system
-        .get_user_from_oidc("https://other.com", subject, store.as_ref(), &txn)
+        .get_user_from_oidc("https://other.com", subject, &store, &txn)
         .unwrap();
     assert!(different_provider_result.is_none());
 
     let different_subject_result = token_system
-        .get_user_from_oidc(provider, "other_user", store.as_ref(), &txn)
+        .get_user_from_oidc(provider, "other_user", &store, &txn)
         .unwrap();
     assert!(different_subject_result.is_none());
 
