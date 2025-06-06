@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use aruna_permission::paths::RealmKey;
 use aruna_permission::{Action, Path, PermissionManager, ResourceId, UserIdentity};
 use aruna_storage::storage::{
@@ -6,7 +8,7 @@ use aruna_storage::storage::{
 };
 use ulid::Ulid;
 
-pub async fn setup_test_store() -> (LmdbStore, String) {
+pub async fn setup_test_store() -> (Arc<LmdbStore>, String) {
     let test_id = Ulid::new().to_string();
     let test_dir = format!("/dev/shm/test_perm_{}", test_id);
     std::fs::create_dir_all(&test_dir).unwrap();
@@ -21,7 +23,7 @@ pub async fn setup_test_store() -> (LmdbStore, String) {
         ],
     };
 
-    let store = LmdbStore::new(config).unwrap();
+    let store = Arc::new(LmdbStore::new(config).unwrap());
     (store, test_dir)
 }
 
@@ -55,7 +57,7 @@ async fn test_complete_oidc_workflow() {
     // Step 1: User logs in for the first time (registration)
     let user_ulid = Ulid::new(); // This would be generated during registration
     manager
-        .add_oidc_identity(oidc_provider, oidc_sub, user_ulid, &store, &mut txn)
+        .add_oidc_identity(oidc_provider, oidc_sub, user_ulid, store.as_ref(), &mut txn)
         .unwrap();
 
     let user_identity = UserIdentity::new(user_ulid, realm_id);
@@ -63,7 +65,7 @@ async fn test_complete_oidc_workflow() {
     // Step 2: User creates their first group
     let group_id = Ulid::new();
     manager
-        .create_group(group_id, &user_identity, realm_id, &store, &mut txn)
+        .create_group(group_id, &user_identity, realm_id, store.as_ref(), &mut txn)
         .await
         .unwrap();
 
@@ -79,7 +81,7 @@ async fn test_complete_oidc_workflow() {
         .add_resource(
             ResourceId::Ulid(document_id),
             &document_path,
-            &store,
+            store.as_ref(),
             &mut txn,
         )
         .unwrap();
@@ -94,14 +96,14 @@ async fn test_complete_oidc_workflow() {
             "github",
             "invited_user",
             invited_user_ulid,
-            &store,
+            store.as_ref(),
             &mut txn,
         )
         .unwrap();
 
     // Add them to the group
     manager
-        .add_user(group_id, &invited_identity, "member", &store, &mut txn)
+        .add_user(group_id, &invited_identity, "member", store.as_ref(), &mut txn)
         .await
         .unwrap();
 
@@ -113,8 +115,7 @@ async fn test_complete_oidc_workflow() {
             &user_identity,
             ResourceId::Ulid(document_id),
             Action::Write,
-            &store,
-            &txn,
+            store.clone(),
         )
         .await;
     assert!(admin_result.is_ok());
@@ -125,8 +126,7 @@ async fn test_complete_oidc_workflow() {
             &invited_identity,
             ResourceId::Ulid(document_id),
             Action::Write,
-            &store,
-            &txn,
+            store.clone(),
         )
         .await;
     assert!(member_result.is_ok());
@@ -138,8 +138,7 @@ async fn test_complete_oidc_workflow() {
             &outsider,
             ResourceId::Ulid(document_id),
             Action::Write,
-            &store,
-            &txn,
+            store.clone(),
         )
         .await;
     assert!(outsider_result.is_err());
@@ -148,7 +147,7 @@ async fn test_complete_oidc_workflow() {
 
     // User logs in again with Google
     let found_user = manager
-        .get_user_from_oidc(oidc_provider, oidc_sub, &store, &txn)
+        .get_user_from_oidc(oidc_provider, oidc_sub, store.as_ref(), &txn)
         .unwrap();
     assert_eq!(found_user, Some(user_ulid));
 
@@ -168,7 +167,7 @@ async fn test_complete_oidc_workflow() {
         .add_identity_permission(
             &cross_realm_identity,
             other_permission_ulid,
-            &store,
+            store.as_ref(),
             &mut txn,
         )
         .unwrap();
@@ -180,7 +179,7 @@ async fn test_complete_oidc_workflow() {
             other_group_id,
             &cross_realm_identity,
             other_realm_id,
-            &store,
+            store.as_ref(),
             &mut txn,
         )
         .await
@@ -201,13 +200,13 @@ async fn test_permission_unification_scenario() {
 
     // Scenario: User has multiple OIDC accounts that should be unified
     manager
-        .add_oidc_identity("google", "user@gmail.com", user_ulid, &store, &mut txn)
+        .add_oidc_identity("google", "user@gmail.com", user_ulid, store.as_ref(), &mut txn)
         .unwrap();
     manager
-        .add_oidc_identity("github", "user123", user_ulid, &store, &mut txn)
+        .add_oidc_identity("github", "user123", user_ulid, store.as_ref(), &mut txn)
         .unwrap();
     manager
-        .add_oidc_identity("microsoft", "user@company.com", user_ulid, &store, &mut txn)
+        .add_oidc_identity("microsoft", "user@company.com", user_ulid, store.as_ref(), &mut txn)
         .unwrap();
 
     let user_identity = UserIdentity::new(user_ulid, realm_id);
@@ -215,18 +214,18 @@ async fn test_permission_unification_scenario() {
     // Create a unified permission ID for this user
     let unified_permission_ulid = Ulid::new();
     manager
-        .add_identity_permission(&user_identity, unified_permission_ulid, &store, &mut txn)
+        .add_identity_permission(&user_identity, unified_permission_ulid, store.as_ref(), &mut txn)
         .unwrap();
 
     // User should be able to login with any provider and get same permissions
     let google_lookup = manager
-        .get_user_from_oidc("google", "user@gmail.com", &store, &txn)
+        .get_user_from_oidc("google", "user@gmail.com", store.as_ref(), &txn)
         .unwrap();
     let github_lookup = manager
-        .get_user_from_oidc("github", "user123", &store, &txn)
+        .get_user_from_oidc("github", "user123", store.as_ref(), &txn)
         .unwrap();
     let microsoft_lookup = manager
-        .get_user_from_oidc("microsoft", "user@company.com", &store, &txn)
+        .get_user_from_oidc("microsoft", "user@company.com", store.as_ref(), &txn)
         .unwrap();
 
     assert_eq!(google_lookup, Some(user_ulid));
@@ -258,7 +257,7 @@ async fn test_realm_sovereignty() {
             "realm_a_provider",
             "user@a.com",
             user_ulid,
-            &store,
+            store.as_ref(),
             &mut txn,
         )
         .unwrap();
@@ -267,7 +266,7 @@ async fn test_realm_sovereignty() {
             "realm_b_provider",
             "user@b.com",
             user_ulid,
-            &store,
+            store.as_ref(),
             &mut txn,
         )
         .unwrap();
@@ -276,21 +275,21 @@ async fn test_realm_sovereignty() {
     let permission_a = Ulid::new();
     let permission_b = Ulid::new();
     manager
-        .add_identity_permission(&identity_a, permission_a, &store, &mut txn)
+        .add_identity_permission(&identity_a, permission_a, store.as_ref(), &mut txn)
         .unwrap();
     manager
-        .add_identity_permission(&identity_b, permission_b, &store, &mut txn)
+        .add_identity_permission(&identity_b, permission_b, store.as_ref(), &mut txn)
         .unwrap();
 
     // Create groups in each realm
     let group_a = Ulid::new();
     let group_b = Ulid::new();
     manager
-        .create_group(group_a, &identity_a, realm_a, &store, &mut txn)
+        .create_group(group_a, &identity_a, realm_a, store.as_ref(), &mut txn)
         .await
         .unwrap();
     manager
-        .create_group(group_b, &identity_b, realm_b, &store, &mut txn)
+        .create_group(group_b, &identity_b, realm_b, store.as_ref(), &mut txn)
         .await
         .unwrap();
 
@@ -311,10 +310,10 @@ async fn test_realm_sovereignty() {
         .unwrap();
 
     manager
-        .add_resource(ResourceId::Ulid(resource_a), &path_a, &store, &mut txn)
+        .add_resource(ResourceId::Ulid(resource_a), &path_a, store.as_ref(), &mut txn)
         .unwrap();
     manager
-        .add_resource(ResourceId::Ulid(resource_b), &path_b, &store, &mut txn)
+        .add_resource(ResourceId::Ulid(resource_b), &path_b, store.as_ref(), &mut txn)
         .unwrap();
 
     // Test realm sovereignty: User should only access resources in their respective realms
@@ -325,8 +324,7 @@ async fn test_realm_sovereignty() {
             &identity_a,
             ResourceId::Ulid(resource_a),
             Action::Write,
-            &store,
-            &txn,
+            store.clone(),
         )
         .await;
     assert!(result_a_a.is_ok());
@@ -337,8 +335,7 @@ async fn test_realm_sovereignty() {
             &identity_b,
             ResourceId::Ulid(resource_b),
             Action::Write,
-            &store,
-            &txn,
+            store.clone(),
         )
         .await;
     assert!(result_b_b.is_ok());
@@ -362,7 +359,7 @@ async fn test_concurrent_operations() {
     // Create group first
     let mut txn = store.create_txn(true).unwrap();
     manager
-        .create_group(group_id, &admin_identity, realm_id, &store, &mut txn)
+        .create_group(group_id, &admin_identity, realm_id, store.as_ref(), &mut txn)
         .await
         .unwrap();
     txn.commit().unwrap();

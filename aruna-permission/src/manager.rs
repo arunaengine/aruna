@@ -484,25 +484,39 @@ impl PermissionManager {
     }
 
     /// Check if a user has permission to access a resource
-    pub async fn check_permission<'a, S: Store<'a> + 'static>(
+    pub async fn check_permission<S>(
         &self,
         user_identity: &UserIdentity,
         resource_id: ResourceId,
         action: Action,
-        store: &'a S,
-        txn: &'a <S as Store<'a>>::Txn,
-    ) -> Result<Path> {
-        // Resolve user identity to permission ULID (must exist)
-        let permission_ulid = self.resolve_permission_ulid(user_identity, store, txn)?;
+        store: Arc<S>,
+        //txn: &'a <S as Store<'a>>::Txn,
+    ) -> Result<Path>
+    where
+        for<'a> S: Store<'a> + 'static,
+    {
+        let store = store.clone();
+        let manager = self.clone();
+        let user_identity = user_identity.clone();
+        let (permission_ulid, path) =
+            tokio::task::spawn_blocking(move || -> Result<(Ulid, Path)> {
+                let txn = store.create_txn(false)?;
+                // Resolve user identity to permission ULID (must exist)
+                let permission_ulid =
+                    manager.resolve_permission_ulid(&user_identity, store.as_ref(), &txn)?;
 
-        // Retrieve path from resource mapping
-        let key = resource_id.to_string();
-        let path_bytes = store
-            .get(txn, RESOURCE_DB, key.as_bytes())
-            .map_err(|_| PermissionError::ResourceNotFound(resource_id.to_string()))?
-            .ok_or_else(|| PermissionError::ResourceNotFound(resource_id.to_string()))?;
+                // Retrieve path from resource mapping
+                let key = resource_id.to_string();
+                let path_bytes = store
+                    .get(&txn, RESOURCE_DB, key.as_bytes())
+                    .map_err(|_| PermissionError::ResourceNotFound(resource_id.to_string()))?
+                    .ok_or_else(|| PermissionError::ResourceNotFound(resource_id.to_string()))?;
 
-        let path = Path::try_from(path_bytes.as_ref())?;
+                let path = Path::try_from(path_bytes.as_ref())?;
+                Ok((permission_ulid, path))
+            })
+            .await
+            .unwrap()?;
 
         // Check permission using the enforcer (read lock)
         let allowed = {
