@@ -15,11 +15,13 @@ use crate::error::PathError;
 /// Result type for path operations.
 pub type Result<T> = std::result::Result<T, PathError>;
 
+pub type RealmKey = [u8; 32];
+
 /// Represents the components that can make up a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathComponent {
     /// Realm ID - this is always the first component
-    RealmId(Ulid),
+    RealmId(RealmKey),
     /// Admin section: `/a`
     Admin,
     /// Groups management section: `/g` within admin
@@ -67,9 +69,9 @@ impl Path {
     }
 
     /// Returns the realm ID of the path.
-    pub fn realm_id(&self) -> Option<Ulid> {
-        if let Some(PathComponent::RealmId(ulid)) = self.components.first() {
-            Some(*ulid)
+    pub fn realm_id(&self) -> Option<RealmKey> {
+        if let Some(PathComponent::RealmId(realm_key)) = self.components.first() {
+            Some(*realm_key)
         } else {
             None
         }
@@ -338,7 +340,7 @@ impl PathBuilder {
     }
 
     /// Sets the realm ID for the path.
-    pub fn realm_id(mut self, realm_id: Ulid) -> Self {
+    pub fn realm_id(mut self, realm_id: RealmKey) -> Self {
         self.components.push(PathComponent::RealmId(realm_id));
         self
     }
@@ -602,8 +604,8 @@ impl Display for Path {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         for component in &self.components {
             match component {
-                PathComponent::RealmId(ulid) => {
-                    write!(f, "{}", ulid)?;
+                PathComponent::RealmId(realm_key) => {
+                    write!(f, "{}", hex::encode(realm_key))?;
                 }
                 PathComponent::Admin => write!(f, "/a")?,
                 PathComponent::Groups => write!(f, "/g")?,
@@ -653,6 +655,11 @@ fn is_valid_ulid_char(c: char) -> bool {
     c.is_ascii_alphanumeric() && !c.is_ascii_lowercase()
 }
 
+/// Validates if a character is valid for hex encoding.
+fn is_valid_hex_char(c: char) -> bool {
+    c.is_ascii_hexdigit()
+}
+
 /// Validates if a character is valid for bucket names.
 /// Bucket names follow S3 naming rules: alphanumeric, hyphens, underscores, dots.
 fn is_valid_bucket_char(c: char) -> bool {
@@ -664,6 +671,24 @@ fn is_valid_bucket_char(c: char) -> bool {
 fn is_valid_key_char(c: char) -> bool {
     // Allow most printable ASCII characters except our delimiter '#'
     c.is_ascii() && c.is_ascii_graphic() && c != '#'
+}
+
+/// Parses a realm key (64 hex characters).
+fn realm_key_parser(input: &str) -> IResult<&str, RealmKey> {
+    let (input, hex_str) = take_while1(is_valid_hex_char).parse(input)?;
+
+    if hex_str.len() != 64 {
+        return Err(NomErr::Error(NomError::new(input, ErrorKind::AlphaNumeric)));
+    }
+
+    match hex::decode(hex_str) {
+        Ok(bytes) if bytes.len() == 32 => {
+            let mut realm_key = [0u8; 32];
+            realm_key.copy_from_slice(&bytes);
+            Ok((input, realm_key))
+        }
+        _ => Err(NomErr::Error(NomError::new(input, ErrorKind::AlphaNumeric))),
+    }
 }
 
 /// Parses a ULID.
@@ -721,7 +746,7 @@ fn wildcard_parser(input: &str) -> IResult<&str, PathComponent> {
 
 /// Parses a complete path.
 fn path_parser(input: &str) -> IResult<&str, Vec<PathComponent>> {
-    let (input, realm_id) = ulid_parser(input)?;
+    let (input, realm_id) = realm_key_parser(input)?;
     let mut components = vec![PathComponent::RealmId(realm_id)];
 
     let mut remaining = input;
@@ -978,6 +1003,13 @@ mod tests {
         Ulid::from_str(s).unwrap_or_else(|_| Ulid::new())
     }
 
+    // Helper function to create a test realm key
+    fn create_test_realm_key(suffix: u8) -> RealmKey {
+        let mut key = [0u8; 32];
+        key[31] = suffix;
+        key
+    }
+
     // Helper function to create a test Blake3 hash
     fn create_test_hash(s: &str) -> Blake3Hash {
         // Create a deterministic hash for tests
@@ -987,8 +1019,8 @@ mod tests {
 
     #[test]
     fn test_parse_realm_only() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let path_str = realm_id.to_string();
+        let realm_id = create_test_realm_key(1);
+        let path_str = hex::encode(realm_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -999,8 +1031,8 @@ mod tests {
 
     #[test]
     fn test_parse_admin_root() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let path_str = format!("{}/a", realm_id);
+        let realm_id = create_test_realm_key(1);
+        let path_str = format!("{}/a", hex::encode(realm_id));
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1012,8 +1044,8 @@ mod tests {
 
     #[test]
     fn test_parse_admin_groups() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let path_str = format!("{}/a/g", realm_id);
+        let realm_id = create_test_realm_key(1);
+        let path_str = format!("{}/a/g", hex::encode(realm_id));
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1026,8 +1058,8 @@ mod tests {
 
     #[test]
     fn test_parse_admin_policies() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let path_str = format!("{}/a/p", realm_id);
+        let realm_id = create_test_realm_key(1);
+        let path_str = format!("{}/a/p", hex::encode(realm_id));
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1040,9 +1072,9 @@ mod tests {
 
     #[test]
     fn test_parse_admin_policy() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let policy_id = create_test_ulid("01H1VECTFR1111111111111111");
-        let path_str = format!("{}/a/p/{}", realm_id, policy_id);
+        let path_str = format!("{}/a/p/{}", hex::encode(realm_id), policy_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1056,9 +1088,9 @@ mod tests {
 
     #[test]
     fn test_parse_group() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let path_str = format!("{}/g/{}", realm_id, group_id);
+        let path_str = format!("{}/g/{}", hex::encode(realm_id), group_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1071,9 +1103,9 @@ mod tests {
 
     #[test]
     fn test_parse_group_admin() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let path_str = format!("{}/g/{}/a", realm_id, group_id);
+        let path_str = format!("{}/g/{}/a", hex::encode(realm_id), group_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1088,7 +1120,7 @@ mod tests {
     // New tests for bucket/key functionality
     #[test]
     fn test_parse_group_data_with_bucket_key_hash() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let bucket = "my-bucket";
         let key = "documents/file.txt";
@@ -1096,10 +1128,12 @@ mod tests {
         let encoded_hash = hash.to_hex();
         let path_str = format!(
             "{}/g/{}/r/d/{}/{}#{}",
-            realm_id, group_id, bucket, key, encoded_hash
+            hex::encode(realm_id),
+            group_id,
+            bucket,
+            key,
+            encoded_hash
         );
-
-        dbg!(&path_str);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1120,9 +1154,9 @@ mod tests {
 
     #[test]
     fn test_parse_group_data_wildcard() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let path_str = format!("{}/g/{}/r/d/*", realm_id, group_id);
+        let path_str = format!("{}/g/{}/r/d/*", hex::encode(realm_id), group_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1138,10 +1172,10 @@ mod tests {
 
     #[test]
     fn test_parse_group_data_bucket_wildcard() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let bucket = "my-bucket";
-        let path_str = format!("{}/g/{}/r/d/{}/*", realm_id, group_id, bucket);
+        let path_str = format!("{}/g/{}/r/d/{}/*", hex::encode(realm_id), group_id, bucket);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1161,13 +1195,16 @@ mod tests {
 
     #[test]
     fn test_parse_group_data_key_prefix_wildcard() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let bucket = "my-bucket";
         let key_prefix = "documents";
         let path_str = format!(
             "{}/g/{}/r/d/{}/{}/*",
-            realm_id, group_id, bucket, key_prefix
+            hex::encode(realm_id),
+            group_id,
+            bucket,
+            key_prefix
         );
 
         let path = Path::parse(&path_str).unwrap();
@@ -1192,7 +1229,7 @@ mod tests {
 
     #[test]
     fn test_parse_group_metadata() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let project_id = create_test_ulid("01H1VECTFR3333333333333333");
         let folder_id1 = create_test_ulid("01H1VECTFR4444444444444444");
@@ -1201,7 +1238,12 @@ mod tests {
 
         let path_str = format!(
             "{}/g/{}/r/m/{}/{}/{}/{}",
-            realm_id, group_id, project_id, folder_id1, folder_id2, object_id
+            hex::encode(realm_id),
+            group_id,
+            project_id,
+            folder_id1,
+            folder_id2,
+            object_id
         );
 
         let path = Path::parse(&path_str).unwrap();
@@ -1221,8 +1263,8 @@ mod tests {
 
     #[test]
     fn test_wildcard_admin() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let path_str = format!("{}/a/*", realm_id);
+        let realm_id = create_test_realm_key(1);
+        let path_str = format!("{}/a/*", hex::encode(realm_id));
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1235,8 +1277,8 @@ mod tests {
 
     #[test]
     fn test_wildcard_admin_groups() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let path_str = format!("{}/a/g/*", realm_id);
+        let realm_id = create_test_realm_key(1);
+        let path_str = format!("{}/a/g/*", hex::encode(realm_id));
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1250,8 +1292,8 @@ mod tests {
 
     #[test]
     fn test_wildcard_admin_policies() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let path_str = format!("{}/a/p/*", realm_id);
+        let realm_id = create_test_realm_key(1);
+        let path_str = format!("{}/a/p/*", hex::encode(realm_id));
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1265,9 +1307,9 @@ mod tests {
 
     #[test]
     fn test_wildcard_policy() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let policy_id = create_test_ulid("01H1VECTFR1111111111111111");
-        let path_str = format!("{}/a/p/{}/*", realm_id, policy_id);
+        let path_str = format!("{}/a/p/{}/*", hex::encode(realm_id), policy_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1282,8 +1324,8 @@ mod tests {
 
     #[test]
     fn test_wildcard_realm_admin() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
-        let path_str = format!("{}/a/*", realm_id);
+        let realm_id = create_test_realm_key(1);
+        let path_str = format!("{}/a/*", hex::encode(realm_id));
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1296,9 +1338,9 @@ mod tests {
 
     #[test]
     fn test_wildcard_group() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let path_str = format!("{}/g/{}/*", realm_id, group_id);
+        let path_str = format!("{}/g/{}/*", hex::encode(realm_id), group_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1312,9 +1354,9 @@ mod tests {
 
     #[test]
     fn test_wildcard_group_admin() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let path_str = format!("{}/g/{}/a/*", realm_id, group_id);
+        let path_str = format!("{}/g/{}/a/*", hex::encode(realm_id), group_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1329,9 +1371,9 @@ mod tests {
 
     #[test]
     fn test_wildcard_resources() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let path_str = format!("{}/g/{}/r/*", realm_id, group_id);
+        let path_str = format!("{}/g/{}/r/*", hex::encode(realm_id), group_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1346,9 +1388,9 @@ mod tests {
 
     #[test]
     fn test_wildcard_metadata() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
-        let path_str = format!("{}/g/{}/r/m/*", realm_id, group_id);
+        let path_str = format!("{}/g/{}/r/m/*", hex::encode(realm_id), group_id);
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1364,10 +1406,15 @@ mod tests {
 
     #[test]
     fn test_wildcard_project() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let project_id = create_test_ulid("01H1VECTFR3333333333333333");
-        let path_str = format!("{}/g/{}/r/m/{}/*", realm_id, group_id, project_id);
+        let path_str = format!(
+            "{}/g/{}/r/m/{}/*",
+            hex::encode(realm_id),
+            group_id,
+            project_id
+        );
 
         let path = Path::parse(&path_str).unwrap();
         assert_eq!(path.realm_id(), Some(realm_id));
@@ -1384,13 +1431,16 @@ mod tests {
 
     #[test]
     fn test_wildcard_object() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let project_id = create_test_ulid("01H1VECTFR3333333333333333");
         let folder_id = create_test_ulid("01H1VECTFR4444444444444444");
         let path_str = format!(
             "{}/g/{}/r/m/{}/{}/*",
-            realm_id, group_id, project_id, folder_id
+            hex::encode(realm_id),
+            group_id,
+            project_id,
+            folder_id
         );
 
         let path = Path::parse(&path_str).unwrap();
@@ -1410,7 +1460,7 @@ mod tests {
     // New builder tests for bucket/key functionality
     #[test]
     fn test_builder_group_data_with_bucket_key() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let bucket = "my-bucket".to_string();
         let key = "documents/file.txt".to_string();
@@ -1426,7 +1476,7 @@ mod tests {
             path.to_string(),
             format!(
                 "{}/g/{}/r/d/{}/{}#{}",
-                realm_id,
+                hex::encode(realm_id),
                 group_id,
                 bucket,
                 key,
@@ -1438,7 +1488,7 @@ mod tests {
 
     #[test]
     fn test_builder_group_data_wildcards() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let bucket = "my-bucket".to_string();
         let key_prefix = "documents".to_string();
@@ -1452,7 +1502,7 @@ mod tests {
 
         assert_eq!(
             path.to_string(),
-            format!("{}/g/{}/r/d/*", realm_id, group_id)
+            format!("{}/g/{}/r/d/*", hex::encode(realm_id), group_id)
         );
         assert!(path.has_wildcards());
 
@@ -1465,7 +1515,7 @@ mod tests {
 
         assert_eq!(
             path.to_string(),
-            format!("{}/g/{}/r/d/{}/*", realm_id, group_id, bucket)
+            format!("{}/g/{}/r/d/{}/*", hex::encode(realm_id), group_id, bucket)
         );
         assert!(path.has_wildcards());
 
@@ -1480,7 +1530,10 @@ mod tests {
             path.to_string(),
             format!(
                 "{}/g/{}/r/d/{}/{}/*",
-                realm_id, group_id, bucket, key_prefix
+                hex::encode(realm_id),
+                group_id,
+                bucket,
+                key_prefix
             )
         );
         assert!(path.has_wildcards());
@@ -1488,7 +1541,7 @@ mod tests {
 
     #[test]
     fn test_path_validation_bucket_key() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
 
         // Test invalid path with bucket but no key and no wildcard (this is now valid)
@@ -1563,7 +1616,7 @@ mod tests {
 
     #[test]
     fn test_to_string_with_bucket_key() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let bucket = "my-bucket".to_string();
         let key = "documents/file.txt".to_string();
@@ -1579,7 +1632,7 @@ mod tests {
             path.to_string(),
             format!(
                 "{}/g/{}/r/d/{}/{}#{}",
-                realm_id,
+                hex::encode(realm_id),
                 group_id,
                 bucket,
                 key,
@@ -1595,7 +1648,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             path.to_string(),
-            format!("{}/g/{}/r/d/*", realm_id, group_id)
+            format!("{}/g/{}/r/d/*", hex::encode(realm_id), group_id)
         );
 
         // Test bucket wildcard
@@ -1606,7 +1659,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             path.to_string(),
-            format!("{}/g/{}/r/d/{}/*", realm_id, group_id, bucket)
+            format!("{}/g/{}/r/d/{}/*", hex::encode(realm_id), group_id, bucket)
         );
 
         // Test key prefix wildcard
@@ -1620,14 +1673,17 @@ mod tests {
             path.to_string(),
             format!(
                 "{}/g/{}/r/d/{}/{}/*",
-                realm_id, group_id, bucket, key_prefix
+                hex::encode(realm_id),
+                group_id,
+                bucket,
+                key_prefix
             )
         );
     }
 
     #[test]
     fn test_new_format_with_slashes_in_keys() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
         let bucket = "my-bucket";
         let key = "folder1/folder2/file.txt"; // Key with slashes
@@ -1637,7 +1693,11 @@ mod tests {
         // New format: bucket/key#hash
         let path_str = format!(
             "{}/g/{}/r/d/{}/{}#{}",
-            realm_id, group_id, bucket, key, encoded_hash
+            hex::encode(realm_id),
+            group_id,
+            bucket,
+            key,
+            encoded_hash
         );
 
         let path = Path::parse(&path_str).unwrap();
@@ -1653,22 +1713,30 @@ mod tests {
 
     #[test]
     fn test_edge_cases() {
-        let realm_id = create_test_ulid("01H1VECTFR0000000000000000");
+        let realm_id = create_test_realm_key(1);
         let group_id = create_test_ulid("01H1VECTFR2222222222222222");
 
         // Case 1: <bucket>/key_part1/keypart2 (key with slashes, no hash)
         // This would be: realm/g/group/r/d/bucket/key_part1/keypart2/*
-        let path_str = format!("{}/g/{}/r/d/my-bucket/docs/subfolder/*", realm_id, group_id);
+        let path_str = format!(
+            "{}/g/{}/r/d/my-bucket/docs/subfolder/*",
+            hex::encode(realm_id),
+            group_id
+        );
         let path = Path::parse(&path_str).unwrap();
         assert!(path.has_wildcards());
 
         // Case 2: <bucket>/* (bucket with wildcard)
-        let path_str = format!("{}/g/{}/r/d/my-bucket/*", realm_id, group_id);
+        let path_str = format!("{}/g/{}/r/d/my-bucket/*", hex::encode(realm_id), group_id);
         let path = Path::parse(&path_str).unwrap();
         assert!(path.has_wildcards());
 
         // Case 3: <bucket>/keypart1/keypart2/* (bucket with key wildcard)
-        let path_str = format!("{}/g/{}/r/d/my-bucket/docs/files/*", realm_id, group_id);
+        let path_str = format!(
+            "{}/g/{}/r/d/my-bucket/docs/files/*",
+            hex::encode(realm_id),
+            group_id
+        );
         let path = Path::parse(&path_str).unwrap();
         assert!(path.has_wildcards());
 
@@ -1677,7 +1745,9 @@ mod tests {
         let encoded_hash = hash.to_hex();
         let path_str = format!(
             "{}/g/{}/r/d/my-bucket/docs/file.txt#{}",
-            realm_id, group_id, encoded_hash
+            hex::encode(realm_id),
+            group_id,
+            encoded_hash
         );
         let path = Path::parse(&path_str).unwrap();
         assert!(!path.has_wildcards());
@@ -1686,5 +1756,40 @@ mod tests {
             PathComponent::Key("docs/file.txt".to_string())
         );
         assert_eq!(path.components()[7], PathComponent::ContentHash(hash));
+    }
+
+    #[test]
+    fn test_builder_with_realm_key() {
+        let realm_id = create_test_realm_key(10);
+        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+
+        let path = Path::builder()
+            .realm_id(realm_id)
+            .group_wildcard(group_id)
+            .build()
+            .unwrap();
+
+        assert_eq!(path.realm_id(), Some(realm_id));
+        assert_eq!(path.components().len(), 4);
+        assert_eq!(path.components()[0], PathComponent::RealmId(realm_id));
+        assert_eq!(path.components()[1], PathComponent::Group);
+        assert_eq!(path.components()[2], PathComponent::GroupId(group_id));
+        assert_eq!(path.components()[3], PathComponent::Wildcard);
+        assert!(path.has_wildcards());
+    }
+
+    #[test]
+    fn test_display_with_realm_key() {
+        let realm_id = create_test_realm_key(42);
+        let group_id = create_test_ulid("01H1VECTFR2222222222222222");
+
+        let path = Path::builder()
+            .realm_id(realm_id)
+            .group(group_id)
+            .build()
+            .unwrap();
+
+        let expected = format!("{}/g/{}", hex::encode(realm_id), group_id);
+        assert_eq!(path.to_string(), expected);
     }
 }

@@ -4,7 +4,6 @@ use anyhow::anyhow;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::PathBuilder;
 use aruna_storage::storage::store::Store;
-use parking_lot::RwLock;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::path::S3Path;
@@ -28,7 +27,7 @@ where
     for<'a> St: Store<'a>,
 {
     pub(crate) store: Arc<St>,
-    pub(crate) permission_manager: Arc<RwLock<PermissionManager>>,
+    pub(crate) permission_manager: PermissionManager,
     pub(crate) realm_id: Ulid,
 }
 
@@ -91,8 +90,8 @@ where
 
         let allowed = self
             .permission_manager
-            .write()
             .enforcer
+            .read()
             .enforce(
                 &user_access.user_id.to_string(),
                 &perm_path.to_string(),

@@ -8,19 +8,18 @@ use aruna_data::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICAT
 use aruna_data::io::io_handler::{IOHandler, LOCATION_DB_NAME};
 use aruna_data::{config::config::Config, util::opendal::get_operator};
 use aruna_net::actor::NetworkActorBuilder;
+use aruna_permission::UserIdentity;
 use aruna_permission::manager::{PermissionManager, RESOURCE_DB};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
 use futures_util::TryFutureExt;
 use iroh::SecretKey;
 use lazy_static::lazy_static;
-use parking_lot::{RwLock, deadlock};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::try_join;
-use tracing::{Level, debug, error, trace};
+use tracing::{Level, debug, error};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
 
@@ -102,10 +101,9 @@ async fn main() -> Result<()> {
     let lmdb_store = Arc::new(LmdbStore::new(lmdb_config)?);
 
     // Init PermissionManager and load policies from persistence
-    let permission_manager = Arc::new(RwLock::new(PermissionManager::new().await?));
+    let permission_manager = PermissionManager::new().await?;
     let mut read_txn = lmdb_store.create_txn(false)?;
     permission_manager
-        .write()
         .load_policies(lmdb_store.as_ref(), &mut read_txn)
         .await?;
     lmdb_store.commit(read_txn)?;
@@ -117,6 +115,7 @@ async fn main() -> Result<()> {
         actor_handle,
         kademlia,
         lmdb_store,
+        permission_manager.clone(),
     )
     .await?;
 
@@ -127,27 +126,6 @@ async fn main() -> Result<()> {
         permission_manager.clone(),
     )
     .await?; //TODO: Remove later
-
-    // Create a background thread which checks for deadlocks every 10s
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_secs(10));
-            let deadlocks = deadlock::check_deadlock();
-            if deadlocks.is_empty() {
-                continue;
-            }
-
-            error!("{} deadlocks detected", deadlocks.len());
-            for (i, threads) in deadlocks.iter().enumerate() {
-                trace!("Deadlock #{}", i);
-                for t in threads {
-                    trace!("Thread Id {:#?}", t.thread_id());
-                    trace!("{:#?}", t.backtrace());
-                }
-            }
-            panic!("Deadlock detected");
-        }
-    });
 
     let s3server = S3Server::new(
         CONFIG.frontend.s3_frontend.clone(),
@@ -179,7 +157,7 @@ async fn main() -> Result<()> {
 async fn create_dummy_access<St>(
     store: Arc<St>,
     realm_id: Ulid,
-    manager: Arc<RwLock<PermissionManager>>,
+    manager: PermissionManager,
 ) -> Result<()>
 where
     for<'a> St: Store<'a> + 'static,
@@ -187,15 +165,29 @@ where
     // Create a dummy user with some permissions and credentials
     let user_id = Ulid::from_string("01JWB4X5TY0K776QDDCHGK3KT2")?;
     let group_id = Ulid::from_string("01JWB4XFCRJX53Q839QMHPGSXH")?;
+    let user_identity = UserIdentity {
+        user_ulid: user_id,
+        realm_ulid: realm_id,
+    };
 
     let mut write_txn = store.create_txn(true)?;
     manager
-        .write()
-        .create_group(group_id, user_id, realm_id, store.as_ref(), &mut write_txn)
+        .create_group(
+            group_id,
+            &user_identity,
+            realm_id,
+            store.as_ref(),
+            &mut write_txn,
+        )
         .await?;
     manager
-        .write()
-        .add_user(group_id, user_id, "admin", store.as_ref(), &mut write_txn)
+        .add_user(
+            group_id,
+            &user_identity,
+            "admin",
+            store.as_ref(),
+            &mut write_txn,
+        )
         .await?;
 
     let access_info = UserAccess {

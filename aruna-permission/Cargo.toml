@@ -23,7 +23,10 @@ tokio = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-jsonwebtoken = "9.3.1"
+jsonwebtoken = { version = "9.3.1", features = ["use_pem"] }
+ed25519-dalek = "2.1.1"
+pkcs8 = "0.10.2"
+hex = "0.4.3"
 
 [dev-dependencies]
 # Additional test dependencies if needed

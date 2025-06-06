@@ -60,19 +60,24 @@ where
     network: NetworkActorHandle,
     kademlia: Kademlia,
     pub store: Arc<St>,
+    pub permission_manager: PermissionManager,
 }
 
 impl<St> IOHandler<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(node_addr, operator, network, kademlia, store))]
+    #[tracing::instrument(
+        level = "trace",
+        skip(node_addr, operator, network, kademlia, store, permission_manager)
+    )]
     pub async fn new(
         node_addr: NodeAddr,
         operator: Operator,
         network: NetworkActorHandle,
         kademlia: Kademlia,
         store: Arc<St>,
+        permission_manager: PermissionManager,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let repl_handler = Arc::new(Self {
             node_addr,
@@ -80,6 +85,7 @@ where
             network,
             kademlia,
             store,
+            permission_manager,
         });
 
         repl_handler.clone().run().await;
@@ -416,6 +422,47 @@ where
         encode_ranges_validated(stream_wrapper, &mut ob, &ranges, &mut sx_wrapper).await?;
         debug!("Sent all chunks.");
 
+        Ok(())
+    }
+
+    async fn store_location(
+        &self,
+        location: &ObjectInfo,
+        frontend_path: Option<String>,
+        permission_path: Option<Path>,
+    ) -> anyhow::Result<()> {
+        let data_hash = location.file_hashes.blake3.as_bytes();
+
+        // Store object info with blake3 hash as key
+        let mut write_txn = self.store.create_txn(true)?;
+        self.store.put(
+            &mut write_txn,
+            LOCATION_DB_NAME,
+            data_hash,
+            &bincode::serde::encode_to_vec(location.clone(), bincode::config::standard())?,
+        )?;
+
+        // If provided store frontend path mapping
+        if let Some(path) = frontend_path {
+            self.store.put(
+                &mut write_txn,
+                PATH_LOCATION_DB_NAME,
+                path.as_bytes(),
+                data_hash,
+            )?;
+        }
+
+        // If provided store permission path
+        if let Some(path) = permission_path {
+            self.permission_manager.add_resource(
+                ResourceId::Ulid(location.id),
+                &path,
+                self.store.as_ref(),
+                &mut write_txn,
+            )?
+        }
+
+        self.store.commit(write_txn)?;
         Ok(())
     }
 }

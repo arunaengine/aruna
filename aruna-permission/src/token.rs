@@ -1,6 +1,8 @@
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
 };
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -8,19 +10,20 @@ use ulid::Ulid;
 
 use crate::error::{PermissionError, Result};
 use crate::manager::UserIdentity;
+use crate::paths::RealmKey;
 
 /// JWT Claims for realm identity tokens
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RealmTokenClaims {
     /// User ULID within the realm
     pub user_ulid: String,
-    /// Realm ULID that issued this token
+    /// Realm key (hex encoded) that issued this token
     pub realm_ulid: String,
     /// Standard JWT issued at time
     pub iat: u64,
     /// Standard JWT expiration time
     pub exp: u64,
-    /// Standard JWT issuer (aruna@realm_id format)
+    /// Standard JWT issuer (aruna@realm_key format)
     pub iss: String,
     /// Standard JWT subject (user identifier)
     pub sub: String,
@@ -34,12 +37,14 @@ impl RealmTokenClaims {
             .unwrap()
             .as_secs();
 
+        let realm_hex = hex::encode(user_identity.realm_ulid);
+
         Self {
             user_ulid: user_identity.user_ulid.to_string(),
-            realm_ulid: user_identity.realm_ulid.to_string(),
+            realm_ulid: realm_hex.clone(),
             iat: now,
             exp: now + (expiration_hours * 3600),
-            iss: format!("aruna@{}", user_identity.realm_ulid),
+            iss: format!("aruna@{}", realm_hex),
             sub: user_identity.user_ulid.to_string(),
         }
     }
@@ -49,11 +54,21 @@ impl RealmTokenClaims {
         let user_ulid = Ulid::from_string(&self.user_ulid).map_err(|_| {
             PermissionError::ResourceNotFound("Invalid user ULID in token".to_string())
         })?;
-        let realm_ulid = Ulid::from_string(&self.realm_ulid).map_err(|_| {
-            PermissionError::ResourceNotFound("Invalid realm ULID in token".to_string())
+
+        let realm_bytes = hex::decode(&self.realm_ulid).map_err(|_| {
+            PermissionError::ResourceNotFound("Invalid realm key in token".to_string())
         })?;
 
-        Ok(UserIdentity::new(user_ulid, realm_ulid))
+        if realm_bytes.len() != 32 {
+            return Err(PermissionError::ResourceNotFound(
+                "Invalid realm key length in token".to_string(),
+            ));
+        }
+
+        let mut realm_key = [0u8; 32];
+        realm_key.copy_from_slice(&realm_bytes);
+
+        Ok(UserIdentity::new(user_ulid, realm_key))
     }
 
     /// Check if token is expired
@@ -142,66 +157,67 @@ impl OidcTrustConfig {
     }
 }
 
-/// Convert raw Ed25519 private key bytes to PKCS#8 DER format
-fn ed25519_private_key_to_pkcs8_der(private_key_bytes: &[u8; 32]) -> Vec<u8> {
-    // PKCS#8 DER encoding for Ed25519 private key
-    // This is the ASN.1 structure for Ed25519 private keys
-    let mut pkcs8_der = Vec::new();
-
-    // PKCS#8 header for Ed25519
-    pkcs8_der.extend_from_slice(&[
-        0x30, 0x2e, // SEQUENCE, length 46
-        0x02, 0x01, 0x00, // INTEGER version (0)
-        0x30, 0x05, // SEQUENCE, length 5 (algorithm identifier)
-        0x06, 0x03, 0x2b, 0x65, 0x70, // OID for Ed25519 (1.3.101.112)
-        0x04, 0x22, // OCTET STRING, length 34
-        0x04, 0x20, // OCTET STRING, length 32 (inner key)
-    ]);
-
-    // Add the actual private key bytes
-    pkcs8_der.extend_from_slice(private_key_bytes);
-
-    pkcs8_der
+/// Ed25519 key pair for realm token operations
+#[derive(Debug, Clone)]
+pub struct Ed25519KeyPair {
+    pub signing_key: SigningKey,
+    pub verifying_key: VerifyingKey,
 }
 
-/// Convert raw Ed25519 public key bytes to SubjectPublicKeyInfo DER format
-fn ed25519_public_key_to_spki_der(public_key_bytes: &[u8; 32]) -> Vec<u8> {
-    // SubjectPublicKeyInfo DER encoding for Ed25519 public key
-    let mut spki_der = Vec::new();
+impl Ed25519KeyPair {
+    /// Generate a new Ed25519 key pair using iroh's SecretKey
+    pub fn generate() -> Self {
+        let iroh_secret = iroh::SecretKey::generate(&mut OsRng);
+        let signing_key = SigningKey::from_bytes(&iroh_secret.to_bytes());
+        let verifying_key = signing_key.verifying_key();
 
-    // SPKI header for Ed25519
-    spki_der.extend_from_slice(&[
-        0x30, 0x2a, // SEQUENCE, length 42
-        0x30, 0x05, // SEQUENCE, length 5 (algorithm identifier)
-        0x06, 0x03, 0x2b, 0x65, 0x70, // OID for Ed25519 (1.3.101.112)
-        0x03, 0x21, 0x00, // BIT STRING, length 33, unused bits 0
-    ]);
+        Self {
+            signing_key,
+            verifying_key,
+        }
+    }
 
-    // Add the actual public key bytes
-    spki_der.extend_from_slice(public_key_bytes);
+    /// Get the signing key as PKCS8 PEM format
+    pub fn signing_key_pem(&self) -> Result<String> {
+        use pkcs8::EncodePrivateKey;
+        self.signing_key
+            .to_pkcs8_pem(pkcs8::LineEnding::LF)
+            .map(|s| s.to_string())
+            .map_err(|e| {
+                PermissionError::ResourceNotFound(format!("Failed to encode signing key: {}", e))
+            })
+    }
 
-    spki_der
+    /// Get the verifying key as PEM format
+    pub fn verifying_key_pem(&self) -> Result<String> {
+        use pkcs8::EncodePublicKey;
+        self.verifying_key
+            .to_public_key_pem(pkcs8::LineEnding::LF)
+            .map_err(|e| {
+                PermissionError::ResourceNotFound(format!("Failed to encode verifying key: {}", e))
+            })
+    }
 }
 
 /// Simple token system for identity management
 pub struct TokenSystem {
-    /// Local realm ULID
-    local_realm_ulid: Ulid,
+    /// Local realm key
+    local_realm_key: RealmKey,
     /// Static configuration for trusted OIDC issuers
     oidc_trust_config: OidcTrustConfig,
-    /// OIDC provider public keys (issuer -> public_key_bytes)
-    oidc_public_keys: HashMap<String, Vec<u8>>,
-    /// Realm public keys for verification (realm_ulid -> public_key_bytes)
-    realm_public_keys: HashMap<Ulid, [u8; 32]>,
+    /// OIDC provider public keys (issuer -> public_key_pem as String)
+    oidc_public_keys: HashMap<String, String>,
+    /// Realm Ed25519 verifying keys for verification (realm_key -> verifying_key_pem as String)
+    realm_public_keys: HashMap<RealmKey, String>,
     /// Default token expiration in hours
     default_expiration_hours: u64,
 }
 
 impl TokenSystem {
     /// Create new token system for a specific realm
-    pub fn new(local_realm_ulid: Ulid, oidc_trust_config: OidcTrustConfig) -> Self {
+    pub fn new(local_realm_key: RealmKey, oidc_trust_config: OidcTrustConfig) -> Self {
         Self {
-            local_realm_ulid,
+            local_realm_key,
             oidc_trust_config,
             oidc_public_keys: HashMap::new(),
             realm_public_keys: HashMap::new(),
@@ -209,14 +225,14 @@ impl TokenSystem {
         }
     }
 
-    /// Add OIDC provider public key for token verification
-    pub fn add_oidc_public_key(&mut self, issuer: String, public_key: Vec<u8>) {
-        self.oidc_public_keys.insert(issuer, public_key);
+    /// Add OIDC provider public key for token verification (expects PEM format)
+    pub fn add_oidc_public_key(&mut self, issuer: String, public_key_pem: String) {
+        self.oidc_public_keys.insert(issuer, public_key_pem);
     }
 
-    /// Add realm public key for verification
-    pub fn add_realm_public_key(&mut self, realm_ulid: Ulid, public_key: [u8; 32]) {
-        self.realm_public_keys.insert(realm_ulid, public_key);
+    /// Add realm Ed25519 verifying key for verification (expects PEM format)
+    pub fn add_realm_public_key(&mut self, realm_ulid: RealmKey, verifying_key_pem: String) {
+        self.realm_public_keys.insert(realm_ulid, verifying_key_pem);
     }
 
     /// Register user from OIDC token - creates new UserIdentity after verification or returns existing one
@@ -258,7 +274,7 @@ impl TokenSystem {
             self.get_user_from_oidc(oidc_provider, oidc_sub, store, txn)?
         {
             // Return existing identity
-            return Ok(UserIdentity::new(existing_user_ulid, self.local_realm_ulid));
+            return Ok(UserIdentity::new(existing_user_ulid, self.local_realm_key));
         }
 
         // No existing mapping found, create new user
@@ -268,7 +284,7 @@ impl TokenSystem {
         self.add_oidc_identity(oidc_provider, oidc_sub, user_ulid, store, txn)?;
 
         // Create UserIdentity for local realm
-        let user_identity = UserIdentity::new(user_ulid, self.local_realm_ulid);
+        let user_identity = UserIdentity::new(user_ulid, self.local_realm_key);
 
         Ok(user_identity)
     }
@@ -317,40 +333,21 @@ impl TokenSystem {
         }
     }
 
-    /// Verify and decode OIDC token
+    /// Verify and decode OIDC token (supports RSA, EC, EdDSA algorithms)
     fn verify_oidc_token(&self, token: &str) -> Result<OidcToken> {
-        // Decode header to get algorithm and key info
-        let header = decode_header(token)
-            .map_err(|_| PermissionError::ResourceNotFound("Invalid JWT format".to_string()))?;
+        // Decode without verification first to get issuer for key lookup
+        let dummy_key = DecodingKey::from_secret("dummy".as_ref());
+        let mut unverified_validation = Validation::new(Algorithm::RS256);
+        unverified_validation.insecure_disable_signature_validation();
+        unverified_validation.validate_exp = false;
+        unverified_validation.validate_aud = false;
 
-        // Decode claims without verification first to get issuer
-        let token_parts: Vec<&str> = token.split('.').collect();
-        if token_parts.len() != 3 {
-            return Err(PermissionError::ResourceNotFound(
-                "Invalid JWT format".to_string(),
-            ));
-        }
-
-        // Decode claims part as JSON
-        let claims_json = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            token_parts[1],
-        )
-        .map_err(|_| {
-            PermissionError::ResourceNotFound("Invalid JWT claims encoding".to_string())
-        })?;
-
-        let claims_value: serde_json::Value =
-            serde_json::from_slice(&claims_json).map_err(|_| {
-                PermissionError::ResourceNotFound("Invalid JWT claims JSON".to_string())
+        let unverified =
+            decode::<OidcToken>(token, &dummy_key, &unverified_validation).map_err(|_| {
+                PermissionError::ResourceNotFound("Invalid OIDC token format".to_string())
             })?;
 
-        let issuer = claims_value
-            .get("iss")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                PermissionError::ResourceNotFound("Missing issuer in token".to_string())
-            })?;
+        let issuer = &unverified.claims.iss;
 
         // Check if issuer is trusted
         if !self.oidc_trust_config.is_trusted(issuer) {
@@ -361,28 +358,34 @@ impl TokenSystem {
         }
 
         // Get public key for this issuer
-        let public_key = self.oidc_public_keys.get(issuer).ok_or_else(|| {
+        let public_key_pem = self.oidc_public_keys.get(issuer).ok_or_else(|| {
             PermissionError::ResourceNotFound(format!(
                 "No public key available for issuer: {}",
                 issuer
             ))
         })?;
 
+        // Get algorithm from token header
+        let header = decode_header(token)
+            .map_err(|_| PermissionError::ResourceNotFound("Invalid JWT format".to_string()))?;
+
         // Create decoding key based on algorithm
         let decoding_key = match header.alg {
             Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-                DecodingKey::from_rsa_pem(public_key).map_err(|_| {
+                DecodingKey::from_rsa_pem(public_key_pem.as_bytes()).map_err(|_| {
                     PermissionError::ResourceNotFound("Invalid RSA public key".to_string())
                 })?
             }
             Algorithm::ES256 | Algorithm::ES384 => {
-                DecodingKey::from_ec_pem(public_key).map_err(|_| {
+                DecodingKey::from_ec_pem(public_key_pem.as_bytes()).map_err(|_| {
                     PermissionError::ResourceNotFound("Invalid EC public key".to_string())
                 })?
             }
-            Algorithm::EdDSA => DecodingKey::from_ed_pem(public_key).map_err(|_| {
-                PermissionError::ResourceNotFound("Invalid Ed25519 public key".to_string())
-            })?,
+            Algorithm::EdDSA => {
+                DecodingKey::from_ed_pem(public_key_pem.as_bytes()).map_err(|_| {
+                    PermissionError::ResourceNotFound("Invalid Ed25519 public key".to_string())
+                })?
+            }
             _ => {
                 return Err(PermissionError::ResourceNotFound(format!(
                     "Unsupported algorithm: {:?}",
@@ -391,7 +394,7 @@ impl TokenSystem {
             }
         };
 
-        // Set up validation
+        // Set up proper validation
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[issuer]);
 
@@ -417,28 +420,19 @@ impl TokenSystem {
         store: &'a S,
         txn: &mut <S as aruna_storage::storage::store::Store<'a>>::Txn,
     ) -> Result<UserIdentity> {
-        // Decode claims part to check issuer
-        let token_parts: Vec<&str> = token.split('.').collect();
-        if token_parts.len() != 3 {
-            return Err(PermissionError::ResourceNotFound(
-                "Invalid JWT format".to_string(),
-            ));
-        }
+        // Decode without verification to check issuer type
+        let dummy_key = DecodingKey::from_secret("dummy".as_ref());
+        let mut unverified_validation = Validation::new(Algorithm::EdDSA);
+        unverified_validation.insecure_disable_signature_validation();
+        unverified_validation.validate_exp = false;
+        unverified_validation.validate_aud = false;
 
-        let claims_json = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            token_parts[1],
-        )
-        .map_err(|_| {
-            PermissionError::ResourceNotFound("Invalid JWT claims encoding".to_string())
-        })?;
+        // Try to decode as generic JSON to get issuer
+        let unverified = decode::<serde_json::Value>(token, &dummy_key, &unverified_validation)
+            .map_err(|_| PermissionError::ResourceNotFound("Invalid JWT format".to_string()))?;
 
-        let claims_value: serde_json::Value =
-            serde_json::from_slice(&claims_json).map_err(|_| {
-                PermissionError::ResourceNotFound("Invalid JWT claims JSON".to_string())
-            })?;
-
-        let issuer = claims_value
+        let issuer = unverified
+            .claims
             .get("iss")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
@@ -454,91 +448,105 @@ impl TokenSystem {
         self.register_user(token, store, txn)
     }
 
-    /// Generate realm token for UserIdentity using provided private key
+    /// Generate realm token for UserIdentity using Ed25519 signing key (PKCS8 PEM format)
     pub fn generate_token(
         &self,
         user_identity: &UserIdentity,
-        private_key: &[u8; 32],
+        signing_key_pem: &str,
     ) -> Result<String> {
         // Only generate tokens for users in our local realm
-        if user_identity.realm_ulid != self.local_realm_ulid {
+        if user_identity.realm_ulid != self.local_realm_key {
             return Err(PermissionError::ResourceNotFound(
                 "Cannot generate token for foreign realm user".to_string(),
             ));
         }
 
         let claims = RealmTokenClaims::new(user_identity, self.default_expiration_hours);
-        let header = Header::new(Algorithm::EdDSA);
 
-        // Convert raw Ed25519 private key to PKCS#8 DER format
-        let pkcs8_der = ed25519_private_key_to_pkcs8_der(private_key);
-        let encoding_key = EncodingKey::from_ed_der(&pkcs8_der);
-
-        encode(&header, &claims, &encoding_key)
-            .map_err(|_| PermissionError::ResourceNotFound("Failed to encode token".to_string()))
-    }
-
-    /// Validate realm JWT token and extract UserIdentity
-    fn validate_realm_token(&self, token: &str) -> Result<UserIdentity> {
-        // Decode claims to get realm info
-        let token_parts: Vec<&str> = token.split('.').collect();
-        if token_parts.len() != 3 {
-            return Err(PermissionError::ResourceNotFound(
-                "Invalid JWT format".to_string(),
-            ));
-        }
-
-        let claims_json = base64::Engine::decode(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            token_parts[1],
-        )
-        .map_err(|_| {
-            PermissionError::ResourceNotFound("Invalid JWT claims encoding".to_string())
+        // Use Ed25519 for realm tokens only
+        let encoding_key = EncodingKey::from_ed_pem(signing_key_pem.as_bytes()).map_err(|e| {
+            PermissionError::ResourceNotFound(format!(
+                "Failed to create Ed25519 encoding key: {}",
+                e
+            ))
         })?;
 
-        let unverified_claims: RealmTokenClaims =
-            serde_json::from_slice(&claims_json).map_err(|_| {
+        let header = Header::new(Algorithm::EdDSA);
+        encode(&header, &claims, &encoding_key).map_err(|e| {
+            PermissionError::ResourceNotFound(format!("Failed to encode EdDSA token: {}", e))
+        })
+    }
+
+    /// Validate realm JWT token and extract UserIdentity (Ed25519 only)
+    pub fn validate_realm_token(&self, token: &str) -> Result<UserIdentity> {
+        // Decode without verification first to get realm info for key lookup
+        let dummy_key = DecodingKey::from_secret("dummy".as_ref());
+        let mut unverified_validation = Validation::new(Algorithm::EdDSA);
+        unverified_validation.insecure_disable_signature_validation();
+        unverified_validation.validate_exp = false;
+        unverified_validation.validate_aud = false;
+
+        let unverified = decode::<RealmTokenClaims>(token, &dummy_key, &unverified_validation)
+            .map_err(|_| {
                 PermissionError::ResourceNotFound("Failed to decode realm token claims".to_string())
             })?;
 
-        // Check expiration
-        if unverified_claims.is_expired() {
+        // Check expiration early
+        if unverified.claims.is_expired() {
             return Err(PermissionError::ResourceNotFound(
                 "Token expired".to_string(),
             ));
         }
 
-        // Extract realm ULID from issuer
-        let realm_ulid = if let Some(realm_str) = unverified_claims.iss.strip_prefix("aruna@") {
-            Ulid::from_string(realm_str).map_err(|_| {
-                PermissionError::ResourceNotFound("Invalid realm ULID in issuer".to_string())
-            })?
+        // Extract realm key from issuer
+        let realm_key = if let Some(realm_hex) = unverified.claims.iss.strip_prefix("aruna@") {
+            let realm_bytes = hex::decode(realm_hex).map_err(|_| {
+                PermissionError::ResourceNotFound("Invalid realm key in issuer".to_string())
+            })?;
+
+            if realm_bytes.len() != 32 {
+                return Err(PermissionError::ResourceNotFound(
+                    "Invalid realm key length in issuer".to_string(),
+                ));
+            }
+
+            let mut realm_key = [0u8; 32];
+            realm_key.copy_from_slice(&realm_bytes);
+            realm_key
         } else {
             return Err(PermissionError::ResourceNotFound(
                 "Invalid Aruna token issuer format".to_string(),
             ));
         };
 
-        // Get public key for verification
-        let public_key = self
-            .realm_public_keys
-            .get(&realm_ulid)
-            .copied()
-            .ok_or_else(|| {
-                PermissionError::ResourceNotFound("Realm public key not found".to_string())
-            })?;
+        // Get Ed25519 verifying key for verification
+        let verifying_key_pem = self.realm_public_keys.get(&realm_key).ok_or_else(|| {
+            PermissionError::ResourceNotFound("Realm public key not found".to_string())
+        })?;
 
-        // Convert raw Ed25519 public key to SPKI DER format
-        let spki_der = ed25519_public_key_to_spki_der(&public_key);
-        let decoding_key = DecodingKey::from_ed_der(&spki_der);
+        // Get algorithm from token header - must be EdDSA for realm tokens
+        let header = decode_header(token)
+            .map_err(|_| PermissionError::ResourceNotFound("Invalid JWT format".to_string()))?;
+
+        if header.alg != Algorithm::EdDSA {
+            return Err(PermissionError::ResourceNotFound(format!(
+                "Invalid algorithm for realm token: {:?}, expected EdDSA",
+                header.alg
+            )));
+        }
+
+        // Create Ed25519 decoding key
+        let decoding_key = DecodingKey::from_ed_pem(verifying_key_pem.as_bytes()).map_err(|e| {
+            PermissionError::ResourceNotFound(format!("Invalid Ed25519 verifying key: {}", e))
+        })?;
 
         // Verify token signature with proper validation
         let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.set_issuer(&[&unverified_claims.iss]);
+        validation.set_issuer(&[&unverified.claims.iss]);
 
         let verified_token = decode::<RealmTokenClaims>(token, &decoding_key, &validation)
-            .map_err(|_| {
-                PermissionError::ResourceNotFound("Token verification failed".to_string())
+            .map_err(|e| {
+                PermissionError::ResourceNotFound(format!("Token verification failed: {}", e))
             })?;
 
         // Convert to UserIdentity
@@ -556,18 +564,21 @@ mod tests {
         Ulid::from_bytes(bytes)
     }
 
-    fn create_test_keypair() -> ([u8; 32], [u8; 32]) {
-        // Generate a test Ed25519 keypair (in practice you'd use a proper crypto library)
-        let mut private_key = [0u8; 32];
-        let mut public_key = [0u8; 32];
+    fn create_test_realm_key(suffix: u8) -> RealmKey {
+        let mut key = [0u8; 32];
+        key[31] = suffix;
+        key
+    }
 
-        // Fill with test data (in reality, use proper key generation)
-        for i in 0..32 {
-            private_key[i] = i as u8;
-            public_key[i] = (i + 32) as u8;
-        }
+    #[test]
+    fn test_ed25519_key_pair_generation() {
+        let key_pair = Ed25519KeyPair::generate();
 
-        (private_key, public_key)
+        let signing_pem = key_pair.signing_key_pem().unwrap();
+        let verifying_pem = key_pair.verifying_key_pem().unwrap();
+
+        assert!(signing_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(verifying_pem.contains("BEGIN PUBLIC KEY"));
     }
 
     #[test]
@@ -588,7 +599,7 @@ mod tests {
 
     #[test]
     fn test_realm_token_claims() {
-        let realm_ulid = create_test_ulid(1);
+        let realm_ulid = create_test_realm_key(1);
         let user_ulid = create_test_ulid(2);
         let user_identity = UserIdentity::new(user_ulid, realm_ulid);
 
@@ -596,97 +607,140 @@ mod tests {
         let recovered_identity = claims.to_user_identity().unwrap();
 
         assert_eq!(recovered_identity, user_identity);
-        assert_eq!(claims.iss, format!("aruna@{}", realm_ulid));
+        assert_eq!(claims.iss, format!("aruna@{}", hex::encode(realm_ulid)));
         assert!(!claims.is_expired());
     }
 
     #[test]
     fn test_token_system_creation() {
-        let realm_ulid = create_test_ulid(1);
+        let realm_ulid = create_test_realm_key(1);
         let trust_config =
             OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
 
         let mut token_system = TokenSystem::new(realm_ulid, trust_config);
 
-        // Add OIDC public key (dummy PEM for testing)
-        let dummy_rsa_public_key = b"-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1234567890...
------END PUBLIC KEY-----"
-            .to_vec();
+        // Add OIDC public key (RSA for testing)
+        let rsa_public_key = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3VoPN9PKUjKFLMwOge9+
+GnWSGqIFRN5PefrZKFJ9d0I0P9DI/hI1/P8TdTGczkOQG+QYkwQYRbHvyIKOAPjM
+zJBEwOv8/sYKrJnM4CbzA+p9+f5X5XhqyuVzgE5pGHpE7Jg1g3bvBbKh9B0BvuOQ
+LhRj9dE8aJb2yS7Jk1kEOGfN8QnMLRf4Mj+ZUZ7SuKJwdEQ1vJE9pEgZQHr45FPf
+OYPh1F2PZhQ1Jf5p0tYwMHT7k2+4HgWOz1R23XvFxT8Y4PnN8X3+j1S3WyqKO1R2
+g8MQTS1BnfL1XHZj5r9OhF2h/Qzlx/eHf1zA9L+rYCdm9FjKNT3bJl6sKO9zJp8k
+ZwIDAQAB
+-----END PUBLIC KEY-----"#;
 
         token_system.add_oidc_public_key(
             "https://accounts.google.com".to_string(),
-            dummy_rsa_public_key,
+            rsa_public_key.to_string(),
         );
 
-        // Add realm public key
-        let (_, public_key) = create_test_keypair();
-        token_system.add_realm_public_key(realm_ulid, public_key);
+        // Add realm Ed25519 key
+        let key_pair = Ed25519KeyPair::generate();
+        let verifying_pem = key_pair.verifying_key_pem().unwrap();
+        token_system.add_realm_public_key(realm_ulid, verifying_pem);
 
-        assert_eq!(token_system.local_realm_ulid, realm_ulid);
+        assert_eq!(token_system.local_realm_key, realm_ulid);
     }
 
     #[test]
-    fn test_oidc_mapping_storage() {
-        // This test demonstrates the concept but would need a real store implementation
-        // In practice, this would be tested in integration tests with actual storage
-        let realm_ulid = create_test_ulid(1);
-        let trust_config = OidcTrustConfig::TrustAll;
-        let token_system = TokenSystem::new(realm_ulid, trust_config);
+    fn test_ed25519_token_round_trip() {
+        let realm_ulid = create_test_realm_key(1);
+        let user_ulid = create_test_ulid(2);
+        let mut token_system = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
 
-        // The actual storage testing would happen in integration tests
-        // where we have access to a real Store implementation
-        assert_eq!(token_system.local_realm_ulid, realm_ulid);
+        // Generate Ed25519 key pair
+        let key_pair = Ed25519KeyPair::generate();
+        let signing_pem = key_pair.signing_key_pem().unwrap();
+        let verifying_pem = key_pair.verifying_key_pem().unwrap();
+
+        // Configure the token system with test keys
+        token_system.add_realm_public_key(realm_ulid, verifying_pem);
+
+        let user_identity = UserIdentity::new(user_ulid, realm_ulid);
+
+        // Generate token using Ed25519
+        let token = token_system
+            .generate_token(&user_identity, &signing_pem)
+            .unwrap();
+        assert!(!token.is_empty());
+
+        // Validate token and extract identity
+        let recovered_identity = token_system.validate_realm_token(&token).unwrap();
+
+        assert_eq!(recovered_identity, user_identity);
     }
 
     #[test]
-    fn test_oidc_claims_registration() {
-        let realm_ulid = create_test_ulid(1);
-        let trust_config =
-            OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
-        let token_system = TokenSystem::new(realm_ulid, trust_config);
+    fn test_cross_realm_token_validation() {
+        let realm_a = create_test_realm_key(1);
+        let realm_b = create_test_realm_key(2);
+        let user_ulid = create_test_ulid(10);
 
-        // This demonstrates the interface - actual testing requires integration tests
-        // with real storage implementation
+        let mut token_system_a = TokenSystem::new(realm_a, OidcTrustConfig::TrustAll);
+        let mut token_system_b = TokenSystem::new(realm_b, OidcTrustConfig::TrustAll);
 
-        // The methods are available for integration testing:
-        // 1. register_user_from_oidc_claims() - for direct provider/sub registration
-        // 2. add_oidc_identity() - for storing mappings
-        // 3. get_user_from_oidc() - for looking up existing mappings
+        // Generate Ed25519 key pair for realm A
+        let key_pair = Ed25519KeyPair::generate();
+        let signing_pem = key_pair.signing_key_pem().unwrap();
+        let verifying_pem = key_pair.verifying_key_pem().unwrap();
 
-        assert_eq!(token_system.local_realm_ulid, realm_ulid);
+        // Configure realm A with keys
+        token_system_a.add_realm_public_key(realm_a, verifying_pem.clone());
+
+        // Configure realm B to recognize realm A's public key
+        token_system_b.add_realm_public_key(realm_a, verifying_pem);
+
+        let user_identity_a = UserIdentity::new(user_ulid, realm_a);
+
+        // Generate token in realm A
+        let token = token_system_a
+            .generate_token(&user_identity_a, &signing_pem)
+            .unwrap();
+
+        // Validate token in realm B (should work since B has A's public key)
+        let recovered_identity = token_system_b.validate_realm_token(&token).unwrap();
+        assert_eq!(recovered_identity, user_identity_a);
     }
 
     #[test]
-    fn test_ed25519_key_conversion() {
-        let (private_key, public_key) = create_test_keypair();
+    fn test_token_generation_foreign_realm() {
+        let realm_a = create_test_realm_key(1);
+        let realm_b = create_test_realm_key(2);
+        let user_ulid = create_test_ulid(10);
+        let token_system = TokenSystem::new(realm_a, OidcTrustConfig::TrustAll);
 
-        // Test key conversion functions
-        let pkcs8_der = ed25519_private_key_to_pkcs8_der(&private_key);
-        let spki_der = ed25519_public_key_to_spki_der(&public_key);
+        let key_pair = Ed25519KeyPair::generate();
+        let signing_pem = key_pair.signing_key_pem().unwrap();
 
-        // Basic sanity checks
-        assert!(pkcs8_der.len() > 32); // Should be longer than raw key
-        assert!(spki_der.len() > 32); // Should be longer than raw key
-
-        // Check DER structure headers
-        assert_eq!(pkcs8_der[0], 0x30); // SEQUENCE tag
-        assert_eq!(spki_der[0], 0x30); // SEQUENCE tag
+        // Try to generate token for user from different realm
+        let foreign_user_identity = UserIdentity::new(user_ulid, realm_b);
+        let result = token_system.generate_token(&foreign_user_identity, &signing_pem);
+        assert!(result.is_err());
     }
 
     #[test]
-    fn test_different_realms() {
-        let realm_a = create_test_ulid(1);
-        let realm_b = create_test_ulid(2);
+    fn test_token_validation_without_public_key() {
+        let realm_ulid = create_test_realm_key(1);
+        let user_ulid = create_test_ulid(2);
+        let mut token_system_generator = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
 
-        let trust_config_a = OidcTrustConfig::TrustAll;
-        let trust_config_b = OidcTrustConfig::TrustAll;
+        let key_pair = Ed25519KeyPair::generate();
+        let signing_pem = key_pair.signing_key_pem().unwrap();
+        let verifying_pem = key_pair.verifying_key_pem().unwrap();
 
-        let token_system_a = TokenSystem::new(realm_a, trust_config_a);
-        let token_system_b = TokenSystem::new(realm_b, trust_config_b);
+        token_system_generator.add_realm_public_key(realm_ulid, verifying_pem);
 
-        // Different realms should be separate
-        assert_eq!(token_system_a.local_realm_ulid, realm_a);
-        assert_eq!(token_system_b.local_realm_ulid, realm_b);
+        let user_identity = UserIdentity::new(user_ulid, realm_ulid);
+        let token = token_system_generator
+            .generate_token(&user_identity, &signing_pem)
+            .unwrap();
+
+        // Create a new token system without the public key
+        let validator_system = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
+
+        // Should fail because no public key is available for validation
+        let result = validator_system.validate_realm_token(&token);
+        assert!(result.is_err());
     }
 }

@@ -22,7 +22,6 @@ impl RestServer {
         for<'a> St: Store<'a> + 'static,
     {
         let socket_address = SocketAddr::from((rest_address, rest_port));
-        println!("ADDR: {socket_address}");
         let listener = tokio::net::TcpListener::bind(socket_address).await?;
 
         let (router, api) = OpenApiRouter::with_openapi(ArunaApi::openapi())
