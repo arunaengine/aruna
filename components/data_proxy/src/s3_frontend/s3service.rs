@@ -181,7 +181,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let response = CompleteMultipartUploadOutput {
-            e_tag: Some(format!("-{}", object.id.to_string())),
+            e_tag: Some(format!("-{}", object.id)),
             ..Default::default()
         };
 
@@ -814,6 +814,125 @@ impl S3 for ArunaS3Service {
 
     #[tracing::instrument(err)]
     #[allow(clippy::blocks_in_conditions)]
+    async fn list_objects(
+        &self,
+        req: S3Request<ListObjectsInput>,
+    ) -> S3Result<S3Response<ListObjectsOutput>> {
+        let CheckAccessResult { headers, .. } = req
+            .extensions
+            .get::<CheckAccessResult>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "No context found");
+                s3_error!(InternalError, "No context found")
+            })?;
+        // Fetch the project name, delimiter and prefix from the request
+        let project_name = &req.input.bucket;
+        let delimiter = req.input.delimiter;
+        let prefix = req.input.prefix.filter(|prefix| !prefix.is_empty());
+
+        // Check if bucket exists as root in cache of paths
+        match self.cache.get_path(project_name.as_str()) {
+            Some(_) => {}
+            None => {
+                error!("No bucket found");
+                return Err(s3_error!(NoSuchBucket, "No bucket found"));
+            }
+        };
+
+        let max_keys = match req.input.max_keys {
+            Some(k) if k < 1000 => k as usize,
+            _ => 1000usize,
+        };
+
+        let start_at = match &req.input.marker {
+            Some(marker) => marker,
+            None => "",
+        };
+
+        let (keys, common_prefixes, next_marker) = list_response(
+            &self.cache,
+            &delimiter,
+            &prefix,
+            project_name,
+            start_at,
+            max_keys,
+            true,
+        )
+        .await
+        .map_err(|_| {
+            error!(error = "Keys not found in ListObjects");
+            s3_error!(NoSuchKey, "Keys not found in ListObjects")
+        })?;
+
+        let common_prefixes = Some(
+            common_prefixes
+                .into_iter()
+                .map(|e| CommonPrefix { prefix: Some(e) })
+                .collect(),
+        );
+        let contents = Some(
+            keys.into_iter()
+                .map(|e| Object {
+                    checksum_algorithm: None,
+                    e_tag: Some(e.etag.to_string()),
+                    key: Some(e.key),
+                    last_modified: e.created_at.map(|t| {
+                        s3s::dto::Timestamp::from(
+                            time::OffsetDateTime::from_unix_timestamp(t.and_utc().timestamp())
+                                .unwrap_or_else(|_| {
+                                    error!(error = "Unable to parse timestamp");
+                                    time::OffsetDateTime::now_utc()
+                                }),
+                        )
+                    }),
+                    owner: None,
+                    size: Some(e.size),
+                    ..Default::default()
+                })
+                .collect(),
+        );
+
+        let result = ListObjectsOutput {
+            common_prefixes,
+            contents,
+            marker: req.input.marker,
+            delimiter,
+            encoding_type: None,
+            is_truncated: Some(next_marker.is_some()),
+            max_keys: Some(max_keys.try_into().map_err(|err| {
+                error!(error = ?err, "Conversion failure");
+                s3_error!(InternalError, "[BACKEND] Conversion failure: {}", err)
+            })?),
+            name: Some(project_name.clone()),
+            next_marker,
+            prefix,
+            ..Default::default()
+        };
+        debug!(?result);
+
+        let mut resp = S3Response::new(result);
+
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
+                        error!(error = "Unable to parse header name");
+                        s3_error!(InternalError, "Unable to parse header name")
+                    })?,
+                    HeaderValue::from_str(&v).map_err(|_| {
+                        error!(error = "Unable to parse header value");
+                        s3_error!(InternalError, "Unable to parse header value")
+                    })?,
+                );
+            }
+        }
+
+        Ok(resp)
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
     async fn list_objects_v2(
         &self,
         req: S3Request<ListObjectsV2Input>,
@@ -878,6 +997,7 @@ impl S3 for ArunaS3Service {
             project_name,
             &start_after,
             max_keys,
+            false,
         )
         .await
         .map_err(|_| {

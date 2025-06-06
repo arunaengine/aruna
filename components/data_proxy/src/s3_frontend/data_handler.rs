@@ -71,11 +71,12 @@ impl DataHandler {
         let parents = if let Some(levels) = path_level {
             levels
         } else {
-            let mut object_id = object.id.clone();
+            let mut object_id = object.id;
             if let Some(version) = &object.versions {
-                version.iter().next().map(|v| match v {
-                    VersionVariant::IsVersion(id) => object_id = id.clone(),
-                    _ => {}
+                version.iter().next().map(|v| {
+                    if let VersionVariant::IsVersion(id) = v {
+                        object_id = *id
+                    }
                 });
             }
             cache.get_single_parent(&object_id).await.map_err(|e| {
@@ -83,7 +84,7 @@ impl DataHandler {
                 e
             })?
         };
-        if parents.get(0).is_none() {
+        if parents.is_empty() {
             error!(?parents, "No parent found");
             return Err(anyhow!("No parent found"));
         }

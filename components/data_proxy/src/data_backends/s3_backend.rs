@@ -25,7 +25,6 @@ use http_body_util::StreamBody;
 use hyper::body::Frame;
 use rand::random;
 use tracing::error;
-use tracing::trace;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
