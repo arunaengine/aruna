@@ -23,21 +23,21 @@ pub const IDENTITY_PERMISSIONS_DB: &str = "identity_permissions";
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub user_ulid: Ulid,
-    pub realm_ulid: RealmKey,
+    pub realm_key: RealmKey,
 }
 
 impl UserIdentity {
-    pub fn new(user_ulid: Ulid, realm_ulid: RealmKey) -> Self {
+    pub fn new(user_ulid: Ulid, realm_key: RealmKey) -> Self {
         Self {
             user_ulid,
-            realm_ulid,
+            realm_key,
         }
     }
 }
 
 impl Display for UserIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}@{}", self.user_ulid, hex::encode(self.realm_ulid))
+        write!(f, "{}@{}", self.user_ulid, hex::encode(self.realm_key))
     }
 }
 

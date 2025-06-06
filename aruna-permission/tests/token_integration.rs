@@ -136,7 +136,7 @@ async fn test_clean_separation_workflow() {
         .create_group(
             group_id,
             &alice_identity,
-            alice_identity.realm_ulid,
+            alice_identity.realm_key,
             &store,
             &mut txn,
         )
@@ -152,7 +152,7 @@ async fn test_clean_separation_workflow() {
     // Step 4: Create resource and test access control
     let resource_id = create_test_ulid(30);
     let resource_path = Path::builder()
-        .realm_id(alice_identity.realm_ulid)
+        .realm_id(alice_identity.realm_key)
         .group_metadata(group_id, resource_id, vec![])
         .build()
         .unwrap();
@@ -246,8 +246,8 @@ async fn test_cross_realm_token_handling() {
         .register_user_from_oidc_claims(alice_provider, alice_sub, &store, &mut txn)
         .unwrap();
 
-    assert_eq!(alice_realm_a.realm_ulid, realm_a);
-    assert_eq!(alice_realm_b.realm_ulid, realm_b);
+    assert_eq!(alice_realm_a.realm_key, realm_a);
+    assert_eq!(alice_realm_b.realm_key, realm_b);
 
     // Create separate groups and resources in each realm
     let group_a = create_test_ulid(20);
@@ -344,10 +344,10 @@ async fn test_cross_realm_token_handling() {
 
 #[tokio::test]
 async fn test_token_identity_extraction() {
-    let realm_ulid = create_test_realm_key(10);
+    let realm_key = create_test_realm_key(10);
     let oidc_trust_config =
         OidcTrustConfig::TrustedIssuers(vec!["https://login.microsoftonline.com".to_string()]);
-    let mut token_system = TokenSystem::new(realm_ulid, oidc_trust_config);
+    let mut token_system = TokenSystem::new(realm_key, oidc_trust_config);
 
     let (store, test_dir) = setup_test_store().await;
     let mut txn = store.create_txn(true).unwrap();
@@ -361,7 +361,7 @@ async fn test_token_identity_extraction() {
     // Generate Ed25519 key pair for realm tokens
     let realm_keys = Ed25519KeyPair::generate();
     let verifying_pem = realm_keys.verifying_key_pem().unwrap();
-    token_system.add_realm_public_key(realm_ulid, verifying_pem);
+    token_system.add_realm_public_key(realm_key, verifying_pem);
 
     // Test 1: First-time OIDC registration creates new identity
     let identity_from_oidc = token_system
@@ -373,7 +373,7 @@ async fn test_token_identity_extraction() {
         )
         .unwrap();
 
-    assert_eq!(identity_from_oidc.realm_ulid, realm_ulid);
+    assert_eq!(identity_from_oidc.realm_key, realm_key);
 
     // Test 2: Subsequent login with same OIDC returns existing identity
     let identity_second_login = token_system
@@ -404,7 +404,7 @@ async fn test_token_identity_extraction() {
         identity_from_oidc.user_ulid,
         different_user_identity.user_ulid
     );
-    assert_eq!(different_user_identity.realm_ulid, realm_ulid);
+    assert_eq!(different_user_identity.realm_key, realm_key);
 
     // Test 4: Aruna realm token round-trip
     let signing_pem = realm_keys.signing_key_pem().unwrap();
@@ -417,7 +417,7 @@ async fn test_token_identity_extraction() {
         .unwrap();
 
     assert_eq!(parsed_identity.user_ulid, identity_from_oidc.user_ulid);
-    assert_eq!(parsed_identity.realm_ulid, identity_from_oidc.realm_ulid);
+    assert_eq!(parsed_identity.realm_key, identity_from_oidc.realm_key);
 
     txn.commit().unwrap();
     cleanup_test_dir(&test_dir);
@@ -425,10 +425,10 @@ async fn test_token_identity_extraction() {
 
 #[tokio::test]
 async fn test_typical_usage_pattern() {
-    let realm_ulid = create_test_realm_key(10);
+    let realm_key = create_test_realm_key(10);
     let oidc_trust_config =
         OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
-    let mut token_system = TokenSystem::new(realm_ulid, oidc_trust_config);
+    let mut token_system = TokenSystem::new(realm_key, oidc_trust_config);
     let permission_manager = PermissionManager::new().await.unwrap();
 
     let (store, test_dir) = setup_test_store().await;
@@ -442,7 +442,7 @@ async fn test_typical_usage_pattern() {
 
     let realm_keys = Ed25519KeyPair::generate();
     let verifying_pem = realm_keys.verifying_key_pem().unwrap();
-    token_system.add_realm_public_key(realm_ulid, verifying_pem);
+    token_system.add_realm_public_key(realm_key, verifying_pem);
 
     // === Token System Usage ===
 
@@ -461,14 +461,14 @@ async fn test_typical_usage_pattern() {
     // 2. Use identity for permission operations
     let group_id = create_test_ulid(20);
     permission_manager
-        .create_group(group_id, &user_identity, realm_ulid, &store, &mut txn)
+        .create_group(group_id, &user_identity, realm_key, &store, &mut txn)
         .await
         .unwrap();
 
     // 3. Add resources
     let doc_id = create_test_ulid(30);
     let doc_path = Path::builder()
-        .realm_id(realm_ulid)
+        .realm_id(realm_key)
         .group_metadata(group_id, doc_id, vec![])
         .build()
         .unwrap();
@@ -502,7 +502,7 @@ async fn test_typical_usage_pattern() {
         .unwrap();
 
     assert_eq!(verified_identity.user_ulid, user_identity.user_ulid);
-    assert_eq!(verified_identity.realm_ulid, user_identity.realm_ulid);
+    assert_eq!(verified_identity.realm_key, user_identity.realm_key);
 
     // === Cross-realm scenario ===
 
@@ -525,7 +525,7 @@ async fn test_typical_usage_pattern() {
         )
         .unwrap();
 
-    assert_eq!(other_identity.realm_ulid, other_realm);
+    assert_eq!(other_identity.realm_key, other_realm);
 
     // 8. Unify identities across realms for seamless access
     permission_manager
@@ -539,9 +539,9 @@ async fn test_typical_usage_pattern() {
 
 #[tokio::test]
 async fn test_oidc_lookup_operations() {
-    let realm_ulid = create_test_realm_key(10);
+    let realm_key = create_test_realm_key(10);
     let oidc_trust_config = OidcTrustConfig::TrustAll;
-    let token_system = TokenSystem::new(realm_ulid, oidc_trust_config);
+    let token_system = TokenSystem::new(realm_key, oidc_trust_config);
 
     let (store, test_dir) = setup_test_store().await;
     let mut txn = store.create_txn(true).unwrap();
@@ -594,13 +594,13 @@ async fn test_ed25519_key_generation_and_usage() {
     assert!(verifying_pem.contains("BEGIN PUBLIC KEY"));
 
     // Test token generation and validation with Ed25519
-    let realm_ulid = create_test_realm_key(1);
+    let realm_key = create_test_realm_key(1);
     let user_ulid = create_test_ulid(2);
-    let mut token_system = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
+    let mut token_system = TokenSystem::new(realm_key, OidcTrustConfig::TrustAll);
 
-    token_system.add_realm_public_key(realm_ulid, verifying_pem);
+    token_system.add_realm_public_key(realm_key, verifying_pem);
 
-    let user_identity = UserIdentity::new(user_ulid, realm_ulid);
+    let user_identity = UserIdentity::new(user_ulid, realm_key);
 
     // Generate token
     let token = token_system
