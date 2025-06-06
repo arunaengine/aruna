@@ -14,6 +14,7 @@ pub enum MessageType {
     },
     InitReplicationResponse {
         ack: bool,
+        reason: Option<String>,
     },
 }
 

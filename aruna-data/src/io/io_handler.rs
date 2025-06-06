@@ -143,9 +143,7 @@ where
         let message = ReplicationMessage::read(&mut recv_stream).await?;
         if let MessageType::InitReplicationRequest { path, size, root } = &message.msg_type {
             // Handle replication init message
-            let response = self
-                .handle_replication_init_message(message.clone())
-                .await?;
+            let response = self.handle_replication_init(message.id, path).await?;
             response.send(&mut send_stream).await?;
 
             // Decode chunks and write to backend
@@ -153,6 +151,7 @@ where
             let mut writer = OpenDalWriter {
                 writer: self.operator.writer(path).await?.into_futures_async_write(),
                 len: *size,
+                hasher: Hasher::new(),
             };
 
             let mut ob = PreOrderOutboard {
@@ -169,7 +168,23 @@ where
             writer.writer.close().await?;
             debug!("Decoded all chunks and wrote them into the backend");
 
-            //TODO: Store location + Register permission
+            // Store & publish location + register permission
+            //TODO: Store frontend path?
+            //TODO: Store permissions?
+            let hashes = writer.hasher.finalize()?;
+            let blake3_clone = hashes.blake3.clone();
+            let location = ObjectInfo {
+                id: Ulid::new(),
+                staging: true,
+                compressed: false, //TODO
+                encrypted: false,  //TODO
+                file_path: path.to_string(),
+                file_size: *size,
+                file_hashes: hashes,
+            };
+
+            self.store_location(&location, None, None)?;
+            self.publish_hash(blake3_clone).await?
         } else {
             error!("Stream did not start with init message");
             return Err(Box::new(std::io::Error::new(
@@ -183,15 +198,34 @@ where
         Ok(())
     }
 
-    async fn handle_replication_init_message(
+    async fn handle_replication_init(
         &self,
-        message: ReplicationMessage,
+        message_id: Ulid,
+        path: &str,
+        //message: ReplicationMessage,
     ) -> Result<ReplicationMessage, StdError> {
         //TODO: Validate conditions to accept replication request
+        //  - User has write permissions      | 
+        //  - Backend path is not occupied    | DONE
+        //  - Backend has enough storage left | 
+        if self.operator.exists(path).await? {
+            return Ok(ReplicationMessage {
+                id: message_id,
+                sender: self.get_node_addr(),
+                msg_type: MessageType::InitReplicationResponse {
+                    ack: false,
+                    reason: Some("Path is already occupied".to_string()),
+                },
+            })
+        }
+
         Ok(ReplicationMessage {
-            id: message.id,
+            id: message_id,
             sender: self.get_node_addr(),
-            msg_type: MessageType::InitReplicationResponse { ack: true },
+            msg_type: MessageType::InitReplicationResponse {
+                ack: true,
+                reason: None,
+            },
         })
     }
 
@@ -372,7 +406,6 @@ where
     }
 
     pub async fn bao_tree_replicate(
-        // try_replicate_to_node(
         &self,
         replication_id: Ulid,
         replication_node: NodeAddr,
@@ -409,11 +442,12 @@ where
 
         // Wait for response if replication node accepts
         let response = ReplicationMessage::read(&mut rx).await?;
-        if let MessageType::InitReplicationResponse { ack } = response.msg_type {
+        if let MessageType::InitReplicationResponse { ack, reason } = response.msg_type {
             if !ack {
                 return Err(anyhow!(
-                    "Replication node {:?} rejected replication request.",
-                    replication_node
+                    "Replication node {:?} rejected replication request: {:?}",
+                    replication_node,
+                    reason.ok_or_else(|| "No reason provided")
                 ));
             }
         }

@@ -1,4 +1,5 @@
 use crate::io::io_handler::ObjectInfo;
+use crate::util::hash::Hasher;
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SinkExt};
 use iroh::endpoint::{RecvStream, SendStream};
@@ -88,19 +89,22 @@ impl AsyncStreamWriter for SendStreamWrapper {
 pub struct OpenDalWriter {
     pub writer: FuturesAsyncWriter,
     pub len: u64,
+    pub hasher: Hasher,
 }
 impl AsyncSliceWriter for OpenDalWriter {
     async fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
         debug!("[OpenDalWriter] Try to write data with offset {}", offset);
         self.writer.write_all(data).await?;
         self.writer.flush().await?;
+        self.hasher.update(data);
         Ok(())
     }
 
     async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> std::io::Result<()> {
         debug!("[OpenDalWriter] Try to write bytes with offset {}", offset);
-        self.writer.write_all(data.as_ref()).await?;
+        self.writer.write_all(&data).await?;
         self.writer.flush().await?;
+        self.hasher.update(&data);
         Ok(())
     }
 
@@ -117,21 +121,22 @@ impl AsyncSliceWriter for OpenDalWriter {
 pub struct OpenDalSinkWriter {
     pub writer: BufferSink,
     pub len: u64,
+    pub hasher: Hasher,
 }
 impl AsyncSliceWriter for OpenDalSinkWriter {
     async fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
         debug!("Try to write data with offset {}", offset);
         self.writer.send(Buffer::from(data.to_vec())).await?;
-        //self.writer.send(Bytes::from(data.to_vec())).await?;
         self.writer.flush().await?;
+        self.hasher.update(data);
         Ok(())
     }
 
     async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> std::io::Result<()> {
         debug!("Try to write bytes with offset {}", offset);
         self.writer.send(Buffer::from(data.to_vec())).await?;
-        //self.writer.send(Bytes::from(data.to_vec())).await?;
         self.writer.flush().await?;
+        self.hasher.update(&data);
         Ok(())
     }
 
