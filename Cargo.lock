@@ -140,6 +140,7 @@ dependencies = [
  "blake3",
  "bytes",
  "dotenvy",
+ "ed25519-dalek",
  "futures",
  "futures-core",
  "futures-util",

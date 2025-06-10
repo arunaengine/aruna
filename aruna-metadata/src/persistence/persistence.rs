@@ -419,7 +419,7 @@ where
         let actor_id = ActorId::from(
             [
                 user.user_ulid.to_bytes().as_slice(),
-                &user.realm_ulid,
+                &user.realm_key,
                 actor_id.as_slice(),
             ]
             .concat(),

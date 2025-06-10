@@ -18,7 +18,7 @@ pub struct RealmTokenClaims {
     /// User ULID within the realm
     pub user_ulid: String,
     /// Realm key (hex encoded) that issued this token
-    pub realm_ulid: String,
+    pub realm_key: String,
     /// Standard JWT issued at time
     pub iat: u64,
     /// Standard JWT expiration time
@@ -37,11 +37,11 @@ impl RealmTokenClaims {
             .unwrap()
             .as_secs();
 
-        let realm_hex = hex::encode(user_identity.realm_ulid);
+        let realm_hex = hex::encode(user_identity.realm_key);
 
         Self {
             user_ulid: user_identity.user_ulid.to_string(),
-            realm_ulid: realm_hex.clone(),
+            realm_key: realm_hex.clone(),
             iat: now,
             exp: now + (expiration_hours * 3600),
             iss: format!("aruna@{}", realm_hex),
@@ -55,7 +55,7 @@ impl RealmTokenClaims {
             PermissionError::ResourceNotFound("Invalid user ULID in token".to_string())
         })?;
 
-        let realm_bytes = hex::decode(&self.realm_ulid).map_err(|_| {
+        let realm_bytes = hex::decode(&self.realm_key).map_err(|_| {
             PermissionError::ResourceNotFound("Invalid realm key in token".to_string())
         })?;
 
@@ -231,8 +231,8 @@ impl TokenSystem {
     }
 
     /// Add realm Ed25519 verifying key for verification (expects PEM format)
-    pub fn add_realm_public_key(&mut self, realm_ulid: RealmKey, verifying_key_pem: String) {
-        self.realm_public_keys.insert(realm_ulid, verifying_key_pem);
+    pub fn add_realm_public_key(&mut self, realm_key: RealmKey, verifying_key_pem: String) {
+        self.realm_public_keys.insert(realm_key, verifying_key_pem);
     }
 
     /// Register user from OIDC token - creates new UserIdentity after verification or returns existing one
@@ -455,7 +455,7 @@ impl TokenSystem {
         signing_key_pem: &str,
     ) -> Result<String> {
         // Only generate tokens for users in our local realm
-        if user_identity.realm_ulid != self.local_realm_key {
+        if user_identity.realm_key != self.local_realm_key {
             return Err(PermissionError::ResourceNotFound(
                 "Cannot generate token for foreign realm user".to_string(),
             ));
@@ -599,25 +599,25 @@ mod tests {
 
     #[test]
     fn test_realm_token_claims() {
-        let realm_ulid = create_test_realm_key(1);
+        let realm_key = create_test_realm_key(1);
         let user_ulid = create_test_ulid(2);
-        let user_identity = UserIdentity::new(user_ulid, realm_ulid);
+        let user_identity = UserIdentity::new(user_ulid, realm_key);
 
         let claims = RealmTokenClaims::new(&user_identity, 24);
         let recovered_identity = claims.to_user_identity().unwrap();
 
         assert_eq!(recovered_identity, user_identity);
-        assert_eq!(claims.iss, format!("aruna@{}", hex::encode(realm_ulid)));
+        assert_eq!(claims.iss, format!("aruna@{}", hex::encode(realm_key)));
         assert!(!claims.is_expired());
     }
 
     #[test]
     fn test_token_system_creation() {
-        let realm_ulid = create_test_realm_key(1);
+        let realm_key = create_test_realm_key(1);
         let trust_config =
             OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
 
-        let mut token_system = TokenSystem::new(realm_ulid, trust_config);
+        let mut token_system = TokenSystem::new(realm_key, trust_config);
 
         // Add OIDC public key (RSA for testing)
         let rsa_public_key = r#"-----BEGIN PUBLIC KEY-----
@@ -638,16 +638,16 @@ ZwIDAQAB
         // Add realm Ed25519 key
         let key_pair = Ed25519KeyPair::generate();
         let verifying_pem = key_pair.verifying_key_pem().unwrap();
-        token_system.add_realm_public_key(realm_ulid, verifying_pem);
+        token_system.add_realm_public_key(realm_key, verifying_pem);
 
-        assert_eq!(token_system.local_realm_key, realm_ulid);
+        assert_eq!(token_system.local_realm_key, realm_key);
     }
 
     #[test]
     fn test_ed25519_token_round_trip() {
-        let realm_ulid = create_test_realm_key(1);
+        let realm_key = create_test_realm_key(1);
         let user_ulid = create_test_ulid(2);
-        let mut token_system = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
+        let mut token_system = TokenSystem::new(realm_key, OidcTrustConfig::TrustAll);
 
         // Generate Ed25519 key pair
         let key_pair = Ed25519KeyPair::generate();
@@ -655,9 +655,9 @@ ZwIDAQAB
         let verifying_pem = key_pair.verifying_key_pem().unwrap();
 
         // Configure the token system with test keys
-        token_system.add_realm_public_key(realm_ulid, verifying_pem);
+        token_system.add_realm_public_key(realm_key, verifying_pem);
 
-        let user_identity = UserIdentity::new(user_ulid, realm_ulid);
+        let user_identity = UserIdentity::new(user_ulid, realm_key);
 
         // Generate token using Ed25519
         let token = token_system
@@ -721,23 +721,23 @@ ZwIDAQAB
 
     #[test]
     fn test_token_validation_without_public_key() {
-        let realm_ulid = create_test_realm_key(1);
+        let realm_key = create_test_realm_key(1);
         let user_ulid = create_test_ulid(2);
-        let mut token_system_generator = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
+        let mut token_system_generator = TokenSystem::new(realm_key, OidcTrustConfig::TrustAll);
 
         let key_pair = Ed25519KeyPair::generate();
         let signing_pem = key_pair.signing_key_pem().unwrap();
         let verifying_pem = key_pair.verifying_key_pem().unwrap();
 
-        token_system_generator.add_realm_public_key(realm_ulid, verifying_pem);
+        token_system_generator.add_realm_public_key(realm_key, verifying_pem);
 
-        let user_identity = UserIdentity::new(user_ulid, realm_ulid);
+        let user_identity = UserIdentity::new(user_ulid, realm_key);
         let token = token_system_generator
             .generate_token(&user_identity, &signing_pem)
             .unwrap();
 
         // Create a new token system without the public key
-        let validator_system = TokenSystem::new(realm_ulid, OidcTrustConfig::TrustAll);
+        let validator_system = TokenSystem::new(realm_key, OidcTrustConfig::TrustAll);
 
         // Should fail because no public key is available for validation
         let result = validator_system.validate_realm_token(&token);

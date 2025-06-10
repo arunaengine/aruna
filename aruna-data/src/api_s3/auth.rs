@@ -2,7 +2,7 @@ use crate::api_s3::util::get_s3_operation_permission;
 use crate::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME};
 use anyhow::anyhow;
 use aruna_permission::manager::PermissionManager;
-use aruna_permission::paths::PathBuilder;
+use aruna_permission::paths::{PathBuilder, RealmKey};
 use aruna_storage::storage::store::Store;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
@@ -28,7 +28,7 @@ where
 {
     pub(crate) store: Arc<St>,
     pub(crate) permission_manager: PermissionManager,
-    pub(crate) realm_id: Ulid,
+    pub(crate) realm_key: RealmKey,
 }
 
 #[async_trait::async_trait]
@@ -64,7 +64,7 @@ where
         let action = get_s3_operation_permission(cx.s3_op().name())
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
-        let builder = PathBuilder::new().realm_id(self.realm_id);
+        let builder = PathBuilder::new().realm_id(self.realm_key);
         let perm_path = match cx.s3_path() {
             S3Path::Root => builder.group_admin(user_access.group_id),
             S3Path::Bucket { bucket } => {
@@ -92,6 +92,7 @@ where
             .permission_manager
             .enforcer
             .read()
+            .await
             .enforce(
                 &user_access.user_id.to_string(),
                 &perm_path.to_string(),

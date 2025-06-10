@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use aruna_net::Kademlia;
 use aruna_net::actor_handle::{NetworkActorHandle, ReceiveStreams};
 use aruna_permission::manager::{PermissionManager, ResourceId};
+use aruna_permission::paths::{Path, RealmKey};
 use aruna_storage::storage::store::Store;
 use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -27,7 +28,7 @@ use tracing::{debug, error, trace};
 use ulid::Ulid;
 
 pub const REPLICATION_PROTOCOL_ID: u32 = 2;
-pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16);
+pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); //2^16 bytes
 pub const ACCESS_DB_NAME: &str = "user_access";
 pub const LOCATION_DB_NAME: &str = "locations";
 pub const PATH_LOCATION_DB_NAME: &str = "path_locations_mapping";
@@ -50,7 +51,7 @@ pub struct ObjectInfo {
     pub file_hashes: Hashes,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IOHandler<St>
 where
     for<'a> St: Store<'a> + 'static,
@@ -61,6 +62,7 @@ where
     kademlia: Kademlia,
     pub store: Arc<St>,
     pub permission_manager: PermissionManager,
+    realm_key: RealmKey,
 }
 
 impl<St> IOHandler<St>
@@ -78,6 +80,7 @@ where
         kademlia: Kademlia,
         store: Arc<St>,
         permission_manager: PermissionManager,
+        realm_key: RealmKey,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let repl_handler = Arc::new(Self {
             node_addr,
@@ -86,6 +89,7 @@ where
             kademlia,
             store,
             permission_manager,
+            realm_key,
         });
 
         repl_handler.clone().run().await;
@@ -104,7 +108,7 @@ where
                     Ok(inc_stream) = self.network.receive() => {
                         let self_clone = self.clone();
 
-                        trace!("Received stream from: {:?}", inc_stream.sender);
+                        trace!("{:?} Received stream from: {:?}", self.node_addr, inc_stream.sender);
                         tokio::spawn(
                             async move {
                                 if let Err(e) = self_clone.handle_incoming_p2p_stream(
@@ -138,9 +142,7 @@ where
         let message = ReplicationMessage::read(&mut recv_stream).await?;
         if let MessageType::InitReplicationRequest { path, size, root } = &message.msg_type {
             // Handle replication init message
-            let response = self
-                .handle_replication_init_message(message.clone())
-                .await?;
+            let response = self.handle_replication_init(message.id, path).await?;
             response.send(&mut send_stream).await?;
 
             // Decode chunks and write to backend
@@ -148,6 +150,7 @@ where
             let mut writer = OpenDalWriter {
                 writer: self.operator.writer(path).await?.into_futures_async_write(),
                 len: *size,
+                hasher: Hasher::new(),
             };
 
             let mut ob = PreOrderOutboard {
@@ -164,7 +167,23 @@ where
             writer.writer.close().await?;
             debug!("Decoded all chunks and wrote them into the backend");
 
-            //TODO: Store location + Register permission
+            // Store & publish location + register permission
+            //TODO: Store frontend path?
+            //TODO: Store permissions?
+            let hashes = writer.hasher.finalize()?;
+            let blake3_clone = hashes.blake3.clone();
+            let location = ObjectInfo {
+                id: Ulid::new(),
+                staging: true,
+                compressed: false, //TODO
+                encrypted: false,  //TODO
+                file_path: path.to_string(),
+                file_size: *size,
+                file_hashes: hashes,
+            };
+
+            self.store_location(&location, None, None)?;
+            self.publish_hash(blake3_clone).await?
         } else {
             error!("Stream did not start with init message");
             return Err(Box::new(std::io::Error::new(
@@ -178,15 +197,34 @@ where
         Ok(())
     }
 
-    async fn handle_replication_init_message(
+    async fn handle_replication_init(
         &self,
-        message: ReplicationMessage,
+        message_id: Ulid,
+        path: &str,
+        //message: ReplicationMessage,
     ) -> Result<ReplicationMessage, StdError> {
         //TODO: Validate conditions to accept replication request
+        //  - User has write permissions      | 
+        //  - Backend path is not occupied    | DONE
+        //  - Backend has enough storage left | 
+        if self.operator.exists(path).await? {
+            return Ok(ReplicationMessage {
+                id: message_id,
+                sender: self.get_node_addr(),
+                msg_type: MessageType::InitReplicationResponse {
+                    ack: false,
+                    reason: Some("Path is already occupied".to_string()),
+                },
+            })
+        }
+
         Ok(ReplicationMessage {
-            id: message.id,
+            id: message_id,
             sender: self.get_node_addr(),
-            msg_type: MessageType::InitReplicationResponse { ack: true },
+            msg_type: MessageType::InitReplicationResponse {
+                ack: true,
+                reason: None,
+            },
         })
     }
 
@@ -212,7 +250,7 @@ where
         while let Some(bytes) = data_stream.next().await {
             let bytes = bytes?;
 
-            // Write first, then update
+            // Write first, then update hashes and written bytes
             writer.write_all(&bytes).await?;
             hasher.update(&bytes);
             written_bytes = written_bytes + bytes.len();
@@ -220,7 +258,7 @@ where
         writer.flush().await?;
         writer.close().await?;
 
-        // Store some technical metadata in persistence
+        // Store some technical metadata in persistence and publish content-hash
         let hashes = hasher.finalize()?;
         let blake3_hash = hashes.blake3.clone();
         let info = ObjectInfo {
@@ -232,46 +270,21 @@ where
             file_size: written_bytes as u64,
             file_hashes: hashes,
         };
-        debug!("New Object: {:#?}", info);
 
-        let store_clone = self.store.clone();
-        let info_clone = info.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut write_txn = store_clone.create_txn(true)?;
-
-            // Store object info with blake3 hash as key
-            store_clone.put(
-                &mut write_txn,
-                LOCATION_DB_NAME,
-                blake3_hash.as_bytes(), //&info.id.to_bytes(),
-                &bincode::serde::encode_to_vec(info_clone, bincode::config::standard())?,
-            )?;
-
-            // Store mapping of frontend path <--> blake3 hash
-            store_clone.put(
-                &mut write_txn,
-                PATH_LOCATION_DB_NAME,
-                frontend_path.as_bytes(),
-                blake3_hash.as_bytes(),
-            )?;
-            store_clone.commit(write_txn)?;
-
-            Ok::<(), anyhow::Error>(())
-        });
-
-        // Publish content hash location via Kademlia
-        self.kademlia
-            .store(*blake3_hash.as_bytes(), self.node_addr.clone(), None)
-            .await?;
+        self.store_location(&info, Some(frontend_path), None)?;
+        self.publish_hash(blake3_hash).await?;
 
         Ok(info)
     }
 
     pub async fn register_backend_data(&self, path: &str, group: Ulid) -> anyhow::Result<String> {
-        // Check if backend path resource exists
-        self.operator.exists(path).await?;
+        // Check if backend path resource exists by fetching stats
         let meta = self.operator.stat(path).await?;
 
+        //TODO: Parse path -> (..)
+        //let (frontend_path, backend_path) = self.parse_path(path)?;
+
+        //TODO: Wrap in tokio::spawn without await
         let mut hasher = Hasher::new();
         let mut reader =
             get_data_stream(&self.operator, path, None, Some(BLOCK_SIZE.bytes())).await?;
@@ -283,16 +296,16 @@ where
 
         //TODO: Register resource in permission manager
         let perm_path = aruna_permission::paths::PathBuilder::new()
-            .realm_id(Ulid::new()) //TODO
+            .realm_id(self.realm_key) 
             .group_data(
                 group,
                 "bucket".to_string(), //TODO
-                "key".to_string(), //TODO
+                "key".to_string(),    //TODO
                 hashes.blake3,
-            ) 
+            )
             .build()?;
 
-        // Register resource
+        // Store location +
         let location = ObjectInfo {
             id: Ulid::new(),
             staging: false,
@@ -303,38 +316,9 @@ where
             file_hashes: hashes.clone(),
         };
 
-        let mut manager = PermissionManager::new().await?;
-        let store_clone = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut write_txn = store_clone.create_txn(true)?;
-            manager.add_resource(
-                ResourceId::Ulid(location.id),
-                &perm_path,
-                store_clone.as_ref(),
-                &mut write_txn,
-            )?;
-
-            // Store content hash --> location
-            store_clone.put(
-                &mut write_txn,
-                LOCATION_DB_NAME,
-                hashes.blake3.as_bytes(), //&info.id.to_bytes(),
-                &bincode::serde::encode_to_vec(location, bincode::config::standard())?,
-            )?;
-
-            //TODO: Store frontend path ?
-            store_clone.commit(write_txn)?;
-
-            Ok::<(), anyhow::Error>(())
-        })
-        .await??;
-
-        //TODO: Store mapping of frontend path <--> blake3 hash ?
-
-        // Publish content hash location via Kademlia
-        self.kademlia
-            .store(*hashes.blake3.as_bytes(), self.node_addr.clone(), None)
-            .await?;
+        //TODO: Store frontend path mapping?
+        self.store_location(&location, None, Some(perm_path))?;
+        self.publish_hash(hashes.blake3).await?;
 
         Ok("".to_string())
     }
@@ -367,7 +351,6 @@ where
     }
 
     pub async fn bao_tree_replicate(
-        // try_replicate_to_node(
         &self,
         replication_id: Ulid,
         replication_node: NodeAddr,
@@ -404,11 +387,12 @@ where
 
         // Wait for response if replication node accepts
         let response = ReplicationMessage::read(&mut rx).await?;
-        if let MessageType::InitReplicationResponse { ack } = response.msg_type {
+        if let MessageType::InitReplicationResponse { ack, reason } = response.msg_type {
             if !ack {
                 return Err(anyhow!(
-                    "Replication node {:?} rejected replication request.",
-                    replication_node
+                    "Replication node {:?} rejected replication request: {:?}",
+                    replication_node,
+                    reason.ok_or_else(|| "No reason provided")
                 ));
             }
         }
@@ -425,7 +409,7 @@ where
         Ok(())
     }
 
-    async fn store_location(
+    fn store_location(
         &self,
         location: &ObjectInfo,
         frontend_path: Option<String>,
@@ -461,8 +445,14 @@ where
                 &mut write_txn,
             )?
         }
-
         self.store.commit(write_txn)?;
+
         Ok(())
+    }
+
+    async fn publish_hash(&self, hash: blake3::Hash) -> anyhow::Result<()> {
+        self.kademlia
+            .store(*hash.as_bytes(), self.get_node_addr(), None)
+            .await
     }
 }

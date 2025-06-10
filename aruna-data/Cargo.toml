@@ -15,6 +15,7 @@ bincode = { version= "2.0.1", features = ["serde"]}
 blake3 = {workspace = true}
 bytes = "1.10.1"
 dotenvy = {workspace = true}
+ed25519-dalek = { workspace = true }
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = "0.3.31"

@@ -39,7 +39,7 @@ where
         todo!("Split registration and verification of oidc_tokens");
         let user_identity = controller.persistence.get_identity(token).await?;
 
-        if user_identity.realm_ulid == realm_key {
+        if user_identity.realm_key == realm_key {
             Ok(Some(user_identity))
         } else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);

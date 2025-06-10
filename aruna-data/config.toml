@@ -1,5 +1,5 @@
 [general]
-realm_id = "01JWRB29J0Q2M3YTJGR24P5N31"
+realm_key = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAm0MmPVNon81HDfAXRXtCuS3msYVLVB8KqEAXrtoctMU=\n-----END PUBLIC KEY-----"
 node_key = "358ea489d2f7d91466eff6edbb7d69b507346dc199d963915138865c03ffe1db"
 
 [persistence]

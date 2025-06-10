@@ -35,7 +35,7 @@ autosurgeon = "0.8.7"
 axum = "0.8.4"
 axum-extra = {version = "0.10.1", features = ["query"]}
 chrono = { version = "0.4.41", features = ["serde"]}
-ed25519-dalek = { version = "2.1.1", features = ["rand_core", "pem"] } # TODO: Move into workspace deps
+ed25519-dalek = { workspace = true }
 opentelemetry = "0.29.1"
 opentelemetry-otlp = { version = "0.29.0", features = ["grpc-tonic"]}
 opentelemetry_sdk = { version = "0.29.0", features = ["rt-tokio"]}

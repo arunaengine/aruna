@@ -9,7 +9,7 @@ use aruna_data::io::io_handler::{IOHandler, LOCATION_DB_NAME};
 use aruna_data::{config::config::Config, util::opendal::get_operator};
 use aruna_net::actor::NetworkActorBuilder;
 use aruna_permission::UserIdentity;
-use aruna_permission::manager::{PermissionManager, RESOURCE_DB};
+use aruna_permission::manager::PermissionManager;
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
 use futures_util::TryFutureExt;
@@ -18,10 +18,13 @@ use lazy_static::lazy_static;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 use std::sync::Arc;
+use ed25519_dalek::pkcs8::DecodePublicKey;
+use ed25519_dalek::VerifyingKey;
 use tokio::try_join;
 use tracing::{Level, debug, error};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
+use aruna_permission::paths::RealmKey;
 
 lazy_static! {
     static ref CONFIG: Config = {
@@ -57,6 +60,7 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     debug!(config = ?*CONFIG);
+    let realm_key = VerifyingKey::from_public_key_pem(&CONFIG.general.realm_key)?; // Also validates key format
     let node_key = SecretKey::from_str(&CONFIG.general.node_key)?;
     let rest_addr = Ipv4Addr::from_str(&CONFIG.frontend.openapi_frontend.address)?;
 
@@ -94,8 +98,10 @@ async fn main() -> Result<()> {
             ACCESS_DB_NAME,
             LOCATION_DB_NAME,
             PATH_LOCATION_DB_NAME,
-            RESOURCE_DB,
-            "casbin",
+            aruna_permission::RESOURCE_DB,
+            aruna_permission::DBNAME,
+            aruna_permission::IDENTITY_PERMISSIONS_DB,
+            aruna_permission::OIDC_IDENTITIES_DB
         ],
     };
     let lmdb_store = Arc::new(LmdbStore::new(lmdb_config)?);
@@ -116,23 +122,25 @@ async fn main() -> Result<()> {
         kademlia,
         lmdb_store,
         permission_manager.clone(),
+        realm_key.to_bytes()
     )
     .await?;
 
-    let realm_ulid = Ulid::from_string(&CONFIG.general.realm_id)?;
+    //TODO: ----- Remove later ----------
     create_dummy_access(
         io_handler.store.clone(),
-        realm_ulid,
+        realm_key.to_bytes(),
         permission_manager.clone(),
     )
-    .await?; //TODO: Remove later
+    .await?;
+    // -----------------------------------
 
     let s3server = S3Server::new(
         CONFIG.frontend.s3_frontend.clone(),
         io_handler.clone(),
         permission_manager.clone(),
         node_addr.node_id,
-        realm_ulid,
+        realm_key.to_bytes(),
     )
     .await?;
 
@@ -156,7 +164,7 @@ async fn main() -> Result<()> {
 
 async fn create_dummy_access<St>(
     store: Arc<St>,
-    realm_id: Ulid,
+    realm_key: RealmKey,
     manager: PermissionManager,
 ) -> Result<()>
 where
@@ -167,7 +175,7 @@ where
     let group_id = Ulid::from_string("01JWB4XFCRJX53Q839QMHPGSXH")?;
     let user_identity = UserIdentity {
         user_ulid: user_id,
-        realm_ulid: realm_id,
+        realm_key,
     };
 
     let mut write_txn = store.create_txn(true)?;
@@ -175,7 +183,7 @@ where
         .create_group(
             group_id,
             &user_identity,
-            realm_id,
+            realm_key,
             store.as_ref(),
             &mut write_txn,
         )
