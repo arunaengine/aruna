@@ -3,7 +3,9 @@ use crate::{
     models::requests::{ForwardRequest, ForwardResponse},
     network::util::send_message,
     persistence::{
-        persistence::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
+        persistence::{
+            tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
+        },
         search::search::Search,
     },
     transactions::{controller::Controller, request::Request},
@@ -18,7 +20,7 @@ use ed25519_dalek::SigningKey;
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddrV4, sync::Arc};
-use tracing::{error, trace, warn};
+use tracing::{error, trace};
 use ulid::Ulid;
 
 use super::util::read_message;
@@ -192,12 +194,12 @@ pub struct NetworkConfig {
     pub secret_key: Option<SecretKey>,
     pub socket_addr: SocketAddrV4,
     pub bootstrap_nodes: Vec<NodeAddr>,
-    pub realm_key: Option<SigningKey>,
+    pub realm_key: SigningKey,
 }
 
 pub struct P2PNetwork {
     chandler: NetworkActorHandle,
-    realm_handler: Option<Realm>,
+    realm_handler: Realm,
 }
 
 #[async_trait::async_trait]
@@ -213,19 +215,16 @@ impl Network for P2PNetwork {
             .await?;
 
         let chandler = init_handle.new_actor_handle(METADATA_PROTOCOL_ID).await?;
-        let mut p2p = P2PNetwork {
-            chandler,
-            realm_handler: None,
-        };
 
-        if let Some(key) = config.realm_key {
-            let self_addr = init_handle.get_node_addr().await?;
-            let kademlia = init_handle.get_kademlia_actor_handle().await?;
-            let realm = Realm::new(key, self_addr, kademlia).await?;
-            realm.update_now().await?;
-            p2p.realm_handler = Some(realm);
-        }
-        Ok(p2p)
+        let self_addr = init_handle.get_node_addr().await?;
+        let kademlia = init_handle.get_kademlia_actor_handle().await?;
+        let realm_handler = Realm::new(config.realm_key, self_addr, kademlia).await?;
+        realm_handler.update_now().await?;
+
+        Ok(P2PNetwork {
+            chandler,
+            realm_handler,
+        })
     }
 
     async fn start_actor<St, Se, N>(
@@ -285,16 +284,11 @@ impl Network for P2PNetwork {
     }
 
     async fn find_verified(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
-        let Some(realm) = &self.realm_handler else {
-            warn!("No realm configured!");
-            return self.find(subject_id).await;
-        };
-
         let mut chunk_hasher = blake3::Hasher::new();
         chunk_hasher.update(subject_id.to_bytes().as_slice());
         let id_hash = chunk_hasher.finalize();
 
-        let members = realm.get_realm_member_addrs();
+        let members = self.realm_handler.get_realm_member_addrs();
         let find_results = self
             .chandler
             .get_kademlia_actor_handle()
@@ -310,12 +304,8 @@ impl Network for P2PNetwork {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn get_realm_key(&self) -> Result<Option<[u8; 32]>, ArunaMetadataError> {
-        todo!()
-        //Ok(self
-        //    .realm_handler
-        //    .as_ref()
-        //    .map(|r| r.realm_public_key().as_bytes().clone()))
+    async fn get_realm_key(&self) -> Result<[u8; 32], ArunaMetadataError> {
+        Ok(self.realm_handler.realm_public_key().as_bytes().clone())
     }
     #[tracing::instrument(level = "trace", skip(self, subject, stream))]
     async fn sync(
@@ -417,20 +407,15 @@ impl Network for P2PNetwork {
     }
 
     async fn get_realm_nodes(&self) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
-        match &self.realm_handler {
-            Some(realm) => {
-                let query = realm.get_realm_member_addrs();
-                // try one refresh if no members are found
-                let members = if query.len() <= 1 {
-                    realm.update_now().await?;
-                    realm.get_realm_member_addrs()
-                } else {
-                    query
-                };
-                Ok(members)
-            }
-            None => Ok(vec![self.get_addr().await?]),
-        }
+        let query = self.realm_handler.get_realm_member_addrs();
+        // try one refresh if no members are found
+        let members = if query.len() <= 1 {
+            self.realm_handler.update_now().await?;
+            self.realm_handler.get_realm_member_addrs()
+        } else {
+            query
+        };
+        Ok(members)
     }
 
     async fn store_in_realm(&self, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
@@ -580,51 +565,33 @@ impl P2PNetwork {
         while let Ok(msg) = read_message(&mut recv_stream.recv_stream).await {
             trace!("Received message: {:?}", msg);
 
-            match &msg.body {
-                Body::Replicate { id, sync_message } => {
+            match msg.body {
+                Body::Replicate { id, ref sync_message } => {
                     self.handle_replication_messages(
                         msg.clone(),
                         sync_message.clone(),
-                        *id,
+                        id,
                         recv_stream,
                         controller,
                     )
                     .await?;
                 }
                 Body::Request { token, request } => {
-                    let user = match token {
-                        Some(id) => {
-                            todo!("Get UserIdentity from token")
-                            //match controller
-                            //    .persistence
-                            //    .get_user(&Ulid::from_string(&id).map_err(|e| {
-                            //        ArunaMetadataError::DeserializeError(e.to_string())
-                            //    })?)
-                            //    .await
-                            //{
-                            //    Ok(user) => user,
-                            //    Err(e) => {
-                            //        error!(?e);
-                            //        return Err(e);
-                            //    }
-                            //}
-                        }
-                        None => None,
-                    };
+                    let permissions = request.authorize(token, &controller).await?;
                     let body = match request {
                         ForwardRequest::GetResource(req) => {
                             Body::Response(Response::ForwardResponse(ForwardResponse::GetResource(
-                                req.clone().run_request(user, controller).await,
+                                req.clone().run_request(permissions, controller).await,
                             )))
                         }
                         ForwardRequest::UpdateResource(req) => Body::Response(
                             Response::ForwardResponse(ForwardResponse::UpdateResource(
-                                req.clone().run_request(user, controller).await,
+                                req.clone().run_request(permissions, controller).await,
                             )),
                         ),
                         ForwardRequest::Search(req) => {
                             Body::Response(Response::ForwardResponse(ForwardResponse::Search(
-                                req.clone().run_request(user, controller).await,
+                                req.clone().run_request(permissions, controller).await,
                             )))
                         }
                     };
@@ -638,8 +605,7 @@ impl P2PNetwork {
                         &mut recv_stream.send_stream,
                     )
                     .await?;
-                }
-                Body::Response { .. } => {
+                } Body::Response { .. } => {
                     todo!("Backchannel for updated merged docs or sync protocol");
                     // Nothing to do here, there are currently no messages that send responses
                     // after replication/forwarding back

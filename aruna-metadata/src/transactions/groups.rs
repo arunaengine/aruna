@@ -11,9 +11,9 @@ use crate::{
         },
     },
     network::network_trait::Network,
-    persistence::search::search::Search,
+    persistence::{persistence::Authorize, search::search::Search},
 };
-use aruna_permission::UserIdentity;
+use aruna_permission::{Action, Path, UserIdentity};
 use aruna_storage::storage::store::Store;
 use ulid::Ulid;
 
@@ -25,6 +25,26 @@ where
     N: Network + 'static,
 {
     type Response = AddGroupResponse;
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let Some(token) = token else {
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
+        };
+        let realm_key = controller.network.get_realm_key().await?;
+        todo!("Split registration and verification of oidc_tokens");
+        let user_identity = controller.persistence.get_identity(token).await?;
+
+        if user_identity.realm_ulid == realm_key {
+            Ok(Some(user_identity))
+        } else {
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
+        }
+    }
 
     #[tracing::instrument(level = "trace", skip(_controller))]
     async fn forward_or_return(
@@ -55,7 +75,7 @@ where
         let realm_id = controller.network.get_realm_key().await?;
         let group_doc = controller
             .persistence
-            .add_group(node_id.as_bytes(),realm_id, &user, group.clone())
+            .add_group(node_id.as_bytes(), &realm_id, &user, group.clone())
             .await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
@@ -88,6 +108,20 @@ where
 {
     type Response = AddUserToGroupResponse;
 
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let (action, id) = (Action::Write, self.group_id);
+        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+            Ok(Some(i))
+        } else {
+            Ok(None)
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip(_controller))]
     async fn forward_or_return(
         &self,
@@ -116,6 +150,20 @@ where
 {
     type Response = AddRolesToGroupResponse;
 
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let (action, id) = (Action::Write, self.group_id);
+        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+            Ok(Some(i))
+        } else {
+            Ok(None)
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip(_controller))]
     async fn forward_or_return(
         &self,
@@ -143,6 +191,20 @@ where
     N: Network + 'static,
 {
     type Response = AddResourcesToGroupResponse;
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let (action, id) = (Action::Write, self.group_id);
+        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+            Ok(Some(i))
+        } else {
+            Ok(None)
+        }
+    }
 
     #[tracing::instrument(level = "trace", skip(_controller))]
     async fn forward_or_return(

@@ -1,10 +1,7 @@
 use super::request::Request;
 use crate::{
     error::ArunaMetadataError,
-    models::{
-        models::User,
-        requests::{SearchRequest, SearchResponse},
-    },
+    models::requests::{SearchRequest, SearchResponse},
     network::network_trait::Network,
     persistence::search::search::Search,
 };
@@ -22,14 +19,28 @@ where
 {
     type Response = SearchResponse;
 
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        if let Some(token) = token {
+            let user_identity = controller.persistence.get_identity(token).await?;
+            Ok(Some(user_identity))
+        } else {
+            Ok(None)
+        }
+    }
+
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn forward_or_return(
         &self,
-        user: &Option<String>,
+        token: &Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
         let body = crate::network::network_trait::Body::Request {
-            token: user.clone(),
+            token: token.clone(),
             request: crate::models::requests::ForwardRequest::Search(self.clone()),
         };
 
@@ -41,20 +52,7 @@ where
         for node in nodes {
             if node == self_addr {
                 // TODO: Replace this with real authorization
-                let user =
-                    match user {
-                        Some(token) => {
-                        todo!();
-                            //controller
-                            //    .persistence
-                            //    .get_user(&Ulid::from_string(&id).map_err(|e| {
-                            //        ArunaMetadataError::DeserializeError(e.to_string())
-                            //    })?)
-                            //    .await?
-                        }
-                        None => None,
-                    };
-
+                let user = self.authorize(token.clone(), controller).await?;
                 results.append(&mut self.clone().run_request(user, controller).await?.resources);
             } else {
                 trace!("Asking {node:?} for search");
@@ -84,10 +82,8 @@ where
         user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        trace!("got into search");
         let user = user.map(|u| u.user_ulid);
         let resources = controller.persistence.search(user, self.query).await?;
-        trace!("return from search");
         Ok(SearchResponse { resources })
     }
 }

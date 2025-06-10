@@ -15,7 +15,7 @@ use crate::{
     network::network_trait::{Network, REPLICATION_POLICY},
     persistence::{persistence::Authorize, search::search::Search},
 };
-use aruna_permission::UserIdentity;
+use aruna_permission::{Action, UserIdentity};
 use aruna_storage::storage::store::Store;
 use rand::seq::IteratorRandom;
 use ulid::Ulid;
@@ -28,6 +28,20 @@ where
     N: Network + 'static,
 {
     type Response = CreateResourceResponse;
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let (action, id) = (Action::Write, self.parent_id);
+        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+            Ok(Some(i))
+        } else {
+            Ok(None)
+        }
+    }
 
     #[tracing::instrument(level = "trace", skip(_controller))]
     async fn forward_or_return(
@@ -45,9 +59,6 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaMetadataError::Unauthorized);
-        };
-        if !controller.persistence.authorize(&user.user_ulid, &self.parent_id) {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
 
@@ -114,6 +125,20 @@ where
 {
     type Response = GetResourceResponse;
 
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let (action, id) = (Action::Read, self.id);
+        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+            Ok(Some(i))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn forward_or_return(
         &self,
         user: &Option<String>,
@@ -156,9 +181,6 @@ where
         let Some(user) = user else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        if !controller.persistence.authorize(&user.user_ulid, &self.id) {
-            return Err(crate::error::ArunaMetadataError::Unauthorized);
-        };
         let persistor = controller.persistence.clone();
         let resource = persistor.get_resource(self.id).await?;
         Ok(GetResourceResponse { resource })
@@ -173,6 +195,20 @@ where
     N: Network + 'static,
 {
     type Response = ResourceUpdateResponses;
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let (action, id) = (Action::Write, self.get_id());
+        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+            Ok(Some(i))
+        } else {
+            Ok(None)
+        }
+    }
 
     async fn forward_or_return(
         &self,
@@ -214,9 +250,6 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let Some(user) = user else {
-            return Err(crate::error::ArunaMetadataError::Unauthorized);
-        };
-        if !controller.persistence.authorize(&user.user_ulid, &self.get_id()) {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
 

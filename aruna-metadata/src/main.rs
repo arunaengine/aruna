@@ -2,6 +2,7 @@ use crate::network::network_trait::NetworkConfig;
 use crate::persistence::persistence::Persistor;
 use crate::persistence::persistence::tables::*;
 use api::server::RestServer;
+use aruna_permission::token::OidcTrustConfig;
 use aruna_storage::storage::fjall::FjallConfig;
 use aruna_storage::storage::fjall::FjallStore;
 use aruna_storage::storage::lmdb::LmdbConfig;
@@ -17,12 +18,14 @@ use network::network_trait::P2PNetwork;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use parking_lot::deadlock;
 use persistence::search::tantivy::TantivyConfig;
 use persistence::search::tantivy::TantivySearch;
 use std::net::Ipv4Addr;
 use std::net::SocketAddrV4;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, trace};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
@@ -89,15 +92,9 @@ async fn main() {
     } else {
         None
     };
-    let realm_key = if let Ok(key) = dotenvy::var("REALM_KEY") {
-        if key.is_empty() {
-            None
-        } else {
-            Some(SigningKey::from_pkcs8_pem(&key).unwrap())
-        }
-    } else {
-        None
-    };
+    let realm_key = SigningKey::from_pkcs8_pem(&dotenvy::var("REALM_KEY").unwrap()).unwrap();
+
+    let oidc_config = OidcTrustConfig::TrustAll;
     let bootstrap_nodes: Vec<NodeAddr> = match dotenvy::var("BOOTSTRAP_NODES") {
         Ok(env_var) => env_var
             .split(";")
@@ -125,9 +122,6 @@ async fn main() {
         index_buffer: 1_000_000_000,
         resources: res_rcv,
     };
-
-    use parking_lot::deadlock;
-    use std::time::Duration;
 
     // Create a background thread which checks for deadlocks every 10s
     std::thread::spawn(move || {
@@ -164,7 +158,7 @@ async fn main() {
                 ],
             };
             let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-                Persistor::new(res_sdx, store_config, search_config)
+                Persistor::new(res_sdx, store_config, search_config, *realm_key.as_bytes(), oidc_config)
                     .await
                     .unwrap(),
             );
@@ -239,7 +233,7 @@ async fn main() {
                 ],
             };
             let persistor: Arc<Persistor<FjallStore, TantivySearch>> = Arc::new(
-                Persistor::new(res_sdx, store_config, search_config)
+                Persistor::new(res_sdx, store_config, search_config, *realm_key.as_bytes(), oidc_config)
                     .await
                     .unwrap(),
             );

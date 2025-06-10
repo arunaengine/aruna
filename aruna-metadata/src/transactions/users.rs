@@ -20,6 +20,19 @@ where
 {
     type Response = AddUserResponse;
 
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let Some(token) = token else {
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
+        };
+        todo!("Check token and register user");
+        Ok(None)
+    }
+
     #[tracing::instrument(level = "trace", skip(_controller))]
     async fn forward_or_return(
         &self,

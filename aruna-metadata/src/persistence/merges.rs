@@ -273,9 +273,9 @@ where
 
                 // Update mappings if neccessary
                 if visibility != foreign_resource.visibility {
-                    update_mappings(store.as_ref(), &mut wtxn, foreign_resource, &user_id, idx)?;
+                    update_mappings(&store, &mut wtxn, foreign_resource, &user_id, idx)?;
                 } else {
-                    create_mappings(store.as_ref(), &mut wtxn, foreign_resource, &user_id, idx)?;
+                    create_mappings(&store, &mut wtxn, foreign_resource, &user_id, idx)?;
                 }
 
                 store.commit(wtxn)?;

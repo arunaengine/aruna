@@ -1,8 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::error::ArunaMetadataError;
+use crate::{
+    error::ArunaMetadataError,
+    transactions::{controller::Controller, request::Request},
+};
 
 use super::models::{Author, Group, KeyValue, Resource, ResourceVariant, User, VisibilityClass};
+use aruna_permission::{Path, UserIdentity};
+use aruna_storage::storage::store::Store;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
@@ -81,6 +86,7 @@ pub struct AddGroupResponse {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddRolesToGroupRequest {
+    pub group_id: Ulid,
     pub roles: BTreeMap<String, String>,
 }
 
@@ -89,7 +95,8 @@ pub struct AddRolesToGroupResponse {}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddUserToGroupRequest {
-    pub name: BTreeMap<Ulid, Vec<String>>,
+    pub group_id: Ulid,
+    pub user_roles: BTreeMap<Ulid, Vec<String>>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
@@ -97,6 +104,7 @@ pub struct AddUserToGroupResponse {}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddResourcesToGroupRequest {
+    pub group_id: Ulid,
     pub resources: Vec<Ulid>,
 }
 
@@ -241,6 +249,7 @@ pub enum ForwardRequest {
     UpdateResource(ResourceUpdateRequests),
     Search(SearchRequest),
 }
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum ForwardResponse {
     GetResource(Result<GetResourceResponse, ArunaMetadataError>),

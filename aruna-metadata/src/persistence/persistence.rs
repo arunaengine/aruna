@@ -9,8 +9,8 @@ use crate::{
 };
 use ahash::RandomState;
 use aruna_permission::{
-    PermissionManager, TokenSystem, UserIdentity, manager::CreateGroupPrepare,
-    token::OidcTrustConfig,
+    Action, Path, PermissionManager, ResourceId, TokenSystem, UserIdentity,
+    manager::CreateGroupPrepare, token::OidcTrustConfig,
 };
 use aruna_storage::storage::store::Store;
 use automerge::{ActorId, AutoCommit, sync::State};
@@ -22,11 +22,16 @@ use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicU32},
 };
-use tracing::trace;
 use ulid::Ulid;
 
+#[async_trait::async_trait]
 pub trait Authorize {
-    fn authorize(&self, user_id: &Ulid, resource_id: &Ulid) -> bool;
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        action: Action,
+        resource_id: Ulid,
+    ) -> Result<Option<(UserIdentity, Path)>, ArunaMetadataError>;
 }
 
 pub mod tables {
@@ -43,13 +48,13 @@ where
     for<'a> St: Store<'a>,
     Se: Search,
 {
-    pub(super) store: Arc<St>,
+    pub(super) store: St,
     pub(super) search: Arc<Se>,
     pub(super) idx_counter: Arc<AtomicU32>,
     pub(super) connection_states:
         Arc<Mutex<HashMap<Ulid, HashMap<PublicKey, State, RandomState>, RandomState>>>,
     pub(super) permission_manager: PermissionManager,
-    //pub(super) token_handler: Arc<RwLock<TokenSystem>>,
+    pub token_handler: Arc<RwLock<TokenSystem>>,
 }
 
 impl<Se, St> Persistor<St, Se>
@@ -62,11 +67,16 @@ where
         res_sdx: tokio::sync::mpsc::Sender<(u32, Resource)>,
         store_config: <St as Store<'static>>::StoreConfig,
         search_config: Se::SearchConfig,
-        //realm_id: Ulid,
-        //oidc_trust_config: OidcTrustConfig,
+        realm_id: [u8; 32],
+        oidc_trust_config: OidcTrustConfig,
     ) -> Result<Self, ArunaMetadataError> {
-        let store = Arc::new(St::new(store_config)?);
+        let store = St::new(store_config)?;
+
         let permission_manager = PermissionManager::new().await?;
+        let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_id, oidc_trust_config)));
+
+        // TODO: Init perm/auth
+
         let search = tokio::task::spawn_blocking(move || {
             let search = Se::new(search_config)?;
             Ok::<Arc<Se>, ArunaMetadataError>(Arc::new(search))
@@ -141,6 +151,7 @@ where
             idx_counter,
             connection_states: Arc::new(Mutex::new(HashMap::default())),
             permission_manager,
+            token_handler,
         })
     }
 
@@ -182,7 +193,7 @@ where
                 &idx.to_be_bytes(),
             )?;
 
-            create_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx)?;
+            create_mappings(&store, &mut write_txn, resource, &user_id, idx)?;
 
             store.commit(write_txn)?;
             Ok::<AutoCommit, ArunaMetadataError>(doc)
@@ -374,7 +385,7 @@ where
                 )?;
 
                 if visibility != resource.visibility {
-                    update_mappings(store.as_ref(), &mut write_txn, resource, &user_id, idx)?;
+                    update_mappings(&store, &mut write_txn, resource, &user_id, idx)?;
                 }
 
                 store.commit(write_txn)?;
@@ -401,14 +412,14 @@ where
         let store = self.store.clone();
         let permission = self.permission_manager.clone();
         let group_id = group.id;
-        let realm_id = todo!("wait for merge");
         let user = user.clone();
+        let realm_key = realm_key.clone();
 
         // Generate actor id
         let actor_id = ActorId::from(
             [
                 user.user_ulid.to_bytes().as_slice(),
-                user.realm_ulid.to_bytes().as_slice(),
+                &user.realm_ulid,
                 actor_id.as_slice(),
             ]
             .concat(),
@@ -435,8 +446,8 @@ where
                 let handle = permission.create_group_prepare(
                     group_id,
                     &user,
-                    realm_id,
-                    store.as_ref(),
+                    realm_key,
+                    &store,
                     &mut write_txn,
                 )?;
 
@@ -449,22 +460,90 @@ where
         )
         .await
         .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
-        //self.permission_manager
-        //    .create_group_commit(commit_handle)
-        //    .await?;
+        self.permission_manager
+            .create_group_commit(commit_handle)
+            .await?;
 
         Ok(result)
+    }
+    pub async fn check_public(&self, resource_id: &Ulid) -> Result<bool, ArunaMetadataError> {
+        let store = self.store.clone();
+        let id = resource_id.to_bytes();
+        tokio::task::spawn_blocking(move || -> Result<bool, ArunaMetadataError> {
+            let txn = store.create_txn(false)?;
+
+            let mapping = store.get(&txn, RESOURCE_MAPPINGS_DB_NAME, id.as_slice())?;
+
+            Ok(mapping.is_some())
+        })
+        .await
+        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
+    }
+
+    pub async fn get_identity(&self, token: String) -> Result<UserIdentity, ArunaMetadataError> {
+        let store = self.store.clone();
+        let token_handler = self.token_handler.clone();
+        tokio::task::spawn_blocking(move || -> Result<UserIdentity, ArunaMetadataError> {
+            let mut txn = store.create_txn(false)?;
+            let user_identity = token_handler
+                .read()
+                .get_identity(&token, &store, &mut txn)?;
+            store.commit(txn)?;
+            Ok(user_identity)
+        })
+        .await
+        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
     }
 }
 
 // TODO
+#[async_trait::async_trait]
 impl<St, Se> Authorize for Persistor<St, Se>
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
-    fn authorize(&self, user_identity: &Ulid, _resource_id: &Ulid) -> bool {
-        // TODO: Use casbin here
-        true
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        action: Action,
+        resource_id: Ulid,
+    ) -> Result<Option<(UserIdentity, Path)>, ArunaMetadataError> {
+        match token {
+            Some(token) => {
+                let store = self.store.clone();
+                todo!("Split registration and verification of oidc_tokens");
+                let user_identity = tokio::task::spawn_blocking(
+                    move || -> Result<UserIdentity, ArunaMetadataError> {
+                        let mut txn = store.create_txn(false)?;
+                        let user_identity = self
+                            .token_handler
+                            .read()
+                            .get_identity(&token, &store, &mut txn)?;
+                        store.commit(txn)?;
+                        Ok(user_identity)
+                    },
+                )
+                .await
+                .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))??;
+                let cloned_user_identity = user_identity.clone();
+                let store = self.store.clone();
+                let permission_manager = self.permission_manager.clone();
+
+                let path = permission_manager
+                    .check_permission(
+                        &cloned_user_identity,
+                        ResourceId::Ulid(resource_id),
+                        action,
+                        &store,
+                    )
+                    .await?;
+                Ok(Some((user_identity, path)))
+            }
+            None => match self.check_public(&resource_id).await? {
+                true => Ok(None),
+                false => Err(ArunaMetadataError::Unauthorized),
+            },
+        }
     }
 }

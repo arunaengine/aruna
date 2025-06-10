@@ -14,6 +14,7 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
+use aruna_permission::token::OidcTrustConfig;
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -51,9 +52,9 @@ pub async fn init_lmdb_servers(
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("aruna_metadata=trace".parse().unwrap());
-        //.add_directive("aruna_storage=info".parse().unwrap())
-        //.add_directive("tower_http=info".parse().unwrap())
-        //.add_directive("aruna_net=info".parse().unwrap());
+    //.add_directive("aruna_storage=info".parse().unwrap())
+    //.add_directive("tower_http=info".parse().unwrap())
+    //.add_directive("aruna_net=info".parse().unwrap());
 
     let fmt_layer = tracing_subscriber::fmt::layer()
         .with_file(true)
@@ -61,7 +62,7 @@ pub async fn init_lmdb_servers(
         .with_filter(logging_env_filter);
     tracing_subscriber::registry().with(fmt_layer).init();
 
-    let realm_key = Some(SigningKey::generate(&mut OsRng));
+    let realm_key = SigningKey::generate(&mut OsRng);
     let mut base_urls = Vec::new();
 
     let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -86,9 +87,15 @@ pub async fn init_lmdb_servers(
     };
 
     let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-        Persistor::new(res_sdx, store_config, search_config)
-            .await
-            .unwrap(),
+        Persistor::new(
+            res_sdx,
+            store_config,
+            search_config,
+            realm_key.as_bytes().clone(),
+            OidcTrustConfig::TrustAll,
+        )
+        .await
+        .unwrap(),
     );
     let network = Arc::new(
         P2PNetwork::new(NetworkConfig {
@@ -141,9 +148,15 @@ pub async fn init_lmdb_servers(
         };
 
         let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-            Persistor::new(res_sdx, store_config, search_config)
-                .await
-                .unwrap(),
+            Persistor::new(
+                res_sdx,
+                store_config,
+                search_config,
+                realm_key.as_bytes().clone(),
+                OidcTrustConfig::TrustAll,
+            )
+            .await
+            .unwrap(),
         );
         let network = Arc::new(
             P2PNetwork::new(NetworkConfig {

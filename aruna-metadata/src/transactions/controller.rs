@@ -3,7 +3,7 @@ use crate::{
     error::ArunaMetadataError,
     models::models::TypedDoc,
     network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search},
+    persistence::{persistence::{Authorize, Persistor}, search::search::Search},
 };
 use aruna_storage::storage::store::Store;
 use automerge::sync::Message;
@@ -45,20 +45,8 @@ where
         match request.forward_or_return(&token, self).await? {
             Some(response) => Ok(response),
             None => {
-                // TODO: Replace this with real authorization
-                let user = match token {
-                    Some(token) => {
-                        todo!("Get UserIdentity from token")
-                        //self.persistence
-                        //    .get_user(&Ulid::from_string(&id).map_err(|e| {
-                        //        ArunaMetadataError::DeserializeError(e.to_string())
-                        //    })?)
-                        //    .await?
-                    }
-                    None => None,
-                };
-
-                let result = request.run_request(user, self).await?;
+                let user_identity = request.authorize(token, self).await?;
+                let result = request.run_request(user_identity, self).await?;
                 Ok(result)
             }
         }
