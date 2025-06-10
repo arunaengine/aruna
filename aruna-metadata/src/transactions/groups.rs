@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::request::Request;
 use crate::{
     models::{
-        models::{Group, User},
+        models::Group,
         requests::{
             AddGroupRequest, AddGroupResponse, AddResourcesToGroupRequest,
             AddResourcesToGroupResponse, AddRolesToGroupRequest, AddRolesToGroupResponse,
@@ -115,7 +115,7 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.group_id);
-        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
             Ok(Some(i))
         } else {
             Ok(None)
@@ -157,7 +157,7 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.group_id);
-        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
             Ok(Some(i))
         } else {
             Ok(None)
@@ -199,7 +199,7 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.group_id);
-        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
             Ok(Some(i))
         } else {
             Ok(None)

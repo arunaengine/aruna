@@ -1,13 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
-use crate::{
-    error::ArunaMetadataError,
-    transactions::{controller::Controller, request::Request},
-};
+use crate::error::ArunaMetadataError;
 
 use super::models::{Author, Group, KeyValue, Resource, ResourceVariant, User, VisibilityClass};
-use aruna_permission::{Path, UserIdentity};
-use aruna_storage::storage::store::Store;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};

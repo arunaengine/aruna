@@ -3,7 +3,7 @@ use crate::{
     error::ArunaMetadataError,
     models::models::TypedDoc,
     network::network_trait::Network,
-    persistence::{persistence::{Authorize, Persistor}, search::search::Search},
+    persistence::{persistence::Persistor, search::search::Search},
 };
 use aruna_storage::storage::store::Store;
 use automerge::sync::Message;

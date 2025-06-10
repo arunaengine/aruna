@@ -36,7 +36,7 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.parent_id);
-        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
             Ok(Some(i))
         } else {
             Ok(None)
@@ -132,7 +132,7 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Read, self.id);
-        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
             Ok(Some(i))
         } else {
             Ok(None)
@@ -175,12 +175,9 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<UserIdentity>,
+        _user: Option<UserIdentity>, // authorize checks if resource is pub
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        let Some(user) = user else {
-            return Err(crate::error::ArunaMetadataError::Unauthorized);
-        };
         let persistor = controller.persistence.clone();
         let resource = persistor.get_resource(self.id).await?;
         Ok(GetResourceResponse { resource })
@@ -203,7 +200,7 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.get_id());
-        if let Some((i, p)) = controller.persistence.authorize(token, action, id).await? {
+        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
             Ok(Some(i))
         } else {
             Ok(None)

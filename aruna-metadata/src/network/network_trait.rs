@@ -3,9 +3,7 @@ use crate::{
     models::requests::{ForwardRequest, ForwardResponse},
     network::util::send_message,
     persistence::{
-        persistence::{
-            tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
-        },
+        persistence::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
         search::search::Search,
     },
     transactions::{controller::Controller, request::Request},
