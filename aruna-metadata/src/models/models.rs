@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use super::conversions::autosurgeon_date_time;
 use super::conversions::autosurgeon_ulid;
+use super::conversions::autosurgeon_bytes;
 use automerge::AutoCommit;
 use autosurgeon::{Hydrate, Reconcile};
 use chrono::{DateTime, Utc};
@@ -227,6 +228,9 @@ pub struct User {
     #[autosurgeon(with = "autosurgeon_ulid")]
     #[key]
     pub id: Ulid,
+
+    #[autosurgeon(with = "autosurgeon_bytes")]
+    pub realm_key: [u8;32],
     pub name: String,
 }
 

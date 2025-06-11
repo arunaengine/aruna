@@ -19,6 +19,7 @@ where
     N: Network + 'static,
 {
     type Response = AddUserResponse;
+    type AuthContext = Option<UserIdentity>;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
@@ -48,8 +49,10 @@ where
         _user: Option<UserIdentity>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let realm_key = controller.network.get_realm_key().await?;
         let user = User {
             id: Ulid::new(),
+            realm_key,
             name: self.name,
         };
         let node_id = controller.network.get_addr().await?.node_id;

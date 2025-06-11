@@ -67,13 +67,13 @@ where
         res_sdx: tokio::sync::mpsc::Sender<(u32, Resource)>,
         store_config: <St as Store<'static>>::StoreConfig,
         search_config: Se::SearchConfig,
-        realm_id: [u8; 32],
+        realm_key: [u8; 32],
         oidc_trust_config: OidcTrustConfig,
     ) -> Result<Self, ArunaMetadataError> {
         let store = St::new(store_config)?;
 
         let permission_manager = PermissionManager::new().await?;
-        let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_id, oidc_trust_config)));
+        let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_trust_config)));
 
         // TODO: Init perm/auth
 
@@ -158,14 +158,22 @@ where
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn add_resource(
         &self,
-        actor_id: &[u8; 32],
-        user_id: &Ulid,
+        node_key: &[u8; 32],
+        user: &UserIdentity,
+        path: Path,
         resource: Resource,
     ) -> Result<AutoCommit, ArunaMetadataError> {
         let store = self.store.clone();
-        let search = self.search.clone();
-        let user_id = *user_id;
-        let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
+        let permission_manager = self.permission_manager.clone();
+        let user_id = user.user_ulid;
+        let actor_id = ActorId::from(
+            [
+                user.user_ulid.to_bytes().as_slice(),
+                user.realm_key.as_slice(),
+                node_key.as_slice(),
+            ]
+            .concat(),
+        );
 
         // spawn search in its own block and dont await outcome
         let idx = self
@@ -192,28 +200,36 @@ where
                 &resource.id.to_bytes(),
                 &idx.to_be_bytes(),
             )?;
-
             create_mappings(&store, &mut write_txn, resource, &user_id, idx)?;
+            permission_manager.add_resource(
+                ResourceId::Ulid(res_clone.id),
+                &path,
+                &store,
+                &mut write_txn,
+            )?;
 
             store.commit(write_txn)?;
+
             Ok::<AutoCommit, ArunaMetadataError>(doc)
         })
         .await
         .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
 
-        search.add_resource(idx, res_clone).await?;
+        self.search.add_resource(idx, res_clone).await?;
 
         Ok(res)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn get_resource(&self, id: Ulid) -> Result<Resource, ArunaMetadataError> {
+    pub async fn get_resource(&self, resource_id: Ulid) -> Result<Resource, ArunaMetadataError> {
         let store = self.store.clone();
         let result = tokio::task::spawn_blocking(move || {
             let read_txn = store.create_txn(false)?;
-            let byte_id = id.to_bytes();
+            let byte_id = resource_id.to_bytes();
             let Some(res) = store.get(&read_txn, RESOURCE_DB_NAME, &byte_id)? else {
-                return Err(ArunaMetadataError::NotFound(format!("{id} not found")));
+                return Err(ArunaMetadataError::NotFound(format!(
+                    "{resource_id} not found"
+                )));
             };
 
             let doc = automerge::AutoCommit::load(res.as_ref())?;
@@ -230,11 +246,18 @@ where
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn add_user(
         &self,
-        actor_id: &[u8; 32],
+        node_key: &[u8; 32],
         user: User,
     ) -> Result<AutoCommit, ArunaMetadataError> {
         let store = self.store.clone();
-        let actor_id = ActorId::from([user.id.to_bytes().as_slice(), actor_id.as_slice()].concat());
+        let actor_id = ActorId::from(
+            [
+                user.id.to_bytes().as_slice(),
+                user.realm_key.as_slice(),
+                node_key.as_slice(),
+            ]
+            .concat(),
+        );
         let result = tokio::task::spawn_blocking(move || {
             let mut write_txn = store.create_txn(true)?;
 
@@ -333,19 +356,26 @@ where
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn update_resource(
         &self,
-        actor_id: &[u8; 32],
-        user_id: &Ulid,
+        node_key: &[u8; 32],
+        user_identity: &UserIdentity,
         resource: Resource,
     ) -> Result<AutoCommit, ArunaMetadataError> {
         // Clones for spawn_blocking
         let store = self.store.clone();
         let search = self.search.clone();
-        let user_id = *user_id;
+        let user_id = user_identity.user_ulid;
         let resource_id = resource.id.to_bytes();
         let res_clone = resource.clone();
 
         // Generate actor id
-        let actor_id = ActorId::from([user_id.to_bytes().as_slice(), actor_id.as_slice()].concat());
+        let actor_id = ActorId::from(
+            [
+                user_id.to_bytes().as_slice(),
+                user_identity.realm_key.as_slice(),
+                node_key.as_slice(),
+            ]
+            .concat(),
+        );
 
         let (result, idx) = tokio::task::spawn_blocking(
             move || -> Result<(AutoCommit, u32), ArunaMetadataError> {
@@ -403,7 +433,7 @@ where
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn add_group(
         &self,
-        actor_id: &[u8; 32],
+        node_key: &[u8; 32],
         realm_key: &[u8; 32],
         user: &UserIdentity,
         group: Group,
@@ -420,7 +450,7 @@ where
             [
                 user.user_ulid.to_bytes().as_slice(),
                 &user.realm_key,
-                actor_id.as_slice(),
+                node_key.as_slice(),
             ]
             .concat(),
         );

@@ -1,15 +1,7 @@
-use aruna_permission::UserIdentity;
-use aruna_storage::storage::store::Store;
 use iroh::endpoint::{RecvStream, SendStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-use super::network_trait::{MetadataMessage, Network};
-use crate::{
-    error::ArunaMetadataError,
-    models::requests::ForwardRequest,
-    persistence::search::search::Search,
-    transactions::{controller::Controller, request::Request},
-};
+use super::network_trait::MetadataMessage;
+use crate::error::ArunaMetadataError;
 
 pub(super) async fn read_message(
     recv_stream: &mut RecvStream,
@@ -38,25 +30,4 @@ pub(super) async fn send_message(
         .await
         .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
     Ok(())
-}
-
-impl ForwardRequest {
-    pub async fn authorize<St, Se, N>(
-        &self,
-        token: Option<String>,
-        controller: &Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, ArunaMetadataError>
-    where
-        for<'a> St: Store<'a> + 'static,
-        Se: Search + 'static,
-        N: Network + 'static,
-    {
-        let auth_context = match self {
-            ForwardRequest::GetResource(r) => r.authorize(token, controller).await?,
-            ForwardRequest::UpdateResource(r) => r.authorize(token, controller).await?,
-            ForwardRequest::Search(r) => r.authorize(token, controller).await?,
-        };
-
-        Ok(auth_context)
-    }
 }

@@ -564,7 +564,10 @@ impl P2PNetwork {
             trace!("Received message: {:?}", msg);
 
             match msg.body {
-                Body::Replicate { id, ref sync_message } => {
+                Body::Replicate {
+                    id,
+                    ref sync_message,
+                } => {
                     self.handle_replication_messages(
                         msg.clone(),
                         sync_message.clone(),
@@ -575,21 +578,25 @@ impl P2PNetwork {
                     .await?;
                 }
                 Body::Request { token, request } => {
-                    let permissions = request.authorize(token, &controller).await?;
                     let body = match request {
                         ForwardRequest::GetResource(req) => {
+                            let auth_ctx = req.authorize(token, controller).await?;
                             Body::Response(Response::ForwardResponse(ForwardResponse::GetResource(
-                                req.clone().run_request(permissions, controller).await,
+                                req.clone().run_request(auth_ctx, controller).await,
                             )))
                         }
-                        ForwardRequest::UpdateResource(req) => Body::Response(
-                            Response::ForwardResponse(ForwardResponse::UpdateResource(
-                                req.clone().run_request(permissions, controller).await,
-                            )),
-                        ),
+                        ForwardRequest::UpdateResource(req) => {
+                            let auth_ctx = req.authorize(token, controller).await?;
+                            Body::Response(Response::ForwardResponse(
+                                ForwardResponse::UpdateResource(
+                                    req.clone().run_request(auth_ctx, controller).await,
+                                ),
+                            ))
+                        }
                         ForwardRequest::Search(req) => {
+                            let auth_ctx = req.authorize(token, controller).await?;
                             Body::Response(Response::ForwardResponse(ForwardResponse::Search(
-                                req.clone().run_request(permissions, controller).await,
+                                req.clone().run_request(auth_ctx, controller).await,
                             )))
                         }
                     };
@@ -603,7 +610,8 @@ impl P2PNetwork {
                         &mut recv_stream.send_stream,
                     )
                     .await?;
-                } Body::Response { .. } => {
+                }
+                Body::Response { .. } => {
                     todo!("Backchannel for updated merged docs or sync protocol");
                     // Nothing to do here, there are currently no messages that send responses
                     // after replication/forwarding back

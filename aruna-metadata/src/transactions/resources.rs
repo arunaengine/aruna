@@ -15,7 +15,7 @@ use crate::{
     network::network_trait::{Network, REPLICATION_POLICY},
     persistence::{persistence::Authorize, search::search::Search},
 };
-use aruna_permission::{Action, UserIdentity};
+use aruna_permission::{Action, Path, UserIdentity};
 use aruna_storage::storage::store::Store;
 use rand::seq::IteratorRandom;
 use ulid::Ulid;
@@ -28,19 +28,20 @@ where
     N: Network + 'static,
 {
     type Response = CreateResourceResponse;
+    type AuthContext = (UserIdentity, Path);
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
         &self,
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+    ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.parent_id);
-        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
-            Ok(Some(i))
-        } else {
-            Ok(None)
-        }
+        controller
+            .persistence
+            .authorize(token, action, id)
+            .await?
+            .ok_or_else(|| ArunaMetadataError::Unauthorized)
     }
 
     #[tracing::instrument(level = "trace", skip(_controller))]
@@ -55,12 +56,11 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<UserIdentity>,
+        auth_result: Self::AuthContext,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        let Some(user) = user else {
-            return Err(crate::error::ArunaMetadataError::Unauthorized);
-        };
+        let user = auth_result.0;
+        let path = auth_result.1;
 
         let time = chrono::Utc::now().timestamp_millis();
         let time = chrono::DateTime::from_timestamp_millis(time).ok_or_else(|| {
@@ -93,7 +93,7 @@ where
         let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
-            .add_resource(node_id.as_bytes(), &user.user_ulid, resource.clone())
+            .add_resource(node_id.as_bytes(), &user, path, resource.clone())
             .await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
@@ -124,6 +124,7 @@ where
     N: Network + 'static,
 {
     type Response = GetResourceResponse;
+    type AuthContext = Option<UserIdentity>;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
@@ -192,6 +193,7 @@ where
     N: Network + 'static,
 {
     type Response = ResourceUpdateResponses;
+    type AuthContext = Option<UserIdentity>;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
@@ -331,7 +333,7 @@ where
         let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
-            .update_resource(node_id.as_bytes(), &user.user_ulid, resource.clone())
+            .update_resource(node_id.as_bytes(), &user, resource.clone())
             .await?;
 
         // Replay update only to members that already got the object

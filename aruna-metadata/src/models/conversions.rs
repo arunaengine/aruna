@@ -69,6 +69,24 @@ pub mod autosurgeon_ulid {
     }
 }
 
+pub mod autosurgeon_bytes {
+    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
+    pub fn hydrate<'a, D: ReadDoc>(
+        doc: &D,
+        obj: &automerge::ObjId,
+        prop: Prop<'a>,
+    ) -> Result<[u8; 32], HydrateError> {
+        let inner = autosurgeon::bytes::ByteVec::hydrate(doc, obj, prop)?;
+        Ok(inner.as_slice().try_into().map_err(|_| {
+            HydrateError::unexpected("&[u8; 16]", "Invalid slice of bytes".to_string())
+        })?)
+    }
+
+    pub fn reconcile<R: Reconciler>(bytes: &[u8; 32], mut reconciler: R) -> Result<(), R::Error> {
+        reconciler.bytes(bytes)
+    }
+}
+
 pub mod autosurgeon_date_time {
 
     use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
@@ -108,6 +126,7 @@ mod tests {
     fn test_conversion() {
         let user = User {
             id: Ulid::new(),
+            realm_key: [0u8; 32],
             name: "test_name".to_string(),
         };
 
@@ -160,6 +179,7 @@ mod tests {
     fn test_automerge() {
         let user1 = User {
             id: Ulid::new(),
+            realm_key: [0u8; 32],
             name: "test_name".to_string(),
         };
 

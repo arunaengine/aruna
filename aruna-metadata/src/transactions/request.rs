@@ -2,8 +2,9 @@ use super::controller::Controller;
 use crate::{
     error::ArunaMetadataError, network::network_trait::Network, persistence::search::search::Search,
 };
-use aruna_permission::UserIdentity;
+use aruna_permission::{Path, UserIdentity};
 use aruna_storage::storage::store::Store;
+
 
 #[async_trait::async_trait]
 pub trait Request<St, Se, N>
@@ -13,22 +14,23 @@ where
     N: Network + 'static,
 {
     type Response;
+    type AuthContext;
 
     async fn authorize(
         &self,
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError>;
+    ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError>;
 
     async fn run_request(
         self,
-        requester: Option<UserIdentity>,
+        auth_result: Self::AuthContext,
         controller: &Controller<St, Se, N>,
     ) -> Result<Self::Response, ArunaMetadataError>;
 
     async fn forward_or_return(
         &self,
-        requester: &Option<String>,
+        token: &Option<String>,
         controller: &Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, ArunaMetadataError>;
 }

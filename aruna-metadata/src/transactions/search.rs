@@ -18,6 +18,7 @@ where
     N: Network + 'static,
 {
     type Response = SearchResponse;
+    type AuthContext = Option<UserIdentity>;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(

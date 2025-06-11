@@ -25,6 +25,7 @@ where
     N: Network + 'static,
 {
     type Response = AddGroupResponse;
+    type AuthContext = Option<UserIdentity>;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
@@ -107,6 +108,7 @@ where
     N: Network + 'static,
 {
     type Response = AddUserToGroupResponse;
+    type AuthContext = Option<UserIdentity>;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
@@ -149,6 +151,7 @@ where
     N: Network + 'static,
 {
     type Response = AddRolesToGroupResponse;
+    type AuthContext = Option<UserIdentity>;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
@@ -191,6 +194,7 @@ where
     N: Network + 'static,
 {
     type Response = AddResourcesToGroupResponse;
+    type AuthContext = Option<UserIdentity>;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
