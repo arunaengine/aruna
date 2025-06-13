@@ -8,6 +8,7 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
+use aruna_permission::token::OidcTrustConfig;
 use aruna_storage::storage::fjall::{FjallConfig, FjallStore};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use std::sync::Arc;
@@ -36,10 +37,18 @@ impl TantivyFjall {
                 PUBLIC_MAPPINGS_DB_NAME,
             ],
         };
+        let oidc_trust_config = OidcTrustConfig::TrustAll;
+        let realm_key = [0u8; 32];
         let persistor = Arc::new(
-            Persistor::new(res_sdx, store_config, search_config)
-                .await
-                .unwrap(),
+            Persistor::new(
+                res_sdx,
+                store_config,
+                search_config,
+                realm_key,
+                oidc_trust_config,
+            )
+            .await
+            .unwrap(),
         );
         let network = Arc::new(NetworkDummy::new(()).await.unwrap());
 
@@ -142,10 +151,18 @@ impl TantivyHeed {
                 PUBLIC_MAPPINGS_DB_NAME,
             ],
         };
+        let oidc_trust_config = OidcTrustConfig::TrustAll;
+        let realm_key = [0u8; 32];
         let persistor = Arc::new(
-            Persistor::new(res_sdx, store_config, search_config)
-                .await
-                .unwrap(),
+            Persistor::new(
+                res_sdx,
+                store_config,
+                search_config,
+                realm_key,
+                oidc_trust_config,
+            )
+            .await
+            .unwrap(),
         );
         let network = Arc::new(NetworkDummy::new(()).await.unwrap());
 

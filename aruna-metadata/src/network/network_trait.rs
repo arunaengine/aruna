@@ -12,6 +12,7 @@ use aruna_net::{
     actor::NetworkActorBuilder,
     actor_handle::{NetworkActorHandle, ReceiveStreams},
 };
+use aruna_permission::Path;
 use aruna_realm::Realm;
 use aruna_storage::storage::store::Store;
 use ed25519_dalek::SigningKey;
@@ -41,6 +42,7 @@ pub struct MetadataMessage {
 pub enum Body {
     Replicate {
         id: Ulid,
+        path: Path,
         sync_message: ReplicationSubject,
     },
     Request {
@@ -75,6 +77,7 @@ pub trait Network: Sync + Send + Sized {
         stream: &mut Self::Stream,
         subject: ReplicationSubject,
         subject_id: &Ulid,
+        path: Path,
         target_node: NodeAddr,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError>;
 
@@ -137,6 +140,7 @@ impl Network for NetworkDummy {
         _stream: &mut Self::Stream,
         _subject: ReplicationSubject,
         _subject_id: &Ulid,
+        _path: Path,
         _target_node: NodeAddr,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
         Ok(None)
@@ -311,6 +315,7 @@ impl Network for P2PNetwork {
         stream: &mut Self::Stream,
         subject: ReplicationSubject,
         subject_id: &Ulid,
+        path: Path,
         target_node: NodeAddr,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
         let (sdx, recv) = (&mut stream.send_stream, &mut stream.recv_stream);
@@ -327,6 +332,7 @@ impl Network for P2PNetwork {
             subject: *id_hash.as_bytes(),
             body: Body::Replicate {
                 id: *subject_id,
+                path,
                 sync_message: subject,
             },
         };
@@ -342,7 +348,6 @@ impl Network for P2PNetwork {
                 )));
             }
         };
-        trace!("Got response");
 
         Ok(response)
     }
@@ -444,6 +449,7 @@ impl P2PNetwork {
         message: MetadataMessage,
         sync_message: ReplicationSubject,
         subject_id: Ulid,
+        path: Path,
         recv_stream: &mut ReceiveStreams,
         controller: &Controller<St, Se, N>,
     ) -> Result<(), ArunaMetadataError>
@@ -472,7 +478,7 @@ impl P2PNetwork {
         // Poll sync response
         let sync_response = controller
             .persistence
-            .handle_replication(node_id, subject_id, sync_message, &mut doc)
+            .handle_replication(node_id, subject_id, path, sync_message, &mut doc)
             .await?;
 
         // Send response either with Some(_) or None
@@ -493,7 +499,12 @@ impl P2PNetwork {
                 from,
                 to,
                 subject,
-                body: Body::Replicate { id, sync_message },
+                body:
+                    Body::Replicate {
+                        id,
+                        path,
+                        sync_message,
+                    },
             } = read_message(&mut recv_stream.recv_stream).await?
             else {
                 return Err(ArunaMetadataError::ServerError(
@@ -503,7 +514,7 @@ impl P2PNetwork {
 
             let sync_response = controller
                 .persistence
-                .handle_replication(node_id, id, sync_message.clone(), &mut doc)
+                .handle_replication(node_id, id, path.clone(), sync_message.clone(), &mut doc)
                 .await?;
 
             send_message(
@@ -534,8 +545,9 @@ impl P2PNetwork {
                     ReplicationSubject::Object(None) => {
                         controller
                             .persistence
-                            .handle_user_merges(doc.save())
+                            .handle_object_merges(path, doc.save())
                             .await?;
+                        self.store(&subject).await?;
                     }
                     _ => continue,
                 }
@@ -543,7 +555,6 @@ impl P2PNetwork {
                     .send_stream
                     .finish()
                     .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))?;
-                self.store(&subject).await?;
                 break 'inner;
             }
         }
@@ -561,17 +572,18 @@ impl P2PNetwork {
         N: Network,
     {
         while let Ok(msg) = read_message(&mut recv_stream.recv_stream).await {
-            trace!("Received message: {:?}", msg);
 
             match msg.body {
                 Body::Replicate {
                     id,
+                    ref path,
                     ref sync_message,
                 } => {
                     self.handle_replication_messages(
                         msg.clone(),
                         sync_message.clone(),
                         id,
+                        path.clone(),
                         recv_stream,
                         controller,
                     )

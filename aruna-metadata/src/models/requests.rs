@@ -16,7 +16,7 @@ pub struct CreateResourceRequest {
     pub title: String,
     #[serde(default)]
     pub description: String,
-    pub variant: ResourceVariant,
+    pub variant: CreateResourceVariant,
     #[serde(default)]
     pub labels: Vec<KeyValue>,
     #[serde(default)]
@@ -30,10 +30,57 @@ pub struct CreateResourceRequest {
     pub parent_id: Ulid,
 }
 
+#[derive(
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Debug,
+    Serialize,
+    Deserialize,
+    ToSchema,
+    Default,
+)]
+pub enum CreateResourceVariant {
+    #[default]
+    Folder,
+    Object,
+}
+
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateResourceResponse {
     pub resource: Resource,
 }
+
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
+)]
+pub struct CreateProjectRequest {
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub labels: Vec<KeyValue>,
+    #[serde(default)]
+    pub identifiers: Vec<String>,
+    #[serde(default)]
+    pub visibility: VisibilityClass,
+    #[serde(default)]
+    pub authors: Vec<Author>,
+    #[serde(default)]
+    pub license_id: Option<Ulid>,
+    pub group_id: Ulid,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateProjectResponse {
+    pub resource: Resource,
+}
+
 
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,

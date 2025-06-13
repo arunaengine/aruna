@@ -7,7 +7,7 @@ use crate::{
     network::network_trait::Network,
     persistence::search::search::Search,
 };
-use aruna_permission::UserIdentity;
+use aruna_permission::{OidcToken, Path};
 use aruna_storage::storage::store::Store;
 use ulid::Ulid;
 
@@ -19,19 +19,18 @@ where
     N: Network + 'static,
 {
     type Response = AddUserResponse;
-    type AuthContext = Option<UserIdentity>;
+    type AuthContext = OidcToken;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
         &self,
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+    ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError> {
         let Some(token) = token else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        todo!("Check token and register user");
-        Ok(None)
+        controller.persistence.check_oidc_token(token).await
     }
 
     #[tracing::instrument(level = "trace", skip(_controller))]
@@ -46,19 +45,13 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        _user: Option<UserIdentity>,
+        auth_ctx: Self::AuthContext,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        let realm_key = controller.network.get_realm_key().await?;
-        let user = User {
-            id: Ulid::new(),
-            realm_key,
-            name: self.name,
-        };
         let node_id = controller.network.get_addr().await?.node_id;
-        let user_doc = controller
+        let (user, doc) = controller
             .persistence
-            .add_user(node_id.as_bytes(), user.clone())
+            .add_user(node_id.as_bytes(), self.name, auth_ctx)
             .await?;
 
         // (for now) Replicate users to all member nodes
@@ -69,12 +62,15 @@ where
             .into_iter()
             .filter(|addr| addr.node_id != node_id);
 
+        // TODO: Change this later either to a group + user path
+        // or Option<Path>
+        let path = Path::builder()
+            .realm_id(controller.network.get_realm_key().await?)
+            .build()
+            .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
+
         controller
-            .sync_loop(
-                crate::models::models::TypedDoc::User(user_doc),
-                user.id,
-                members,
-            )
+            .sync_loop(crate::models::models::TypedDoc::User(doc), user.id, path, members)
             .await?;
 
         Ok(AddUserResponse { user })

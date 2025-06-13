@@ -123,7 +123,7 @@ impl PermissionManager {
     }
 
     /// Resolve user identity to permission ULID (PRIVATE) - UPDATED
-    fn resolve_permission_ulid<'a, S: Store<'a> + 'static>(
+    pub fn resolve_permission_ulid<'a, S: Store<'a> + 'static>(
         &self,
         user_identity: &UserIdentity,
         store: &'a S,
@@ -148,7 +148,7 @@ impl PermissionManager {
     }
 
     /// Create a user identity with explicit permission mapping
-    fn create_user_identity<'a, S: Store<'a> + 'static>(
+    pub fn create_user_identity<'a, S: Store<'a> + 'static>(
         &self,
         user_identity: &UserIdentity,
         store: &'a S,
@@ -545,6 +545,8 @@ impl PermissionManager {
     ) -> Result<CreateGroupPrepare> {
         // Ensure user identity exists with explicit mapping
         let permission_ulid = self.ensure_user_identity(initial_user, store, txn)?;
+
+        println!("{}", permission_ulid.to_string());
 
         let admin_role = format!("{}_admin", group_id);
         let member_role = format!("{}_member", group_id);

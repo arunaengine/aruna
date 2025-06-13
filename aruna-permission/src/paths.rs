@@ -6,6 +6,7 @@ use nom::{
     combinator::map,
     error::{Error as NomError, ErrorKind},
 };
+use serde::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 use std::str::FromStr;
 use ulid::Ulid;
@@ -18,7 +19,7 @@ pub type Result<T> = std::result::Result<T, PathError>;
 pub type RealmKey = [u8; 32];
 
 /// Represents the components that can make up a path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathComponent {
     /// Realm ID - this is always the first component
     RealmId(RealmKey),
@@ -57,7 +58,7 @@ pub enum PathComponent {
 }
 
 /// Represents a path in the custom path system.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Path {
     components: Vec<PathComponent>,
 }

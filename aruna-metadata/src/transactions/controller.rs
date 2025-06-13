@@ -5,6 +5,7 @@ use crate::{
     network::network_trait::Network,
     persistence::{persistence::Persistor, search::search::Search},
 };
+use aruna_permission::Path;
 use aruna_storage::storage::store::Store;
 use automerge::sync::Message;
 use iroh::NodeAddr;
@@ -57,6 +58,7 @@ where
         &self,
         doc: TypedDoc,
         doc_id: Ulid,
+        path: Path,
         nodes: impl Iterator<Item = NodeAddr>,
     ) -> Result<(), ArunaMetadataError> {
         for node in nodes {
@@ -64,6 +66,7 @@ where
             let network = self.network.clone();
             let persistence = self.persistence.clone();
             let doc = doc.clone();
+            let path = path.clone();
             tokio::spawn(async move {
                 let mut stream = network.create_stream(node.node_id).await?;
                 let mut document = inner_doc;
@@ -93,6 +96,7 @@ where
                                 }
                             },
                             &doc_id,
+                            path.clone(),
                             node.clone(),
                         )
                         .await?;
@@ -115,7 +119,7 @@ where
 
                 match &doc {
                     TypedDoc::Resource(_) => {
-                        persistence.handle_object_merges(document.save()).await?
+                        persistence.handle_object_merges(path, document.save()).await?
                     }
                     TypedDoc::Group(_) => persistence.handle_group_merges(document.save()).await?,
                     TypedDoc::User(_) => persistence.handle_user_merges(document.save()).await?,

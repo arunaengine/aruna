@@ -2,62 +2,36 @@ pub mod commons;
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use crate::commons::init_lmdb_servers;
+    use crate::commons::{TestServers, create_user_with_token, init_lmdb_servers};
     use aruna_metadata::{
         models::{
             models::Resource,
             requests::{
-                AddUserRequest, AddUserResponse, CreateResourceRequest, CreateResourceResponse,
+                AddGroupRequest, CreateProjectRequest, CreateProjectResponse,
                 GetResourceResponse,
             },
         },
         network::network_trait::Network,
+        transactions::request::Request,
     };
+    use std::time::Duration;
     const OFFSET: u16 = 0;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_create() {
-        let servers = init_lmdb_servers(OFFSET).await.unwrap();
-        println!("Init servers");
+    async fn test_user_creation() {
+        let ref test @ TestServers {
+            addr_server_pairs: ref servers,
+            ..
+        } = init_lmdb_servers(OFFSET).await.unwrap();
 
-        let (_, first_url) = servers.first().unwrap();
-
-        let client = reqwest::Client::new();
-
-        let request = AddUserRequest {
-            name: "bench_user1".to_string(),
-        };
-        let response: AddUserResponse = client
-            .post(format!("{first_url}/users"))
-            .json(&request)
-            .send()
-            .await
-            .unwrap()
-            .json()
+        let (user1_identity, _) = create_user_with_token(&test, "bench_user1".to_string())
             .await
             .unwrap();
-        let user1 = response.user.id;
-        println!("{}", user1.to_string());
-
-        let request = AddUserRequest {
-            name: "bench_user2".to_string(),
-        };
-
-        let response: AddUserResponse = client
-            .post(format!("{first_url}/users"))
-            .json(&request)
-            .send()
-            .await
-            .unwrap()
-            .json()
+        let user1 = user1_identity.user_ulid;
+        let (user2_identity, _) = create_user_with_token(&test, "bench_user2".to_string())
             .await
             .unwrap();
-        let user2 = response.user.id;
-        println!("{}", user2.to_string());
-
-        std::thread::sleep(Duration::from_secs(5));
+        let user2 = user2_identity.user_ulid;
 
         for (controller, _) in servers.iter() {
             println!("{}", controller.network.get_addr().await.unwrap().node_id);
@@ -78,57 +52,114 @@ mod tests {
                     .is_some()
             );
         }
+    }
 
-        let create_resource = CreateResourceRequest {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create() {
+        let ref test @ TestServers {
+            addr_server_pairs: ref servers,
+            ..
+        } = init_lmdb_servers(OFFSET).await.unwrap();
+
+        let (controller, first_url) = servers.first().unwrap();
+        let client = reqwest::Client::new();
+
+        let (user1_identity, user1_token) =
+            create_user_with_token(&test, "bench_user1".to_string())
+                .await
+                .unwrap();
+        let (user2_identity, user2_token) =
+            create_user_with_token(&test, "bench_user2".to_string())
+                .await
+                .unwrap();
+
+        std::thread::sleep(Duration::from_secs(5));
+
+        let request = AddGroupRequest {
+            name: "group1".to_string(),
+        };
+        let response = request
+            .run_request(user1_identity.clone(), controller)
+            .await
+            .unwrap();
+        let group1 = response.group.id;
+        let request = AddGroupRequest {
+            name: "group1".to_string(),
+        };
+        let response = request
+            .run_request(user2_identity.clone(), controller)
+            .await
+            .unwrap();
+        let group2 = response.group.id;
+
+        println!(
+            "
+User1 ID:       {}
+User1 GROUP:    {}
+User2 ID:       {}
+User2 GROUP:    {}
+",
+            user1_identity.user_ulid.to_string(),
+            group1.to_string(),
+            user2_identity.user_ulid.to_string(),
+            group2.to_string()
+        );
+
+
+        std::thread::sleep(Duration::from_secs(5));
+
+        let create_resource = CreateProjectRequest {
             name: format!("test_resource_from_user1"),
             visibility: aruna_metadata::models::models::VisibilityClass::Private,
+            group_id: group1,
             ..Default::default()
         };
         let object1: Resource = client
-            .post(format!("{first_url}/resources"))
+            .post(format!("{first_url}/resources/project"))
             .header::<&str, &str>(
                 "Authorization",
-                format!("Bearer {}", user1.to_string()).as_ref(),
+                format!("Bearer {}", user1_token.to_string()).as_ref(),
             )
             .json(&create_resource)
             .send()
             .await
             .unwrap()
-            .json::<CreateResourceResponse>()
+            .json::<CreateProjectResponse>()
             .await
             .unwrap()
             .resource;
         let object_id1 = object1.id;
 
-        let create_resource = CreateResourceRequest {
+        let create_resource = CreateProjectRequest {
             name: format!("test_resource_from_user2"),
             visibility: aruna_metadata::models::models::VisibilityClass::Private,
+            group_id: group2,
             ..Default::default()
         };
         let object2: Resource = client
-            .post(format!("{first_url}/resources"))
+            .post(format!("{first_url}/resources/project"))
             .header::<&str, &str>(
                 "Authorization",
-                format!("Bearer {}", user2.to_string()).as_ref(),
+                format!("Bearer {}", user2_token.to_string()).as_ref(),
             )
             .json(&create_resource)
             .send()
             .await
             .unwrap()
-            .json::<CreateResourceResponse>()
+            .json::<CreateProjectResponse>()
             .await
             .unwrap()
             .resource;
         let object_id2 = object2.id;
 
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(10));
 
         for (_, base_url) in servers.iter() {
             let response: GetResourceResponse = client
                 .get(format!("{base_url}/resources"))
                 .header::<&str, &str>(
                     "Authorization",
-                    format!("Bearer {}", user1.to_string()).as_ref(),
+                    format!("Bearer {}", user1_token.to_string()).as_ref(),
                 )
                 .query(&[("id".to_string(), object_id1.to_string())])
                 .send()
@@ -143,7 +174,7 @@ mod tests {
                 .get(format!("{base_url}/resources"))
                 .header::<&str, &str>(
                     "Authorization",
-                    format!("Bearer {}", user2.to_string()).as_ref(),
+                    format!("Bearer {}", user2_token.to_string()).as_ref(),
                 )
                 .query(&[("id".to_string(), object_id1.to_string())])
                 .send()
@@ -162,7 +193,7 @@ mod tests {
                 .get(format!("{base_url}/resources"))
                 .header::<&str, &str>(
                     "Authorization",
-                    format!("Bearer {}", user2.to_string()).as_ref(),
+                    format!("Bearer {}", user2_token.to_string()).as_ref(),
                 )
                 .query(&[("id".to_string(), object_id2.to_string())])
                 .send()
@@ -171,13 +202,13 @@ mod tests {
                 .json()
                 .await
                 .unwrap();
-            assert_eq!(response.resource, object1);
+            assert_eq!(response.resource, object2);
 
             let response = client
                 .get(format!("{base_url}/resources"))
                 .header::<&str, &str>(
                     "Authorization",
-                    format!("Bearer {}", user1.to_string()).as_ref(),
+                    format!("Bearer {}", user1_token.to_string()).as_ref(),
                 )
                 .query(&[("id".to_string(), object_id2.to_string())])
                 .send()

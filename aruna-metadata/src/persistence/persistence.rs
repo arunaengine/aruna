@@ -9,7 +9,7 @@ use crate::{
 };
 use ahash::RandomState;
 use aruna_permission::{
-    Action, Path, PermissionManager, ResourceId, TokenSystem, UserIdentity,
+    Action, OidcToken, Path, PermissionManager, ResourceId, TokenSystem, UserIdentity,
     manager::CreateGroupPrepare, token::OidcTrustConfig,
 };
 use aruna_storage::storage::store::Store;
@@ -22,6 +22,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicU32},
 };
+use tracing::{error, trace};
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -93,7 +94,9 @@ where
                 let (id, res) = resource;
                 let idx = store_clone
                     .get(&txn, RESOURCE_MAPPINGS_DB_NAME, id.as_ref())?
-                    .expect("No valid mapping found"); // TODO: Remove unwraps and replace with
+                    .ok_or_else(|| {
+                        ArunaMetadataError::ServerError("No valid mapping found".to_string())
+                    })?;
 
                 let doc = automerge::AutoCommit::load(res.as_ref())?;
                 let resource: Resource = autosurgeon::hydrate(&doc)?;
@@ -247,38 +250,58 @@ where
     pub async fn add_user(
         &self,
         node_key: &[u8; 32],
-        user: User,
-    ) -> Result<AutoCommit, ArunaMetadataError> {
+        user_name: String,
+        oidc_token: OidcToken,
+    ) -> Result<(User, AutoCommit), ArunaMetadataError> {
         let store = self.store.clone();
-        let actor_id = ActorId::from(
-            [
-                user.id.to_bytes().as_slice(),
-                user.realm_key.as_slice(),
-                node_key.as_slice(),
-            ]
-            .concat(),
-        );
+        let token_handler = self.token_handler.clone();
+        let permission_handler = self.permission_manager.clone();
+        let iss = oidc_token.iss;
+        let sub = oidc_token.sub;
+        let node_key = node_key.clone();
+
         let result = tokio::task::spawn_blocking(move || {
             let mut write_txn = store.create_txn(true)?;
+            let user_identity = token_handler.read().register_user_from_oidc_claims(
+                &iss,
+                &sub,
+                &store,
+                &mut write_txn,
+            )?;
+            let actor_id = ActorId::from(
+                [
+                    user_identity.user_ulid.to_bytes().as_slice(),
+                    user_identity.realm_key.as_slice(),
+                    node_key.as_slice(),
+                ]
+                .concat(),
+            );
+
+            let user = User {
+                id: user_identity.user_ulid,
+                realm_key: user_identity.realm_key,
+                name: user_name,
+            };
 
             // Serialize into &[u8]
             let id = user.id.to_bytes();
 
             let mut doc = automerge::AutoCommit::new().with_actor(actor_id);
 
-            autosurgeon::reconcile(&mut doc, user)?;
-            let user = doc.save();
+            autosurgeon::reconcile(&mut doc, &user)?;
+            let doc_vec = doc.save();
 
             let mut bitmap = Vec::new();
             RoaringBitmap::new().serialize_into(&mut bitmap)?;
 
             // Write in store
-            store.put(&mut write_txn, USER_DB_NAME, &id, &user)?;
+            store.put(&mut write_txn, USER_DB_NAME, &id, &doc_vec)?;
             store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
+            permission_handler.create_user_identity(&user_identity, &store, &mut write_txn)?;
 
             // Commit
             store.commit(write_txn)?;
-            Ok::<AutoCommit, ArunaMetadataError>(doc)
+            Ok::<(User, AutoCommit), ArunaMetadataError>((user, doc))
         })
         .await
         .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
@@ -467,8 +490,8 @@ where
                 autosurgeon::reconcile(&mut doc, group)?;
                 let group_doc = doc.save();
 
-                let mut bitmap = Vec::new();
-                RoaringBitmap::new().serialize_into(&mut bitmap)?;
+                // let mut bitmap = Vec::new();
+                // RoaringBitmap::new().serialize_into(&mut bitmap)?;
 
                 // Write in store
                 store.put(&mut write_txn, GROUPS_DB_NAME, &id, &group_doc)?;
@@ -481,7 +504,8 @@ where
                     &mut write_txn,
                 )?;
 
-                //store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
+                //TODO: Group mappings: 
+                // store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
 
                 // Commit
                 store.commit(write_txn)?;
@@ -490,12 +514,24 @@ where
         )
         .await
         .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+
         self.permission_manager
             .create_group_commit(commit_handle)
             .await?;
 
         Ok(result)
     }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn add_user_to_group(
+        &self,
+        node_key: &[u8; 32],
+        user: &UserIdentity,
+        group: Ulid,
+    ) -> Result<AutoCommit, ArunaMetadataError> {
+        todo!()
+    }
+
     pub async fn check_public(&self, resource_id: &Ulid) -> Result<bool, ArunaMetadataError> {
         let store = self.store.clone();
         let id = resource_id.to_bytes();
@@ -508,6 +544,40 @@ where
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
+    }
+
+    pub async fn check_path(
+        &self,
+        path: &Path,
+        identity: &UserIdentity,
+        action: Action,
+    ) -> Result<bool, ArunaMetadataError> {
+        let store = self.store.clone();
+        let permission_manager = self.permission_manager.clone();
+        let identity = identity.clone();
+
+        let ulid = tokio::task::spawn_blocking(move || -> Result<Ulid, ArunaMetadataError> {
+            let txn = store.create_txn(false)?;
+
+            let permission_ulid =
+                permission_manager.resolve_permission_ulid(&identity, &store, &txn)?;
+
+            store.commit(txn)?;
+
+            Ok(permission_ulid)
+        })
+        .await
+        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))??;
+        println!("{}", ulid.to_string());
+        self.permission_manager
+            .enforcer
+            .read()
+            .await
+            .enforce(&ulid.to_string(), &path.to_string(), &action.to_string())
+            .map_err(|e| {
+                error!(?e);
+                ArunaMetadataError::Unauthorized
+            })
     }
 
     pub async fn get_identity(&self, token: String) -> Result<UserIdentity, ArunaMetadataError> {
@@ -524,9 +594,28 @@ where
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
     }
+
+    pub async fn check_oidc_token(&self, token: String) -> Result<OidcToken, ArunaMetadataError> {
+        let store = self.store.clone();
+        let token_handler = self.token_handler.clone();
+        tokio::task::spawn_blocking(move || -> Result<OidcToken, ArunaMetadataError> {
+            let txn = store.create_txn(false)?;
+            let token = token_handler.read().verify_oidc_token(&token)?;
+            let exists = token_handler
+                .read()
+                .get_user_from_oidc(&token.iss, &token.sub, &store, &txn)?
+                .is_some();
+            if exists {
+                return Err(ArunaMetadataError::Unauthorized);
+            }
+            store.commit(txn)?;
+            Ok(token)
+        })
+        .await
+        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
+    }
 }
 
-// TODO
 #[async_trait::async_trait]
 impl<St, Se> Authorize for Persistor<St, Se>
 where
@@ -542,12 +631,11 @@ where
         match token {
             Some(token) => {
                 let store = self.store.clone();
-                todo!("Split registration and verification of oidc_tokens");
+                let token_handler = self.token_handler.clone();
                 let user_identity = tokio::task::spawn_blocking(
                     move || -> Result<UserIdentity, ArunaMetadataError> {
                         let mut txn = store.create_txn(false)?;
-                        let user_identity = self
-                            .token_handler
+                        let user_identity = token_handler
                             .read()
                             .get_identity(&token, &store, &mut txn)?;
                         store.commit(txn)?;
@@ -560,6 +648,7 @@ where
                 let store = self.store.clone();
                 let permission_manager = self.permission_manager.clone();
 
+                trace!(?resource_id);
                 let path = permission_manager
                     .check_permission(
                         &cloned_user_identity,
@@ -568,6 +657,7 @@ where
                         &store,
                     )
                     .await?;
+                trace!(?path);
                 Ok(Some((user_identity, path)))
             }
             None => match self.check_public(&resource_id).await? {

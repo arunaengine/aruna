@@ -8,9 +8,10 @@ use super::{
 };
 use crate::{
     error::ArunaMetadataError,
-    models::models::{Resource, User},
+    models::models::{Group, HandleHelper, Resource, User},
     network::network_trait::ReplicationSubject,
 };
+use aruna_permission::{Path, ResourceId, UserIdentity};
 use aruna_storage::storage::store::Store;
 use automerge::{
     AutoCommit,
@@ -19,7 +20,7 @@ use automerge::{
 use autosurgeon::hydrate;
 use iroh::PublicKey;
 use roaring::RoaringBitmap;
-use tracing::trace;
+use tracing::warn;
 use ulid::Ulid;
 
 impl<Se, St> Persistor<St, Se>
@@ -92,13 +93,13 @@ where
         &self,
         node: PublicKey,
         subject_id: Ulid,
+        path: Path,
         msg: ReplicationSubject,
         doc: &mut AutoCommit,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
         let response = match msg {
             crate::network::network_trait::ReplicationSubject::User(message) => {
                 if let Some(message) = &message {
-                    trace!("Sync message from {node}");
                     self.receive_sync_message(
                         &subject_id,
                         doc,
@@ -129,7 +130,7 @@ where
                     .generate_sync_message(&subject_id, doc, node.clone())
                     .await?;
                 if response.is_none() && message.is_none() {
-                    self.handle_object_merges(doc.save()).await?;
+                    self.handle_object_merges(path, doc.save()).await?;
                 }
                 response
             }
@@ -157,21 +158,127 @@ where
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_group_merges(&self, doc: Vec<u8>) -> Result<(), ArunaMetadataError> {
-        todo!()
+        let store = self.store.clone();
+        let permission = self.permission_manager.clone();
+
+        let handles = tokio::task::spawn_blocking(
+            move || -> Result<Vec<HandleHelper>, ArunaMetadataError> {
+                let mut wtxn = store.create_txn(true)?;
+
+                // Parse document, actor_id and ulid
+                let mut doc = automerge::AutoCommit::load(doc.as_ref())?;
+                let foreign_group: Group = autosurgeon::hydrate(&doc)?;
+                let ulid_bytes = foreign_group.id.to_bytes();
+
+                // Decide if merge or create
+                let (mut merged_resource, handle) =
+                    match store.get(&wtxn, GROUPS_DB_NAME, &ulid_bytes)? {
+                        Some(existing_doc) => {
+                            let mut existing_group =
+                                automerge::AutoCommit::load(existing_doc.as_ref())?;
+                            existing_group.merge(&mut doc)?;
+                            (existing_group, vec![])
+                        }
+                        None => {
+                            let mut handles = vec![];
+                            let Some((admin, _)) = foreign_group
+                                .members
+                                .iter()
+                                .filter(|(_, r)| r.iter().any(|r| r == &"admin"))
+                                .next()
+                            else {
+                                warn!("No admin found in group");
+                                return Ok(vec![]);
+                            };
+                            let identity = UserIdentity::new(
+                                Ulid::from_string(&admin).map_err(|_e| {
+                                    ArunaMetadataError::ConversionError {
+                                        from: "String".to_string(),
+                                        to: "Ulid".to_string(),
+                                    }
+                                })?,
+                                foreign_group.realm_key,
+                            );
+                            let handle = permission.create_group_prepare(
+                                foreign_group.id,
+                                &identity,
+                                foreign_group.realm_key,
+                                &store,
+                                &mut wtxn,
+                            )?;
+                            handles.push(HandleHelper::AddGroup(handle));
+
+                            for user in &foreign_group.members {
+                                let (id, roles) = user;
+
+                                let identity = UserIdentity::new(
+                                    Ulid::from_string(id).map_err(|_e| {
+                                        ArunaMetadataError::ConversionError {
+                                            from: "String".to_string(),
+                                            to: "Ulid".to_string(),
+                                        }
+                                    })?,
+                                    foreign_group.realm_key,
+                                );
+                                for role in roles {
+                                    if id == admin && role == "admin" {
+                                        continue;
+                                    }
+                                    let handle = permission.add_user_prepare(
+                                        foreign_group.id,
+                                        &identity,
+                                        &role,
+                                        &store,
+                                        &mut wtxn,
+                                    )?;
+                                    handles.push(HandleHelper::AddUser(handle));
+                                }
+                            }
+
+                            //let mut bitmap = Vec::new();
+                            //RoaringBitmap::new().serialize_into(&mut bitmap)?; // TODO: Group mappings
+                            //// instead of user mappings
+
+                            //// Write in store
+                            //store.put(&mut wtxn, USER_MAPPINGS_DB_NAME, &ulid_bytes, &bitmap)?;
+                            (doc, handles)
+                        }
+                    };
+
+                let res = merged_resource.save();
+
+                // Persist
+                store.put(&mut wtxn, GROUPS_DB_NAME, &ulid_bytes, &res)?;
+
+                store.commit(wtxn)?;
+                Ok(handle)
+            },
+        )
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+        for handle in handles {
+            match handle {
+                HandleHelper::AddGroup(handle) => {
+                    self.permission_manager.create_group_commit(handle).await?
+                }
+                HandleHelper::AddUser(handle) => {
+                    self.permission_manager.add_user_commit(handle).await?
+                }
+            }
+        }
+
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_user_merges(&self, doc: Vec<u8>) -> Result<(), ArunaMetadataError> {
         let store = self.store.clone();
-        trace!("Here");
+        let permission_handler = self.permission_manager.clone();
         tokio::task::spawn_blocking(move || -> Result<(), ArunaMetadataError> {
             let mut wtxn = store.create_txn(true)?;
-            trace!("There");
 
             // Parse document, actor_id and ulid
             let mut doc = automerge::AutoCommit::load(doc.as_ref())?;
-            trace!("Yes");
-            trace!(?doc);
             let foreign_user: User = autosurgeon::hydrate(&doc)?;
             let ulid_bytes = foreign_user.id.to_bytes();
 
@@ -197,6 +304,12 @@ where
             // Persist
             store.put(&mut wtxn, USER_DB_NAME, &ulid_bytes, &res)?;
 
+            permission_handler.create_user_identity(
+                &UserIdentity::new(foreign_user.id, foreign_user.realm_key),
+                &store,
+                &mut wtxn,
+            )?;
+
             store.commit(wtxn)?;
             Ok::<(), ArunaMetadataError>(())
         })
@@ -207,9 +320,13 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn handle_object_merges(&self, doc: Vec<u8>) -> Result<(), ArunaMetadataError> {
-        trace!("Handle object merge");
+    pub async fn handle_object_merges(
+        &self,
+        path: Path,
+        doc: Vec<u8>,
+    ) -> Result<(), ArunaMetadataError> {
         let store = self.store.clone();
+        let permission_manager = self.permission_manager.clone();
         let idx_counter = self.idx_counter.clone();
         let (idx, resource) =
             tokio::task::spawn_blocking(move || -> Result<(u32, Resource), ArunaMetadataError> {
@@ -271,12 +388,16 @@ where
                     &idx.to_be_bytes(),
                 )?;
 
+                let id = foreign_resource.id;
+
                 // Update mappings if neccessary
                 if visibility != foreign_resource.visibility {
                     update_mappings(&store, &mut wtxn, foreign_resource, &user_id, idx)?;
                 } else {
                     create_mappings(&store, &mut wtxn, foreign_resource, &user_id, idx)?;
                 }
+
+                permission_manager.add_resource(ResourceId::Ulid(id), &path, &store, &mut wtxn)?;
 
                 store.commit(wtxn)?;
                 Ok::<(u32, Resource), ArunaMetadataError>((idx, result))
@@ -286,7 +407,6 @@ where
 
         // Update search idx
         self.search.add_resource(idx, resource).await?;
-        trace!("Finished replicate");
 
         Ok(())
     }

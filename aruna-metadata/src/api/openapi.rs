@@ -44,6 +44,7 @@ where
 {
     OpenApiRouter::new()
         .routes(routes!(create_resource))
+        .routes(routes!(create_project))
         .routes(routes!(get_resource))
         .routes(routes!(update_resource_name))
         .routes(routes!(update_resource_title))

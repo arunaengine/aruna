@@ -52,6 +52,35 @@ where
     into_axum_response(state.request(request, extract_token(&headers)).await)
 }
 
+/// Create a new resource
+#[utoipa::path(
+    post,
+    path = "/resources/project",
+    request_body = CreateProjectRequest,
+    responses(
+        (status = 200, body = CreateProjectResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = RESOURCES,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn create_project<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    headers: HeaderMap,
+    Json(request): Json<CreateProjectRequest>,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+
+
 /// Get resources
 #[utoipa::path(
     get,

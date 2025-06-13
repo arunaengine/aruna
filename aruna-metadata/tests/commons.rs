@@ -1,24 +1,28 @@
 use anyhow::Result;
 use aruna_metadata::{
     api::server::RestServer,
+    models::requests::AddUserRequest,
     network::network_trait::{Network, NetworkConfig, P2PNetwork},
     persistence::{
         persistence::{
-            Persistor,
             tables::{
-                PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME, RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME,
+                PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME, RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME, GROUPS_DB_NAME,
                 USER_MAPPINGS_DB_NAME,
-            },
+            }, Persistor
         },
         search::tantivy::{TantivyConfig, TantivySearch},
     },
-    transactions::controller::Controller,
+    transactions::{controller::Controller, request::Request},
 };
-use aruna_permission::token::OidcTrustConfig;
+use aruna_permission::{
+    OidcToken, UserIdentity,
+    token::{Ed25519KeyPair, OidcTrustConfig},
+};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use std::{
+    collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
     sync::{Arc, atomic::AtomicU16},
@@ -41,14 +45,16 @@ struct TestConfig {
     api_port: u16,
 }
 
-pub async fn init_lmdb_servers(
-    offset: u16,
-) -> Result<
-    Vec<(
+pub struct TestServers {
+    pub realm_key: SigningKey,
+    pub token_handler_keys: Ed25519KeyPair,
+    pub addr_server_pairs: Vec<(
         Arc<Controller<LmdbStore, TantivySearch, P2PNetwork>>,
         String,
     )>,
-> {
+}
+
+pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("aruna_metadata=trace".parse().unwrap());
@@ -63,7 +69,21 @@ pub async fn init_lmdb_servers(
     tracing_subscriber::registry().with(fmt_layer).init();
 
     let realm_key = SigningKey::generate(&mut OsRng);
-    let mut base_urls = Vec::new();
+    let token_handler_realm_keys = Ed25519KeyPair::generate();
+
+    let mut server_url_pairs = Vec::new();
+    let databases = vec![
+        aruna_permission::DBNAME,
+        aruna_permission::RESOURCE_DB,
+        aruna_permission::OIDC_IDENTITIES_DB,
+        aruna_permission::IDENTITY_PERMISSIONS_DB,
+        RESOURCE_DB_NAME,
+        RESOURCE_MAPPINGS_DB_NAME,
+        USER_DB_NAME,
+        GROUPS_DB_NAME,
+        USER_MAPPINGS_DB_NAME,
+        PUBLIC_MAPPINGS_DB_NAME,
+    ];
 
     let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -77,13 +97,7 @@ pub async fn init_lmdb_servers(
     let store_path = format!("{}/{}/node_{}/heed", TEST_CONFIG.path, subscriber, 0);
     let store_config = LmdbConfig {
         path: store_path,
-        databases: vec![
-            RESOURCE_DB_NAME,
-            RESOURCE_MAPPINGS_DB_NAME,
-            USER_DB_NAME,
-            USER_MAPPINGS_DB_NAME,
-            PUBLIC_MAPPINGS_DB_NAME,
-        ],
+        databases: databases.clone(),
     };
 
     let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
@@ -97,6 +111,12 @@ pub async fn init_lmdb_servers(
         .await
         .unwrap(),
     );
+
+    persistor.token_handler.write().add_realm_public_key(
+        realm_key.as_bytes().clone(),
+        token_handler_realm_keys.verifying_key_pem().unwrap(),
+    );
+
     let network = Arc::new(
         P2PNetwork::new(NetworkConfig {
             secret_key: None,
@@ -124,7 +144,7 @@ pub async fn init_lmdb_servers(
     tokio::spawn(async move { RestServer::run(controller_clone, api_port).await });
 
     let bootstrap_addr = controller.network.get_addr().await.unwrap();
-    base_urls.push((controller, format!("http://localhost:{}/api/v3", api_port)));
+    server_url_pairs.push((controller, format!("http://localhost:{}/api/v3", api_port)));
 
     for node in 1..5 {
         let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -138,13 +158,7 @@ pub async fn init_lmdb_servers(
         let store_path = format!("{}/{}/node_{}/heed", TEST_CONFIG.path, subscriber, node);
         let store_config = LmdbConfig {
             path: store_path,
-            databases: vec![
-                RESOURCE_DB_NAME,
-                RESOURCE_MAPPINGS_DB_NAME,
-                USER_DB_NAME,
-                USER_MAPPINGS_DB_NAME,
-                PUBLIC_MAPPINGS_DB_NAME,
-            ],
+            databases: databases.clone(),
         };
 
         let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
@@ -158,6 +172,12 @@ pub async fn init_lmdb_servers(
             .await
             .unwrap(),
         );
+
+        persistor.token_handler.write().add_realm_public_key(
+            realm_key.as_bytes().clone(),
+            token_handler_realm_keys.verifying_key_pem().unwrap(),
+        );
+
         let network = Arc::new(
             P2PNetwork::new(NetworkConfig {
                 secret_key: None,
@@ -183,8 +203,49 @@ pub async fn init_lmdb_servers(
         let api_port = TEST_CONFIG.api_port + offset + subscriber;
         let controller_clone = controller.clone();
         tokio::spawn(async move { RestServer::run(controller_clone, api_port).await });
-        base_urls.push((controller, format!("http://localhost:{}/api/v3", api_port)));
+        server_url_pairs.push((controller, format!("http://localhost:{}/api/v3", api_port)));
     }
 
-    Ok(base_urls)
+    Ok(TestServers {
+        realm_key,
+        token_handler_keys: token_handler_realm_keys,
+        addr_server_pairs: server_url_pairs,
+    })
+}
+
+pub async fn create_user_with_token(test: &TestServers, name: String) -> Result<(UserIdentity, String)> {
+    let (controller, _) = test.addr_server_pairs.first().unwrap();
+
+    let request = AddUserRequest {
+        name: name.clone(),
+    };
+    let response = request
+        .run_request(
+            OidcToken {
+                iss: "https://accounts.google.com".to_string(),
+                sub: format!("{name}@example.com"),
+                exp: 2538621798,
+                iat: 1749710598,
+                aud: None,
+                email: None,
+                email_verified: None,
+                preferred_username: None,
+                name: None,
+                given_name: None,
+                family_name: None,
+                additional_claims: HashMap::default(),
+            },
+            controller,
+        )
+        .await?;
+    let user = response.user.id;
+    let user_identity = UserIdentity::new(user, test.realm_key.to_bytes());
+    let user_token = controller
+        .persistence
+        .token_handler
+        .read()
+        .generate_token(&user_identity, &test.token_handler_keys.signing_key_pem()?)?;
+
+    Ok((user_identity, user_token))
+
 }

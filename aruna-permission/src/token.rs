@@ -273,6 +273,9 @@ impl TokenSystem {
         if let Some(existing_user_ulid) =
             self.get_user_from_oidc(oidc_provider, oidc_sub, store, txn)?
         {
+            // TODO: Shouldn't this check if user is from another realm instead of just returning an
+            // identity from this realm?
+
             // Return existing identity
             return Ok(UserIdentity::new(existing_user_ulid, self.local_realm_key));
         }
@@ -334,7 +337,7 @@ impl TokenSystem {
     }
 
     /// Verify and decode OIDC token (supports RSA, EC, EdDSA algorithms)
-    fn verify_oidc_token(&self, token: &str) -> Result<OidcToken> {
+    pub fn verify_oidc_token(&self, token: &str) -> Result<OidcToken> {
         // Decode without verification first to get issuer for key lookup
         let dummy_key = DecodingKey::from_secret("dummy".as_ref());
         let mut unverified_validation = Validation::new(Algorithm::RS256);
@@ -441,11 +444,20 @@ impl TokenSystem {
 
         // Check if it's an Aruna token (issuer starts with "aruna@")
         if issuer.starts_with("aruna@") {
-            return self.validate_realm_token(token);
+            self.validate_realm_token(token)
+        } else {
+            let oidc_token = self.verify_oidc_token(token)?;
+            let Some(user_ulid) =
+                self.get_user_from_oidc(&oidc_token.iss, &oidc_token.sub, store, txn)?
+            else {
+                return Err(PermissionError::ResourceNotFound(
+                    "User not found".to_string(),
+                ));
+            };
+            Ok(UserIdentity::new(user_ulid, self.local_realm_key))
         }
-
         // Otherwise, treat as OIDC token and register/lookup user
-        self.register_user(token, store, txn)
+        //self.register_user(token, store, txn)
     }
 
     /// Generate realm token for UserIdentity using Ed25519 signing key (PKCS8 PEM format)

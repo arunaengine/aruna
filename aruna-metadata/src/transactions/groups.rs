@@ -25,23 +25,22 @@ where
     N: Network + 'static,
 {
     type Response = AddGroupResponse;
-    type AuthContext = Option<UserIdentity>;
+    type AuthContext = UserIdentity;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
         &self,
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+    ) -> Result<UserIdentity, crate::error::ArunaMetadataError> {
         let Some(token) = token else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
         let realm_key = controller.network.get_realm_key().await?;
-        todo!("Split registration and verification of oidc_tokens");
         let user_identity = controller.persistence.get_identity(token).await?;
 
         if user_identity.realm_key == realm_key {
-            Ok(Some(user_identity))
+            Ok(user_identity)
         } else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         }
@@ -59,18 +58,17 @@ where
     #[tracing::instrument(level = "trace", skip(controller, user))]
     async fn run_request(
         self,
-        user: Option<UserIdentity>,
+        user: UserIdentity,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        let Some(user) = user else {
-            return Err(crate::error::ArunaMetadataError::Unauthorized);
-        };
         let group_id = Ulid::new();
+        let realm_key = controller.network.get_realm_key().await?;
         let group = Group {
             id: group_id,
             name: self.name,
             roles: vec!["admin".to_string(), "member".to_string()],
             members: BTreeMap::from([(user.user_ulid.to_string(), vec!["admin".to_string()])]),
+            realm_key,
         };
         let node_id = controller.network.get_addr().await?.node_id;
         let realm_id = controller.network.get_realm_key().await?;
@@ -87,11 +85,17 @@ where
             .await?
             .into_iter()
             .filter(|addr| addr.node_id != node_id);
+        let path = Path::builder()
+            .realm_id(realm_key)
+            .group(group_id)
+            .build()
+            .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
 
         controller
             .sync_loop(
                 crate::models::models::TypedDoc::Group(group_doc),
                 group.id,
+                path,
                 members,
             )
             .await?;

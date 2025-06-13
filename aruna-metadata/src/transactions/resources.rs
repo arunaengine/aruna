@@ -2,13 +2,14 @@ use super::request::Request;
 use crate::{
     error::ArunaMetadataError,
     models::{
-        models::Resource,
+        models::{Resource, ResourceVariant},
         requests::{
-            CreateResourceRequest, CreateResourceResponse, GetInner, GetResourceRequest,
-            GetResourceResponse, ResourceUpdateRequests, ResourceUpdateResponses,
-            UpdateResourceAuthorsResponse, UpdateResourceDescriptionResponse,
-            UpdateResourceIdentifiersResponse, UpdateResourceLabelsResponse,
-            UpdateResourceLicenseResponse, UpdateResourceNameResponse, UpdateResourceTitleResponse,
+            CreateProjectRequest, CreateProjectResponse, CreateResourceRequest,
+            CreateResourceResponse, GetInner, GetResourceRequest, GetResourceResponse,
+            ResourceUpdateRequests, ResourceUpdateResponses, UpdateResourceAuthorsResponse,
+            UpdateResourceDescriptionResponse, UpdateResourceIdentifiersResponse,
+            UpdateResourceLabelsResponse, UpdateResourceLicenseResponse,
+            UpdateResourceNameResponse, UpdateResourceTitleResponse,
             UpdateResourceVisibilityResponse,
         },
     },
@@ -18,6 +19,7 @@ use crate::{
 use aruna_permission::{Action, Path, UserIdentity};
 use aruna_storage::storage::store::Store;
 use rand::seq::IteratorRandom;
+use tracing::{error, trace};
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -75,7 +77,10 @@ where
             title: self.title,
             description: self.description,
             revision: 0,
-            variant: self.variant,
+            variant: match self.variant {
+                crate::models::requests::CreateResourceVariant::Folder => ResourceVariant::Folder,
+                crate::models::requests::CreateResourceVariant::Object => ResourceVariant::Object,
+            },
             labels: self.labels,
             identifiers: self.identifiers,
             content_len: 0,
@@ -93,7 +98,7 @@ where
         let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
-            .add_resource(node_id.as_bytes(), &user, path, resource.clone())
+            .add_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
             .await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
@@ -108,6 +113,7 @@ where
             .sync_loop(
                 crate::models::models::TypedDoc::Resource(doc),
                 resource.id,
+                path,
                 realm_nodes.into_iter(),
             )
             .await?;
@@ -193,20 +199,20 @@ where
     N: Network + 'static,
 {
     type Response = ResourceUpdateResponses;
-    type AuthContext = Option<UserIdentity>;
+    type AuthContext = (UserIdentity, Path);
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
         &self,
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+    ) -> Result<(UserIdentity, Path), crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.get_id());
-        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
-            Ok(Some(i))
-        } else {
-            Ok(None)
-        }
+        Ok(controller
+            .persistence
+            .authorize(token, action, id)
+            .await?
+            .ok_or_else(|| ArunaMetadataError::Unauthorized)?)
     }
 
     async fn forward_or_return(
@@ -245,12 +251,10 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<UserIdentity>,
+        auth_ctx: (UserIdentity, Path),
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        let Some(user) = user else {
-            return Err(crate::error::ArunaMetadataError::Unauthorized);
-        };
+        let (user, path) = auth_ctx;
 
         let id = self.get_id();
         let updated = chrono::Utc::now();
@@ -349,10 +353,145 @@ where
             .sync_loop(
                 crate::models::models::TypedDoc::Resource(doc),
                 resource.id,
+                path,
                 members,
             )
             .await?;
 
         Ok(response)
+    }
+}
+
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for CreateProjectRequest
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    type Response = CreateProjectResponse;
+    type AuthContext = (UserIdentity, [u8; 32], Ulid);
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError> {
+        trace!("Checking create project");
+        let Some(token) = token else {
+            return Err(ArunaMetadataError::Unauthorized);
+        };
+        let (action, group_id) = (Action::Write, self.group_id);
+        let realm_id = controller.network.get_realm_key().await?;
+
+        let path = Path::builder()
+            .realm_id(realm_id)
+            .group_resources_wildcard(group_id)
+            .build()
+            .map_err(|e| {
+                error!(?e);
+                ArunaMetadataError::Unauthorized
+            })?;
+
+        trace!(?path);
+
+        let identity = controller.persistence.get_identity(token).await?;
+        if controller
+            .persistence
+            .check_path(&path, &identity, action)
+            .await?
+        {
+            trace!("Okay");
+            Ok((identity, realm_id, group_id))
+        } else {
+            trace!("Not okay");
+            Err(ArunaMetadataError::Unauthorized)
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        Ok(None)
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn run_request(
+        self,
+        auth_result: Self::AuthContext,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        trace!("Creating project");
+
+        let user = auth_result.0;
+        let realm_id = auth_result.1;
+        let group_id = auth_result.2;
+
+        let time = chrono::Utc::now().timestamp_millis();
+        let time = chrono::DateTime::from_timestamp_millis(time).ok_or_else(|| {
+            ArunaMetadataError::ConversionError {
+                from: "i64".to_string(),
+                to: "Chrono::DateTime".to_string(),
+            }
+        })?;
+        let resource = Resource {
+            id: Ulid::new(),
+            name: self.name,
+            title: self.title,
+            description: self.description,
+            revision: 0,
+            variant: ResourceVariant::Project,
+            labels: self.labels,
+            identifiers: self.identifiers,
+            content_len: 0,
+            count: 0,
+            visibility: self.visibility,
+            created_at: time,
+            last_modified: time,
+            authors: self.authors,
+            license_id: self.license_id.unwrap_or_default(),
+            locked: false,
+            deleted: false,
+            location: Vec::new(),
+            hashes: Vec::new(),
+        };
+        let node_id = controller.network.get_addr().await?.node_id;
+
+        let path = Path::builder()
+            .realm_id(realm_id)
+            .group_metadata(group_id, resource.id, vec![])
+            .build()
+            .map_err(|e| {
+                error!(?e);
+                ArunaMetadataError::ServerError(e.to_string())
+            })?;
+
+        let doc = controller
+            .persistence
+            .add_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
+            .await?;
+
+        // Choose x = REPLICATION_POLICY random nodes of members
+        // and replicate resource
+        let members = controller.network.get_realm_nodes().await?;
+        let realm_nodes = members
+            .into_iter()
+            .filter(|addr| addr.node_id != node_id)
+            .choose_multiple(&mut rand::rngs::OsRng, REPLICATION_POLICY);
+
+        controller
+            .sync_loop(
+                crate::models::models::TypedDoc::Resource(doc),
+                resource.id,
+                path,
+                realm_nodes.into_iter(),
+            )
+            .await?;
+
+        Ok(CreateProjectResponse { resource })
     }
 }

@@ -52,7 +52,6 @@ where
 
         for node in nodes {
             if node == self_addr {
-                // TODO: Replace this with real authorization
                 let user = self.authorize(token.clone(), controller).await?;
                 results.append(&mut self.clone().run_request(user, controller).await?.resources);
             } else {

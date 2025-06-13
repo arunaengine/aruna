@@ -58,7 +58,7 @@ pub struct TantivyConfig {
     pub path: String,
     pub index_buffer: usize,
     pub resources: tokio::sync::mpsc::Receiver<(u32, Resource)>, // TODO: replace with channel receiver
-                                                                 //pub _users: tokio::sync::mpsc::Receiver<User>, // TODO: replace with channel receiver
+    //pub _users: tokio::sync::mpsc::Receiver<User>, // TODO: replace with channel receiver
 }
 
 impl Search for TantivySearch {

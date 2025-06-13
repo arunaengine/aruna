@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 
+use super::conversions::autosurgeon_bytes;
 use super::conversions::autosurgeon_date_time;
 use super::conversions::autosurgeon_ulid;
-use super::conversions::autosurgeon_bytes;
+use aruna_permission::manager::AddUserPrepare;
+use aruna_permission::manager::CreateGroupPrepare;
 use automerge::AutoCommit;
 use autosurgeon::{Hydrate, Reconcile};
 use chrono::{DateTime, Utc};
@@ -228,9 +230,8 @@ pub struct User {
     #[autosurgeon(with = "autosurgeon_ulid")]
     #[key]
     pub id: Ulid,
-
     #[autosurgeon(with = "autosurgeon_bytes")]
-    pub realm_key: [u8;32],
+    pub realm_key: [u8; 32],
     pub name: String,
 }
 
@@ -247,7 +248,8 @@ impl TypedDoc {
             TypedDoc::Resource(x) => x,
             TypedDoc::Group(x) => x,
             TypedDoc::User(x) => x,
-        }.clone()
+        }
+        .clone()
     }
 }
 
@@ -269,7 +271,15 @@ pub struct Group {
     #[autosurgeon(with = "autosurgeon_ulid")]
     #[key]
     pub id: Ulid,
+    #[autosurgeon(with = "autosurgeon_bytes")]
+    pub realm_key: [u8; 32],
     pub name: String,
     pub roles: Vec<String>,
     pub members: BTreeMap<String, Vec<String>>, // User to role mappings
 }
+
+pub enum HandleHelper {
+    AddGroup(CreateGroupPrepare),
+    AddUser(AddUserPrepare),
+}
+
