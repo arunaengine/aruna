@@ -337,7 +337,7 @@ where
         let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
-            .update_resource(node_id.as_bytes(), &user, resource.clone())
+            .update_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
             .await?;
 
         // Replay update only to members that already got the object
@@ -393,7 +393,6 @@ where
                 ArunaMetadataError::Unauthorized
             })?;
 
-
         let identity = controller.persistence.get_identity(token).await?;
         if controller
             .persistence
@@ -421,7 +420,6 @@ where
         auth_result: Self::AuthContext,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-
         let user = auth_result.0;
         let realm_id = auth_result.1;
         let group_id = auth_result.2;

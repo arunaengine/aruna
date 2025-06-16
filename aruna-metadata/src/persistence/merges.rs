@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 
 use super::{
-    persistence::Persistor,
-    persistence::tables::*,
+    persistence::{Persistor, tables::*},
     search::search::Search,
-    utils::{create_mappings, idx_from_cow, update_mappings, visiblity_from_doc},
+    utils::{create_mappings, group_from_path, idx_from_cow, update_mappings, visiblity_from_doc},
 };
 use crate::{
     error::ArunaMetadataError,
@@ -235,12 +234,10 @@ where
                                 }
                             }
 
-                            //let mut bitmap = Vec::new();
-                            //RoaringBitmap::new().serialize_into(&mut bitmap)?; // TODO: Group mappings
-                            //// instead of user mappings
+                            let mut bitmap = Vec::new();
+                            RoaringBitmap::new().serialize_into(&mut bitmap)?; // TODO: Group mappings
+                            store.put(&mut wtxn, GROUPS_MAPPINGS_DB_NAME, &ulid_bytes, &bitmap)?;
 
-                            //// Write in store
-                            //store.put(&mut wtxn, USER_MAPPINGS_DB_NAME, &ulid_bytes, &bitmap)?;
                             (doc, handles)
                         }
                     };
@@ -289,14 +286,7 @@ where
                     existing_user.merge(&mut doc)?;
                     existing_user
                 }
-                None => {
-                    let mut bitmap = Vec::new();
-                    RoaringBitmap::new().serialize_into(&mut bitmap)?;
-
-                    // Write in store
-                    store.put(&mut wtxn, USER_MAPPINGS_DB_NAME, &ulid_bytes, &bitmap)?;
-                    doc
-                }
+                None => doc,
             };
 
             let res = merged_resource.save();
@@ -328,19 +318,13 @@ where
         let store = self.store.clone();
         let permission_manager = self.permission_manager.clone();
         let idx_counter = self.idx_counter.clone();
+        let group_id = group_from_path(path.clone())?;
         let (idx, resource) =
             tokio::task::spawn_blocking(move || -> Result<(u32, Resource), ArunaMetadataError> {
                 let mut wtxn = store.create_txn(true)?;
 
                 // Parse document, actor_id and ulid
                 let mut doc = automerge::AutoCommit::load(doc.as_ref())?;
-                let (user_id_bytes, _node_pubkey) = doc.get_actor().to_bytes().split_at(16);
-                let user_id = Ulid::from_bytes(user_id_bytes.try_into().map_err(|_e| {
-                    ArunaMetadataError::ConversionError {
-                        from: "[u8]".to_string(),
-                        to: "[u8;16]".to_string(),
-                    }
-                })?);
                 let foreign_resource: Resource = autosurgeon::hydrate(&doc)?;
                 let ulid_bytes = foreign_resource.id.to_bytes();
 
@@ -392,9 +376,9 @@ where
 
                 // Update mappings if neccessary
                 if visibility != foreign_resource.visibility {
-                    update_mappings(&store, &mut wtxn, foreign_resource, &user_id, idx)?;
+                    update_mappings(&store, &mut wtxn, foreign_resource, &group_id, idx)?;
                 } else {
-                    create_mappings(&store, &mut wtxn, foreign_resource, &user_id, idx)?;
+                    create_mappings(&store, &mut wtxn, foreign_resource, &group_id, idx)?;
                 }
 
                 permission_manager.add_resource(ResourceId::Ulid(id), &path, &store, &mut wtxn)?;

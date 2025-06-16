@@ -206,7 +206,7 @@ impl PermissionManager {
     }
 
     /// Get all roles for a permission ULID
-    async fn get_roles_for_permission(&self, permission_ulid: &str) -> Vec<Vec<String>> {
+    pub async fn get_roles_for_permission(&self, permission_ulid: &str) -> Vec<Vec<String>> {
         let enforcer = self.enforcer.read().await;
 
         // Get all role assignments where this permission ULID is the subject

@@ -1,6 +1,6 @@
 use super::{
     search::search::Search,
-    utils::{create_mappings, idx_from_cow, update_mappings, visiblity_from_doc},
+    utils::{create_mappings, group_from_path, idx_from_cow, update_mappings, visiblity_from_doc},
 };
 use crate::{
     error::ArunaMetadataError,
@@ -40,7 +40,7 @@ pub mod tables {
     pub const RESOURCE_MAPPINGS_DB_NAME: &str = "resource_mappings";
     pub const USER_DB_NAME: &str = "users";
     pub const GROUPS_DB_NAME: &str = "groups";
-    pub const USER_MAPPINGS_DB_NAME: &str = "user_mappings";
+    pub const GROUPS_MAPPINGS_DB_NAME: &str = "group_mappings";
     pub const PUBLIC_MAPPINGS_DB_NAME: &str = "public_mappings";
 }
 
@@ -168,7 +168,6 @@ where
     ) -> Result<AutoCommit, ArunaMetadataError> {
         let store = self.store.clone();
         let permission_manager = self.permission_manager.clone();
-        let user_id = user.user_ulid;
         let actor_id = ActorId::from(
             [
                 user.user_ulid.to_bytes().as_slice(),
@@ -177,6 +176,8 @@ where
             ]
             .concat(),
         );
+
+        let group_id = group_from_path(path.clone())?;
 
         // spawn search in its own block and dont await outcome
         let idx = self
@@ -203,7 +204,7 @@ where
                 &resource.id.to_bytes(),
                 &idx.to_be_bytes(),
             )?;
-            create_mappings(&store, &mut write_txn, resource, &user_id, idx)?;
+            create_mappings(&store, &mut write_txn, resource, &group_id, idx)?;
             permission_manager.add_resource(
                 ResourceId::Ulid(res_clone.id),
                 &path,
@@ -291,12 +292,8 @@ where
             autosurgeon::reconcile(&mut doc, &user)?;
             let doc_vec = doc.save();
 
-            let mut bitmap = Vec::new();
-            RoaringBitmap::new().serialize_into(&mut bitmap)?;
-
             // Write in store
             store.put(&mut write_txn, USER_DB_NAME, &id, &doc_vec)?;
-            store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
             permission_handler.create_user_identity(&user_identity, &store, &mut write_txn)?;
 
             // Commit
@@ -335,7 +332,7 @@ where
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn search(
         &self,
-        user: Option<Ulid>,
+        group: Option<Vec<Ulid>>,
         query: String,
     ) -> Result<Vec<Resource>, ArunaMetadataError> {
         let store = self.store.clone();
@@ -349,11 +346,16 @@ where
                 ));
             };
             let mut universe = RoaringBitmap::deserialize_from(bytes.as_ref())?;
-            if let Some(id) = user {
-                let id = id.to_bytes();
-                if let Some(byte_universe) = store.get(&read_txn, USER_MAPPINGS_DB_NAME, &id)? {
-                    let user_universe = RoaringBitmap::deserialize_from(byte_universe.as_ref())?;
-                    universe |= user_universe;
+            if let Some(ids) = group {
+                for group in ids {
+                    let id = group.to_bytes();
+                    if let Some(byte_universe) =
+                        store.get(&read_txn, GROUPS_MAPPINGS_DB_NAME, &id)?
+                    {
+                        let user_universe =
+                            RoaringBitmap::deserialize_from(byte_universe.as_ref())?;
+                        universe |= user_universe;
+                    }
                 }
             };
 
@@ -381,6 +383,7 @@ where
         &self,
         node_key: &[u8; 32],
         user_identity: &UserIdentity,
+        path: Path,
         resource: Resource,
     ) -> Result<AutoCommit, ArunaMetadataError> {
         // Clones for spawn_blocking
@@ -390,6 +393,7 @@ where
         let resource_id = resource.id.to_bytes();
         let res_clone = resource.clone();
 
+        let group_id = group_from_path(path)?;
         // Generate actor id
         let actor_id = ActorId::from(
             [
@@ -438,7 +442,7 @@ where
                 )?;
 
                 if visibility != resource.visibility {
-                    update_mappings(&store, &mut write_txn, resource, &user_id, idx)?;
+                    update_mappings(&store, &mut write_txn, resource, &group_id, idx)?;
                 }
 
                 store.commit(write_txn)?;
@@ -505,7 +509,9 @@ where
                 )?;
 
                 //TODO: Group mappings:
-                // store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
+                let mut bitmap = Vec::new();
+                RoaringBitmap::new().serialize_into(&mut bitmap)?;
+                store.put(&mut write_txn, GROUPS_MAPPINGS_DB_NAME, &id, &bitmap)?;
 
                 // Commit
                 store.commit(write_txn)?;
@@ -568,7 +574,6 @@ where
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))??;
-        println!("{}", ulid.to_string());
         self.permission_manager
             .enforcer
             .read()
@@ -613,6 +618,41 @@ where
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn get_user_groups(
+        &self,
+        user_identity: &UserIdentity,
+    ) -> Result<Vec<Ulid>, ArunaMetadataError> {
+        let store = self.store.clone();
+        let perm_manager = self.permission_manager.clone();
+        let user_identity = user_identity.clone();
+        let perm_ulid = tokio::task::spawn_blocking(move || -> Result<Ulid, ArunaMetadataError> {
+            let txn = store.create_txn(false)?;
+            let perm_ulid = perm_manager.resolve_permission_ulid(&user_identity, &store, &txn)?;
+            store.commit(txn)?;
+            Ok(perm_ulid)
+        })
+        .await
+        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))??;
+
+        self.permission_manager
+            .get_roles_for_permission(&perm_ulid.to_string())
+            .await
+            .iter()
+            .flatten()
+            .filter_map(|r| match r.split_once("_") {
+                Some((id, _)) => Some(id),
+                None => None,
+            })
+            .map(|id| -> Result<Ulid, ArunaMetadataError> {
+                Ulid::from_string(id).map_err(|e| ArunaMetadataError::ConversionError {
+                    from: "String".to_string(),
+                    to: "Ulid".to_string(),
+                })
+            })
+            .collect::<Result<Vec<Ulid>, ArunaMetadataError>>()
     }
 }
 

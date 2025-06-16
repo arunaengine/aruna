@@ -7,8 +7,8 @@ use aruna_metadata::{
         persistence::{
             Persistor,
             tables::{
-                GROUPS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME,
-                RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME, USER_MAPPINGS_DB_NAME,
+                GROUPS_DB_NAME, GROUPS_MAPPINGS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME,
+                RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME,
             },
         },
         search::tantivy::{TantivyConfig, TantivySearch},
@@ -22,16 +22,13 @@ use aruna_permission::{
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use chrono::Months;
 use ed25519_dalek::SigningKey;
-use hex::ToHex;
 use rand::rngs::OsRng;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
     sync::{Arc, atomic::AtomicU16},
-    time::Duration,
 };
-use tantivy::time::Month;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -75,8 +72,6 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
 
     let realm_key = SigningKey::generate(&mut OsRng);
 
-    println!("RAW {:?}", realm_key.verifying_key());
-    println!("ENCODED {}", hex::encode(realm_key.verifying_key()));
     let token_handler_realm_keys = Ed25519KeyPair::generate();
 
     let mut server_url_pairs = Vec::new();
@@ -89,7 +84,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         RESOURCE_MAPPINGS_DB_NAME,
         USER_DB_NAME,
         GROUPS_DB_NAME,
-        USER_MAPPINGS_DB_NAME,
+        GROUPS_MAPPINGS_DB_NAME,
         PUBLIC_MAPPINGS_DB_NAME,
     ];
 
@@ -252,7 +247,6 @@ pub async fn create_user_with_token(
         .await?;
     let user = response.user.id;
     let user_identity = UserIdentity::new(user, test.realm_key.verifying_key().to_bytes());
-    println!("{}", user_identity);
     let user_token = controller
         .persistence
         .token_handler

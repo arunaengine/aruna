@@ -5,14 +5,12 @@ use crate::{
 use roaring::RoaringBitmap;
 use std::{collections::HashMap, fs};
 use tantivy::{
-    Document, Index, IndexReader, IndexWriter, TantivyDocument,
+    Index, IndexReader, IndexWriter, TantivyDocument,
     collector::{FilterCollector, TopDocs},
     directory::MmapDirectory,
     query::QueryParser,
     schema::{FAST, Field, INDEXED, OwnedValue, STORED, Schema, TEXT, Value},
 };
-use tracing::trace;
-use tracing_subscriber::fmt::writer;
 use ulid::Ulid;
 
 pub struct TantivySearch {
@@ -58,7 +56,7 @@ pub struct TantivyConfig {
     pub path: String,
     pub index_buffer: usize,
     pub resources: tokio::sync::mpsc::Receiver<(u32, Resource)>, // TODO: replace with channel receiver
-    //pub _users: tokio::sync::mpsc::Receiver<User>, // TODO: replace with channel receiver
+                                                                 //pub _users: tokio::sync::mpsc::Receiver<User>, // TODO: replace with channel receiver
 }
 
 impl Search for TantivySearch {
@@ -195,15 +193,15 @@ impl Search for TantivySearch {
         let idx_collector = FilterCollector::new(
             "idx".to_string(),
             move |idx: u64| universe.contains(idx as u32),
-            TopDocs::with_limit(100),
+            TopDocs::with_limit(1000),
         );
         let result = searcher.search(&parsed_query, &idx_collector)?;
         let mut ids = Vec::new();
         for (_, addr) in result {
             let doc = searcher.doc::<HashMap<Field, OwnedValue>>(addr)?;
 
-            let explanation = parsed_query.explain(&searcher, addr)?;
-            trace!(?explanation);
+            // let explanation = parsed_query.explain(&searcher, addr)?;
+            // trace!(?explanation);
 
             match doc.get(&self.fields.ids) {
                 Some(id) => {

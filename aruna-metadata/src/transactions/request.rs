@@ -2,7 +2,6 @@ use super::controller::Controller;
 use crate::{
     error::ArunaMetadataError, network::network_trait::Network, persistence::search::search::Search,
 };
-use aruna_permission::{Path, UserIdentity};
 use aruna_storage::storage::store::Store;
 
 

@@ -1,11 +1,15 @@
+use std::collections::HashSet;
+
 use super::request::Request;
 use crate::{
     error::ArunaMetadataError,
-    models::requests::{SearchRequest, SearchResponse},
+    models::{
+        models::Resource,
+        requests::{SearchRequest, SearchResponse},
+    },
     network::network_trait::Network,
     persistence::search::search::Search,
 };
-use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use tracing::error;
 use ulid::Ulid;
@@ -18,17 +22,21 @@ where
     N: Network + 'static,
 {
     type Response = SearchResponse;
-    type AuthContext = Option<UserIdentity>;
+    type AuthContext = Option<Vec<Ulid>>; // (Identity, Groups)
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
         &self,
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+    ) -> Result<Option<Vec<Ulid>>, crate::error::ArunaMetadataError> {
         if let Some(token) = token {
             let user_identity = controller.persistence.get_identity(token).await?;
-            Ok(Some(user_identity))
+            let groups = controller
+                .persistence
+                .get_user_groups(&user_identity)
+                .await?;
+            Ok(Some(groups))
         } else {
             Ok(None)
         }
@@ -48,12 +56,15 @@ where
         let self_addr = controller.network.get_addr().await?;
         let nodes = controller.network.get_realm_nodes().await?;
 
-        let mut results = Vec::new();
+        let mut results: HashSet<Resource, ahash::RandomState> = HashSet::default();
 
         for node in nodes {
             if node == self_addr {
                 let user = self.authorize(token.clone(), controller).await?;
-                results.append(&mut self.clone().run_request(user, controller).await?.resources);
+                let result = self.clone().run_request(user, controller).await?;
+                for r in result.resources {
+                    results.insert(r);
+                }
             } else {
                 match controller
                     .network
@@ -61,7 +72,9 @@ where
                     .await
                 {
                     Ok(crate::models::requests::ForwardResponse::Search(response)) => {
-                        results.append(&mut response?.resources);
+                        for r in response?.resources {
+                            results.insert(r);
+                        }
                     }
                     e @ _ => {
                         error!(?e);
@@ -72,17 +85,18 @@ where
                 }
             }
         }
-        Ok(Some(SearchResponse { resources: results }))
+        Ok(Some(SearchResponse {
+            resources: results.into_iter().collect(),
+        }))
     }
 
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<UserIdentity>,
+        groups: Option<Vec<Ulid>>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        let user = user.map(|u| u.user_ulid);
-        let resources = controller.persistence.search(user, self.query).await?;
+        let resources = controller.persistence.search(groups, self.query).await?;
         Ok(SearchResponse { resources })
     }
 }

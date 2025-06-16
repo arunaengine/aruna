@@ -1,8 +1,9 @@
 use crate::{
     error::ArunaMetadataError,
     models::models::{Resource, VisibilityClass},
-    persistence::persistence::tables::{PUBLIC_MAPPINGS_DB_NAME, USER_MAPPINGS_DB_NAME},
+    persistence::persistence::tables::{GROUPS_MAPPINGS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME},
 };
+use aruna_permission::{Path, paths::PathComponent};
 use aruna_storage::storage::store::Store;
 use automerge::ReadDoc;
 use roaring::RoaringBitmap;
@@ -50,7 +51,7 @@ pub(super) fn update_mappings<'a, 'b, S>(
     store: &'a S,
     txn: &'b mut <S as Store<'a>>::Txn,
     resource: Resource,
-    user_id: &Ulid,
+    group_id: &Ulid,
     idx: u32,
 ) -> Result<(), ArunaMetadataError>
 where
@@ -59,16 +60,15 @@ where
 {
     if !matches!(resource.visibility, VisibilityClass::Public) {
         // Add to private mappings
-        let user_id = user_id.to_bytes();
-        let mut map = match store.get(txn, USER_MAPPINGS_DB_NAME, &user_id)? {
+        let group_id = group_id.to_bytes();
+        let mut map = match store.get(txn, GROUPS_MAPPINGS_DB_NAME, &group_id)? {
             Some(map) => RoaringBitmap::deserialize_from(map.as_ref())?,
             None => RoaringBitmap::new(),
         };
-        //.ok_or_else(|| ArunaError::NotFound("No user mapping found".to_string()))?;
         map.insert(idx);
         let mut bitmap = Vec::new();
         map.serialize_into(&mut bitmap)?;
-        store.put(txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
+        store.put(txn, GROUPS_MAPPINGS_DB_NAME, &group_id, &bitmap)?;
 
         // Remove from public mappings
         let public_id = Ulid::default().to_bytes();
@@ -93,15 +93,15 @@ where
         store.put(txn, PUBLIC_MAPPINGS_DB_NAME, &public_id, &bitmap)?;
 
         // Remove from private mappings
-        let user_id = user_id.to_bytes();
-        let mut map = match store.get(txn, USER_MAPPINGS_DB_NAME, &user_id)? {
+        let user_id = group_id.to_bytes();
+        let mut map = match store.get(txn, GROUPS_MAPPINGS_DB_NAME, &user_id)? {
             Some(map) => RoaringBitmap::deserialize_from(map.as_ref())?,
             None => RoaringBitmap::new(),
         };
         map.remove(idx);
         let mut bitmap = Vec::new();
         map.serialize_into(&mut bitmap)?;
-        store.put(txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
+        store.put(txn, GROUPS_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
     }
     Ok(())
 }
@@ -110,7 +110,7 @@ pub(super) fn create_mappings<'a, 'b, S>(
     store: &'a S,
     txn: &'b mut <S as Store<'a>>::Txn,
     resource: Resource,
-    user_id: &Ulid,
+    group_id: &Ulid,
     idx: u32,
 ) -> Result<(), ArunaMetadataError>
 where
@@ -119,15 +119,15 @@ where
 {
     if !matches!(resource.visibility, VisibilityClass::Public) {
         // Create private bitmap
-        let user_id = user_id.to_bytes();
-        let mut map = match store.get(txn, USER_MAPPINGS_DB_NAME, &user_id)? {
+        let group_id = group_id.to_bytes();
+        let mut map = match store.get(txn, GROUPS_MAPPINGS_DB_NAME, &group_id)? {
             Some(map) => RoaringBitmap::deserialize_from(map.as_ref())?,
             None => RoaringBitmap::new(),
         };
         map.insert(idx);
         let mut bitmap = Vec::new();
         map.serialize_into(&mut bitmap)?;
-        store.put(txn, USER_MAPPINGS_DB_NAME, &user_id, &bitmap)?;
+        store.put(txn, GROUPS_MAPPINGS_DB_NAME, &group_id, &bitmap)?;
     } else {
         // Update public bitmap
         let public_id = Ulid::default().to_bytes();
@@ -141,4 +141,18 @@ where
         store.put(txn, PUBLIC_MAPPINGS_DB_NAME, &public_id, &bitmap)?;
     }
     Ok(())
+}
+
+pub(super) fn group_from_path(path: Path) -> Result<Ulid, ArunaMetadataError> {
+    let group_id = path
+        .components()
+        .iter()
+        .find_map(|c| match c {
+            PathComponent::GroupId(id) => Some(id),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            ArunaMetadataError::ServerError("Invalid permission path. Expected Group".to_string())
+        })?;
+    Ok(*group_id)
 }

@@ -10,7 +10,6 @@ use aruna_storage::storage::store::Store;
 use automerge::sync::Message;
 use iroh::NodeAddr;
 use std::sync::Arc;
-use tracing::trace;
 use ulid::Ulid;
 
 pub struct Controller<St, Se, N>

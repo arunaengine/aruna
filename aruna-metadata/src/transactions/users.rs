@@ -1,15 +1,13 @@
 use super::request::Request;
 use crate::{
-    models::{
-        models::User,
-        requests::{AddUserRequest, AddUserResponse},
-    },
+    models::
+        requests::{AddUserRequest, AddUserResponse}
+    ,
     network::network_trait::Network,
     persistence::search::search::Search,
 };
 use aruna_permission::{OidcToken, Path};
 use aruna_storage::storage::store::Store;
-use ulid::Ulid;
 
 #[async_trait::async_trait]
 impl<St, Se, N> Request<St, Se, N> for AddUserRequest

@@ -150,17 +150,28 @@ async fn main() {
             let store_config = LmdbConfig {
                 path: store_path,
                 databases: vec![
+                    aruna_permission::DBNAME,
+                    aruna_permission::RESOURCE_DB,
+                    aruna_permission::OIDC_IDENTITIES_DB,
+                    aruna_permission::IDENTITY_PERMISSIONS_DB,
                     RESOURCE_DB_NAME,
                     RESOURCE_MAPPINGS_DB_NAME,
                     USER_DB_NAME,
-                    USER_MAPPINGS_DB_NAME,
+                    GROUPS_DB_NAME,
+                    GROUPS_MAPPINGS_DB_NAME,
                     PUBLIC_MAPPINGS_DB_NAME,
                 ],
             };
             let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-                Persistor::new(res_sdx, store_config, search_config, *realm_key.as_bytes(), oidc_config)
-                    .await
-                    .unwrap(),
+                Persistor::new(
+                    res_sdx,
+                    store_config,
+                    search_config,
+                    *realm_key.as_bytes(),
+                    oidc_config,
+                )
+                .await
+                .unwrap(),
             );
             let network = Arc::new(
                 P2PNetwork::new(NetworkConfig {
@@ -225,17 +236,28 @@ async fn main() {
             let store_config = FjallConfig {
                 path: store_path,
                 databases: vec![
+                    aruna_permission::DBNAME,
+                    aruna_permission::RESOURCE_DB,
+                    aruna_permission::OIDC_IDENTITIES_DB,
+                    aruna_permission::IDENTITY_PERMISSIONS_DB,
                     RESOURCE_DB_NAME,
                     RESOURCE_MAPPINGS_DB_NAME,
                     USER_DB_NAME,
-                    USER_MAPPINGS_DB_NAME,
+                    GROUPS_DB_NAME,
+                    GROUPS_MAPPINGS_DB_NAME,
                     PUBLIC_MAPPINGS_DB_NAME,
                 ],
             };
             let persistor: Arc<Persistor<FjallStore, TantivySearch>> = Arc::new(
-                Persistor::new(res_sdx, store_config, search_config, *realm_key.as_bytes(), oidc_config)
-                    .await
-                    .unwrap(),
+                Persistor::new(
+                    res_sdx,
+                    store_config,
+                    search_config,
+                    *realm_key.as_bytes(),
+                    oidc_config,
+                )
+                .await
+                .unwrap(),
             );
             let network = Arc::new(
                 P2PNetwork::new(NetworkConfig {

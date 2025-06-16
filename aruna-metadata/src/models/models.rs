@@ -25,6 +25,7 @@ use utoipa::ToSchema;
     Default,
     Reconcile,
     Hydrate,
+    Hash
 )]
 pub struct Resource {
     #[autosurgeon(with = "autosurgeon_ulid")]
@@ -66,6 +67,7 @@ pub struct Resource {
     Default,
     Reconcile,
     Hydrate,
+    Hash,
 )]
 pub enum ResourceVariant {
     #[default]
@@ -86,6 +88,7 @@ pub enum ResourceVariant {
     ToSchema,
     Reconcile,
     Hydrate,
+    Hash,
 )]
 pub struct KeyValue {
     #[key]
@@ -105,6 +108,7 @@ pub struct KeyValue {
     ToSchema,
     Reconcile,
     Hydrate,
+    Hash,
 )]
 pub struct Author {
     pub first: String,
@@ -125,6 +129,7 @@ pub struct Author {
     Default,
     Reconcile,
     Hydrate,
+    Hash,
 )]
 pub enum VisibilityClass {
     Public,
@@ -145,6 +150,7 @@ pub enum VisibilityClass {
     ToSchema,
     Reconcile,
     Hydrate,
+    Hash
 )]
 pub struct Hash {
     pub algorithm: HashAlgorithm,
@@ -163,6 +169,7 @@ pub struct Hash {
     ToSchema,
     Reconcile,
     Hydrate,
+    Hash,
 )]
 pub enum HashAlgorithm {
     Sha256,
