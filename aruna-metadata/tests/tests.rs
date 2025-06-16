@@ -7,8 +7,7 @@ mod tests {
         models::{
             models::Resource,
             requests::{
-                AddGroupRequest, CreateProjectRequest, CreateProjectResponse,
-                GetResourceResponse,
+                AddGroupRequest, CreateProjectRequest, CreateProjectResponse, GetResourceResponse,
             },
         },
         network::network_trait::Network,
@@ -34,7 +33,6 @@ mod tests {
         let user2 = user2_identity.user_ulid;
 
         for (controller, _) in servers.iter() {
-            println!("{}", controller.network.get_addr().await.unwrap().node_id);
             assert!(
                 controller
                     .persistence
@@ -73,7 +71,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(1));
 
         let request = AddGroupRequest {
             name: "group1".to_string(),
@@ -82,6 +80,7 @@ mod tests {
             .run_request(user1_identity.clone(), controller)
             .await
             .unwrap();
+
         let group1 = response.group.id;
         let request = AddGroupRequest {
             name: "group1".to_string(),
@@ -92,21 +91,7 @@ mod tests {
             .unwrap();
         let group2 = response.group.id;
 
-        println!(
-            "
-User1 ID:       {}
-User1 GROUP:    {}
-User2 ID:       {}
-User2 GROUP:    {}
-",
-            user1_identity.user_ulid.to_string(),
-            group1.to_string(),
-            user2_identity.user_ulid.to_string(),
-            group2.to_string()
-        );
-
-
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(1));
 
         let create_resource = CreateProjectRequest {
             name: format!("test_resource_from_user1"),
@@ -152,7 +137,7 @@ User2 GROUP:    {}
             .resource;
         let object_id2 = object2.id;
 
-        std::thread::sleep(Duration::from_secs(10));
+        std::thread::sleep(Duration::from_secs(1));
 
         for (_, base_url) in servers.iter() {
             let response: GetResourceResponse = client
@@ -169,7 +154,6 @@ User2 GROUP:    {}
                 .await
                 .unwrap();
             assert_eq!(response.resource, object1);
-
             let response = client
                 .get(format!("{base_url}/resources"))
                 .header::<&str, &str>(
@@ -182,11 +166,6 @@ User2 GROUP:    {}
                 .unwrap()
                 .json::<GetResourceResponse>()
                 .await;
-            println!(
-                "Response :
-{:?}",
-                response
-            );
             assert!(response.is_err());
 
             let response: GetResourceResponse = client
@@ -216,11 +195,6 @@ User2 GROUP:    {}
                 .unwrap()
                 .json::<GetResourceResponse>()
                 .await;
-            println!(
-                "Response :
-{:?}",
-                response
-            );
             assert!(response.is_err());
         }
     }

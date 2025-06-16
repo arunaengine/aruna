@@ -19,7 +19,7 @@ use crate::{
 use aruna_permission::{Action, Path, UserIdentity};
 use aruna_storage::storage::store::Store;
 use rand::seq::IteratorRandom;
-use tracing::{error, trace};
+use tracing::error;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -378,7 +378,6 @@ where
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError> {
-        trace!("Checking create project");
         let Some(token) = token else {
             return Err(ArunaMetadataError::Unauthorized);
         };
@@ -394,7 +393,6 @@ where
                 ArunaMetadataError::Unauthorized
             })?;
 
-        trace!(?path);
 
         let identity = controller.persistence.get_identity(token).await?;
         if controller
@@ -402,10 +400,8 @@ where
             .check_path(&path, &identity, action)
             .await?
         {
-            trace!("Okay");
             Ok((identity, realm_id, group_id))
         } else {
-            trace!("Not okay");
             Err(ArunaMetadataError::Unauthorized)
         }
     }
@@ -425,7 +421,6 @@ where
         auth_result: Self::AuthContext,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        trace!("Creating project");
 
         let user = auth_result.0;
         let realm_id = auth_result.1;

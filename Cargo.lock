@@ -190,6 +190,7 @@ dependencies = [
  "criterion",
  "dotenvy",
  "ed25519-dalek",
+ "hex",
  "iroh",
  "iroh-base",
  "opentelemetry",

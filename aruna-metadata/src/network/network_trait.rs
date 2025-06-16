@@ -387,7 +387,6 @@ impl Network for P2PNetwork {
                 )));
             }
         };
-        trace!("Got response");
 
         Ok(response)
     }

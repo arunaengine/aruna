@@ -7,7 +7,7 @@ use crate::{
 };
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
-use tracing::{error, trace};
+use tracing::error;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -55,7 +55,6 @@ where
                 let user = self.authorize(token.clone(), controller).await?;
                 results.append(&mut self.clone().run_request(user, controller).await?.resources);
             } else {
-                trace!("Asking {node:?} for search");
                 match controller
                     .network
                     .forward(body.clone(), &Ulid::default(), node.clone())

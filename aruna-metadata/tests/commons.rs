@@ -5,10 +5,11 @@ use aruna_metadata::{
     network::network_trait::{Network, NetworkConfig, P2PNetwork},
     persistence::{
         persistence::{
+            Persistor,
             tables::{
-                PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME, RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME, GROUPS_DB_NAME,
-                USER_MAPPINGS_DB_NAME,
-            }, Persistor
+                GROUPS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME,
+                RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME, USER_MAPPINGS_DB_NAME,
+            },
         },
         search::tantivy::{TantivyConfig, TantivySearch},
     },
@@ -19,14 +20,18 @@ use aruna_permission::{
     token::{Ed25519KeyPair, OidcTrustConfig},
 };
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
+use chrono::Months;
 use ed25519_dalek::SigningKey;
+use hex::ToHex;
 use rand::rngs::OsRng;
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
     sync::{Arc, atomic::AtomicU16},
+    time::Duration,
 };
+use tantivy::time::Month;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -69,6 +74,9 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     tracing_subscriber::registry().with(fmt_layer).init();
 
     let realm_key = SigningKey::generate(&mut OsRng);
+
+    println!("RAW {:?}", realm_key.verifying_key());
+    println!("ENCODED {}", hex::encode(realm_key.verifying_key()));
     let token_handler_realm_keys = Ed25519KeyPair::generate();
 
     let mut server_url_pairs = Vec::new();
@@ -105,7 +113,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
             res_sdx,
             store_config,
             search_config,
-            realm_key.as_bytes().clone(),
+            realm_key.verifying_key().as_bytes().clone(),
             OidcTrustConfig::TrustAll,
         )
         .await
@@ -113,7 +121,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     );
 
     persistor.token_handler.write().add_realm_public_key(
-        realm_key.as_bytes().clone(),
+        realm_key.verifying_key().as_bytes().clone(),
         token_handler_realm_keys.verifying_key_pem().unwrap(),
     );
 
@@ -166,7 +174,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
                 res_sdx,
                 store_config,
                 search_config,
-                realm_key.as_bytes().clone(),
+                realm_key.verifying_key().as_bytes().clone(),
                 OidcTrustConfig::TrustAll,
             )
             .await
@@ -174,7 +182,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         );
 
         persistor.token_handler.write().add_realm_public_key(
-            realm_key.as_bytes().clone(),
+            realm_key.verifying_key().as_bytes().clone(),
             token_handler_realm_keys.verifying_key_pem().unwrap(),
         );
 
@@ -213,19 +221,23 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     })
 }
 
-pub async fn create_user_with_token(test: &TestServers, name: String) -> Result<(UserIdentity, String)> {
+pub async fn create_user_with_token(
+    test: &TestServers,
+    name: String,
+) -> Result<(UserIdentity, String)> {
     let (controller, _) = test.addr_server_pairs.first().unwrap();
 
-    let request = AddUserRequest {
-        name: name.clone(),
-    };
+    let request = AddUserRequest { name: name.clone() };
     let response = request
         .run_request(
             OidcToken {
                 iss: "https://accounts.google.com".to_string(),
                 sub: format!("{name}@example.com"),
-                exp: 2538621798,
-                iat: 1749710598,
+                exp: chrono::Utc::now()
+                    .checked_add_months(Months::new(12))
+                    .unwrap()
+                    .timestamp_millis() as u64,
+                iat: chrono::Utc::now().timestamp_millis() as u64,
                 aud: None,
                 email: None,
                 email_verified: None,
@@ -239,7 +251,8 @@ pub async fn create_user_with_token(test: &TestServers, name: String) -> Result<
         )
         .await?;
     let user = response.user.id;
-    let user_identity = UserIdentity::new(user, test.realm_key.to_bytes());
+    let user_identity = UserIdentity::new(user, test.realm_key.verifying_key().to_bytes());
+    println!("{}", user_identity);
     let user_token = controller
         .persistence
         .token_handler
@@ -247,5 +260,4 @@ pub async fn create_user_with_token(test: &TestServers, name: String) -> Result<
         .generate_token(&user_identity, &test.token_handler_keys.signing_key_pem()?)?;
 
     Ok((user_identity, user_token))
-
 }

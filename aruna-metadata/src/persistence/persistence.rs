@@ -22,7 +22,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, atomic::AtomicU32},
 };
-use tracing::{error, trace};
+use tracing::error;
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -504,7 +504,7 @@ where
                     &mut write_txn,
                 )?;
 
-                //TODO: Group mappings: 
+                //TODO: Group mappings:
                 // store.put(&mut write_txn, USER_MAPPINGS_DB_NAME, &id, &bitmap)?;
 
                 // Commit
@@ -648,7 +648,6 @@ where
                 let store = self.store.clone();
                 let permission_manager = self.permission_manager.clone();
 
-                trace!(?resource_id);
                 let path = permission_manager
                     .check_permission(
                         &cloned_user_identity,
@@ -657,7 +656,6 @@ where
                         &store,
                     )
                     .await?;
-                trace!(?path);
                 Ok(Some((user_identity, path)))
             }
             None => match self.check_public(&resource_id).await? {

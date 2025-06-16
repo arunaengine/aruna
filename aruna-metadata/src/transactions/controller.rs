@@ -115,7 +115,6 @@ where
                         break 'sync;
                     }
                 }
-                trace!("PERSIST TO DISK");
 
                 match &doc {
                     TypedDoc::Resource(_) => {
