@@ -88,7 +88,7 @@ fn e2e_benchmark(c: &mut Criterion) {
                             .post(url)
                             .header::<&str, &str>(
                                 "Authorization",
-                                format!("Bearer {}", user1.to_string()).as_ref(),
+                                format!("Bearer {}", todo!()).as_str(),
                             )
                             .json(&create_resource)
                             .send()
@@ -104,7 +104,7 @@ fn e2e_benchmark(c: &mut Criterion) {
                             .post(url)
                             .header::<&str, &str>(
                                 "Authorization",
-                                format!("Bearer {}", user2.to_string()).as_ref(),
+                                format!("Bearer {}", todo!()).as_str(),
                             )
                             .json(&create_resource)
                             .send()

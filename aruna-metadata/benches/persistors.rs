@@ -74,7 +74,7 @@ impl TantivyFjall {
         };
         let res = controller.request(create_user, None).await.unwrap();
         let user2 = res.user.id;
-        (user1, user2)
+        (user1.user_ulid, user2.user_ulid)
     }
 
     pub async fn bench_create(
@@ -188,7 +188,7 @@ impl TantivyHeed {
         };
         let res = controller.request(create_user, None).await.unwrap();
         let user2 = res.user.id;
-        (user1, user2)
+        (user1.user_ulid, user2.user_ulid)
     }
 
     pub async fn bench_create(

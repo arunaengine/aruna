@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::error::ArunaMetadataError;
 
-use super::models::{Author, Group, KeyValue, Resource, ResourceVariant, User, VisibilityClass};
-use aruna_permission::UserIdentity;
+use super::models::{Author, Group, KeyValue, Resource, User, VisibilityClass};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
