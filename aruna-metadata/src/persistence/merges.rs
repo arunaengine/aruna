@@ -295,7 +295,7 @@ where
             store.put(&mut wtxn, USER_DB_NAME, &ulid_bytes, &res)?;
 
             permission_handler.create_user_identity(
-                &UserIdentity::new(foreign_user.id, foreign_user.realm_key),
+                &foreign_user.id,
                 &store,
                 &mut wtxn,
             )?;

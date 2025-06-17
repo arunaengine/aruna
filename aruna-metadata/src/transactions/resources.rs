@@ -381,6 +381,12 @@ where
         let Some(token) = token else {
             return Err(ArunaMetadataError::Unauthorized);
         };
+        if !controller.persistence.check_is_group(self.group_id).await? {
+            return Err(ArunaMetadataError::InvalidParameter {
+                name: "group_id".to_string(),
+                error: "Group not found".to_string(),
+            });
+        };
         let (action, group_id) = (Action::Write, self.group_id);
         let realm_id = controller.network.get_realm_key().await?;
 

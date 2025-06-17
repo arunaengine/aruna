@@ -33,7 +33,7 @@ impl TantivyFjall {
                 RESOURCE_DB_NAME,
                 RESOURCE_MAPPINGS_DB_NAME,
                 USER_DB_NAME,
-                USER_MAPPINGS_DB_NAME,
+                GROUPS_MAPPINGS_DB_NAME,
                 PUBLIC_MAPPINGS_DB_NAME,
             ],
         };
@@ -147,7 +147,7 @@ impl TantivyHeed {
                 RESOURCE_DB_NAME,
                 RESOURCE_MAPPINGS_DB_NAME,
                 USER_DB_NAME,
-                USER_MAPPINGS_DB_NAME,
+                GROUPS_MAPPINGS_DB_NAME,
                 PUBLIC_MAPPINGS_DB_NAME,
             ],
         };

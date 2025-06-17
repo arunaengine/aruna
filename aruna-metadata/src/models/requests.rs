@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::error::ArunaMetadataError;
 
 use super::models::{Author, Group, KeyValue, Resource, ResourceVariant, User, VisibilityClass};
+use aruna_permission::UserIdentity;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
@@ -129,7 +130,7 @@ pub struct AddGroupResponse {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddRolesToGroupRequest {
     pub group_id: Ulid,
-    pub roles: BTreeMap<String, String>,
+    pub roles: BTreeMap<String, String>, // role + permission
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
@@ -138,7 +139,7 @@ pub struct AddRolesToGroupResponse {}
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddUserToGroupRequest {
     pub group_id: Ulid,
-    pub user_roles: BTreeMap<Ulid, Vec<String>>,
+    pub user_roles: BTreeMap<String, Vec<String>>, // useridentity + roles
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]

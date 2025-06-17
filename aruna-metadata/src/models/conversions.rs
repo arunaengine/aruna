@@ -113,9 +113,34 @@ pub mod autosurgeon_date_time {
     }
 }
 
+pub mod autosurgeon_user_identity {
+    use aruna_permission::UserIdentity;
+    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
+    pub fn hydrate<'a, D: ReadDoc>(
+        doc: &D,
+        obj: &automerge::ObjId,
+        prop: Prop<'a>,
+    ) -> Result<UserIdentity, HydrateError> {
+        let inner = autosurgeon::bytes::ByteVec::hydrate(doc, obj, prop)?;
+        UserIdentity::from_bytes(inner.as_slice()).map_err(|_| {
+            HydrateError::unexpected("&[u8; 16]", "Invalid slice of bytes".to_string())
+        })
+    }
+
+    pub fn reconcile<R: Reconciler>(
+        identity: &UserIdentity,
+        mut reconciler: R,
+    ) -> Result<(), R::Error> {
+        reconciler.bytes(identity.to_bytes())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use aruna_permission::UserIdentity;
     use autosurgeon::{hydrate, reconcile};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     use ulid::Ulid;
 
     use crate::models::models::{
@@ -124,9 +149,11 @@ mod tests {
 
     #[test]
     fn test_conversion() {
+        let realm_key = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let id = UserIdentity::new(Ulid::new(), realm_key);
         let user = User {
-            id: Ulid::new(),
-            realm_key: [0u8; 32],
+            id,
+            realm_key,
             name: "test_name".to_string(),
         };
 
@@ -177,9 +204,11 @@ mod tests {
 
     #[test]
     fn test_automerge() {
+        let realm_key = SigningKey::generate(&mut OsRng).verifying_key().to_bytes();
+        let id = UserIdentity::new(Ulid::new(), realm_key);
         let user1 = User {
-            id: Ulid::new(),
-            realm_key: [0u8; 32],
+            id,
+            realm_key,
             name: "test_name".to_string(),
         };
 

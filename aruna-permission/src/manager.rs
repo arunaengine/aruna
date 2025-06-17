@@ -8,7 +8,7 @@ use ulid::Ulid;
 
 use crate::casbin::DBNAME;
 use crate::casbin_helper::{CasbinPolicy, CasbinRole};
-use crate::error::{PathError, PermissionError, Result, UnificationError};
+use crate::error::{ConversionError, PathError, PermissionError, Result, UnificationError};
 use crate::{
     casbin::Enforcer,
     paths::{Path, RealmKey},
@@ -20,7 +20,7 @@ pub const OIDC_IDENTITIES_DB: &str = "oidc_identities";
 pub const IDENTITY_PERMISSIONS_DB: &str = "identity_permissions";
 
 /// User identity consisting of user ULID and realm key
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct UserIdentity {
     pub user_ulid: Ulid,
     pub realm_key: RealmKey,
@@ -32,6 +32,41 @@ impl UserIdentity {
             user_ulid,
             realm_key,
         }
+    }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(self.user_ulid.to_bytes().as_slice());
+        buf.extend_from_slice(self.realm_key.as_slice());
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let (ulid_bytes, realm_key_bytes) = bytes.split_at(16);
+        let sized_ulid: &[u8; 16] = ulid_bytes
+            .try_into()
+            .map_err(|e| ConversionError::InvalidSliceSize(e))?;
+        let realm_key: &[u8; 32] = realm_key_bytes
+            .try_into()
+            .map_err(|e| ConversionError::InvalidSliceSize(e))?;
+        Ok(Self {
+            user_ulid: Ulid::from_bytes(*sized_ulid),
+            realm_key: *realm_key,
+        })
+    }
+
+    pub fn from_string(user_id: String) -> Result<Self> {
+        let (ulid, realm_key) = user_id.split_once('@').ok_or_else(|| {
+            ConversionError::InvalidFormat("Invalid format for UserIdentity".to_string())
+        })?;
+        let ulid = Ulid::from_string(ulid).map_err(|e| ConversionError::InvalidUlid(e))?;
+        let realm_key = hex::decode(realm_key).map_err(|e| ConversionError::InvalidRealmKey(e))?;
+
+        let realm_key: &[u8; 32] = realm_key
+            .as_slice()
+            .try_into()
+            .map_err(|e| ConversionError::InvalidSliceSize(e))?;
+
+        Ok(UserIdentity::new(ulid, *realm_key))
     }
 }
 

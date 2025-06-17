@@ -27,6 +27,7 @@ jsonwebtoken = { version = "9.3.1", features = ["use_pem"] }
 ed25519-dalek = { workspace = true }
 pkcs8 = "0.10.2"
 hex = "0.4.3"
+utoipa = { workspace = true }
 
 [dev-dependencies]
 # Additional test dependencies if needed

@@ -10,7 +10,8 @@ use crate::{
 use ahash::RandomState;
 use aruna_permission::{
     Action, OidcToken, Path, PermissionManager, ResourceId, TokenSystem, UserIdentity,
-    manager::CreateGroupPrepare, token::OidcTrustConfig,
+    manager::{AddUserPrepare, CreateGroupPrepare},
+    token::OidcTrustConfig,
 };
 use aruna_storage::storage::store::Store;
 use automerge::{ActorId, AutoCommit, sync::State};
@@ -19,7 +20,7 @@ use iroh::PublicKey;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, atomic::AtomicU32},
 };
 use tracing::error;
@@ -279,7 +280,7 @@ where
             );
 
             let user = User {
-                id: user_identity.user_ulid,
+                id: user_identity.clone(),
                 realm_key: user_identity.realm_key,
                 name: user_name,
             };
@@ -306,9 +307,9 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn get_user(&self, id: &Ulid) -> Result<Option<User>, ArunaMetadataError> {
+    pub async fn get_user(&self, id: &UserIdentity) -> Result<Option<User>, ArunaMetadataError> {
         let store = self.store.clone();
-        let id = *id;
+        let id = id.clone();
         let result = tokio::task::spawn_blocking(move || {
             let read_txn = store.create_txn(false)?;
             let id = id.to_bytes();
@@ -532,10 +533,81 @@ where
     pub async fn add_user_to_group(
         &self,
         node_key: &[u8; 32],
+        realm_key: &[u8; 32],
         user: &UserIdentity,
-        group: Ulid,
+        user_roles: BTreeMap<String, Vec<String>>,
+        group_id: Ulid,
     ) -> Result<AutoCommit, ArunaMetadataError> {
-        todo!()
+        // Clones for spawn_blocking
+        let store = self.store.clone();
+        let permission = self.permission_manager.clone();
+        let user = user.clone();
+
+        // Generate actor id
+        let actor_id = ActorId::from(
+            [
+                user.user_ulid.to_bytes().as_slice(),
+                &user.realm_key,
+                node_key.as_slice(),
+            ]
+            .concat(),
+        );
+
+        let (commit_handles, result) = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<AddUserPrepare>, AutoCommit), ArunaMetadataError> {
+                let mut write_txn = store.create_txn(true)?;
+
+                // Serialize into &[u8]
+                let id = group_id.to_bytes();
+
+                let group_bytes =
+                    store
+                        .get(&mut write_txn, GROUPS_DB_NAME, &id)?
+                        .ok_or_else(|| ArunaMetadataError::InvalidParameter {
+                            name: "group_id".to_string(),
+                            error: "Group not found".to_string(),
+                        })?;
+
+                let mut group_doc =
+                    automerge::AutoCommit::load(group_bytes.as_ref())?.with_actor(actor_id);
+
+                let mut group: Group = autosurgeon::hydrate(&group_doc)?;
+                let mut handles = Vec::new();
+
+                for (user, roles_to_add) in user_roles {
+                    let identity = UserIdentity::from_string(user.clone())?;
+                    let roles = group.members.entry(user).or_insert(roles_to_add.clone());
+                    roles.extend(roles_to_add.into_iter());
+                    for role in roles {
+                        let handle = permission.add_user_prepare(
+                            group_id,
+                            &identity,
+                            role,
+                            &store,
+                            &mut write_txn,
+                        )?;
+                        handles.push(handle);
+                    }
+                }
+
+                autosurgeon::reconcile(&mut group_doc, group)?;
+
+                let group_bytes = group_doc.save();
+
+                store.put(&mut write_txn, GROUPS_DB_NAME, &id, &group_bytes)?;
+
+                store.commit(write_txn)?;
+                Ok::<(Vec<AddUserPrepare>, AutoCommit), ArunaMetadataError>((handles, group_doc))
+            },
+        )
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+
+        for handle in commit_handles {
+            self.permission_manager.add_user_commit(handle).await?;
+        }
+
+        Ok(result)
     }
 
     pub async fn check_public(&self, resource_id: &Ulid) -> Result<bool, ArunaMetadataError> {
@@ -647,12 +719,27 @@ where
                 None => None,
             })
             .map(|id| -> Result<Ulid, ArunaMetadataError> {
-                Ulid::from_string(id).map_err(|e| ArunaMetadataError::ConversionError {
+                Ulid::from_string(id).map_err(|_e| ArunaMetadataError::ConversionError {
                     from: "String".to_string(),
                     to: "Ulid".to_string(),
                 })
             })
             .collect::<Result<Vec<Ulid>, ArunaMetadataError>>()
+    }
+
+    pub async fn check_is_group(&self, group_id: Ulid) -> Result<bool, ArunaMetadataError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || -> Result<bool, ArunaMetadataError> {
+            let txn = store.create_txn(false)?;
+            let byte_id = group_id.to_bytes();
+            let is_group = store
+                .get(&txn, GROUPS_DB_NAME, byte_id.as_slice())?
+                .is_some();
+            store.commit(txn)?;
+            Ok(is_group)
+        })
+        .await
+        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
     }
 }
 

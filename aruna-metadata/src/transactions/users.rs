@@ -68,7 +68,7 @@ where
             .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
 
         controller
-            .sync_loop(crate::models::models::TypedDoc::User(doc), user.id, path, members)
+            .sync_loop(crate::models::models::TypedDoc::User(doc), user.id.user_ulid, path, members)
             .await?;
 
         Ok(AddUserResponse { user })

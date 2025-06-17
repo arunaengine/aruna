@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use super::conversions::autosurgeon_bytes;
 use super::conversions::autosurgeon_date_time;
 use super::conversions::autosurgeon_ulid;
+use super::conversions::autosurgeon_user_identity;
+use aruna_permission::UserIdentity;
 use aruna_permission::manager::AddUserPrepare;
 use aruna_permission::manager::CreateGroupPrepare;
 use automerge::AutoCommit;
@@ -12,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 
+// TODO: Decide what essential fields are needed
+// and put rest into labels/hashmap
 #[derive(
     Clone,
     PartialEq,
@@ -25,7 +29,7 @@ use utoipa::ToSchema;
     Default,
     Reconcile,
     Hydrate,
-    Hash
+    Hash,
 )]
 pub struct Resource {
     #[autosurgeon(with = "autosurgeon_ulid")]
@@ -150,7 +154,7 @@ pub enum VisibilityClass {
     ToSchema,
     Reconcile,
     Hydrate,
-    Hash
+    Hash,
 )]
 pub struct Hash {
     pub algorithm: HashAlgorithm,
@@ -219,6 +223,7 @@ pub enum Direction {
     All,
 }
 
+// TODO: UserIdentities
 #[derive(
     Clone,
     PartialEq,
@@ -229,17 +234,18 @@ pub enum Direction {
     Serialize,
     Deserialize,
     ToSchema,
-    Default,
     Reconcile,
     Hydrate,
 )]
 pub struct User {
-    #[autosurgeon(with = "autosurgeon_ulid")]
+    #[autosurgeon(with = "autosurgeon_user_identity")]
+    #[schema(value_type=String)]
     #[key]
-    pub id: Ulid,
+    pub id: UserIdentity,
     #[autosurgeon(with = "autosurgeon_bytes")]
     pub realm_key: [u8; 32],
     pub name: String,
+    //pub user_identity: UserIdentity,
 }
 
 #[derive(Clone)]
@@ -282,11 +288,10 @@ pub struct Group {
     pub realm_key: [u8; 32],
     pub name: String,
     pub roles: Vec<String>,
-    pub members: BTreeMap<String, Vec<String>>, // User to role mappings
+    pub members: BTreeMap<String, Vec<String>>, // UserIndentity to role mappings
 }
 
 pub enum HandleHelper {
     AddGroup(CreateGroupPrepare),
     AddUser(AddUserPrepare),
 }
-

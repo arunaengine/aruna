@@ -6,7 +6,7 @@ use crate::{
         models::Group,
         requests::{
             AddGroupRequest, AddGroupResponse, AddResourcesToGroupRequest,
-            AddResourcesToGroupResponse, AddRolesToGroupRequest, AddRolesToGroupResponse,
+            AddResourcesToGroupResponse, // AddRolesToGroupRequest, AddRolesToGroupResponse,
             AddUserToGroupRequest, AddUserToGroupResponse,
         },
     },
@@ -112,19 +112,19 @@ where
     N: Network + 'static,
 {
     type Response = AddUserToGroupResponse;
-    type AuthContext = Option<UserIdentity>;
+    type AuthContext = UserIdentity;
 
     #[tracing::instrument(level = "trace", skip(controller, token))]
     async fn authorize(
         &self,
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+    ) -> Result<UserIdentity, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.group_id);
         if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
-            Ok(Some(i))
+            Ok(i)
         } else {
-            Ok(None)
+            Err(crate::error::ArunaMetadataError::Unauthorized)
         }
     }
 
@@ -140,55 +140,58 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<UserIdentity>,
+        user: UserIdentity,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+
+        //controller.persistence.add_user_to_group(node_key, user, group);
         todo!()
+
     }
 }
 
-#[async_trait::async_trait]
-impl<St, Se, N> Request<St, Se, N> for AddRolesToGroupRequest
-where
-    for<'a> St: Store<'a> + 'static,
-    Se: Search + 'static,
-    N: Network + 'static,
-{
-    type Response = AddRolesToGroupResponse;
-    type AuthContext = Option<UserIdentity>;
-
-    #[tracing::instrument(level = "trace", skip(controller, token))]
-    async fn authorize(
-        &self,
-        token: Option<String>,
-        controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
-        let (action, id) = (Action::Write, self.group_id);
-        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
-            Ok(Some(i))
-        } else {
-            Ok(None)
-        }
-    }
-
-    #[tracing::instrument(level = "trace", skip(_controller))]
-    async fn forward_or_return(
-        &self,
-        user: &Option<String>,
-        _controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
-        Ok(None)
-    }
-
-    #[tracing::instrument(level = "trace", skip(controller))]
-    async fn run_request(
-        self,
-        user: Option<UserIdentity>,
-        controller: &super::controller::Controller<St, Se, N>,
-    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        todo!()
-    }
-}
+// #[async_trait::async_trait]
+// impl<St, Se, N> Request<St, Se, N> for AddRolesToGroupRequest
+// where
+//     for<'a> St: Store<'a> + 'static,
+//     Se: Search + 'static,
+//     N: Network + 'static,
+// {
+//     type Response = AddRolesToGroupResponse;
+//     type AuthContext = Option<UserIdentity>;
+// 
+//     #[tracing::instrument(level = "trace", skip(controller, token))]
+//     async fn authorize(
+//         &self,
+//         token: Option<String>,
+//         controller: &super::controller::Controller<St, Se, N>,
+//     ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+//         let (action, id) = (Action::Write, self.group_id);
+//         if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
+//             Ok(Some(i))
+//         } else {
+//             Ok(None)
+//         }
+//     }
+// 
+//     #[tracing::instrument(level = "trace", skip(_controller))]
+//     async fn forward_or_return(
+//         &self,
+//         user: &Option<String>,
+//         _controller: &super::controller::Controller<St, Se, N>,
+//     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+//         Ok(None)
+//     }
+// 
+//     #[tracing::instrument(level = "trace", skip(controller))]
+//     async fn run_request(
+//         self,
+//         user: Option<UserIdentity>,
+//         controller: &super::controller::Controller<St, Se, N>,
+//     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+//         todo!()
+//     }
+// }
 
 #[async_trait::async_trait]
 impl<St, Se, N> Request<St, Se, N> for AddResourcesToGroupRequest

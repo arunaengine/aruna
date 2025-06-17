@@ -23,20 +23,20 @@ mod tests {
             ..
         } = init_lmdb_servers(OFFSET).await.unwrap();
 
-        let (user1_identity, _) = create_user_with_token(&test, "bench_user1".to_string())
+        let (user1_identity, _) = create_user_with_token(&test, "create_user_test1".to_string())
             .await
             .unwrap();
-        let user1 = user1_identity.user_ulid;
-        let (user2_identity, _) = create_user_with_token(&test, "bench_user2".to_string())
+        let (user2_identity, _) = create_user_with_token(&test, "create_user_test2".to_string())
             .await
             .unwrap();
-        let user2 = user2_identity.user_ulid;
+
+        std::thread::sleep(Duration::from_secs(1));
 
         for (controller, _) in servers.iter() {
             assert!(
                 controller
                     .persistence
-                    .get_user(&user1)
+                    .get_user(&user1_identity)
                     .await
                     .unwrap()
                     .is_some()
@@ -44,7 +44,7 @@ mod tests {
             assert!(
                 controller
                     .persistence
-                    .get_user(&user2)
+                    .get_user(&user2_identity)
                     .await
                     .unwrap()
                     .is_some()
@@ -63,18 +63,18 @@ mod tests {
         let client = reqwest::Client::new();
 
         let (user1_identity, user1_token) =
-            create_user_with_token(&test, "bench_user1".to_string())
+            create_user_with_token(&test, "create_resource_test1".to_string())
                 .await
                 .unwrap();
         let (user2_identity, user2_token) =
-            create_user_with_token(&test, "bench_user2".to_string())
+            create_user_with_token(&test, "create_resource_test2".to_string())
                 .await
                 .unwrap();
 
         std::thread::sleep(Duration::from_secs(1));
 
         let request = AddGroupRequest {
-            name: "group1".to_string(),
+            name: "create_test_group1".to_string(),
         };
         let response = request
             .run_request(user1_identity.clone(), controller)
@@ -83,7 +83,7 @@ mod tests {
 
         let group1 = response.group.id;
         let request = AddGroupRequest {
-            name: "group1".to_string(),
+            name: "gcreate_test_group2".to_string(),
         };
         let response = request
             .run_request(user2_identity.clone(), controller)

@@ -1,3 +1,5 @@
+use std::array::TryFromSliceError;
+
 use casbin::error::AdapterError;
 use thiserror::Error;
 use tracing::error;
@@ -38,6 +40,21 @@ pub enum UnificationError {
     SelfUnification,
 }
 
+
+/// Error types for unification operations
+#[derive(Error, Debug)]
+pub enum ConversionError {
+    #[error("Invalid size for slice: {0}")]
+    InvalidSliceSize(#[from] TryFromSliceError),
+    #[error("Invalid format: {0}")]
+    InvalidFormat(String),
+    #[error("Invalid ulid: {0}")]
+    InvalidUlid(#[from] ulid::DecodeError),
+    #[error("Invalid realm_key: {0}")]
+    InvalidRealmKey(#[from] hex::FromHexError),
+}
+
+
 #[derive(Error, Debug)]
 pub enum ArunaPermissionHandlerError {
     #[error("Failed to convert permission: {0}")]
@@ -75,6 +92,8 @@ pub enum PermissionError {
     ArunaPermissionHandlerError(#[from] ArunaPermissionHandlerError),
     #[error("Unification error: {0}")]
     UnificationError(#[from] UnificationError),
+    #[error("Conversion error: {0}")]
+    ConversionError(#[from] ConversionError),
 }
 
 pub type Result<T> = std::result::Result<T, PermissionError>;

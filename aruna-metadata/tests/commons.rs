@@ -57,18 +57,18 @@ pub struct TestServers {
 }
 
 pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
-    let logging_env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or("none".into())
-        .add_directive("aruna_metadata=trace".parse().unwrap());
-    //.add_directive("aruna_storage=info".parse().unwrap())
-    //.add_directive("tower_http=info".parse().unwrap())
-    //.add_directive("aruna_net=info".parse().unwrap());
+    //let logging_env_filter = EnvFilter::try_from_default_env()
+    //    .unwrap_or("none".into())
+    //    .add_directive("aruna_metadata=trace".parse().unwrap());
+    ////.add_directive("aruna_storage=info".parse().unwrap())
+    ////.add_directive("tower_http=info".parse().unwrap())
+    ////.add_directive("aruna_net=info".parse().unwrap());
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_file(true)
-        .with_line_number(true)
-        .with_filter(logging_env_filter);
-    tracing_subscriber::registry().with(fmt_layer).init();
+    //let fmt_layer = tracing_subscriber::fmt::layer()
+    //    .with_file(true)
+    //    .with_line_number(true)
+    //    .with_filter(logging_env_filter);
+    //tracing_subscriber::registry().with(fmt_layer).init();
 
     let realm_key = SigningKey::generate(&mut OsRng);
 
@@ -245,8 +245,7 @@ pub async fn create_user_with_token(
             controller,
         )
         .await?;
-    let user = response.user.id;
-    let user_identity = UserIdentity::new(user, test.realm_key.verifying_key().to_bytes());
+    let user_identity = response.user.id;
     let user_token = controller
         .persistence
         .token_handler
