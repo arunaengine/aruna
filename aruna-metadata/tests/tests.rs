@@ -241,7 +241,7 @@ mod tests {
         std::thread::sleep(Duration::from_secs(1));
 
         let create_resource = CreateProjectRequest {
-            name: format!("test_search_from_user1"),
+            name: format!("test_search"),
             visibility: aruna_metadata::models::models::VisibilityClass::Private,
             group_id: group1,
             ..Default::default()
@@ -263,7 +263,7 @@ mod tests {
         let parent_project1 = object1.id;
 
         let create_resource = CreateProjectRequest {
-            name: format!("test_search_from_user2"),
+            name: format!("test_search"),
             visibility: aruna_metadata::models::models::VisibilityClass::Private,
             group_id: group2,
             ..Default::default()

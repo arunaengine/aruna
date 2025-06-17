@@ -546,8 +546,6 @@ impl PermissionManager {
         // Ensure user identity exists with explicit mapping
         let permission_ulid = self.ensure_user_identity(initial_user, store, txn)?;
 
-        println!("{}", permission_ulid.to_string());
-
         let admin_role = format!("{}_admin", group_id);
         let member_role = format!("{}_member", group_id);
 
