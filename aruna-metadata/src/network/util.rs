@@ -8,7 +8,6 @@ pub(super) async fn read_message(
 ) -> Result<MetadataMessage, ArunaMetadataError> {
     let len = recv_stream.read_u32().await?;
     let mut buf = vec![0; len as usize];
-
     recv_stream
         .read_exact(&mut buf)
         .await

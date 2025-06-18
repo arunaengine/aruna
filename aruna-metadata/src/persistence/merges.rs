@@ -176,6 +176,7 @@ where
                             let mut existing_group =
                                 automerge::AutoCommit::load(existing_doc.as_ref())?;
                             existing_group.merge(&mut doc)?;
+                            //TODO: Add users & admins to perm handler
                             (existing_group, vec![])
                         }
                         None => {
@@ -189,19 +190,24 @@ where
                                 warn!("No admin found in group");
                                 return Ok(vec![]);
                             };
-                            let identity = UserIdentity::new(
-                                Ulid::from_string(&admin).map_err(|_e| {
-                                    ArunaMetadataError::ConversionError {
-                                        from: "String".to_string(),
-                                        to: "Ulid".to_string(),
-                                    }
-                                })?,
-                                foreign_group.realm_key,
-                            );
+                            let identity = UserIdentity::from_string(admin.clone())?;
                             let handle = permission.create_group_prepare(
                                 foreign_group.id,
                                 &identity,
                                 foreign_group.realm_key,
+                                &store,
+                                &mut wtxn,
+                            )?;
+
+                            let path = Path::builder()
+                                .realm_id(foreign_group.realm_key)
+                                .group(foreign_group.id)
+                                .build()
+                                .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
+
+                            permission.add_resource(
+                                ResourceId::Ulid(foreign_group.id),
+                                &path,
                                 &store,
                                 &mut wtxn,
                             )?;
@@ -210,15 +216,7 @@ where
                             for user in &foreign_group.members {
                                 let (id, roles) = user;
 
-                                let identity = UserIdentity::new(
-                                    Ulid::from_string(id).map_err(|_e| {
-                                        ArunaMetadataError::ConversionError {
-                                            from: "String".to_string(),
-                                            to: "Ulid".to_string(),
-                                        }
-                                    })?,
-                                    foreign_group.realm_key,
-                                );
+                                let identity = UserIdentity::from_string(id.clone())?;
                                 for role in roles {
                                     if id == admin && role == "admin" {
                                         continue;
@@ -291,14 +289,9 @@ where
 
             let res = merged_resource.save();
 
+            let _ = permission_handler.ensure_user_identity(&foreign_user.id, &store, &mut wtxn)?;
             // Persist
             store.put(&mut wtxn, USER_DB_NAME, &ulid_bytes, &res)?;
-
-            permission_handler.create_user_identity(
-                &foreign_user.id,
-                &store,
-                &mut wtxn,
-            )?;
 
             store.commit(wtxn)?;
             Ok::<(), ArunaMetadataError>(())
@@ -380,7 +373,6 @@ where
                 } else {
                     create_mappings(&store, &mut wtxn, foreign_resource, &group_id, idx)?;
                 }
-
                 permission_manager.add_resource(ResourceId::Ulid(id), &path, &store, &mut wtxn)?;
 
                 store.commit(wtxn)?;

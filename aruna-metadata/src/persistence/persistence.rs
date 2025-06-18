@@ -37,12 +37,12 @@ pub trait Authorize {
 }
 
 pub mod tables {
-    pub const RESOURCE_DB_NAME: &str = "resources";
-    pub const RESOURCE_MAPPINGS_DB_NAME: &str = "resource_mappings";
-    pub const USER_DB_NAME: &str = "users";
-    pub const GROUPS_DB_NAME: &str = "groups";
-    pub const GROUPS_MAPPINGS_DB_NAME: &str = "group_mappings";
-    pub const PUBLIC_MAPPINGS_DB_NAME: &str = "public_mappings";
+    pub const RESOURCE_DB_NAME: &str = "metatadata_resources";
+    pub const RESOURCE_MAPPINGS_DB_NAME: &str = "metadata_resource_mappings";
+    pub const USER_DB_NAME: &str = "metadata_users";
+    pub const GROUPS_DB_NAME: &str = "metadata_groups";
+    pub const GROUPS_MAPPINGS_DB_NAME: &str = "metadata_group_mappings";
+    pub const PUBLIC_MAPPINGS_DB_NAME: &str = "metadata_public_mappings";
 }
 
 pub struct Persistor<St, Se>
@@ -206,6 +206,12 @@ where
                 &idx.to_be_bytes(),
             )?;
             create_mappings(&store, &mut write_txn, resource, &group_id, idx)?;
+
+            println!(
+                "ADD RESOURCE PATH 
+{}",
+                path
+            );
             permission_manager.add_resource(
                 ResourceId::Ulid(res_clone.id),
                 &path,
@@ -295,7 +301,8 @@ where
 
             // Write in store
             store.put(&mut write_txn, USER_DB_NAME, &id, &doc_vec)?;
-            permission_handler.create_user_identity(&user_identity, &store, &mut write_txn)?;
+            let _ =
+                permission_handler.ensure_user_identity(&user_identity, &store, &mut write_txn)?;
 
             // Commit
             store.commit(write_txn)?;
@@ -495,9 +502,6 @@ where
                 autosurgeon::reconcile(&mut doc, group)?;
                 let group_doc = doc.save();
 
-                // let mut bitmap = Vec::new();
-                // RoaringBitmap::new().serialize_into(&mut bitmap)?;
-
                 // Write in store
                 store.put(&mut write_txn, GROUPS_DB_NAME, &id, &group_doc)?;
 
@@ -509,7 +513,19 @@ where
                     &mut write_txn,
                 )?;
 
-                //TODO: Group mappings:
+                let path = Path::builder()
+                    .realm_id(realm_key)
+                    .group(group_id)
+                    .build()
+                    .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
+
+                permission.add_resource(
+                    ResourceId::Ulid(group_id),
+                    &path,
+                    &store,
+                    &mut write_txn,
+                )?;
+
                 let mut bitmap = Vec::new();
                 RoaringBitmap::new().serialize_into(&mut bitmap)?;
                 store.put(&mut write_txn, GROUPS_MAPPINGS_DB_NAME, &id, &bitmap)?;
@@ -630,6 +646,7 @@ where
         identity: &UserIdentity,
         action: Action,
     ) -> Result<bool, ArunaMetadataError> {
+        println!("{}", path);
         let store = self.store.clone();
         let permission_manager = self.permission_manager.clone();
         let identity = identity.clone();
@@ -646,25 +663,25 @@ where
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))??;
-        self.permission_manager
-            .enforcer
-            .read()
-            .await
-            .enforce(&ulid.to_string(), &path.to_string(), &action.to_string())
-            .map_err(|e| {
-                error!(?e);
-                ArunaMetadataError::Unauthorized
-            })
+        println!("yes");
+        let res = self.permission_manager.enforcer.read().await.enforce(
+            &ulid.to_string(),
+            &path.to_string(),
+            &action.to_string(),
+        );
+        println!("{:?}", res);
+        res.map_err(|e| {
+            error!(?e);
+            ArunaMetadataError::Unauthorized
+        })
     }
 
     pub async fn get_identity(&self, token: String) -> Result<UserIdentity, ArunaMetadataError> {
         let store = self.store.clone();
         let token_handler = self.token_handler.clone();
         tokio::task::spawn_blocking(move || -> Result<UserIdentity, ArunaMetadataError> {
-            let mut txn = store.create_txn(false)?;
-            let user_identity = token_handler
-                .read()
-                .get_identity(&token, &store, &mut txn)?;
+            let txn = store.create_txn(false)?;
+            let user_identity = token_handler.read().get_identity(&token, &store, &txn)?;
             store.commit(txn)?;
             Ok(user_identity)
         })
@@ -761,10 +778,9 @@ where
                 let token_handler = self.token_handler.clone();
                 let user_identity = tokio::task::spawn_blocking(
                     move || -> Result<UserIdentity, ArunaMetadataError> {
-                        let mut txn = store.create_txn(false)?;
-                        let user_identity = token_handler
-                            .read()
-                            .get_identity(&token, &store, &mut txn)?;
+                        let txn = store.create_txn(false)?;
+                        let user_identity =
+                            token_handler.read().get_identity(&token, &store, &txn)?;
                         store.commit(txn)?;
                         Ok(user_identity)
                     },

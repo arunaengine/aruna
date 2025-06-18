@@ -25,7 +25,6 @@ impl RestServer {
         N: Network + 'static,
     {
         let socket_address = SocketAddr::from(([0, 0, 0, 0], rest_port));
-        println!("ADDR: {socket_address}");
         let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();
 
         let (router, api) = OpenApiRouter::with_openapi(ArunaApi::openapi())

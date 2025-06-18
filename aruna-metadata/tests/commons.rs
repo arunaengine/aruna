@@ -29,6 +29,7 @@ use std::{
     str::FromStr,
     sync::{Arc, atomic::AtomicU16},
 };
+
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -220,7 +221,8 @@ pub async fn create_user_with_token(
     test: &TestServers,
     name: String,
 ) -> Result<(UserIdentity, String)> {
-    let (controller, _) = test.addr_server_pairs.first().unwrap();
+    let (controller, url) = test.addr_server_pairs.first().unwrap();
+    println!("CREATE USERS @ {url}");
 
     let request = AddUserRequest { name: name.clone() };
     let response = request

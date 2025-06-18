@@ -421,7 +421,7 @@ impl TokenSystem {
         &self,
         token: &str,
         store: &'a S,
-        txn: &mut <S as aruna_storage::storage::store::Store<'a>>::Txn,
+        txn: &<S as aruna_storage::storage::store::Store<'a>>::Txn,
     ) -> Result<UserIdentity> {
         // Decode without verification to check issuer type
         let dummy_key = DecodingKey::from_secret("dummy".as_ref());

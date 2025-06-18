@@ -11,6 +11,7 @@ mod tests {
                 CreateResourceRequest, GetResourceResponse, SearchResponse,
             },
         },
+        network::network_trait::Network,
         transactions::request::Request,
     };
     use std::time::Duration;
@@ -30,7 +31,7 @@ mod tests {
             .await
             .unwrap();
 
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(5));
 
         for (controller, _) in servers.iter() {
             assert!(
@@ -60,6 +61,12 @@ mod tests {
         } = init_lmdb_servers(OFFSET).await.unwrap();
 
         let (controller, first_url) = servers.first().unwrap();
+        println!("{first_url}");
+        println!("{:?}", controller.network.get_addr().await.unwrap());
+        println!(
+            "{:?}",
+            servers.iter().map(|(_, url)| url).collect::<Vec<&String>>()
+        );
         let client = reqwest::Client::new();
 
         let (user1_identity, user1_token) =
@@ -71,8 +78,6 @@ mod tests {
                 .await
                 .unwrap();
 
-        std::thread::sleep(Duration::from_secs(1));
-
         let request = AddGroupRequest {
             name: "create_test_group1".to_string(),
         };
@@ -82,6 +87,7 @@ mod tests {
             .unwrap();
 
         let group1 = response.group.id;
+
         let request = AddGroupRequest {
             name: "gcreate_test_group2".to_string(),
         };
@@ -91,14 +97,13 @@ mod tests {
             .unwrap();
         let group2 = response.group.id;
 
-        std::thread::sleep(Duration::from_secs(1));
-
         let create_resource = CreateProjectRequest {
             name: format!("test_resource_from_user1"),
             visibility: aruna_metadata::models::models::VisibilityClass::Private,
             group_id: group1,
             ..Default::default()
         };
+
         let object1: Resource = client
             .post(format!("{first_url}/resources/project"))
             .header::<&str, &str>(
@@ -137,9 +142,10 @@ mod tests {
             .resource;
         let object_id2 = object2.id;
 
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(5));
 
         for (_, base_url) in servers.iter() {
+            println!("{base_url}");
             let response: GetResourceResponse = client
                 .get(format!("{base_url}/resources"))
                 .header::<&str, &str>(
@@ -218,8 +224,6 @@ mod tests {
                 .await
                 .unwrap();
 
-        std::thread::sleep(Duration::from_secs(1));
-
         let request = AddGroupRequest {
             name: "search_group1".to_string(),
         };
@@ -237,8 +241,6 @@ mod tests {
             .await
             .unwrap();
         let group2 = response.group.id;
-
-        std::thread::sleep(Duration::from_secs(1));
 
         let create_resource = CreateProjectRequest {
             name: format!("test_search"),
@@ -284,7 +286,7 @@ mod tests {
             .resource;
         let parent_project2 = object2.id;
 
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_secs(5));
 
         let mut user1_ids = Vec::new();
         user1_ids.push(parent_project1);

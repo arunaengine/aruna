@@ -101,6 +101,11 @@ where
             .add_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
             .await?;
 
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(resource.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        controller.network.store(subject.as_bytes()).await?;
+
         // Choose x = REPLICATION_POLICY random nodes of members
         // and replicate resource
         let members = controller.network.get_realm_nodes().await?;
@@ -159,17 +164,20 @@ where
         let nodes = controller.network.find(&self.id).await?;
 
         if nodes.is_empty() || nodes.contains(&self_addr) {
+            println!("Myself");
             Ok(None)
         } else {
             let Some(first_node) = nodes.first() else {
                 return Ok(None);
             };
+            println!("Forward");
             match controller
                 .network
                 .forward(body, &self.id, first_node.clone())
                 .await?
             {
                 crate::models::requests::ForwardResponse::GetResource(response) => {
+                    println!("{:?}", response);
                     Ok(Some(response?))
                 }
                 e @ _ => Err(ArunaMetadataError::NetworkError(format!(
@@ -185,6 +193,7 @@ where
         _user: Option<UserIdentity>, // authorize checks if resource is pub
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        println!("Hi");
         let persistor = controller.persistence.clone();
         let resource = persistor.get_resource(self.id).await?;
         Ok(GetResourceResponse { resource })
@@ -473,6 +482,11 @@ where
             .persistence
             .add_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
             .await?;
+
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(resource.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        controller.network.store(subject.as_bytes()).await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
         // and replicate resource

@@ -15,7 +15,7 @@ use crate::{
 };
 
 // Database constants
-pub const RESOURCE_DB: &str = "resources";
+pub const RESOURCE_DB: &str = "permission_resources";
 pub const OIDC_IDENTITIES_DB: &str = "oidc_identities";
 pub const IDENTITY_PERMISSIONS_DB: &str = "identity_permissions";
 
@@ -194,12 +194,18 @@ impl PermissionManager {
 
         // Create explicit mapping
         self.add_identity_permission(user_identity, permission_ulid, store, txn)?;
+        println!(
+            "CREATE_IDENTITY: 
+{}
+{}",
+            user_identity, permission_ulid
+        );
 
         Ok(permission_ulid)
     }
 
     /// Create a user identity with explicit permission mapping, or return existing one
-    fn ensure_user_identity<'a, S: Store<'a> + 'static>(
+    pub fn ensure_user_identity<'a, S: Store<'a> + 'static>(
         &self,
         user_identity: &UserIdentity,
         store: &'a S,
@@ -529,6 +535,12 @@ impl PermissionManager {
     where
         for<'a> S: Store<'a> + 'static,
     {
+        println!(
+            "
+CHECK PERMISSIONS
+{}",
+            user_identity
+        );
         let store = store.clone();
         let manager = self.clone();
         let user_identity = user_identity.clone();
@@ -547,20 +559,27 @@ impl PermissionManager {
                     .ok_or_else(|| PermissionError::ResourceNotFound(resource_id.to_string()))?;
 
                 let path = Path::try_from(path_bytes.as_ref())?;
+                store.commit(txn)?;
                 Ok((permission_ulid, path))
             })
-            .await
-            .unwrap()?;
+            .await??;
 
         // Check permission using the enforcer (read lock)
         let allowed = {
             let enforcer = self.enforcer.read().await;
+            println!(
+                "{}
+{}
+{}",
+                permission_ulid, path, action
+            );
             enforcer.enforce(
                 &permission_ulid.to_string(),
                 &path.to_string(),
                 &action.to_string(),
             )?
         };
+        println!("{allowed}");
 
         if allowed {
             Ok(path)
@@ -632,6 +651,16 @@ impl PermissionManager {
             format!("g:{}", member_role_mapping.join(":")).as_bytes(),
             &[],
         )?;
+
+        println!(
+            "
+CREATE GROUP WITH
+{}
+{}
+{}
+",
+            admin_path, member_path, permission_ulid
+        );
 
         Ok(CreateGroupPrepare {
             policy: vec![

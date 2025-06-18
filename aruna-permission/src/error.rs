@@ -2,6 +2,7 @@ use std::array::TryFromSliceError;
 
 use casbin::error::AdapterError;
 use thiserror::Error;
+use tokio::task::JoinError;
 use tracing::error;
 
 /// Custom error type for path operations.
@@ -40,7 +41,6 @@ pub enum UnificationError {
     SelfUnification,
 }
 
-
 /// Error types for unification operations
 #[derive(Error, Debug)]
 pub enum ConversionError {
@@ -53,7 +53,6 @@ pub enum ConversionError {
     #[error("Invalid realm_key: {0}")]
     InvalidRealmKey(#[from] hex::FromHexError),
 }
-
 
 #[derive(Error, Debug)]
 pub enum ArunaPermissionHandlerError {
@@ -94,6 +93,8 @@ pub enum PermissionError {
     UnificationError(#[from] UnificationError),
     #[error("Conversion error: {0}")]
     ConversionError(#[from] ConversionError),
+    #[error("Runtime error: {0}")]
+    RuntimeError(#[from] JoinError),
 }
 
 pub type Result<T> = std::result::Result<T, PermissionError>;

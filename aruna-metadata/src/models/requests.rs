@@ -31,23 +31,13 @@ pub struct CreateResourceRequest {
 }
 
 #[derive(
-    Clone,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Debug,
-    Serialize,
-    Deserialize,
-    ToSchema,
-    Default,
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
 )]
 pub enum CreateResourceVariant {
     #[default]
     Folder,
     Object,
 }
-
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateResourceResponse {
@@ -80,7 +70,6 @@ pub struct CreateProjectRequest {
 pub struct CreateProjectResponse {
     pub resource: Resource,
 }
-
 
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,
@@ -126,14 +115,24 @@ pub struct AddGroupResponse {
     pub group: Group,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
-pub struct AddRolesToGroupRequest {
-    pub group_id: Ulid,
-    pub roles: BTreeMap<String, String>, // role + permission
-}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
-pub struct AddRolesToGroupResponse {}
+// TODO: Add Roles and add resources(?)
+// #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+// pub struct AddRolesToGroupRequest {
+//     pub group_id: Ulid,
+//     pub roles: BTreeMap<String, String>, // role + permission
+// }
+//
+// #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+// pub struct AddRolesToGroupResponse {}
+//
+// #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+// pub struct AddResourcesToGroupRequest {
+//     pub group_id: Ulid,
+//     pub resources: Vec<Ulid>,
+// }
+//
+// #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+// pub struct AddResourcesToGroupResponse {}
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddUserToGroupRequest {
@@ -143,15 +142,6 @@ pub struct AddUserToGroupRequest {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddUserToGroupResponse {}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
-pub struct AddResourcesToGroupRequest {
-    pub group_id: Ulid,
-    pub resources: Vec<Ulid>,
-}
-
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
-pub struct AddResourcesToGroupResponse {}
 
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,

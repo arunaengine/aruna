@@ -19,7 +19,7 @@ use ed25519_dalek::SigningKey;
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddrV4, sync::Arc};
-use tracing::{error, trace};
+use tracing::error;
 use ulid::Ulid;
 
 use super::util::read_message;
@@ -387,7 +387,6 @@ impl Network for P2PNetwork {
                 )));
             }
         };
-
         Ok(response)
     }
 
@@ -571,7 +570,6 @@ impl P2PNetwork {
         N: Network,
     {
         while let Ok(msg) = read_message(&mut recv_stream.recv_stream).await {
-
             match msg.body {
                 Body::Replicate {
                     id,
@@ -591,24 +589,40 @@ impl P2PNetwork {
                 Body::Request { token, request } => {
                     let body = match request {
                         ForwardRequest::GetResource(req) => {
-                            let auth_ctx = req.authorize(token, controller).await?;
-                            Body::Response(Response::ForwardResponse(ForwardResponse::GetResource(
-                                req.clone().run_request(auth_ctx, controller).await,
-                            )))
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    ForwardResponse::GetResource(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    ),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(
+                                    ForwardResponse::GetResource(Err(e)),
+                                )),
+                            }
                         }
                         ForwardRequest::UpdateResource(req) => {
-                            let auth_ctx = req.authorize(token, controller).await?;
-                            Body::Response(Response::ForwardResponse(
-                                ForwardResponse::UpdateResource(
-                                    req.clone().run_request(auth_ctx, controller).await,
-                                ),
-                            ))
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    ForwardResponse::UpdateResource(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    ),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(
+                                    ForwardResponse::UpdateResource(Err(e)),
+                                )),
+                            }
                         }
                         ForwardRequest::Search(req) => {
-                            let auth_ctx = req.authorize(token, controller).await?;
-                            Body::Response(Response::ForwardResponse(ForwardResponse::Search(
-                                req.clone().run_request(auth_ctx, controller).await,
-                            )))
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    ForwardResponse::Search(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    ),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(
+                                    ForwardResponse::Search(Err(e)),
+                                )),
+                            }
                         }
                     };
                     send_message(
