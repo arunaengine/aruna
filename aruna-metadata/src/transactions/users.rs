@@ -1,8 +1,6 @@
 use super::request::Request;
 use crate::{
-    models::
-        requests::{AddUserRequest, AddUserResponse}
-    ,
+    models::requests::{AddUserRequest, AddUserResponse},
     network::network_trait::Network,
     persistence::search::search::Search,
 };
@@ -68,8 +66,14 @@ where
             .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
 
         controller
-            .sync_loop(crate::models::models::TypedDoc::User(doc), user.id.user_ulid, path, members)
+            .sync_loop(
+                crate::models::models::TypedDoc::User(doc),
+                user.id.user_ulid,
+                path,
+                members,
+            )
             .await?;
+        // TODO: Store user hash in kademlia
 
         Ok(AddUserResponse { user })
     }

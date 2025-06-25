@@ -102,6 +102,9 @@ pub trait Network: Sync + Send + Sized {
     async fn find_verified(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn get_realm_nodes(&self) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn store(&self, subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError>;
+    // This is needed for testing
+    #[allow(dead_code)]
+    async fn update_realm(&self) -> Result<(), ArunaMetadataError>;
     async fn store_in_realm(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
     async fn get_realm_key(&self) -> Result<[u8; 32], ArunaMetadataError>;
 }
@@ -176,6 +179,9 @@ impl Network for NetworkDummy {
         ))
     }
     async fn store(&self, _subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError> {
+        Ok(())
+    }
+    async fn update_realm(&self) -> Result<(), ArunaMetadataError> {
         Ok(())
     }
 
@@ -417,6 +423,11 @@ impl Network for P2PNetwork {
             query
         };
         Ok(members)
+    }
+
+    async fn update_realm(&self) -> Result<(), ArunaMetadataError> {
+        self.realm_handler.update_now().await?;
+        Ok(())
     }
 
     async fn store_in_realm(&self, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {

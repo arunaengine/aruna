@@ -14,9 +14,9 @@ use crate::{
         },
     },
     network::network_trait::{Network, REPLICATION_POLICY},
-    persistence::{persistence::Authorize, search::search::Search},
+    persistence::{authorization::Authorize, search::search::Search},
 };
-use aruna_permission::{Action, Path, UserIdentity};
+use aruna_permission::{Action, Path, UserIdentity, paths::PathBuilder};
 use aruna_storage::storage::store::Store;
 use rand::seq::IteratorRandom;
 use tracing::error;
@@ -62,7 +62,6 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let user = auth_result.0;
-        let path = auth_result.1;
 
         let time = chrono::Utc::now().timestamp_millis();
         let time = chrono::DateTime::from_timestamp_millis(time).ok_or_else(|| {
@@ -95,6 +94,11 @@ where
             location: Vec::new(),
             hashes: Vec::new(),
         };
+
+        let path = PathBuilder::from_path(auth_result.1)
+            .group_metadata_resource(vec![resource.id])
+            .build()
+            .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
         let node_id = controller.network.get_addr().await?.node_id;
         let doc = controller
             .persistence
@@ -164,20 +168,17 @@ where
         let nodes = controller.network.find(&self.id).await?;
 
         if nodes.is_empty() || nodes.contains(&self_addr) {
-            println!("Myself");
             Ok(None)
         } else {
             let Some(first_node) = nodes.first() else {
                 return Ok(None);
             };
-            println!("Forward");
             match controller
                 .network
                 .forward(body, &self.id, first_node.clone())
                 .await?
             {
                 crate::models::requests::ForwardResponse::GetResource(response) => {
-                    println!("{:?}", response);
                     Ok(Some(response?))
                 }
                 e @ _ => Err(ArunaMetadataError::NetworkError(format!(
@@ -193,7 +194,6 @@ where
         _user: Option<UserIdentity>, // authorize checks if resource is pub
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
-        println!("Hi");
         let persistor = controller.persistence.clone();
         let resource = persistor.get_resource(self.id).await?;
         Ok(GetResourceResponse { resource })

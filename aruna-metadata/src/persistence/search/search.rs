@@ -1,5 +1,5 @@
 use crate::{
-    error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize,
+    error::ArunaMetadataError, models::models::Resource, persistence::authorization::Authorize,
 };
 use roaring::RoaringBitmap;
 use ulid::Ulid;

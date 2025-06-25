@@ -117,12 +117,15 @@ where
 
                 match &doc {
                     TypedDoc::Resource(_) => {
-                        persistence.handle_object_merges(path, document.save()).await?
+                        persistence
+                            .handle_object_merges(path, document.save())
+                            .await?
                     }
                     TypedDoc::Group(_) => persistence.handle_group_merges(document.save()).await?,
                     TypedDoc::User(_) => persistence.handle_user_merges(document.save()).await?,
                 }
                 network.finish_stream(stream).await?;
+
                 Ok::<(), ArunaMetadataError>(())
             });
         }

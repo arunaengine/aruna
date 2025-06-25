@@ -194,12 +194,6 @@ impl PermissionManager {
 
         // Create explicit mapping
         self.add_identity_permission(user_identity, permission_ulid, store, txn)?;
-        println!(
-            "CREATE_IDENTITY: 
-{}
-{}",
-            user_identity, permission_ulid
-        );
 
         Ok(permission_ulid)
     }
@@ -535,12 +529,6 @@ impl PermissionManager {
     where
         for<'a> S: Store<'a> + 'static,
     {
-        println!(
-            "
-CHECK PERMISSIONS
-{}",
-            user_identity
-        );
         let store = store.clone();
         let manager = self.clone();
         let user_identity = user_identity.clone();
@@ -567,19 +555,12 @@ CHECK PERMISSIONS
         // Check permission using the enforcer (read lock)
         let allowed = {
             let enforcer = self.enforcer.read().await;
-            println!(
-                "{}
-{}
-{}",
-                permission_ulid, path, action
-            );
             enforcer.enforce(
                 &permission_ulid.to_string(),
                 &path.to_string(),
                 &action.to_string(),
             )?
         };
-        println!("{allowed}");
 
         if allowed {
             Ok(path)
@@ -651,16 +632,6 @@ CHECK PERMISSIONS
             format!("g:{}", member_role_mapping.join(":")).as_bytes(),
             &[],
         )?;
-
-        println!(
-            "
-CREATE GROUP WITH
-{}
-{}
-{}
-",
-            admin_path, member_path, permission_ulid
-        );
 
         Ok(CreateGroupPrepare {
             policy: vec![

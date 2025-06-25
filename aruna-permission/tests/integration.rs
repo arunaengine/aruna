@@ -104,6 +104,8 @@ async fn test_complete_oidc_workflow() {
         .add_user(group_id, &invited_identity, "member", &store, &mut txn)
         .await
         .unwrap();
+    store.commit(txn).unwrap();
+    let txn = store.create_txn(false).unwrap();
 
     // Step 5: Test permission checking
 
@@ -154,6 +156,8 @@ async fn test_complete_oidc_workflow() {
     assert_eq!(logged_in_identity, user_identity);
 
     // Step 7: Test cross-realm functionality
+    store.commit(txn).unwrap();
+    let mut txn = store.create_txn(true).unwrap();
 
     // Same user joins another realm
     let other_realm_id = create_test_realm_key(2);
@@ -313,6 +317,8 @@ async fn test_realm_sovereignty() {
     manager
         .add_resource(ResourceId::Ulid(resource_b), &path_b, &store, &mut txn)
         .unwrap();
+    store.commit(txn).unwrap();
+    let txn = store.create_txn(false).unwrap();
 
     // Test realm sovereignty: User should only access resources in their respective realms
 

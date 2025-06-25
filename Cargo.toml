@@ -23,7 +23,8 @@ ahash = "0.8.12"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
 blake3 = { version = "1.8.2", features = ["serde"] }
-casbin = "2.10.1"
+casbin = { version = "2.10.1", features = ["explain", "logging"]}
+# casbin = "2.10.1"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "pem"] }
 futures = "0.3.31"

@@ -23,20 +23,23 @@ use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use chrono::Months;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
+#[allow(unused)] // used for tracing of commented in
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
     sync::{Arc, atomic::AtomicU16},
+    time::Duration,
 };
-
+#[allow(unused)]
 use tracing_subscriber::EnvFilter;
+#[allow(unused)]
 use tracing_subscriber::prelude::*;
 
 pub static SUBSCRIBERS: AtomicU16 = AtomicU16::new(0);
 const TEST_CONFIG: TestConfig = TestConfig {
     socket_addr: "127.0.0.1",
-    path: "/dev/shm",
+    path: "/dev/shm/tests",
     p2p_port: 50000,
     api_port: 8080,
 };
@@ -59,17 +62,17 @@ pub struct TestServers {
 
 pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     //let logging_env_filter = EnvFilter::try_from_default_env()
-    //    .unwrap_or("none".into())
-    //    .add_directive("aruna_metadata=trace".parse().unwrap());
-    ////.add_directive("aruna_storage=info".parse().unwrap())
-    ////.add_directive("tower_http=info".parse().unwrap())
-    ////.add_directive("aruna_net=info".parse().unwrap());
+    //   .unwrap_or("none".into())
+    //   .add_directive("aruna_realm=trace".parse().unwrap());
+    ////add_directive("aruna_storage=info".parse().unwrap())
+    ////add_directive("tower_http=info".parse().unwrap())
+    ////add_directive("aruna_net=info".parse().unwrap());
 
-    //let fmt_layer = tracing_subscriber::fmt::layer()
-    //    .with_file(true)
-    //    .with_line_number(true)
-    //    .with_filter(logging_env_filter);
-    //tracing_subscriber::registry().with(fmt_layer).init();
+    // let fmt_layer = tracing_subscriber::fmt::layer()
+    //     .with_file(true)
+    //     .with_line_number(true)
+    //     .with_filter(logging_env_filter);
+    // tracing_subscriber::registry().with(fmt_layer).init();
 
     let realm_key = SigningKey::generate(&mut OsRng);
 
@@ -210,6 +213,10 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         server_url_pairs.push((controller, format!("http://localhost:{}/api/v3", api_port)));
     }
 
+    for (controller, _) in &server_url_pairs {
+        controller.network.update_realm().await?;
+    }
+
     Ok(TestServers {
         realm_key,
         token_handler_keys: token_handler_realm_keys,
@@ -222,7 +229,6 @@ pub async fn create_user_with_token(
     name: String,
 ) -> Result<(UserIdentity, String)> {
     let (controller, url) = test.addr_server_pairs.first().unwrap();
-    println!("CREATE USERS @ {url}");
 
     let request = AddUserRequest { name: name.clone() };
     let response = request

@@ -33,7 +33,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_secs(5));
 
-        for (controller, _) in servers.iter() {
+        for (controller, url) in servers.iter() {
             assert!(
                 controller
                     .persistence
@@ -61,12 +61,6 @@ mod tests {
         } = init_lmdb_servers(OFFSET).await.unwrap();
 
         let (controller, first_url) = servers.first().unwrap();
-        println!("{first_url}");
-        println!("{:?}", controller.network.get_addr().await.unwrap());
-        println!(
-            "{:?}",
-            servers.iter().map(|(_, url)| url).collect::<Vec<&String>>()
-        );
         let client = reqwest::Client::new();
 
         let (user1_identity, user1_token) =
@@ -145,7 +139,6 @@ mod tests {
         std::thread::sleep(Duration::from_secs(5));
 
         for (_, base_url) in servers.iter() {
-            println!("{base_url}");
             let response: GetResourceResponse = client
                 .get(format!("{base_url}/resources"))
                 .header::<&str, &str>(
@@ -286,8 +279,6 @@ mod tests {
             .resource;
         let parent_project2 = object2.id;
 
-        std::thread::sleep(Duration::from_secs(5));
-
         let mut user1_ids = Vec::new();
         user1_ids.push(parent_project1);
         let mut user2_ids = Vec::new();
@@ -340,10 +331,9 @@ mod tests {
             }
         }
 
-        std::thread::sleep(Duration::from_secs(20));
+        std::thread::sleep(Duration::from_secs(10));
 
         for (_, base_url) in servers.iter() {
-            println!("{base_url}");
             let response: SearchResponse = client
                 .get(format!("{base_url}/info/search"))
                 .header::<&str, &str>(

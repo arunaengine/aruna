@@ -12,7 +12,7 @@ use crate::{
         },
     },
     network::network_trait::Network,
-    persistence::{persistence::Authorize, search::search::Search},
+    persistence::{authorization::Authorize, search::search::Search},
 };
 use aruna_permission::{Action, Path, UserIdentity};
 use aruna_storage::storage::store::Store;

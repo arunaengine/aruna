@@ -340,6 +340,12 @@ impl PathBuilder {
         }
     }
 
+    pub fn from_path(path: Path) -> PathBuilder {
+        PathBuilder {
+            components: path.components,
+        }
+    }
+
     /// Sets the realm ID for the path.
     pub fn realm_id(mut self, realm_id: RealmKey) -> Self {
         self.components.push(PathComponent::RealmId(realm_id));
@@ -540,6 +546,15 @@ impl PathBuilder {
         self.components.push(PathComponent::Metadata);
         self.components.push(PathComponent::ProjectId(project_id));
 
+        for object_id in sub_object_ids {
+            self.components.push(PathComponent::ObjectId(object_id));
+        }
+
+        self
+    }
+
+    /// Adds a group metadata resource section to the path.
+    pub fn group_metadata_resource(mut self, sub_object_ids: Vec<Ulid>) -> Self {
         for object_id in sub_object_ids {
             self.components.push(PathComponent::ObjectId(object_id));
         }

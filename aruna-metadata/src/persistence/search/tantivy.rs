@@ -1,8 +1,9 @@
 use super::search::Search;
 use crate::{
-    error::ArunaMetadataError, models::models::Resource, persistence::persistence::Authorize,
+    error::ArunaMetadataError, models::models::Resource, persistence::authorization::Authorize,
 };
 use roaring::RoaringBitmap;
+use tracing::error;
 use std::{collections::HashMap, fs};
 use tantivy::{
     Index, IndexReader, IndexWriter, TantivyDocument,
@@ -135,11 +136,11 @@ impl Search for TantivySearch {
                     let doc = fields_clone.create_doc(idx, resource);
                     // Let's index one documents!
                     if let Err(err) = index_writer.add_document(doc) {
-                        println!("{err}");
+                        error!("{err}");
                     };
                 }
                 if let Err(err) = index_writer.commit() {
-                    println!("{err}");
+                    error!("{err}");
                 };
             }
         });

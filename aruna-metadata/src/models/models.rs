@@ -32,28 +32,34 @@ use utoipa::ToSchema;
     Hash,
 )]
 pub struct Resource {
+    // Needed
     #[autosurgeon(with = "autosurgeon_ulid")]
     #[key]
     pub id: Ulid,
     pub name: String,
-    pub title: String,
-    pub description: String,
-    pub revision: u64, // This should not be part of the index
-    pub variant: ResourceVariant,
-    pub labels: Vec<KeyValue>,
-    pub identifiers: Vec<String>,
-    pub content_len: u64,
-    pub count: u64,
-    pub visibility: VisibilityClass,
     #[autosurgeon(with = "autosurgeon_date_time")]
     pub created_at: DateTime<Utc>,
     #[autosurgeon(with = "autosurgeon_date_time")]
     pub last_modified: DateTime<Utc>,
+    pub visibility: VisibilityClass,
+    pub variant: ResourceVariant,
+    pub deleted: bool,
+    // JSON where the rest is defined
+    pub labels: Vec<KeyValue>, // rename to tags
+    // pub metadata: Vec<KeyValue>,
+    // pub data: enum {Url, ContentHash, MetadataId+CommitHash}
+
+    // Optional
+    pub title: String,
+    pub description: String,
+    pub revision: u64, // This should not be part of the index
+    pub identifiers: Vec<String>,
+    pub content_len: u64,
+    pub count: u64,
     pub authors: Vec<Author>,
     #[autosurgeon(with = "autosurgeon_ulid")]
     pub license_id: Ulid,
     pub locked: bool,
-    pub deleted: bool,
     pub location: Vec<String>, // Part of index ?
     pub hashes: Vec<Hash>,
 }

@@ -32,11 +32,13 @@ where
     ) -> Result<Option<Vec<Ulid>>, crate::error::ArunaMetadataError> {
         if let Some(token) = token {
             let user_identity = controller.persistence.get_identity(token).await?;
-            let groups = controller
-                .persistence
-                .get_user_groups(&user_identity)
-                .await?;
-            Ok(Some(groups))
+            match controller.persistence.get_user_groups(&user_identity).await {
+                Ok(groups) => Ok(Some(groups)),
+                Err(err) => {
+                    error!("{err}");
+                    Ok(None)
+                }
+            }
         } else {
             Ok(None)
         }
@@ -72,7 +74,14 @@ where
                     .await
                 {
                     Ok(crate::models::requests::ForwardResponse::Search(response)) => {
-                        for r in response?.resources {
+                        let response = match response {
+                            Ok(res) => res,
+                            Err(err) => {
+                                error!("{err}");
+                                continue;
+                            }
+                        };
+                        for r in response.resources {
                             results.insert(r);
                         }
                     }

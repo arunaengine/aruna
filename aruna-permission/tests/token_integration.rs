@@ -166,6 +166,8 @@ async fn test_clean_separation_workflow() {
         )
         .unwrap();
 
+    txn.commit().unwrap();
+
     // Verify both users have access to the shared resource
     let alice_access = permission_manager
         .check_permission(
@@ -187,7 +189,6 @@ async fn test_clean_separation_workflow() {
     assert!(alice_access.is_ok());
     assert!(bob_access.is_ok());
 
-    txn.commit().unwrap();
     cleanup_test_dir(&test_dir);
 }
 
@@ -288,6 +289,8 @@ async fn test_cross_realm_token_handling() {
         .add_resource(ResourceId::Ulid(resource_b), &path_b, &store, &mut txn)
         .unwrap();
 
+    store.commit(txn).unwrap();
+
     // Verify cross-realm access works after unification
     assert!(
         permission_manager
@@ -323,18 +326,20 @@ async fn test_cross_realm_token_handling() {
         .generate_token(&alice_realm_b, &realm_b_signing_pem)
         .unwrap();
 
+    let txn = store.create_txn(false).unwrap();
+
     // Verify tokens can be validated in their respective realms
     let verified_identity_a = token_system_a
-        .get_identity(&alice_realm_a_token, &store, &mut txn)
+        .get_identity(&alice_realm_a_token, &store, &txn)
         .unwrap();
     let verified_identity_b = token_system_b
-        .get_identity(&alice_realm_b_token, &store, &mut txn)
+        .get_identity(&alice_realm_b_token, &store, &txn)
         .unwrap();
+    store.commit(txn).unwrap();
 
     assert_eq!(verified_identity_a.user_ulid, alice_realm_a.user_ulid);
     assert_eq!(verified_identity_b.user_ulid, alice_realm_b.user_ulid);
 
-    txn.commit().unwrap();
     cleanup_test_dir(&test_dir);
 }
 
@@ -472,6 +477,7 @@ async fn test_typical_usage_pattern() {
     permission_manager
         .add_resource(ResourceId::Ulid(doc_id), &doc_path, &store, &mut txn)
         .unwrap();
+    store.commit(txn).unwrap();
 
     // 4. Check permissions
     let access_result = permission_manager
@@ -491,9 +497,11 @@ async fn test_typical_usage_pattern() {
         .generate_token(&user_identity, &signing_pem)
         .unwrap();
 
+    let mut txn = store.create_txn(true).unwrap();
+
     // 6. Token verification workflow
     let verified_identity = token_system
-        .get_identity(&aruna_token, &store, &mut txn)
+        .get_identity(&aruna_token, &store, &txn)
         .unwrap();
 
     assert_eq!(verified_identity.user_ulid, user_identity.user_ulid);

@@ -479,7 +479,11 @@ impl Kademlia {
         // Set up tracking for the find operation
         let mut visited_nodes = HashSet::new();
         let mut closest_nodes = Closest::<ALPHA>::new(target);
+        closest_nodes.add(self.get_node_addr());
         let mut found_values_at = HashMap::new();
+        if let Some(value) = self.state.find_local_addr(&target) {
+            found_values_at.insert(self.node_id(), value);
+        };
 
         let mut futures = FuturesUnordered::new();
 
