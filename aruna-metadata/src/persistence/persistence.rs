@@ -25,7 +25,6 @@ use std::{
 };
 use ulid::Ulid;
 
-
 pub mod tables {
     pub const RESOURCE_DB_NAME: &str = "metatadata_resources";
     pub const RESOURCE_MAPPINGS_DB_NAME: &str = "metadata_resource_mappings";
@@ -44,7 +43,7 @@ where
     pub(super) search: Arc<Se>,
     pub(super) idx_counter: Arc<AtomicU32>,
     pub(super) connection_states:
-        Arc<Mutex<HashMap<Ulid, HashMap<PublicKey, State, RandomState>, RandomState>>>,
+        Arc<Mutex<HashMap<Vec<u8>, HashMap<PublicKey, State, RandomState>, RandomState>>>,
     pub(super) permission_manager: PermissionManager,
     pub token_handler: Arc<RwLock<TokenSystem>>,
 }

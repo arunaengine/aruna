@@ -50,6 +50,13 @@ where
             .add_user(node_id.as_bytes(), self.name, auth_ctx)
             .await?;
 
+        // Store user hash in DHT
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(user.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        controller.network.store(subject_hash).await?;
+
         // (for now) Replicate users to all member nodes
         let members = controller
             .network
@@ -68,12 +75,12 @@ where
         controller
             .sync_loop(
                 crate::models::models::TypedDoc::User(doc),
-                user.id.user_ulid,
+                *subject_hash,
+                user.id.to_bytes(),
                 path,
                 members,
             )
             .await?;
-        // TODO: Store user hash in kademlia
 
         Ok(AddUserResponse { user })
     }

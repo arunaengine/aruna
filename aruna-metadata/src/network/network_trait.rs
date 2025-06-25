@@ -41,7 +41,7 @@ pub struct MetadataMessage {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Body {
     Replicate {
-        id: Ulid,
+        id: Vec<u8>,
         path: Path,
         sync_message: ReplicationSubject,
     },
@@ -76,7 +76,8 @@ pub trait Network: Sync + Send + Sized {
         &self,
         stream: &mut Self::Stream,
         subject: ReplicationSubject,
-        subject_id: &Ulid,
+        subject_hash: &[u8; 32],
+        doc_id: Vec<u8>,
         path: Path,
         target_node: NodeAddr,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError>;
@@ -98,14 +99,17 @@ pub trait Network: Sync + Send + Sized {
     ) -> Result<ForwardResponse, ArunaMetadataError>;
     async fn create_stream(&self, target: PublicKey) -> Result<Self::Stream, ArunaMetadataError>;
     async fn finish_stream(&self, stream: Self::Stream) -> Result<(), ArunaMetadataError>;
-    async fn find(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
-    async fn find_verified(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
+    async fn find(&self, subject_hash: &[u8; 32]) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
+    async fn find_verified(
+        &self,
+        subject_hash: &[u8; 32],
+    ) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
     async fn get_realm_nodes(&self) -> Result<Vec<NodeAddr>, ArunaMetadataError>;
-    async fn store(&self, subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError>;
+    async fn store(&self, subject_hash: &[u8; 32]) -> Result<(), ArunaMetadataError>;
     // This is needed for testing
     #[allow(dead_code)]
     async fn update_realm(&self) -> Result<(), ArunaMetadataError>;
-    async fn store_in_realm(&self, subject_id: &Ulid) -> Result<(), ArunaMetadataError>;
+    async fn store_in_realm(&self, subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError>;
     async fn get_realm_key(&self) -> Result<[u8; 32], ArunaMetadataError>;
 }
 
@@ -142,7 +146,8 @@ impl Network for NetworkDummy {
         &self,
         _stream: &mut Self::Stream,
         _subject: ReplicationSubject,
-        _subject_id: &Ulid,
+        _subject_hash: &[u8; 32],
+        _doc_id: Vec<u8>,
         _path: Path,
         _target_node: NodeAddr,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
@@ -161,11 +166,14 @@ impl Network for NetworkDummy {
         Ok(())
     }
 
-    async fn find(&self, _subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
+    async fn find(&self, _subject_hash: &[u8; 32]) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
         Ok(vec![self.get_addr().await?])
     }
 
-    async fn find_verified(&self, _subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
+    async fn find_verified(
+        &self,
+        _subject_hash: &[u8; 32],
+    ) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
         Ok(vec![self.get_addr().await?])
     }
     async fn forward(
@@ -189,7 +197,7 @@ impl Network for NetworkDummy {
         Ok(vec![self.self_id.clone()])
     }
 
-    async fn store_in_realm(&self, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
+    async fn store_in_realm(&self, _subject_hash: &[u8; 32]) -> Result<(), ArunaMetadataError> {
         Ok(())
     }
 
@@ -276,32 +284,28 @@ impl Network for P2PNetwork {
             .await
             .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))
     }
-    async fn find(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
-        let mut chunk_hasher = blake3::Hasher::new();
-        chunk_hasher.update(subject_id.to_bytes().as_slice());
-        let id_hash = chunk_hasher.finalize();
+    async fn find(&self, subject_hash: &[u8; 32]) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
         Ok(self
             .chandler
             .get_kademlia_actor_handle()
             .await?
-            .find_value(*id_hash.as_bytes())
+            .find_value(*subject_hash)
             .await?
             .iter()
             .map(|m| m.addr().clone())
             .collect())
     }
 
-    async fn find_verified(&self, subject_id: &Ulid) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
-        let mut chunk_hasher = blake3::Hasher::new();
-        chunk_hasher.update(subject_id.to_bytes().as_slice());
-        let id_hash = chunk_hasher.finalize();
-
+    async fn find_verified(
+        &self,
+        subject_hash: &[u8; 32],
+    ) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
         let members = self.realm_handler.get_realm_member_addrs();
         let find_results = self
             .chandler
             .get_kademlia_actor_handle()
             .await?
-            .find_value(*id_hash.as_bytes())
+            .find_value(*subject_hash)
             .await?
             .iter()
             .map(|m| m.addr().clone())
@@ -320,24 +324,20 @@ impl Network for P2PNetwork {
         &self,
         stream: &mut Self::Stream,
         subject: ReplicationSubject,
-        subject_id: &Ulid,
+        subject_hash: &[u8; 32],
+        doc_id: Vec<u8>,
         path: Path,
         target_node: NodeAddr,
     ) -> Result<Option<Vec<u8>>, ArunaMetadataError> {
         let (sdx, recv) = (&mut stream.send_stream, &mut stream.recv_stream);
         let node_id = self.chandler.get_node_addr().await?;
 
-        // Calc hash
-        let mut chunk_hasher = blake3::Hasher::new();
-        chunk_hasher.update(subject_id.to_bytes().as_slice());
-        let id_hash = chunk_hasher.finalize();
-
         let mut message = MetadataMessage {
             from: *node_id.node_id.as_bytes(),
             to: [0u8; 32],
-            subject: *id_hash.as_bytes(),
+            subject: *subject_hash,
             body: Body::Replicate {
-                id: *subject_id,
+                id: doc_id,
                 path,
                 sync_message: subject,
             },
@@ -430,7 +430,7 @@ impl Network for P2PNetwork {
         Ok(())
     }
 
-    async fn store_in_realm(&self, _subject_id: &Ulid) -> Result<(), ArunaMetadataError> {
+    async fn store_in_realm(&self, _subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError> {
         todo!()
     }
 
@@ -457,7 +457,7 @@ impl P2PNetwork {
         &self,
         message: MetadataMessage,
         sync_message: ReplicationSubject,
-        subject_id: Ulid,
+        subject_id: Vec<u8>,
         path: Path,
         recv_stream: &mut ReceiveStreams,
         controller: &Controller<St, Se, N>,
@@ -481,7 +481,7 @@ impl P2PNetwork {
         };
         let mut doc = controller
             .persistence
-            .get_or_create_doc(subject_id, table)
+            .get_or_create_doc(subject_id.clone(), table)
             .await?;
 
         // Poll sync response
@@ -550,6 +550,7 @@ impl P2PNetwork {
                             .persistence
                             .handle_user_merges(doc.save())
                             .await?;
+                        self.store(&subject).await?;
                     }
                     ReplicationSubject::Object(None) => {
                         controller
@@ -583,14 +584,14 @@ impl P2PNetwork {
         while let Ok(msg) = read_message(&mut recv_stream.recv_stream).await {
             match msg.body {
                 Body::Replicate {
-                    id,
+                    ref id,
                     ref path,
                     ref sync_message,
                 } => {
                     self.handle_replication_messages(
                         msg.clone(),
                         sync_message.clone(),
-                        id,
+                        id.clone(),
                         path.clone(),
                         recv_stream,
                         controller,

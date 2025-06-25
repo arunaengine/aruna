@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use super::request::Request;
 use crate::{
     models::{
+        conversions::ToBytes,
         models::Group,
         requests::{
             AddGroupRequest,
@@ -78,6 +79,13 @@ where
             .add_group(node_id.as_bytes(), &realm_id, &user, group.clone())
             .await?;
 
+        // TODO: Store group
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(group.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        controller.network.store(subject_hash).await?;
+
         // Choose x = REPLICATION_POLICY random nodes of members
         // and replicate resource
         let members = controller
@@ -95,7 +103,8 @@ where
         controller
             .sync_loop(
                 crate::models::models::TypedDoc::Group(group_doc),
-                group.id,
+                *subject_hash,
+                ToBytes::to_bytes(group.id),
                 path,
                 members,
             )
@@ -158,6 +167,12 @@ where
             )
             .await?;
 
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.group_id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        controller.network.store(subject_hash).await?;
+
         // Choose x = REPLICATION_POLICY random nodes of members
         // and replicate resource
         let members = controller
@@ -175,7 +190,8 @@ where
         controller
             .sync_loop(
                 crate::models::models::TypedDoc::Group(group_doc),
-                self.group_id,
+                *subject_hash,
+                ToBytes::to_bytes(self.group_id),
                 path,
                 members,
             )
@@ -194,7 +210,7 @@ where
 // {
 //     type Response = AddRolesToGroupResponse;
 //     type AuthContext = Option<UserIdentity>;
-// 
+//
 //     #[tracing::instrument(level = "trace", skip(controller, token))]
 //     async fn authorize(
 //         &self,
@@ -208,7 +224,7 @@ where
 //             Ok(None)
 //         }
 //     }
-// 
+//
 //     #[tracing::instrument(level = "trace", skip(_controller))]
 //     async fn forward_or_return(
 //         &self,
@@ -217,7 +233,7 @@ where
 //     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
 //         Ok(None)
 //     }
-// 
+//
 //     #[tracing::instrument(level = "trace", skip(controller))]
 //     async fn run_request(
 //         self,
@@ -227,7 +243,7 @@ where
 //         todo!()
 //     }
 // }
-// 
+//
 // #[async_trait::async_trait]
 // impl<St, Se, N> Request<St, Se, N> for AddResourcesToGroupRequest
 // where
@@ -237,7 +253,7 @@ where
 // {
 //     type Response = AddResourcesToGroupResponse;
 //     type AuthContext = Option<UserIdentity>;
-// 
+//
 //     #[tracing::instrument(level = "trace", skip(controller, token))]
 //     async fn authorize(
 //         &self,
@@ -251,7 +267,7 @@ where
 //             Ok(None)
 //         }
 //     }
-// 
+//
 //     #[tracing::instrument(level = "trace", skip(_controller))]
 //     async fn forward_or_return(
 //         &self,
@@ -260,7 +276,7 @@ where
 //     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
 //         Ok(None)
 //     }
-// 
+//
 //     #[tracing::instrument(level = "trace", skip(controller))]
 //     async fn run_request(
 //         self,

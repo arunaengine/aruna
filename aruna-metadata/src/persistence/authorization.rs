@@ -75,6 +75,7 @@ where
     pub async fn get_identity(&self, token: String) -> Result<UserIdentity, ArunaMetadataError> {
         let store = self.store.clone();
         let token_handler = self.token_handler.clone();
+        // TODO: Query user from kademlia
         tokio::task::spawn_blocking(move || -> Result<UserIdentity, ArunaMetadataError> {
             let txn = store.create_txn(false)?;
             let user_identity = token_handler.read().get_identity(&token, &store, &txn)?;
@@ -173,6 +174,7 @@ where
             Some(token) => {
                 let store = self.store.clone();
                 let token_handler = self.token_handler.clone();
+                // TODO: Query user from network
                 let user_identity = tokio::task::spawn_blocking(
                     move || -> Result<UserIdentity, ArunaMetadataError> {
                         let txn = store.create_txn(false)?;

@@ -56,7 +56,8 @@ where
     pub async fn sync_loop(
         &self,
         doc: TypedDoc,
-        doc_id: Ulid,
+        subject_hash: [u8; 32],
+        doc_id: Vec<u8>,
         path: Path,
         nodes: impl Iterator<Item = NodeAddr>,
     ) -> Result<(), ArunaMetadataError> {
@@ -65,13 +66,14 @@ where
             let network = self.network.clone();
             let persistence = self.persistence.clone();
             let doc = doc.clone();
+            let doc_id = doc_id.clone();
             let path = path.clone();
             tokio::spawn(async move {
                 let mut stream = network.create_stream(node.node_id).await?;
                 let mut document = inner_doc;
                 'sync: loop {
                     let sync_message = persistence
-                        .generate_sync_message(&doc_id, &mut document, node.node_id.clone())
+                        .generate_sync_message(doc_id.clone(), &mut document, node.node_id.clone())
                         .await?;
 
                     let recv_message = network
@@ -94,7 +96,8 @@ where
                                     )
                                 }
                             },
-                            &doc_id,
+                            &subject_hash,
+                            doc_id.clone(),
                             path.clone(),
                             node.clone(),
                         )
@@ -103,7 +106,7 @@ where
                     if let Some(response) = &recv_message {
                         persistence
                             .receive_sync_message(
-                                &doc_id,
+                                doc_id.clone(),
                                 &mut document,
                                 Message::decode(response)?,
                                 node.node_id.clone(),

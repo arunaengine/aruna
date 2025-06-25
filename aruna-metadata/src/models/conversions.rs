@@ -1,3 +1,5 @@
+use ulid::Ulid;
+
 use crate::error::ArunaMetadataError;
 
 use super::models::{Group, Resource, User};
@@ -47,6 +49,21 @@ impl TryFrom<Group> for Vec<u8> {
     fn try_from(value: Group) -> Result<Self, Self::Error> {
         let bytes = postcard::to_allocvec(&value)?;
         Ok(bytes)
+    }
+}
+
+pub trait ToBytes: Sized {
+    fn to_bytes(self: Self) -> Vec<u8>;
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self, ArunaMetadataError>;
+}
+
+impl ToBytes for Ulid {
+    fn to_bytes(self: Self) -> Vec<u8> {
+        Ulid::to_bytes(&self).to_vec()
+    }
+
+    fn from_bytes(bytes: Vec<u8>) -> Result<Self, ArunaMetadataError> {
+        Ok(Ulid::from_bytes(bytes.as_slice().try_into()?))
     }
 }
 

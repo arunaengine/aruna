@@ -2,6 +2,7 @@ use super::request::Request;
 use crate::{
     error::ArunaMetadataError,
     models::{
+        conversions::ToBytes,
         models::{Resource, ResourceVariant},
         requests::{
             CreateProjectRequest, CreateProjectResponse, CreateResourceRequest,
@@ -108,6 +109,7 @@ where
         let mut chunk_hasher = blake3::Hasher::new();
         chunk_hasher.update(resource.id.to_bytes().as_slice());
         let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
         controller.network.store(subject.as_bytes()).await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
@@ -121,7 +123,8 @@ where
         controller
             .sync_loop(
                 crate::models::models::TypedDoc::Resource(doc),
-                resource.id,
+                *subject_hash,
+                resource.id.to_bytes().to_vec(),
                 path,
                 realm_nodes.into_iter(),
             )
@@ -165,7 +168,13 @@ where
             request: crate::models::requests::ForwardRequest::GetResource(self.clone()),
         };
         let self_addr = controller.network.get_addr().await?;
-        let nodes = controller.network.find(&self.id).await?;
+
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+
+        let nodes = controller.network.find(subject_hash).await?;
 
         if nodes.is_empty() || nodes.contains(&self_addr) {
             Ok(None)
@@ -234,7 +243,13 @@ where
             request: crate::models::requests::ForwardRequest::UpdateResource(self.clone()),
         };
         let self_addr = controller.network.get_addr().await?;
-        let nodes = controller.network.find(&self.get_id()).await?;
+
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.get_id().to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+
+        let nodes = controller.network.find(subject_hash).await?;
 
         if nodes.is_empty() || nodes.contains(&self_addr) {
             Ok(None)
@@ -349,11 +364,17 @@ where
             .update_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
             .await?;
 
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(resource.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        controller.network.store(subject.as_bytes()).await?;
+
         // Replay update only to members that already got the object
         // In this case replicate functions as replay
         let members = controller
             .network
-            .find_verified(&id)
+            .find_verified(subject_hash)
             .await?
             .into_iter()
             .filter(|addr| addr.node_id != node_id);
@@ -361,7 +382,8 @@ where
         controller
             .sync_loop(
                 crate::models::models::TypedDoc::Resource(doc),
-                resource.id,
+                *subject_hash,
+                ToBytes::to_bytes(resource.id),
                 path,
                 members,
             )
@@ -486,7 +508,8 @@ where
         let mut chunk_hasher = blake3::Hasher::new();
         chunk_hasher.update(resource.id.to_bytes().as_slice());
         let subject = chunk_hasher.finalize();
-        controller.network.store(subject.as_bytes()).await?;
+        let subject_hash = subject.as_bytes();
+        controller.network.store(subject_hash).await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
         // and replicate resource
@@ -499,7 +522,8 @@ where
         controller
             .sync_loop(
                 crate::models::models::TypedDoc::Resource(doc),
-                resource.id,
+                *subject_hash,
+                resource.id.to_bytes().to_vec(),
                 path,
                 realm_nodes.into_iter(),
             )
