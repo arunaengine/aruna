@@ -121,8 +121,19 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 name = "aruna"
 version = "3.0.0"
 dependencies = [
+ "aruna-data",
+ "aruna-metadata",
  "aruna-net",
+ "aruna-permission",
+ "aruna-storage",
+ "dotenvy",
+ "ed25519-dalek",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -10,8 +10,12 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace=true }
 dotenvy = { workspace = true }
+ed25519-dalek = { workspace = true }
 iroh = { workspace = true }
 iroh-base = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
 parking_lot = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true }
@@ -21,6 +25,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true } 
 tracing-subscriber = { workspace = true }
+tracing-opentelemtry = { workspace = true }
 ulid = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
@@ -35,17 +40,12 @@ autosurgeon = "0.8.7"
 axum = "0.8.4"
 axum-extra = {version = "0.10.1", features = ["query"]}
 chrono = { version = "0.4.41", features = ["serde"]}
-ed25519-dalek = { workspace = true }
 hex = "0.4.3"
-opentelemetry = "0.29.1"
-opentelemetry-otlp = { version = "0.29.0", features = ["grpc-tonic"]}
-opentelemetry_sdk = { version = "0.29.0", features = ["rt-tokio"]}
 rayon = "1.10.0"
 reqwest = { version = "0.12.15", features = ["json"] }
 roaring = "0.10.12"
 tantivy = "0.24.1"
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
-tracing-opentelemetry = "0.30.0"
 typetag = "0.2.20"
 
 [dev-dependencies]

@@ -4,5 +4,17 @@ version = { workspace = true }
 edition = { workspace = true }
 
 [dependencies]
-tokio = { workspace = true }
 aruna-net = { path = "../aruna-net" }
+aruna-metadata = { path = "../aruna-metadata" }
+aruna-permission = { path = "../aruna-permission" }
+aruna-data = { path = "../aruna-data" }
+aruna-storage = { path = "../aruna-storage" }
+dotenvy = { workspace = true }
+ed25519-dalek = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true } 
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
