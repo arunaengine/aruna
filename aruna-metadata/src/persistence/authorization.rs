@@ -45,31 +45,10 @@ where
         identity: &UserIdentity,
         action: Action,
     ) -> Result<bool, ArunaMetadataError> {
-        let store = self.store.clone();
-        let permission_manager = self.permission_manager.clone();
-        let identity = identity.clone();
-
-        let ulid = tokio::task::spawn_blocking(move || -> Result<Ulid, ArunaMetadataError> {
-            let txn = store.create_txn(false)?;
-
-            let permission_ulid =
-                permission_manager.resolve_permission_ulid(&identity, &store, &txn)?;
-
-            store.commit(txn)?;
-
-            Ok(permission_ulid)
-        })
-        .await
-        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))??;
-        let res = self.permission_manager.enforcer.read().await.enforce(
-            &ulid.to_string(),
-            &path.to_string(),
-            &action.to_string(),
-        );
-        res.map_err(|e| {
-            error!(?e);
-            ArunaMetadataError::Unauthorized
-        })
+        Ok(self
+            .permission_manager
+            .check_path(identity, path, action, &self.store)
+            .await?)
     }
 
     pub async fn get_identity(&self, token: String) -> Result<UserIdentity, ArunaMetadataError> {
