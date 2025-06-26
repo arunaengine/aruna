@@ -11,7 +11,6 @@ use axum::{
 };
 use std::sync::Arc;
 use tags::*;
-
 use super::utils::{extract_token, into_axum_response};
 
 mod tags {
@@ -79,7 +78,6 @@ where
 {
     into_axum_response(state.request(request, extract_token(&headers)).await)
 }
-
 
 /// Get resources
 #[utoipa::path(
@@ -511,6 +509,38 @@ where
 )]
 #[tracing::instrument(level = "trace", skip(state))]
 pub async fn add_user<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    headers: HeaderMap,
+    Json(request): Json<AddUserRequest>,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+
+/// Authorizes and returns a user
+/// TODO: Add to server after cross realm verification 
+///       and foreign users querying local users is implemented
+#[utoipa::path(
+    get,
+    path = "/users",
+    params (
+        GetUserRequest
+    ),
+    responses(
+        (status = 200, body = GetUserResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = USERS,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn get_user<St, Se, N>(
     State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<AddUserRequest>,

@@ -3,14 +3,16 @@ use crate::{
     error::ArunaMetadataError,
     models::models::TypedDoc,
     network::network_trait::Network,
-    persistence::{persistence::Persistor, search::search::Search},
+    persistence::{
+        persistence::{Persistor, tables::USER_DB_NAME},
+        search::search::Search,
+    },
 };
-use aruna_permission::Path;
+use aruna_permission::{Path, UserIdentity};
 use aruna_storage::storage::store::Store;
 use automerge::sync::Message;
 use iroh::NodeAddr;
 use std::sync::Arc;
-use ulid::Ulid;
 
 pub struct Controller<St, Se, N>
 where
@@ -50,6 +52,42 @@ where
                 Ok(result)
             }
         }
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, token))]
+    pub async fn get_or_sync_user(
+        &self,
+        token: String,
+    ) -> Result<UserIdentity, ArunaMetadataError> {
+        let identity = self.persistence.get_identity(token).await?;
+
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(identity.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        let nodes = self.network.find_verified(subject_hash).await?;
+
+        if !nodes.contains(&self.network.get_addr().await?) {
+            let doc = self
+                .persistence
+                .get_or_create_doc(identity.to_bytes(), USER_DB_NAME)
+                .await?;
+
+            let path = Path::builder()
+                .realm_id(self.network.get_realm_key().await?)
+                .build()
+                .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
+
+            self.sync_loop(
+                crate::models::models::TypedDoc::User(doc),
+                *subject_hash,
+                identity.to_bytes(),
+                path,
+                nodes.into_iter(),
+            )
+            .await?;
+        }
+        Ok(identity)
     }
 
     #[tracing::instrument(level = "trace", skip(self, doc, nodes))]

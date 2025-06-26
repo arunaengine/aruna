@@ -14,7 +14,7 @@ use super::{
 pub trait Authorize {
     async fn authorize(
         &self,
-        token: Option<String>,
+        user_identity: Option<UserIdentity>,
         action: Action,
         resource_id: Ulid,
     ) -> Result<Option<(UserIdentity, Path)>, ArunaMetadataError>;
@@ -166,36 +166,19 @@ where
 {
     async fn authorize(
         &self,
-        token: Option<String>,
+        user_identity: Option<UserIdentity>,
         action: Action,
         resource_id: Ulid,
     ) -> Result<Option<(UserIdentity, Path)>, ArunaMetadataError> {
-        match token {
-            Some(token) => {
-                let store = self.store.clone();
-                let token_handler = self.token_handler.clone();
-                // TODO: Query user from network
-                let user_identity = tokio::task::spawn_blocking(
-                    move || -> Result<UserIdentity, ArunaMetadataError> {
-                        let txn = store.create_txn(false)?;
-                        let user_identity =
-                            token_handler.read().get_identity(&token, &store, &txn)?;
-                        store.commit(txn)?;
-                        Ok(user_identity)
-                    },
-                )
-                .await
-                .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))??;
-                let cloned_user_identity = user_identity.clone();
-                let store = self.store.clone();
-                let permission_manager = self.permission_manager.clone();
-
-                let path = permission_manager
+        match user_identity {
+            Some(user_identity) => {
+                let path = self
+                    .permission_manager
                     .check_permission(
-                        &cloned_user_identity,
+                        &user_identity,
                         ResourceId::Ulid(resource_id),
                         action,
-                        &store,
+                        &self.store,
                     )
                     .await?;
                 Ok(Some((user_identity, path)))

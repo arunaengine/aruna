@@ -1,10 +1,10 @@
 use super::request::Request;
 use crate::{
-    models::requests::{AddUserRequest, AddUserResponse},
+    models::requests::{AddUserRequest, AddUserResponse, GetUserRequest, GetUserResponse},
     network::network_trait::Network,
     persistence::search::search::Search,
 };
-use aruna_permission::{OidcToken, Path};
+use aruna_permission::{OidcToken, Path, UserIdentity};
 use aruna_storage::storage::store::Store;
 
 #[async_trait::async_trait]
@@ -83,5 +83,54 @@ where
             .await?;
 
         Ok(AddUserResponse { user })
+    }
+}
+
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for GetUserRequest
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    type Response = GetUserResponse;
+    type AuthContext = UserIdentity;
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError> {
+        // TODO: Handle permissions when user is requesting other users
+        let Some(token) = token else {
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
+        };
+        controller.persistence.get_identity(token).await
+    }
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        // TODO: Forward when cross realm and user querying other users is implemented
+        Ok(None)
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn run_request(
+        self,
+        auth_ctx: Self::AuthContext,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        // TODO: Handle other users except self
+        let Some(user) = controller.persistence.get_user(&auth_ctx).await? else {
+            return Err(crate::error::ArunaMetadataError::NotFound(
+                "User not found".to_string(),
+            ));
+        };
+        Ok(GetUserResponse { user })
     }
 }

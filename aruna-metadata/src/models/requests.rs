@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::error::ArunaMetadataError;
 
 use super::models::{Author, Group, KeyValue, Resource, User, VisibilityClass};
+use aruna_permission::UserIdentity;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
@@ -287,4 +288,16 @@ pub enum ForwardResponse {
     GetResource(Result<GetResourceResponse, ArunaMetadataError>),
     UpdateResource(Result<ResourceUpdateResponses, ArunaMetadataError>),
     Search(Result<SearchResponse, ArunaMetadataError>),
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams)]
+pub struct GetUserRequest {
+    #[schema(value_type=String)]
+    #[param(value_type=String)]
+    pub id: UserIdentity,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetUserResponse {
+    pub user: User,
 }

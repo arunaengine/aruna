@@ -40,9 +40,13 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.parent_id);
+        let identity = match token {
+            Some(token) => Some(controller.get_or_sync_user(token).await?),
+            None => None,
+        };
         controller
             .persistence
-            .authorize(token, action, id)
+            .authorize(identity, action, id)
             .await?
             .ok_or_else(|| ArunaMetadataError::Unauthorized)
     }
@@ -110,7 +114,7 @@ where
         chunk_hasher.update(resource.id.to_bytes().as_slice());
         let subject = chunk_hasher.finalize();
         let subject_hash = subject.as_bytes();
-        controller.network.store(subject.as_bytes()).await?;
+        controller.network.store(subject_hash).await?;
 
         // Choose x = REPLICATION_POLICY random nodes of members
         // and replicate resource
@@ -151,7 +155,16 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Read, self.id);
-        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
+
+        let identity = match token {
+            Some(token) => Some(controller.get_or_sync_user(token).await?),
+            None => None,
+        };
+        if let Some((i, _)) = controller
+            .persistence
+            .authorize(identity, action, id)
+            .await?
+        {
             Ok(Some(i))
         } else {
             Ok(None)
@@ -226,9 +239,14 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<(UserIdentity, Path), crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.get_id());
+
+        let identity = match token {
+            Some(token) => Some(controller.get_or_sync_user(token).await?),
+            None => None,
+        };
         Ok(controller
             .persistence
-            .authorize(token, action, id)
+            .authorize(identity, action, id)
             .await?
             .ok_or_else(|| ArunaMetadataError::Unauthorized)?)
     }
@@ -430,7 +448,7 @@ where
                 ArunaMetadataError::Unauthorized
             })?;
 
-        let identity = controller.persistence.get_identity(token).await?;
+        let identity = controller.get_or_sync_user(token).await?;
         if controller
             .persistence
             .check_path(&path, &identity, action)

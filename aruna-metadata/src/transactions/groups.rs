@@ -39,7 +39,7 @@ where
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
         let realm_key = controller.network.get_realm_key().await?;
-        let user_identity = controller.persistence.get_identity(token).await?;
+        let user_identity = controller.get_or_sync_user(token).await?;
 
         if user_identity.realm_key == realm_key {
             Ok(user_identity)
@@ -131,7 +131,11 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<UserIdentity, crate::error::ArunaMetadataError> {
         let (action, id) = (Action::Write, self.group_id);
-        if let Some((i, _)) = controller.persistence.authorize(token, action, id).await? {
+        let identity = match token {
+            Some(token) => Some(controller.get_or_sync_user(token).await?),
+            None => None,
+        };
+        if let Some((i, _)) = controller.persistence.authorize(identity, action, id).await? {
             Ok(i)
         } else {
             Err(crate::error::ArunaMetadataError::Unauthorized)
