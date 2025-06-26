@@ -1,3 +1,13 @@
+/*
+use crate::io::io_handler::ObjectInfo2;
+use aws_sdk_s3::operation::upload_part::UploadPartOutput;
+use aws_smithy_types::body::SdkBody;
+use aws_smithy_types::byte_stream::ByteStream;
+use futures_util::TryStreamExt;
+use http_body_util::StreamBody;
+use hyper::body::Frame;
+use s3s::dto::{CreateBucketInput, CreateMultipartUploadInput, UploadPartInput};
+*/
 use aruna_permission::manager::Action;
 
 pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
@@ -106,3 +116,41 @@ pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
         _ => None,
     }
 }
+
+/*
+pub fn create_bucket(req: CreateBucketInput) -> Result<(), S3Error> {
+    // Directly create bucket in backend storage
+
+    Ok(())
+}
+
+pub fn create_multipart_upload(req: CreateMultipartUploadInput) -> Result<(), S3Error> {
+    Ok(())
+}
+
+pub async fn upload_part(
+    req: UploadPartInput,
+    client: aws_sdk_s3::client::Client,
+    info: ObjectInfo2,
+) -> Result<UploadPartOutput, S3Error> {
+    // Create stream from body?
+    let hyper_body = StreamBody::new(req.body.unwrap().map_ok(Frame::data));
+    let bytestream = ByteStream::from(SdkBody::from_body_1_x(hyper_body));
+
+    client
+        .upload_part()
+        .set_bucket(None)
+        .set_key(None)
+        .set_content_length(None)
+        .body(bytestream)
+        .send()
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))
+}
+
+fn parse_s3_path(path: String) -> anyhow::Result<(String, String)> {
+    //
+
+    Ok(("".to_string(), "".to_string()))
+}
+*/

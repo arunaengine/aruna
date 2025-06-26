@@ -10,10 +10,13 @@ backend_type = "S3" #"Postgres", "FS", "HTTP", "Memory", ...
 encryption = false
 compression = false
 deduplication = false
+# Schema which defines the path under which uploaded objects are stored
+#backend_scheme = "{{NODE_ID}}/{{GROUP_ID}}/{{RAND:ULID}}/{{BUCKET}}/{{KEY}}"
 
 [backend.access]
 endpoint = "http://localhost:9000"
-region = "us-east-1"
+region = "eu-central-1"
+disable_config_load = "true"
 # Should access credentials and bucket be dynamically set ?
 bucket = "aruna"
 access_key_id = "minioadmin"
@@ -42,7 +45,7 @@ secret_access_key = "minioadmin"
 
 [frontend.openapi_frontend]
 address = "0.0.0.0"
-port = 50056
+port = 8085
 
 [frontend.s3_frontend]
 server = "0.0.0.0:1337"

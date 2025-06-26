@@ -1,6 +1,5 @@
 use anyhow::{Result, anyhow};
 use aruna_data::api_json::server::RestServer;
-use aruna_data::api_json::util::xor_ulids;
 use aruna_data::api_s3::auth::UserAccess;
 use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::io::controller::Controller;
@@ -8,23 +7,25 @@ use aruna_data::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICAT
 use aruna_data::io::io_handler::{IOHandler, LOCATION_DB_NAME};
 use aruna_data::{config::config::Config, util::opendal::get_operator};
 use aruna_net::actor::NetworkActorBuilder;
-use aruna_permission::UserIdentity;
 use aruna_permission::manager::PermissionManager;
+use aruna_permission::paths::RealmKey;
+use aruna_permission::token::OidcTrustConfig;
+use aruna_permission::{TokenSystem, UserIdentity};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
+use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::pkcs8::DecodePublicKey;
 use futures_util::TryFutureExt;
 use iroh::SecretKey;
 use lazy_static::lazy_static;
+use parking_lot::RwLock;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 use std::sync::Arc;
-use ed25519_dalek::pkcs8::DecodePublicKey;
-use ed25519_dalek::VerifyingKey;
 use tokio::try_join;
 use tracing::{Level, debug, error};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
-use aruna_permission::paths::RealmKey;
 
 lazy_static! {
     static ref CONFIG: Config = {
@@ -101,7 +102,7 @@ async fn main() -> Result<()> {
             aruna_permission::RESOURCE_DB,
             aruna_permission::DBNAME,
             aruna_permission::IDENTITY_PERMISSIONS_DB,
-            aruna_permission::OIDC_IDENTITIES_DB
+            aruna_permission::OIDC_IDENTITIES_DB,
         ],
     };
     let lmdb_store = Arc::new(LmdbStore::new(lmdb_config)?);
@@ -114,6 +115,13 @@ async fn main() -> Result<()> {
         .await?;
     lmdb_store.commit(read_txn)?;
 
+    // Token Handler
+    let oidc_config = OidcTrustConfig::TrustAll;
+    let token_handler = Arc::new(RwLock::new(TokenSystem::new(
+        realm_key.to_bytes(),
+        oidc_config,
+    )));
+
     // Create and run IOHandler
     let io_handler = IOHandler::<LmdbStore>::new(
         node_addr.clone(),
@@ -122,7 +130,7 @@ async fn main() -> Result<()> {
         kademlia,
         lmdb_store,
         permission_manager.clone(),
-        realm_key.to_bytes()
+        realm_key.to_bytes(),
     )
     .await?;
 
@@ -144,7 +152,11 @@ async fn main() -> Result<()> {
     )
     .await?;
 
-    let controller = Arc::new(Controller::<LmdbStore>::new(io_handler, permission_manager));
+    let controller = Arc::new(Controller::<LmdbStore>::new(
+        io_handler,
+        permission_manager,
+        token_handler,
+    ));
     let rest_handle = tokio::spawn(async move {
         RestServer::run(controller, rest_addr, CONFIG.frontend.openapi_frontend.port).await
     })
@@ -198,31 +210,37 @@ where
         )
         .await?;
 
+    let access_key_id = Ulid::from_string("01JYEH75CM8DGP5PZWZ3K2BVVN")?;
     let access_info = UserAccess {
-        user_id,
+        user_id: user_identity.clone(),
         group_id,
         secret: "PT97PKZjFdtj59umdqHuU54rTauknd".to_string(),
     };
     store.put(
         &mut write_txn,
         ACCESS_DB_NAME,
-        &xor_ulids(&user_id, &group_id),
+        &access_key_id.to_bytes(), //&xor_ulids(&user_id, &group_id).unwrap(),
         &bincode::serde::encode_to_vec(access_info, bincode::config::standard())?,
     )?;
 
+    let access_key_id = Ulid::from_string("01JYEH7Y5QAE4XN3TDZCM4K8VS")?;
     let access_info = UserAccess {
-        user_id,
+        user_id: user_identity,
         group_id: Ulid::from_string("01JWX8CR80KRHW5XFVKHPJ6Z5D")?, // Other group
         secret: "gSVpgA2sFFPv06yiS87kEhKGe8IL02".to_string(),
     };
     store.put(
         &mut write_txn,
         ACCESS_DB_NAME,
-        &xor_ulids(&user_id, &access_info.group_id),
+        &access_key_id.to_bytes(), //&xor_ulids(&user_id, &access_info.group_id).unwrap(),
         &bincode::serde::encode_to_vec(access_info, bincode::config::standard())?,
     )?;
 
     store.commit(write_txn)?;
+
+    tracing::info!("{:?}", manager.get_group_roles(group_id).await);
+    tracing::info!("{:?}", manager.get_role_users(group_id, "admin").await);
+    tracing::info!("{:?}", manager.get_role_policies(group_id, "admin").await);
 
     Ok(())
 }

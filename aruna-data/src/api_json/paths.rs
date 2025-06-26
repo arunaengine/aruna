@@ -98,7 +98,7 @@ where
 pub async fn register_data<St>(
     State(state): State<Arc<Controller<St>>>,
     headers: HeaderMap,
-    Json(request): Json<DeleteS3CredentialsRequest>,
+    Json(request): Json<RegisterDataRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
