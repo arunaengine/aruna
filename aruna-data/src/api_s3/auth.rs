@@ -1,6 +1,7 @@
 use crate::api_s3::util::get_s3_operation_permission;
 use crate::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME};
 use anyhow::anyhow;
+use aruna_permission::UserIdentity;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::{PathBuilder, RealmKey};
 use aruna_storage::storage::store::Store;
@@ -15,7 +16,7 @@ use ulid::Ulid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserAccess {
-    pub user_id: Ulid,
+    pub user_id: UserIdentity,
     pub group_id: Ulid,
     pub secret: String,
     //filter
@@ -49,6 +50,7 @@ where
 {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // Fetch user access
+        tracing::info!("{:#?}", cx.credentials());
         let user_access = self
             .query_user_access(
                 cx.credentials()
@@ -59,6 +61,7 @@ where
                     .to_string(),
             )
             .await?;
+        debug!(?user_access);
 
         // Evaluate action from operation name
         let action = get_s3_operation_permission(cx.s3_op().name())
@@ -71,9 +74,11 @@ where
                 builder.group_data_bucket_wildcard(user_access.group_id, bucket.to_string())
             }
             S3Path::Object { bucket, key } => {
+                tracing::info!("Bucket: {}, Key: {}", bucket, key);
                 let kkey = key.to_string();
                 let path = std::path::Path::new(&kkey);
                 let parent = path.parent().ok_or_else(|| s3_error!(InvalidKeyPath))?;
+
                 builder.group_data_key_prefix_wildcard(
                     user_access.group_id,
                     bucket.to_string(),
@@ -88,17 +93,36 @@ where
         .build()
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
+        tracing::info!("{}", perm_path.to_string());
+        tracing::info!(
+            "{:?}",
+            self.permission_manager
+                .get_group_roles(user_access.group_id)
+                .await
+        );
+        tracing::info!(
+            "{:?}",
+            self.permission_manager
+                .get_role_users(user_access.group_id, "admin")
+                .await
+        );
+        tracing::info!(
+            "{:?}",
+            self.permission_manager
+                .get_role_policies(user_access.group_id, "admin")
+                .await
+        );
+
         let allowed = self
             .permission_manager
-            .enforcer
-            .read()
-            .await
-            .enforce(
-                &user_access.user_id.to_string(),
-                &perm_path.to_string(),
-                &action.to_string(),
+            .check_path(
+                &user_access.user_id,
+                &perm_path,
+                action,
+                self.store.as_ref(),
             )
-            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+            .await
+            .map_err(|e| s3_error!(InternalError, "Permission check failed: {}", e))?;
         debug!("{} allowed: {}", cx.s3_op().name(), allowed);
 
         match allowed {
@@ -123,9 +147,11 @@ where
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
             // Fetch access info for user
-            let info: UserAccess = if let Some(info_raw) =
-                store_clone.get(&mut read_txn, ACCESS_DB_NAME, access_key_id.as_bytes())?
-            {
+            let info: UserAccess = if let Some(info_raw) = store_clone.get(
+                &mut read_txn,
+                ACCESS_DB_NAME,
+                &Ulid::from_string(&access_key_id)?.to_bytes(),
+            )? {
                 bincode::serde::decode_from_slice(&*info_raw, bincode::config::standard())?.0
             } else {
                 return Err(anyhow!("No access info found"));

@@ -16,11 +16,3 @@ pub fn into_axum_response<T: Serialize>(response: Result<T, ArunaDataError>) -> 
         .map(|r| (axum::http::StatusCode::OK, Json(r)).into_response())
         .unwrap_or_else(|e| e.into_axum_tuple().into_response())
 }
-
-pub fn xor_ulids(a: &Ulid, b: &Ulid) -> Vec<u8> {
-    a.to_bytes()
-        .iter()
-        .zip(b.to_bytes().iter())
-        .map(|(x1, x2)| *x1 ^ *x2)
-        .collect()
-}

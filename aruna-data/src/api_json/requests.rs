@@ -1,9 +1,9 @@
 use crate::api_json::request::{Request, User};
-use crate::api_json::util::xor_ulids;
 use crate::api_s3::auth::UserAccess;
 use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
 use crate::io::io_handler::ACCESS_DB_NAME;
+use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
@@ -43,16 +43,17 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &Controller<St>,
     ) -> Result<Self::Response, ArunaDataError> {
         let Some(user) = user else {
             return Err(ArunaDataError::Unauthorized);
         };
 
+        let access_key_id = Ulid::new();
         let access_info = UserAccess {
-            user_id: user.id,
-            group_id: user.group,
+            user_id: user,
+            group_id: Ulid::from_string(&self.group_id)?,
             secret: thread_rng()
                 .sample_iter(&Alphanumeric)
                 .take(30)
@@ -61,6 +62,7 @@ where
         };
 
         let store_clone = controller.io_handler.store.clone();
+        let access_key_id_clone = access_key_id.clone();
         let access_info_clone = access_info.clone();
         tokio::task::spawn_blocking(move || {
             let mut write_txn = store_clone.create_txn(true)?;
@@ -69,7 +71,7 @@ where
             store_clone.put(
                 &mut write_txn,
                 ACCESS_DB_NAME,
-                &xor_ulids(&user.id, &user.group),
+                &access_key_id_clone.to_bytes(),
                 &bincode::serde::encode_to_vec(access_info_clone, bincode::config::standard())?,
             )?;
 
@@ -79,7 +81,7 @@ where
         });
 
         Ok(CreateS3CredentialsResponse {
-            access_key_id: access_info.user_id,
+            access_key_id,
             secret_access_key: access_info.secret.to_string(),
         })
     }
@@ -115,7 +117,7 @@ where
     #[tracing::instrument(level = "trace", skip(_controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         _controller: &Controller<St>,
     ) -> Result<Self::Response, ArunaDataError> {
         let Some(_user) = user else {
@@ -158,7 +160,7 @@ where
     #[tracing::instrument(level = "trace", skip(_controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         _controller: &Controller<St>,
     ) -> Result<Self::Response, ArunaDataError> {
         let Some(_user) = user else {
@@ -175,6 +177,7 @@ where
 pub struct RegisterDataRequest {
     group_id: String,
     backend_path: String,
+    bucket: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
@@ -192,16 +195,17 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        user: Option<User>,
+        user: Option<UserIdentity>,
         controller: &Controller<St>,
     ) -> Result<Self::Response, ArunaDataError> {
         let Some(user) = user else {
             return Err(ArunaDataError::Unauthorized);
         };
 
+        let group_id = Ulid::from_string(&self.group_id)?;
         let frontend_path = controller
             .io_handler
-            .register_backend_data(&self.backend_path, user.group)
+            .register_backend_data(&self.backend_path, group_id)
             .await
             .map_err(|e| ArunaDataError::IoError(e.to_string()))?;
 

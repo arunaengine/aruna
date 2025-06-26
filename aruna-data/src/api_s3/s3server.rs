@@ -4,6 +4,7 @@ use crate::api_s3::auth::AuthProvider;
 use crate::config::config::S3Frontend;
 use anyhow::Result;
 use aruna_permission::manager::PermissionManager;
+use aruna_permission::paths::RealmKey;
 use aruna_storage::storage::lmdb::LmdbStore;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -28,7 +29,6 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing::{debug, error};
-use aruna_permission::paths::RealmKey;
 
 pub struct S3Server {
     s3service: S3Service,
