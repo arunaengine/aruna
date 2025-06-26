@@ -518,6 +518,40 @@ impl PermissionManager {
         self.unify_identities_commit(prepare).await
     }
 
+    /// Check if a user has permission to access a path
+    pub async fn check_path<S>(
+        &self,
+        identity: &UserIdentity,
+        path: &Path,
+        action: Action,
+        store: &S,
+    ) -> Result<bool>
+    where
+        for<'a> S: Store<'a> + 'static,
+    {
+        let store = store.clone();
+        let permission_manager = self.clone();
+        let identity = identity.clone();
+
+        let ulid = tokio::task::spawn_blocking(move || -> Result<Ulid> {
+            let txn = store.create_txn(false)?;
+
+            let permission_ulid =
+                permission_manager.resolve_permission_ulid(&identity, &store, &txn)?;
+
+            store.commit(txn)?;
+
+            Ok(permission_ulid)
+        })
+        .await??;
+        let res = self.enforcer.read().await.enforce(
+            &ulid.to_string(),
+            &path.to_string(),
+            &action.to_string(),
+        );
+        Ok(res?)
+    }
+
     /// Check if a user has permission to access a resource
     pub async fn check_permission<S>(
         &self,
