@@ -53,16 +53,14 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(store_config, search_config))]
+    #[tracing::instrument(level = "trace", skip(store, search_config))]
     pub async fn new(
         res_sdx: tokio::sync::mpsc::Sender<(u32, Resource)>,
-        store_config: <St as Store<'static>>::StoreConfig,
+        store: St,
         search_config: Se::SearchConfig,
         realm_key: [u8; 32],
         oidc_trust_config: OidcTrustConfig,
     ) -> Result<Self, ArunaMetadataError> {
-        let store = St::new(store_config)?;
-
         let permission_manager = PermissionManager::new().await?;
         let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_trust_config)));
 

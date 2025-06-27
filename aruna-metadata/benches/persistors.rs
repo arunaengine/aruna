@@ -11,6 +11,7 @@ use aruna_metadata::{
 use aruna_permission::token::OidcTrustConfig;
 use aruna_storage::storage::fjall::{FjallConfig, FjallStore};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
+use aruna_storage::storage::store::Store;
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -42,7 +43,7 @@ impl TantivyFjall {
         let persistor = Arc::new(
             Persistor::new(
                 res_sdx,
-                store_config,
+                FjallStore::new(store_config).unwrap(),
                 search_config,
                 realm_key,
                 oidc_trust_config,
@@ -156,7 +157,7 @@ impl TantivyHeed {
         let persistor = Arc::new(
             Persistor::new(
                 res_sdx,
-                store_config,
+                LmdbStore::new(store_config).unwrap(),
                 search_config,
                 realm_key,
                 oidc_trust_config,

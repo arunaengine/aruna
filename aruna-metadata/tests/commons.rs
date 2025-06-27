@@ -19,7 +19,10 @@ use aruna_permission::{
     OidcToken, UserIdentity,
     token::{Ed25519KeyPair, OidcTrustConfig},
 };
-use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
+use aruna_storage::storage::{
+    lmdb::{LmdbConfig, LmdbStore},
+    store::Store,
+};
 use chrono::Months;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
@@ -110,7 +113,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
         Persistor::new(
             res_sdx,
-            store_config,
+            LmdbStore::new(store_config)?,
             search_config,
             realm_key.verifying_key().as_bytes().clone(),
             OidcTrustConfig::TrustAll,
@@ -171,7 +174,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
             Persistor::new(
                 res_sdx,
-                store_config,
+                LmdbStore::new(store_config)?,
                 search_config,
                 realm_key.verifying_key().as_bytes().clone(),
                 OidcTrustConfig::TrustAll,
@@ -228,7 +231,7 @@ pub async fn create_user_with_token(
     test: &TestServers,
     name: String,
 ) -> Result<(UserIdentity, String)> {
-    let (controller, url) = test.addr_server_pairs.first().unwrap();
+    let (controller, _) = test.addr_server_pairs.first().unwrap();
 
     let request = AddUserRequest { name: name.clone() };
     let response = request

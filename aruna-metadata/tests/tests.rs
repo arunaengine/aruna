@@ -11,7 +11,6 @@ mod tests {
                 CreateResourceRequest, GetResourceResponse, SearchResponse,
             },
         },
-        network::network_trait::Network,
         transactions::request::Request,
     };
     use std::time::Duration;
@@ -33,7 +32,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_secs(5));
 
-        for (controller, url) in servers.iter() {
+        for (controller, _) in servers.iter() {
             assert!(
                 controller
                     .persistence

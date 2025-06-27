@@ -7,8 +7,7 @@ use crate::{
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use iroh::{
-    Endpoint, NodeAddr, NodeId, RelayMode, SecretKey,
-    endpoint::{Builder, Connection, Incoming, RecvStream, SendStream},
+    endpoint::{Builder, Connection, Incoming, RecvStream, SendStream}, Endpoint, NodeAddr, NodeId, RelayMode, SecretKey, Watcher
 };
 use log::warn;
 use std::{collections::HashMap, time::Duration};
@@ -48,7 +47,7 @@ impl NetworkActorBuilder {
 
         let endpoint = Builder::default()
             .alpns(vec![ARUNA_NET_ALPN.to_vec()])
-            .add_discovery(move |_| Some(handle_clone))
+            .add_discovery(handle_clone)
             .relay_mode(RelayMode::Disabled)
             .secret_key(secret_key);
 
@@ -101,7 +100,7 @@ impl NetworkActorBuilder {
             endpoint.add_node_addr(node_addr.clone())?;
         }
         let init_actor_handle = InitActorHandle::new(self.command.sender().clone());
-        let node_addr = endpoint.node_addr().await?;
+        let node_addr = endpoint.node_addr().initialized().await?;
         NetworkActor::new(
             endpoint,
             self.command,
@@ -305,7 +304,7 @@ impl NetworkActor {
                             },
                             NetworkRequests::GetNodeAddr { return_channel } => {
                                 // Get the node address and send it to the command channel
-                                let Ok(node_addr) = self.endpoint.node_addr().await else {
+                                let Ok(node_addr) = self.endpoint.node_addr().initialized().await else {
                                     warn!("cannot get node address");
                                     continue;
                                 };

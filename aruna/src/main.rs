@@ -8,17 +8,22 @@ use aruna_metadata::{
     transactions::controller::Controller,
 };
 use aruna_permission::token::OidcTrustConfig;
-use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
+use aruna_storage::storage::{
+    lmdb::{LmdbConfig, LmdbStore},
+    store::Store,
+};
 use ed25519_dalek::SigningKey;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
     sync::Arc,
+    time::Duration,
 };
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 pub async fn main() {
@@ -62,21 +67,8 @@ pub async fn main() {
         .init();
 
     // parse config
-    let config = todo!();
-    start_metadata(config);
-}
+    let config: Config = todo!();
 
-pub struct Config {
-    pub path: String,
-    pub oidc_trust_config: OidcTrustConfig,
-    pub token_handler_realm_keys: String,
-    pub realm_key: SigningKey,
-    pub p2p_address: String,
-    pub p2p_port: u16,
-    pub api_port: u16,
-}
-
-pub async fn start_metadata(config: Config) {
     let databases = vec![
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,
@@ -90,6 +82,31 @@ pub async fn start_metadata(config: Config) {
         PUBLIC_MAPPINGS_DB_NAME,
     ];
 
+    let store_path = format!("{}/heed", config.path);
+    let store_config = LmdbConfig {
+        path: store_path,
+        databases: databases.clone(),
+    };
+
+    let store = LmdbStore::new(store_config).unwrap();
+
+    start_metadata(config, store).await;
+}
+
+pub struct Config {
+    pub path: String,
+    pub oidc_trust_config: OidcTrustConfig,
+    pub token_handler_realm_keys: String,
+    pub realm_key: SigningKey,
+    pub p2p_address: String,
+    pub p2p_port: u16,
+    pub api_port: u16,
+}
+
+pub async fn start_metadata<S>(config: Config, store: S)
+where
+    for<'a> S: Store<'a> + 'static,
+{
     let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
     let tantivy_path = format!("{}/tantivy", config.path);
     let search_config = TantivyConfig {
@@ -97,16 +114,11 @@ pub async fn start_metadata(config: Config) {
         index_buffer: 1_000_000_000,
         resources: res_rcv,
     };
-    let store_path = format!("{}/heed", config.path);
-    let store_config = LmdbConfig {
-        path: store_path,
-        databases: databases.clone(),
-    };
 
-    let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
+    let persistor: Arc<Persistor<S, TantivySearch>> = Arc::new(
         Persistor::new(
             res_sdx,
-            store_config,
+            store,
             search_config,
             config.realm_key.verifying_key().to_bytes().clone(),
             config.oidc_trust_config,
@@ -134,7 +146,7 @@ pub async fn start_metadata(config: Config) {
         .unwrap(),
     );
 
-    let controller = Arc::new(Controller::<LmdbStore, TantivySearch, P2PNetwork>::new(
+    let controller = Arc::new(Controller::<S, TantivySearch, P2PNetwork>::new(
         persistor,
         network.clone(),
     ));

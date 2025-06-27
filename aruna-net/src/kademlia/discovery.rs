@@ -1,6 +1,9 @@
+use std::pin::Pin;
+
+use futures::{Stream, TryFutureExt};
 use iroh::{
     Endpoint, NodeId,
-    discovery::{Discovery, DiscoveryItem},
+    discovery::{Discovery, DiscoveryError, DiscoveryItem},
     node_info::{NodeData, NodeInfo},
 };
 
@@ -9,14 +12,37 @@ use tracing::{error, trace};
 
 use super::kademlia::Kademlia;
 
+#[derive(Debug)]
+pub struct ErrorWrapper {
+    error: String,
+}
+impl std::fmt::Display for ErrorWrapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let path = &self.error;
+        write!(f, "unable to read configuration at {path}")
+    }
+}
+
+impl std::error::Error for ErrorWrapper {}
+
 impl Discovery for Kademlia {
     fn publish(&self, _data: &NodeData) {}
 
     fn resolve(
         &self,
-        _endpoint: Endpoint,
+        //_endpoint: Endpoint,
         node_id: NodeId,
-    ) -> Option<BoxStream<anyhow::Result<DiscoveryItem>>> {
+    ) -> std::option::Option<
+        Pin<
+            Box<
+                (
+                    dyn Stream<Item = Result<DiscoveryItem, DiscoveryError>>
+                        + std::marker::Send
+                        + 'static
+                ),
+            >,
+        >,
+    > {
         trace!("resolve {:?}", node_id);
 
         let target = *node_id.as_bytes();
@@ -32,7 +58,11 @@ impl Discovery for Kademlia {
                 }
                 Err(e) => {
                     trace!("resolve error {:?}", e);
-                    return Err(anyhow::anyhow!("resolve error {:?}", e));
+                    let err = ErrorWrapper {
+                        error: e.to_string(),
+                    };
+                    return Err(DiscoveryError::from_err("anyhow", err));
+                    //return Err(anyhow::anyhow!("resolve error {:?}", e));
                 }
             };
 
@@ -41,7 +71,10 @@ impl Discovery for Kademlia {
                 .first()
                 .ok_or_else(|| {
                     error!("No nodes found for target {:?}", target);
-                    anyhow::anyhow!("No nodes found for target {:?}", target)
+                    let e = ErrorWrapper {
+                        error: format!("No nodes found for target {:?}", target),
+                    };
+                    DiscoveryError::from_err("anyhow_error", e)
                 })?
                 .addr();
 
@@ -50,7 +83,7 @@ impl Discovery for Kademlia {
                 node_addr.direct_addresses.clone(),
             );
 
-            Ok(DiscoveryItem::new(
+            Ok::<DiscoveryItem, DiscoveryError>(DiscoveryItem::new(
                 NodeInfo::from_parts(node_id, node_data),
                 "ARUNA_KADEMLIA",
                 None,

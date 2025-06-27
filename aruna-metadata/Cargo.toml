@@ -25,7 +25,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true } 
 tracing-subscriber = { workspace = true }
-tracing-opentelemtry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
 utoipa = { workspace = true }
 utoipa-axum = { workspace = true }
@@ -43,7 +43,7 @@ chrono = { version = "0.4.41", features = ["serde"]}
 hex = "0.4.3"
 rayon = "1.10.0"
 reqwest = { version = "0.12.15", features = ["json"] }
-roaring = "0.10.12"
+roaring = "0.11.0"
 tantivy = "0.24.1"
 tower-http = { version = "0.6.2", features = ["cors", "trace"] }
 typetag = "0.2.20"

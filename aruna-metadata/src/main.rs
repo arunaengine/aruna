@@ -7,6 +7,7 @@ use aruna_storage::storage::fjall::FjallConfig;
 use aruna_storage::storage::fjall::FjallStore;
 use aruna_storage::storage::lmdb::LmdbConfig;
 use aruna_storage::storage::lmdb::LmdbStore;
+use aruna_storage::storage::store::Store;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use iroh::KeyParsingError;
@@ -165,7 +166,7 @@ async fn main() {
             let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
                 Persistor::new(
                     res_sdx,
-                    store_config,
+                    LmdbStore::new(store_config).unwrap(),
                     search_config,
                     *realm_key.as_bytes(),
                     oidc_config,
@@ -251,7 +252,7 @@ async fn main() {
             let persistor: Arc<Persistor<FjallStore, TantivySearch>> = Arc::new(
                 Persistor::new(
                     res_sdx,
-                    store_config,
+                    FjallStore::new(store_config).unwrap(),
                     search_config,
                     *realm_key.as_bytes(),
                     oidc_config,

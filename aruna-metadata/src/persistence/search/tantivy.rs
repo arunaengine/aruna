@@ -34,6 +34,8 @@ impl std::fmt::Debug for TantivySearch {
     }
 }
 
+
+// TODO: Couple fields with models
 #[derive(Clone, Debug)]
 struct Fields {
     ids: Field,
@@ -274,6 +276,7 @@ impl Fields {
             self.last_modified,
             tantivy::DateTime::from_timestamp_secs(resource.last_modified.timestamp()),
         );
+        // TODO: Fixme
         doc.add_object(
             self.authors,
             resource

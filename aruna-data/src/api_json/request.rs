@@ -1,5 +1,6 @@
 use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
+use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -22,7 +23,7 @@ where
     type Response;
     async fn run_request(
         self,
-        requester: Option<User>,
+        requester: Option<UserIdentity>,
         controller: &Controller<St>,
     ) -> Result<Self::Response, ArunaDataError>;
 
