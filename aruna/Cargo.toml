@@ -11,9 +11,11 @@ aruna-data = { path = "../aruna-data" }
 aruna-storage = { path = "../aruna-storage" }
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
+iroh = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true } 
 tracing-subscriber = { workspace = true }

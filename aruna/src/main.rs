@@ -1,5 +1,7 @@
 use aruna_metadata::{
     api::server::RestServer,
+    error::ArunaMetadataError,
+    models::models::Resource,
     network::network_trait::{Network, NetworkConfig, P2PNetwork},
     persistence::{
         persistence::{Persistor, tables::*},
@@ -7,23 +9,47 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
-use aruna_permission::token::OidcTrustConfig;
+use aruna_permission::{token::{Ed25519KeyPair, OidcTrustConfig}, PermissionError};
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
 };
 use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::DecodePrivateKey;
+use iroh::KeyParsingError;
+use iroh::NodeAddr;
+use iroh::PublicKey;
+use iroh::SecretKey;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::prelude::*;
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
+    num::ParseIntError,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
+use thiserror::Error;
+use tracing::trace;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::prelude::*;
+
+#[derive(Debug, Error)]
+pub enum ArunaError {
+    #[error("ArunaMetadataError: {0}")]
+    MetadataError(#[from] ArunaMetadataError),
+    #[error("DotenvyError: {0}")]
+    DotenvyError(#[from] dotenvy::Error),
+    #[error("KeyParsingError: {0}")]
+    KeyParsingError(#[from] KeyParsingError),
+    #[error("ParseIntError: {0}")]
+    ParseIntError(#[from] ParseIntError),
+    #[error("SigningKeyError: {0}")]
+    SigningKeyError(#[from] ed25519_dalek::pkcs8::Error),
+    #[error("PermissionError: {0}")]
+    PermissionError(#[from] PermissionError),
+}
 
 #[tokio::main]
 pub async fn main() {
@@ -67,7 +93,7 @@ pub async fn main() {
         .init();
 
     // parse config
-    let config: Config = todo!();
+    let config: Config = parse_config().unwrap();
 
     let databases = vec![
         aruna_permission::DBNAME,
@@ -90,20 +116,26 @@ pub async fn main() {
 
     let store = LmdbStore::new(store_config).unwrap();
 
-    start_metadata(config, store).await;
+    let metadata_future = start_metadata(config, store);
+    let data_future = async move {todo!()};
+
+    tokio::join!(metadata_future, data_future);
+
 }
 
 pub struct Config {
     pub path: String,
     pub oidc_trust_config: OidcTrustConfig,
-    pub token_handler_realm_keys: String,
+    pub token_handler_realm_keys: Ed25519KeyPair,
     pub realm_key: SigningKey,
     pub p2p_address: String,
     pub p2p_port: u16,
     pub api_port: u16,
+    pub search_config: TantivyConfig,
+    pub resource_to_search_sender: tokio::sync::mpsc::Sender<(u32, Resource)>,
 }
 
-pub async fn start_metadata<S>(config: Config, store: S)
+pub async fn start_metadata<S>(config: Config, store: S) -> Result<(), ArunaError>
 where
     for<'a> S: Store<'a> + 'static,
 {
@@ -123,39 +155,102 @@ where
             config.realm_key.verifying_key().to_bytes().clone(),
             config.oidc_trust_config,
         )
-        .await
-        .unwrap(),
+        .await?,
     );
 
     persistor.token_handler.write().add_realm_public_key(
         config.realm_key.verifying_key().to_bytes().clone(),
-        config.token_handler_realm_keys,
+        config.token_handler_realm_keys.verifying_key_pem()?,
     );
 
     let network = Arc::new(
         P2PNetwork::new(NetworkConfig {
             secret_key: None,
             socket_addr: SocketAddrV4::new(
-                Ipv4Addr::from_str(&config.p2p_address).unwrap(),
+                Ipv4Addr::from_str(&config.p2p_address)
+                    .map_err(|e| ArunaMetadataError::ConfigError(e.to_string()))?,
                 config.p2p_port,
             ),
             bootstrap_nodes: vec![],
             realm_key: config.realm_key.clone(),
         })
-        .await
-        .unwrap(),
+        .await?,
     );
 
     let controller = Arc::new(Controller::<S, TantivySearch, P2PNetwork>::new(
         persistor,
         network.clone(),
     ));
-    Network::start_actor(network, controller.clone())
-        .await
-        .unwrap();
+    Network::start_actor(network, controller.clone()).await?;
 
     let controller_clone = controller.clone();
     tokio::spawn(async move { RestServer::run(controller_clone, config.api_port).await });
 
-    controller.network.get_addr().await.unwrap();
+    controller.network.get_addr().await?;
+    Ok(())
+}
+
+pub fn parse_config() -> Result<Config, ArunaError> {
+    let path = dotenvy::var("DBPATH")?;
+    let api_port = dotenvy::var("API_PORT")?.parse()?;
+    let p2p_port = dotenvy::var("P2P_PORT")?.parse()?;
+    let p2p_address = dotenvy::var("P2P_ADDRESS")?;
+    let p2p_secret_key = if let Ok(key) = dotenvy::var("P2P_SECRET_KEY") {
+        if key.is_empty() {
+            None
+        } else {
+            Some(SecretKey::from_str(&key)?)
+        }
+    } else {
+        None
+    };
+    let realm_key = SigningKey::from_pkcs8_pem(&dotenvy::var("REALM_KEY")?)?;
+    // TODO: Parse from config
+    let signing_key = SigningKey::from_pkcs8_pem(&dotenvy::var("TOKEN_SIGNING_KEY")?)?;
+    let verifying_key = signing_key.verifying_key();
+    let token_handler_realm_keys = Ed25519KeyPair {
+        signing_key,
+        verifying_key,
+    };
+
+    let oidc_trust_config = OidcTrustConfig::TrustAll;
+    let bootstrap_nodes: Vec<NodeAddr> = match dotenvy::var("BOOTSTRAP_NODES") {
+        Ok(env_var) => env_var
+            .split(";")
+            .map(|key| {
+                Ok(NodeAddr::from_parts(
+                    PublicKey::from_str(key)?,
+                    None,
+                    Some(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 1230).into()),
+                ))
+            })
+            .collect::<Result<Vec<NodeAddr>, KeyParsingError>>()
+            .unwrap(),
+        Err(_) => vec![],
+    };
+    let variant = dotenvy::var("VARIANT").unwrap();
+
+    trace!(
+        "DB_VARIANT: {variant} on {path} API: {api_port} P2P: {p2p_port} P2P_KEY: {p2p_secret_key:?} BOOTSTRAP_NODES: {bootstrap_nodes:?}",
+    );
+
+    let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
+    let tantivy_path = format!("{path}/tantivy");
+    let search_config = TantivyConfig {
+        path: tantivy_path,
+        index_buffer: 1_000_000_000,
+        resources: res_rcv,
+    };
+
+    Ok(Config {
+        path,
+        oidc_trust_config,
+        realm_key,
+        p2p_port,
+        api_port,
+        p2p_address,
+        search_config,
+        resource_to_search_sender: res_sdx,
+        token_handler_realm_keys,
+    })
 }
