@@ -3,9 +3,8 @@ use aruna_data::api_json::server::RestServer;
 use aruna_data::api_s3::auth::UserAccess;
 use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::io::controller::Controller;
-use aruna_data::io::io_handler::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICATION_PROTOCOL_ID};
-use aruna_data::io::io_handler::{IOHandler, LOCATION_DB_NAME};
-use aruna_data::{config::config::Config, util::opendal::get_operator};
+use aruna_data::io::io_handler::{IOHandler, REPLICATION_PROTOCOL_ID};
+use aruna_data::util::opendal::get_operator;
 use aruna_net::actor::NetworkActorBuilder;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::RealmKey;
@@ -17,7 +16,6 @@ use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use futures_util::TryFutureExt;
 use iroh::SecretKey;
-use lazy_static::lazy_static;
 use parking_lot::RwLock;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
@@ -26,16 +24,8 @@ use tokio::try_join;
 use tracing::{Level, debug, error};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
-
-lazy_static! {
-    static ref CONFIG: Config = {
-        dotenvy::from_filename(".env").ok();
-        let config_file = dotenvy::var("CONFIG").unwrap_or("config.toml".to_string());
-        let config: Config =
-            toml::from_str(std::fs::read_to_string(config_file).unwrap().as_str()).unwrap();
-        config
-    };
-}
+use aruna_data::config::config;
+use aruna_data::io::io_handler::tables::{ACCESS_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,22 +47,23 @@ async fn main() -> Result<()> {
         .with_line_number(true)
         .with_target(false)
         .finish();
-
     tracing::subscriber::set_global_default(subscriber)?;
-
-    debug!(config = ?*CONFIG);
-    let realm_key = VerifyingKey::from_public_key_pem(&CONFIG.general.realm_key)?; // Also validates key format
-    let node_key = SecretKey::from_str(&CONFIG.general.node_key)?;
-    let rest_addr = Ipv4Addr::from_str(&CONFIG.frontend.openapi_frontend.address)?;
+    
+    let config = config::Config::load_from_env()?;
+    debug!(?config);
+    
+    let realm_key = VerifyingKey::from_public_key_pem(&config.general.realm_key)?; // Also validates key format
+    let node_key = SecretKey::from_str(&config.general.node_key)?;
+    let rest_addr = Ipv4Addr::from_str(&config.frontend.openapi_frontend.address)?;
 
     // Dummy access conf which is provided by user/request/node
-    let op_conf = CONFIG.backend.access.clone();
-    let operator = get_operator(&CONFIG.backend.backend_type, op_conf).await?;
+    let op_conf = config.backend.access.clone();
+    let operator = get_operator(&config.backend.backend_type, op_conf).await?;
 
     match operator.check().await {
         Ok(_) => debug!(
             "Connection to {} backend succeeded",
-            CONFIG.backend.backend_type
+            config.backend.backend_type
         ),
         Err(err) => {
             error!("Connection to backend failed: {}", err);
@@ -94,7 +85,7 @@ async fn main() -> Result<()> {
     let kademlia = actor_handle.get_kademlia_actor_handle().await?;
 
     let lmdb_config = LmdbConfig {
-        path: CONFIG.persistence.path.to_string(),
+        path: config.persistence.path.to_string(),
         databases: vec![
             ACCESS_DB_NAME,
             LOCATION_DB_NAME,
@@ -144,7 +135,7 @@ async fn main() -> Result<()> {
     // -----------------------------------
 
     let s3server = S3Server::new(
-        CONFIG.frontend.s3_frontend.clone(),
+        config.frontend.s3_frontend.clone(),
         io_handler.clone(),
         permission_manager.clone(),
         node_addr.node_id,
@@ -158,7 +149,7 @@ async fn main() -> Result<()> {
         token_handler,
     ));
     let rest_handle = tokio::spawn(async move {
-        RestServer::run(controller, rest_addr, CONFIG.frontend.openapi_frontend.port).await
+        RestServer::run(controller, rest_addr, config.frontend.openapi_frontend.port).await
     })
     .map_err(|e| {
         error!(error = ?e, msg = e.to_string());

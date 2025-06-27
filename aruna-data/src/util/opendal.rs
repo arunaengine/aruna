@@ -4,6 +4,7 @@ use opendal::{Builder, FuturesAsyncReader, FuturesBytesStream, Operator, Reader,
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::str::FromStr;
 
 #[derive(Debug, Serialize, Deserialize)]
 // Currently supported backends
@@ -13,6 +14,21 @@ pub enum Backend {
     Memory,
     Postgres,
     FileSystem,
+}
+
+impl FromStr for Backend {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "s3" => Ok(Backend::S3),
+            "http" => Ok(Backend::HTTP),
+            "memory" => Ok(Backend::Memory),
+            "postgres" => Ok(Backend::Postgres),
+            "filesystem" => Ok(Backend::FileSystem),
+            _ => Err(anyhow::Error::msg("unknown backend")),
+        }
+    }
 }
 
 impl Display for Backend {
