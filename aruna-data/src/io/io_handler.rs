@@ -26,12 +26,16 @@ use std::ops::Range;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
 use ulid::Ulid;
+use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 
 pub const REPLICATION_PROTOCOL_ID: u32 = 2;
 pub const BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); //2^16 bytes
-pub const ACCESS_DB_NAME: &str = "user_access";
-pub const LOCATION_DB_NAME: &str = "locations";
-pub const PATH_LOCATION_DB_NAME: &str = "path_locations_mapping";
+
+pub mod tables {
+    pub const ACCESS_DB_NAME: &str = "user_access";
+    pub const LOCATION_DB_NAME: &str = "locations";
+    pub const PATH_LOCATION_DB_NAME: &str = "path_locations_mapping";
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hashes {

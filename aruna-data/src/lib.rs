@@ -9,3 +9,4 @@ pub mod io;
 pub mod util;
 
 pub use io::io_handler::IOHandler;
+pub use crate::io::io_handler::tables::{ACCESS_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};

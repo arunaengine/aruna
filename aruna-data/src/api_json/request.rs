@@ -2,18 +2,6 @@ use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
-use serde::{Deserialize, Serialize};
-use ulid::Ulid;
-use utoipa::ToSchema;
-
-#[derive(
-    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
-)]
-pub struct User {
-    pub id: Ulid,
-    pub name: String,
-    pub group: Ulid,
-}
 
 #[async_trait::async_trait]
 pub trait Request<St>

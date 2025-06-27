@@ -1,6 +1,6 @@
 use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
-use crate::io::io_handler::{LOCATION_DB_NAME, ObjectInfo, PATH_LOCATION_DB_NAME};
+use crate::io::io_handler::{ObjectInfo};
 use anyhow::Result;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 use ulid::Ulid;
+use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 
 pub struct ArunaS3Service<St>
 where

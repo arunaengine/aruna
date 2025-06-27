@@ -1,8 +1,7 @@
-use crate::api_json::request::{Request, User};
+use crate::api_json::request::Request;
 use crate::api_s3::auth::UserAccess;
 use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
-use crate::io::io_handler::ACCESS_DB_NAME;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use rand::distributions::Alphanumeric;
@@ -10,6 +9,7 @@ use rand::{Rng, thread_rng};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
+use crate::io::io_handler::tables::ACCESS_DB_NAME;
 
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
