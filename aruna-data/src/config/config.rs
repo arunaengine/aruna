@@ -3,9 +3,12 @@ use s3s::host::{S3Host, VirtualHost};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
+use ed25519_dalek::pkcs8::DecodePrivateKey;
+use ed25519_dalek::SigningKey;
+use iroh::SecretKey;
 use crate::util::opendal::Backend;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub general: General,
     pub persistence: Persistence,
@@ -13,20 +16,22 @@ pub struct Config {
     pub frontend: Frontend,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct General {
-    pub realm_key: String,
-    pub node_key: String,
+    pub realm_key: SigningKey,
+    pub node_key: SecretKey,
+    pub p2p_address: String,
+    pub p2p_port: u16,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct Persistence {
     pub path: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub struct BackendConfig {
     pub backend_type: Backend,
@@ -65,8 +70,10 @@ impl Config {
         }
         
         let general = General { 
-            realm_key: dotenvy::var("REALM_KEY")?.to_string(), 
-            node_key: dotenvy::var("NODE_KEY")?.to_string()
+            realm_key: SigningKey::from_pkcs8_pem(&dotenvy::var("REALM_KEY")?)?,
+            node_key: SecretKey::from_str(&dotenvy::var("NODE_KEY")?)?,
+            p2p_address: dotenvy::var("P2P_ADDRESS")?,
+            p2p_port: dotenvy::var("P2P_PORT")?.parse()?,
         };
         
         let persistence = Persistence {

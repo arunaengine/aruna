@@ -214,7 +214,7 @@ pub struct NetworkConfig {
 }
 
 pub struct P2PNetwork {
-    chandler: NetworkActorHandle,
+    pub chandler: NetworkActorHandle,
     realm_handler: Realm,
 }
 

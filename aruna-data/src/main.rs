@@ -12,10 +12,7 @@ use aruna_permission::token::OidcTrustConfig;
 use aruna_permission::{TokenSystem, UserIdentity};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
-use ed25519_dalek::VerifyingKey;
-use ed25519_dalek::pkcs8::DecodePublicKey;
 use futures_util::TryFutureExt;
-use iroh::SecretKey;
 use parking_lot::RwLock;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
@@ -52,8 +49,6 @@ async fn main() -> Result<()> {
     let config = config::Config::load_from_env()?;
     debug!(?config);
     
-    let realm_key = VerifyingKey::from_public_key_pem(&config.general.realm_key)?; // Also validates key format
-    let node_key = SecretKey::from_str(&config.general.node_key)?;
     let rest_addr = Ipv4Addr::from_str(&config.frontend.openapi_frontend.address)?;
 
     // Dummy access conf which is provided by user/request/node
@@ -72,7 +67,7 @@ async fn main() -> Result<()> {
     }
 
     // Create an endpoint, it allows creating and accepting connections in the iroh p2p world
-    let network_handle_01 = NetworkActorBuilder::new(Some(node_key))
+    let network_handle_01 = NetworkActorBuilder::new(Some(config.general.node_key))
         .await
         .add_bind_addr_v4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 31337))
         .build(vec![])
@@ -109,7 +104,7 @@ async fn main() -> Result<()> {
     // Token Handler
     let oidc_config = OidcTrustConfig::TrustAll;
     let token_handler = Arc::new(RwLock::new(TokenSystem::new(
-        realm_key.to_bytes(),
+        config.general.realm_key.to_bytes(),
         oidc_config,
     )));
 
@@ -121,14 +116,14 @@ async fn main() -> Result<()> {
         kademlia,
         lmdb_store,
         permission_manager.clone(),
-        realm_key.to_bytes(),
+        config.general.realm_key.to_bytes(),
     )
     .await?;
 
     //TODO: ----- Remove later ----------
     create_dummy_access(
         io_handler.store.clone(),
-        realm_key.to_bytes(),
+        config.general.realm_key.to_bytes(),
         permission_manager.clone(),
     )
     .await?;
@@ -139,7 +134,7 @@ async fn main() -> Result<()> {
         io_handler.clone(),
         permission_manager.clone(),
         node_addr.node_id,
-        realm_key.to_bytes(),
+        config.general.realm_key.to_bytes(),
     )
     .await?;
 

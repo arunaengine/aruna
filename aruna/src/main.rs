@@ -1,3 +1,8 @@
+use anyhow::anyhow;
+use aruna_data::api_s3::s3server::S3Server;
+use aruna_data::config::config::Config as DataConfig;
+use aruna_data::util::opendal::get_operator;
+use aruna_data::{ACCESS_DB_NAME, IOHandler, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 use aruna_metadata::{
     api::server::RestServer,
     error::ArunaMetadataError,
@@ -9,8 +14,9 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
+use aruna_permission::PermissionError::ArunaPermissionHandlerError;
 use aruna_permission::{
-    PermissionError,
+    PermissionError, PermissionManager, TokenSystem,
     token::{Ed25519KeyPair, OidcTrustConfig},
 };
 use aruna_storage::storage::{
@@ -19,6 +25,7 @@ use aruna_storage::storage::{
 };
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
+use futures_util::TryFutureExt;
 use iroh::KeyParsingError;
 use iroh::NodeAddr;
 use iroh::PublicKey;
@@ -26,6 +33,7 @@ use iroh::SecretKey;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
+use parking_lot::RwLock;
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::ParseIntError,
@@ -34,6 +42,8 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+use tokio::try_join;
+use tracing::{debug, error};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -43,6 +53,8 @@ pub enum ArunaError {
     MetadataError(#[from] ArunaMetadataError),
     #[error("DotenvyError: {0}")]
     DotenvyError(#[from] dotenvy::Error),
+    #[error("DataError: {0}")]
+    DataError(#[from] anyhow::Error),
     #[error("KeyParsingError: {0}")]
     KeyParsingError(#[from] KeyParsingError),
     #[error("ParseIntError: {0}")]
@@ -98,6 +110,9 @@ pub async fn main() {
         .init();
 
     let databases = vec![
+        ACCESS_DB_NAME,
+        LOCATION_DB_NAME,
+        PATH_LOCATION_DB_NAME,
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,
         aruna_permission::OIDC_IDENTITIES_DB,
@@ -110,35 +125,136 @@ pub async fn main() {
         PUBLIC_MAPPINGS_DB_NAME,
     ];
 
+    let network = Arc::new(
+        P2PNetwork::new(NetworkConfig {
+            secret_key: Some(config.config.general.node_key.clone()),
+            socket_addr: SocketAddrV4::new(
+                Ipv4Addr::from_str(&config.config.general.p2p_address)
+                    .map_err(|e| ArunaMetadataError::ConfigError(e.to_string()))
+                    .unwrap(),
+                config.config.general.p2p_port,
+            ),
+            bootstrap_nodes: config.bootstrap_nodes.clone(),
+            realm_key: config.config.general.realm_key.clone(),
+        })
+        .await
+        .unwrap(),
+    );
+
     let store_path = format!("{}/heed", config.path);
     let store_config = LmdbConfig {
         path: store_path,
         databases: databases.clone(),
     };
-
     let store = LmdbStore::new(store_config).unwrap();
 
-    let metadata_future = start_metadata(config, store);
-    let data_future = async move { todo!() };
+    let permission_manager = PermissionManager::new().await.unwrap();
+    let read_txn = store.create_txn(false).unwrap();
+    permission_manager
+        .load_policies(&store, &read_txn)
+        .await
+        .unwrap();
+    store.commit(read_txn).unwrap();
+
+    // Token Handler
+    let oidc_config = OidcTrustConfig::TrustAll;
+    let token_handler = Arc::new(RwLock::new(TokenSystem::new(
+        config.config.general.realm_key.to_bytes(),
+        oidc_config,
+    )));
+
+    let metadata_future = start_metadata(config.clone(), store.clone(), network.clone());
+    let data_future = start_data(config, store, network, permission_manager, token_handler);
 
     tokio::join!(metadata_future, data_future);
 }
 
+#[derive(Clone, Debug)]
 pub struct Config {
     pub bootstrap_nodes: Vec<NodeAddr>,
     pub path: String,
     pub oidc_trust_config: OidcTrustConfig,
     pub token_handler_realm_keys: Ed25519KeyPair,
-    pub realm_key: SigningKey,
-    pub p2p_address: String,
-    pub p2p_port: u16,
-    pub p2p_secret_key: Option<SecretKey>,
-    pub api_port: u16,
     pub search_config: TantivyConfig,
     pub resource_to_search_sender: tokio::sync::mpsc::Sender<(u32, Resource)>,
+    pub config: DataConfig,
 }
 
-pub async fn start_metadata<S>(config: Config, store: S) -> Result<(), ArunaError>
+pub async fn start_data(
+    config: Config,
+    store: LmdbStore,
+    network: Arc<P2PNetwork>,
+    perm_manager: PermissionManager,
+    token_handler: Arc<RwLock<TokenSystem>>,
+) -> Result<(), ArunaError>{
+    let op_conf = config.config.backend.access.clone();
+    let operator = get_operator(&config.config.backend.backend_type, op_conf).await?;
+    match operator.check().await {
+        Ok(_) => debug!(
+            "Connection to {} backend succeeded",
+            config.config.backend.backend_type
+        ),
+        Err(err) => {
+            error!("Connection to backend failed: {}", err);
+            //anyhow::bail!("Connection to backend failed: {}", err);
+        }
+    }
+
+    let kademlia = network.chandler.get_kademlia_actor_handle().await?;
+    let node_addr = network.chandler.get_node_addr().await?;
+
+    // Create and run IOHandler
+    let io_handler = IOHandler::<LmdbStore>::new(
+        node_addr.clone(),
+        operator,
+        network.chandler.clone(),
+        kademlia,
+        Arc::new(store),
+        perm_manager.clone(),
+        config.config.general.realm_key.to_bytes(),
+    )
+    .await?;
+    let s3server = S3Server::new(
+        config.config.frontend.s3_frontend.clone(),
+        io_handler.clone(),
+        perm_manager.clone(),
+        node_addr.node_id,
+        config.config.general.realm_key.to_bytes(),
+    )
+    .await?;
+
+    let controller = Arc::new(aruna_data::io::controller::Controller::<LmdbStore>::new(
+        io_handler,
+        perm_manager,
+        token_handler,
+    ));
+    let rest_handle = tokio::spawn(async move {
+        aruna_data::api_json::server::RestServer::run(
+            controller,
+            Ipv4Addr::from_str(&config.config.frontend.openapi_frontend.address)?,
+            8081//config.config.frontend.openapi_frontend.port,
+        )
+        .await
+    })
+    .map_err(|e| {
+        error!(error = ?e, msg = e.to_string());
+        anyhow!("an error occurred {e}")
+    });
+
+    match try_join!(s3server.run(), rest_handle) {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            error!("{}", err);
+            panic!("Meh.")
+        }
+    }
+}
+
+pub async fn start_metadata<S>(
+    config: Config,
+    store: S,
+    network: Arc<P2PNetwork>,
+) -> Result<(), ArunaError>
 where
     for<'a> S: Store<'a> + 'static,
 {
@@ -147,28 +263,15 @@ where
             config.resource_to_search_sender,
             store,
             config.search_config,
-            config.realm_key.verifying_key().to_bytes().clone(),
+            config
+                .config
+                .general
+                .realm_key
+                .verifying_key()
+                .to_bytes()
+                .clone(),
             config.oidc_trust_config,
         )
-        .await?,
-    );
-
-    persistor.token_handler.write().add_realm_public_key(
-        config.realm_key.verifying_key().to_bytes().clone(),
-        config.token_handler_realm_keys.verifying_key_pem()?,
-    );
-
-    let network = Arc::new(
-        P2PNetwork::new(NetworkConfig {
-            secret_key: config.p2p_secret_key,
-            socket_addr: SocketAddrV4::new(
-                Ipv4Addr::from_str(&config.p2p_address)
-                    .map_err(|e| ArunaMetadataError::ConfigError(e.to_string()))?,
-                config.p2p_port,
-            ),
-            bootstrap_nodes: config.bootstrap_nodes,
-            realm_key: config.realm_key.clone(),
-        })
         .await?,
     );
 
@@ -179,27 +282,23 @@ where
     Network::start_actor(network, controller.clone()).await?;
 
     let controller_clone = controller.clone();
-    tokio::spawn(async move { RestServer::run(controller_clone, config.api_port).await });
+    tokio::spawn(async move {
+        RestServer::run(
+            controller_clone,
+            config.config.frontend.openapi_frontend.port,
+        )
+        .await
+    });
 
     Ok(())
 }
 
 pub fn parse_config() -> Result<Config, ArunaError> {
+    if let Ok(file) = dotenvy::var("ENV") {
+        dotenvy::from_filename_override(file)?;
+    }
+    
     let path = dotenvy::var("DBPATH")?;
-    let api_port = dotenvy::var("API_PORT")?.parse()?;
-    let p2p_port = dotenvy::var("P2P_PORT")?.parse()?;
-    let p2p_address = dotenvy::var("P2P_ADDRESS")?;
-    let p2p_secret_key = if let Ok(key) = dotenvy::var("P2P_SECRET_KEY") {
-        if key.is_empty() {
-            None
-        } else {
-            Some(SecretKey::from_str(&key)?)
-        }
-    } else {
-        None
-    };
-    let realm_key = SigningKey::from_pkcs8_pem(&dotenvy::var("REALM_KEY")?)?;
-    // TODO: Parse from config
     let signing_key = SigningKey::from_pkcs8_pem(&dotenvy::var("TOKEN_SIGNING_KEY")?)?;
     let verifying_key = signing_key.verifying_key();
     let token_handler_realm_keys = Ed25519KeyPair {
@@ -231,17 +330,15 @@ pub fn parse_config() -> Result<Config, ArunaError> {
         resources: res_rcv,
     };
 
+    let data_config = DataConfig::load_from_env()?;
+
     Ok(Config {
         bootstrap_nodes,
         path,
         oidc_trust_config,
-        realm_key,
-        p2p_port,
-        api_port,
-        p2p_address,
-        p2p_secret_key,
         search_config,
         resource_to_search_sender: res_sdx,
         token_handler_realm_keys,
+        config: data_config,
     })
 }

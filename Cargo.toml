@@ -10,7 +10,6 @@ members = [
 ]
 resolver = "2"
 
-
 [workspace.package]
 description = "A federated data orchestration network"
 version = "3.0.0"
@@ -28,6 +27,7 @@ casbin = { version = "2.10.1", features = ["explain", "logging"]}
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "pem"] }
 futures = "0.3.31"
+futures-util = "0.3.31"
 iroh = "0.90.0"
 iroh-base = "0.90.0"
 opentelemetry = "0.30.0"
