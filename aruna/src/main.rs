@@ -9,7 +9,10 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
-use aruna_permission::{token::{Ed25519KeyPair, OidcTrustConfig}, PermissionError};
+use aruna_permission::{
+    PermissionError,
+    token::{Ed25519KeyPair, OidcTrustConfig},
+};
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
@@ -31,7 +34,6 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
-use tracing::trace;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -53,6 +55,9 @@ pub enum ArunaError {
 
 #[tokio::main]
 pub async fn main() {
+    // parse config
+    let config: Config = parse_config().unwrap();
+
     // Init tracing
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
@@ -92,9 +97,6 @@ pub async fn main() {
         .with(telemetry_layer)
         .init();
 
-    // parse config
-    let config: Config = parse_config().unwrap();
-
     let databases = vec![
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,
@@ -117,19 +119,20 @@ pub async fn main() {
     let store = LmdbStore::new(store_config).unwrap();
 
     let metadata_future = start_metadata(config, store);
-    let data_future = async move {todo!()};
+    let data_future = async move { todo!() };
 
     tokio::join!(metadata_future, data_future);
-
 }
 
 pub struct Config {
+    pub bootstrap_nodes: Vec<NodeAddr>,
     pub path: String,
     pub oidc_trust_config: OidcTrustConfig,
     pub token_handler_realm_keys: Ed25519KeyPair,
     pub realm_key: SigningKey,
     pub p2p_address: String,
     pub p2p_port: u16,
+    pub p2p_secret_key: Option<SecretKey>,
     pub api_port: u16,
     pub search_config: TantivyConfig,
     pub resource_to_search_sender: tokio::sync::mpsc::Sender<(u32, Resource)>,
@@ -139,19 +142,11 @@ pub async fn start_metadata<S>(config: Config, store: S) -> Result<(), ArunaErro
 where
     for<'a> S: Store<'a> + 'static,
 {
-    let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
-    let tantivy_path = format!("{}/tantivy", config.path);
-    let search_config = TantivyConfig {
-        path: tantivy_path,
-        index_buffer: 1_000_000_000,
-        resources: res_rcv,
-    };
-
     let persistor: Arc<Persistor<S, TantivySearch>> = Arc::new(
         Persistor::new(
-            res_sdx,
+            config.resource_to_search_sender,
             store,
-            search_config,
+            config.search_config,
             config.realm_key.verifying_key().to_bytes().clone(),
             config.oidc_trust_config,
         )
@@ -165,13 +160,13 @@ where
 
     let network = Arc::new(
         P2PNetwork::new(NetworkConfig {
-            secret_key: None,
+            secret_key: config.p2p_secret_key,
             socket_addr: SocketAddrV4::new(
                 Ipv4Addr::from_str(&config.p2p_address)
                     .map_err(|e| ArunaMetadataError::ConfigError(e.to_string()))?,
                 config.p2p_port,
             ),
-            bootstrap_nodes: vec![],
+            bootstrap_nodes: config.bootstrap_nodes,
             realm_key: config.realm_key.clone(),
         })
         .await?,
@@ -186,7 +181,6 @@ where
     let controller_clone = controller.clone();
     tokio::spawn(async move { RestServer::run(controller_clone, config.api_port).await });
 
-    controller.network.get_addr().await?;
     Ok(())
 }
 
@@ -228,11 +222,6 @@ pub fn parse_config() -> Result<Config, ArunaError> {
             .unwrap(),
         Err(_) => vec![],
     };
-    let variant = dotenvy::var("VARIANT").unwrap();
-
-    trace!(
-        "DB_VARIANT: {variant} on {path} API: {api_port} P2P: {p2p_port} P2P_KEY: {p2p_secret_key:?} BOOTSTRAP_NODES: {bootstrap_nodes:?}",
-    );
 
     let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
     let tantivy_path = format!("{path}/tantivy");
@@ -243,12 +232,14 @@ pub fn parse_config() -> Result<Config, ArunaError> {
     };
 
     Ok(Config {
+        bootstrap_nodes,
         path,
         oidc_trust_config,
         realm_key,
         p2p_port,
         api_port,
         p2p_address,
+        p2p_secret_key,
         search_config,
         resource_to_search_sender: res_sdx,
         token_handler_realm_keys,
