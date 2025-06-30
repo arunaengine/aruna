@@ -2,7 +2,6 @@ use aruna_metadata::models::requests::{
     AddUserRequest, AddUserResponse, CreateResourceRequest, CreateResourceResponse, SearchRequest,
 };
 use criterion::{Criterion, criterion_group, criterion_main};
-//use persistors::{TantivyFjall, TantivyHeed, TantivyRedb};
 use persistors::{TantivyFjall, TantivyHeed};
 use rand::seq::IteratorRandom;
 use std::time::Duration;

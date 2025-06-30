@@ -248,7 +248,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         server_url_pairs.push((controller, format!("http://localhost:{}/api/v3", api_port)));
     }
 
-    for (controller, url) in &server_url_pairs {
+    for (controller, _url) in &server_url_pairs {
         controller.network.update_realm().await?;
     }
 

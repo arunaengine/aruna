@@ -1,15 +1,12 @@
 use std::pin::Pin;
 
-use futures::{Stream, TryFutureExt};
+use futures::Stream;
 use iroh::{
-    Endpoint, NodeId,
+    NodeId,
     discovery::{Discovery, DiscoveryError, DiscoveryItem},
     node_info::{NodeData, NodeInfo},
 };
-
-use n0_future::boxed::BoxStream;
 use tracing::{error, trace};
-
 use super::kademlia::Kademlia;
 
 #[derive(Debug)]
