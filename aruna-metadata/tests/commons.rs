@@ -16,7 +16,7 @@ use aruna_metadata::{
     transactions::{controller::Controller, request::Request},
 };
 use aruna_permission::{
-    OidcToken, UserIdentity,
+    OidcToken, PermissionManager, TokenSystem, UserIdentity,
     token::{Ed25519KeyPair, OidcTrustConfig},
 };
 use aruna_storage::storage::{
@@ -25,6 +25,7 @@ use aruna_storage::storage::{
 };
 use chrono::Months;
 use ed25519_dalek::SigningKey;
+use parking_lot::RwLock;
 use rand::rngs::OsRng;
 #[allow(unused)] // used for tracing of commented in
 use std::{
@@ -97,24 +98,39 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
 
     let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
     let tantivy_path = format!("{}/{}/node_{}/tantivy", TEST_CONFIG.path, subscriber, 0);
     let search_config = TantivyConfig {
         path: tantivy_path,
         index_buffer: 1_000_000_000,
-        resources: res_rcv,
     };
     let store_path = format!("{}/{}/node_{}/heed", TEST_CONFIG.path, subscriber, 0);
     let store_config = LmdbConfig {
         path: store_path,
         databases: databases.clone(),
     };
+    let store = LmdbStore::new(store_config)?;
+
+    let permission_manager = PermissionManager::new().await.unwrap();
+    let read_txn = store.create_txn(false).unwrap();
+    permission_manager
+        .load_policies(&store, &read_txn)
+        .await
+        .unwrap();
+    store.commit(read_txn).unwrap();
+
+    // Token Handler
+    let oidc_config = OidcTrustConfig::TrustAll;
+    let token_handler = Arc::new(RwLock::new(TokenSystem::new(
+        realm_key.verifying_key().as_bytes().clone(),
+        oidc_config,
+    )));
 
     let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
         Persistor::new(
-            res_sdx,
-            LmdbStore::new(store_config)?,
+            store,
             search_config,
+            permission_manager,
+            token_handler,
             realm_key.verifying_key().as_bytes().clone(),
             OidcTrustConfig::TrustAll,
         )
@@ -158,12 +174,10 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
 
     for node in 1..5 {
         let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
         let tantivy_path = format!("{}/{}/node_{}/tantivy", TEST_CONFIG.path, subscriber, node);
         let search_config = TantivyConfig {
             path: tantivy_path,
             index_buffer: 1_000_000_000,
-            resources: res_rcv,
         };
         let store_path = format!("{}/{}/node_{}/heed", TEST_CONFIG.path, subscriber, node);
         let store_config = LmdbConfig {
@@ -171,11 +185,29 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
             databases: databases.clone(),
         };
 
+        let store = LmdbStore::new(store_config)?;
+
+        let permission_manager = PermissionManager::new().await.unwrap();
+        let read_txn = store.create_txn(false).unwrap();
+        permission_manager
+            .load_policies(&store, &read_txn)
+            .await
+            .unwrap();
+        store.commit(read_txn).unwrap();
+
+        // Token Handler
+        let oidc_config = OidcTrustConfig::TrustAll;
+        let token_handler = Arc::new(RwLock::new(TokenSystem::new(
+            realm_key.verifying_key().as_bytes().clone(),
+            oidc_config,
+        )));
+
         let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
             Persistor::new(
-                res_sdx,
-                LmdbStore::new(store_config)?,
+                store,
                 search_config,
+                permission_manager,
+                token_handler,
                 realm_key.verifying_key().as_bytes().clone(),
                 OidcTrustConfig::TrustAll,
             )
@@ -216,7 +248,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         server_url_pairs.push((controller, format!("http://localhost:{}/api/v3", api_port)));
     }
 
-    for (controller, _) in &server_url_pairs {
+    for (controller, url) in &server_url_pairs {
         controller.network.update_realm().await?;
     }
 

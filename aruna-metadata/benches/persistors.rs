@@ -9,9 +9,11 @@ use aruna_metadata::{
     transactions::controller::Controller,
 };
 use aruna_permission::token::OidcTrustConfig;
+use aruna_permission::{PermissionManager, TokenSystem};
 use aruna_storage::storage::fjall::{FjallConfig, FjallStore};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
+use parking_lot::RwLock;
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -19,18 +21,20 @@ pub struct TantivyFjall;
 impl TantivyFjall {
     pub async fn start() -> Arc<Controller<FjallStore, TantivySearch, NetworkDummy>> {
         let path = "/dev/shm/fjall_tantivy".to_string();
-        let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
         let tantivy_path = format!("{path}/tantivy");
         let search_config = TantivyConfig {
             path: tantivy_path,
             index_buffer: 1_000_000_000,
-            resources: res_rcv,
         };
 
         let store_path = format!("{path}/fjall");
         let store_config = FjallConfig {
             path: store_path,
             databases: vec![
+                aruna_permission::DBNAME,
+                aruna_permission::RESOURCE_DB,
+                aruna_permission::OIDC_IDENTITIES_DB,
+                aruna_permission::IDENTITY_PERMISSIONS_DB,
                 RESOURCE_DB_NAME,
                 RESOURCE_MAPPINGS_DB_NAME,
                 USER_DB_NAME,
@@ -38,13 +42,28 @@ impl TantivyFjall {
                 PUBLIC_MAPPINGS_DB_NAME,
             ],
         };
-        let oidc_trust_config = OidcTrustConfig::TrustAll;
+
+        let store = FjallStore::new(store_config).unwrap();
         let realm_key = [0u8; 32];
+
+        let permission_manager = PermissionManager::new().await.unwrap();
+        let read_txn = store.create_txn(false).unwrap();
+        permission_manager
+            .load_policies(&store, &read_txn)
+            .await
+            .unwrap();
+        store.commit(read_txn).unwrap();
+
+        // Token Handler
+        let oidc_config = OidcTrustConfig::TrustAll;
+        let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_config)));
+        let oidc_trust_config = OidcTrustConfig::TrustAll;
         let persistor = Arc::new(
             Persistor::new(
-                res_sdx,
-                FjallStore::new(store_config).unwrap(),
+                store,
                 search_config,
+                permission_manager,
+                token_handler,
                 realm_key,
                 oidc_trust_config,
             )
@@ -133,18 +152,20 @@ pub struct TantivyHeed;
 impl TantivyHeed {
     pub async fn start() -> Arc<Controller<LmdbStore, TantivySearch, NetworkDummy>> {
         let path = "/dev/shm/lmdb_tantivy".to_string();
-        let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
         let tantivy_path = format!("{path}/tantivy");
         let search_config = TantivyConfig {
             path: tantivy_path,
             index_buffer: 1_000_000_000,
-            resources: res_rcv,
         };
 
         let store_path = format!("{path}/lmdb");
         let store_config = LmdbConfig {
             path: store_path,
             databases: vec![
+                aruna_permission::DBNAME,
+                aruna_permission::RESOURCE_DB,
+                aruna_permission::OIDC_IDENTITIES_DB,
+                aruna_permission::IDENTITY_PERMISSIONS_DB,
                 RESOURCE_DB_NAME,
                 RESOURCE_MAPPINGS_DB_NAME,
                 USER_DB_NAME,
@@ -152,13 +173,28 @@ impl TantivyHeed {
                 PUBLIC_MAPPINGS_DB_NAME,
             ],
         };
-        let oidc_trust_config = OidcTrustConfig::TrustAll;
+
+        let store = LmdbStore::new(store_config).unwrap();
         let realm_key = [0u8; 32];
+
+        let permission_manager = PermissionManager::new().await.unwrap();
+        let read_txn = store.create_txn(false).unwrap();
+        permission_manager
+            .load_policies(&store, &read_txn)
+            .await
+            .unwrap();
+        store.commit(read_txn).unwrap();
+
+        // Token Handler
+        let oidc_config = OidcTrustConfig::TrustAll;
+        let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_config)));
+        let oidc_trust_config = OidcTrustConfig::TrustAll;
         let persistor = Arc::new(
             Persistor::new(
-                res_sdx,
-                LmdbStore::new(store_config).unwrap(),
+                store,
                 search_config,
+                permission_manager,
+                token_handler,
                 realm_key,
                 oidc_trust_config,
             )

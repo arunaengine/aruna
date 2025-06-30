@@ -1,11 +1,10 @@
-use crate::api_json::request::{Request, User};
+use crate::api_json::request::Request;
 use crate::{IOHandler, error::ArunaDataError};
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::{TokenSystem, UserIdentity};
 use aruna_storage::storage::store::Store;
 use parking_lot::RwLock;
 use std::sync::Arc;
-use ulid::Ulid;
 
 pub struct Controller<St>
 where

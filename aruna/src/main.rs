@@ -163,10 +163,18 @@ pub async fn main() {
         oidc_config,
     )));
 
-    let metadata_future = start_metadata(config.clone(), store.clone(), network.clone());
+    let metadata_future = start_metadata(
+        config.clone(),
+        store.clone(),
+        network.clone(),
+        permission_manager.clone(),
+        token_handler.clone(),
+    );
     let data_future = start_data(config, store, network, permission_manager, token_handler);
 
-    tokio::join!(metadata_future, data_future);
+    let (metadata, data) = tokio::join!(metadata_future, data_future);
+    metadata.unwrap();
+    data.unwrap();
 }
 
 #[derive(Clone, Debug)]
@@ -176,7 +184,6 @@ pub struct Config {
     pub oidc_trust_config: OidcTrustConfig,
     pub token_handler_realm_keys: Ed25519KeyPair,
     pub search_config: TantivyConfig,
-    pub resource_to_search_sender: tokio::sync::mpsc::Sender<(u32, Resource)>,
     pub config: DataConfig,
 }
 
@@ -186,7 +193,7 @@ pub async fn start_data(
     network: Arc<P2PNetwork>,
     perm_manager: PermissionManager,
     token_handler: Arc<RwLock<TokenSystem>>,
-) -> Result<(), ArunaError>{
+) -> Result<(), ArunaError> {
     let op_conf = config.config.backend.access.clone();
     let operator = get_operator(&config.config.backend.backend_type, op_conf).await?;
     match operator.check().await {
@@ -232,7 +239,7 @@ pub async fn start_data(
         aruna_data::api_json::server::RestServer::run(
             controller,
             Ipv4Addr::from_str(&config.config.frontend.openapi_frontend.address)?,
-            8081//config.config.frontend.openapi_frontend.port,
+            8081, //config.config.frontend.openapi_frontend.port,
         )
         .await
     })
@@ -254,15 +261,18 @@ pub async fn start_metadata<S>(
     config: Config,
     store: S,
     network: Arc<P2PNetwork>,
+    perm_manager: PermissionManager,
+    token_handler: Arc<RwLock<TokenSystem>>,
 ) -> Result<(), ArunaError>
 where
     for<'a> S: Store<'a> + 'static,
 {
     let persistor: Arc<Persistor<S, TantivySearch>> = Arc::new(
         Persistor::new(
-            config.resource_to_search_sender,
             store,
             config.search_config,
+            perm_manager,
+            token_handler,
             config
                 .config
                 .general
@@ -297,7 +307,7 @@ pub fn parse_config() -> Result<Config, ArunaError> {
     if let Ok(file) = dotenvy::var("ENV") {
         dotenvy::from_filename_override(file)?;
     }
-    
+
     let path = dotenvy::var("DBPATH")?;
     let signing_key = SigningKey::from_pkcs8_pem(&dotenvy::var("TOKEN_SIGNING_KEY")?)?;
     let verifying_key = signing_key.verifying_key();
@@ -322,12 +332,10 @@ pub fn parse_config() -> Result<Config, ArunaError> {
         Err(_) => vec![],
     };
 
-    let (res_sdx, res_rcv) = tokio::sync::mpsc::channel(1000);
     let tantivy_path = format!("{path}/tantivy");
     let search_config = TantivyConfig {
         path: tantivy_path,
         index_buffer: 1_000_000_000,
-        resources: res_rcv,
     };
 
     let data_config = DataConfig::load_from_env()?;
@@ -337,7 +345,6 @@ pub fn parse_config() -> Result<Config, ArunaError> {
         path,
         oidc_trust_config,
         search_config,
-        resource_to_search_sender: res_sdx,
         token_handler_realm_keys,
         config: data_config,
     })

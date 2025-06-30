@@ -53,27 +53,30 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(store, search_config))]
+    #[tracing::instrument(
+        level = "trace",
+        skip(store, search_config, permission_manager, token_handler)
+    )]
     pub async fn new(
-        res_sdx: tokio::sync::mpsc::Sender<(u32, Resource)>,
+        //res_sdx: tokio::sync::mpsc::Sender<(u32, Resource)>,
         store: St,
         search_config: Se::SearchConfig,
+        permission_manager: PermissionManager,
+        token_handler: Arc<RwLock<TokenSystem>>,
         realm_key: [u8; 32],
         oidc_trust_config: OidcTrustConfig,
     ) -> Result<Self, ArunaMetadataError> {
-        let permission_manager = PermissionManager::new().await?;
-        let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_trust_config)));
+        //let permission_manager = PermissionManager::new().await?;
+        //let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_trust_config)));
 
         // TODO: Init perm/auth
 
-        let search = tokio::task::spawn_blocking(move || {
-            let search = Se::new(search_config)?;
-            Ok::<Arc<Se>, ArunaMetadataError>(Arc::new(search))
-        });
+        let search = Arc::new(Se::new(search_config)?);
 
         let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
 
         let store_clone = store.clone();
+        let search_clone = search.clone();
         tokio::task::spawn_blocking(move || {
             let mut txn = store_clone.create_txn(true)?;
 
@@ -96,7 +99,8 @@ where
                     }
                 })?);
                 // new idx because this is a local only sorting
-                res_sdx
+                search_clone
+                    .get_resource_sender()?
                     .blocking_send((idx, resource))
                     .map_err(|e| ArunaMetadataError::DatabaseError(e.to_string()))?;
             }
@@ -131,8 +135,6 @@ where
                 .map_err(|e| ArunaMetadataError::DatabaseError(e.to_string()))?;
             Ok::<(), ArunaMetadataError>(())
         });
-
-        let search = search.await.unwrap().unwrap();
 
         let idx_counter = Arc::new(AtomicU32::new(idx_rcv.await.unwrap()));
 

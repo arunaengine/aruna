@@ -55,17 +55,18 @@ struct Fields {
     deleted: Field,
 }
 
+#[derive(Clone, Debug)]
 pub struct TantivyConfig {
     pub path: String,
     pub index_buffer: usize,
-    pub resources: tokio::sync::mpsc::Receiver<(u32, Resource)>, // TODO: replace with channel receiver
+    //pub resources: tokio::sync::mpsc::Receiver<(u32, Resource)>, // TODO: replace with channel receiver
                                                                  //pub _users: tokio::sync::mpsc::Receiver<User>, // TODO: replace with channel receiver
 }
 
 impl Search for TantivySearch {
     type SearchConfig = TantivyConfig;
     #[tracing::instrument(level = "trace", skip(config))]
-    fn new(mut config: Self::SearchConfig) -> Result<Self, ArunaMetadataError> {
+    fn new(config: Self::SearchConfig) -> Result<Self, ArunaMetadataError> {
         let (update_queue_sdx, mut update_queue_rcv) = tokio::sync::mpsc::channel(1000);
         // First we need to define a schema ...
 
@@ -121,12 +122,12 @@ impl Search for TantivySearch {
 
         // idx docs send from store init
         let mut index_writer: IndexWriter = index.writer(config.index_buffer)?;
-        while let Some((idx, resource)) = config.resources.blocking_recv() {
-            let doc = fields.create_doc(idx, resource);
-            // Let's index one documents!
-            index_writer.add_document(doc)?;
-        }
-        index_writer.commit()?;
+        //while let Some((idx, resource)) = config.resources.blocking_recv() {
+        //    let doc = fields.create_doc(idx, resource);
+        //    // Let's index one documents!
+        //    index_writer.add_document(doc)?;
+        //}
+        //index_writer.commit()?;
 
         // Idx task for batching
         let fields_clone = fields.clone();
@@ -241,6 +242,12 @@ impl Search for TantivySearch {
             .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
 
         Ok(())
+    }
+
+    fn get_resource_sender(
+        &self,
+    ) -> Result<&tokio::sync::mpsc::Sender<(u32, Resource)>, ArunaMetadataError> {
+        Ok(&self.writer)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
