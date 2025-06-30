@@ -95,6 +95,8 @@ pub enum PermissionError {
     ConversionError(#[from] ConversionError),
     #[error("Runtime error: {0}")]
     RuntimeError(#[from] JoinError),
+    #[error("OIDC error: {0}")]
+    OidcError(String),
 }
 
 pub type Result<T> = std::result::Result<T, PermissionError>;

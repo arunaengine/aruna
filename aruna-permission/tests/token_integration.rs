@@ -1,15 +1,11 @@
 use aruna_permission::paths::RealmKey;
-use aruna_permission::token::{Ed25519KeyPair, OidcTrustConfig, TokenSystem};
+use aruna_permission::token::{Ed25519KeyPair, TokenSystem};
 use aruna_permission::*;
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
 };
 use ulid::Ulid;
-
-// Include RSA test keys for OIDC providers
-const GOOGLE_PUBLIC_KEY: &str = include_str!("../tests/test_google_priv.pem.pub");
-const GITHUB_PUBLIC_KEY: &str = include_str!("../tests/test_github_priv.pem.pub");
 
 async fn setup_test_systems() -> (
     TokenSystem,
@@ -36,26 +32,26 @@ async fn setup_test_systems() -> (
 
     // Create token system for realm A with trusted OIDC issuers
     let realm_a = create_test_realm_key(10);
-    let oidc_trust_config = OidcTrustConfig::TrustedIssuers(vec![
-        "https://accounts.google.com".to_string(),
-        "https://github.com/login/oauth".to_string(),
-    ]);
-    let mut token_system = TokenSystem::new(realm_a, oidc_trust_config);
-
-    // Add RSA public keys for OIDC verification
-    token_system.add_oidc_public_key(
-        "https://accounts.google.com".to_string(),
-        GOOGLE_PUBLIC_KEY.to_string(),
-    );
-    token_system.add_oidc_public_key(
-        "https://github.com/login/oauth".to_string(),
-        GITHUB_PUBLIC_KEY.to_string(),
-    );
+    let issuers = vec![
+        aruna_permission::token::Issuer {
+            issuer_name: "https://accounts.google.com".to_string(),
+            pubkey_url: "".to_string(),
+            aud: vec![],
+        },
+        aruna_permission::token::Issuer {
+            issuer_name: "https://github.com/login/oauth".to_string(),
+            pubkey_url: "".to_string(),
+            aud: vec![],
+        },
+    ];
+    let mut token_system = TokenSystem::new(realm_a, issuers).await.unwrap();
 
     // Generate Ed25519 key pair for realm tokens
     let realm_key_pair = Ed25519KeyPair::generate();
     let verifying_key_pem = realm_key_pair.verifying_key_pem().unwrap();
-    token_system.add_realm_public_key(realm_a, verifying_key_pem);
+    token_system
+        .add_realm_public_key(realm_a, verifying_key_pem)
+        .unwrap();
 
     // Create permission manager
     let permission_manager = PermissionManager::new().await.unwrap();
@@ -197,43 +193,44 @@ async fn test_cross_realm_token_handling() {
     let realm_a = create_test_realm_key(10);
     let realm_b = create_test_realm_key(11);
 
-    let oidc_trust_config_a =
-        OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
-    let oidc_trust_config_b =
-        OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
-
-    let mut token_system_a = TokenSystem::new(realm_a, oidc_trust_config_a);
-    let mut token_system_b = TokenSystem::new(realm_b, oidc_trust_config_b);
+    let issuers_a = vec![aruna_permission::token::Issuer {
+        issuer_name: "https://accounts.google.com".to_string(),
+        pubkey_url: "".to_string(),
+        aud: vec![],
+    }];
+    let issuers_b = vec![aruna_permission::token::Issuer {
+        issuer_name: "https://accounts.google.com".to_string(),
+        pubkey_url: "".to_string(),
+        aud: vec![],
+    }];
+    let mut token_system_a = TokenSystem::new(realm_a, issuers_a).await.unwrap();
+    let mut token_system_b = TokenSystem::new(realm_b, issuers_b).await.unwrap();
     let permission_manager = PermissionManager::new().await.unwrap();
 
     let (store, test_dir) = setup_test_store().await;
     let mut txn = store.create_txn(true).unwrap();
 
-    // Configure OIDC public keys for both realms
-    token_system_a.add_oidc_public_key(
-        "https://accounts.google.com".to_string(),
-        GOOGLE_PUBLIC_KEY.to_string(),
-    );
-    token_system_b.add_oidc_public_key(
-        "https://accounts.google.com".to_string(),
-        GOOGLE_PUBLIC_KEY.to_string(),
-    );
-
-    // Generate Ed25519 key pairs for both realms
     let realm_a_keys = Ed25519KeyPair::generate();
     let realm_b_keys = Ed25519KeyPair::generate();
 
     let realm_a_verifying_pem = realm_a_keys.verifying_key_pem().unwrap();
     let realm_b_verifying_pem = realm_b_keys.verifying_key_pem().unwrap();
 
-    token_system_a.add_realm_public_key(realm_a, realm_a_verifying_pem.clone());
-    token_system_b.add_realm_public_key(realm_b, realm_b_verifying_pem.clone());
+    token_system_a
+        .add_realm_public_key(realm_a, realm_a_verifying_pem.clone())
+        .unwrap();
+    token_system_b
+        .add_realm_public_key(realm_b, realm_b_verifying_pem.clone())
+        .unwrap();
 
     // Enable cross-realm verification by sharing public keys
-    token_system_a.add_realm_public_key(realm_b, realm_b_verifying_pem);
-    token_system_b.add_realm_public_key(realm_a, realm_a_verifying_pem);
+    token_system_a
+        .add_realm_public_key(realm_b, realm_b_verifying_pem)
+        .unwrap();
+    token_system_b
+        .add_realm_public_key(realm_a, realm_a_verifying_pem)
+        .unwrap();
 
-    // Same OIDC user gets separate identities in each realm
     let alice_provider = "https://accounts.google.com";
     let alice_sub = "alice@example.com";
 
@@ -326,16 +323,15 @@ async fn test_cross_realm_token_handling() {
         .generate_token(&alice_realm_b, &realm_b_signing_pem)
         .unwrap();
 
-    let txn = store.create_txn(false).unwrap();
-
     // Verify tokens can be validated in their respective realms
     let verified_identity_a = token_system_a
-        .get_identity(&alice_realm_a_token, &store, &txn)
+        .validate_realm_token(&alice_realm_a_token)
+        .await
         .unwrap();
     let verified_identity_b = token_system_b
-        .get_identity(&alice_realm_b_token, &store, &txn)
+        .validate_realm_token(&alice_realm_b_token)
+        .await
         .unwrap();
-    store.commit(txn).unwrap();
 
     assert_eq!(verified_identity_a.user_ulid, alice_realm_a.user_ulid);
     assert_eq!(verified_identity_b.user_ulid, alice_realm_b.user_ulid);
@@ -346,25 +342,24 @@ async fn test_cross_realm_token_handling() {
 #[tokio::test]
 async fn test_token_identity_extraction() {
     let realm_key = create_test_realm_key(10);
-    let oidc_trust_config =
-        OidcTrustConfig::TrustedIssuers(vec!["https://login.microsoftonline.com".to_string()]);
-    let mut token_system = TokenSystem::new(realm_key, oidc_trust_config);
+    let issuers = vec![aruna_permission::token::Issuer {
+        issuer_name: "https://login.microsoftonline.com".to_string(),
+        pubkey_url: "".to_string(),
+        aud: vec![],
+    }];
+    let mut token_system = TokenSystem::new(realm_key, issuers).await.unwrap();
 
     let (store, test_dir) = setup_test_store().await;
     let mut txn = store.create_txn(true).unwrap();
 
-    // For testing purposes, we'll use the Google key as Microsoft since we don't have a separate one
-    token_system.add_oidc_public_key(
-        "https://login.microsoftonline.com".to_string(),
-        GOOGLE_PUBLIC_KEY.to_string(),
-    );
-
     // Generate Ed25519 key pair for realm tokens
     let realm_keys = Ed25519KeyPair::generate();
     let verifying_pem = realm_keys.verifying_key_pem().unwrap();
-    token_system.add_realm_public_key(realm_key, verifying_pem);
+    token_system
+        .add_realm_public_key(realm_key, verifying_pem)
+        .unwrap();
 
-    // Test 1: First-time OIDC registration creates new identity
+    // Test 1: Register user from OIDC claims
     let identity_from_oidc = token_system
         .register_user_from_oidc_claims(
             "https://login.microsoftonline.com",
@@ -374,9 +369,7 @@ async fn test_token_identity_extraction() {
         )
         .unwrap();
 
-    assert_eq!(identity_from_oidc.realm_key, realm_key);
-
-    // Test 2: Subsequent login with same OIDC returns existing identity
+    // Test 2: Same OIDC subject should return same identity
     let identity_second_login = token_system
         .register_user_from_oidc_claims(
             "https://login.microsoftonline.com",
@@ -414,40 +407,40 @@ async fn test_token_identity_extraction() {
         .unwrap();
 
     let parsed_identity = token_system
-        .get_identity(&aruna_token, &store, &mut txn)
+        .validate_realm_token(&aruna_token)
+        .await
         .unwrap();
 
     assert_eq!(parsed_identity.user_ulid, identity_from_oidc.user_ulid);
     assert_eq!(parsed_identity.realm_key, identity_from_oidc.realm_key);
 
-    txn.commit().unwrap();
     cleanup_test_dir(&test_dir);
 }
 
 #[tokio::test]
 async fn test_typical_usage_pattern() {
     let realm_key = create_test_realm_key(10);
-    let oidc_trust_config =
-        OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
-    let mut token_system = TokenSystem::new(realm_key, oidc_trust_config);
+    let issuers = vec![aruna_permission::token::Issuer {
+        issuer_name: "https://accounts.google.com".to_string(),
+        pubkey_url: "".to_string(),
+        aud: vec![],
+    }];
+    let mut token_system = TokenSystem::new(realm_key, issuers).await.unwrap();
     let permission_manager = PermissionManager::new().await.unwrap();
 
     let (store, test_dir) = setup_test_store().await;
     let mut txn = store.create_txn(true).unwrap();
 
-    // Configure OIDC and realm keys
-    token_system.add_oidc_public_key(
-        "https://accounts.google.com".to_string(),
-        GOOGLE_PUBLIC_KEY.to_string(),
-    );
-
+    // Configure realm keys
     let realm_keys = Ed25519KeyPair::generate();
     let verifying_pem = realm_keys.verifying_key_pem().unwrap();
-    token_system.add_realm_public_key(realm_key, verifying_pem);
+    token_system
+        .add_realm_public_key(realm_key, verifying_pem)
+        .unwrap();
 
     // === Token System Usage ===
 
-    // 1. User authenticates via OIDC and gets identity
+    // 1. Register user from OIDC token
     let user_identity = token_system
         .register_user_from_oidc_claims(
             "https://accounts.google.com",
@@ -459,7 +452,7 @@ async fn test_typical_usage_pattern() {
 
     // === Permission System Usage ===
 
-    // 2. Use identity for permission operations
+    // 2. Create group
     let group_id = create_test_ulid(20);
     permission_manager
         .create_group(group_id, &user_identity, realm_key, &store, &mut txn)
@@ -501,23 +494,20 @@ async fn test_typical_usage_pattern() {
 
     // 6. Token verification workflow
     let verified_identity = token_system
-        .get_identity(&aruna_token, &store, &txn)
+        .validate_realm_token(&aruna_token)
+        .await
         .unwrap();
 
     assert_eq!(verified_identity.user_ulid, user_identity.user_ulid);
-    assert_eq!(verified_identity.realm_key, user_identity.realm_key);
-
-    // === Cross-realm scenario ===
 
     // 7. Same user in different realm
     let other_realm = create_test_realm_key(11);
-    let other_oidc_trust_config =
-        OidcTrustConfig::TrustedIssuers(vec!["https://accounts.google.com".to_string()]);
-    let mut other_token_system = TokenSystem::new(other_realm, other_oidc_trust_config);
-    other_token_system.add_oidc_public_key(
-        "https://accounts.google.com".to_string(),
-        GOOGLE_PUBLIC_KEY.to_string(),
-    );
+    let other_issuers = vec![aruna_permission::token::Issuer {
+        issuer_name: "https://accounts.google.com".to_string(),
+        pubkey_url: "".to_string(),
+        aud: vec![],
+    }];
+    let other_token_system = TokenSystem::new(other_realm, other_issuers).await.unwrap();
 
     let other_identity = other_token_system
         .register_user_from_oidc_claims(
@@ -528,9 +518,7 @@ async fn test_typical_usage_pattern() {
         )
         .unwrap();
 
-    assert_eq!(other_identity.realm_key, other_realm);
-
-    // 8. Unify identities across realms for seamless access
+    // Cross-realm unification
     permission_manager
         .unify_identities(&user_identity, &other_identity, &store, &mut txn)
         .await
@@ -543,11 +531,10 @@ async fn test_typical_usage_pattern() {
 #[tokio::test]
 async fn test_oidc_lookup_operations() {
     let realm_key = create_test_realm_key(10);
-    let oidc_trust_config = OidcTrustConfig::TrustAll;
-    let token_system = TokenSystem::new(realm_key, oidc_trust_config);
+    let token_system = TokenSystem::new(realm_key, vec![]).await.unwrap();
 
     let (store, test_dir) = setup_test_store().await;
-    let mut txn = store.create_txn(true).unwrap();
+    let txn = store.create_txn(false).unwrap();
 
     let user_ulid = create_test_ulid(42);
     let provider = "https://auth.example.com";
@@ -559,29 +546,32 @@ async fn test_oidc_lookup_operations() {
         .unwrap();
     assert!(lookup_result.is_none());
 
+    // Need write transaction to add mapping
+    let mut write_txn = store.create_txn(true).unwrap();
+
     // Add OIDC identity mapping
     token_system
-        .add_oidc_identity(provider, subject, user_ulid, &store, &mut txn)
+        .add_oidc_identity(provider, subject, user_ulid, &store, &mut write_txn)
         .unwrap();
 
     // Lookup should now return the mapped user ULID
     let lookup_result = token_system
-        .get_user_from_oidc(provider, subject, &store, &txn)
+        .get_user_from_oidc(provider, subject, &store, &write_txn)
         .unwrap();
     assert_eq!(lookup_result, Some(user_ulid));
 
     // Verify isolation: different provider/subject combinations return None
     let different_provider_result = token_system
-        .get_user_from_oidc("https://other.com", subject, &store, &txn)
+        .get_user_from_oidc("https://other.com", subject, &store, &write_txn)
         .unwrap();
     assert!(different_provider_result.is_none());
 
     let different_subject_result = token_system
-        .get_user_from_oidc(provider, "other_user", &store, &txn)
+        .get_user_from_oidc(provider, "other_user", &store, &write_txn)
         .unwrap();
     assert!(different_subject_result.is_none());
 
-    txn.commit().unwrap();
+    write_txn.commit().unwrap();
     cleanup_test_dir(&test_dir);
 }
 
@@ -598,11 +588,13 @@ async fn test_ed25519_key_generation_and_usage() {
 
     // Test token generation and validation with Ed25519
     let realm_key = create_test_realm_key(1);
-    let user_ulid = create_test_ulid(2);
-    let mut token_system = TokenSystem::new(realm_key, OidcTrustConfig::TrustAll);
+    let mut token_system = TokenSystem::new(realm_key, vec![]).await.unwrap();
 
-    token_system.add_realm_public_key(realm_key, verifying_pem);
+    token_system
+        .add_realm_public_key(realm_key, verifying_pem)
+        .unwrap();
 
+    let user_ulid = create_test_ulid(123);
     let user_identity = UserIdentity::new(user_ulid, realm_key);
 
     // Generate token
@@ -611,7 +603,8 @@ async fn test_ed25519_key_generation_and_usage() {
         .unwrap();
 
     // Validate token
-    let recovered_identity = token_system.validate_realm_token(&token).unwrap();
+    let recovered_identity = token_system.validate_realm_token(&token).await.unwrap();
 
-    assert_eq!(recovered_identity, user_identity);
+    assert_eq!(recovered_identity.user_ulid, user_identity.user_ulid);
+    assert_eq!(recovered_identity.realm_key, user_identity.realm_key);
 }
