@@ -79,19 +79,22 @@ pub async fn main() {
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .build()
-        .tracer("aruna1");
+        .tracer("aruna");
     let tracing_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("aruna_metadata=trace".parse().unwrap())
-        .add_directive("tower_http=debug".parse().unwrap())
-        .add_directive("aruna_net=trace".parse().unwrap());
+        .add_directive("aruna_storage=trace".parse().unwrap())
+        .add_directive("aruna_net=trace".parse().unwrap())
+        .add_directive("aruna_realm=trace".parse().unwrap())
+        .add_directive("aruna_permission=trace".parse().unwrap());
 
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("aruna_metadata=trace".parse().unwrap())
         .add_directive("aruna_storage=trace".parse().unwrap())
-        .add_directive("tower_http=info".parse().unwrap())
-        .add_directive("aruna_net=info".parse().unwrap());
+        .add_directive("aruna_net=trace".parse().unwrap())
+        .add_directive("aruna_realm=trace".parse().unwrap())
+        .add_directive("aruna_permission=trace".parse().unwrap());
 
     let telemetry_layer = tracing_opentelemetry::layer()
         .with_tracer(provider)
@@ -310,7 +313,9 @@ pub fn parse_config() -> Result<Config, ArunaError> {
     }
 
     let path = dotenvy::var("DB_PATH")?;
-    let signing_key = SigningKey::from_pkcs8_pem(&dotenvy::var("REALM_KEY")?)?;
+    let key = &dotenvy::var("REALM_KEY")?;
+    println!("{key}");
+    let signing_key = SigningKey::from_pkcs8_pem(key)?;
     let verifying_key = signing_key.verifying_key();
     let token_handler_realm_keys = Ed25519KeyPair {
         signing_key,

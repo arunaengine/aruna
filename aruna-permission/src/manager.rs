@@ -533,15 +533,18 @@ impl PermissionManager {
         let permission_manager = self.clone();
         let identity = identity.clone();
 
+        let current_span = tracing::Span::current();
         let ulid = tokio::task::spawn_blocking(move || -> Result<Ulid> {
-            let txn = store.create_txn(false)?;
+            current_span.in_scope(|| {
+                let txn = store.create_txn(false)?;
 
-            let permission_ulid =
-                permission_manager.resolve_permission_ulid(&identity, &store, &txn)?;
+                let permission_ulid =
+                    permission_manager.resolve_permission_ulid(&identity, &store, &txn)?;
 
-            store.commit(txn)?;
+                store.commit(txn)?;
 
-            Ok(permission_ulid)
+                Ok(permission_ulid)
+            })
         })
         .await??;
         let res = self.enforcer.read().await.enforce(
@@ -553,6 +556,7 @@ impl PermissionManager {
     }
 
     /// Check if a user has permission to access a resource
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn check_permission<S>(
         &self,
         user_identity: &UserIdentity,
@@ -566,23 +570,28 @@ impl PermissionManager {
         let store = store.clone();
         let manager = self.clone();
         let user_identity = user_identity.clone();
+        let current_span = tracing::Span::current();
         let (permission_ulid, path) =
             tokio::task::spawn_blocking(move || -> Result<(Ulid, Path)> {
-                let txn = store.create_txn(false)?;
-                // Resolve user identity to permission ULID (must exist)
-                let permission_ulid =
-                    manager.resolve_permission_ulid(&user_identity, &store, &txn)?;
+                current_span.in_scope(|| {
+                    let txn = store.create_txn(false)?;
+                    // Resolve user identity to permission ULID (must exist)
+                    let permission_ulid =
+                        manager.resolve_permission_ulid(&user_identity, &store, &txn)?;
 
-                // Retrieve path from resource mapping
-                let key = resource_id.to_string();
-                let path_bytes = store
-                    .get(&txn, RESOURCE_DB, key.as_bytes())
-                    .map_err(|_| PermissionError::ResourceNotFound(resource_id.to_string()))?
-                    .ok_or_else(|| PermissionError::ResourceNotFound(resource_id.to_string()))?;
+                    // Retrieve path from resource mapping
+                    let key = resource_id.to_string();
+                    let path_bytes = store
+                        .get(&txn, RESOURCE_DB, key.as_bytes())
+                        .map_err(|_| PermissionError::ResourceNotFound(resource_id.to_string()))?
+                        .ok_or_else(|| {
+                            PermissionError::ResourceNotFound(resource_id.to_string())
+                        })?;
 
-                let path = Path::try_from(path_bytes.as_ref())?;
-                store.commit(txn)?;
-                Ok((permission_ulid, path))
+                    let path = Path::try_from(path_bytes.as_ref())?;
+                    store.commit(txn)?;
+                    Ok((permission_ulid, path))
+                })
             })
             .await??;
 

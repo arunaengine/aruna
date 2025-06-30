@@ -28,12 +28,15 @@ where
     pub async fn check_public(&self, resource_id: &Ulid) -> Result<bool, ArunaMetadataError> {
         let store = self.store.clone();
         let id = resource_id.to_bytes();
+        let current_span = tracing::Span::current();
         tokio::task::spawn_blocking(move || -> Result<bool, ArunaMetadataError> {
-            let txn = store.create_txn(false)?;
+            current_span.in_scope(|| {
+                let txn = store.create_txn(false)?;
 
-            let mapping = store.get(&txn, RESOURCE_MAPPINGS_DB_NAME, id.as_slice())?;
+                let mapping = store.get(&txn, RESOURCE_MAPPINGS_DB_NAME, id.as_slice())?;
 
-            Ok(mapping.is_some())
+                Ok(mapping.is_some())
+            })
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
@@ -55,11 +58,14 @@ where
         let store = self.store.clone();
         let token_handler = self.token_handler.clone();
         // TODO: Query user from kademlia
+        let current_span = tracing::Span::current();
         tokio::task::spawn_blocking(move || -> Result<UserIdentity, ArunaMetadataError> {
-            let txn = store.create_txn(false)?;
-            let user_identity = token_handler.read().get_identity(&token, &store, &txn)?;
-            store.commit(txn)?;
-            Ok(user_identity)
+            current_span.in_scope(|| {
+                let txn = store.create_txn(false)?;
+                let user_identity = token_handler.read().get_identity(&token, &store, &txn)?;
+                store.commit(txn)?;
+                Ok(user_identity)
+            })
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
@@ -68,19 +74,22 @@ where
     pub async fn check_oidc_token(&self, token: String) -> Result<OidcToken, ArunaMetadataError> {
         let store = self.store.clone();
         let token_handler = self.token_handler.clone();
+        let current_span = tracing::Span::current();
         tokio::task::spawn_blocking(move || -> Result<OidcToken, ArunaMetadataError> {
-            let txn = store.create_txn(false)?;
-            let token = token_handler.read().verify_oidc_token(&token)?;
-            let exists = token_handler
-                .read()
-                .get_user_from_oidc(&token.iss, &token.sub, &store, &txn)?
-                .is_some();
-            if !exists {
-                trace!("User does not exist");
-                return Err(ArunaMetadataError::Unauthorized);
-            }
-            store.commit(txn)?;
-            Ok(token)
+            current_span.in_scope(|| {
+                let txn = store.create_txn(false)?;
+                let token = token_handler.read().verify_oidc_token(&token)?;
+                let exists = token_handler
+                    .read()
+                    .get_user_from_oidc(&token.iss, &token.sub, &store, &txn)?
+                    .is_some();
+                if !exists {
+                    trace!("User does not exist");
+                    return Err(ArunaMetadataError::Unauthorized);
+                }
+                store.commit(txn)?;
+                Ok(token)
+            })
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
@@ -94,11 +103,14 @@ where
         let store = self.store.clone();
         let perm_manager = self.permission_manager.clone();
         let user_identity = user_identity.clone();
+        let current_span = tracing::Span::current();
         let perm_ulid = tokio::task::spawn_blocking(move || -> Result<Ulid, ArunaMetadataError> {
-            let txn = store.create_txn(false)?;
-            let perm_ulid = perm_manager.resolve_permission_ulid(&user_identity, &store, &txn);
-            store.commit(txn)?;
-            Ok(perm_ulid?)
+            current_span.in_scope(|| {
+                let txn = store.create_txn(false)?;
+                let perm_ulid = perm_manager.resolve_permission_ulid(&user_identity, &store, &txn);
+                store.commit(txn)?;
+                Ok(perm_ulid?)
+            })
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))??;
@@ -121,16 +133,21 @@ where
             .collect::<Result<Vec<Ulid>, ArunaMetadataError>>()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn check_is_group(&self, group_id: Ulid) -> Result<bool, ArunaMetadataError> {
         let store = self.store.clone();
+
+        let current_span = tracing::Span::current();
         tokio::task::spawn_blocking(move || -> Result<bool, ArunaMetadataError> {
-            let txn = store.create_txn(false)?;
-            let byte_id = group_id.to_bytes();
-            let is_group = store
-                .get(&txn, GROUPS_DB_NAME, byte_id.as_slice())?
-                .is_some();
-            store.commit(txn)?;
-            Ok(is_group)
+            current_span.in_scope(|| {
+                let txn = store.create_txn(false)?;
+                let byte_id = group_id.to_bytes();
+                let is_group = store
+                    .get(&txn, GROUPS_DB_NAME, byte_id.as_slice())?
+                    .is_some();
+                store.commit(txn)?;
+                Ok(is_group)
+            })
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
