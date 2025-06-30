@@ -28,6 +28,10 @@ ed25519-dalek = { workspace = true }
 pkcs8 = "0.10.2"
 hex = "0.4.3"
 utoipa = { workspace = true }
+reqwest = { version = "0.12.20", features = ["json"] }
+anyhow = { workspace = true }
+
 
 [dev-dependencies]
+mockito = "1.7.0"
 # Additional test dependencies if needed
