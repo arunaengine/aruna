@@ -6,7 +6,6 @@ use aruna_data::{ACCESS_DB_NAME, IOHandler, LOCATION_DB_NAME, PATH_LOCATION_DB_N
 use aruna_metadata::{
     api::server::RestServer,
     error::ArunaMetadataError,
-    models::models::Resource,
     network::network_trait::{Network, NetworkConfig, P2PNetwork},
     persistence::{
         persistence::{Persistor, tables::*},
@@ -14,7 +13,6 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
-use aruna_permission::PermissionError::ArunaPermissionHandlerError;
 use aruna_permission::{
     PermissionError, PermissionManager, TokenSystem,
     token::{Ed25519KeyPair, OidcTrustConfig},
@@ -28,8 +26,6 @@ use ed25519_dalek::pkcs8::DecodePrivateKey;
 use futures_util::TryFutureExt;
 use iroh::KeyParsingError;
 use iroh::NodeAddr;
-use iroh::PublicKey;
-use iroh::SecretKey;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -43,7 +39,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::try_join;
-use tracing::{debug, error};
+use tracing::{debug, error, trace};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
@@ -63,6 +59,8 @@ pub enum ArunaError {
     SigningKeyError(#[from] ed25519_dalek::pkcs8::Error),
     #[error("PermissionError: {0}")]
     PermissionError(#[from] PermissionError),
+    #[error("SerdeError: {0}")]
+    SerdeError(#[from] serde_json::error::Error),
 }
 
 #[tokio::main]
@@ -140,6 +138,9 @@ pub async fn main() {
         .await
         .unwrap(),
     );
+
+    let addr = network.get_addr().await.unwrap();
+    trace!("{}", serde_json::to_string(&addr).unwrap());
 
     let store_path = format!("{}/heed", config.path);
     let store_config = LmdbConfig {
@@ -308,7 +309,7 @@ pub fn parse_config() -> Result<Config, ArunaError> {
         dotenvy::from_filename_override(file)?;
     }
 
-    let path = dotenvy::var("DBPATH")?;
+    let path = dotenvy::var("DB_PATH")?;
     let signing_key = SigningKey::from_pkcs8_pem(&dotenvy::var("TOKEN_SIGNING_KEY")?)?;
     let verifying_key = signing_key.verifying_key();
     let token_handler_realm_keys = Ed25519KeyPair {
@@ -318,17 +319,7 @@ pub fn parse_config() -> Result<Config, ArunaError> {
 
     let oidc_trust_config = OidcTrustConfig::TrustAll;
     let bootstrap_nodes: Vec<NodeAddr> = match dotenvy::var("BOOTSTRAP_NODES") {
-        Ok(env_var) => env_var
-            .split(";")
-            .map(|key| {
-                Ok(NodeAddr::from_parts(
-                    PublicKey::from_str(key)?,
-                    None,
-                    Some(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 1230).into()),
-                ))
-            })
-            .collect::<Result<Vec<NodeAddr>, KeyParsingError>>()
-            .unwrap(),
+        Ok(env_var) => serde_json::from_str(&env_var)?,
         Err(_) => vec![],
     };
 

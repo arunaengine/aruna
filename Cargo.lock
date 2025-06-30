@@ -138,6 +138,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "parking_lot",
+ "serde_json",
  "thiserror 2.0.12",
  "tokio",
  "tracing",

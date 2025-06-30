@@ -55,7 +55,7 @@ impl<'a> Store<'a> for LmdbStore {
         env_options
             .map_size(30 * 1024 * 1024 * 1024) // 30 GB
             .max_readers(4098)
-            .max_dbs(10);
+            .max_dbs(20);
         let env = unsafe { env_options.open(path) }?;
 
         // Init database
