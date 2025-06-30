@@ -90,11 +90,11 @@ pub async fn main() {
 
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
-        .add_directive("aruna_metadata=trace".parse().unwrap())
-        .add_directive("aruna_storage=trace".parse().unwrap())
-        .add_directive("aruna_net=trace".parse().unwrap())
-        .add_directive("aruna_realm=trace".parse().unwrap())
-        .add_directive("aruna_permission=trace".parse().unwrap());
+        .add_directive("aruna_metadata=info".parse().unwrap())
+        .add_directive("aruna_storage=info".parse().unwrap())
+        .add_directive("aruna_net=info".parse().unwrap())
+        .add_directive("aruna_realm=info".parse().unwrap())
+        .add_directive("aruna_permission=info".parse().unwrap());
 
     let telemetry_layer = tracing_opentelemetry::layer()
         .with_tracer(provider)

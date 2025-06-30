@@ -14,6 +14,7 @@ macro_rules! logerr {
     () => {
         |e| {
             tracing::error!("Error: {:?}", e);
+            e
         }
     };
 }

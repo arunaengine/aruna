@@ -351,7 +351,6 @@ where
         let result = tokio::task::spawn_blocking(move || {
             current_span.in_scope(|| {
                 let read_txn = store.create_txn(false)?;
-                println!("There");
                 let id = Ulid::default().to_bytes();
                 let Some(bytes) = store.get(&read_txn, PUBLIC_MAPPINGS_DB_NAME, &id)? else {
                     return Err(ArunaMetadataError::DatabaseError(
@@ -359,7 +358,6 @@ where
                     ));
                 };
                 let mut universe = RoaringBitmap::deserialize_from(bytes.as_ref())?;
-                println!("Here");
                 if let Some(ids) = group {
                     for group in ids {
                         let id = group.to_bytes();
@@ -373,8 +371,6 @@ where
                     }
                 };
 
-                println!("There");
-
                 let ids = search.search::<Self>(universe, query)?;
 
                 let mut result = Vec::new();
@@ -385,10 +381,7 @@ where
                         result.push(resource);
                     }
 
-                    println!("{res}");
                 }
-
-                println!("finish");
 
                 store.commit(read_txn)?;
                 Ok(result)

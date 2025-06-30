@@ -1,9 +1,9 @@
 use super::search::Search;
 use crate::{
-    error::ArunaMetadataError, models::models::Resource, persistence::authorization::Authorize,
+    error::ArunaMetadataError, logerr, models::models::Resource,
+    persistence::authorization::Authorize,
 };
 use roaring::RoaringBitmap;
-use tracing::error;
 use std::{collections::HashMap, fs};
 use tantivy::{
     Index, IndexReader, IndexWriter, TantivyDocument,
@@ -12,6 +12,7 @@ use tantivy::{
     query::QueryParser,
     schema::{FAST, Field, INDEXED, OwnedValue, STORED, Schema, TEXT, Value},
 };
+use tracing::error;
 use ulid::Ulid;
 
 pub struct TantivySearch {
@@ -33,7 +34,6 @@ impl std::fmt::Debug for TantivySearch {
             .finish()
     }
 }
-
 
 // TODO: Couple fields with models
 #[derive(Clone, Debug)]
@@ -60,7 +60,7 @@ pub struct TantivyConfig {
     pub path: String,
     pub index_buffer: usize,
     //pub resources: tokio::sync::mpsc::Receiver<(u32, Resource)>, // TODO: replace with channel receiver
-                                                                 //pub _users: tokio::sync::mpsc::Receiver<User>, // TODO: replace with channel receiver
+    //pub _users: tokio::sync::mpsc::Receiver<User>, // TODO: replace with channel receiver
 }
 
 impl Search for TantivySearch {
@@ -165,7 +165,7 @@ impl Search for TantivySearch {
         })
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
+    #[tracing::instrument(level = "trace", skip(self, universe))]
     fn search<A: Authorize>(
         &self,
         universe: RoaringBitmap,
@@ -192,17 +192,21 @@ impl Search for TantivySearch {
                 self.fields.deleted,
             ],
         );
-        let parsed_query = parser.parse_query(&query)?;
+        let parsed_query = parser.parse_query(&query).map_err(logerr!())?;
         let universe = universe.clone();
         let idx_collector = FilterCollector::new(
             "idx".to_string(),
             move |idx: u64| universe.contains(idx as u32),
             TopDocs::with_limit(1000),
         );
-        let result = searcher.search(&parsed_query, &idx_collector)?;
+        let result = searcher
+            .search(&parsed_query, &idx_collector)
+            .map_err(logerr!())?;
         let mut ids = Vec::new();
         for (_, addr) in result {
-            let doc = searcher.doc::<HashMap<Field, OwnedValue>>(addr)?;
+            let doc = searcher
+                .doc::<HashMap<Field, OwnedValue>>(addr)
+                .map_err(logerr!())?;
 
             // let explanation = parsed_query.explain(&searcher, addr)?;
             // trace!(?explanation);
@@ -214,7 +218,7 @@ impl Search for TantivySearch {
                             "Id not provided as bytes in searching doc".to_string(),
                         ));
                     };
-                    ids.push(Ulid::from_bytes(id.try_into()?))
+                    ids.push(Ulid::from_bytes(id.try_into().map_err(logerr!())?))
                 }
                 None => {
                     return Err(ArunaMetadataError::DeserializeError(
