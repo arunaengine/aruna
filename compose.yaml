@@ -8,7 +8,7 @@ services:
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin      
       KC_HEALTH_ENABLED: true
     volumes:
-      - ./aruna-permission/tests/test_db/realm.json:/opt/keycloak/data/import/realm.json
+      - ./aruna/tests/realm.json:/opt/keycloak/data/import/realm.json
     command: "start-dev --import-realm"
     healthcheck:
       # I hate keycloak
@@ -16,22 +16,50 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
-  # aruna:
-  #   image: aruna:latest
-  #   network_mode: "host"
-  #   environment:
-  #     NODE_ID: 01J69YGPPZY80206PGHHXBR863
-  #     GRPC_PORT: 50050
-  #     GRPC_PORT_CONSENSUS: 50051
-  #     REST_PORT: 8080
-  #     NODE_SERIAL: 0
-  #     DB_PATH: ./01J69YGPPZY80206PGHHXBR863
-  #     ENCODING_KEY: MC4CAQAwBQYDK2VwBCIEICHl/V9wxvENDJKePwusDhnC7xgaHYV6iHLb0ENJZndj
-  #     DECODING_KEY: MCowBQYDK2VwAyEA2YfYTgb8Y0LTFr+2Rm2Fkdu38eJTfnsMDH2iZHErBH0=
-  #     KEY_SERIAL: 1
-  #     OIDC_ISSUER_NAME: http://localhost:1998/realms/test
-  #     OIDC_ISSUER_ENDPOINT: http://localhost:1998/realms/test/protocol/openid-connect/certs
-  #     OIDC_ISSUER_AUDIENCES: test;test-long
-  #   depends_on:
-  #     keycloak:
-  #       condition: service_healthy
+  jaeger:
+    environment:
+      COLLECTOR_OTLP_ENABLED: true
+    ports:
+      - 16686:16686 
+      - 4317:4317 
+      - 4318:4318
+    image: jaegertracing/all-in-one:1.70.0
+  minio:
+    image: minio/minio
+    ports:
+      - 9000:9000
+      - 9001:9001
+    environment:
+      MINIO_DOMAIN: minio:9000
+    command: "server /data --console-address ':9001'"
+  aruna:
+    image: aruna:latest
+    network_mode: "host"
+    environment:
+      REALM_KEY: "-----BEGIN PRIVATE KEY-----
+MFECAQEwBQYDK2VwBCIEIJucl73sk/By4tUQqsv1qopNy1Bi+EWhPugOxB+dyFRW
+gSEAtOYxE8jy2F90OEGr7NixCoc6pDIHMG2GwhKWfJqMGQA=
+-----END PRIVATE KEY-----"
+      P2P_KEY: "358ea489d2f7d91466eff6edbb7d69b507346dc199d963915138865c03ffe1db"
+      P2P_ADDRESS: "0.0.0.0"
+      P2P_PORT: 1230
+      VARIANT: "LMDB"
+      DB_PATH: "/dev/shm/node"
+      BACKEND_TYPE: "s3"
+      BACKEND_ENCRYPTION: false
+      BACKEND_COMPRESSION: false
+      BACKEND_DEDUPLICATION: false
+      BACKEND_ACCESS_ENDPOINT: "http://localhost:9000"
+      BACKEND_ACCESS_REGION: "eu-central-1"
+      BACKEND_ACCESS_REGION_DISABLE_CONFIG_LOAD: true
+      BACKEND_ACCESS_BUCKET: "aruna"
+      BACKEND_ACCESS_ACCESS_KEY_ID: "minioadmin"
+      BACKEND_ACCESS_SECRET_ACCESS_KEY: "minioadmin"
+      OPENAPI_ADDRESS: "0.0.0.0"
+      OPENAPI_PORT: 8080
+      S3_SERVER: "0.0.0.0:1337"
+      S3_HOSTNAME: "localhost:1337"
+      S3_CORS_EXCEPTION: "http://localhost:3000"
+    depends_on:
+      keycloak:
+        condition: service_healthy

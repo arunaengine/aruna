@@ -310,7 +310,7 @@ pub fn parse_config() -> Result<Config, ArunaError> {
     }
 
     let path = dotenvy::var("DB_PATH")?;
-    let signing_key = SigningKey::from_pkcs8_pem(&dotenvy::var("TOKEN_SIGNING_KEY")?)?;
+    let signing_key = SigningKey::from_pkcs8_pem(&dotenvy::var("REALM_KEY")?)?;
     let verifying_key = signing_key.verifying_key();
     let token_handler_realm_keys = Ed25519KeyPair {
         signing_key,
