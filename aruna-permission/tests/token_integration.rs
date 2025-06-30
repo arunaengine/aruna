@@ -44,7 +44,7 @@ async fn setup_test_systems() -> (
             aud: vec![],
         },
     ];
-    let mut token_system = TokenSystem::new(realm_a, issuers).await.unwrap();
+    let mut token_system = TokenSystem::new(realm_a, issuers).unwrap();
 
     // Generate Ed25519 key pair for realm tokens
     let realm_key_pair = Ed25519KeyPair::generate();

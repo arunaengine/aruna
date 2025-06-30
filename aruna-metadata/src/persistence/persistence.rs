@@ -11,7 +11,6 @@ use ahash::RandomState;
 use aruna_permission::{
     OidcToken, Path, PermissionManager, ResourceId, TokenSystem, UserIdentity,
     manager::{AddUserPrepare, CreateGroupPrepare},
-    token::OidcTrustConfig,
 };
 use aruna_storage::storage::store::Store;
 use automerge::{ActorId, AutoCommit, sync::State};

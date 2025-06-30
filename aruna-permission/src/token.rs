@@ -3,12 +3,12 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
 };
+use parking_lot::RwLock;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::RwLock;
 use ulid::Ulid;
 
 use crate::error::{ConversionError, PermissionError, Result};
@@ -174,16 +174,16 @@ pub struct Issuer {
 }
 
 impl Issuer {
-    pub async fn fetch_jwks(&self) -> anyhow::Result<HashMap<String, DecodingKey>> {
+    pub fn fetch_jwks(&self) -> anyhow::Result<HashMap<String, DecodingKey>> {
         if self.pubkey_url.is_empty() {
             return Err(anyhow::anyhow!("Empty pubkey URL"));
         }
 
-        let client = reqwest::Client::builder()
+        let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
 
-        let res = client.get(&self.pubkey_url).send().await?;
+        let res = client.get(&self.pubkey_url).send()?;
 
         if !res.status().is_success() {
             return Err(anyhow::anyhow!(
@@ -192,7 +192,7 @@ impl Issuer {
             ));
         }
 
-        let jwks: JwkSet = res.json().await?;
+        let jwks: JwkSet = res.json()?;
 
         Ok(jwks
             .keys
@@ -292,7 +292,7 @@ pub struct TokenSystem {
 
 impl TokenSystem {
     /// Create new token system for a specific realm
-    pub async fn new(local_realm_key: RealmKey, issuers: Vec<Issuer>) -> Result<Self> {
+    pub fn new(local_realm_key: RealmKey, issuers: Vec<Issuer>) -> Result<Self> {
         // Validate inputs
         for issuer in &issuers {
             if issuer.issuer_name.is_empty() {
@@ -318,16 +318,16 @@ impl TokenSystem {
         };
 
         // Initial JWKS fetch with better error handling
-        system.refresh_jwks().await?;
+        system.refresh_jwks()?;
 
         Ok(system)
     }
 
     /// Get OIDC decoding key with caching
-    async fn get_oidc_key(&self, issuer_name: &str, kid: Option<&str>) -> Result<DecodingKey> {
+    fn get_oidc_key(&self, issuer_name: &str, kid: Option<&str>) -> Result<DecodingKey> {
         // Check cache first
         {
-            let cache = self.oidc_cache.read().await;
+            let cache = self.oidc_cache.read();
             if let Some(entry) = cache.get(issuer_name) {
                 if entry.fetched_at.elapsed().unwrap_or(Duration::MAX) < self.cache_duration {
                     // Cache is still valid
@@ -353,12 +353,11 @@ impl TokenSystem {
 
         let keys = issuer
             .fetch_jwks()
-            .await
             .map_err(|e| PermissionError::OidcError(format!("Failed to fetch JWKS: {}", e)))?;
 
         // Update cache
         {
-            let mut cache = self.oidc_cache.write().await;
+            let mut cache = self.oidc_cache.write();
             cache.insert(
                 issuer_name.to_string(),
                 JwksCache {
@@ -396,13 +395,13 @@ impl TokenSystem {
     }
 
     /// Refresh JWKs for all configured issuers
-    pub async fn refresh_jwks(&mut self) -> Result<()> {
+    pub fn refresh_jwks(&mut self) -> Result<()> {
         let mut fetch_errors = Vec::new();
 
         for issuer in &self.issuers {
-            match issuer.fetch_jwks().await {
+            match issuer.fetch_jwks() {
                 Ok(keys) => {
-                    let mut cache = self.oidc_cache.write().await;
+                    let mut cache = self.oidc_cache.write();
                     cache.insert(
                         issuer.issuer_name.clone(),
                         JwksCache {
@@ -433,8 +432,8 @@ impl TokenSystem {
     }
 
     /// Revoke a token by its JTI
-    pub async fn revoke_token(&self, jti: &str, exp: u64) {
-        let mut revoked = self.revoked_tokens.write().await;
+    pub fn revoke_token(&self, jti: &str, exp: u64) {
+        let mut revoked = self.revoked_tokens.write();
         revoked.insert(jti.to_string(), exp);
 
         // Clean up expired revocations
@@ -446,20 +445,20 @@ impl TokenSystem {
     }
 
     /// Check if a token is revoked
-    async fn is_token_revoked(&self, jti: &str) -> bool {
-        let revoked = self.revoked_tokens.read().await;
+    fn is_token_revoked(&self, jti: &str) -> bool {
+        let revoked = self.revoked_tokens.read();
         revoked.contains_key(jti)
     }
 
     /// Register user from OIDC token - creates new UserIdentity after verification or returns existing one
-    pub async fn register_user<'a, S: aruna_storage::storage::store::Store<'a> + 'static>(
+    pub fn register_user<'a, S: aruna_storage::storage::store::Store<'a> + 'static>(
         &self,
         token: &str,
         store: &'a S,
         txn: &mut <S as aruna_storage::storage::store::Store<'a>>::Txn,
     ) -> Result<UserIdentity> {
         // First verify and decode the OIDC token
-        let oidc_token = self.verify_oidc_token(token).await?;
+        let oidc_token = self.verify_oidc_token(token)?;
 
         // Use issuer as provider and sub as subject for OIDC identity mapping
         self.register_user_from_oidc_claims(&oidc_token.iss, &oidc_token.sub, store, txn)
@@ -562,7 +561,7 @@ impl TokenSystem {
     }
 
     /// Verify and decode OIDC token
-    pub async fn verify_oidc_token(&self, token: &str) -> Result<OidcToken> {
+    pub fn verify_oidc_token(&self, token: &str) -> Result<OidcToken> {
         // Decode header to get algorithm and kid
         let header = decode_header(token)
             .map_err(|e| PermissionError::OidcError(format!("Invalid JWT header: {}", e)))?;
@@ -595,9 +594,7 @@ impl TokenSystem {
         }
 
         // Get the decoding key
-        let decoding_key = self
-            .get_oidc_key(issuer_name, header.kid.as_deref())
-            .await?;
+        let decoding_key = self.get_oidc_key(issuer_name, header.kid.as_deref())?;
 
         // Set up proper validation
         let mut validation = Validation::new(header.alg);
@@ -617,7 +614,7 @@ impl TokenSystem {
     }
 
     /// Get identity from token (OIDC JWT or Aruna JWT)
-    pub async fn get_identity<'a, S: aruna_storage::storage::store::Store<'a> + 'static>(
+    pub fn get_identity<'a, S: aruna_storage::storage::store::Store<'a> + 'static>(
         &self,
         token: &str,
         store: &'a S,
@@ -642,10 +639,10 @@ impl TokenSystem {
 
         // Check if it's an Aruna token (issuer starts with "aruna@")
         if issuer.starts_with("aruna@") {
-            self.validate_realm_token(token).await
+            self.validate_realm_token(token)
         } else {
             // It's an OIDC token - verify it and lookup the user
-            let oidc_token = self.verify_oidc_token(token).await?;
+            let oidc_token = self.verify_oidc_token(token)?;
 
             // Check if user exists in our system
             match self.get_user_from_oidc(&oidc_token.iss, &oidc_token.sub, store, txn)? {
@@ -686,7 +683,7 @@ impl TokenSystem {
     }
 
     /// Validate realm JWT token and extract UserIdentity (Ed25519 only)
-    pub async fn validate_realm_token(&self, token: &str) -> Result<UserIdentity> {
+    pub fn validate_realm_token(&self, token: &str) -> Result<UserIdentity> {
         // Decode without verification first to get realm info for key lookup
         let dummy_key = DecodingKey::from_secret("dummy".as_ref());
         let mut unverified_validation = Validation::new(Algorithm::EdDSA);
@@ -700,7 +697,7 @@ impl TokenSystem {
             })?;
 
         // Check if token is revoked
-        if self.is_token_revoked(&unverified.claims.jti).await {
+        if self.is_token_revoked(&unverified.claims.jti) {
             return Err(PermissionError::OidcError(
                 "Token has been revoked".to_string(),
             ));
@@ -1030,7 +1027,7 @@ mod tests {
             aud: vec![],
         }];
 
-        let result = TokenSystem::new(realm_key, invalid_issuers).await;
+        let result = TokenSystem::new(realm_key, invalid_issuers);
         assert!(result.is_err());
 
         // Issuer name with pipe character
@@ -1040,14 +1037,14 @@ mod tests {
             aud: vec![],
         }];
 
-        let result = TokenSystem::new(realm_key, invalid_issuers).await;
+        let result = TokenSystem::new(realm_key, invalid_issuers);
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_token_revocation() {
         let realm_key = [1u8; 32];
-        let token_system = TokenSystem::new(realm_key, vec![]).await.unwrap();
+        let token_system = TokenSystem::new(realm_key, vec![]).unwrap();
 
         let jti = "test-jti";
         let exp = SystemTime::now()
@@ -1057,13 +1054,13 @@ mod tests {
             + 3600;
 
         // Token should not be revoked initially
-        assert!(!token_system.is_token_revoked(jti).await);
+        assert!(!token_system.is_token_revoked(jti));
 
         // Revoke the token
-        token_system.revoke_token(jti, exp).await;
+        token_system.revoke_token(jti, exp);
 
         // Token should now be revoked
-        assert!(token_system.is_token_revoked(jti).await);
+        assert!(token_system.is_token_revoked(jti));
     }
 
     #[test]
@@ -1072,9 +1069,7 @@ mod tests {
         let keypair = Ed25519KeyPair::generate();
         let public_key_pem = keypair.verifying_key_pem().unwrap();
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut token_system =
-            rt.block_on(async { TokenSystem::new(realm_key, vec![]).await.unwrap() });
+        let mut token_system = TokenSystem::new(realm_key, vec![]).unwrap();
 
         // Should succeed with valid PEM
         let result = token_system.add_realm_public_key(realm_key, public_key_pem);
@@ -1095,9 +1090,7 @@ mod tests {
         let user_ulid = Ulid::new();
         let user_identity = UserIdentity::new(user_ulid, realm_key);
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut token_system =
-            rt.block_on(async { TokenSystem::new(realm_key, vec![]).await.unwrap() });
+        let mut token_system = TokenSystem::new(realm_key, vec![]).unwrap();
 
         token_system
             .add_realm_public_key(realm_key, verifying_pem)
@@ -1110,9 +1103,7 @@ mod tests {
         assert!(!token.is_empty());
 
         // Validate token
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let validated_identity =
-            rt.block_on(async { token_system.validate_realm_token(&token).await.unwrap() });
+        let validated_identity = token_system.validate_realm_token(&token).unwrap();
 
         assert_eq!(validated_identity.user_ulid, user_ulid);
         assert_eq!(validated_identity.realm_key, realm_key);
@@ -1128,9 +1119,7 @@ mod tests {
         let user_ulid = Ulid::new();
         let foreign_user_identity = UserIdentity::new(user_ulid, foreign_realm_key);
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let token_system =
-            rt.block_on(async { TokenSystem::new(local_realm_key, vec![]).await.unwrap() });
+        let token_system = TokenSystem::new(local_realm_key, vec![]).unwrap();
 
         // Should fail to generate token for foreign realm user
         let result = token_system.generate_token(&foreign_user_identity, &signing_pem);
@@ -1147,7 +1136,7 @@ mod tests {
         let user_ulid = Ulid::new();
         let user_identity = UserIdentity::new(user_ulid, realm_key);
 
-        let mut token_system = TokenSystem::new(realm_key, vec![]).await.unwrap();
+        let mut token_system = TokenSystem::new(realm_key, vec![]).unwrap();
         token_system
             .add_realm_public_key(realm_key, verifying_pem)
             .unwrap();
@@ -1167,10 +1156,10 @@ mod tests {
         let jti = decoded.claims.jti;
 
         // Revoke the token
-        token_system.revoke_token(&jti, decoded.claims.exp).await;
+        token_system.revoke_token(&jti, decoded.claims.exp);
 
         // Validation should fail
-        let result = token_system.validate_realm_token(&token).await;
+        let result = token_system.validate_realm_token(&token);
         assert!(result.is_err());
     }
 
@@ -1180,7 +1169,7 @@ mod tests {
         let user_ulid = Ulid::new();
         let user_identity = UserIdentity::new(user_ulid, realm_key);
 
-        let token_system = TokenSystem::new(realm_key, vec![]).await.unwrap();
+        let token_system = TokenSystem::new(realm_key, vec![]).unwrap();
 
         // Create a token with wrong algorithm (HS256 instead of EdDSA)
         let claims = RealmTokenClaims::new(&user_identity, 24);
@@ -1189,7 +1178,7 @@ mod tests {
         let token = encode(&header, &claims, &encoding_key).unwrap();
 
         // Should fail validation due to wrong algorithm
-        let result = token_system.validate_realm_token(&token).await;
+        let result = token_system.validate_realm_token(&token);
         assert!(result.is_err());
     }
 
@@ -1215,9 +1204,7 @@ mod tests {
         let keypair = Ed25519KeyPair::generate();
         let verifying_pem = keypair.verifying_key_pem().unwrap();
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let mut token_system =
-            rt.block_on(async { TokenSystem::new(realm_key, vec![]).await.unwrap() });
+        let mut token_system = TokenSystem::new(realm_key, vec![]).unwrap();
 
         token_system
             .add_realm_public_key(realm_key, verifying_pem)
@@ -1230,7 +1217,7 @@ mod tests {
         let token = encode(&header, &claims, &encoding_key).unwrap();
 
         // Should fail validation due to realm key mismatch
-        let result = rt.block_on(async { token_system.validate_realm_token(&token).await });
+        let result = token_system.validate_realm_token(&token);
         assert!(result.is_err());
     }
 }
