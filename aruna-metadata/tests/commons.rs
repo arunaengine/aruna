@@ -16,7 +16,7 @@ use aruna_metadata::{
     transactions::{controller::Controller, request::Request},
 };
 use aruna_permission::{
-    OidcToken, PermissionManager, TokenSystem, UserIdentity, token::Ed25519KeyPair,
+    OidcToken, PermissionManager, TokenSystem, UserIdentity,
 };
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
@@ -55,7 +55,7 @@ struct TestConfig {
 }
 
 pub struct TestServers {
-    pub realm_keys: Ed25519KeyPair,
+    pub realm_key: SigningKey,
     pub addr_server_pairs: Vec<(
         Arc<Controller<LmdbStore, TantivySearch, P2PNetwork>>,
         String,
@@ -76,7 +76,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     //     .with_filter(logging_env_filter);
     // tracing_subscriber::registry().with(fmt_layer).init();
 
-    let realm_keys = Ed25519KeyPair::generate();
+    let realm_key = SigningKey::generate(&mut OsRng);
 
     let mut server_url_pairs = Vec::new();
     let databases = vec![
@@ -117,7 +117,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     // Token Handler
     let token_handler = Arc::new(RwLock::new(
         TokenSystem::new(
-            realm_keys.verifying_key.as_bytes().clone(),
+            &realm_key.verifying_key().as_bytes().clone(),
             vec![aruna_permission::token::Issuer {
                 issuer_name: "http://localhost:1998/realms/test".to_string(),
                 pubkey_url: "http://localhost:1998/realms/test/protocol/openid-connect/certs"
@@ -142,7 +142,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
                 TEST_CONFIG.p2p_port + offset + subscriber,
             ),
             bootstrap_nodes: vec![],
-            realm_key: realm_keys.signing_key.clone(),
+            realm_key: realm_key.clone(),
         })
         .await
         .unwrap(),
@@ -189,7 +189,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         // Token Handler
         let token_handler = Arc::new(RwLock::new(
             TokenSystem::new(
-                realm_keys.verifying_key.as_bytes().clone(),
+                realm_key.verifying_key().as_bytes(),
                 vec![aruna_permission::token::Issuer {
                     issuer_name: "http://localhost:1998/realms/test".to_string(),
                     pubkey_url: "http://localhost:1998/realms/test/protocol/openid-connect/certs"
@@ -214,7 +214,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
                     TEST_CONFIG.p2p_port + offset + subscriber,
                 ),
                 bootstrap_nodes: vec![bootstrap_addr.clone()],
-                realm_key: realm_keys.signing_key.clone(),
+                realm_key: realm_key.clone(),
             })
             .await
             .unwrap(),
@@ -239,7 +239,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     }
 
     Ok(TestServers {
-        realm_keys,
+        realm_key,
         addr_server_pairs: server_url_pairs,
     })
 }
@@ -278,7 +278,7 @@ pub async fn create_user_with_token(
         .persistence
         .token_handler
         .read()
-        .generate_token(&user_identity, &test.realm_keys.signing_key_pem()?)?;
+        .generate_token(&user_identity)?;
 
     Ok((user_identity, user_token))
 }

@@ -63,7 +63,7 @@ where
         tokio::task::spawn_blocking(move || -> anyhow::Result<UserIdentity> {
             let txn = store.create_txn(false)?;
             let user_identity = token_handler
-                .read()
+                .write()
                 .get_identity(&token, store.as_ref(), &txn)?;
             store.commit(txn)?;
             Ok(user_identity)

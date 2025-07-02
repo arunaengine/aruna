@@ -65,7 +65,7 @@ where
         tokio::task::spawn_blocking(move || -> Result<UserIdentity, ArunaMetadataError> {
             current_span.in_scope(|| {
                 let txn = store.create_txn(false)?;
-                let user_identity = token_handler.read().get_identity(&token, &store, &txn)?;
+                let user_identity = token_handler.write().get_identity(&token, &store, &txn)?;
                 store.commit(txn)?;
                 Ok(user_identity)
             })
@@ -82,7 +82,7 @@ where
         tokio::task::spawn_blocking(move || -> Result<OidcToken, ArunaMetadataError> {
             current_span.in_scope(|| {
                 let txn = store.create_txn(false)?;
-                let token = token_handler.read().verify_oidc_token(&token)?;
+                let token = token_handler.write().verify_oidc_token(&token)?;
                 let exists = token_handler
                     .read()
                     .get_user_from_oidc(&token.iss, &token.sub, &store, &txn)?

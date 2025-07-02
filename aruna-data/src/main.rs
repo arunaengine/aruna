@@ -108,7 +108,7 @@ async fn main() -> Result<()> {
         aud: todo!(),
     }];
     let token_handler = Arc::new(RwLock::new(TokenSystem::new(
-        config.general.realm_key.to_bytes(),
+        &config.general.realm_key.to_bytes(),
         issuers,
     )?));
 

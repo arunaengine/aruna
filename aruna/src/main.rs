@@ -15,7 +15,7 @@ use aruna_metadata::{
 };
 use aruna_permission::{
     PermissionError, PermissionManager, TokenSystem,
-    token::{Ed25519KeyPair, Issuer},
+    token::Issuer,
 };
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
@@ -166,7 +166,7 @@ pub async fn main() {
     // Token Handler
     let token_handler = Arc::new(RwLock::new(
         TokenSystem::new(
-            config.config.general.realm_key.to_bytes(),
+            &config.config.general.realm_key.to_bytes(),
             config.issuers.clone(),
         )
         .unwrap(),
@@ -191,7 +191,7 @@ pub struct Config {
     pub bootstrap_nodes: Vec<NodeAddr>,
     pub path: String,
     pub issuers: Vec<Issuer>,
-    pub token_handler_realm_keys: Ed25519KeyPair,
+    pub realm_key: SigningKey,
     pub search_config: TantivyConfig,
     pub config: DataConfig,
 }
@@ -305,11 +305,6 @@ pub fn parse_config() -> Result<Config, ArunaError> {
     let path = dotenvy::var("DB_PATH")?;
     let key = &dotenvy::var("REALM_KEY")?;
     let signing_key = SigningKey::from_pkcs8_pem(key)?;
-    let verifying_key = signing_key.verifying_key();
-    let token_handler_realm_keys = Ed25519KeyPair {
-        signing_key,
-        verifying_key,
-    };
 
     let issuers = serde_json::from_str(&dotenvy::var("ISSUERS")?)?;
     let bootstrap_nodes: Vec<NodeAddr> = match dotenvy::var("BOOTSTRAP_NODES") {
@@ -330,7 +325,7 @@ pub fn parse_config() -> Result<Config, ArunaError> {
         path,
         issuers,
         search_config,
-        token_handler_realm_keys,
+        realm_key: signing_key,
         config: data_config,
     })
 }
