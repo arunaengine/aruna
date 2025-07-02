@@ -62,14 +62,7 @@ where
         search_config: Se::SearchConfig,
         permission_manager: PermissionManager,
         token_handler: Arc<RwLock<TokenSystem>>,
-        realm_key: [u8; 32],
-        oidc_trust_config: OidcTrustConfig,
     ) -> Result<Self, ArunaMetadataError> {
-        //let permission_manager = PermissionManager::new().await?;
-        //let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_trust_config)));
-
-        // TODO: Init perm/auth
-
         let search = Arc::new(Se::new(search_config)?);
 
         let (idx_sdx, idx_rcv) = tokio::sync::oneshot::channel();
@@ -379,7 +372,6 @@ where
                         let resource: Resource = autosurgeon::hydrate(&doc)?;
                         result.push(resource);
                     }
-
                 }
 
                 store.commit(read_txn)?;

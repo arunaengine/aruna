@@ -16,8 +16,7 @@ use aruna_metadata::{
     transactions::{controller::Controller, request::Request},
 };
 use aruna_permission::{
-    OidcToken, PermissionManager, TokenSystem, UserIdentity,
-    token::{Ed25519KeyPair, OidcTrustConfig},
+    OidcToken, PermissionManager, TokenSystem, UserIdentity, token::Ed25519KeyPair,
 };
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
@@ -56,8 +55,7 @@ struct TestConfig {
 }
 
 pub struct TestServers {
-    pub realm_key: SigningKey,
-    pub token_handler_keys: Ed25519KeyPair,
+    pub realm_keys: Ed25519KeyPair,
     pub addr_server_pairs: Vec<(
         Arc<Controller<LmdbStore, TantivySearch, P2PNetwork>>,
         String,
@@ -78,9 +76,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     //     .with_filter(logging_env_filter);
     // tracing_subscriber::registry().with(fmt_layer).init();
 
-    let realm_key = SigningKey::generate(&mut OsRng);
-
-    let token_handler_realm_keys = Ed25519KeyPair::generate();
+    let realm_keys = Ed25519KeyPair::generate();
 
     let mut server_url_pairs = Vec::new();
     let databases = vec![
@@ -119,28 +115,23 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     store.commit(read_txn).unwrap();
 
     // Token Handler
-    let oidc_config = OidcTrustConfig::TrustAll;
-    let token_handler = Arc::new(RwLock::new(TokenSystem::new(
-        realm_key.verifying_key().as_bytes().clone(),
-        oidc_config,
-    )));
+    let token_handler = Arc::new(RwLock::new(
+        TokenSystem::new(
+            realm_keys.verifying_key.as_bytes().clone(),
+            vec![aruna_permission::token::Issuer {
+                issuer_name: "http://localhost:1998/realms/test".to_string(),
+                pubkey_url: "http://localhost:1998/realms/test/protocol/openid-connect/certs"
+                    .to_string(),
+                aud: vec!["test".to_string(), "test-long".to_string()],
+            }],
+        )
+        .unwrap(),
+    ));
 
     let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-        Persistor::new(
-            store,
-            search_config,
-            permission_manager,
-            token_handler,
-            realm_key.verifying_key().as_bytes().clone(),
-            OidcTrustConfig::TrustAll,
-        )
-        .await
-        .unwrap(),
-    );
-
-    persistor.token_handler.write().add_realm_public_key(
-        realm_key.verifying_key().as_bytes().clone(),
-        token_handler_realm_keys.verifying_key_pem().unwrap(),
+        Persistor::new(store, search_config, permission_manager, token_handler)
+            .await
+            .unwrap(),
     );
 
     let network = Arc::new(
@@ -151,7 +142,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
                 TEST_CONFIG.p2p_port + offset + subscriber,
             ),
             bootstrap_nodes: vec![],
-            realm_key: realm_key.clone(),
+            realm_key: realm_keys.signing_key.clone(),
         })
         .await
         .unwrap(),
@@ -196,28 +187,23 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         store.commit(read_txn).unwrap();
 
         // Token Handler
-        let oidc_config = OidcTrustConfig::TrustAll;
-        let token_handler = Arc::new(RwLock::new(TokenSystem::new(
-            realm_key.verifying_key().as_bytes().clone(),
-            oidc_config,
-        )));
+        let token_handler = Arc::new(RwLock::new(
+            TokenSystem::new(
+                realm_keys.verifying_key.as_bytes().clone(),
+                vec![aruna_permission::token::Issuer {
+                    issuer_name: "http://localhost:1998/realms/test".to_string(),
+                    pubkey_url: "http://localhost:1998/realms/test/protocol/openid-connect/certs"
+                        .to_string(),
+                    aud: vec!["test".to_string(), "test-long".to_string()],
+                }],
+            )
+            .unwrap(),
+        ));
 
         let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-            Persistor::new(
-                store,
-                search_config,
-                permission_manager,
-                token_handler,
-                realm_key.verifying_key().as_bytes().clone(),
-                OidcTrustConfig::TrustAll,
-            )
-            .await
-            .unwrap(),
-        );
-
-        persistor.token_handler.write().add_realm_public_key(
-            realm_key.verifying_key().as_bytes().clone(),
-            token_handler_realm_keys.verifying_key_pem().unwrap(),
+            Persistor::new(store, search_config, permission_manager, token_handler)
+                .await
+                .unwrap(),
         );
 
         let network = Arc::new(
@@ -228,7 +214,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
                     TEST_CONFIG.p2p_port + offset + subscriber,
                 ),
                 bootstrap_nodes: vec![bootstrap_addr.clone()],
-                realm_key: realm_key.clone(),
+                realm_key: realm_keys.signing_key.clone(),
             })
             .await
             .unwrap(),
@@ -253,8 +239,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     }
 
     Ok(TestServers {
-        realm_key,
-        token_handler_keys: token_handler_realm_keys,
+        realm_keys,
         addr_server_pairs: server_url_pairs,
     })
 }
@@ -269,14 +254,14 @@ pub async fn create_user_with_token(
     let response = request
         .run_request(
             OidcToken {
-                iss: "https://accounts.google.com".to_string(),
-                sub: format!("{name}@example.com"),
+                iss: "http://localhost:1998/realms/test".to_string(),
+                sub: format!("{name}@test.org"),
                 exp: chrono::Utc::now()
                     .checked_add_months(Months::new(12))
                     .unwrap()
                     .timestamp_millis() as u64,
                 iat: chrono::Utc::now().timestamp_millis() as u64,
-                aud: None,
+                aud: Some(serde_json::Value::String("test".to_string())),
                 email: None,
                 email_verified: None,
                 preferred_username: None,
@@ -293,7 +278,7 @@ pub async fn create_user_with_token(
         .persistence
         .token_handler
         .read()
-        .generate_token(&user_identity, &test.token_handler_keys.signing_key_pem()?)?;
+        .generate_token(&user_identity, &test.realm_keys.signing_key_pem()?)?;
 
     Ok((user_identity, user_token))
 }

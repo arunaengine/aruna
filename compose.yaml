@@ -44,6 +44,14 @@ services:
       P2P_KEY: "358ea489d2f7d91466eff6edbb7d69b507346dc199d963915138865c03ffe1db"
       P2P_ADDRESS: "0.0.0.0"
       P2P_PORT: 1230
+      ISSUERS: |
+          [
+            {
+              "issuer_name": "http://localhost:1998/realms/test",
+              "pubkey_url": "http://localhost:1998/realms/test/protocol/openid-connect/certs",
+              "aud": ["test", "test-long"]
+            }
+          ]
       VARIANT: "LMDB"
       DB_PATH: "/database"
       BACKEND_TYPE: "s3"

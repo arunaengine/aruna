@@ -8,7 +8,6 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
-use aruna_permission::token::OidcTrustConfig;
 use aruna_permission::{PermissionManager, TokenSystem};
 use aruna_storage::storage::fjall::{FjallConfig, FjallStore};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
@@ -55,20 +54,13 @@ impl TantivyFjall {
         store.commit(read_txn).unwrap();
 
         // Token Handler
-        let oidc_config = OidcTrustConfig::TrustAll;
-        let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_config)));
-        let oidc_trust_config = OidcTrustConfig::TrustAll;
+        let token_handler = Arc::new(RwLock::new(
+            TokenSystem::new(realm_key, vec![todo!()]).unwrap(),
+        ));
         let persistor = Arc::new(
-            Persistor::new(
-                store,
-                search_config,
-                permission_manager,
-                token_handler,
-                realm_key,
-                oidc_trust_config,
-            )
-            .await
-            .unwrap(),
+            Persistor::new(store, search_config, permission_manager, token_handler)
+                .await
+                .unwrap(),
         );
         let network = Arc::new(NetworkDummy::new(()).await.unwrap());
 
@@ -186,20 +178,13 @@ impl TantivyHeed {
         store.commit(read_txn).unwrap();
 
         // Token Handler
-        let oidc_config = OidcTrustConfig::TrustAll;
-        let token_handler = Arc::new(RwLock::new(TokenSystem::new(realm_key, oidc_config)));
-        let oidc_trust_config = OidcTrustConfig::TrustAll;
+        let token_handler = Arc::new(RwLock::new(
+            TokenSystem::new(realm_key, vec![todo!()]).unwrap(),
+        ));
         let persistor = Arc::new(
-            Persistor::new(
-                store,
-                search_config,
-                permission_manager,
-                token_handler,
-                realm_key,
-                oidc_trust_config,
-            )
-            .await
-            .unwrap(),
+            Persistor::new(store, search_config, permission_manager, token_handler)
+                .await
+                .unwrap(),
         );
         let network = Arc::new(NetworkDummy::new(()).await.unwrap());
 

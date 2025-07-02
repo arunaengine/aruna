@@ -203,8 +203,8 @@ async fn test_cross_realm_token_handling() {
         pubkey_url: "".to_string(),
         aud: vec![],
     }];
-    let mut token_system_a = TokenSystem::new(realm_a, issuers_a).await.unwrap();
-    let mut token_system_b = TokenSystem::new(realm_b, issuers_b).await.unwrap();
+    let mut token_system_a = TokenSystem::new(realm_a, issuers_a).unwrap();
+    let mut token_system_b = TokenSystem::new(realm_b, issuers_b).unwrap();
     let permission_manager = PermissionManager::new().await.unwrap();
 
     let (store, test_dir) = setup_test_store().await;
@@ -326,11 +326,9 @@ async fn test_cross_realm_token_handling() {
     // Verify tokens can be validated in their respective realms
     let verified_identity_a = token_system_a
         .validate_realm_token(&alice_realm_a_token)
-        .await
         .unwrap();
     let verified_identity_b = token_system_b
         .validate_realm_token(&alice_realm_b_token)
-        .await
         .unwrap();
 
     assert_eq!(verified_identity_a.user_ulid, alice_realm_a.user_ulid);
@@ -347,7 +345,7 @@ async fn test_token_identity_extraction() {
         pubkey_url: "".to_string(),
         aud: vec![],
     }];
-    let mut token_system = TokenSystem::new(realm_key, issuers).await.unwrap();
+    let mut token_system = TokenSystem::new(realm_key, issuers).unwrap();
 
     let (store, test_dir) = setup_test_store().await;
     let mut txn = store.create_txn(true).unwrap();
@@ -406,10 +404,7 @@ async fn test_token_identity_extraction() {
         .generate_token(&identity_from_oidc, &signing_pem)
         .unwrap();
 
-    let parsed_identity = token_system
-        .validate_realm_token(&aruna_token)
-        .await
-        .unwrap();
+    let parsed_identity = token_system.validate_realm_token(&aruna_token).unwrap();
 
     assert_eq!(parsed_identity.user_ulid, identity_from_oidc.user_ulid);
     assert_eq!(parsed_identity.realm_key, identity_from_oidc.realm_key);
@@ -425,7 +420,7 @@ async fn test_typical_usage_pattern() {
         pubkey_url: "".to_string(),
         aud: vec![],
     }];
-    let mut token_system = TokenSystem::new(realm_key, issuers).await.unwrap();
+    let mut token_system = TokenSystem::new(realm_key, issuers).unwrap();
     let permission_manager = PermissionManager::new().await.unwrap();
 
     let (store, test_dir) = setup_test_store().await;
@@ -493,10 +488,7 @@ async fn test_typical_usage_pattern() {
     let mut txn = store.create_txn(true).unwrap();
 
     // 6. Token verification workflow
-    let verified_identity = token_system
-        .validate_realm_token(&aruna_token)
-        .await
-        .unwrap();
+    let verified_identity = token_system.validate_realm_token(&aruna_token).unwrap();
 
     assert_eq!(verified_identity.user_ulid, user_identity.user_ulid);
 
@@ -507,7 +499,7 @@ async fn test_typical_usage_pattern() {
         pubkey_url: "".to_string(),
         aud: vec![],
     }];
-    let other_token_system = TokenSystem::new(other_realm, other_issuers).await.unwrap();
+    let other_token_system = TokenSystem::new(other_realm, other_issuers).unwrap();
 
     let other_identity = other_token_system
         .register_user_from_oidc_claims(
@@ -531,7 +523,7 @@ async fn test_typical_usage_pattern() {
 #[tokio::test]
 async fn test_oidc_lookup_operations() {
     let realm_key = create_test_realm_key(10);
-    let token_system = TokenSystem::new(realm_key, vec![]).await.unwrap();
+    let token_system = TokenSystem::new(realm_key, vec![]).unwrap();
 
     let (store, test_dir) = setup_test_store().await;
     let txn = store.create_txn(false).unwrap();
@@ -588,7 +580,7 @@ async fn test_ed25519_key_generation_and_usage() {
 
     // Test token generation and validation with Ed25519
     let realm_key = create_test_realm_key(1);
-    let mut token_system = TokenSystem::new(realm_key, vec![]).await.unwrap();
+    let mut token_system = TokenSystem::new(realm_key, vec![]).unwrap();
 
     token_system
         .add_realm_public_key(realm_key, verifying_pem)
@@ -603,7 +595,7 @@ async fn test_ed25519_key_generation_and_usage() {
         .unwrap();
 
     // Validate token
-    let recovered_identity = token_system.validate_realm_token(&token).await.unwrap();
+    let recovered_identity = token_system.validate_realm_token(&token).unwrap();
 
     assert_eq!(recovered_identity.user_ulid, user_identity.user_ulid);
     assert_eq!(recovered_identity.realm_key, user_identity.realm_key);

@@ -15,7 +15,7 @@ use aruna_metadata::{
 };
 use aruna_permission::{
     PermissionError, PermissionManager, TokenSystem,
-    token::{Ed25519KeyPair, OidcTrustConfig},
+    token::{Ed25519KeyPair, Issuer},
 };
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
@@ -80,6 +80,7 @@ pub async fn main() {
         .with_batch_exporter(exporter)
         .build()
         .tracer("aruna");
+
     let tracing_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("aruna_metadata=trace".parse().unwrap())
@@ -109,6 +110,8 @@ pub async fn main() {
         .with(fmt_layer)
         .with(telemetry_layer)
         .init();
+
+    trace!("{:?}", config);
 
     let databases = vec![
         ACCESS_DB_NAME,
@@ -161,11 +164,13 @@ pub async fn main() {
     store.commit(read_txn).unwrap();
 
     // Token Handler
-    let oidc_config = OidcTrustConfig::TrustAll;
-    let token_handler = Arc::new(RwLock::new(TokenSystem::new(
-        config.config.general.realm_key.to_bytes(),
-        oidc_config,
-    )));
+    let token_handler = Arc::new(RwLock::new(
+        TokenSystem::new(
+            config.config.general.realm_key.to_bytes(),
+            config.issuers.clone(),
+        )
+        .unwrap(),
+    ));
 
     let metadata_future = start_metadata(
         config.clone(),
@@ -185,7 +190,7 @@ pub async fn main() {
 pub struct Config {
     pub bootstrap_nodes: Vec<NodeAddr>,
     pub path: String,
-    pub oidc_trust_config: OidcTrustConfig,
+    pub issuers: Vec<Issuer>,
     pub token_handler_realm_keys: Ed25519KeyPair,
     pub search_config: TantivyConfig,
     pub config: DataConfig,
@@ -271,23 +276,8 @@ pub async fn start_metadata<S>(
 where
     for<'a> S: Store<'a> + 'static,
 {
-    let persistor: Arc<Persistor<S, TantivySearch>> = Arc::new(
-        Persistor::new(
-            store,
-            config.search_config,
-            perm_manager,
-            token_handler,
-            config
-                .config
-                .general
-                .realm_key
-                .verifying_key()
-                .to_bytes()
-                .clone(),
-            config.oidc_trust_config,
-        )
-        .await?,
-    );
+    let persistor: Arc<Persistor<S, TantivySearch>> =
+        Arc::new(Persistor::new(store, config.search_config, perm_manager, token_handler).await?);
 
     let controller = Arc::new(Controller::<S, TantivySearch, P2PNetwork>::new(
         persistor,
@@ -314,7 +304,6 @@ pub fn parse_config() -> Result<Config, ArunaError> {
 
     let path = dotenvy::var("DB_PATH")?;
     let key = &dotenvy::var("REALM_KEY")?;
-    println!("{key}");
     let signing_key = SigningKey::from_pkcs8_pem(key)?;
     let verifying_key = signing_key.verifying_key();
     let token_handler_realm_keys = Ed25519KeyPair {
@@ -322,7 +311,7 @@ pub fn parse_config() -> Result<Config, ArunaError> {
         verifying_key,
     };
 
-    let oidc_trust_config = OidcTrustConfig::TrustAll;
+    let issuers = serde_json::from_str(&dotenvy::var("ISSUERS")?)?;
     let bootstrap_nodes: Vec<NodeAddr> = match dotenvy::var("BOOTSTRAP_NODES") {
         Ok(env_var) => serde_json::from_str(&env_var)?,
         Err(_) => vec![],
@@ -339,7 +328,7 @@ pub fn parse_config() -> Result<Config, ArunaError> {
     Ok(Config {
         bootstrap_nodes,
         path,
-        oidc_trust_config,
+        issuers,
         search_config,
         token_handler_realm_keys,
         config: data_config,

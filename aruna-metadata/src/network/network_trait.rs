@@ -223,6 +223,7 @@ impl Network for P2PNetwork {
     type Config = NetworkConfig;
     type Stream = ReceiveStreams;
 
+    #[tracing::instrument(level = "trace", skip(config))]
     async fn new(config: Self::Config) -> Result<Self, ArunaMetadataError> {
         let init_handle = NetworkActorBuilder::new(config.secret_key)
             .await
@@ -243,6 +244,7 @@ impl Network for P2PNetwork {
         })
     }
 
+    #[tracing::instrument(level = "trace", skip(self, controller))]
     async fn start_actor<St, Se, N>(
         self: Arc<Self>,
         controller: Arc<Controller<St, Se, N>>,
@@ -278,12 +280,15 @@ impl Network for P2PNetwork {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_addr(&self) -> Result<NodeAddr, ArunaMetadataError> {
         self.chandler
             .get_node_addr()
             .await
             .map_err(|e| ArunaMetadataError::NetworkError(e.to_string()))
     }
+
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn find(&self, subject_hash: &[u8; 32]) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
         Ok(self
             .chandler
@@ -296,6 +301,7 @@ impl Network for P2PNetwork {
             .collect())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn find_verified(
         &self,
         subject_hash: &[u8; 32],
@@ -396,6 +402,7 @@ impl Network for P2PNetwork {
         Ok(response)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn store(&self, subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError> {
         let node_addr = self
             .chandler
@@ -413,6 +420,7 @@ impl Network for P2PNetwork {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn get_realm_nodes(&self) -> Result<Vec<NodeAddr>, ArunaMetadataError> {
         let query = self.realm_handler.get_realm_member_addrs();
         // try one refresh if no members are found
@@ -425,15 +433,18 @@ impl Network for P2PNetwork {
         Ok(members)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn update_realm(&self) -> Result<(), ArunaMetadataError> {
         self.realm_handler.update_now().await?;
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn store_in_realm(&self, _subject_id: &[u8; 32]) -> Result<(), ArunaMetadataError> {
         todo!()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn create_stream(&self, target: PublicKey) -> Result<Self::Stream, ArunaMetadataError> {
         let (send, rcv) = self.chandler.create_stream(target).await?;
         Ok(ReceiveStreams {
@@ -443,6 +454,7 @@ impl Network for P2PNetwork {
         })
     }
 
+    #[tracing::instrument(level = "trace", skip(self, stream))]
     async fn finish_stream(&self, mut stream: Self::Stream) -> Result<(), ArunaMetadataError> {
         stream
             .send_stream
@@ -453,6 +465,10 @@ impl Network for P2PNetwork {
 }
 
 impl P2PNetwork {
+    #[tracing::instrument(
+        level = "trace",
+        skip(self, message, sync_message, subject_id, recv_stream, controller)
+    )]
     async fn handle_replication_messages<St, Se, N>(
         &self,
         message: MetadataMessage,
@@ -571,6 +587,7 @@ impl P2PNetwork {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, recv_stream, controller))]
     pub async fn dispatch_messages<St, Se, N>(
         &self,
         recv_stream: &mut ReceiveStreams,

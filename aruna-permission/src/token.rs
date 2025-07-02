@@ -165,7 +165,7 @@ impl OidcToken {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Issuer {
     pub issuer_name: String,
     /// The issuer URL (e.g., "https://keycloak.example.com/realms/myrealm")

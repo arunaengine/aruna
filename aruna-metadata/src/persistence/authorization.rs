@@ -25,6 +25,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn check_public(&self, resource_id: &Ulid) -> Result<bool, ArunaMetadataError> {
         let store = self.store.clone();
         let id = resource_id.to_bytes();
@@ -42,6 +43,7 @@ where
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn check_path(
         &self,
         path: &Path,
@@ -54,6 +56,7 @@ where
             .await?)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn get_identity(&self, token: String) -> Result<UserIdentity, ArunaMetadataError> {
         let store = self.store.clone();
         let token_handler = self.token_handler.clone();
@@ -71,6 +74,7 @@ where
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn check_oidc_token(&self, token: String) -> Result<OidcToken, ArunaMetadataError> {
         let store = self.store.clone();
         let token_handler = self.token_handler.clone();
@@ -160,6 +164,7 @@ where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
 {
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn authorize(
         &self,
         user_identity: Option<UserIdentity>,

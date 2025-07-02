@@ -2,13 +2,15 @@ use anyhow::{Result, anyhow};
 use aruna_data::api_json::server::RestServer;
 use aruna_data::api_s3::auth::UserAccess;
 use aruna_data::api_s3::s3server::S3Server;
+use aruna_data::config::config;
 use aruna_data::io::controller::Controller;
+use aruna_data::io::io_handler::tables::{ACCESS_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 use aruna_data::io::io_handler::{IOHandler, REPLICATION_PROTOCOL_ID};
 use aruna_data::util::opendal::get_operator;
 use aruna_net::actor::NetworkActorBuilder;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::RealmKey;
-use aruna_permission::token::OidcTrustConfig;
+use aruna_permission::token::Issuer;
 use aruna_permission::{TokenSystem, UserIdentity};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
@@ -21,8 +23,6 @@ use tokio::try_join;
 use tracing::{Level, debug, error};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
-use aruna_data::config::config;
-use aruna_data::io::io_handler::tables::{ACCESS_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -45,10 +45,10 @@ async fn main() -> Result<()> {
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
-    
+
     let config = config::Config::load_from_env()?;
     debug!(?config);
-    
+
     let rest_addr = Ipv4Addr::from_str(&config.frontend.openapi_frontend.address)?;
 
     // Dummy access conf which is provided by user/request/node
@@ -102,11 +102,15 @@ async fn main() -> Result<()> {
     lmdb_store.commit(read_txn)?;
 
     // Token Handler
-    let oidc_config = OidcTrustConfig::TrustAll;
+    let issuers = vec![Issuer {
+        issuer_name: todo!(),
+        pubkey_url: todo!(),
+        aud: todo!(),
+    }];
     let token_handler = Arc::new(RwLock::new(TokenSystem::new(
         config.general.realm_key.to_bytes(),
-        oidc_config,
-    )));
+        issuers,
+    )?));
 
     // Create and run IOHandler
     let io_handler = IOHandler::<LmdbStore>::new(
