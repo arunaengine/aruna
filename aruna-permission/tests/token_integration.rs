@@ -1,4 +1,3 @@
-use aruna_permission::paths::RealmKey;
 use aruna_permission::token::{TokenSystem, derive_realm_key, generate_realm_private_key};
 use aruna_permission::*;
 use aruna_storage::storage::{
@@ -39,7 +38,7 @@ async fn setup_test_systems() -> (
     let realm_a_private_key = generate_realm_private_key();
 
     // For integration tests, use TokenSystem::generate() to avoid JWKS fetching issues
-    let mut token_system = TokenSystem::generate().unwrap();
+    let token_system = TokenSystem::generate().unwrap();
 
     // Create permission manager
     let permission_manager = PermissionManager::new().await.unwrap();
@@ -57,12 +56,6 @@ fn create_test_ulid(suffix: u8) -> Ulid {
     let mut bytes = [0u8; 16];
     bytes[15] = suffix;
     Ulid::from_bytes(bytes)
-}
-
-fn create_test_realm_key(suffix: u8) -> RealmKey {
-    let mut key = [0u8; 32];
-    key[31] = suffix;
-    key
 }
 
 pub async fn setup_test_store() -> (LmdbStore, String) {
@@ -90,7 +83,7 @@ pub fn cleanup_test_dir(path: &str) {
 
 #[tokio::test]
 async fn test_clean_separation_workflow() {
-    let (mut token_system, permission_manager, store, test_dir, _realm_private_key) =
+    let (token_system, permission_manager, store, test_dir, _realm_private_key) =
         setup_test_systems().await;
     let mut txn = store.create_txn(true).unwrap();
 
@@ -327,9 +320,7 @@ async fn test_cross_realm_token_handling() {
 
 #[tokio::test]
 async fn test_token_identity_extraction() {
-    let realm_private_key = generate_realm_private_key();
-    let realm_key = derive_realm_key(&realm_private_key);
-    let mut token_system = TokenSystem::generate().unwrap();
+    let token_system = TokenSystem::generate().unwrap();
 
     let (store, test_dir) = setup_test_store().await;
     let mut txn = store.create_txn(true).unwrap();
@@ -404,9 +395,7 @@ async fn test_token_identity_extraction() {
 
 #[tokio::test]
 async fn test_typical_usage_pattern() {
-    let realm_private_key = generate_realm_private_key();
-    let realm_key = derive_realm_key(&realm_private_key);
-    let mut token_system = TokenSystem::generate().unwrap();
+    let token_system = TokenSystem::generate().unwrap();
     let permission_manager = PermissionManager::new().await.unwrap();
 
     let (store, test_dir) = setup_test_store().await;
@@ -479,7 +468,7 @@ async fn test_typical_usage_pattern() {
     assert_eq!(verified_identity.user_ulid, user_identity.user_ulid);
 
     // 7. Same user in different realm
-    let mut other_token_system = TokenSystem::generate().unwrap();
+    let other_token_system = TokenSystem::generate().unwrap();
     let other_user_ulid = Ulid::new();
     let other_identity = UserIdentity::new(other_user_ulid, other_token_system.local_realm_key());
 
