@@ -429,7 +429,7 @@ mod tests {
                     ..Default::default()
                 }
             };
-            let r: Resource = client
+            let _: Resource = client
                 .post(format!("{first_url}/resources"))
                 .header::<&str, &str>(
                     "Authorization",

@@ -26,8 +26,11 @@ pub struct FjallConfig {
 }
 pub enum FjallTxn<'a> {
     Read(ReadTransaction),
-    Write(WriteTransaction<'a>),
+    Write(Box<WriteTransaction<'a>>),
 }
+
+pub type StoreIterator<'b> = Box<dyn Iterator<Item = (Cow<'b, [u8]>, Cow<'b, [u8]>)> + 'b>;
+type Tuple<'b> = (Cow<'b, [u8]>, Cow<'b, [u8]>);
 
 impl<'a> Store<'a> for FjallStore {
     type StoreConfig = FjallConfig;
@@ -59,7 +62,7 @@ impl<'a> Store<'a> for FjallStore {
 
     fn create_txn(&'a self, write: bool) -> Result<Self::Txn, crate::error::ArunaStorageError> {
         if write {
-            Ok(FjallTxn::Write(self.keyspace.write_tx()))
+            Ok(FjallTxn::Write(Box::new(self.keyspace.write_tx())))
         } else {
             Ok(FjallTxn::Read(self.keyspace.read_tx()))
         }
@@ -82,7 +85,7 @@ impl<'a> Store<'a> for FjallStore {
         };
         match self.tables.get(dbname) {
             Some(handle) => {
-                wtxn.insert(&handle, key, value);
+                wtxn.insert(handle, key, value);
             }
             None => {
                 return Err(ArunaStorageError::DatabaseError(
@@ -135,33 +138,29 @@ impl<'a> Store<'a> for FjallStore {
             FjallTxn::Read(r) => {
                 match self.tables.get(dbname) {
                     Some(handle) => {
-                        Ok(r.get(&handle, key)?.map(|v| {
+                        Ok(r.get(handle, key)?.map(|v| {
                             // TODO: This sucks, needs improvement
                             let value = v.as_ref().to_vec();
-                            Cow::from(value).to_owned()
+                            Cow::from(value).clone()
                         }))
                     }
-                    None => {
-                        return Err(ArunaStorageError::DatabaseError(
-                            "Database not found".to_string(),
-                        ));
-                    }
+                    None => Err(ArunaStorageError::DatabaseError(
+                        "Database not found".to_string(),
+                    )),
                 }
             }
             FjallTxn::Write(w) => {
                 match self.tables.get(dbname) {
                     Some(handle) => {
-                        Ok(w.get(&handle, key)?.map(|v| {
+                        Ok(w.get(handle, key)?.map(|v| {
                             // TODO: This sucks, needs improvement
                             let value = v.as_ref().to_vec();
-                            Cow::from(value).to_owned()
+                            Cow::from(value).clone()
                         }))
                     }
-                    None => {
-                        return Err(ArunaStorageError::DatabaseError(
-                            "Database not found".to_string(),
-                        ));
-                    }
+                    None => Err(ArunaStorageError::DatabaseError(
+                        "Database not found".to_string(),
+                    )),
                 }
             }
         }
@@ -182,40 +181,36 @@ impl<'a> Store<'a> for FjallStore {
         &'a self,
         txn: &'b Self::Txn,
         dbname: &'static str,
-    ) -> Result<Box<dyn Iterator<Item = (Cow<'b, [u8]>, Cow<'b, [u8]>)> + 'b>, ArunaStorageError>
+    ) -> Result<StoreIterator<'b>, ArunaStorageError>
     where
         'a: 'b,
     {
         match txn {
             FjallTxn::Read(r) => match self.tables.get(dbname) {
-                Some(handle) => Ok(Box::new(r.iter(&handle).filter_map(
-                    |slices| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
+                Some(handle) => Ok(Box::new(r.iter(handle).filter_map(
+                    |slices| -> Option<Tuple> {
                         let (key, value) = slices.ok()?;
-                        let key = Cow::from(key.as_ref().to_vec()).to_owned();
-                        let value = Cow::from(value.as_ref().to_vec()).to_owned();
+                        let key = Cow::from(key.as_ref().to_vec()).clone();
+                        let value = Cow::from(value.as_ref().to_vec()).clone();
                         Some((key, value))
                     },
                 ))),
-                None => {
-                    return Err(ArunaStorageError::DatabaseError(
-                        "Database not found".to_string(),
-                    ));
-                }
+                None => Err(ArunaStorageError::DatabaseError(
+                    "Database not found".to_string(),
+                )),
             },
             FjallTxn::Write(w) => match self.tables.get(dbname) {
-                Some(handle) => Ok(Box::new(w.iter(&handle).filter_map(
+                Some(handle) => Ok(Box::new(w.iter(handle).filter_map(
                     |slices| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
                         let (key, value) = slices.ok()?;
-                        let key = Cow::from(key.as_ref().to_vec()).to_owned();
-                        let value = Cow::from(value.as_ref().to_vec()).to_owned();
+                        let key = Cow::from(key.as_ref().to_vec()).clone();
+                        let value = Cow::from(value.as_ref().to_vec()).clone();
                         Some((key, value))
                     },
                 ))),
-                None => {
-                    return Err(ArunaStorageError::DatabaseError(
-                        "Database not found".to_string(),
-                    ));
-                }
+                None => Err(ArunaStorageError::DatabaseError(
+                    "Database not found".to_string(),
+                )),
             },
         }
     }
@@ -225,17 +220,17 @@ impl<'a> Store<'a> for FjallStore {
         txn: &'b Self::Txn,
         dbname: &'static str,
         prefix: String,
-    ) -> Result<Box<dyn Iterator<Item = (Cow<'b, [u8]>, Cow<'b, [u8]>)> + 'b>, ArunaStorageError>
+    ) -> Result<StoreIterator<'b>, ArunaStorageError>
     where
         'a: 'b,
     {
         match txn {
             FjallTxn::Read(r) => match self.tables.get(dbname) {
                 Some(handle) => Ok(Box::new(r.prefix(&handle, prefix).filter_map(
-                    |slices| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
+                    |slices| -> Option<Tuple<'b>> {
                         let (key, value) = slices.ok()?;
-                        let key = Cow::from(key.as_ref().to_vec()).to_owned();
-                        let value = Cow::from(value.as_ref().to_vec()).to_owned();
+                        let key = Cow::from(key.as_ref().to_vec()).clone();
+                        let value = Cow::from(value.as_ref().to_vec()).clone();
                         Some((key, value))
                     },
                 ))),
@@ -247,10 +242,10 @@ impl<'a> Store<'a> for FjallStore {
             },
             FjallTxn::Write(w) => match self.tables.get(dbname) {
                 Some(handle) => Ok(Box::new(w.prefix(&handle, prefix).filter_map(
-                    |slices| -> Option<(Cow<'b, [u8]>, Cow<'b, [u8]>)> {
+                    |slices| -> Option<Tuple<'b>> {
                         let (key, value) = slices.ok()?;
-                        let key = Cow::from(key.as_ref().to_vec()).to_owned();
-                        let value = Cow::from(value.as_ref().to_vec()).to_owned();
+                        let key = Cow::from(key.as_ref().to_vec()).clone();
+                        let value = Cow::from(value.as_ref().to_vec()).clone();
                         Some((key, value))
                     },
                 ))),
