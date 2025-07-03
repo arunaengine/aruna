@@ -169,8 +169,8 @@ impl StorageBackend for S3Backend {
                 return Err(err.into());
             }
         };
-        let id = location.id.to_string();
 
+        //let id = location.id.to_string();
         while let Some(bytes) = object_request.body.next().await {
             //trace!(len = ?bytes.as_ref().map(|e| e.len()), ?id, "Sending bytes");
             sender

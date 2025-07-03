@@ -127,7 +127,7 @@ impl Cache {
         cache.set_auth(auth_handler).await;
 
         // Set database conn in cache
-        let temp_locations = if with_persistence {
+        let _temp_locations = if with_persistence {
             let persistence = Database::new().await?;
             cache.set_persistence(persistence).await?
         } else {
@@ -772,6 +772,66 @@ impl Cache {
         Ok(())
     }
 
+    /// These resources only live in the proxy until the next restart
+    #[tracing::instrument(level = "trace", skip(self, object))]
+    pub async fn insert_temp_resource(&self, object: Object) -> Result<()> {
+        // Return Ok if already exists
+        if let Ok((rwlock_object, _)) = self.get_resource(&object.id).await {
+            let cache_object = rwlock_object.read().await;
+            if *cache_object == object {
+                return Ok(());
+            }
+        }
+
+        // Else just insert in cache
+        self.resources.insert(
+            object.id,
+            (
+                Arc::new(RwLock::new(object.clone())),
+                Arc::new(RwLock::new(Some(ObjectLocation {
+                    id: DieselUlid::generate(),
+                    bucket: "temp".to_string(),
+                    key: object.name.clone(),
+                    upload_id: None,
+                    file_format: crate::structs::FileFormat::Raw,
+                    raw_content_len: 0,
+                    disk_content_len: 0,
+                    disk_hash: None,
+                    is_temporary: true,
+                    ref_count: 0,
+                }))),
+            ),
+        );
+
+        // Add paths to cache
+        let prefixes = self.get_prefixes(&TypedId::Unknown(object.id), false).await;
+        trace!(?prefixes, "temp resource prefixes");
+        if object
+            .parents
+            .as_ref()
+            .map(|e| e.is_empty())
+            .unwrap_or_else(|| true)
+            && object.object_type != ObjectType::Project
+        {
+            for (_, pre) in prefixes.iter() {
+                self.paths
+                    .remove(&format!("{}/{}", pre.clone(), object.name));
+            }
+        } else {
+            for (_, pre) in prefixes.iter() {
+                self.paths
+                    .insert(format!("{}/{}", pre.clone(), object.name), object.id);
+
+                trace!(
+                    inserted = format!("{}/{}", pre.clone(), object.name),
+                    "inserted"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self, object))]
     pub async fn upsert_object(&self, object: Object) -> Result<()> {
         trace!(?object, "upserting object");
@@ -908,7 +968,7 @@ impl Cache {
                 let (_, loc) = resource.value();
                 if let Some(location) = loc.read().await.as_ref() {
                     s3_backend.delete_object(location.clone()).await?;
-        }
+                }
             }
         }
 

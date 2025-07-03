@@ -80,6 +80,42 @@ impl ArunaS3Service {
             cache,
         })
     }
+
+    #[tracing::instrument(level = "trace", skip(object, headers))]
+    async fn put_empty_object(
+        &self,
+        object: ProxyObject,
+        headers: Option<HashMap<String, String>>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let md5 = Md5::new().finalize();
+        let sha256 = Sha256::new().finalize();
+
+        let output = PutObjectOutput {
+            e_tag: Some(format!("{:x}", md5)),
+            checksum_sha256: Some(format!("{:x}", sha256)),
+            version_id: Some(object.id.to_string()),
+            ..Default::default()
+        };
+
+        self.cache.insert_temp_resource(object).await.map_err(|_| {
+            error!(error = "Unable to temporarily cache empty object");
+            s3_error!(InternalError, "Unable to temporarily cache empty object")
+        })?;
+
+        let mut resp = S3Response::new(output);
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+
+        Ok(resp)
+    }
 }
 
 #[async_trait::async_trait]
@@ -336,7 +372,7 @@ impl S3 for ArunaS3Service {
                 ))
             }
         };
-
+        
         trace!(?new_object);
 
         let mut location = self
@@ -1411,17 +1447,6 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        match req.input.content_length {
-            Some(0) | None => {
-                error!("Missing or invalid (0) content-length");
-                return Err(s3_error!(
-                    MissingContentLength,
-                    "Missing or invalid (0) content-length"
-                ));
-            }
-            _ => {}
-        };
-
         let CheckAccessResult {
             objects_state,
             user_state,
@@ -1484,6 +1509,16 @@ impl S3 for ArunaS3Service {
         };
 
         trace!(?new_object);
+        match req.input.content_length {
+            Some(0) => {
+                return self.put_empty_object(new_object, headers).await;
+            }
+            None => {
+                error!("Missing content-length");
+                return Err(s3_error!(MissingContentLength, "Missing content-length"));
+            }
+            _ => {} // Go on.
+        };
 
         let mut location = self
             .backend
