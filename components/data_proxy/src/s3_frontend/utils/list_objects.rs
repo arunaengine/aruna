@@ -70,10 +70,11 @@ pub async fn list_response(
                             delimiter
                         ));
                     } else {
-                        let object_with_location = cache
-                            .get_resource_cloned(&id, false)
-                            .await
-                            .map_err(|_| s3_error!(NoSuchKey, "No key found for path"))?;
+                        let object_with_location =
+                            cache.get_resource_cloned(&id, true).await.map_err(|e| {
+                                tracing::error!(error = "No key found for path", ?e, ?path);
+                                s3_error!(NoSuchKey, "No key found for path: {}", path)
+                            })?;
 
                         if object_with_location.0.object_type != ObjectType::Object {
                             continue;
@@ -103,10 +104,11 @@ pub async fn list_response(
                     common_prefixes.insert(format!("{}{}", common_prefix, delimiter));
                 } else {
                     // If None split -> Entry
-                    let object_with_location = cache
-                        .get_resource_cloned(&id, false)
-                        .await
-                        .map_err(|_| s3_error!(NoSuchKey, "No key found for path"))?;
+                    let object_with_location =
+                        cache.get_resource_cloned(&id, true).await.map_err(|e| {
+                            tracing::error!(error = "No key found for path", ?e, ?path);
+                            s3_error!(NoSuchKey, "No key found for path: {}", path)
+                        })?;
 
                     if object_with_location.0.object_type != ObjectType::Object {
                         continue;
@@ -129,10 +131,11 @@ pub async fn list_response(
                 }
 
                 if path.strip_prefix(&prefix).is_some() {
-                    let object_with_location = cache
-                        .get_resource_cloned(&id, false)
-                        .await
-                        .map_err(|_| s3_error!(NoSuchKey, "No key found for path"))?;
+                    let object_with_location =
+                        cache.get_resource_cloned(&id, true).await.map_err(|e| {
+                            tracing::error!(error = "No key found for path", ?e, ?path);
+                            s3_error!(NoSuchKey, "No key found for path: {}", path)
+                        })?;
 
                     if object_with_location.0.object_type != ObjectType::Object {
                         continue;
@@ -156,10 +159,11 @@ pub async fn list_response(
                     break;
                 }
 
-                let object_with_location = cache
-                    .get_resource_cloned(&id, false)
-                    .await
-                    .map_err(|_| s3_error!(NoSuchKey, "No key found for path"))?;
+                let object_with_location =
+                    cache.get_resource_cloned(&id, true).await.map_err(|e| {
+                        tracing::error!(error = "No key found for path", ?e, ?path);
+                        s3_error!(NoSuchKey, "No key found for path: {}", path)
+                    })?;
 
                 if object_with_location.0.object_type != ObjectType::Object {
                     continue;
