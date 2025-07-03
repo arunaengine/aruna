@@ -104,6 +104,7 @@ pub struct AddUserRequest {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddUserResponse {
     pub user: User,
+    pub token: String,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
@@ -290,7 +291,9 @@ pub enum ForwardResponse {
     Search(Result<SearchResponse, ArunaMetadataError>),
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams)]
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,
+)]
 pub struct GetUserRequest {
     #[schema(value_type=String)]
     #[param(value_type=String)]
@@ -300,4 +303,14 @@ pub struct GetUserRequest {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct GetUserResponse {
     pub user: User,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateTokenRequest {
+    pub expiration_hours: Option<u64>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct CreateTokenResponse {
+    pub token: String,
 }

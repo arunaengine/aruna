@@ -1,6 +1,6 @@
 use aruna_permission::{Action, OidcToken, Path, ResourceId, UserIdentity};
 use aruna_storage::storage::store::Store;
-use tracing::{error, trace};
+use tracing::error;
 use ulid::Ulid;
 
 use crate::{error::ArunaMetadataError, logerr};
@@ -162,6 +162,28 @@ where
         })
         .await
         .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn create_token(
+        &self,
+        user: &UserIdentity,
+        expiration_hours: Option<u64>,
+    ) -> Result<String, ArunaMetadataError> {
+        if let Some(expiration_hours) = expiration_hours {
+            self.token_handler
+                .read()
+                .generate_token_with_expiration(user, expiration_hours)
+                .map_err(|e| {
+                    error!(?e);
+                    ArunaMetadataError::ServerError(e.to_string())
+                })
+        } else {
+            self.token_handler.read().generate_token(user).map_err(|e| {
+                error!(?e);
+                ArunaMetadataError::ServerError(e.to_string())
+            })
+        }
     }
 }
 

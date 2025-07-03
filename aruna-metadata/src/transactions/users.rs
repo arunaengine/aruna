@@ -1,6 +1,9 @@
 use super::request::Request;
 use crate::{
-    models::requests::{AddUserRequest, AddUserResponse, GetUserRequest, GetUserResponse},
+    models::requests::{
+        AddUserRequest, AddUserResponse, CreateTokenRequest, CreateTokenResponse, GetUserRequest,
+        GetUserResponse,
+    },
     network::network_trait::Network,
     persistence::search::search::Search,
 };
@@ -88,8 +91,12 @@ where
                 members,
             )
             .await?;
+        let token = controller
+            .persistence
+            .create_token(&user.id, None)
+            .await?;
 
-        Ok(AddUserResponse { user })
+        Ok(AddUserResponse { user, token })
     }
 }
 
@@ -139,5 +146,51 @@ where
             ));
         };
         Ok(GetUserResponse { user })
+    }
+}
+
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for CreateTokenRequest
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    type Response = CreateTokenResponse;
+    type AuthContext = UserIdentity;
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError> {
+        // TODO: Handle permissions when user is requesting other users
+        let Some(token) = token else {
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
+        };
+        controller.persistence.get_identity(token).await
+    }
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        Ok(None)
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn run_request(
+        self,
+        auth_ctx: Self::AuthContext,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let token = controller
+            .persistence
+            .create_token(&auth_ctx, self.expiration_hours)
+            .await?;
+        Ok(CreateTokenResponse { token })
     }
 }

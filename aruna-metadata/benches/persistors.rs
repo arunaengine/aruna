@@ -55,7 +55,7 @@ impl TantivyFjall {
 
         // Token Handler
         let token_handler = Arc::new(RwLock::new(
-            TokenSystem::new(realm_key, vec![todo!()]).unwrap(),
+            TokenSystem::new(&realm_key, vec![todo!()]).unwrap(),
         ));
         let persistor = Arc::new(
             Persistor::new(store, search_config, permission_manager, token_handler)
@@ -179,7 +179,7 @@ impl TantivyHeed {
 
         // Token Handler
         let token_handler = Arc::new(RwLock::new(
-            TokenSystem::new(realm_key, vec![todo!()]).unwrap(),
+            TokenSystem::new(&realm_key, vec![todo!()]).unwrap(),
         ));
         let persistor = Arc::new(
             Persistor::new(store, search_config, permission_manager, token_handler)

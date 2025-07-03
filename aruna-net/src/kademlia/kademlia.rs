@@ -564,7 +564,7 @@ impl Kademlia {
     ) -> Result<()> {
         let self_addr = self.get_node_addr();
 
-        info!(
+        trace!(
             "Storing key: {:?} @ {} ",
             PublicKey::from_bytes(&key),
             self_addr.node_id

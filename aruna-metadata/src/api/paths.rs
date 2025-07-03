@@ -543,7 +543,7 @@ where
 pub async fn get_user<St, Se, N>(
     State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
-    Json(request): Json<AddUserRequest>,
+    Json(request): Json<GetUserRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
@@ -571,7 +571,34 @@ where
 pub async fn add_group<St, Se, N>(
     State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
-    Json(request): Json<AddUserRequest>,
+    Json(request): Json<AddGroupRequest>,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+/// Add a new group
+#[utoipa::path(
+    post,
+    path = "/groups/user",
+    request_body = AddUserToGroupRequest,
+    responses(
+        (status = 200, body = AddUserToGroupResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = USERS,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn add_user_to_group<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    headers: HeaderMap,
+    Json(request): Json<AddUserToGroupRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,

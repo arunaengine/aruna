@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::request::Request;
 use crate::{
-    models::{
+    logerr, models::{
         conversions::ToBytes,
         models::Group,
         requests::{
@@ -11,9 +11,7 @@ use crate::{
             AddUserToGroupRequest,
             AddUserToGroupResponse,
         },
-    },
-    network::network_trait::Network,
-    persistence::{authorization::Authorize, search::search::Search},
+    }, network::network_trait::Network, persistence::{authorization::Authorize, search::search::Search}
 };
 use aruna_permission::{Action, Path, UserIdentity};
 use aruna_storage::storage::store::Store;
@@ -38,8 +36,9 @@ where
         let Some(token) = token else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        let realm_key = controller.network.get_realm_key().await?;
-        let user_identity = controller.get_or_sync_user(token).await?;
+
+        let realm_key = controller.network.get_realm_key().await.map_err(logerr!())?;
+        let user_identity = controller.get_or_sync_user(token).await.map_err(logerr!())?;
 
         if user_identity.realm_key == realm_key {
             Ok(user_identity)

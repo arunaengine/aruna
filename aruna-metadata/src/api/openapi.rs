@@ -56,6 +56,8 @@ where
         .routes(routes!(update_resource_authors))
         .routes(routes!(search))
         .routes(routes!(add_user))
+        .routes(routes!(get_user))
         .routes(routes!(add_group))
+        .routes(routes!(add_user_to_group))
         .with_state(store)
 }

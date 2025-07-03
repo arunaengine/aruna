@@ -1,12 +1,9 @@
 use super::request::Request;
 use crate::{
-    error::ArunaMetadataError,
-    models::models::TypedDoc,
-    network::network_trait::Network,
-    persistence::{
-        persistence::{Persistor, tables::USER_DB_NAME},
+    error::ArunaMetadataError, logerr, models::models::TypedDoc, network::network_trait::Network, persistence::{
+        persistence::{tables::USER_DB_NAME, Persistor},
         search::search::Search,
-    },
+    }
 };
 use aruna_permission::{Path, UserIdentity};
 use aruna_storage::storage::store::Store;
@@ -59,7 +56,7 @@ where
         &self,
         token: String,
     ) -> Result<UserIdentity, ArunaMetadataError> {
-        let identity = self.persistence.get_identity(token).await?;
+        let identity = self.persistence.get_identity(token).await.map_err(logerr!())?;
 
         let mut chunk_hasher = blake3::Hasher::new();
         chunk_hasher.update(identity.to_bytes().as_slice());
