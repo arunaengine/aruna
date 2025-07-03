@@ -1,9 +1,9 @@
 use aruna_permission::{Action, OidcToken, Path, ResourceId, UserIdentity};
 use aruna_storage::storage::store::Store;
-use tracing::trace;
+use tracing::{error, trace};
 use ulid::Ulid;
 
-use crate::error::ArunaMetadataError;
+use crate::{error::ArunaMetadataError, logerr};
 
 use super::{
     persistence::{Persistor, tables::*},
@@ -75,28 +75,35 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn check_oidc_token(&self, token: String) -> Result<OidcToken, ArunaMetadataError> {
+    pub async fn check_oidc_token(
+        &self,
+        token: String,
+    ) -> Result<(OidcToken, Option<Ulid>), ArunaMetadataError> {
         let store = self.store.clone();
         let token_handler = self.token_handler.clone();
         let current_span = tracing::Span::current();
-        tokio::task::spawn_blocking(move || -> Result<OidcToken, ArunaMetadataError> {
-            current_span.in_scope(|| {
-                let txn = store.create_txn(false)?;
-                let token = token_handler.write().verify_oidc_token(&token)?;
-                let exists = token_handler
-                    .read()
-                    .get_user_from_oidc(&token.iss, &token.sub, &store, &txn)?
-                    .is_some();
-                if !exists {
-                    trace!("User does not exist");
-                    return Err(ArunaMetadataError::Unauthorized);
-                }
-                store.commit(txn)?;
-                Ok(token)
-            })
-        })
+        tokio::task::spawn_blocking(
+            move || -> Result<(OidcToken, Option<Ulid>), ArunaMetadataError> {
+                current_span.in_scope(|| {
+                    let txn = store.create_txn(false).map_err(logerr!())?;
+                    let token = token_handler
+                        .write()
+                        .verify_oidc_token(&token)
+                        .map_err(logerr!())?;
+                    let existing = token_handler
+                        .read()
+                        .get_user_from_oidc(&token.iss, &token.sub, &store, &txn)
+                        .map_err(logerr!())?;
+                    store.commit(txn).map_err(logerr!())?;
+                    Ok((token, existing))
+                })
+            },
+        )
         .await
-        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
+        .map_err(|e| {
+            error!(?e);
+            ArunaMetadataError::ServerError(e.to_string())
+        })?
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

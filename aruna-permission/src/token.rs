@@ -549,10 +549,13 @@ impl TokenSystem {
     }
 
     /// Verify and decode OIDC token
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn verify_oidc_token(&mut self, token: &str) -> Result<OidcToken> {
         // Decode header to get algorithm and kid
-        let header = decode_header(token)
-            .map_err(|e| PermissionError::OidcError(format!("Invalid JWT header: {}", e)))?;
+        let header = decode_header(token).map_err(|e| {
+            tracing::error!(?e);
+            PermissionError::OidcError(format!("Invalid JWT header: {}", e))
+        })?;
 
         // Decode without verification first to get issuer
         let dummy_key = DecodingKey::from_secret("dummy".as_ref());
@@ -561,25 +564,33 @@ impl TokenSystem {
         unverified_validation.validate_exp = false;
         unverified_validation.validate_aud = false;
 
-        let unverified = decode::<OidcToken>(token, &dummy_key, &unverified_validation)
-            .map_err(|e| PermissionError::OidcError(format!("Invalid OIDC token format: {}", e)))?;
+        let unverified =
+            decode::<OidcToken>(token, &dummy_key, &unverified_validation).map_err(|e| {
+                tracing::error!(?e);
+                PermissionError::OidcError(format!("Invalid OIDC token format: {}", e))
+            })?;
 
         let issuer_name = &unverified.claims.iss;
         // Get the decoding key
-        let decoding_key = self.get_oidc_key(issuer_name, header.kid.as_deref())?;
+        let decoding_key = self
+            .get_oidc_key(issuer_name, header.kid.as_deref())
+            .map_err(|e| {
+                tracing::error!(?e);
+                e
+            })?;
         // Check if issuer is trusted
         let Some(issuer) = self.issuers.iter().find(|i| i.issuer_name == *issuer_name) else {
-            return Err(PermissionError::OidcError(format!(
-                "Unrecognized OIDC issuer: {}",
-                issuer_name
-            )));
+            let e =
+                PermissionError::OidcError(format!("Unrecognized OIDC issuer: {}", issuer_name));
+            tracing::error!(?e);
+            return Err(e);
         };
 
         // Check if token was issued in the future
         if unverified.claims.is_future() {
-            return Err(PermissionError::OidcError(
-                "Token issued in the future".to_string(),
-            ));
+            let e = PermissionError::OidcError("Token issued in the future".to_string());
+            tracing::error!(?e);
+            return Err(e);
         }
 
         // Set up proper validation
@@ -593,6 +604,7 @@ impl TokenSystem {
 
         // Verify and decode token
         let token_data = decode::<OidcToken>(token, &decoding_key, &validation).map_err(|e| {
+            tracing::error!(?e);
             PermissionError::OidcError(format!("OIDC token verification failed: {}", e))
         })?;
 

@@ -21,6 +21,8 @@ async-channel = "2.3.1"
 ahash = "0.8.12"
 anyhow = "1.0.98"
 async-trait = "0.1.88"
+axum = "0.8.4"
+axum-extra = {version = "0.10.1", features = ["query"]}
 blake3 = { version = "1.8.2", features = ["serde"] }
 casbin = { version = "2.10.1", features = ["explain", "logging"]}
 # casbin = "2.10.1"

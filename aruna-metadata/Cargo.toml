@@ -8,7 +8,9 @@ edition = { workspace = true }
 ahash = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-blake3 = { workspace=true }
+axum = { workspace = true }
+axum-extra = { workspace = true }
+blake3 = { workspace = true }
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
 iroh = { workspace = true }
@@ -37,8 +39,6 @@ aruna-realm = {path = "../aruna-realm"}
 aruna-permission = {path = "../aruna-permission"}
 automerge = "0.6.1"
 autosurgeon = "0.8.7"
-axum = "0.8.4"
-axum-extra = {version = "0.10.1", features = ["query"]}
 chrono = { version = "0.4.41", features = ["serde"]}
 hex = "0.4.3"
 rayon = "1.10.0"

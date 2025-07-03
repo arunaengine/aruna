@@ -26,7 +26,14 @@ where
         let Some(token) = token else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        controller.persistence.check_oidc_token(token).await
+        let (token, user) = controller.persistence.check_oidc_token(token).await?;
+        if user.is_some() {
+            Err(crate::error::ArunaMetadataError::Forbidden(
+                "User already exsists".to_string(),
+            ))
+        } else {
+            Ok(token)
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(_controller))]
