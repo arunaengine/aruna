@@ -246,8 +246,10 @@ impl DatabaseHandler {
             .ok_or_else(|| anyhow!("No parent found"))?
             .get_id()?;
         let parent = Object::get_object_with_relations(&parent_id, &client).await?;
-        let name = request.get_name()?;
-        if parent
+
+        // Check if parent already has a child with same name
+        let query = request.get_name()?;
+        let children = parent
             .outbound_belongs_to
             .0
             .iter()
@@ -264,47 +266,36 @@ impl DatabaseHandler {
                 // return name of other resources
                 _ => rel.target_name.to_string(),
             })
-            // Check if names contain request name
-            .contains(&name)
-        {
-            return Err(anyhow!(
-                "Name is invalid: Contains path of object".to_string()
-            ));
+            .collect_vec();
+
+        log::debug!("[Check Hierarchy] {:?} {:?}", query, children);
+        if children.contains(&query) {
+            return Err(anyhow!("Name is invalid: Contains path of object"));
         }
         Ok(())
     }
 
     async fn check_object(&self, request: &CreateRequest) -> Result<()> {
         let client = self.database.get_client().await?;
+
+        // Fetch parent
         let parent_id = request
             .get_parent()
             .ok_or_else(|| anyhow!("No parent found"))?
             .get_id()?;
         let parent = Object::get_object_with_relations(&parent_id, &client).await?;
-        let name = request.get_name()?;
-        let query = match name.split('/').next() {
-            Some(name) => name.to_string(),
-            None => name,
-        };
-        if parent
+
+        // Check if parent already has a child with same name
+        let query = request.get_name()?;
+        let children = parent
             .outbound_belongs_to
             .0
             .iter()
-            .map(|rel| match rel.target_type {
-                ObjectType::OBJECT => {
-                    // Check if object splits by '/'
-                    match rel.target_name.split('/').next().map(|s| s.to_string()) {
-                        // return first path
-                        Some(split) => split,
-                        // return full name
-                        None => rel.target_name.to_string(),
-                    }
-                }
-                // return name of other resources
-                _ => rel.target_name.to_string(),
-            })
-            .contains(&query)
-        {
+            .map(|rel| rel.target_name.to_string())
+            .collect_vec();
+
+        log::debug!("[Check Object] {:#?} {:#?}", query, children);
+        if children.contains(&query) {
             return Err(anyhow!(
                 "Name is invalid: Contains substring that matches same hierarchy object"
             ));

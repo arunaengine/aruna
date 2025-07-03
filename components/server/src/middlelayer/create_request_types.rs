@@ -109,11 +109,22 @@ impl CreateRequest {
                 }
             }
             CreateRequest::Object(request) => {
-                let name = request.name.to_string();
+                let full_name = request.name.to_string();
+                let mut name_parts = full_name.split("/").collect::<Vec<&str>>();
+                let name = name_parts
+                    .pop()
+                    .ok_or_else(|| anyhow!("Invalid object name"))?;
+
+                for part in name_parts {
+                    if !S3_KEY_SCHEMA.is_match(part) {
+                        return Err(anyhow!("Invalid path name"));
+                    }
+                }
+
                 if !OBJECT_SCHEMA.is_match(&name) {
                     Err(anyhow!("Invalid object name"))
                 } else {
-                    Ok(name)
+                    Ok(full_name.to_string())
                 }
             }
         }
