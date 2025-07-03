@@ -1335,6 +1335,76 @@ impl S3 for ArunaS3Service {
         };
     }
 
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let CheckAccessResult {
+            objects_state,
+            user_state,
+            headers,
+        } = req
+            .extensions
+            .get::<CheckAccessResult>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing data context");
+                s3_error!(UnexpectedContent, "Missing data context")
+            })?;
+
+        let impersonating_token =
+            user_state.sign_impersonating_token(self.cache.auth.read().await.as_ref());
+
+        let (states, _) = objects_state.require_regular()?;
+
+        let (_, _, _, object, _) = states.to_new_or_existing()?;
+
+        match object {
+            NewOrExistingObject::Missing(_) => {
+                //Do nothing.
+            }
+            NewOrExistingObject::Existing(object) => {
+                if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
+                    if let Some(token) = &impersonating_token {
+                        handler
+                            .delete_object(&object.id, token)
+                            .await
+                            .map_err(|e| {
+                                error!("Object deletion failed: {e}");
+                                s3_error!(InternalError, "Object deletion failed")
+                            })?;
+
+                        self.cache.delete_object(object.id).await.map_err(|e| {
+                            error!("Object cache deletion failed: {e}");
+                            s3_error!(InternalError, "Object cache deletion failed")
+                        })?;
+                    }
+                }
+            }
+            NewOrExistingObject::None => {
+                return Err(s3_error!(
+                    InvalidObjectState,
+                    "Object in invalid state: None"
+                ))
+            }
+        }
+
+        let mut resp = S3Response::new(DeleteObjectOutput::default());
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+        Ok(resp)
+    }
+
     #[tracing::instrument(err, skip(self, req))]
     #[allow(clippy::blocks_in_conditions)]
     async fn put_object(

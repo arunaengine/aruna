@@ -878,34 +878,54 @@ impl Cache {
             transaction.commit().await?;
         }
 
+        // Remove paths from cache
+        if let Some(entry) = self.resources.get(&id) {
+            let resource = entry.value().0.read().await.clone();
+            let name_trees = self
+                .get_name_trees(&TypedId::from(&resource), resource.name, None)
+                .await
+                .0;
+            debug!("Paths to be deleted: {:?}", name_trees);
+
+            for p in name_trees {
+                self.paths.remove(&p);
+            }
+        }
+
+        // Remove object and location from cache
+        let Some(_) = self.resources.remove(&id) else {
+            warn!(?id, "Resource not found");
+            return Ok(());
+        };
+
+        // Remove multiparts from cache
+        self.multi_parts
+            .retain(|_, v| v.first().is_none_or(|e| e.object_id != id));
+
         // Remove data from storage backend
         if let Some(s3_backend) = &self.backend {
             if let Some(resource) = self.resources.get(&id) {
                 let (_, loc) = resource.value();
                 if let Some(location) = loc.read().await.as_ref() {
                     s3_backend.delete_object(location.clone()).await?;
-                }
+        }
             }
         }
 
-        // Remove object and location from cache
-        let Some(old) = self.resources.remove(&id) else {
-            warn!(?id, "Resource not found");
-            return Ok(());
-        };
-
-        self.multi_parts
-            .retain(|_, v| v.first().is_none_or(|e| e.object_id != id));
-
-        let object = old.1 .0.read().await;
-        for p in self
-            .get_name_trees(&TypedId::from(object.deref()), object.name.clone(), None)
-            .await
-            .0
-        {
-            self.paths.remove(&p);
-        }
         Ok(())
+    }
+
+    fn get_paths_of_id(&self, id: &DieselUlid) -> Vec<String> {
+        self.paths
+            .iter()
+            .filter_map(|p| {
+                if p.value() == id {
+                    Some(p.key().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[tracing::instrument(level = "trace", skip(self))]

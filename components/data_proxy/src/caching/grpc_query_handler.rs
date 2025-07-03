@@ -44,6 +44,7 @@ use aruna_rust_api::api::storage::services::v2::CreateCollectionRequest;
 use aruna_rust_api::api::storage::services::v2::CreateDatasetRequest;
 use aruna_rust_api::api::storage::services::v2::CreateObjectRequest;
 use aruna_rust_api::api::storage::services::v2::CreateProjectRequest;
+use aruna_rust_api::api::storage::services::v2::DeleteObjectRequest;
 use aruna_rust_api::api::storage::services::v2::FinishObjectStagingRequest;
 use aruna_rust_api::api::storage::services::v2::FullSyncEndpointRequest;
 use aruna_rust_api::api::storage::services::v2::GetCollectionRequest;
@@ -463,6 +464,41 @@ impl GrpcQueryHandler {
 
         self.cache.upsert_object(object.clone()).await?;
         Ok(object)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, object_id, token))]
+    pub async fn delete_object(&self, object_id: &DieselUlid, token: &str) -> Result<()> {
+        trace!(?object_id, "Deleting object");
+
+        // Check if data proxy local temp resource
+        match self.cache.get_resource_cloned(object_id, false).await?.1 {
+            Some(loc) => {
+                if loc.raw_content_len == 0 && loc.disk_content_len == 0 {
+                    // Early return as the resource does only exist locally
+                    return Ok(());
+                }
+            }
+            None => {}
+        }
+
+        // Request object deletion in server
+        let mut req = Request::new(DeleteObjectRequest {
+            object_id: object_id.to_string(),
+            with_revisions: true,
+        });
+
+        Self::add_token_to_md(req.metadata_mut(), token)?;
+
+        self.object_service
+            .clone()
+            .delete_object(req)
+            .await
+            .map_err(|e| {
+                error!(error = ?e, msg = e.to_string());
+                e
+            })?;
+
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self, obj, token))]
