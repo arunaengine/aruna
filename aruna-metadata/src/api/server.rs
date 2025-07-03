@@ -1,7 +1,7 @@
 use super::openapi::{self, ArunaApi};
 use crate::{
     error::ArunaMetadataError, network::network_trait::Network,
-    persistence::search::search::Search, transactions::controller::Controller,
+    persistence::search::generic::Search, transactions::controller::Controller,
 };
 use aruna_storage::storage::store::Store;
 use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};

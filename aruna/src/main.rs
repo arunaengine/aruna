@@ -8,7 +8,7 @@ use aruna_metadata::{
     error::ArunaMetadataError,
     network::network_trait::{Network, NetworkConfig, P2PNetwork},
     persistence::{
-        persistence::{Persistor, tables::*},
+        persistor::{Persistor, tables::*},
         search::tantivy::{TantivyConfig, TantivySearch},
     },
     transactions::controller::Controller,

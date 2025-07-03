@@ -5,7 +5,7 @@ mod tests {
     use crate::commons::{TestServers, create_user_with_token, init_lmdb_servers};
     use aruna_metadata::{
         models::{
-            models::Resource,
+            structs::Resource,
             requests::{
                 AddGroupRequest, CreateProjectRequest, CreateProjectResponse,
                 CreateResourceRequest, GetResourceResponse, SearchResponse,
@@ -92,7 +92,7 @@ mod tests {
 
         let create_resource = CreateProjectRequest {
             name: format!("test_resource_from_user1"),
-            visibility: aruna_metadata::models::models::VisibilityClass::Private,
+            visibility: aruna_metadata::models::structs::VisibilityClass::Private,
             group_id: group1,
             ..Default::default()
         };
@@ -115,7 +115,7 @@ mod tests {
 
         let create_resource = CreateProjectRequest {
             name: format!("test_resource_from_user2"),
-            visibility: aruna_metadata::models::models::VisibilityClass::Private,
+            visibility: aruna_metadata::models::structs::VisibilityClass::Private,
             group_id: group2,
             ..Default::default()
         };
@@ -236,7 +236,7 @@ mod tests {
 
         let create_resource = CreateProjectRequest {
             name: format!("test_search"),
-            visibility: aruna_metadata::models::models::VisibilityClass::Private,
+            visibility: aruna_metadata::models::structs::VisibilityClass::Private,
             group_id: group1,
             ..Default::default()
         };
@@ -258,7 +258,7 @@ mod tests {
 
         let create_resource = CreateProjectRequest {
             name: format!("test_search"),
-            visibility: aruna_metadata::models::models::VisibilityClass::Private,
+            visibility: aruna_metadata::models::structs::VisibilityClass::Private,
             group_id: group2,
             ..Default::default()
         };
@@ -286,7 +286,7 @@ mod tests {
             if i > 499 {
                 let create_resource = CreateResourceRequest {
                     name: format!("test_search"),
-                    visibility: aruna_metadata::models::models::VisibilityClass::Private,
+                    visibility: aruna_metadata::models::structs::VisibilityClass::Private,
                     parent_id: parent_project1,
                     ..Default::default()
                 };
@@ -308,7 +308,7 @@ mod tests {
             } else {
                 let create_resource = CreateResourceRequest {
                     name: format!("test_search"),
-                    visibility: aruna_metadata::models::models::VisibilityClass::Private,
+                    visibility: aruna_metadata::models::structs::VisibilityClass::Private,
                     parent_id: parent_project2,
                     ..Default::default()
                 };
@@ -392,7 +392,7 @@ mod tests {
 
         let create_resource = CreateProjectRequest {
             name: format!("project_test"),
-            visibility: aruna_metadata::models::models::VisibilityClass::Private,
+            visibility: aruna_metadata::models::structs::VisibilityClass::Private,
             group_id: group,
             ..Default::default()
         };
@@ -416,7 +416,7 @@ mod tests {
             let create_resource = if i == 2 {
                 CreateResourceRequest {
                     name: format!("test_search_{i}"),
-                    visibility: aruna_metadata::models::models::VisibilityClass::Private,
+                    visibility: aruna_metadata::models::structs::VisibilityClass::Private,
                     parent_id: parent_project,
                     description: "A unique description for a unique object".to_string(),
                     ..Default::default()
@@ -424,7 +424,7 @@ mod tests {
             } else {
                 CreateResourceRequest {
                     name: format!("test_search_{i}"),
-                    visibility: aruna_metadata::models::models::VisibilityClass::Private,
+                    visibility: aruna_metadata::models::structs::VisibilityClass::Private,
                     parent_id: parent_project,
                     ..Default::default()
                 }

@@ -1,11 +1,11 @@
 use super::{
-    search::search::Search,
+    search::generic::Search,
     utils::{create_mappings, group_from_path, idx_from_cow, update_mappings, visiblity_from_doc},
 };
 use crate::{
     error::ArunaMetadataError,
-    models::models::{Group, Resource, User},
-    persistence::persistence::tables::*,
+    models::structs::{Group, Resource, User},
+    persistence::persistor::tables::*,
 };
 use ahash::RandomState;
 use aruna_permission::{
@@ -32,6 +32,8 @@ pub mod tables {
     pub const GROUPS_MAPPINGS_DB_NAME: &str = "metadata_group_mappings";
     pub const PUBLIC_MAPPINGS_DB_NAME: &str = "metadata_public_mappings";
 }
+type ConnectionStates =
+    Arc<Mutex<HashMap<Vec<u8>, HashMap<PublicKey, State, RandomState>, RandomState>>>;
 
 pub struct Persistor<St, Se>
 where
@@ -41,8 +43,7 @@ where
     pub(super) store: St,
     pub(super) search: Arc<Se>,
     pub(super) idx_counter: Arc<AtomicU32>,
-    pub(super) connection_states:
-        Arc<Mutex<HashMap<Vec<u8>, HashMap<PublicKey, State, RandomState>, RandomState>>>,
+    pub(super) connection_states: ConnectionStates,
     pub(super) permission_manager: PermissionManager,
     pub token_handler: Arc<RwLock<TokenSystem>>,
 }
@@ -251,7 +252,7 @@ where
         let permission_handler = self.permission_manager.clone();
         let iss = oidc_token.iss;
         let sub = oidc_token.sub;
-        let node_key = node_key.clone();
+        let node_key = *node_key;
 
         let current_span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
@@ -478,7 +479,7 @@ where
         let permission = self.permission_manager.clone();
         let group_id = group.id;
         let user = user.clone();
-        let realm_key = realm_key.clone();
+        let realm_key = *realm_key;
 
         // Generate actor id
         let actor_id = ActorId::from(
@@ -583,7 +584,7 @@ where
 
                     let group_bytes =
                         store
-                            .get(&mut write_txn, GROUPS_DB_NAME, &id)?
+                            .get(&write_txn, GROUPS_DB_NAME, &id)?
                             .ok_or_else(|| ArunaMetadataError::InvalidParameter {
                                 name: "group_id".to_string(),
                                 error: "Group not found".to_string(),

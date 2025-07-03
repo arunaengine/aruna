@@ -1,6 +1,6 @@
-use super::search::Search;
+use super::generic::Search;
 use crate::{
-    error::ArunaMetadataError, logerr, models::models::Resource,
+    error::ArunaMetadataError, logerr, models::structs::Resource,
     persistence::authorization::Authorize,
 };
 use roaring::RoaringBitmap;

@@ -1,6 +1,6 @@
 use super::controller::Controller;
 use crate::{
-    error::ArunaMetadataError, network::network_trait::Network, persistence::search::search::Search,
+    error::ArunaMetadataError, network::network_trait::Network, persistence::search::generic::Search,
 };
 use aruna_storage::storage::store::Store;
 

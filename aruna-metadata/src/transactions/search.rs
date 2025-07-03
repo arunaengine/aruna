@@ -4,11 +4,11 @@ use super::request::Request;
 use crate::{
     error::ArunaMetadataError,
     models::{
-        models::Resource,
+        structs::Resource,
         requests::{SearchRequest, SearchResponse},
     },
     network::network_trait::Network,
-    persistence::search::search::Search,
+    persistence::search::generic::Search,
 };
 use aruna_storage::storage::store::Store;
 use tracing::error;
@@ -85,7 +85,7 @@ where
                             results.insert(r);
                         }
                     }
-                    e @ _ => {
+                    e => {
                         error!(?e);
                         return Err(ArunaMetadataError::NetworkError(format!(
                             "Got wrong forward response {e:?}"

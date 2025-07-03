@@ -1,7 +1,7 @@
 use crate::{
     error::ArunaMetadataError,
-    models::models::{Resource, VisibilityClass},
-    persistence::persistence::tables::{GROUPS_MAPPINGS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME},
+    models::structs::{Resource, VisibilityClass},
+    persistence::persistor::tables::{GROUPS_MAPPINGS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME},
 };
 use aruna_permission::{Path, paths::PathComponent};
 use aruna_storage::storage::store::Store;

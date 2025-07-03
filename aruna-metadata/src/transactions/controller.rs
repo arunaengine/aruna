@@ -1,8 +1,8 @@
 use super::request::Request;
 use crate::{
-    error::ArunaMetadataError, logerr, models::models::TypedDoc, network::network_trait::Network, persistence::{
-        persistence::{tables::USER_DB_NAME, Persistor},
-        search::search::Search,
+    error::ArunaMetadataError, logerr, models::structs::TypedDoc, network::network_trait::Network, persistence::{
+        persistor::{tables::USER_DB_NAME, Persistor},
+        search::generic::Search,
     }
 };
 use aruna_permission::{Path, UserIdentity};
@@ -76,7 +76,7 @@ where
                 .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
 
             self.sync_loop(
-                crate::models::models::TypedDoc::User(doc),
+                crate::models::structs::TypedDoc::User(doc),
                 *subject_hash,
                 identity.to_bytes(),
                 path,

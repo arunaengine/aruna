@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::error::ArunaMetadataError;
 
-use super::models::{Author, Group, KeyValue, Resource, User, VisibilityClass};
+use super::structs::{Author, Group, KeyValue, Resource, User, VisibilityClass};
 use aruna_permission::UserIdentity;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;

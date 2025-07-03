@@ -1,8 +1,8 @@
 use crate::{
     api::paths::*,
-    models::models::{Direction, Permission},
+    models::structs::{Direction, Permission},
     network::network_trait::Network,
-    persistence::search::search::Search,
+    persistence::search::generic::Search,
     transactions::controller::Controller,
 };
 use aruna_storage::storage::store::Store;

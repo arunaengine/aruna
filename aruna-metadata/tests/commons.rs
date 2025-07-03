@@ -4,7 +4,7 @@ use aruna_metadata::{
     models::requests::AddUserRequest,
     network::network_trait::{Network, NetworkConfig, P2PNetwork},
     persistence::{
-        persistence::{
+        persistor::{
             Persistor,
             tables::{
                 GROUPS_DB_NAME, GROUPS_MAPPINGS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME,

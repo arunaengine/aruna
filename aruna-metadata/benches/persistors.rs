@@ -1,9 +1,9 @@
-use aruna_metadata::persistence::persistence::tables::*;
+use aruna_metadata::persistence::persistor::tables::*;
 use aruna_metadata::{
     models::requests::{AddUserRequest, CreateResourceRequest, SearchRequest},
     network::network_trait::{Network, NetworkDummy},
     persistence::{
-        persistence::Persistor,
+        persistor::Persistor,
         search::tantivy::{TantivyConfig, TantivySearch},
     },
     transactions::controller::Controller,

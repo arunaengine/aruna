@@ -1,3 +1,3 @@
 pub mod conversions;
-pub mod models;
+pub mod structs;
 pub mod requests;

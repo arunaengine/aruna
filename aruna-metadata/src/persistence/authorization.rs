@@ -6,8 +6,8 @@ use ulid::Ulid;
 use crate::{error::ArunaMetadataError, logerr};
 
 use super::{
-    persistence::{Persistor, tables::*},
-    search::search::Search,
+    persistor::{Persistor, tables::*},
+    search::generic::Search,
 };
 
 #[async_trait::async_trait]

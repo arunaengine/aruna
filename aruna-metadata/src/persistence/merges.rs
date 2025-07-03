@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
 use super::{
-    persistence::{Persistor, tables::*},
-    search::search::Search,
+    persistor::{Persistor, tables::*},
+    search::generic::Search,
     utils::{create_mappings, group_from_path, idx_from_cow, update_mappings, visiblity_from_doc},
 };
 use crate::{
     error::ArunaMetadataError,
-    models::models::{Group, HandleHelper, Resource, User},
+    models::structs::{Group, HandleHelper, Resource, User},
     network::network_trait::ReplicationSubject,
 };
 use aruna_permission::{Path, ResourceId, UserIdentity};
@@ -37,12 +37,10 @@ where
 
         let msg = match lock.get_mut(&doc_id) {
             Some(persisted) => {
-                let mut state = persisted.entry(node).or_insert(State::new());
-                let msg = doc
-                    .sync()
-                    .generate_sync_message(&mut state)
-                    .map(|msg| msg.encode());
-                msg
+                let state = persisted.entry(node).or_insert(State::new());
+                doc.sync()
+                    .generate_sync_message(state)
+                    .map(|msg| msg.encode())
             }
             None => {
                 let mut state = State::new();
@@ -72,8 +70,8 @@ where
 
         match lock.get_mut(&doc_id) {
             Some(persisted) => {
-                let mut state = persisted.entry(node).or_insert(State::new());
-                doc.sync().receive_sync_message(&mut state, message)?;
+                let state = persisted.entry(node).or_insert(State::new());
+                doc.sync().receive_sync_message(state, message)?;
             }
             None => {
                 let mut state = State::new();
@@ -102,13 +100,11 @@ where
                         subject_id.clone(),
                         doc,
                         Message::decode(message)?,
-                        node.clone(),
+                        node,
                     )
                     .await?;
                 }
-                let response = self
-                    .generate_sync_message(subject_id, doc, node.clone())
-                    .await?;
+                let response = self.generate_sync_message(subject_id, doc, node).await?;
                 if response.is_none() && message.is_none() {
                     self.handle_user_merges(doc.save()).await?;
                 }
@@ -120,13 +116,11 @@ where
                         subject_id.clone(),
                         doc,
                         Message::decode(message)?,
-                        node.clone(),
+                        node,
                     )
                     .await?;
                 }
-                let response = self
-                    .generate_sync_message(subject_id, doc, node.clone())
-                    .await?;
+                let response = self.generate_sync_message(subject_id, doc, node).await?;
                 if response.is_none() && message.is_none() {
                     self.handle_object_merges(path, doc.save()).await?;
                 }
@@ -138,13 +132,11 @@ where
                         subject_id.clone(),
                         doc,
                         Message::decode(message)?,
-                        node.clone(),
+                        node,
                     )
                     .await?;
                 }
-                let response = self
-                    .generate_sync_message(subject_id, doc, node.clone())
-                    .await?;
+                let response = self.generate_sync_message(subject_id, doc, node).await?;
                 if response.is_none() && message.is_none() {
                     self.handle_group_merges(doc.save()).await?;
                 }
@@ -185,8 +177,7 @@ where
                                 let Some((admin, _)) = foreign_group
                                     .members
                                     .iter()
-                                    .filter(|(_, r)| r.iter().any(|r| r == &"admin"))
-                                    .next()
+                                    .find(|(_, r)| r.iter().any(|r| r == "admin"))
                                 else {
                                     warn!("No admin found in group");
                                     return Ok(vec![]);
@@ -225,7 +216,7 @@ where
                                         let handle = permission.add_user_prepare(
                                             foreign_group.id,
                                             &identity,
-                                            &role,
+                                            role,
                                             &store,
                                             &mut wtxn,
                                         )?;

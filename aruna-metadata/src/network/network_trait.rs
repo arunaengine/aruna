@@ -3,8 +3,8 @@ use crate::{
     models::requests::{ForwardRequest, ForwardResponse},
     network::util::send_message,
     persistence::{
-        persistence::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
-        search::search::Search,
+        persistor::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
+        search::generic::Search,
     },
     transactions::{controller::Controller, request::Request},
 };
@@ -55,7 +55,7 @@ pub enum Body {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum Response {
-    ForwardResponse(ForwardResponse),
+    ForwardResponse(Box<ForwardResponse>),
     SyncResponse(Option<Vec<u8>>),
 }
 
@@ -323,7 +323,7 @@ impl Network for P2PNetwork {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn get_realm_key(&self) -> Result<[u8; 32], ArunaMetadataError> {
-        Ok(self.realm_handler.realm_public_key().as_bytes().clone())
+        Ok(*self.realm_handler.realm_public_key().as_bytes())
     }
     #[tracing::instrument(level = "trace", skip(self, subject, stream))]
     async fn sync(
@@ -354,7 +354,7 @@ impl Network for P2PNetwork {
 
         let response = match read_message(recv).await?.body {
             Body::Response(Response::SyncResponse(result)) => result,
-            e @ _ => {
+            e => {
                 return Err(ArunaMetadataError::NetworkError(format!(
                     "Got wrong response {e:?}, expected Body::Response"
                 )));
@@ -393,13 +393,13 @@ impl Network for P2PNetwork {
 
         let response = match read_message(&mut recv).await?.body {
             Body::Response(Response::ForwardResponse(result)) => result,
-            e @ _ => {
+            e => {
                 return Err(ArunaMetadataError::NetworkError(format!(
                     "Got wrong response {e:?}, expected Body::Response"
                 )));
             }
         };
-        Ok(response)
+        Ok(*response)
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -620,36 +620,36 @@ impl P2PNetwork {
                         ForwardRequest::GetResource(req) => {
                             match req.authorize(token, controller).await {
                                 Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
-                                    ForwardResponse::GetResource(
+                                    Box::new(ForwardResponse::GetResource(
                                         req.clone().run_request(auth_ctx, controller).await,
-                                    ),
+                                    )),
                                 )),
                                 Err(e) => Body::Response(Response::ForwardResponse(
-                                    ForwardResponse::GetResource(Err(e)),
+                                    Box::new(ForwardResponse::GetResource(Err(e))),
                                 )),
                             }
                         }
                         ForwardRequest::UpdateResource(req) => {
                             match req.authorize(token, controller).await {
                                 Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
-                                    ForwardResponse::UpdateResource(
+                                    Box::new(ForwardResponse::UpdateResource(
                                         req.clone().run_request(auth_ctx, controller).await,
-                                    ),
+                                    )),
                                 )),
                                 Err(e) => Body::Response(Response::ForwardResponse(
-                                    ForwardResponse::UpdateResource(Err(e)),
+                                    Box::new(ForwardResponse::UpdateResource(Err(e))),
                                 )),
                             }
                         }
                         ForwardRequest::Search(req) => {
                             match req.authorize(token, controller).await {
                                 Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
-                                    ForwardResponse::Search(
+                                    Box::new(ForwardResponse::Search(
                                         req.clone().run_request(auth_ctx, controller).await,
-                                    ),
+                                    )),
                                 )),
                                 Err(e) => Body::Response(Response::ForwardResponse(
-                                    ForwardResponse::Search(Err(e)),
+                                    Box::new(ForwardResponse::Search(Err(e))),
                                 )),
                             }
                         }

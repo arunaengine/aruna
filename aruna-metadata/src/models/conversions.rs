@@ -2,7 +2,7 @@ use ulid::Ulid;
 
 use crate::error::ArunaMetadataError;
 
-use super::models::{Group, Resource, User};
+use super::structs::{Group, Resource, User};
 
 impl TryFrom<&[u8]> for Resource {
     type Error = ArunaMetadataError;
@@ -53,12 +53,12 @@ impl TryFrom<Group> for Vec<u8> {
 }
 
 pub trait ToBytes: Sized {
-    fn to_bytes(self: Self) -> Vec<u8>;
+    fn to_bytes(self) -> Vec<u8>;
     fn from_bytes(bytes: Vec<u8>) -> Result<Self, ArunaMetadataError>;
 }
 
 impl ToBytes for Ulid {
-    fn to_bytes(self: Self) -> Vec<u8> {
+    fn to_bytes(self) -> Vec<u8> {
         Ulid::to_bytes(&self).to_vec()
     }
 
@@ -94,9 +94,9 @@ pub mod autosurgeon_bytes {
         prop: Prop<'a>,
     ) -> Result<[u8; 32], HydrateError> {
         let inner = autosurgeon::bytes::ByteVec::hydrate(doc, obj, prop)?;
-        Ok(inner.as_slice().try_into().map_err(|_| {
+        inner.as_slice().try_into().map_err(|_| {
             HydrateError::unexpected("&[u8; 16]", "Invalid slice of bytes".to_string())
-        })?)
+        })
     }
 
     pub fn reconcile<R: Reconciler>(bytes: &[u8; 32], mut reconciler: R) -> Result<(), R::Error> {
@@ -160,7 +160,7 @@ mod tests {
     use rand::rngs::OsRng;
     use ulid::Ulid;
 
-    use crate::models::models::{
+    use crate::models::structs::{
         Author, Hash, HashAlgorithm, KeyValue, Resource, ResourceVariant, User, VisibilityClass,
     };
 

@@ -5,7 +5,7 @@ use crate::{
         GetUserResponse,
     },
     network::network_trait::Network,
-    persistence::search::search::Search,
+    persistence::search::generic::Search,
 };
 use aruna_permission::{OidcToken, Path, UserIdentity};
 use aruna_storage::storage::store::Store;
@@ -84,7 +84,7 @@ where
 
         controller
             .sync_loop(
-                crate::models::models::TypedDoc::User(doc),
+                crate::models::structs::TypedDoc::User(doc),
                 *subject_hash,
                 user.id.to_bytes(),
                 path,

@@ -3,7 +3,7 @@ use crate::{
     error::ArunaMetadataError,
     models::{
         conversions::ToBytes,
-        models::{Resource, ResourceVariant},
+        structs::{Resource, ResourceVariant},
         requests::{
             CreateProjectRequest, CreateProjectResponse, CreateResourceRequest,
             CreateResourceResponse, GetInner, GetResourceRequest, GetResourceResponse,
@@ -15,7 +15,7 @@ use crate::{
         },
     },
     network::network_trait::{Network, REPLICATION_POLICY},
-    persistence::{authorization::Authorize, search::search::Search},
+    persistence::{authorization::Authorize, search::generic::Search},
 };
 use aruna_permission::{Action, Path, UserIdentity, paths::PathBuilder};
 use aruna_storage::storage::store::Store;
@@ -126,7 +126,7 @@ where
 
         controller
             .sync_loop(
-                crate::models::models::TypedDoc::Resource(doc),
+                crate::models::structs::TypedDoc::Resource(doc),
                 *subject_hash,
                 resource.id.to_bytes().to_vec(),
                 path,
@@ -203,7 +203,7 @@ where
                 crate::models::requests::ForwardResponse::GetResource(response) => {
                     Ok(Some(response?))
                 }
-                e @ _ => Err(ArunaMetadataError::NetworkError(format!(
+                e => Err(ArunaMetadataError::NetworkError(format!(
                     "Got wrong forward response {e:?}"
                 ))),
             }
@@ -283,7 +283,7 @@ where
                 crate::models::requests::ForwardResponse::UpdateResource(response) => {
                     Ok(Some(response?))
                 }
-                e @ _ => Err(ArunaMetadataError::NetworkError(format!(
+                e => Err(ArunaMetadataError::NetworkError(format!(
                     "Got wrong forward response {e:?}"
                 ))),
             }
@@ -399,7 +399,7 @@ where
 
         controller
             .sync_loop(
-                crate::models::models::TypedDoc::Resource(doc),
+                crate::models::structs::TypedDoc::Resource(doc),
                 *subject_hash,
                 ToBytes::to_bytes(resource.id),
                 path,
@@ -539,7 +539,7 @@ where
 
         controller
             .sync_loop(
-                crate::models::models::TypedDoc::Resource(doc),
+                crate::models::structs::TypedDoc::Resource(doc),
                 *subject_hash,
                 resource.id.to_bytes().to_vec(),
                 path,

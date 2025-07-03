@@ -4,14 +4,14 @@ use super::request::Request;
 use crate::{
     logerr, models::{
         conversions::ToBytes,
-        models::Group,
+        structs::Group,
         requests::{
             AddGroupRequest,
             AddGroupResponse, // AddResourcesToGroupRequest, AddResourcesToGroupResponse, AddRolesToGroupRequest, AddRolesToGroupResponse,
             AddUserToGroupRequest,
             AddUserToGroupResponse,
         },
-    }, network::network_trait::Network, persistence::{authorization::Authorize, search::search::Search}
+    }, network::network_trait::Network, persistence::{authorization::Authorize, search::generic::Search}
 };
 use aruna_permission::{Action, Path, UserIdentity};
 use aruna_storage::storage::store::Store;
@@ -101,7 +101,7 @@ where
 
         controller
             .sync_loop(
-                crate::models::models::TypedDoc::Group(group_doc),
+                crate::models::structs::TypedDoc::Group(group_doc),
                 *subject_hash,
                 ToBytes::to_bytes(group.id),
                 path,
@@ -192,7 +192,7 @@ where
 
         controller
             .sync_loop(
-                crate::models::models::TypedDoc::Group(group_doc),
+                crate::models::structs::TypedDoc::Group(group_doc),
                 *subject_hash,
                 ToBytes::to_bytes(self.group_id),
                 path,

@@ -1,6 +1,6 @@
 use crate::{
     error::ArunaMetadataError, models::requests::*, network::network_trait::Network,
-    persistence::search::search::Search, transactions::controller::Controller,
+    persistence::search::generic::Search, transactions::controller::Controller,
 };
 use aruna_storage::storage::store::Store;
 use axum::{
