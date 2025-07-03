@@ -87,7 +87,7 @@ impl DatabaseHandler {
                 .await
             {
                 // Log and return error
-                log::error!("{}", err);
+                log::error!("{err}");
                 return Err(anyhow::anyhow!("Notification emission failed"));
             }
         }

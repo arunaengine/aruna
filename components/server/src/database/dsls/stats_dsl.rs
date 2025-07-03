@@ -121,7 +121,7 @@ pub async fn start_refresh_loop(
             let client = match database.get_client().await {
                 Ok(client) => client,
                 Err(err) => {
-                    error!("Failed to get database client for MV refresh: {}", err);
+                    error!("Failed to get database client for MV refresh: {err}");
                     tokio::time::sleep(Duration::from_secs(15)).await; // Wait 15s and try again
                     continue;
                 }
@@ -162,11 +162,11 @@ pub async fn start_refresh_loop(
                             .register_server_event(ServerEvents::MVREFRESH(current_timestamp))
                             .await
                         {
-                            error!("Failed to send MV refresh notification: {}", err)
+                            error!("Failed to send MV refresh notification: {err}")
                         }
                     }
                     Err(err) => {
-                        error!("Start MV refresh failed: {}", err);
+                        error!("Start MV refresh failed: {err}");
                         // Sleep for refresh interval and try again
                         tokio::time::sleep(Duration::from_millis(
                             refresh_interval.try_into().unwrap_or(30000),
@@ -185,7 +185,7 @@ pub async fn start_refresh_loop(
                         BTreeSet::from_iter(match ObjectStats::get_all_stats(&client).await {
                             Ok(stats) => stats,
                             Err(err) => {
-                                error!("Failed to fetch all stats from database: {}", err);
+                                error!("Failed to fetch all stats from database: {err}");
                                 break;
                             }
                         });
@@ -201,7 +201,7 @@ pub async fn start_refresh_loop(
                     // Update changed stats in cache only if stats are available and anything has changed
                     if !diff.is_empty() {
                         if let Err(err) = cache.upsert_object_stats(diff.clone()).await {
-                            error!("Object stats cache update failed: {}", err)
+                            error!("Object stats cache update failed: {err}")
                         } else {
                             // Update changes in search index
                             let ods: Result<Vec<ObjectDocument>> = diff
@@ -225,10 +225,9 @@ pub async fn start_refresh_loop(
                                     )
                                     .await;
                                 }
-                                Err(err) => error!(
-                                    "Failed to fetch objects for search index update: {}",
-                                    err
-                                ),
+                                Err(err) => {
+                                    error!("Failed to fetch objects for search index update: {err}")
+                                }
                             }
                         };
                     }

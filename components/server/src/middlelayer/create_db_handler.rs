@@ -175,7 +175,7 @@ impl DatabaseHandler {
                 .await
             {
                 // Log error and return
-                log::error!("{}", err);
+                log::error!("{err}");
                 //transaction.rollback().await?;
                 return Err(anyhow::anyhow!("Notification emission failed: {err}"));
             }
@@ -212,7 +212,7 @@ impl DatabaseHandler {
                 .trigger_hooks(object_with_relation, trigger, None)
                 .await;
             if hook_trigger.is_err() {
-                log::error!("{:?}", hook_trigger)
+                log::error!("{hook_trigger:?}")
             }
         });
         // Fetch all object paths for the notification subjects
@@ -229,7 +229,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             Err(anyhow::anyhow!("Notification emission failed: {err}"))
         } else {
@@ -268,7 +268,7 @@ impl DatabaseHandler {
             })
             .collect_vec();
 
-        log::debug!("[Check Hierarchy] {:?} {:?}", query, children);
+        log::debug!("[Check Hierarchy] {query:?} {children:?}");
         if children.contains(&query) {
             return Err(anyhow!("Name is invalid: Contains path of object"));
         }
@@ -294,7 +294,7 @@ impl DatabaseHandler {
             .map(|rel| rel.target_name.to_string())
             .collect_vec();
 
-        log::debug!("[Check Object] {:#?} {:#?}", query, children);
+        log::debug!("[Check Object] {query:#?} {children:#?}");
         if children.contains(&query) {
             return Err(anyhow!(
                 "Name is invalid: Contains substring that matches same hierarchy object"

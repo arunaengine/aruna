@@ -64,7 +64,7 @@ async fn get_announcements() {
             Announcement {
                 id: DieselUlid::generate(),
                 announcement_type: "ORGA".to_string(),
-                title: format!("middlelayer get_announcements({})", idx),
+                title: format!("middlelayer get_announcements({idx})"),
                 teaser: "Announcement Teaser".to_string(),
                 image_url: "https://announcement_image_url/some_dummy.webp".to_string(),
                 content: "Announcement Content {}".to_string(),

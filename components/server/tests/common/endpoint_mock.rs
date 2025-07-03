@@ -32,7 +32,7 @@ pub async fn start_server(
                 let pull_consumer = notification_handler
                     .create_internal_consumer(
                         DieselUlid::generate(),
-                        format!("AOS.ENDPOINT.{}", endpoint_id),
+                        format!("AOS.ENDPOINT.{endpoint_id}"),
                         DeliverPolicy::ByStartTime {
                             start_time: OffsetDateTime::from_unix_timestamp(Utc::now().timestamp())
                                 .unwrap(),

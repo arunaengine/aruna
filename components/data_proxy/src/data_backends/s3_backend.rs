@@ -58,7 +58,7 @@ impl S3Backend {
 
         let temp = tmp
             .clone()
-            .unwrap_or_else(|| format!("temp-{}", endpoint_id).to_ascii_lowercase());
+            .unwrap_or_else(|| format!("temp-{endpoint_id}").to_ascii_lowercase());
 
         let compiled_schema = CompiledVariant::new(backend_scheme.as_str())?;
 

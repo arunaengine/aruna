@@ -68,7 +68,7 @@ impl HookHandler {
                 // - deduplication
                 // - retries
                 if let Err(action) = handler.hook_action(message, client.clone()).await {
-                    log::error!("[HookHandler] ERROR: {:?}", action);
+                    log::error!("[HookHandler] ERROR: {action:?}");
                 };
             }
         });
@@ -394,7 +394,7 @@ impl HookHandler {
                 )
                 .await;
             if call.is_err() {
-                log::error!("{:?}", call);
+                log::error!("{call:?}");
             }
         });
         Ok(())

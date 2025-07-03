@@ -4,10 +4,7 @@ use ed25519_dalek::pkcs8::DecodePublicKey;
 use sha2::Digest;
 
 pub fn ed25519_to_x25519_pubkey(pubkey: &str) -> Result<[u8; 32]> {
-    let key_pem = format!(
-        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
-        pubkey
-    );
+    let key_pem = format!("-----BEGIN PUBLIC KEY-----\n{pubkey}\n-----END PUBLIC KEY-----");
     let pk = ed25519_dalek::VerifyingKey::from_public_key_pem(&key_pem)?;
     use curve25519_dalek::edwards::CompressedEdwardsY;
     let cey = CompressedEdwardsY::from_slice(pk.as_bytes())?;
@@ -18,10 +15,7 @@ pub fn ed25519_to_x25519_pubkey(pubkey: &str) -> Result<[u8; 32]> {
 }
 
 pub fn ed25519_to_x25519_privatekey(privatekey: &str) -> Result<[u8; 32]> {
-    let key_pem = format!(
-        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----",
-        privatekey
-    );
+    let key_pem = format!("-----BEGIN PRIVATE KEY-----\n{privatekey}\n-----END PRIVATE KEY-----");
     let sk = ed25519_dalek::SigningKey::from_pkcs8_pem(&key_pem)?;
     if sk.as_bytes().len() < 32 {
         bail!("Invalid private key length")

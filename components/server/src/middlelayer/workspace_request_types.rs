@@ -102,7 +102,7 @@ impl CreateWorkspace {
         let endpoints = endpoints.into_iter().map(|id| (id, Empty {}));
         User {
             id: user_id,
-            display_name: format!("SERVICE_ACCOUNT#{}", user_id),
+            display_name: format!("SERVICE_ACCOUNT#{user_id}"),
             first_name: "".to_string(),
             last_name: "".to_string(),
             email: String::new(),

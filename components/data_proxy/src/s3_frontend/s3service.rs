@@ -91,8 +91,8 @@ impl ArunaS3Service {
         let sha256 = Sha256::new().finalize();
 
         let output = PutObjectOutput {
-            e_tag: Some(format!("{:x}", md5)),
-            checksum_sha256: Some(format!("{:x}", sha256)),
+            e_tag: Some(format!("{md5:x}")),
+            checksum_sha256: Some(format!("{sha256:x}")),
             version_id: Some(object.id.to_string()),
             ..Default::default()
         };
@@ -372,7 +372,7 @@ impl S3 for ArunaS3Service {
                 ))
             }
         };
-        
+
         trace!(?new_object);
 
         let mut location = self
@@ -590,8 +590,8 @@ impl S3 for ArunaS3Service {
             let mut resp = S3Response::new(GetObjectOutput {
                 body,
                 last_modified: None,
-                content_disposition: Some(format!(r#"attachment;filename="{}.tar.gz"#, name)),
-                e_tag: Some(format!("-{}", name)),
+                content_disposition: Some(format!(r#"attachment;filename="{name}.tar.gz"#)),
+                e_tag: Some(format!("-{name}")),
                 ..Default::default()
             });
 
@@ -660,7 +660,7 @@ impl S3 for ArunaS3Service {
                 self.backend
                     .get_object(
                         location.clone(),
-                        Some(format!("bytes=-{}", buffer_size)),
+                        Some(format!("bytes=-{buffer_size}")),
                         footer_sender,
                     )
                     .await
@@ -1909,7 +1909,7 @@ impl S3 for ArunaS3Service {
         };
 
         let output = UploadPartOutput {
-            e_tag: Some(format!("-{}", etag)),
+            e_tag: Some(format!("-{etag}")),
             ..Default::default()
         };
         debug!(?output);

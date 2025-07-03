@@ -136,10 +136,8 @@ impl AuthHandler {
         encode_secret: String,
         encoding_key_serial: i32,
     ) -> Result<Self, anyhow::Error> {
-        let private_pem = format!(
-            "-----BEGIN PRIVATE KEY-----{}-----END PRIVATE KEY-----",
-            encode_secret
-        );
+        let private_pem =
+            format!("-----BEGIN PRIVATE KEY-----{encode_secret}-----END PRIVATE KEY-----");
         let encoding_key = EncodingKey::from_ed_pem(private_pem.as_bytes()).map_err(|e| {
             error!(error = ?e, msg = e.to_string());
             e

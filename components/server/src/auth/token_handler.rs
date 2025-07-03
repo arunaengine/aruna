@@ -37,7 +37,7 @@ pub enum OIDCError {
 impl Display for OIDCError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OIDCError::NotFound(err) => write!(f, "{}", err),
+            OIDCError::NotFound(err) => write!(f, "{err}"),
         }
     }
 }
@@ -173,14 +173,10 @@ impl TokenHandler {
         encode_secret: String,
         decode_secret: String,
     ) -> Result<Self> {
-        let private_pem = format!(
-            "-----BEGIN PRIVATE KEY-----{}-----END PRIVATE KEY-----",
-            encode_secret
-        );
-        let public_pem = format!(
-            "-----BEGIN PUBLIC KEY-----{}-----END PUBLIC KEY-----",
-            decode_secret
-        );
+        let private_pem =
+            format!("-----BEGIN PRIVATE KEY-----{encode_secret}-----END PRIVATE KEY-----");
+        let public_pem =
+            format!("-----BEGIN PUBLIC KEY-----{decode_secret}-----END PUBLIC KEY-----");
 
         // Read encoding and decoding key; On error panic, we do not want malformed keys.
         let encoding_key = EncodingKey::from_ed_pem(private_pem.as_bytes())?;
@@ -300,7 +296,7 @@ impl TokenHandler {
         let (kid, validated_claims) = match issuer.check_token(token).await {
             Ok((kid, validated_claims)) => (kid, validated_claims),
             Err(e) => {
-                error!("Possible invalid token: {}", e);
+                error!("Possible invalid token: {e}");
                 self.cache
                     .issuer_sender
                     .try_send(issuer.issuer_name.clone())?;
@@ -450,7 +446,7 @@ impl TokenHandler {
             .ok_or_else(|| anyhow!("Pubkey not found"))?
             .get_key_string();
         let mut mac = HmacSha256::new_from_slice(key.as_bytes())?;
-        let sign = format!("{}{}", object_id, hook_id);
+        let sign = format!("{object_id}{hook_id}");
         mac.update(sign.as_bytes());
         Ok((
             general_purpose::STANDARD.encode(mac.finalize().into_bytes()),
@@ -470,7 +466,7 @@ impl TokenHandler {
             .ok_or_else(|| anyhow!("No pubkey found"))?
             .get_key_string();
         let mut mac = HmacSha256::new_from_slice(key.as_bytes())?;
-        let sign = format!("{}{}", object_id, hook_id);
+        let sign = format!("{object_id}{hook_id}");
         mac.update(sign.as_bytes());
         let verify = general_purpose::STANDARD.decode(secret.as_bytes())?;
         mac.verify_slice(&verify).unwrap();

@@ -467,10 +467,10 @@ impl MeilisearchClient {
         primary_key: Option<&str>, // Has to be unique index document attribute, so most likely 'id'
     ) -> anyhow::Result<Index> {
         Ok(if let Ok(index) = self.client.get_index(index_name).await {
-            debug!("Re-use already existing search index: {}", index_name);
+            debug!("Re-use already existing search index: {index_name}");
             index
         } else {
-            debug!("Create new search index: {}", index_name);
+            debug!("Create new search index: {index_name}");
             // Create index in Meilisearch server
             let index = match self
                 .client

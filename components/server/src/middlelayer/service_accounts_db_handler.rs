@@ -37,7 +37,7 @@ impl DatabaseHandler {
         }
         let mut user = User {
             id: user_id,
-            display_name: format!("SERVICE_ACCOUNT#{}", user_id),
+            display_name: format!("SERVICE_ACCOUNT#{user_id}"),
             first_name: "".to_string(),
             last_name: "".to_string(),
             email: String::new(),
@@ -62,7 +62,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -139,7 +139,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -166,7 +166,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -189,7 +189,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -211,7 +211,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }

@@ -81,7 +81,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -106,7 +106,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -131,7 +131,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -160,7 +160,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -189,7 +189,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -218,7 +218,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -255,7 +255,7 @@ impl DatabaseHandler {
                 id: DieselUlid::generate(),
                 user_id,
                 notification_variant: PersistentNotificationVariant::PERMISSION_GRANTED,
-                message: format!("Permission granted for {} ({})", resource_name, resource_id),
+                message: format!("Permission granted for {resource_name} ({resource_id})"),
                 refs: Json(NotificationReferences(vec![NotificationReference {
                     reference_type: NotificationReferenceType::Resource,
                     reference_name: resource_name.to_string(),
@@ -272,7 +272,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -324,7 +324,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -354,7 +354,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -513,7 +513,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -536,7 +536,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -628,7 +628,7 @@ impl DatabaseHandler {
         let mut credentials_request = Request::new(CreateOrUpdateCredentialsRequest {});
         credentials_request.metadata_mut().append(
             AsciiMetadataKey::from_bytes("Authorization".as_bytes())?,
-            AsciiMetadataValue::try_from(format!("Bearer {}", short_lived_token))?,
+            AsciiMetadataValue::try_from(format!("Bearer {short_lived_token}"))?,
         );
 
         let response = tokio::spawn(async move {
@@ -648,7 +648,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -714,7 +714,7 @@ impl DatabaseHandler {
         let mut credentials_request = Request::new(GetCredentialsRequest {});
         credentials_request.metadata_mut().append(
             AsciiMetadataKey::from_bytes("Authorization".as_bytes())?,
-            AsciiMetadataValue::try_from(format!("Bearer {}", short_lived_token))?,
+            AsciiMetadataValue::try_from(format!("Bearer {short_lived_token}"))?,
         );
 
         // Collect results
@@ -784,7 +784,7 @@ impl DatabaseHandler {
         let mut credentials_request = Request::new(RevokeCredentialsRequest {});
         credentials_request.metadata_mut().append(
             AsciiMetadataKey::from_bytes("Authorization".as_bytes())?,
-            AsciiMetadataValue::try_from(format!("Bearer {}", short_lived_token))?,
+            AsciiMetadataValue::try_from(format!("Bearer {short_lived_token}"))?,
         );
 
         dp_conn.revoke_credentials(credentials_request).await?;
@@ -803,7 +803,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -842,7 +842,7 @@ impl DatabaseHandler {
                 .await
             {
                 // Log error (rollback transaction and return)
-                log::error!("{}", err);
+                log::error!("{err}");
                 //transaction.rollback().await?;
                 return Err(anyhow::anyhow!("Notification emission failed"));
             }
@@ -890,7 +890,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }

@@ -342,10 +342,10 @@ async fn process_announcement_event(
                 //ToDo: Implement downtime/shutdown preparation
                 //  - Set instance status to something like `HealthStatus::Shutdown`
                 //  - Do not accept any new requests
-                debug!("Received Downtime announcement: {:?}", info)
+                debug!("Received Downtime announcement: {info:?}")
             }
             AnnEventVariant::Version(version) => {
-                debug!("Received Version announcement: {:?}", version)
+                debug!("Received Version announcement: {version:?}")
             }
         }
     } else {
@@ -365,10 +365,7 @@ async fn process_server_event(
     match server_event {
         ServerEvents::MVREFRESH(refresh_timestamp) => {
             if let Err(err) = sender.send(refresh_timestamp).await {
-                error!(
-                    "Failed to send refresh started timestamp to stats loop: {}",
-                    err
-                )
+                error!("Failed to send refresh started timestamp to stats loop: {err}")
             }
         }
         ServerEvents::CACHEUPDATE(action) => match action {

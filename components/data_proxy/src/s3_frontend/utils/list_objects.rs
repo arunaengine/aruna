@@ -101,7 +101,7 @@ pub async fn list_response(
 
                 if let Some((common_prefix, _)) = path.split_once(&delimiter) {
                     // Collect common prefix with delimiter at its end
-                    common_prefixes.insert(format!("{}{}", common_prefix, delimiter));
+                    common_prefixes.insert(format!("{common_prefix}{delimiter}"));
                 } else {
                     // If None split -> Entry
                     let object_with_location =

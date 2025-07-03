@@ -601,9 +601,9 @@ impl Cache {
         while let Some((id, name)) = prefixes.pop_front() {
             if let Some(children) = self.get_children(&id.get_id()).await {
                 for (child_name, child_id) in children {
-                    prefixes.push_back((child_id, format!("{}/{}", name, child_name)));
+                    prefixes.push_back((child_id, format!("{name}/{child_name}")));
                     if with_intermediates {
-                        final_result.push((child_id, format!("{}/{}", name, child_name)));
+                        final_result.push((child_id, format!("{name}/{child_name}")));
                     }
                 }
             } else {
@@ -635,9 +635,9 @@ impl Cache {
         let mut new_paths = Vec::new();
         for (_, pre) in prefixes.iter() {
             for (_, suf) in suffixes.iter() {
-                final_paths.push(format!("{}/{}{}", pre, resource_name, suf));
+                final_paths.push(format!("{pre}/{resource_name}{suf}"));
                 if let Some(new_name) = &new_name {
-                    new_paths.push(format!("{}/{}{}", pre, new_name, suf));
+                    new_paths.push(format!("{pre}/{new_name}{suf}"));
                 }
             }
         }
@@ -1042,7 +1042,7 @@ impl Cache {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_path_range(&self, bucket_name: &str, skip: &str) -> Vec<(String, DieselUlid)> {
-        let prefix = format!("{}/", bucket_name);
+        let prefix = format!("{bucket_name}/");
 
         self.paths
             .range(format!("{prefix}{skip}")..=format!("{prefix}~"))
@@ -1175,7 +1175,7 @@ impl Cache {
                 if let TypedId::Object(id) = id {
                     results.push((name, self.get_location_cloned(&id).await));
                 } else {
-                    results.push((format!("{}/", name), None))
+                    results.push((format!("{name}/"), None))
                 }
             }
         }
@@ -1385,7 +1385,7 @@ impl Cache {
             let next_part_number = p.part_number + 1;
             response_parts.push(p.into());
 
-            if response_parts.len() == limit as usize {
+            if response_parts.len() == limit {
                 next_part_marker = Some(next_part_number.to_string());
                 is_truncated = true;
                 break;

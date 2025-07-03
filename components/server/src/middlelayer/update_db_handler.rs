@@ -63,7 +63,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             Err(anyhow::anyhow!("Notification emission failed"))
         } else {
@@ -99,7 +99,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             Err(anyhow::anyhow!("Notification emission failed"))
         } else {
@@ -138,7 +138,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             Err(anyhow::anyhow!("Notification emission failed"))
         } else {
@@ -213,7 +213,7 @@ impl DatabaseHandler {
         tokio::spawn(async move {
             let response = db_handler.trigger_hooks(object_clone, trigger, None).await;
             if response.is_err() {
-                log::error!("{:?}", response)
+                log::error!("{response:?}")
             }
         });
 
@@ -232,7 +232,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             Err(anyhow::anyhow!("Notification emission failed"))
         } else {
@@ -271,7 +271,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             Err(anyhow::anyhow!("Notification emission failed"))
         } else {
@@ -503,7 +503,7 @@ impl DatabaseHandler {
                     .trigger_hooks(object, trigger_variants, Some(kvs))
                     .await;
                 if call.is_err() {
-                    log::error!("{:?}", call);
+                    log::error!("{call:?}");
                 }
             });
         } else if !req.0.add_key_values.is_empty() && is_new {
@@ -537,7 +537,7 @@ impl DatabaseHandler {
                     .trigger_hooks(object, trigger_variants, Some(kvs))
                     .await;
                 if call_on_create.is_err() {
-                    log::error!("{:?}", call_on_create);
+                    log::error!("{call_on_create:?}");
                 }
             });
         } else if is_new {
@@ -552,7 +552,7 @@ impl DatabaseHandler {
                     .trigger_hooks(object, vec![TriggerVariant::RESOURCE_CREATED], None)
                     .await;
                 if on_append.is_err() {
-                    log::error!("{:?}", on_append);
+                    log::error!("{on_append:?}");
                 }
             });
         };
@@ -575,7 +575,7 @@ impl DatabaseHandler {
                 .await
             {
                 // Log error, rollback transaction and return
-                log::error!("{}", err);
+                log::error!("{err}");
                 //transaction.rollback().await?;
                 return Err(anyhow::anyhow!("Notification emission failed"));
             }
@@ -612,7 +612,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             Err(anyhow::anyhow!("Notification emission failed"))
         } else {
             Ok(updated)
@@ -654,7 +654,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             Err(anyhow::anyhow!("Notification emission failed"))
         } else {
             Ok(object)

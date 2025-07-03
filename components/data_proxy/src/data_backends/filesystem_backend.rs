@@ -222,7 +222,7 @@ impl StorageBackend for FSBackend {
         let mut file = tokio::fs::File::create(
             Path::new(&self.base_path)
                 .join(&upload_id)
-                .join(format!(".{}.part", part_number)),
+                .join(format!(".{part_number}.part")),
         )
         .await
         .map_err(|e| {

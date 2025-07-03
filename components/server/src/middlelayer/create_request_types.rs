@@ -121,7 +121,7 @@ impl CreateRequest {
                     }
                 }
 
-                if !OBJECT_SCHEMA.is_match(&name) {
+                if !OBJECT_SCHEMA.is_match(name) {
                     Err(anyhow!("Invalid object name"))
                 } else {
                     Ok(full_name.to_string())

@@ -192,7 +192,7 @@ impl EventNotificationService for NotificationServiceImpl {
             .get_client()
             .await
             .map_err(|e| {
-                log::error!("{}", e);
+                log::error!("{e}");
                 Status::unavailable("Database not available.")
             })?;
 
@@ -208,8 +208,7 @@ impl EventNotificationService for NotificationServiceImpl {
             .try_into()?
         } else {
             return Err(Status::invalid_argument(format!(
-                "Consumer with id {} does not exist",
-                consumer_id
+                "Consumer with id {consumer_id} does not exist"
             )));
         };
 
@@ -331,7 +330,7 @@ impl EventNotificationService for NotificationServiceImpl {
                 .get_client()
                 .await
                 .map_err(|e| {
-                    log::error!("{}", e);
+                    log::error!("{e}");
                     Status::unavailable("Database not available.")
                 })?;
 
@@ -380,10 +379,7 @@ impl EventNotificationService for NotificationServiceImpl {
                     .await
                     .is_err()
                 {
-                    error!(
-                        "Keep-alive connection to DataProxy {} terminated",
-                        consumer_id
-                    );
+                    error!("Keep-alive connection to DataProxy {consumer_id} terminated");
                     break;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;

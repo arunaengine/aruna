@@ -75,7 +75,7 @@ impl Display for DbPermissionLevel {
             DbPermissionLevel::Write => "write",
             DbPermissionLevel::Admin => "admin",
         };
-        write!(f, "{}", str)
+        write!(f, "{str}")
     }
 }
 
@@ -1960,13 +1960,13 @@ pub struct UploadPart {
     pub size: u64,
 }
 
-impl Into<Part> for UploadPart {
-    fn into(self) -> Part {
+impl From<UploadPart> for Part {
+    fn from(val: UploadPart) -> Self {
         Part {
             e_tag: None,         //TODO?
             last_modified: None, //TODO?
-            part_number: Some(self.part_number as i32),
-            size: Some(self.size as i64),
+            part_number: Some(val.part_number as i32),
+            size: Some(val.size as i64),
             ..Default::default() //Checksums
         }
     }

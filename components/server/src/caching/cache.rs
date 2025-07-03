@@ -630,12 +630,12 @@ impl Cache {
         ctxs.iter().all(|x| match &x.variant {
             ContextVariant::NotActivated => true,
             ContextVariant::Resource((id, _)) => {
-                log::debug!("[Check Proxy Ctxs] Looking for resource id: {}", id);
+                log::debug!("[Check Proxy Ctxs] Looking for resource id: {id}");
                 if let Some(obj) = self.get_object(id) {
                     log::debug!("[Check Proxy Ctxs] Found object: {:#?}", &obj);
                     obj.object.endpoints.0.contains_key(endpoint_id)
                 } else {
-                    log::debug!("[Check Proxy Ctxs] No object found with id: {}", id);
+                    log::debug!("[Check Proxy Ctxs] No object found with id: {id}");
                     false
                 }
             }
@@ -1111,7 +1111,7 @@ mod tests {
         let now = Instant::now();
         let iterative_result = cache.upstream_dfs_iterative(&id7).unwrap();
         let elapsed = now.elapsed();
-        log::debug!("Cache iterative traversal: {:.2?}", elapsed);
+        log::debug!("Cache iterative traversal: {elapsed:.2?}");
 
         // Evaluate result
         assert_eq!(iterative_result.len(), 5);

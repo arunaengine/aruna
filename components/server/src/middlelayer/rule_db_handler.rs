@@ -67,7 +67,7 @@ impl DatabaseHandler {
                 )))
                 .await
             {
-                log::error!("{}", err);
+                log::error!("{err}");
                 return Err(anyhow::anyhow!("Notification emission failed"));
             }
         }
@@ -109,7 +109,7 @@ impl DatabaseHandler {
             ))))
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
         Ok(id)
@@ -132,7 +132,7 @@ impl DatabaseHandler {
             ))))
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
         Ok(updated)
@@ -149,7 +149,7 @@ impl DatabaseHandler {
             ))))
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
         Ok(())
@@ -179,7 +179,7 @@ impl DatabaseHandler {
             )))
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
         Ok(())
@@ -199,7 +199,7 @@ impl DatabaseHandler {
             )))
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
         Ok(())

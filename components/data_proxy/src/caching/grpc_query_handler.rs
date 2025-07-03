@@ -198,7 +198,7 @@ impl GrpcQueryHandler {
             error!(error = ?e, msg = e.to_string());
             e
         })?;
-        let value = AsciiMetadataValue::try_from(format!("Bearer {}", token)).map_err(|e| {
+        let value = AsciiMetadataValue::try_from(format!("Bearer {token}")).map_err(|e| {
             error!(error = ?e, msg = e.to_string());
             e
         })?;
@@ -471,14 +471,11 @@ impl GrpcQueryHandler {
         trace!(?object_id, "Deleting object");
 
         // Check if data proxy local temp resource
-        match self.cache.get_resource_cloned(object_id, false).await?.1 {
-            Some(loc) => {
-                if loc.raw_content_len == 0 && loc.disk_content_len == 0 {
-                    // Early return as the resource does only exist locally
-                    return Ok(());
-                }
+        if let Some(loc) = self.cache.get_resource_cloned(object_id, false).await?.1 {
+            if loc.raw_content_len == 0 && loc.disk_content_len == 0 {
+                // Early return as the resource does only exist locally
+                return Ok(());
             }
-            None => {}
         }
 
         // Request object deletion in server

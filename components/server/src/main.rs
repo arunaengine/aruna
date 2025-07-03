@@ -130,7 +130,7 @@ pub async fn main() -> Result<()> {
     tokio::spawn(async move {
         // Delete existing index
         if let Err(err) = search_clone.delete_index(MeilisearchIndexes::OBJECT).await {
-            warn!("Search index deletion failed: {}", err)
+            warn!("Search index deletion failed: {err}")
         }
 
         // Re-create index with current config
@@ -138,14 +138,14 @@ pub async fn main() -> Result<()> {
             .get_or_create_index(&MeilisearchIndexes::OBJECT.to_string(), Some("id"))
             .await
         {
-            warn!("Search index creation failed: {}", err)
+            warn!("Search index creation failed: {err}")
         };
 
         // Full sync search index with database content
         if let Err(err) =
             search_utils::full_sync_search_index(db_clone, cache_clone, search_clone).await
         {
-            warn!("Search index full sync failed: {}", err)
+            warn!("Search index full sync failed: {err}")
         };
 
         Ok::<(), anyhow::Error>(())
@@ -167,7 +167,7 @@ pub async fn main() -> Result<()> {
     let refresh_interval = dotenvy::var("REFRESH_INTERVAL")?
         .parse::<i64>()
         .unwrap_or_else(|err| {
-            error!("Could not parse refresh interval: {}", err);
+            error!("Could not parse refresh interval: {err}");
             300000 // 5 minutes is default
         });
 
@@ -332,7 +332,7 @@ pub async fn main() -> Result<()> {
     // Do it.
     //let addr: std::net::SocketAddr = "0.0.0.0:50051".parse()?;
     let addr: std::net::SocketAddr = dotenvy::var("ARUNA_SOCKET_ADDRESS")?.parse()?;
-    info!("ArunaServer listening on {}", addr);
+    info!("ArunaServer listening on {addr}");
     builder.serve(addr).await?;
 
     // Cron scheduler?

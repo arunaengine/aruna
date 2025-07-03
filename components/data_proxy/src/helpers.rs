@@ -74,18 +74,13 @@ pub fn sign_url(
     // Construct request
     let url = if multipart {
         Url::parse(&format!(
-            "{}{}.{}/{}?partNumber={}&uploadId={}",
-            protocol, bucket, endpoint_sanitized, key, part_number, upload_id
+            "{protocol}{bucket}.{endpoint_sanitized}/{key}?partNumber={part_number}&uploadId={upload_id}"
         ))
         .inspect_err(|&e| {
             tracing::error!(error = ?e, msg = e.to_string());
         })?
     } else {
-        Url::parse(&format!(
-            "{}{}.{}/{}",
-            protocol, bucket, endpoint_sanitized, key
-        ))
-        .inspect_err(|&e| {
+        Url::parse(&format!("{protocol}{bucket}.{endpoint_sanitized}/{key}")).inspect_err(|&e| {
             tracing::error!(error = ?e, msg = e.to_string());
         })?
     };

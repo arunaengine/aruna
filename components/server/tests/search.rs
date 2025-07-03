@@ -49,7 +49,7 @@ async fn search_test() {
     // Query some specific stuff without filter/sorting
     let mut specific_document = index_documents.first().unwrap().to_owned();
     let document_id = specific_document.id.to_string();
-    let search_query = format!("\"{}\"", document_id); // Exact search with quotation marks
+    let search_query = format!("\"{document_id}\""); // Exact search with quotation marks
 
     let (hits, estimated_total) = meilisearch_client
         .query_generic_stuff::<ObjectDocument>("objects", &search_query, "", 1000, 0)
