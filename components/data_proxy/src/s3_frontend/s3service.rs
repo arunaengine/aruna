@@ -80,6 +80,42 @@ impl ArunaS3Service {
             cache,
         })
     }
+
+    #[tracing::instrument(level = "trace", skip(object, headers))]
+    async fn put_empty_object(
+        &self,
+        object: ProxyObject,
+        headers: Option<HashMap<String, String>>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let md5 = Md5::new().finalize();
+        let sha256 = Sha256::new().finalize();
+
+        let output = PutObjectOutput {
+            e_tag: Some(format!("{md5:x}")),
+            checksum_sha256: Some(format!("{sha256:x}")),
+            version_id: Some(object.id.to_string()),
+            ..Default::default()
+        };
+
+        self.cache.insert_temp_resource(object).await.map_err(|_| {
+            error!(error = "Unable to temporarily cache empty object");
+            s3_error!(InternalError, "Unable to temporarily cache empty object")
+        })?;
+
+        let mut resp = S3Response::new(output);
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+
+        Ok(resp)
+    }
 }
 
 #[async_trait::async_trait]
@@ -444,6 +480,72 @@ impl S3 for ArunaS3Service {
 
     #[tracing::instrument(err)]
     #[allow(clippy::blocks_in_conditions)]
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let CheckAccessResult { headers, .. } = req
+            .extensions
+            .get::<CheckAccessResult>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "No context found");
+                s3_error!(InternalError, "No context found")
+            })?;
+
+        let max_parts = match req.input.max_parts {
+            Some(k) if k < 1000 => k as usize,
+            _ => 1000usize,
+        };
+        let start_at: u64 = match &req.input.part_number_marker {
+            Some(marker) => {
+                let next_part_number = marker.parse().map_err(|_| {
+                    error!(error = "Invalid part number marker", marker);
+                    s3_error!(InvalidArgument, "Invalid part number marker")
+                })?;
+
+                if next_part_number < 10000 {
+                    next_part_number
+                } else {
+                    error!(error = "Invalid part number marker", marker);
+                    return Err(s3_error!(InvalidArgument, "Invalid part number marker"));
+                }
+            }
+            None => 1,
+        };
+        let (parts, next_marker, is_truncated) =
+            self.cache
+                .list_parts(&req.input.upload_id, start_at, max_parts);
+
+        let output = ListPartsOutput {
+            bucket: Some(req.input.bucket),
+            is_truncated: Some(is_truncated),
+            key: Some(req.input.key),
+            max_parts: req.input.max_parts,
+            next_part_number_marker: next_marker,
+            owner: None, //Todo?
+            part_number_marker: req.input.part_number_marker,
+            parts: Some(parts),
+            upload_id: Some(req.input.upload_id),
+            ..Default::default()
+        };
+        debug!(?output);
+        let mut resp = S3Response::new(output);
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+        Ok(resp)
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,
@@ -488,8 +590,8 @@ impl S3 for ArunaS3Service {
             let mut resp = S3Response::new(GetObjectOutput {
                 body,
                 last_modified: None,
-                content_disposition: Some(format!(r#"attachment;filename="{}.tar.gz"#, name)),
-                e_tag: Some(format!("-{}", name)),
+                content_disposition: Some(format!(r#"attachment;filename="{name}.tar.gz"#)),
+                e_tag: Some(format!("-{name}")),
                 ..Default::default()
             });
 
@@ -558,7 +660,7 @@ impl S3 for ArunaS3Service {
                 self.backend
                     .get_object(
                         location.clone(),
-                        Some(format!("bytes=-{}", buffer_size)),
+                        Some(format!("bytes=-{buffer_size}")),
                         footer_sender,
                     )
                     .await
@@ -1269,23 +1371,82 @@ impl S3 for ArunaS3Service {
         };
     }
 
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let CheckAccessResult {
+            objects_state,
+            user_state,
+            headers,
+        } = req
+            .extensions
+            .get::<CheckAccessResult>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing data context");
+                s3_error!(UnexpectedContent, "Missing data context")
+            })?;
+
+        let impersonating_token =
+            user_state.sign_impersonating_token(self.cache.auth.read().await.as_ref());
+
+        let (states, _) = objects_state.require_regular()?;
+
+        let (_, _, _, object, _) = states.to_new_or_existing()?;
+
+        match object {
+            NewOrExistingObject::Missing(_) => {
+                //Do nothing.
+            }
+            NewOrExistingObject::Existing(object) => {
+                if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
+                    if let Some(token) = &impersonating_token {
+                        handler
+                            .delete_object(&object.id, token)
+                            .await
+                            .map_err(|e| {
+                                error!("Object deletion failed: {e}");
+                                s3_error!(InternalError, "Object deletion failed")
+                            })?;
+
+                        self.cache.delete_object(object.id).await.map_err(|e| {
+                            error!("Object cache deletion failed: {e}");
+                            s3_error!(InternalError, "Object cache deletion failed")
+                        })?;
+                    }
+                }
+            }
+            NewOrExistingObject::None => {
+                return Err(s3_error!(
+                    InvalidObjectState,
+                    "Object in invalid state: None"
+                ))
+            }
+        }
+
+        let mut resp = S3Response::new(DeleteObjectOutput::default());
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+        Ok(resp)
+    }
+
     #[tracing::instrument(err, skip(self, req))]
     #[allow(clippy::blocks_in_conditions)]
     async fn put_object(
         &self,
         req: S3Request<PutObjectInput>,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        match req.input.content_length {
-            Some(0) | None => {
-                error!("Missing or invalid (0) content-length");
-                return Err(s3_error!(
-                    MissingContentLength,
-                    "Missing or invalid (0) content-length"
-                ));
-            }
-            _ => {}
-        };
-
         let CheckAccessResult {
             objects_state,
             user_state,
@@ -1348,6 +1509,16 @@ impl S3 for ArunaS3Service {
         };
 
         trace!(?new_object);
+        match req.input.content_length {
+            Some(0) => {
+                return self.put_empty_object(new_object, headers).await;
+            }
+            None => {
+                error!("Missing content-length");
+                return Err(s3_error!(MissingContentLength, "Missing content-length"));
+            }
+            _ => {} // Go on.
+        };
 
         let mut location = self
             .backend
@@ -1738,7 +1909,7 @@ impl S3 for ArunaS3Service {
         };
 
         let output = UploadPartOutput {
-            e_tag: Some(format!("-{}", etag)),
+            e_tag: Some(format!("-{etag}")),
             ..Default::default()
         };
         debug!(?output);

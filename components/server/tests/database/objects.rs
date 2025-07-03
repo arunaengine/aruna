@@ -87,7 +87,7 @@ async fn fetch_object_paths() {
     let now = Instant::now();
     let result = object.fetch_object_hierarchies(&client).await.unwrap();
     let elapsed = now.elapsed();
-    log::debug!("Hierarchy traversal elapsed: {:.2?}", elapsed);
+    log::debug!("Hierarchy traversal elapsed: {elapsed:.2?}");
 
     assert_eq!(result.len(), 5);
 

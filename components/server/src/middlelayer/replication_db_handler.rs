@@ -249,7 +249,7 @@ impl DatabaseHandler {
                 )
                 .await
             {
-                log::error!("{}", err);
+                log::error!("{err}");
                 return Ok(APIReplicationStatus::Error);
             };
         }
@@ -298,7 +298,7 @@ impl DatabaseHandler {
             )
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow::anyhow!("Notification emission failed"));
         };
         Ok(())
@@ -451,7 +451,7 @@ impl DatabaseHandler {
                 .await
             {
                 // Log error, rollback transaction and return
-                log::error!("{}", err);
+                log::error!("{err}");
                 return Err(anyhow::anyhow!("Notification emission failed"));
             }
             let block_id = DieselUlid::generate();
@@ -467,7 +467,7 @@ impl DatabaseHandler {
                 .await
             {
                 // Log error, rollback transaction and return
-                log::error!("{}", err);
+                log::error!("{err}");
                 return Err(anyhow::anyhow!("Notification emission failed"));
             }
         }

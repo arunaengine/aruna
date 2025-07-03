@@ -237,7 +237,7 @@ async fn resource_notification_test() {
     let now = Instant::now();
     let object_hierarchies = object.fetch_object_hierarchies(&client).await.unwrap();
     let elapsed = now.elapsed();
-    println!("Path fetch: {:.2?}", elapsed);
+    println!("Path fetch: {elapsed:.2?}");
 
     let now = Instant::now();
     nats_handler
@@ -250,7 +250,7 @@ async fn resource_notification_test() {
         .await
         .unwrap();
     let elapsed = now.elapsed();
-    println!("Notification emit: {:.2?}", elapsed);
+    println!("Notification emit: {elapsed:.2?}");
 
     // Give Nats time to process the published messages as Github Actions machines are slow...
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;

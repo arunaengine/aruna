@@ -24,6 +24,7 @@ use diesel_ulid::DieselUlid;
 use jsonwebtoken::DecodingKey;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use s3s::auth::SecretKey;
+use s3s::dto::Part;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
 use std::time::Duration;
@@ -126,7 +127,7 @@ impl Cache {
         cache.set_auth(auth_handler).await;
 
         // Set database conn in cache
-        let temp_locations = if with_persistence {
+        let _temp_locations = if with_persistence {
             let persistence = Database::new().await?;
             cache.set_persistence(persistence).await?
         } else {
@@ -600,9 +601,9 @@ impl Cache {
         while let Some((id, name)) = prefixes.pop_front() {
             if let Some(children) = self.get_children(&id.get_id()).await {
                 for (child_name, child_id) in children {
-                    prefixes.push_back((child_id, format!("{}/{}", name, child_name)));
+                    prefixes.push_back((child_id, format!("{name}/{child_name}")));
                     if with_intermediates {
-                        final_result.push((child_id, format!("{}/{}", name, child_name)));
+                        final_result.push((child_id, format!("{name}/{child_name}")));
                     }
                 }
             } else {
@@ -634,9 +635,9 @@ impl Cache {
         let mut new_paths = Vec::new();
         for (_, pre) in prefixes.iter() {
             for (_, suf) in suffixes.iter() {
-                final_paths.push(format!("{}/{}{}", pre, resource_name, suf));
+                final_paths.push(format!("{pre}/{resource_name}{suf}"));
                 if let Some(new_name) = &new_name {
-                    new_paths.push(format!("{}/{}{}", pre, new_name, suf));
+                    new_paths.push(format!("{pre}/{new_name}{suf}"));
                 }
             }
         }
@@ -771,6 +772,66 @@ impl Cache {
         Ok(())
     }
 
+    /// These resources only live in the proxy until the next restart
+    #[tracing::instrument(level = "trace", skip(self, object))]
+    pub async fn insert_temp_resource(&self, object: Object) -> Result<()> {
+        // Return Ok if already exists
+        if let Ok((rwlock_object, _)) = self.get_resource(&object.id).await {
+            let cache_object = rwlock_object.read().await;
+            if *cache_object == object {
+                return Ok(());
+            }
+        }
+
+        // Else just insert in cache
+        self.resources.insert(
+            object.id,
+            (
+                Arc::new(RwLock::new(object.clone())),
+                Arc::new(RwLock::new(Some(ObjectLocation {
+                    id: DieselUlid::generate(),
+                    bucket: "temp".to_string(),
+                    key: object.name.clone(),
+                    upload_id: None,
+                    file_format: crate::structs::FileFormat::Raw,
+                    raw_content_len: 0,
+                    disk_content_len: 0,
+                    disk_hash: None,
+                    is_temporary: true,
+                    ref_count: 0,
+                }))),
+            ),
+        );
+
+        // Add paths to cache
+        let prefixes = self.get_prefixes(&TypedId::Unknown(object.id), false).await;
+        trace!(?prefixes, "temp resource prefixes");
+        if object
+            .parents
+            .as_ref()
+            .map(|e| e.is_empty())
+            .unwrap_or_else(|| true)
+            && object.object_type != ObjectType::Project
+        {
+            for (_, pre) in prefixes.iter() {
+                self.paths
+                    .remove(&format!("{}/{}", pre.clone(), object.name));
+            }
+        } else {
+            for (_, pre) in prefixes.iter() {
+                self.paths
+                    .insert(format!("{}/{}", pre.clone(), object.name), object.id);
+
+                trace!(
+                    inserted = format!("{}/{}", pre.clone(), object.name),
+                    "inserted"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self, object))]
     pub async fn upsert_object(&self, object: Object) -> Result<()> {
         trace!(?object, "upserting object");
@@ -877,6 +938,30 @@ impl Cache {
             transaction.commit().await?;
         }
 
+        // Remove paths from cache
+        if let Some(entry) = self.resources.get(&id) {
+            let resource = entry.value().0.read().await.clone();
+            let name_trees = self
+                .get_name_trees(&TypedId::from(&resource), resource.name, None)
+                .await
+                .0;
+            debug!("Paths to be deleted: {:?}", name_trees);
+
+            for p in name_trees {
+                self.paths.remove(&p);
+            }
+        }
+
+        // Remove object and location from cache
+        let Some(_) = self.resources.remove(&id) else {
+            warn!(?id, "Resource not found");
+            return Ok(());
+        };
+
+        // Remove multiparts from cache
+        self.multi_parts
+            .retain(|_, v| v.first().is_none_or(|e| e.object_id != id));
+
         // Remove data from storage backend
         if let Some(s3_backend) = &self.backend {
             if let Some(resource) = self.resources.get(&id) {
@@ -887,24 +972,20 @@ impl Cache {
             }
         }
 
-        // Remove object and location from cache
-        let Some(old) = self.resources.remove(&id) else {
-            warn!(?id, "Resource not found");
-            return Ok(());
-        };
-
-        self.multi_parts
-            .retain(|_, v| v.first().is_none_or(|e| e.object_id != id));
-
-        let object = old.1 .0.read().await;
-        for p in self
-            .get_name_trees(&TypedId::from(object.deref()), object.name.clone(), None)
-            .await
-            .0
-        {
-            self.paths.remove(&p);
-        }
         Ok(())
+    }
+
+    fn get_paths_of_id(&self, id: &DieselUlid) -> Vec<String> {
+        self.paths
+            .iter()
+            .filter_map(|p| {
+                if p.value() == id {
+                    Some(p.key().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
@@ -961,7 +1042,7 @@ impl Cache {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_path_range(&self, bucket_name: &str, skip: &str) -> Vec<(String, DieselUlid)> {
-        let prefix = format!("{}/", bucket_name);
+        let prefix = format!("{bucket_name}/");
 
         self.paths
             .range(format!("{prefix}{skip}")..=format!("{prefix}~"))
@@ -1094,7 +1175,7 @@ impl Cache {
                 if let TypedId::Object(id) = id {
                     results.push((name, self.get_location_cloned(&id).await));
                 } else {
-                    results.push((format!("{}/", name), None))
+                    results.push((format!("{name}/"), None))
                 }
             }
         }
@@ -1278,6 +1359,40 @@ impl Cache {
             .unwrap_or_default();
         parts.sort_by(|a, b| a.part_number.cmp(&b.part_number));
         parts
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, upload_id))]
+    pub fn list_parts(
+        &self,
+        upload_id: &str,
+        start_at: u64,
+        limit: usize,
+    ) -> (Vec<Part>, Option<String>, bool) {
+        let mut all_parts: Vec<UploadPart> = self
+            .multi_parts
+            .get(upload_id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.part_number > start_at)
+            .collect::<Vec<_>>();
+        all_parts.sort_by(|a, b| a.part_number.cmp(&b.part_number));
+
+        let mut is_truncated = false;
+        let mut response_parts: Vec<Part> = vec![];
+        let mut next_part_marker = None;
+        for p in all_parts {
+            let next_part_number = p.part_number + 1;
+            response_parts.push(p.into());
+
+            if response_parts.len() == limit {
+                next_part_marker = Some(next_part_number.to_string());
+                is_truncated = true;
+                break;
+            }
+        }
+
+        (response_parts, next_part_marker, is_truncated)
     }
 
     #[tracing::instrument(level = "trace", skip(self, upload_id))]

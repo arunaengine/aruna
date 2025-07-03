@@ -668,7 +668,7 @@ async fn persistent_notification_test() {
         id: notification_ulid,
         user_id: user_ulid,
         notification_variant: PersistentNotificationVariant::PERMISSION_GRANTED,
-        message: format!("Permission granted for example.file ({})", resource_ulid),
+        message: format!("Permission granted for example.file ({resource_ulid})"),
         refs: Json(NotificationReferences(vec![NotificationReference {
             reference_type: NotificationReferenceType::Resource,
             reference_name: "example.file".to_string(),
@@ -691,7 +691,7 @@ async fn persistent_notification_test() {
     );
     assert_eq!(
         pers_notification.message,
-        format!("Permission granted for example.file ({})", resource_ulid)
+        format!("Permission granted for example.file ({resource_ulid})")
     );
     assert_eq!(pers_notification.refs, validation.refs);
 

@@ -57,7 +57,7 @@ impl PermissionHandler {
         } = match self.token_handler.process_token(token).await {
             Ok(results) => results,
             Err(err) => {
-                error!("Error in auth: {:?}", err);
+                error!("Error in auth: {err:?}");
                 return match err.downcast_ref::<OIDCError>() {
                     Some(_) => Err(tonic::Status::unauthenticated("Not registered")),
                     None => Err(tonic::Status::unauthenticated("Unauthorized")),

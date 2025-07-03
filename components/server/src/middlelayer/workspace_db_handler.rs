@@ -122,7 +122,7 @@ impl DatabaseHandler {
             )
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
         if let Err(err) = self
@@ -130,7 +130,7 @@ impl DatabaseHandler {
             .register_user_event(&service_user, EventVariant::Created)
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
 
@@ -164,7 +164,7 @@ impl DatabaseHandler {
         let mut credentials_request = Request::new(GetCredentialsRequest {});
         credentials_request.metadata_mut().append(
             AsciiMetadataKey::from_bytes("Authorization".as_bytes())?,
-            AsciiMetadataValue::try_from(format!("Bearer {}", slt))?,
+            AsciiMetadataValue::try_from(format!("Bearer {slt}"))?,
         );
         let (
             ..,
@@ -216,7 +216,7 @@ impl DatabaseHandler {
             .register_user_event(&user, EventVariant::Deleted)
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow!("Notification emission failed"));
         }
 
@@ -296,7 +296,7 @@ impl DatabaseHandler {
                 .register_resource_event(object_plus, hierarchies, event_variant, Some(&block_id))
                 .await
             {
-                log::error!("{}", err);
+                log::error!("{err}");
                 return Err(anyhow::anyhow!("Notification emission failed"));
             }
         }
@@ -305,7 +305,7 @@ impl DatabaseHandler {
             .register_user_event(&user, EventVariant::Updated)
             .await
         {
-            log::error!("{}", err);
+            log::error!("{err}");
             return Err(anyhow!("Notification emission failed"));
         }
 

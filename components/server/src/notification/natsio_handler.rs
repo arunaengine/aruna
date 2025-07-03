@@ -123,7 +123,7 @@ impl EventHandler for NatsIoHandler {
         {
             Ok(_) => Ok(()),
             Err(err) => {
-                log::error!("{}", err);
+                log::error!("{err}");
                 Err(err.into())
             }
         }
@@ -224,7 +224,7 @@ impl EventHandler for NatsIoHandler {
                     }
                 }
                 Err(err) => {
-                    log::error!("{}", err);
+                    log::error!("{err}");
                     return Err(err);
                     //anyhow::anyhow!("Could not validate reply msg")
                 }
@@ -242,7 +242,7 @@ impl EventHandler for NatsIoHandler {
             Ok(_) => {}
             Err(err) => {
                 return {
-                    log::error!("{}", err);
+                    log::error!("{err}");
                     Err(anyhow::anyhow!("Could not acknowledge all messages"))
                 }
             }

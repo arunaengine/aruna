@@ -48,9 +48,11 @@ lazy_static! {
     pub static ref PROJECT_SCHEMA: Regex =
         Regex::new(r"^[a-z0-9\-]+$").expect("Regex must be valid");
     pub static ref S3_KEY_SCHEMA: Regex =
-        Regex::new(r"^[a-zA-Z0-9\-\!\_\.\*\_\'\(\)]+$").expect("Regex must be valid");
+        Regex::new(r"^[a-zA-Z0-9\-\!\_\.\*\'\(\)]+$").expect("Regex must be valid");
+
+    //TODO: Improve to match more sophisticated cases
     pub static ref OBJECT_SCHEMA: Regex =
-        Regex::new(r"^[a-zA-Z0-9\-\!\_\.\*\_\'\(\)\/]+$").expect("Regex must be valid");
+        Regex::new(r"^[a-zA-Z0-9\-\!\_\.\*\'\(\)\/\s]+$").expect("Regex must be valid");
 }
 
 impl Parent {
@@ -107,11 +109,22 @@ impl CreateRequest {
                 }
             }
             CreateRequest::Object(request) => {
-                let name = request.name.to_string();
-                if !OBJECT_SCHEMA.is_match(&name) {
+                let full_name = request.name.to_string();
+                let mut name_parts = full_name.split("/").collect::<Vec<&str>>();
+                let name = name_parts
+                    .pop()
+                    .ok_or_else(|| anyhow!("Invalid object name"))?;
+
+                for part in name_parts {
+                    if !S3_KEY_SCHEMA.is_match(part) {
+                        return Err(anyhow!("Invalid path name"));
+                    }
+                }
+
+                if !OBJECT_SCHEMA.is_match(name) {
                     Err(anyhow!("Invalid object name"))
                 } else {
-                    Ok(name)
+                    Ok(full_name.to_string())
                 }
             }
         }

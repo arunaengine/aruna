@@ -198,7 +198,7 @@ impl DatabaseHandler {
                 .trigger_hooks(owr, vec![TriggerVariant::HOOK_STATUS_CHANGED], Some(kvs))
                 .await;
             if call.is_err() {
-                log::error!("{:?}", call);
+                log::error!("{call:?}");
             }
         });
 

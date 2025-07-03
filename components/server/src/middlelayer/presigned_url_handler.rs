@@ -212,11 +212,11 @@ impl DatabaseHandler {
             } else {
                 match (!collection_name.is_empty(), !dataset_name.is_empty()) {
                     (true, true) => {
-                        format!("{}/{}/{}", collection_name, dataset_name, object_name)
+                        format!("{collection_name}/{dataset_name}/{object_name}")
                     }
-                    (false, true) => format!("{}/{}", dataset_name, object_name),
+                    (false, true) => format!("{dataset_name}/{object_name}"),
                     (true, false) => {
-                        format!("{}/{}", collection_name, object_name)
+                        format!("{collection_name}/{object_name}")
                     }
                     (false, false) => object_name,
                 }
@@ -280,11 +280,11 @@ impl DatabaseHandler {
         } else {
             match (!collection_name.is_empty(), !dataset_name.is_empty()) {
                 (true, true) => {
-                    format!("{}/{}/{}", collection_name, dataset_name, object_name)
+                    format!("{collection_name}/{dataset_name}/{object_name}")
                 }
-                (false, true) => format!("{}/{}", dataset_name, object_name),
+                (false, true) => format!("{dataset_name}/{object_name}"),
                 (true, false) => {
-                    format!("{}/{}", collection_name, object_name)
+                    format!("{collection_name}/{object_name}")
                 }
                 (false, false) => object_name,
             }
@@ -379,7 +379,7 @@ impl DatabaseHandler {
         let mut credentials_request = Request::new(GetCredentialsRequest {});
         credentials_request.metadata_mut().append(
             AsciiMetadataKey::from_bytes("Authorization".as_bytes())?,
-            AsciiMetadataValue::try_from(format!("Bearer {}", slt))?,
+            AsciiMetadataValue::try_from(format!("Bearer {slt}"))?,
         );
 
         debug!("Send Request to DataProxy");
@@ -391,7 +391,7 @@ impl DatabaseHandler {
                     let mut credentials_request = Request::new(CreateOrUpdateCredentialsRequest {});
                     credentials_request.metadata_mut().append(
                         AsciiMetadataKey::from_bytes("Authorization".as_bytes())?,
-                        AsciiMetadataValue::try_from(format!("Bearer {}", slt))?,
+                        AsciiMetadataValue::try_from(format!("Bearer {slt}"))?,
                     );
                     let response = dp_conn
                         .create_or_update_credentials(credentials_request)
@@ -402,12 +402,12 @@ impl DatabaseHandler {
                         secret_key: response.secret_key,
                     }
                 } else {
-                    log::error!("Error getting credentials from Dataproxy: {}", e);
+                    log::error!("Error getting credentials from Dataproxy: {e}");
                     return Err(anyhow!("Error getting credentials from Dataproxy: {}", e));
                 }
             }
         };
-        debug!("{:#?}", response);
+        debug!("{response:#?}");
 
         Ok((endpoint_host_url, endpoint_s3_url, ssl, response))
     }
@@ -537,14 +537,10 @@ fn sign_url(
         let upload_id = upload_id
             .ok_or_else(|| anyhow!("No upload id provided for multipart presigned url"))?;
         Url::parse(&format!(
-            "{}{}.{}/{}?partNumber={}&uploadId={}",
-            protocol, bucket, endpoint_sanitized, key, part_number, upload_id
+            "{protocol}{bucket}.{endpoint_sanitized}/{key}?partNumber={part_number}&uploadId={upload_id}"
         ))?
     } else {
-        Url::parse(&format!(
-            "{}{}.{}/{}",
-            protocol, bucket, endpoint_sanitized, key
-        ))?
+        Url::parse(&format!("{protocol}{bucket}.{endpoint_sanitized}/{key}"))?
     };
 
     let mut req = reqwest::Request::new(method, url);

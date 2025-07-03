@@ -559,8 +559,7 @@ impl BundleRuleInputBuilder {
                     .bundle
                     .expires_at
                     .unwrap_or_else(|| {
-                        Utc::now()
-                            + TimeDelta::try_weeks(100 * 52).unwrap_or_else(TimeDelta::max_value)
+                        Utc::now() + TimeDelta::try_weeks(100 * 52).unwrap_or(TimeDelta::MAX)
                     })
                     .timestamp(),
             },

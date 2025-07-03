@@ -89,7 +89,7 @@ With kind regards,
 the Aruna team", user.display_name),
                 "Welcome to Aruna - Registration Successful",
             ) {
-                error!("{:#?}", err);
+                error!("{err:#?}");
             }
         }
 
@@ -156,7 +156,7 @@ Kind regards,
 the Aruna team", user.display_name),
                 "[ARUNA] User activated",
             ) {
-                error!("{:#?}", err); 
+                error!("{err:#?}"); 
             }
         }
 

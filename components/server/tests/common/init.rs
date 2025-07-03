@@ -135,7 +135,7 @@ pub async fn init_database_handler_middlelayer() -> Arc<DatabaseHandler> {
         let hook_executor =
             hooks::hook_handler::HookHandler::new(hook_reciever, auth_clone, db_clone).await;
         if let Err(err) = hook_executor.run().await {
-            log::warn!("Hook execution error: {}", err)
+            log::warn!("Hook execution error: {err}")
         }
     });
     db_handler
@@ -220,7 +220,7 @@ pub async fn init_storage_status_service() -> StorageStatusServiceImpl {
         let hook_executor =
             hooks::hook_handler::HookHandler::new(hook_reciever, auth_clone, db_clone).await;
         if let Err(err) = hook_executor.run().await {
-            log::warn!("Hook execution error: {}", err)
+            log::warn!("Hook execution error: {err}")
         }
     });
     // Init project service
@@ -272,7 +272,7 @@ pub async fn init_endpoint_service() -> EndpointServiceImpl {
         let hook_executor =
             hooks::hook_handler::HookHandler::new(hook_reciever, auth_clone, db_clone).await;
         if let Err(err) = hook_executor.run().await {
-            log::warn!("Hook execution error: {}", err)
+            log::warn!("Hook execution error: {err}")
         }
     });
     // Init project service
@@ -333,7 +333,7 @@ pub async fn init_project_service() -> ProjectServiceImpl {
         let hook_executor =
             hooks::hook_handler::HookHandler::new(hook_reciever, auth_clone, db_clone).await;
         if let Err(err) = hook_executor.run().await {
-            log::warn!("Hook execution error: {}", err)
+            log::warn!("Hook execution error: {err}")
         }
     });
     // Init project service
@@ -479,7 +479,7 @@ pub async fn init_grpc_services() -> (
         let hook_executor =
             hooks::hook_handler::HookHandler::new(hook_reciever, auth_clone, db_clone).await;
         if let Err(err) = hook_executor.run().await {
-            log::warn!("Hook execution error: {}", err)
+            log::warn!("Hook execution error: {err}")
         }
     });
 
@@ -542,7 +542,7 @@ pub async fn init_service_block() -> ServiceBlock {
         let hook_executor =
             hooks::hook_handler::HookHandler::new(hook_reciever, auth_clone, db_clone).await;
         if let Err(err) = hook_executor.run().await {
-            log::warn!("Hook execution error: {}", err)
+            log::warn!("Hook execution error: {err}")
         }
     });
 

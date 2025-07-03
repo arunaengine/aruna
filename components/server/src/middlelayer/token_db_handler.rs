@@ -33,7 +33,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -72,7 +72,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -98,7 +98,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }
@@ -122,7 +122,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error (rollback transaction and return)
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             return Err(anyhow::anyhow!("Notification emission failed"));
         }

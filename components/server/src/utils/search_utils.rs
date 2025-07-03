@@ -19,7 +19,7 @@ pub async fn remove_from_search_index(
             .delete_stuff::<DieselUlid>(index_updates.as_slice(), MeilisearchIndexes::OBJECT)
             .await
         {
-            log::warn!("Search index update failed: {}", err)
+            log::warn!("Search index update failed: {err}")
         }
     });
 }
@@ -57,7 +57,7 @@ pub async fn update_search_index(
             )
             .await
         {
-            log::warn!("Search index update failed: {}", err)
+            log::warn!("Search index update failed: {err}")
         }
     });
 }

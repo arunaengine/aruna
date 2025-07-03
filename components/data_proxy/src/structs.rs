@@ -23,8 +23,8 @@ use diesel_ulid::DieselUlid;
 use http::{HeaderValue, Method};
 use pithos_lib::helpers::structs::{EncryptionKey, FileContext};
 use rand::RngCore;
-use s3s::dto::CreateBucketInput;
 use s3s::dto::{CORSRule as S3SCORSRule, GetBucketCorsOutput};
+use s3s::dto::{CreateBucketInput, Part};
 use s3s::{s3_error, S3Error};
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -75,7 +75,7 @@ impl Display for DbPermissionLevel {
             DbPermissionLevel::Write => "write",
             DbPermissionLevel::Admin => "admin",
         };
-        write!(f, "{}", str)
+        write!(f, "{str}")
     }
 }
 
@@ -1958,6 +1958,18 @@ pub struct UploadPart {
     pub part_number: u64,
     pub raw_size: u64,
     pub size: u64,
+}
+
+impl From<UploadPart> for Part {
+    fn from(val: UploadPart) -> Self {
+        Part {
+            e_tag: None,         //TODO?
+            last_modified: None, //TODO?
+            part_number: Some(val.part_number as i32),
+            size: Some(val.size as i64),
+            ..Default::default() //Checksums
+        }
+    }
 }
 
 #[cfg(test)]

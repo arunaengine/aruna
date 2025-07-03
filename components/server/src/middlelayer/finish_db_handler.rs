@@ -137,7 +137,7 @@ impl DatabaseHandler {
                 .trigger_hooks(owr, vec![TriggerVariant::OBJECT_FINISHED], None)
                 .await;
             if call.is_err() {
-                log::error!("{:?}", call);
+                log::error!("{call:?}");
             }
         });
 
@@ -154,7 +154,7 @@ impl DatabaseHandler {
             .await
         {
             // Log error, rollback transaction and return
-            log::error!("{}", err);
+            log::error!("{err}");
             //transaction.rollback().await?;
             Err(anyhow::anyhow!("Notification emission failed"))
         } else {

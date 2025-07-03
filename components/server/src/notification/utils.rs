@@ -24,16 +24,16 @@ pub fn generate_resource_subject(
 ) -> String {
     // No one cares about the specific graph hierarchy anymore
     let base_subject = match resource_variant {
-        ObjectType::PROJECT => format!("AOS.RESOURCE._.{}.", resource_id),
-        ObjectType::COLLECTION => format!("AOS.RESOURCE._.*._.{}.", resource_id),
-        ObjectType::DATASET => format!("AOS.RESOURCE._.*._.*._.{}.", resource_id),
-        ObjectType::OBJECT => format!("AOS.RESOURCE._.*._.*._.*._.{}.", resource_id),
+        ObjectType::PROJECT => format!("AOS.RESOURCE._.{resource_id}."),
+        ObjectType::COLLECTION => format!("AOS.RESOURCE._.*._.{resource_id}."),
+        ObjectType::DATASET => format!("AOS.RESOURCE._.*._.*._.{resource_id}."),
+        ObjectType::OBJECT => format!("AOS.RESOURCE._.*._.*._.*._.{resource_id}."),
     };
 
     if include_sub_resources {
-        format!("{}>", base_subject)
+        format!("{base_subject}>")
     } else {
-        format!("{}_", base_subject)
+        format!("{base_subject}_")
     }
 }
 
@@ -44,10 +44,10 @@ pub fn generate_resource_message_subject(
 ) -> String {
     // No one cares about the specific graph anymore
     match resource_variant {
-        ObjectType::PROJECT => format!("AOS.RESOURCE._.{}._", resource_id),
-        ObjectType::COLLECTION => format!("AOS.RESOURCE._.*._.{}._", resource_id),
-        ObjectType::DATASET => format!("AOS.RESOURCE._.*._.*._.{}._", resource_id),
-        ObjectType::OBJECT => format!("AOS.RESOURCE._.*._.*._.*._.{}._", resource_id),
+        ObjectType::PROJECT => format!("AOS.RESOURCE._.{resource_id}._"),
+        ObjectType::COLLECTION => format!("AOS.RESOURCE._.*._.{resource_id}._"),
+        ObjectType::DATASET => format!("AOS.RESOURCE._.*._.*._.{resource_id}._"),
+        ObjectType::OBJECT => format!("AOS.RESOURCE._.*._.*._.*._.{resource_id}._"),
     }
 }
 
@@ -69,12 +69,12 @@ pub fn generate_resource_message_subjects(hierarchies: Vec<Hierarchy>) -> Vec<St
 
 ///ToDo: Rust Doc
 pub fn generate_user_subject(user_id: &str) -> String {
-    format!("AOS.USER.{}.>", user_id)
+    format!("AOS.USER.{user_id}.>")
 }
 
 ///ToDo: Rust Doc
 pub fn generate_user_message_subject(user_id: &str) -> String {
-    format!("AOS.USER.{}._", user_id)
+    format!("AOS.USER.{user_id}._")
 }
 
 ///ToDo: Rust Doc
@@ -97,7 +97,7 @@ pub fn generate_announcement_message_subject(event_variant: &EventVariant) -> St
 
 ///ToDo: Rust Doc
 pub fn generate_endpoint_subject(endpoint_id: &DieselUlid) -> String {
-    format!("AOS.ENDPOINT.{}", endpoint_id)
+    format!("AOS.ENDPOINT.{endpoint_id}")
 }
 
 ///ToDo: Rust Doc
@@ -162,7 +162,7 @@ pub fn calculate_reply_hmac(reply_subject: &str, secret: String) -> Reply {
     // Calculate hmac
     let mut mac =
         HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
-    mac.update(format!("{}-{}", reply_subject, salt).as_bytes());
+    mac.update(format!("{reply_subject}-{salt}").as_bytes());
 
     // Encode hmac in base64
     let base64_hmac = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
@@ -213,7 +213,7 @@ mod tests {
     fn test_consumer_subject_parser() {
         /* ----- Resources ----- */
         let project_ulid = DieselUlid::generate();
-        let project_subject = format!("AOS.RESOURCE._.{}._", project_ulid);
+        let project_subject = format!("AOS.RESOURCE._.{project_ulid}._");
 
         let event_type = parse_event_consumer_subject(&project_subject).unwrap();
         assert_eq!(
@@ -222,7 +222,7 @@ mod tests {
         );
 
         let collection_ulid = DieselUlid::generate();
-        let collection_subject = format!("AOS.RESOURCE._.*._.{}._", collection_ulid);
+        let collection_subject = format!("AOS.RESOURCE._.*._.{collection_ulid}._");
 
         let event_type = parse_event_consumer_subject(&collection_subject).unwrap();
         assert_eq!(
@@ -231,7 +231,7 @@ mod tests {
         );
 
         let dataset_ulid = DieselUlid::generate();
-        let dataset_subject = format!("AOS.RESOURCE._.*._.*._.{}._", dataset_ulid);
+        let dataset_subject = format!("AOS.RESOURCE._.*._.*._.{dataset_ulid}._");
 
         let event_type = parse_event_consumer_subject(&dataset_subject).unwrap();
         assert_eq!(
@@ -240,7 +240,7 @@ mod tests {
         );
 
         let object_ulid = DieselUlid::generate();
-        let object_subject = format!("AOS.RESOURCE._.*._.*._.*._.{}._", object_ulid);
+        let object_subject = format!("AOS.RESOURCE._.*._.*._.*._.{object_ulid}._");
 
         let event_type = parse_event_consumer_subject(&object_subject).unwrap();
         assert_eq!(
@@ -250,7 +250,7 @@ mod tests {
 
         /* ----- User ----- */
         let user_ulid = DieselUlid::generate();
-        let user_subject = format!("AOS.USER.{}.>", user_ulid);
+        let user_subject = format!("AOS.USER.{user_ulid}.>");
 
         let event_type = parse_event_consumer_subject(&user_subject).unwrap();
         assert_eq!(event_type, EventType::User(user_ulid.to_string()));
