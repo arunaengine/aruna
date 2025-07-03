@@ -444,6 +444,72 @@ impl S3 for ArunaS3Service {
 
     #[tracing::instrument(err)]
     #[allow(clippy::blocks_in_conditions)]
+    async fn list_parts(
+        &self,
+        req: S3Request<ListPartsInput>,
+    ) -> S3Result<S3Response<ListPartsOutput>> {
+        let CheckAccessResult { headers, .. } = req
+            .extensions
+            .get::<CheckAccessResult>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "No context found");
+                s3_error!(InternalError, "No context found")
+            })?;
+
+        let max_parts = match req.input.max_parts {
+            Some(k) if k < 1000 => k as usize,
+            _ => 1000usize,
+        };
+        let start_at: u64 = match &req.input.part_number_marker {
+            Some(marker) => {
+                let next_part_number = marker.parse().map_err(|_| {
+                    error!(error = "Invalid part number marker", marker);
+                    s3_error!(InvalidArgument, "Invalid part number marker")
+                })?;
+
+                if next_part_number < 10000 {
+                    next_part_number
+                } else {
+                    error!(error = "Invalid part number marker", marker);
+                    return Err(s3_error!(InvalidArgument, "Invalid part number marker"));
+                }
+            }
+            None => 1,
+        };
+        let (parts, next_marker, is_truncated) =
+            self.cache
+                .list_parts(&req.input.upload_id, start_at, max_parts);
+
+        let output = ListPartsOutput {
+            bucket: Some(req.input.bucket),
+            is_truncated: Some(is_truncated),
+            key: Some(req.input.key),
+            max_parts: req.input.max_parts,
+            next_part_number_marker: next_marker,
+            owner: None, //Todo?
+            part_number_marker: req.input.part_number_marker,
+            parts: Some(parts),
+            upload_id: Some(req.input.upload_id),
+            ..Default::default()
+        };
+        debug!(?output);
+        let mut resp = S3Response::new(output);
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+        Ok(resp)
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
     async fn get_object(
         &self,
         req: S3Request<GetObjectInput>,

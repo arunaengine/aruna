@@ -24,6 +24,7 @@ use diesel_ulid::DieselUlid;
 use jsonwebtoken::DecodingKey;
 use rand::{distributions::Alphanumeric, thread_rng, Rng};
 use s3s::auth::SecretKey;
+use s3s::dto::Part;
 use std::collections::{HashMap, VecDeque};
 use std::ops::Deref;
 use std::time::Duration;
@@ -1278,6 +1279,40 @@ impl Cache {
             .unwrap_or_default();
         parts.sort_by(|a, b| a.part_number.cmp(&b.part_number));
         parts
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, upload_id))]
+    pub fn list_parts(
+        &self,
+        upload_id: &str,
+        start_at: u64,
+        limit: usize,
+    ) -> (Vec<Part>, Option<String>, bool) {
+        let mut all_parts: Vec<UploadPart> = self
+            .multi_parts
+            .get(upload_id)
+            .map(|e| e.value().clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.part_number > start_at)
+            .collect::<Vec<_>>();
+        all_parts.sort_by(|a, b| a.part_number.cmp(&b.part_number));
+
+        let mut is_truncated = false;
+        let mut response_parts: Vec<Part> = vec![];
+        let mut next_part_marker = None;
+        for p in all_parts {
+            let next_part_number = p.part_number + 1;
+            response_parts.push(p.into());
+
+            if response_parts.len() == limit as usize {
+                next_part_marker = Some(next_part_number.to_string());
+                is_truncated = true;
+                break;
+            }
+        }
+
+        (response_parts, next_part_marker, is_truncated)
     }
 
     #[tracing::instrument(level = "trace", skip(self, upload_id))]
