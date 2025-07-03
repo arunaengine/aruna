@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_search() {
+    async fn test_search_authorization() {
         let ref test @ TestServers {
             addr_server_pairs: ref servers,
             ..
@@ -363,6 +363,143 @@ mod tests {
                 .unwrap();
             assert_eq!(response.resources.len(), 501);
             assert!(response.resources.iter().all(|r| user2_ids.contains(&r.id)));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_queries() {
+        let ref test @ TestServers {
+            addr_server_pairs: ref servers,
+            ..
+        } = init_lmdb_servers(OFFSET).await.unwrap();
+
+        let (controller, first_url) = servers.first().unwrap();
+        let client = reqwest::Client::new();
+
+        let (user_identity, user_token) =
+            create_user_with_token(&test, "search_query_user".to_string())
+                .await
+                .unwrap();
+        let request = AddGroupRequest {
+            name: "search_query_group".to_string(),
+        };
+        let response = request
+            .run_request(user_identity.clone(), controller)
+            .await
+            .unwrap();
+
+        let group = response.group.id;
+
+        let create_resource = CreateProjectRequest {
+            name: format!("project_test"),
+            visibility: aruna_metadata::models::models::VisibilityClass::Private,
+            group_id: group,
+            ..Default::default()
+        };
+        let object: Resource = client
+            .post(format!("{first_url}/resources/project"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user_token.to_string()).as_ref(),
+            )
+            .json(&create_resource)
+            .send()
+            .await
+            .unwrap()
+            .json::<CreateProjectResponse>()
+            .await
+            .unwrap()
+            .resource;
+        let parent_project = object.id;
+
+        for i in 0..10 {
+            let create_resource = if i == 2 {
+                CreateResourceRequest {
+                    name: format!("test_search_{i}"),
+                    visibility: aruna_metadata::models::models::VisibilityClass::Private,
+                    parent_id: parent_project,
+                    description: "A unique description for a unique object".to_string(),
+                    ..Default::default()
+                }
+            } else {
+                CreateResourceRequest {
+                    name: format!("test_search_{i}"),
+                    visibility: aruna_metadata::models::models::VisibilityClass::Private,
+                    parent_id: parent_project,
+                    ..Default::default()
+                }
+            };
+            let r: Resource = client
+                .post(format!("{first_url}/resources"))
+                .header::<&str, &str>(
+                    "Authorization",
+                    format!("Bearer {}", user_token.to_string()).as_ref(),
+                )
+                .json(&create_resource)
+                .send()
+                .await
+                .unwrap()
+                .json::<CreateProjectResponse>()
+                .await
+                .unwrap()
+                .resource;
+        }
+
+        std::thread::sleep(Duration::from_secs(5));
+
+        for (_, base_url) in servers.iter() {
+            let response: SearchResponse = client
+                .get(format!("{base_url}/info/search"))
+                .header::<&str, &str>(
+                    "Authorization",
+                    format!("Bearer {}", user_token.to_string()).as_ref(),
+                )
+                .query(&[("query", "name:.*search.*")])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response.resources.len(), 10);
+
+            let response: SearchResponse = client
+                .get(format!("{base_url}/info/search"))
+                .header::<&str, &str>(
+                    "Authorization",
+                    format!("Bearer {}", user_token.to_string()).as_ref(),
+                )
+                .query(&[("query", "name:.*1")])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response.resources.len(), 1);
+            assert_eq!(
+                response.resources.first().unwrap().name,
+                "test_search_1".to_string()
+            );
+
+            let response: SearchResponse = client
+                .get(format!("{base_url}/info/search"))
+                .header::<&str, &str>(
+                    "Authorization",
+                    format!("Bearer {}", user_token.to_string()).as_ref(),
+                )
+                .query(&[("query", "description:unique")])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response.resources.len(), 1);
+            assert_eq!(
+                response.resources.first().unwrap().name,
+                "test_search_2".to_string()
+            );
         }
     }
 }

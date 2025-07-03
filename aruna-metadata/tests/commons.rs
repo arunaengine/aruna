@@ -15,9 +15,7 @@ use aruna_metadata::{
     },
     transactions::{controller::Controller, request::Request},
 };
-use aruna_permission::{
-    OidcToken, PermissionManager, TokenSystem, UserIdentity,
-};
+use aruna_permission::{OidcToken, PermissionManager, TokenSystem, UserIdentity};
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
@@ -38,6 +36,7 @@ use std::{
 use tracing_subscriber::EnvFilter;
 #[allow(unused)]
 use tracing_subscriber::prelude::*;
+use ulid::Ulid;
 
 pub static SUBSCRIBERS: AtomicU16 = AtomicU16::new(0);
 const TEST_CONFIG: TestConfig = TestConfig {
@@ -94,12 +93,24 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
 
     let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let tantivy_path = format!("{}/{}/node_{}/tantivy", TEST_CONFIG.path, subscriber, 0);
+    let tantivy_path = format!(
+        "{}/test-{}-{}/node_{}/tantivy",
+        TEST_CONFIG.path,
+        subscriber,
+        Ulid::new(),
+        0
+    );
     let search_config = TantivyConfig {
         path: tantivy_path,
         index_buffer: 1_000_000_000,
     };
-    let store_path = format!("{}/{}/node_{}/heed", TEST_CONFIG.path, subscriber, 0);
+    let store_path = format!(
+        "{}/test-{}-{}/node_{}/heed",
+        TEST_CONFIG.path,
+        Ulid::new(),
+        subscriber,
+        0
+    );
     let store_config = LmdbConfig {
         path: store_path,
         databases: databases.clone(),
@@ -165,12 +176,24 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
 
     for node in 1..5 {
         let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tantivy_path = format!("{}/{}/node_{}/tantivy", TEST_CONFIG.path, subscriber, node);
+        let tantivy_path = format!(
+            "{}/test-{}-{}/node_{}/tantivy",
+            TEST_CONFIG.path,
+            subscriber,
+            Ulid::new(),
+            node
+        );
         let search_config = TantivyConfig {
             path: tantivy_path,
             index_buffer: 1_000_000_000,
         };
-        let store_path = format!("{}/{}/node_{}/heed", TEST_CONFIG.path, subscriber, node);
+        let store_path = format!(
+            "{}/test-{}-{}/node_{}/heed",
+            TEST_CONFIG.path,
+            subscriber,
+            Ulid::new(),
+            node
+        );
         let store_config = LmdbConfig {
             path: store_path,
             databases: databases.clone(),

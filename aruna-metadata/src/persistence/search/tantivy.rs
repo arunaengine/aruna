@@ -12,7 +12,7 @@ use tantivy::{
     query::QueryParser,
     schema::{FAST, Field, INDEXED, OwnedValue, STORED, Schema, TEXT, Value},
 };
-use tracing::error;
+use tracing::{error, trace};
 use ulid::Ulid;
 
 pub struct TantivySearch {
@@ -122,12 +122,6 @@ impl Search for TantivySearch {
 
         // idx docs send from store init
         let mut index_writer: IndexWriter = index.writer(config.index_buffer)?;
-        //while let Some((idx, resource)) = config.resources.blocking_recv() {
-        //    let doc = fields.create_doc(idx, resource);
-        //    // Let's index one documents!
-        //    index_writer.add_document(doc)?;
-        //}
-        //index_writer.commit()?;
 
         // Idx task for batching
         let fields_clone = fields.clone();
@@ -208,8 +202,8 @@ impl Search for TantivySearch {
                 .doc::<HashMap<Field, OwnedValue>>(addr)
                 .map_err(logerr!())?;
 
-            // let explanation = parsed_query.explain(&searcher, addr)?;
-            // trace!(?explanation);
+            let explanation = parsed_query.explain(&searcher, addr)?;
+            trace!(?explanation);
 
             match doc.get(&self.fields.ids) {
                 Some(id) => {
@@ -233,13 +227,6 @@ impl Search for TantivySearch {
 
     #[tracing::instrument(level = "trace", skip(self))]
     async fn add_resource(&self, idx: u32, resource: Resource) -> Result<(), ArunaMetadataError> {
-        //        let mut writer = self.writer.lock().expect("Mutex panicked");
-        //        let doc = self.fields.create_doc(idx, resource);
-        //        writer.add_document(doc)?;
-        //        writer.commit()?;
-
-        // drop(writer);
-
         self.writer
             .send((idx, resource))
             .await
