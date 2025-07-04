@@ -71,7 +71,7 @@ pub async fn main() {
     // Init tracing
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .with_endpoint("http://localhost:4317")
+        .with_endpoint(config.otel_server)
         .with_timeout(Duration::from_secs(5))
         .build()
         .unwrap();
@@ -79,7 +79,7 @@ pub async fn main() {
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .build()
-        .tracer("aruna");
+        .tracer(config.otel_service_name);
 
     let tracing_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
@@ -188,6 +188,8 @@ pub async fn main() {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub otel_server: String,
+    pub otel_service_name: String,
     pub bootstrap_nodes: Vec<NodeAddr>,
     pub path: String,
     pub issuers: Vec<Issuer>,
@@ -301,6 +303,8 @@ pub fn parse_config() -> Result<Config, ArunaError> {
     if let Ok(file) = dotenvy::var("ENV") {
         dotenvy::from_filename_override(file)?;
     }
+    let otel_server = dotenvy::var("OTEL_SERVER")?;
+    let otel_service_name = dotenvy::var("OTEL_SERVICE_NAME")?;
 
     let path = dotenvy::var("DB_PATH")?;
     let key = &dotenvy::var("REALM_KEY")?;
@@ -321,6 +325,8 @@ pub fn parse_config() -> Result<Config, ArunaError> {
     let data_config = DataConfig::load_from_env()?;
 
     Ok(Config {
+        otel_server,
+        otel_service_name,
         bootstrap_nodes,
         path,
         issuers,
