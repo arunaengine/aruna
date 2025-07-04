@@ -514,7 +514,7 @@ where
 
             controller
                 .sync_loop(
-                    crate::models::structs::TypedDoc::Resource(doc),
+                    crate::models::structs::TypedDoc::Group(doc),
                     *subject_hash,
                     self.group_id.to_bytes(),
                     path,
