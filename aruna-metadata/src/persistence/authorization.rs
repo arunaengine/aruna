@@ -131,10 +131,7 @@ where
             .await
             .iter()
             .flatten()
-            .filter_map(|r| match r.split_once("_") {
-                Some((id, _)) => Some(id),
-                None => None,
-            })
+            .filter_map(|r| r.split_once("_").map(|(id,_)|id))
             .map(|id| -> Result<Ulid, ArunaMetadataError> {
                 Ulid::from_string(id).map_err(|_e| ArunaMetadataError::ConversionError {
                     from: "String".to_string(),

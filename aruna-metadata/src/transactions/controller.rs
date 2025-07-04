@@ -1,9 +1,13 @@
 use super::request::Request;
 use crate::{
-    error::ArunaMetadataError, logerr, models::structs::TypedDoc, network::network_trait::Network, persistence::{
-        persistor::{tables::USER_DB_NAME, Persistor},
+    error::ArunaMetadataError,
+    logerr,
+    models::structs::TypedDoc,
+    network::network_trait::Network,
+    persistence::{
+        persistor::{Persistor, tables::USER_DB_NAME},
         search::generic::Search,
-    }
+    },
 };
 use aruna_permission::{Path, UserIdentity};
 use aruna_storage::storage::store::Store;
@@ -29,11 +33,10 @@ where
 {
     #[tracing::instrument(level = "trace", skip(persistence, network))]
     pub fn new(persistence: Arc<Persistor<St, Se>>, network: Arc<N>) -> Self {
-        let controller = Self {
+        Self {
             persistence,
             network,
-        };
-        controller
+        }
     }
     #[tracing::instrument(level = "trace", skip(self, request, token))]
     pub async fn request<R: Request<St, Se, N>>(
@@ -56,7 +59,11 @@ where
         &self,
         token: String,
     ) -> Result<UserIdentity, ArunaMetadataError> {
-        let identity = self.persistence.get_identity(token).await.map_err(logerr!())?;
+        let identity = self
+            .persistence
+            .get_identity(token)
+            .await
+            .map_err(logerr!())?;
 
         let mut chunk_hasher = blake3::Hasher::new();
         chunk_hasher.update(identity.to_bytes().as_slice());
@@ -108,7 +115,7 @@ where
                 let mut document = inner_doc;
                 'sync: loop {
                     let sync_message = persistence
-                        .generate_sync_message(doc_id.clone(), &mut document, node.node_id.clone())
+                        .generate_sync_message(doc_id.clone(), &mut document, node.node_id)
                         .await?;
 
                     let recv_message = network
@@ -144,7 +151,7 @@ where
                                 doc_id.clone(),
                                 &mut document,
                                 Message::decode(response)?,
-                                node.node_id.clone(),
+                                node.node_id,
                             )
                             .await?;
                     }
