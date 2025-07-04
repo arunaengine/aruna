@@ -71,7 +71,7 @@ pub async fn main() {
     // Init tracing
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
-        .with_endpoint(config.otel_server)
+        .with_endpoint(config.otel_server.clone())
         .with_timeout(Duration::from_secs(5))
         .build()
         .unwrap();
@@ -79,7 +79,7 @@ pub async fn main() {
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .build()
-        .tracer(config.otel_service_name);
+        .tracer(config.otel_service_name.clone());
 
     let tracing_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
