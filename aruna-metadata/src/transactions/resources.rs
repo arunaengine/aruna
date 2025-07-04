@@ -3,7 +3,6 @@ use crate::{
     error::ArunaMetadataError,
     models::{
         conversions::ToBytes,
-        structs::{Resource, ResourceVariant},
         requests::{
             CreateProjectRequest, CreateProjectResponse, CreateResourceRequest,
             CreateResourceResponse, GetInner, GetResourceRequest, GetResourceResponse,
@@ -13,9 +12,12 @@ use crate::{
             UpdateResourceNameResponse, UpdateResourceTitleResponse,
             UpdateResourceVisibilityResponse,
         },
+        structs::{Resource, ResourceVariant},
     },
     network::network_trait::{Network, REPLICATION_POLICY},
-    persistence::{authorization::Authorize, search::generic::Search},
+    persistence::{
+        authorization::Authorize, persistor::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME}, search::generic::Search,
+    },
 };
 use aruna_permission::{Action, Path, UserIdentity, paths::PathBuilder};
 use aruna_storage::storage::store::Store;
@@ -51,12 +53,39 @@ where
             .ok_or_else(|| ArunaMetadataError::Unauthorized)
     }
 
-    #[tracing::instrument(level = "trace", skip(_controller))]
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn forward_or_return(
         &self,
         user: &Option<String>,
-        _controller: &super::controller::Controller<St, Se, N>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.parent_id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        let nodes = controller.network.find_verified(subject_hash).await?;
+
+        if !nodes.contains(&controller.network.get_addr().await?) {
+            let doc = controller
+                .persistence
+                .get_or_create_doc(self.parent_id.to_bytes(), RESOURCE_DB_NAME)
+                .await?;
+
+            let path = Path::builder()
+                .realm_id(controller.network.get_realm_key().await?)
+                .build()
+                .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
+
+            controller
+                .sync_loop(
+                    crate::models::structs::TypedDoc::Resource(doc),
+                    *subject_hash,
+                    self.parent_id.to_bytes(),
+                    path,
+                    nodes.into_iter(),
+                )
+                .await?;
+        }
         Ok(None)
     }
 
@@ -460,12 +489,39 @@ where
         }
     }
 
-    #[tracing::instrument(level = "trace", skip(_controller))]
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn forward_or_return(
         &self,
         user: &Option<String>,
-        _controller: &super::controller::Controller<St, Se, N>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.group_id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        let nodes = controller.network.find_verified(subject_hash).await?;
+
+        if !nodes.contains(&controller.network.get_addr().await?) {
+            let doc = controller
+                .persistence
+                .get_or_create_doc(self.group_id.to_bytes(), GROUPS_DB_NAME)
+                .await?;
+
+            let path = Path::builder()
+                .realm_id(controller.network.get_realm_key().await?)
+                .build()
+                .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
+
+            controller
+                .sync_loop(
+                    crate::models::structs::TypedDoc::Resource(doc),
+                    *subject_hash,
+                    self.group_id.to_bytes(),
+                    path,
+                    nodes.into_iter(),
+                )
+                .await?;
+        }
         Ok(None)
     }
 
