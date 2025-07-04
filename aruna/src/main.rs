@@ -13,23 +13,22 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
-use aruna_permission::{
-    PermissionError, PermissionManager, TokenSystem,
-    token::Issuer,
-};
+use aruna_permission::{PermissionError, PermissionManager, TokenSystem, token::Issuer};
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
 };
+use data_encoding::HEXLOWER;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use futures_util::TryFutureExt;
-use iroh::KeyParsingError;
-use iroh::NodeAddr;
+use iroh::{NodeAddr, SecretKey};
+use iroh::{KeyParsingError, PublicKey};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use parking_lot::RwLock;
+use rand::rngs::OsRng;
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     num::ParseIntError,
@@ -83,6 +82,7 @@ pub async fn main() {
 
     let tracing_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
+        .add_directive("aruna=trace".parse().unwrap())
         .add_directive("aruna_metadata=trace".parse().unwrap())
         .add_directive("aruna_storage=trace".parse().unwrap())
         .add_directive("aruna_net=trace".parse().unwrap())
@@ -91,6 +91,7 @@ pub async fn main() {
 
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
+        .add_directive("aruna=info".parse().unwrap())
         .add_directive("aruna_metadata=info".parse().unwrap())
         .add_directive("aruna_storage=info".parse().unwrap())
         .add_directive("aruna_net=info".parse().unwrap())
@@ -300,17 +301,18 @@ where
 }
 
 pub fn parse_config() -> Result<Config, ArunaError> {
-    if let Ok(file) = dotenvy::var("ENV") {
-        dotenvy::from_filename_override(file)?;
-    }
     let otel_server = dotenvy::var("OTEL_SERVER")?;
     let otel_service_name = dotenvy::var("OTEL_SERVICE_NAME")?;
+
+    // let p2p_key = SecretKey::generate(&mut OsRng);
+    // println!("{:?}", &HEXLOWER.encode(&p2p_key.to_bytes()));
 
     let path = dotenvy::var("DB_PATH")?;
     let key = &dotenvy::var("REALM_KEY")?;
     let signing_key = SigningKey::from_pkcs8_pem(key)?;
 
     let issuers = serde_json::from_str(&dotenvy::var("ISSUERS")?)?;
+
     let bootstrap_nodes: Vec<NodeAddr> = match dotenvy::var("BOOTSTRAP_NODES") {
         Ok(env_var) => serde_json::from_str(&env_var)?,
         Err(_) => vec![],

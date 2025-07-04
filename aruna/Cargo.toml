@@ -10,6 +10,7 @@ aruna-metadata = { path = "../aruna-metadata" }
 aruna-permission = { path = "../aruna-permission" }
 aruna-data = { path = "../aruna-data" }
 aruna-storage = { path = "../aruna-storage" }
+data-encoding = "2.9.0"
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
@@ -18,6 +19,7 @@ opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 parking_lot = { workspace = true }
+rand = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
