@@ -69,6 +69,8 @@ services:
       S3_SERVER: "0.0.0.0:1337"
       S3_HOSTNAME: "localhost:1337"
       S3_CORS_EXCEPTION: "http://localhost:3000"
+      OTEL_SERVER: "http://localhost:4317"
+      OTEL_SERVICE_NAME: "aruna"
     depends_on:
       keycloak:
         condition: service_healthy
