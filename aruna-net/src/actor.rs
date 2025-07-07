@@ -7,7 +7,8 @@ use crate::{
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use iroh::{
-    endpoint::{Builder, Connection, Incoming, RecvStream, SendStream}, Endpoint, NodeAddr, NodeId, RelayMode, SecretKey, Watcher
+    Endpoint, NodeAddr, NodeId, RelayMode, SecretKey, Watcher,
+    endpoint::{Builder, Connection, Incoming, RecvStream, SendStream, VarInt},
 };
 use log::warn;
 use std::{collections::HashMap, time::Duration};
@@ -157,7 +158,8 @@ pub async fn connection_loop(
                 Ok(stream) => stream,
                 Err(err) => {
                     error!("Error receiving CreateStream: {err:#}");
-                    continue;
+                    connection_clone.close(VarInt::from_u32(404), b"Connection closed");
+                    break;
                 }
             };
             let connection_clone = connection_clone.clone();
@@ -192,7 +194,7 @@ pub async fn connection_loop(
                 Ok(stream) => stream,
                 Err(err) => {
                     error!("Error receiving CreateStream: {err:#}");
-                    continue;
+                    break;
                 }
             };
 
