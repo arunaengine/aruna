@@ -179,6 +179,7 @@ impl<'a> Store<'a> for LmdbStore {
         })))
     }
 
+    #[tracing::instrument(level = "trace", skip(self, txn))]
     fn iter_over_prefix<'b>(
         &'a self,
         txn: &'b Self::Txn,
@@ -194,11 +195,13 @@ impl<'a> Store<'a> for LmdbStore {
             .open_database(txn, Some(dbname))?
             .ok_or_else(|| ArunaStorageError::DatabaseError("Database not found".to_string()))?;
 
-        Ok(Box::new(db.prefix_iter(txn, prefix.as_bytes())?.filter_map(|iter| {
-            // The trait signature for BytesDecode / BytesEncode contains an result return type
-            // In our case its safe to skip since it will always return Ok
-            let (key, value) = iter.ok()?;
-            Some((Cow::from(key.to_vec()), Cow::from(value.to_vec())))
-        })))
+        Ok(Box::new(
+            db.prefix_iter(txn, prefix.as_bytes())?.filter_map(|iter| {
+                // The trait signature for BytesDecode / BytesEncode contains an result return type
+                // In our case its safe to skip since it will always return Ok
+                let (key, value) = iter.ok()?;
+                Some((Cow::from(key.to_vec()), Cow::from(value.to_vec())))
+            }),
+        ))
     }
 }

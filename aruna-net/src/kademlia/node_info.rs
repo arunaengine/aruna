@@ -11,6 +11,7 @@ pub struct NodeInfo {
 
 impl NodeInfo {
     /// Create a new NodeInfo with the current timestamp
+    #[tracing::instrument(level = "trace")]
     pub fn new(addr: NodeAddr) -> Self {
         Self {
             addr,
@@ -19,11 +20,13 @@ impl NodeInfo {
     }
 
     /// Update the last_seen timestamp to now
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn update_last_seen(&mut self) {
         self.last_seen = Instant::now();
     }
 
     /// Check if this node is stale (hasn't been seen recently)
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn is_stale(&self) -> bool {
         self.last_seen.elapsed() > STALE_NODE_THRESHOLD
     }

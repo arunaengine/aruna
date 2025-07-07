@@ -1,5 +1,6 @@
 use std::pin::Pin;
 
+use super::kademlia::Kademlia;
 use futures::Stream;
 use iroh::{
     NodeId,
@@ -7,7 +8,6 @@ use iroh::{
     node_info::{NodeData, NodeInfo},
 };
 use tracing::{error, trace};
-use super::kademlia::Kademlia;
 
 #[derive(Debug)]
 pub struct ErrorWrapper {
@@ -23,8 +23,10 @@ impl std::fmt::Display for ErrorWrapper {
 impl std::error::Error for ErrorWrapper {}
 
 impl Discovery for Kademlia {
+    #[tracing::instrument(level = "trace", skip(self))]
     fn publish(&self, _data: &NodeData) {}
 
+    #[tracing::instrument(level = "trace", skip(self))]
     fn resolve(
         &self,
         //_endpoint: Endpoint,

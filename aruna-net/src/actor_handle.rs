@@ -20,10 +20,12 @@ pub struct InitActorHandle {
 }
 
 impl InitActorHandle {
+    #[tracing::instrument(level = "trace", skip(send_channel))]
     pub fn new(send_channel: async_channel::Sender<NetworkRequests>) -> Self {
         Self { send_channel }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn get_kademlia_actor_handle(&self) -> Result<Kademlia, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
@@ -38,6 +40,7 @@ impl InitActorHandle {
         Ok(kademlia_actor_handle)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn new_actor_handle(
         &self,
         protocol_id: ProtocolId,
@@ -56,6 +59,7 @@ impl InitActorHandle {
         Ok(connection_actor_handle)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn get_node_addr(&self) -> Result<NodeAddr, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
@@ -97,6 +101,7 @@ pub struct ReceiveStreams {
 }
 
 impl ReceiveStreams {
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn read_protocol(&mut self) -> Result<ProtocolId, anyhow::Error> {
         self.recv_stream
             .read_u32()
@@ -106,6 +111,7 @@ impl ReceiveStreams {
 }
 
 impl NetworkActorHandle {
+    #[tracing::instrument(level = "trace", skip(send_channel, recv_channel))]
     pub fn new(
         protocol_id: ProtocolId,
         send_channel: async_channel::Sender<NetworkRequests>,
@@ -118,6 +124,7 @@ impl NetworkActorHandle {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn create_stream(
         &self,
         target: NodeId,
@@ -137,6 +144,7 @@ impl NetworkActorHandle {
         Ok((send_stream, recv_stream))
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn get_kademlia_actor_handle(&self) -> Result<Kademlia, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
@@ -151,6 +159,7 @@ impl NetworkActorHandle {
         Ok(kademlia_actor_handle)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn new_actor_handle(
         &self,
         protocol_id: ProtocolId,
@@ -169,6 +178,7 @@ impl NetworkActorHandle {
         Ok(connection_actor_handle)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn get_node_addr(&self) -> Result<NodeAddr, anyhow::Error> {
         let (oneshot_tx, oneshot_rx) = oneshot::channel();
 
@@ -183,6 +193,7 @@ impl NetworkActorHandle {
         Ok(node_addr)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn receive(&self) -> Result<ReceiveStreams, anyhow::Error> {
         Ok(self.recv_channel.recv().await?)
     }

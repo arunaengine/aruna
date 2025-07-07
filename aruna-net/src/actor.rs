@@ -10,10 +10,9 @@ use iroh::{
     Endpoint, NodeAddr, NodeId, RelayMode, SecretKey, Watcher,
     endpoint::{Builder, Connection, Incoming, RecvStream, SendStream, VarInt},
 };
-use log::warn;
 use std::{collections::HashMap, time::Duration};
 use tokio::{io::AsyncWriteExt, sync::oneshot};
-use tracing::{error, trace};
+use tracing::{Instrument, error, trace, warn};
 
 pub const CHANNEL_SIZE: usize = 100;
 
@@ -27,6 +26,7 @@ pub struct NetworkActorBuilder {
 }
 
 impl NetworkActorBuilder {
+    #[tracing::instrument(level = "trace", skip(secret_key))]
     pub async fn new(secret_key: Option<SecretKey>) -> Self {
         let command = ChannelPair::new();
 
@@ -65,6 +65,7 @@ impl NetworkActorBuilder {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn add_relay(self, relay_mode: RelayMode) -> Self {
         let endpoint = self.endpoint.relay_mode(relay_mode);
         Self {
@@ -75,6 +76,7 @@ impl NetworkActorBuilder {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn add_bind_addr_v4(self, bind_addr: std::net::SocketAddrV4) -> Self {
         let endpoint = self.endpoint.bind_addr_v4(bind_addr);
         Self {
@@ -85,6 +87,7 @@ impl NetworkActorBuilder {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn add_bind_addr_v6(self, bind_addr: std::net::SocketAddrV6) -> Self {
         let endpoint = self.endpoint.bind_addr_v6(bind_addr);
         Self {
@@ -95,6 +98,7 @@ impl NetworkActorBuilder {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn build(self, bootstrap_nodes: Vec<NodeAddr>) -> Result<InitActorHandle> {
         let endpoint = self.endpoint.bind().await?;
         for node_addr in bootstrap_nodes.iter() {
@@ -143,81 +147,99 @@ pub struct NetworkActor {
     receiver_joinset: tokio::task::JoinSet<()>,
 }
 
+#[tracing::instrument(level = "trace", skip(connection, incoming_streams, create_stream))]
 pub async fn connection_loop(
     connection: Connection,
     incoming_streams: Sender<ReceiveStreams>,
     create_stream: Receiver<CreateStream>,
 ) {
     let connection_clone = connection.clone();
-    tokio::spawn(async move {
-        loop {
-            let CreateStream {
-                protocol_id,
-                return_channel,
-            } = match create_stream.recv().await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    error!("Error receiving CreateStream: {err:#}");
-                    connection_clone.close(VarInt::from_u32(404), b"Connection closed");
-                    break;
-                }
-            };
-            let connection_clone = connection_clone.clone();
-            tokio::spawn(async move {
-                trace!("Creating stream for {protocol_id}");
-
-                let (mut send_stream, recv_stream) = match connection_clone.open_bi().await {
+    tokio::spawn(
+        async move {
+            loop {
+                let CreateStream {
+                    protocol_id,
+                    return_channel,
+                } = match create_stream.recv().await {
                     Ok(stream) => stream,
                     Err(err) => {
-                        warn!("cannot open stream: {err:#}");
-                        return;
+                        error!("Error receiving CreateStream: {err:#}");
+                        connection_clone.close(VarInt::from_u32(404), b"Connection closed");
+                        break;
+                    }
+                };
+                let connection_clone = connection_clone.clone();
+                tokio::spawn(
+                    async move {
+                        trace!("Creating stream for {protocol_id}");
+
+                        let (mut send_stream, recv_stream) = match connection_clone.open_bi().await
+                        {
+                            Ok(stream) => stream,
+                            Err(err) => {
+                                warn!("cannot open stream: {err:#}");
+                                return;
+                            }
+                        };
+
+                        // Write the protocol id to the stream
+                        if send_stream.write_u32(protocol_id).await.is_err() {
+                            warn!("cannot write protocol id to stream");
+                            return;
+                        }
+
+                        if return_channel.send((send_stream, recv_stream)).is_err() {
+                            warn!("cannot send stream to handler");
+                            return;
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
+        }
+        .in_current_span(),
+    );
+
+    tokio::spawn(
+        async move {
+            loop {
+                let (send_stream, recv_stream) = match connection.accept_bi().await {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        error!("Error receiving CreateStream: {err:#}");
+                        break;
                     }
                 };
 
-                // Write the protocol id to the stream
-                if send_stream.write_u32(protocol_id).await.is_err() {
-                    warn!("cannot write protocol id to stream");
-                    return;
-                }
+                let sender = connection.remote_node_id().unwrap();
+                let incoming_streams = incoming_streams.clone();
+                tokio::spawn(
+                    async move {
+                        trace!("Received incoming stream");
 
-                if return_channel.send((send_stream, recv_stream)).is_err() {
-                    warn!("cannot send stream to handler");
-                    return;
-                }
-            });
+                        let receive_streams = ReceiveStreams {
+                            sender,
+                            send_stream,
+                            recv_stream,
+                        };
+                        if incoming_streams.send(receive_streams).await.is_err() {
+                            warn!("cannot send stream to handler");
+                            return;
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
         }
-    });
-
-    tokio::spawn(async move {
-        loop {
-            let (send_stream, recv_stream) = match connection.accept_bi().await {
-                Ok(stream) => stream,
-                Err(err) => {
-                    error!("Error receiving CreateStream: {err:#}");
-                    break;
-                }
-            };
-
-            let sender = connection.remote_node_id().unwrap();
-            let incoming_streams = incoming_streams.clone();
-            tokio::spawn(async move {
-                trace!("Received incoming stream");
-
-                let receive_streams = ReceiveStreams {
-                    sender,
-                    send_stream,
-                    recv_stream,
-                };
-                if incoming_streams.send(receive_streams).await.is_err() {
-                    warn!("cannot send stream to handler");
-                    return;
-                }
-            });
-        }
-    });
+        .in_current_span(),
+    );
 }
 
 impl NetworkActor {
+    #[tracing::instrument(
+        level = "trace",
+        skip(endpoint, command, protocol_handler_map, kademlia)
+    )]
     async fn new(
         endpoint: Endpoint,
         command: ChannelPair<NetworkRequests>,
@@ -238,6 +260,7 @@ impl NetworkActor {
     }
 
     // This spawns the main acceptor loop
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn spawn_acceptor(mut self) {
         tokio::spawn(async move {
             loop {
@@ -351,9 +374,10 @@ impl NetworkActor {
                     }
                 }
             }
-        });
+        }.in_current_span());
     }
 
+    #[tracing::instrument(level = "trace", skip(self, return_channel))]
     async fn create_stream(
         &mut self,
         protocol_id: ProtocolId,
@@ -389,17 +413,20 @@ impl NetworkActor {
                 let incoming_streams = self.incoming_streams.sender().clone();
                 let create_stream_recv = pair.receiver().clone();
                 let endpoint = self.endpoint.clone();
-                self.receiver_joinset.spawn(async move {
-                    // TODO: Timeout connection and send abort signal to actor
-                    let conn = match endpoint.connect(receiver_id, ARUNA_NET_ALPN).await {
-                        Ok(connecting) => connecting,
-                        Err(err) => {
-                            warn!("cannot connect to {receiver_id}: {err:#}");
-                            return;
-                        }
-                    };
-                    connection_loop(conn, incoming_streams, create_stream_recv).await;
-                });
+                self.receiver_joinset.spawn(
+                    async move {
+                        // TODO: Timeout connection and send abort signal to actor
+                        let conn = match endpoint.connect(receiver_id, ARUNA_NET_ALPN).await {
+                            Ok(connecting) => connecting,
+                            Err(err) => {
+                                warn!("cannot connect to {receiver_id}: {err:#}");
+                                return;
+                            }
+                        };
+                        connection_loop(conn, incoming_streams, create_stream_recv).await;
+                    }
+                    .in_current_span(),
+                );
 
                 pair.sender()
                     .send(CreateStream {
@@ -412,6 +439,7 @@ impl NetworkActor {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, incoming))]
     async fn handle_incoming(&mut self, incoming: Incoming) {
         // Handle incoming connections
         // 1. Accept the incoming connection
@@ -451,13 +479,17 @@ impl NetworkActor {
         self.connections.insert(node_id, pair.clone());
 
         // Spawn a task to handle future incoming streams
-        self.receiver_joinset.spawn({
-            let conn = conn.clone();
-            let create_stream_recv = pair.receiver().clone();
-            let incoming_streams = self.incoming_streams.sender().clone();
-            async move {
-                connection_loop(conn, incoming_streams, create_stream_recv).await;
+        self.receiver_joinset.spawn(
+            {
+                let conn = conn.clone();
+                let create_stream_recv = pair.receiver().clone();
+                let incoming_streams = self.incoming_streams.sender().clone();
+                async move {
+                    connection_loop(conn, incoming_streams, create_stream_recv).await;
+                }
+                .in_current_span()
             }
-        });
+            .in_current_span(),
+        );
     }
 }

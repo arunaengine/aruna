@@ -10,6 +10,7 @@ pub struct KBucket {
 
 impl KBucket {
     /// Create a new empty K-bucket
+    #[tracing::instrument(level = "trace")]
     pub fn new() -> Self {
         // Initialize with None values
         Self {
@@ -21,6 +22,7 @@ impl KBucket {
     ///
     /// If the node already exists, updates its last_seen timestamp.
     /// If the bucket is full, returns the least recently seen node for pinging.
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn update(&mut self, info: NodeInfo) -> Option<(NodeAddr, usize)> {
         let node_id = &info.addr.node_id;
 
@@ -56,11 +58,13 @@ impl KBucket {
         None
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn replace_node(&mut self, pos: usize, info: NodeInfo) {
         // Replace the node at the given position
         self.nodes[pos] = Some(info);
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn refresh_node(&mut self, pos: usize) {
         // Refresh the last seen time of the node at the given position
         if let Some(info) = self.nodes[pos].as_mut() {
@@ -69,6 +73,7 @@ impl KBucket {
     }
 
     /// Find a node in the bucket by its ID
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn find_node(&self, node_id: &NodeId) -> Option<usize> {
         self.nodes.iter().position(|opt_info| {
             opt_info
@@ -78,11 +83,13 @@ impl KBucket {
     }
 
     /// Find an empty slot in the bucket
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn find_empty_slot(&self) -> Option<usize> {
         self.nodes.iter().position(|opt_info| opt_info.is_none())
     }
 
     /// Find the least recently seen node in the bucket
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn find_least_recently_seen(&self) -> Option<usize> {
         let mut oldest_pos = None;
         let mut oldest_time = None;
@@ -100,6 +107,7 @@ impl KBucket {
     }
 
     /// Get all nodes in this bucket
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_nodes(&self) -> Vec<NodeAddr> {
         self.nodes
             .iter()
@@ -107,6 +115,7 @@ impl KBucket {
             .collect()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_stale_nodes(&self) -> Vec<NodeAddr> {
         self.nodes
             .iter()
@@ -119,6 +128,7 @@ impl KBucket {
             .collect()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn remove_node(&mut self, node_id: &NodeId) {
         if let Some(pos) = self.find_node(node_id) {
             self.nodes[pos] = None;

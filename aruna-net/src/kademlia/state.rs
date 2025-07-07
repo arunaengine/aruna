@@ -41,6 +41,7 @@ struct KademliaState {
 }
 
 impl KademliaState {
+    #[tracing::instrument(level = "trace")]
     fn new(node_id: NodeId) -> Self {
         let initial_addr = NodeAddr::from(node_id);
 
@@ -55,6 +56,7 @@ impl KademliaState {
     }
 
     // Helper method to clean up expired resources
+    #[tracing::instrument(level = "trace", skip(self))]
     fn prune_expired_resources(&mut self) -> usize {
         let Some(old) = SystemTime::now().checked_sub(KEY_TTL) else {
             return 0;
@@ -85,6 +87,7 @@ pub struct KademliaStateHandler {
 }
 
 impl KademliaStateHandler {
+    #[tracing::instrument(level = "trace")]
     pub fn new(node_id: NodeId) -> Self {
         let state = KademliaState::new(node_id);
         Self {
@@ -92,6 +95,7 @@ impl KademliaStateHandler {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn set_node_addr(&self, node_addr: NodeAddr) {
         let mut state = self.state.write();
         state.node_addr = node_addr.clone();
@@ -100,22 +104,27 @@ impl KademliaStateHandler {
             .insert(node_addr.node_id, node_addr.clone());
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_node_addr(&self) -> NodeAddr {
         self.state.read().node_addr.clone()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn _get_k_buckets(&self) -> [KBucket; 256] {
         self.state.read().k_buckets.clone()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn _get_resources(&self) -> HashMap<[u8; 32], HashSet<KademliaValue>> {
         self.state.read().resources.clone()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn _get_node_addresses(&self) -> HashMap<NodeId, NodeAddr> {
         self.state.read().node_addresses.clone()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_stale_nodes(&self) -> Vec<Vec<NodeAddr>> {
         let state = self.state.read();
         let mut stale_nodes = Vec::new();
@@ -127,6 +136,7 @@ impl KademliaStateHandler {
         stale_nodes
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn insert_node_addr(&self, node_addr: NodeAddr) {
         let mut state = self.state.write();
         state
@@ -134,6 +144,7 @@ impl KademliaStateHandler {
             .insert(node_addr.node_id, node_addr.clone());
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn update_bucket(
         &self,
         bucket_idx: usize,
@@ -143,32 +154,38 @@ impl KademliaStateHandler {
         state.k_buckets[bucket_idx].update(node_info.clone())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn refresh_node(&self, bucket_idx: usize, node_idx: usize) {
         let mut state = self.state.write();
         state.k_buckets[bucket_idx].refresh_node(node_idx);
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn replace_node(&self, bucket_idx: usize, node_idx: usize, node_info: NodeInfo) {
         let mut state = self.state.write();
         state.k_buckets[bucket_idx].replace_node(node_idx, node_info);
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn remove_node(&self, bucket_idx: usize, node_id: &NodeId) {
         let mut state = self.state.write();
         state.k_buckets[bucket_idx].remove_node(node_id);
         state.node_addresses.remove(node_id);
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn find_node_k_idx(&self, bucket_idx: usize, node_id: &NodeId) -> Option<usize> {
         let state = self.state.read();
         state.k_buckets[bucket_idx].find_node(node_id)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn prune_expired_resources(&self) -> usize {
         let mut state = self.state.write();
         state.prune_expired_resources()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn get_republish_sources(&self, interval: Duration) -> Vec<([u8; 32], Option<Vec<u8>>)> {
         let mut state = self.state.write();
         let Some(republish_threshold) = SystemTime::now().checked_sub(interval) else {
@@ -184,6 +201,7 @@ impl KademliaStateHandler {
             .collect::<Vec<_>>()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn find_local_addr(&self, key: &[u8; 32]) -> Option<Vec<MaybeSignedAddr>> {
         let state = self.state.read();
         let mut values = Vec::new();
@@ -208,6 +226,7 @@ impl KademliaStateHandler {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn store(&self, key: [u8; 32], node_addr: &NodeAddr, signature: Option<Vec<u8>>) {
         let mut state = self.state.write();
 
@@ -234,6 +253,7 @@ impl KademliaStateHandler {
     }
 
     /// Find the closest nodes to a target from our routing table
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn find_closest_nodes(&self, target: &[u8; 32]) -> Vec<NodeAddr> {
         let state = self.state.read();
         let addr = &state.node_addr;
@@ -292,6 +312,7 @@ impl KademliaStateHandler {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn _copy_addr_and_resources(
         &self,
     ) -> (

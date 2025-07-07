@@ -12,6 +12,7 @@ pub struct Key {
 }
 
 impl Key {
+    #[tracing::instrument(level = "trace")]
     pub fn new(key: [u8; 32], node_id: Option<NodeId>, signature: Option<Vec<u8>>) -> Self {
         Self {
             created: SystemTime::now(),
@@ -22,6 +23,7 @@ impl Key {
     }
 
     #[allow(dead_code)]
+    #[tracing::instrument(level = "trace")]
     fn with_timestamp(
         key: [u8; 32],
         node_id: Option<NodeId>,
@@ -36,14 +38,17 @@ impl Key {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn key(&self) -> [u8; 32] {
         self.key
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn node_id(&self) -> Option<NodeId> {
         self.node_id
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn signature(&self) -> Option<Vec<u8>> {
         self.signature.clone()
     }
@@ -73,6 +78,7 @@ pub struct TimeHandler {
 }
 
 impl TimeHandler {
+    #[tracing::instrument(level = "trace")]
     pub fn new() -> Self {
         Self {
             heap: BinaryHeap::new(),
@@ -80,6 +86,7 @@ impl TimeHandler {
     }
 
     // Insert a new key with current timestamp
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn insert(&mut self, key: [u8; 32], node_id: Option<NodeId>, signature: Option<Vec<u8>>) {
         let key_obj = Key::new(key, node_id, signature);
         self.heap.push(Reverse(key_obj));
@@ -87,6 +94,7 @@ impl TimeHandler {
 
     // Insert a key with a specific timestamp
     #[allow(dead_code)]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn insert_with_timestamp(
         &mut self,
         key: [u8; 32],
@@ -99,6 +107,7 @@ impl TimeHandler {
     }
 
     // Remove and return all keys older than the threshold
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn remove_older_than(&mut self, threshold: SystemTime) -> Vec<Key> {
         let mut result = Vec::new();
 
@@ -119,23 +128,27 @@ impl TimeHandler {
     }
 
     // Peek at the oldest key
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn peek_oldest(&self) -> Option<&Key> {
         self.heap.peek().map(|Reverse(key)| key)
     }
 
     // Remove and return the oldest key
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn pop_oldest(&mut self) -> Option<Key> {
         self.heap.pop().map(|Reverse(key)| key)
     }
 
     // Get number of keys
     #[allow(dead_code)]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn len(&self) -> usize {
         self.heap.len()
     }
 
     // Check if empty
     #[allow(dead_code)]
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }

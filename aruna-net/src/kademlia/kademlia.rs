@@ -12,7 +12,7 @@ use n0_future::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, info, trace, warn};
+use tracing::{Instrument, error, info, trace, warn};
 use ulid::Ulid;
 
 pub const KADEMLIA_PROTOCOL_ID: u32 = 1;
@@ -28,6 +28,7 @@ pub struct Kademlia {
 
 impl Kademlia {
     /// Create a new Kademlia instance
+    #[tracing::instrument(level = "trace", skip(con))]
     pub async fn new(node_id: NodeId, con: NetworkActorHandle) -> Self {
         let kademlia = Self {
             network: con,
@@ -37,6 +38,7 @@ impl Kademlia {
         kademlia
     }
 
+    #[tracing::instrument(level = "trace", skip(self, send_stream, recv_stream))]
     pub async fn handle_incoming_stream(
         &self,
         ReceiveStreams {
@@ -68,69 +70,78 @@ impl Kademlia {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn run(self) {
-        tokio::spawn(async move {
-            let mut republish_timer = tokio::time::interval(REPUBLISH_INTERVAL);
-            let mut maintenance_timer = tokio::time::interval(Duration::from_secs(3600));
+        tokio::spawn(
+            async move {
+                let mut republish_timer = tokio::time::interval(REPUBLISH_INTERVAL);
+                let mut maintenance_timer = tokio::time::interval(Duration::from_secs(3600));
 
-            loop {
-                tokio::select! {
-                    // Maintenance timer
-                    _ = maintenance_timer.tick() => {
-                        self.run_maintenance().await;
-                        info!("Maintenance run for node {}", self.node_id());
-                    }
+                loop {
+                    tokio::select! {
+                        // Maintenance timer
+                        _ = maintenance_timer.tick() => {
+                            self.run_maintenance().await;
+                            info!("Maintenance run for node {}", self.node_id());
+                        }
 
-                    // Republish timer
-                    _ = republish_timer.tick() => {
-                        self.republish_resources().await;
-                        info!("Resources republished for node {}", self.node_id());
-                    }
+                        // Republish timer
+                        _ = republish_timer.tick() => {
+                            self.republish_resources().await;
+                            info!("Resources republished for node {}", self.node_id());
+                        }
 
-                    // Handle incoming streams
-                    Ok(inc_stream) = self.network.receive() => {
-                        let self_clone = self.clone();
+                        // Handle incoming streams
+                        Ok(inc_stream) = self.network.receive() => {
+                            let self_clone = self.clone();
 
-                        trace!("Received stream from: {:?}", inc_stream.sender);
-                        tokio::spawn(
-                            async move {
-                                if let Err(e) = self_clone.handle_incoming_stream(
-                                    inc_stream,
-                                ).await{
-                                    error!("Failed to handle incoming stream: {e:#}");
-                                }
-                            }
-                        );
-                    }
+                            trace!("Received stream from: {:?}", inc_stream.sender);
+                            tokio::spawn(
+                                async move {
+                                    if let Err(e) = self_clone.handle_incoming_stream(
+                                        inc_stream,
+                                    ).await{
+                                        error!("Failed to handle incoming stream: {e:#}");
+                                    }
+                                }.in_current_span()
+                            );
+                        }
 
-                    // Check for shutdown signal
-                    _ = tokio::signal::ctrl_c() => {
-                        break;
+                        // Check for shutdown signal
+                        _ = tokio::signal::ctrl_c() => {
+                            break;
+                        }
                     }
                 }
             }
-        });
+            .in_current_span(),
+        );
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     pub fn set_node_addr(&self, addr: NodeAddr) {
         self.state.set_node_addr(addr);
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     fn get_node_addr(&self) -> NodeAddr {
         self.state.get_node_addr()
     }
 
     /// Get our node ID
+    #[tracing::instrument(level = "trace", skip(self))]
     fn node_id(&self) -> NodeId {
         self.get_node_addr().node_id
     }
 
     /// Get node ID bytes as owned array
+    #[tracing::instrument(level = "trace", skip(self))]
     fn _node_id_bytes(&self) -> [u8; 32] {
         *self.node_id().as_bytes()
     }
 
     /// Run maintenance to clean up stale nodes and expired keys
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn run_maintenance(&self) {
         // Remove the node from routing and ping it, if it's still alive
         for (bucket_idx, stale_node) in self.state.get_stale_nodes().into_iter().enumerate() {
@@ -171,6 +182,7 @@ impl Kademlia {
     }
 
     /// Periodically republish all stored key-value pairs
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn republish_resources(&self) {
         // Get all resources to republish
         let node_addr = self.get_node_addr().clone();
@@ -183,6 +195,7 @@ impl Kademlia {
     }
 
     /// Handle an incoming Kademlia message
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn handle_message(&self, message: KademliaMessage) -> Option<KademliaMessage> {
         trace!("Received message: {:?}", message);
 
@@ -207,6 +220,7 @@ impl Kademlia {
     }
 
     /// Handle a request message and generate a response
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn handle_request(&self, request: KademliaMessage) -> Option<KademliaMessage> {
         match request.msg_type {
             MessageType::PingRequest { .. } => {
@@ -254,6 +268,7 @@ impl Kademlia {
     }
 
     /// Handle a response message
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn handle_response(&self, response: KademliaMessage) {
         // Just update our routing table with received information
         if let MessageType::FindResponse {
@@ -277,6 +292,7 @@ impl Kademlia {
     }
 
     /// Send a message to a node
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn send_message(
         &self,
         message: KademliaMessage,
@@ -324,6 +340,7 @@ impl Kademlia {
     }
 
     /// Update a node's info in the appropriate k-bucket
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn update_node_seen(&self, addr: NodeAddr) {
         let node_id = addr.node_id;
         trace!("update node");
@@ -360,6 +377,7 @@ impl Kademlia {
     }
 
     /// Ping a node to check if it's still alive
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn ping(&self, target: NodeAddr) -> Result<bool> {
         let self_addr = self.state.get_node_addr();
         // Create ping message
@@ -380,6 +398,7 @@ impl Kademlia {
     }
 
     /// External API: Find value for key
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn find_value(&self, target: [u8; 32]) -> Result<Vec<MaybeSignedAddr>> {
         info!("Searching key: {:?} @ {} ", &target, self.node_id());
 
@@ -406,6 +425,7 @@ impl Kademlia {
 
     /// External API: Find operation
     /// Returns a list of nodes closest to the target key
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn find_nodes(&self, target: [u8; 32]) -> Result<Vec<NodeAddr>> {
         info!(
             "Searching nodes for key: {:?} @ {} ",
@@ -431,6 +451,7 @@ impl Kademlia {
 
     /// External API: Find at closest nodes
     /// Returns the value only at the closest nodes
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn find_at_closest_nodes(&self, target: [u8; 32]) -> Result<Vec<MaybeSignedAddr>> {
         info!(
             "Searching nodes for key: {:?} @ {} ",
@@ -454,6 +475,7 @@ impl Kademlia {
         Ok(result.values_at_closest())
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn find_message(
         &self,
         self_addr: NodeAddr,
@@ -470,6 +492,7 @@ impl Kademlia {
     }
 
     /// Implementation of find that takes initial nodes
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn find_with_nodes(
         &self,
         target: [u8; 32],
@@ -556,6 +579,7 @@ impl Kademlia {
     }
 
     /// External API: Store operation (simplified)
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn store(
         &self,
         key: [u8; 32],
@@ -609,6 +633,7 @@ impl Kademlia {
     }
 
     /// Bootstrap the node by adding it to an existing Kademlia network (private)
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn bootstrap(&self, bootstrap_nodes: Vec<NodeAddr>) -> Result<()> {
         info!("Bootstrapping with nodes: {:?}", bootstrap_nodes);
 

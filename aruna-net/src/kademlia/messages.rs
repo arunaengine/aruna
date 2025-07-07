@@ -39,6 +39,7 @@ pub struct KademliaMessage {
 
 impl KademliaMessage {
     /// Create a new request message
+    #[tracing::instrument(level = "trace")]
     pub fn new_request(id: Ulid, sender: Option<NodeAddr>, msg_type: MessageType) -> Self {
         Self {
             id,
@@ -48,6 +49,7 @@ impl KademliaMessage {
     }
 
     /// Create a response message for a given request
+    #[tracing::instrument(level = "trace")]
     pub fn create_response(&self, sender: Option<NodeAddr>, msg_type: MessageType) -> Self {
         Self {
             id: self.id, // Keep same ID for request/response correlation
@@ -57,6 +59,7 @@ impl KademliaMessage {
     }
 
     /// Check if this message is a response
+    #[tracing::instrument(level = "trace")]
     pub fn is_response(&self) -> bool {
         matches!(
             self.msg_type,
@@ -80,20 +83,24 @@ pub struct MaybeSignedAddr {
 }
 
 impl MaybeSignedAddr {
+    #[tracing::instrument(level = "trace")]
     pub fn new(addr: NodeAddr, signature: Option<Vec<u8>>) -> Self {
         Self { addr, signature }
     }
 
+    #[tracing::instrument(level = "trace")]
     pub fn addr(&self) -> &NodeAddr {
         &self.addr
     }
 
+    #[tracing::instrument(level = "trace")]
     pub fn signature(&self) -> Option<&Vec<u8>> {
         self.signature.as_ref()
     }
 }
 
 impl FindResult {
+    #[tracing::instrument(level = "trace")]
     pub fn empty() -> Self {
         Self {
             value_at_nodes: HashMap::default(),
@@ -101,6 +108,7 @@ impl FindResult {
         }
     }
 
+    #[tracing::instrument(level = "trace")]
     pub fn get_values(&self) -> Vec<MaybeSignedAddr> {
         self.value_at_nodes
             .values()
@@ -108,6 +116,7 @@ impl FindResult {
             .collect()
     }
 
+    #[tracing::instrument(level = "trace")]
     pub fn values_at_closest(&self) -> Vec<MaybeSignedAddr> {
         let mut values = vec![];
         for node in self.nodes.iter() {
