@@ -19,7 +19,7 @@ use ed25519_dalek::SigningKey;
 use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddrV4, sync::Arc};
-use tracing::error;
+use tracing::{Instrument, error};
 use ulid::Ulid;
 
 use super::util::read_message;
@@ -256,27 +256,36 @@ impl Network for P2PNetwork {
     {
         let network = self.clone();
         let controller = controller.clone();
-        tokio::spawn(async move {
-            loop {
-                let mut recv_stream = match self.chandler.receive().await {
-                    Ok(s) => s,
-                    Err(err) => {
-                        error!("{err}");
-                        continue;
-                    }
-                };
-                let controller = controller.clone();
-                let network = network.clone();
-                tokio::spawn(async move {
-                    if let Err(err) = network
-                        .dispatch_messages::<St, Se, N>(&mut recv_stream, controller.as_ref())
-                        .await
-                    {
-                        error!("{err}");
-                    }
-                });
+        tokio::spawn(
+            async move {
+                loop {
+                    let mut recv_stream = match self.chandler.receive().await {
+                        Ok(s) => s,
+                        Err(err) => {
+                            error!("{err}");
+                            continue;
+                        }
+                    };
+                    let controller = controller.clone();
+                    let network = network.clone();
+                    tokio::spawn(
+                        async move {
+                            if let Err(err) = network
+                                .dispatch_messages::<St, Se, N>(
+                                    &mut recv_stream,
+                                    controller.as_ref(),
+                                )
+                                .await
+                            {
+                                error!("{err}");
+                            }
+                        }
+                        .in_current_span(),
+                    );
+                }
             }
-        });
+            .in_current_span(),
+        );
         Ok(())
     }
 
@@ -412,11 +421,14 @@ impl Network for P2PNetwork {
 
         let kademlia = self.chandler.get_kademlia_actor_handle().await?;
         let subject_id = *subject_id;
-        tokio::spawn(async move {
-            // Calc hash
-            kademlia.store(subject_id, node_addr, None).await?;
-            Ok::<(), ArunaMetadataError>(())
-        });
+        tokio::spawn(
+            async move {
+                // Calc hash
+                kademlia.store(subject_id, node_addr, None).await?;
+                Ok::<(), ArunaMetadataError>(())
+            }
+            .in_current_span(),
+        );
         Ok(())
     }
 
@@ -624,9 +636,9 @@ impl P2PNetwork {
                                         req.clone().run_request(auth_ctx, controller).await,
                                     )),
                                 )),
-                                Err(e) => Body::Response(Response::ForwardResponse(
-                                    Box::new(ForwardResponse::GetResource(Err(e))),
-                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::GetResource(Err(e)),
+                                ))),
                             }
                         }
                         ForwardRequest::UpdateResource(req) => {
@@ -636,9 +648,9 @@ impl P2PNetwork {
                                         req.clone().run_request(auth_ctx, controller).await,
                                     )),
                                 )),
-                                Err(e) => Body::Response(Response::ForwardResponse(
-                                    Box::new(ForwardResponse::UpdateResource(Err(e))),
-                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::UpdateResource(Err(e)),
+                                ))),
                             }
                         }
                         ForwardRequest::Search(req) => {
@@ -648,9 +660,9 @@ impl P2PNetwork {
                                         req.clone().run_request(auth_ctx, controller).await,
                                     )),
                                 )),
-                                Err(e) => Body::Response(Response::ForwardResponse(
-                                    Box::new(ForwardResponse::Search(Err(e))),
-                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::Search(Err(e)),
+                                ))),
                             }
                         }
                     };

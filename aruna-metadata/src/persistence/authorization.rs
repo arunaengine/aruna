@@ -1,6 +1,6 @@
 use aruna_permission::{Action, OidcToken, Path, ResourceId, UserIdentity};
 use aruna_storage::storage::store::Store;
-use tracing::error;
+use tracing::{Instrument, error};
 use ulid::Ulid;
 
 use crate::{error::ArunaMetadataError, logerr};

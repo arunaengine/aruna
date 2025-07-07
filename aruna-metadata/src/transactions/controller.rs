@@ -14,6 +14,7 @@ use aruna_storage::storage::store::Store;
 use automerge::sync::Message;
 use iroh::NodeAddr;
 use std::sync::Arc;
+use tracing::Instrument;
 
 pub struct Controller<St, Se, N>
 where
@@ -110,69 +111,76 @@ where
             let doc = doc.clone();
             let doc_id = doc_id.clone();
             let path = path.clone();
-            tokio::spawn(async move {
-                let mut stream = network.create_stream(node.node_id).await?;
-                let mut document = inner_doc;
-                'sync: loop {
-                    let sync_message = persistence
-                        .generate_sync_message(doc_id.clone(), &mut document, node.node_id)
-                        .await?;
+            tokio::spawn(
+                async move {
+                    let mut stream = network.create_stream(node.node_id).await?;
+                    let mut document = inner_doc;
+                    'sync: loop {
+                        let sync_message = persistence
+                            .generate_sync_message(doc_id.clone(), &mut document, node.node_id)
+                            .await?;
 
-                    let recv_message = network
-                        .sync(
-                            &mut stream,
-                            match &doc {
-                                TypedDoc::Resource(_) => {
-                                    crate::network::network_trait::ReplicationSubject::Object(
-                                        sync_message.clone(),
-                                    )
-                                }
-                                TypedDoc::Group(_) => {
-                                    crate::network::network_trait::ReplicationSubject::Group(
-                                        sync_message.clone(),
-                                    )
-                                }
-                                TypedDoc::User(_) => {
-                                    crate::network::network_trait::ReplicationSubject::User(
-                                        sync_message.clone(),
-                                    )
-                                }
-                            },
-                            &subject_hash,
-                            doc_id.clone(),
-                            path.clone(),
-                            node.clone(),
-                        )
-                        .await?;
-
-                    if let Some(response) = &recv_message {
-                        persistence
-                            .receive_sync_message(
+                        let recv_message = network
+                            .sync(
+                                &mut stream,
+                                match &doc {
+                                    TypedDoc::Resource(_) => {
+                                        crate::network::network_trait::ReplicationSubject::Object(
+                                            sync_message.clone(),
+                                        )
+                                    }
+                                    TypedDoc::Group(_) => {
+                                        crate::network::network_trait::ReplicationSubject::Group(
+                                            sync_message.clone(),
+                                        )
+                                    }
+                                    TypedDoc::User(_) => {
+                                        crate::network::network_trait::ReplicationSubject::User(
+                                            sync_message.clone(),
+                                        )
+                                    }
+                                },
+                                &subject_hash,
                                 doc_id.clone(),
-                                &mut document,
-                                Message::decode(response)?,
-                                node.node_id,
+                                path.clone(),
+                                node.clone(),
                             )
                             .await?;
-                    }
-                    if sync_message.is_none() && recv_message.is_none() {
-                        break 'sync;
-                    }
-                }
 
-                match &doc {
-                    TypedDoc::Resource(_) => {
-                        persistence
-                            .handle_object_merges(path, document.save())
-                            .await?
+                        if let Some(response) = &recv_message {
+                            persistence
+                                .receive_sync_message(
+                                    doc_id.clone(),
+                                    &mut document,
+                                    Message::decode(response)?,
+                                    node.node_id,
+                                )
+                                .await?;
+                        }
+                        if sync_message.is_none() && recv_message.is_none() {
+                            break 'sync;
+                        }
                     }
-                    TypedDoc::Group(_) => persistence.handle_group_merges(document.save()).await?,
-                    TypedDoc::User(_) => persistence.handle_user_merges(document.save()).await?,
-                }
-                network.finish_stream(stream).await?;
 
-                Ok::<(), ArunaMetadataError>(())
-            });
+                    match &doc {
+                        TypedDoc::Resource(_) => {
+                            persistence
+                                .handle_object_merges(path, document.save())
+                                .await?
+                        }
+                        TypedDoc::Group(_) => {
+                            persistence.handle_group_merges(document.save()).await?
+                        }
+                        TypedDoc::User(_) => {
+                            persistence.handle_user_merges(document.save()).await?
+                        }
+                    }
+                    network.finish_stream(stream).await?;
+
+                    Ok::<(), ArunaMetadataError>(())
+                }
+                .in_current_span(),
+            );
         }
         Ok(())
     }
