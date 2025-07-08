@@ -1,7 +1,6 @@
 use crate::error::ArunaDataError;
 use axum::{Json, http::HeaderMap, response::IntoResponse};
 use serde::Serialize;
-use ulid::Ulid;
 
 pub(super) fn extract_token(header: &HeaderMap) -> Option<String> {
     header

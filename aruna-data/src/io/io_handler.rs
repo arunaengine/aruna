@@ -1,5 +1,7 @@
 use crate::config::config::BackendConfig;
-use crate::io::io_handler::tables::{LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME};
+use crate::io::io_handler::tables::{
+    LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME,
+};
 use crate::io::messages::{MessageType, ReplicationMessage};
 use crate::util::bao_tree::{
     FuturesAsyncReaderWrapper, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper,

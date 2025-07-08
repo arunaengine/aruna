@@ -25,7 +25,7 @@ impl RestServer {
         let listener = tokio::net::TcpListener::bind(socket_address).await?;
 
         let (router, api) = OpenApiRouter::with_openapi(ArunaApi::openapi())
-            .nest("/api/v3", openapi::router(handler))
+            .nest("/api/v3", openapi::router::<St>(handler))
             .split_for_parts();
 
         let swagger = SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api);
