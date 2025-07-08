@@ -1,12 +1,14 @@
-use anyhow::Result;
+use crate::util::s3::{validate_s3_bucket_name, validate_s3_object_key};
+use anyhow::{Result, bail};
 use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::{Builder, FuturesAsyncReader, FuturesBytesStream, Operator, Reader, services};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::str::FromStr;
+use ulid::Ulid;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 // Currently supported backends
 pub enum Backend {
     S3,
@@ -64,6 +66,51 @@ pub fn init_service<B: Builder>(cfg: HashMap<String, String>) -> Result<Operator
     Ok(op)
 }
 
+/// Creates a valid (frontend path, backend path) tuple for internal use
+pub fn create_paths(
+    origin_path: &str,
+    bucket: Option<String>,
+    group_id: &Ulid,
+    skip_frontend: bool,
+) -> Result<(Option<String>, String)> {
+    // Validate bucket name if provided
+    if let Some(bucket_name) = &bucket {
+        if !validate_s3_bucket_name(bucket_name)? {
+            bail!("Invalid bucket name: {}", bucket_name);
+        }
+    }
+
+    // Split path and check that
+    let origin_path = origin_path.trim_start_matches("/");
+    let parts = origin_path.split("/").collect::<Vec<&str>>();
+    let backend_path = format!("{}/{}", group_id, Ulid::new().to_string());
+    let frontend_path = if skip_frontend {
+        None
+    } else {
+        Some(match parts.len() {
+            0 => return Err(anyhow::anyhow!("Empty path is invalid")),
+            1 => {
+                // Root level object (ingestion only)
+                if validate_s3_object_key(parts[0])?
+                    && let Some(bucket) = bucket
+                {
+                    format!("{}/{}/{}", group_id, bucket, parts[0])
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Bucket is mandatory for objects in root path"
+                    ));
+                }
+            }
+            _ => {
+                // Object that can be mapped to bucket/key
+                format!("{}/{}", group_id, origin_path)
+            }
+        })
+    };
+
+    Ok((frontend_path, backend_path))
+}
+
 pub async fn get_reader(
     operator: &Operator,
     path: &str,
@@ -116,4 +163,56 @@ pub async fn get_data_async_reader(
     }
 
     Ok(builder.await?.into_futures_async_read(..).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_create_paths() {
+        let group_id = Ulid::from_string("01JZN1B6AJZ7JE858HQ8QCADKX").unwrap();
+        let key = "foo/bar/baz.txt";
+        let bucket = "aruna-1";
+
+        let (frontend, backend) = create_paths(key, None, &group_id, true).unwrap();
+        let backend_parts = backend.split("/").collect::<Vec<&str>>();
+        assert_eq!(frontend, None);
+        assert_eq!(backend_parts.len(), 2);
+        assert_eq!(backend_parts[0], group_id.to_string());
+        Ulid::from_string(backend_parts[1]).unwrap();
+
+        let (frontend, backend) = create_paths(key, None, &group_id, false).unwrap();
+        let backend_parts = backend.split("/").collect::<Vec<&str>>();
+        assert_eq!(frontend, Some(format!("{group_id}/{key}")));
+        assert_eq!(backend_parts.len(), 2);
+        assert_eq!(backend_parts[0], group_id.to_string());
+        Ulid::from_string(backend_parts[1]).unwrap();
+
+        let (frontend, backend) =
+            create_paths(key, Some(bucket.to_string()), &group_id, false).unwrap();
+        let backend_parts = backend.split("/").collect::<Vec<&str>>();
+        assert_eq!(frontend, Some(format!("{group_id}/{key}")));
+        assert_eq!(backend_parts.len(), 2);
+        assert_eq!(backend_parts[0], group_id.to_string());
+        Ulid::from_string(backend_parts[1]).unwrap();
+
+        let root_key = "baz.txt";
+        let (frontend, backend) =
+            create_paths(root_key, Some(bucket.to_string()), &group_id, false).unwrap();
+        let backend_parts = backend.split("/").collect::<Vec<&str>>();
+        assert_eq!(frontend, Some(format!("{group_id}/{bucket}/{root_key}")));
+        assert_eq!(backend_parts.len(), 2);
+        assert_eq!(backend_parts[0], group_id.to_string());
+        Ulid::from_string(backend_parts[1]).unwrap();
+
+        let root_key = "/baz.txt";
+        let (frontend, backend) =
+            create_paths(root_key, Some(bucket.to_string()), &group_id, false).unwrap();
+        let backend_parts = backend.split("/").collect::<Vec<&str>>();
+        assert_eq!(frontend, Some(format!("{group_id}/{bucket}{root_key}")));
+        assert_eq!(backend_parts.len(), 2);
+        assert_eq!(backend_parts[0], group_id.to_string());
+        Ulid::from_string(backend_parts[1]).unwrap();
+    }
 }
