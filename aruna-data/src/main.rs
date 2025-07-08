@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use aruna_data::LOCATION_STATS_DB_NAME;
 use aruna_data::api_json::server::RestServer;
 use aruna_data::api_s3::auth::UserAccess;
 use aruna_data::api_s3::s3server::S3Server;
@@ -6,7 +7,6 @@ use aruna_data::config::config;
 use aruna_data::io::controller::Controller;
 use aruna_data::io::io_handler::tables::{ACCESS_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 use aruna_data::io::io_handler::{IOHandler, REPLICATION_PROTOCOL_ID};
-use aruna_data::util::opendal::get_operator;
 use aruna_net::actor::NetworkActorBuilder;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::RealmKey;
@@ -49,24 +49,8 @@ async fn main() -> Result<()> {
     let config = config::Config::load_from_env()?;
     debug!(?config);
 
-    let rest_addr = Ipv4Addr::from_str(&config.frontend.openapi_frontend.address)?;
-
-    // Dummy access conf which is provided by user/request/node
-    let op_conf = config.backend.access.clone();
-    let operator = get_operator(&config.backend.backend_type, op_conf).await?;
-
-    match operator.check().await {
-        Ok(_) => debug!(
-            "Connection to {} backend succeeded",
-            config.backend.backend_type
-        ),
-        Err(err) => {
-            error!("Connection to backend failed: {}", err);
-            //anyhow::bail!("Connection to backend failed: {}", err);
-        }
-    }
-
     // Create an endpoint, it allows creating and accepting connections in the iroh p2p world
+    let rest_addr = Ipv4Addr::from_str(&config.frontend.openapi_frontend.address)?;
     let network_handle_01 = NetworkActorBuilder::new(Some(config.general.node_key))
         .await
         .add_bind_addr_v4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 31337))
@@ -84,6 +68,7 @@ async fn main() -> Result<()> {
         databases: vec![
             ACCESS_DB_NAME,
             LOCATION_DB_NAME,
+            LOCATION_STATS_DB_NAME,
             PATH_LOCATION_DB_NAME,
             aruna_permission::RESOURCE_DB,
             aruna_permission::DBNAME,
@@ -101,11 +86,11 @@ async fn main() -> Result<()> {
         .await?;
     lmdb_store.commit(read_txn)?;
 
-    // Token Handler
+    //TODO: Token handler trusted issuer
     let issuers = vec![Issuer {
-        issuer_name: todo!(),
-        pubkey_url: todo!(),
-        aud: todo!(),
+        issuer_name: "".to_string(),
+        pubkey_url: "".to_string(),
+        aud: vec![],
     }];
     let token_handler = Arc::new(RwLock::new(TokenSystem::new(
         &config.general.realm_key.to_bytes(),
@@ -115,9 +100,9 @@ async fn main() -> Result<()> {
     // Create and run IOHandler
     let io_handler = IOHandler::<LmdbStore>::new(
         node_addr.clone(),
-        operator,
         actor_handle,
         kademlia,
+        config.backend.clone(),
         lmdb_store,
         permission_manager.clone(),
         config.general.realm_key.to_bytes(),
@@ -136,8 +121,8 @@ async fn main() -> Result<()> {
     let s3server = S3Server::new(
         config.frontend.s3_frontend.clone(),
         io_handler.clone(),
+        config.backend.clone(),
         permission_manager.clone(),
-        node_addr.node_id,
         config.general.realm_key.to_bytes(),
     )
     .await?;

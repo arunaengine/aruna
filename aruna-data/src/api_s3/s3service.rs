@@ -1,26 +1,27 @@
 use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
-use crate::io::io_handler::{ObjectInfo};
+use crate::config::config::BackendConfig;
+use crate::io::io_handler::ObjectInfo;
+use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
+use crate::util::opendal::{create_paths, get_backend_operator};
 use anyhow::Result;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
 use futures_util::TryStreamExt;
-use iroh::NodeId;
 use s3s::dto::{GetObjectInput, GetObjectOutput, PutObjectInput, PutObjectOutput, StreamingBlob};
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
-use ulid::Ulid;
-use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
+//TODO: Multipart --> Store parts, concatenate on finish
 
 pub struct ArunaS3Service<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    backend: Arc<IOHandler<St>>,
-    node_id: NodeId,
+    io_handler: Arc<IOHandler<St>>,
+    storage_backend: BackendConfig,
 }
 
 impl<St> Debug for ArunaS3Service<St>
@@ -37,9 +38,15 @@ impl<St> ArunaS3Service<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(backend))]
-    pub async fn new(backend: Arc<IOHandler<St>>, node_id: NodeId) -> Result<Self> {
-        Ok(ArunaS3Service { backend, node_id })
+    #[tracing::instrument(level = "trace", skip(io_handler, storage_backend))]
+    pub async fn new(
+        io_handler: Arc<IOHandler<St>>,
+        storage_backend: BackendConfig,
+    ) -> Result<Self> {
+        Ok(ArunaS3Service {
+            io_handler,
+            storage_backend,
+        })
     }
 }
 
@@ -66,7 +73,7 @@ where
         let frontend_path = format!("{}/{}/{}", group_id, req.input.bucket, req.input.key);
 
         // Fetch object info
-        let store_clone = self.backend.store.clone();
+        let store_clone = self.io_handler.store.clone();
         let info = tokio::task::spawn_blocking(move || {
             let read_txn = store_clone
                 .create_txn(false)
@@ -89,14 +96,23 @@ where
         .map_err(|e| s3_error!(InternalError, "{}", e))?
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
+        // Create backend storage operator
+        let operator = get_backend_operator(
+            &self.storage_backend.backend_type,
+            self.storage_backend.access_config.clone(),
+            &info.storage_root,
+        )
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
         // Fetch reader stream
-        let filename = Path::new(&info.file_path)
+        let filename = Path::new(&info.storage_path)
             .file_name()
             .ok_or_else(|| s3_error!(InvalidKeyPath, "Path is not a file"))?
             .to_str()
             .ok_or_else(|| s3_error!(InternalError, "String conversion failed"))?;
 
-        let stream = IOHandler::<LmdbStore>::read_data(&self.backend.operator, &info.file_path)
+        let stream = IOHandler::<LmdbStore>::read_data(&operator, &info.storage_path)
             .await
             .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
@@ -126,23 +142,24 @@ where
     ) -> S3Result<S3Response<PutObjectOutput>> {
         debug!("Received PUT Request: {:#?}", req);
         // Extract access check result
-        let UserAccess { group_id, .. } =
-            req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
-                error!(error = "Missing user context");
-                s3_error!(UnexpectedContent, "Missing user context")
-            })?;
+        let UserAccess {
+            user_id, group_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
 
         // Create paths
-        let path_ulid = Ulid::new();
-        let backend_path = format!(
-            "{}/{}/{}/{}/{}",
-            self.node_id, group_id, path_ulid, req.input.bucket, req.input.key
-        );
-        let extended_frontend_path = format!("{}/{}/{}", group_id, req.input.bucket, req.input.key);
+        let origin_path = format!("{}/{}", req.input.bucket, req.input.key);
+        let (maybe_frontend_path, backend_path) =
+            create_paths(&origin_path, None, &group_id, false)
+                .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let frontend_path = maybe_frontend_path
+            .ok_or_else(|| s3_error!(InternalError, "Frontend path creation failed"))?;
 
         // Check if frontend path is already occupied
-        let store_clone = self.backend.store.clone();
-        let frontend_path_clone = extended_frontend_path.clone();
+        let store_clone = self.io_handler.store.clone();
+        let frontend_path_clone = frontend_path.clone();
         let exists = tokio::task::spawn_blocking(move || {
             let mut read_txn = store_clone.create_txn(false)?;
 
@@ -162,7 +179,7 @@ where
         if exists {
             warn!(
                 "Frontend path: {} is already occupied and will be overwritten.",
-                extended_frontend_path
+                frontend_path
             )
         }
 
@@ -173,8 +190,8 @@ where
                 return Err(s3_error!(InvalidRequest, "Empty body is not allowed"));
             }
             Some(data) => self
-                .backend
-                .handle_incoming_data_stream(extended_frontend_path, backend_path, data)
+                .io_handler
+                .handle_incoming_data_stream(user_id, group_id, frontend_path, backend_path, data)
                 .await
                 .map_err(|e| s3_error!(InternalError, "{}", e))?,
         };
@@ -183,7 +200,7 @@ where
             //TODO: Update metadata version field?
         }
 
-        //TODO: Set response fields
+        //TODO: Set other response fields?
         // - Version ?
         let inner_response = PutObjectOutput {
             e_tag: Some(object_info.file_hashes.md5),

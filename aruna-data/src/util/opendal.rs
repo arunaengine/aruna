@@ -4,7 +4,10 @@ use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::{Builder, FuturesAsyncReader, FuturesBytesStream, Operator, Reader, services};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::env::join_paths;
 use std::fmt::Display;
+use std::path::Path;
 use std::str::FromStr;
 use ulid::Ulid;
 
@@ -45,8 +48,29 @@ impl Display for Backend {
     }
 }
 
-pub async fn get_operator(backend: &Backend, config: HashMap<String, String>) -> Result<Operator> {
-    let op = match backend {
+pub async fn get_backend_operator(
+    backend_type: &Backend,
+    mut config: HashMap<String, String>,
+    root: &str,
+) -> Result<Operator> {
+    // Extend config with bucket/root
+    if backend_type == &Backend::S3 && !config.contains_key("bucket") {
+        config.insert("bucket".to_string(), root.to_string());
+    } else {
+        match config.entry("root".to_string()) {
+            Entry::Occupied(mut entry) => {
+                let base_root = entry.get();
+                let new_root = join_paths([Path::new(base_root), Path::new(root)])?;
+                entry.insert(new_root.to_string_lossy().to_string());
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(root.to_string());
+            }
+        }
+    }
+
+    // Create and check backend operator
+    let operator = match backend_type {
         Backend::S3 => init_service::<services::S3>(config)?,
         Backend::HTTP => init_service::<services::Http>(config)?,
         Backend::Memory => init_service::<services::Memory>(config)?,
@@ -54,7 +78,13 @@ pub async fn get_operator(backend: &Backend, config: HashMap<String, String>) ->
         Backend::FileSystem => init_service::<services::Fs>(config)?,
     };
 
-    Ok(op)
+    // Check operator without crashing
+    if let Err(e) = operator.check().await {
+        tracing::error!("Operator check failed: {e}");
+    }
+
+    // Return operator
+    Ok(operator)
 }
 
 pub fn init_service<B: Builder>(cfg: HashMap<String, String>) -> Result<Operator> {

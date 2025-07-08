@@ -2,6 +2,7 @@ use crate::api_json::request::Request;
 use crate::api_s3::auth::UserAccess;
 use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
+use crate::io::io_handler::tables::ACCESS_DB_NAME;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use rand::distributions::Alphanumeric;
@@ -9,7 +10,6 @@ use rand::{Rng, thread_rng};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
-use crate::io::io_handler::tables::ACCESS_DB_NAME;
 
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
@@ -177,7 +177,9 @@ where
 pub struct RegisterDataRequest {
     group_id: String,
     backend_path: String,
-    bucket: Option<String>,
+    bucket: String,
+    key: Option<String>,
+    create_s3_path: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
@@ -202,10 +204,18 @@ where
             return Err(ArunaDataError::Unauthorized);
         };
 
+        // Register data
         let group_id = Ulid::from_string(&self.group_id)?;
         let frontend_path = controller
             .io_handler
-            .register_backend_data(&self.backend_path, group_id)
+            .register_backend_data(
+                user,
+                group_id,
+                &self.backend_path,
+                self.bucket,
+                self.key,
+                self.create_s3_path,
+            )
             .await
             .map_err(|e| ArunaDataError::IoError(e.to_string()))?;
 

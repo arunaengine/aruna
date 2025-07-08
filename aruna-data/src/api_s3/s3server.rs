@@ -1,7 +1,7 @@
 use super::s3service::ArunaS3Service;
 use crate::IOHandler;
 use crate::api_s3::auth::AuthProvider;
-use crate::config::config::S3Frontend;
+use crate::config::config::{BackendConfig, S3Frontend};
 use anyhow::Result;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::RealmKey;
@@ -15,7 +15,6 @@ use hyper::service::Service;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
-use iroh::NodeId;
 use s3s::Body;
 use s3s::S3Error;
 use s3s::s3_error;
@@ -39,15 +38,18 @@ pub struct S3Server {
 pub struct WrappingService(SharedS3Service);
 
 impl S3Server {
-    #[tracing::instrument(level = "trace", skip(frontend, backend, permission_manager))]
+    #[tracing::instrument(
+        level = "trace",
+        skip(frontend, io_handler, backend_config, permission_manager)
+    )]
     pub async fn new(
         frontend: S3Frontend,
-        backend: Arc<IOHandler<LmdbStore>>,
+        io_handler: Arc<IOHandler<LmdbStore>>,
+        backend_config: BackendConfig,
         permission_manager: PermissionManager,
-        node_id: NodeId,
         realm_id: RealmKey,
     ) -> Result<Self> {
-        let s3service = ArunaS3Service::new(backend.clone(), node_id)
+        let s3service = ArunaS3Service::new(io_handler.clone(), backend_config)
             .await
             .map_err(|e| {
                 error!(error = ?e, msg = e.to_string());
@@ -57,7 +59,7 @@ impl S3Server {
         let local_address = frontend.server.clone();
 
         let auth = AuthProvider {
-            store: backend.store.clone(),
+            store: io_handler.store.clone(),
             permission_manager,
             realm_key: realm_id,
         };

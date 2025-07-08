@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use aruna_permission::UserIdentity;
 use iroh::NodeAddr;
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,9 @@ use ulid::Ulid;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MessageType {
     InitReplicationRequest {
-        path: String,
+        user_id: UserIdentity,
+        group_id: Ulid,
+        path: Option<String>,
         size: u64,
         root: blake3::Hash,
     },
