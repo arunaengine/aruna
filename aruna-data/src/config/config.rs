@@ -35,10 +35,11 @@ pub struct Persistence {
 #[serde(rename_all = "lowercase")]
 pub struct BackendConfig {
     pub backend_type: Backend,
+    pub access_config: HashMap<String, String>,
+    pub max_bucket_size: u64,
     pub encryption: bool,
     pub compression: bool,
     pub deduplication: bool,
-    pub access: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -85,7 +86,8 @@ impl Config {
             encryption: dotenvy::var("BACKEND_ENCRYPTION")?.parse()?,
             compression: dotenvy::var("BACKEND_COMPRESSION")?.parse()?,
             deduplication: dotenvy::var("BACKEND_DEDUPLICATION")?.parse()?,
-            access: load_access_config("BACKEND_ACCESS_")?,
+            max_bucket_size: dotenvy::var("BACKEND_MAX_BUCKET_SIZE")?.parse()?,
+            access_config: load_access_config("BACKEND_ACCESS_")?,
         };
 
         let openapi_frontend = OpenApiFrontend {
@@ -134,4 +136,3 @@ fn load_access_config(prefix: &str) -> anyhow::Result<HashMap<String, String>> {
 fn strip_prefix(prefix: &str, target: &str) -> String {
     target.strip_prefix(prefix).unwrap().to_lowercase()
 }
-
