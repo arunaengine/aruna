@@ -9,6 +9,8 @@ aruna-net = { path = "../aruna-net" }
 aruna-storage = { path = "../aruna-storage" }
 aruna-permission = { path = "../aruna-permission" }
 async-trait = {workspace = true}
+aws-config = "1.8.1"
+aws-sdk-s3 = "1.96.0"
 axum = { workspace = true }
 bao-tree = "0.15.1"
 bincode = { version= "2.0.1", features = ["serde"]}
