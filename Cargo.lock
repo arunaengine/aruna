@@ -164,6 +164,7 @@ dependencies = [
  "bincode 2.0.1",
  "blake3",
  "bytes",
+ "chrono",
  "dotenvy",
  "ed25519-dalek",
  "fancy-regex",
@@ -181,6 +182,7 @@ dependencies = [
  "parking_lot",
  "postcard",
  "rand 0.8.5",
+ "reqwest",
  "s3s",
  "serde",
  "sha2",
@@ -5716,9 +5718,9 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.20"
+version = "0.12.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eabf4c97d9130e2bf606614eb937e86edac8292eaa6f422f995d7e8de1eb1813"
+checksum = "cbc931937e6ca3a06e3b6c0aa7841849b160a90351d6ab467a8b9b9959767531"
 dependencies = [
  "base64 0.22.1",
  "bytes",

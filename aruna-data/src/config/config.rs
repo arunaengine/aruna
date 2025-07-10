@@ -1,12 +1,15 @@
 use crate::util::opendal::Backend;
+use anyhow::bail;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use iroh::SecretKey;
+use rand::rngs::OsRng;
 use s3s::S3Result;
 use s3s::host::{S3Host, VirtualHost};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
+use ulid::Ulid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -113,6 +116,46 @@ impl Config {
             frontend,
         })
     }
+
+    pub fn create_dummy_config(
+        node_idx: u16,
+        realm_key: Option<SigningKey>,
+        p2p_port: u16,
+        openapi_port: u16,
+        s3_port: u16,
+    ) -> Config {
+        Config {
+            general: General {
+                realm_key: realm_key.unwrap_or(SigningKey::generate(&mut OsRng)),
+                node_key: SecretKey::generate(&mut OsRng),
+                p2p_address: "127.0.0.1".to_string(),
+                p2p_port,
+            },
+            persistence: Persistence {
+                //path: format!("/dev/shm/test-{}/node-{}", Ulid::new(), node_idx),
+                path: format!("/tmp/aruna-data/test-{}/node-{}", Ulid::new(), node_idx),
+            },
+            backend: BackendConfig {
+                backend_type: Backend::Memory,
+                access_config: HashMap::from_iter([("root".to_string(), "/tmp".to_string())]), // Empty sufficient?
+                max_bucket_size: 100,
+                encryption: false,
+                compression: false,
+                deduplication: false,
+            },
+            frontend: Frontend {
+                openapi_frontend: OpenApiFrontend {
+                    address: "0.0.0.0".to_string(),
+                    port: openapi_port,
+                },
+                s3_frontend: S3Frontend {
+                    server: format!("0.0.0.0:{s3_port}",),
+                    hostname: format!("localhost:{s3_port}",),
+                    cors_exception: Some("http://localhost:3000".to_string()),
+                },
+            },
+        }
+    }
 }
 
 impl S3Host for S3Frontend {
@@ -126,13 +169,16 @@ fn load_access_config(prefix: &str) -> anyhow::Result<HashMap<String, String>> {
 
     for (key, value) in dotenvy::vars() {
         if key.starts_with(prefix) {
-            map.insert(strip_prefix(prefix, &key), value);
+            map.insert(strip_prefix(prefix, &key)?, value);
         }
     }
 
     Ok(map)
 }
 
-fn strip_prefix(prefix: &str, target: &str) -> String {
-    target.strip_prefix(prefix).unwrap().to_lowercase()
+fn strip_prefix(prefix: &str, target: &str) -> anyhow::Result<String> {
+    Ok(match target.strip_prefix(prefix) {
+        None => bail!("Key {target} should start with prefix {prefix}"),
+        Some(stripped_target) => stripped_target.to_lowercase(),
+    })
 }

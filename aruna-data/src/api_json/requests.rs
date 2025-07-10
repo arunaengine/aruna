@@ -15,7 +15,7 @@ use utoipa::ToSchema;
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
 )]
 pub struct CreateS3CredentialsRequest {
-    group_id: String,
+    pub group_id: String,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
