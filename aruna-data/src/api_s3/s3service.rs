@@ -87,8 +87,7 @@ where
                 .map_err(|e| s3_error!(InternalError, "{}", e))?
                 .ok_or_else(|| s3_error!(NoSuchKey, "No such key"))?;
             let (info, _): (ObjectInfo, usize) =
-                bincode::serde::decode_from_slice(&*info_raw, bincode::config::standard())
-                    .map_err(|e| s3_error!(InternalError, "{}", e))?;
+                postcard::from_bytes(&*info_raw).map_err(|e| s3_error!(InternalError, "{}", e))?;
 
             Ok::<ObjectInfo, anyhow::Error>(info)
         })

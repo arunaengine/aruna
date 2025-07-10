@@ -50,7 +50,6 @@ where
 {
     async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         // Fetch user access
-        tracing::info!("{:#?}", cx.credentials());
         let user_access = self
             .query_user_access(
                 cx.credentials()
@@ -74,7 +73,7 @@ where
                 builder.group_data_bucket_wildcard(user_access.group_id, bucket.to_string())
             }
             S3Path::Object { bucket, key } => {
-                tracing::info!("Bucket: {}, Key: {}", bucket, key);
+                debug!("Bucket: {}, Key: {}", bucket, key);
                 let kkey = key.to_string();
                 let path = std::path::Path::new(&kkey);
                 let parent = path.parent().ok_or_else(|| s3_error!(InvalidKeyPath))?;
@@ -93,26 +92,6 @@ where
         .build()
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
-        tracing::info!("{}", perm_path.to_string());
-        tracing::info!(
-            "{:?}",
-            self.permission_manager
-                .get_group_roles(user_access.group_id)
-                .await
-        );
-        tracing::info!(
-            "{:?}",
-            self.permission_manager
-                .get_role_users(user_access.group_id, "admin")
-                .await
-        );
-        tracing::info!(
-            "{:?}",
-            self.permission_manager
-                .get_role_policies(user_access.group_id, "admin")
-                .await
-        );
-
         let allowed = self
             .permission_manager
             .check_path(
@@ -123,6 +102,7 @@ where
             )
             .await
             .map_err(|e| s3_error!(InternalError, "Permission check failed: {}", e))?;
+        println!("{} allowed for {perm_path}: {allowed}", cx.s3_op().name());
         debug!("{} allowed: {}", cx.s3_op().name(), allowed);
 
         match allowed {
@@ -152,7 +132,7 @@ where
                 ACCESS_DB_NAME,
                 &Ulid::from_string(&access_key_id)?.to_bytes(),
             )? {
-                bincode::serde::decode_from_slice(&*info_raw, bincode::config::standard())?.0
+                postcard::from_bytes(&*info_raw)?
             } else {
                 return Err(anyhow!("No access info found"));
             };

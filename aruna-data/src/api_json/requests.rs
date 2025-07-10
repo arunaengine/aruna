@@ -72,7 +72,7 @@ where
                 &mut write_txn,
                 ACCESS_DB_NAME,
                 &access_key_id_clone.to_bytes(),
-                &bincode::serde::encode_to_vec(access_info_clone, bincode::config::standard())?,
+                &postcard::to_allocvec(&access_info_clone)?,
             )?;
 
             store_clone.commit(write_txn)?;

@@ -43,7 +43,6 @@ pub enum ArunaDataError {
     // 500 Internal Server Error
     #[response(status = 500)]
     #[error("Deserialize error {0}")]
-    //DeserializeError(#[from] bincode::Error),
     DeserializeError(String),
     #[response(status = 500)]
     #[error("I/O error: {0}")]

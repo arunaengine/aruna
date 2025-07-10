@@ -650,7 +650,7 @@ where
             &mut write_txn,
             LOCATION_DB_NAME,
             data_hash,
-            &bincode::serde::encode_to_vec(location.clone(), bincode::config::standard())?,
+            &postcard::to_allocvec(location)?,
         )?;
 
         // Increase bucket occupancy
