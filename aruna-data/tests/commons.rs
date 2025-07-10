@@ -1,11 +1,14 @@
 use anyhow::Result;
 use aruna_data::IOHandler;
+use aruna_data::api_json::request::Request;
+use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
 use aruna_data::api_json::server::RestServer;
 use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::config::config::Config;
 use aruna_data::io::controller::Controller;
 use aruna_data::io::io_handler::REPLICATION_PROTOCOL_ID;
 use aruna_net::actor::NetworkActorBuilder;
+use aruna_permission::paths::RealmKey;
 use aruna_permission::token::Issuer;
 use aruna_permission::{OidcToken, PermissionManager, TokenSystem, UserIdentity};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
@@ -22,12 +25,14 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU16;
+use ulid::Ulid;
 use utoipa::r#gen::serde_json;
 
 pub static SUBSCRIBERS: AtomicU16 = AtomicU16::new(0);
+
+const OPENAPI_BASE_PORT: u16 = 33000;
+const S3_BASE_PORT: u16 = 34000;
 const P2P_BASE_PORT: u16 = 35000;
-const OPENAPI_BASE_PORT: u16 = 8000;
-const S3_BASE_PORT: u16 = 1337;
 
 pub struct TestServers {
     pub realm_key: SigningKey,
@@ -178,6 +183,39 @@ pub async fn init_test_nodes(num: usize, port_offset: u16) -> anyhow::Result<Tes
     })
 }
 
+pub async fn create_user_with_group_and_credentials<St>(
+    name: &str,
+    group_id: Ulid,
+    realm_key: RealmKey,
+    store: &St,
+    token_handler: Arc<RwLock<TokenSystem>>,
+    permission_handler: PermissionManager,
+    controller: Arc<Controller<LmdbStore>>,
+) -> Result<(UserIdentity, String, CreateS3CredentialsResponse)>
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    // Create user and generate an Aruna token
+    let user_identity = register_oidc_user(name, store, token_handler.clone())?;
+    let token = fetch_user_token(&user_identity, token_handler.clone())?;
+
+    // Create group with user as admin
+    let mut txn = store.create_txn(true)?;
+    permission_handler
+        .create_group(group_id, &user_identity, realm_key, store, &mut txn)
+        .await?;
+    store.commit(txn)?;
+
+    // Create S3 credentials with the controller of a specific node
+    let credentials = CreateS3CredentialsRequest {
+        group_id: group_id.to_string(),
+    }
+    .run_request(Some(user_identity.clone()), controller.as_ref())
+    .await?;
+
+    Ok((user_identity, token, credentials))
+}
+
 pub fn register_oidc_user<St>(
     name: &str,
     store: &St,
@@ -224,9 +262,9 @@ pub fn fetch_user_token(
 }
 
 pub async fn create_s3_client(
-    endpoint: String,
-    access_key_id: String,
-    secret_key: String,
+    endpoint: &str,
+    access_key_id: &str,
+    secret_key: &str,
 ) -> Result<Client> {
     let creds = Credentials::new(access_key_id, secret_key, None, None, "Aruna_v3");
     let client_config = aws_config::defaults(BehaviorVersion::v2025_01_17())

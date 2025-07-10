@@ -2,11 +2,14 @@ pub mod commons;
 
 #[cfg(test)]
 mod tests {
-    use crate::commons::{fetch_user_token, init_test_nodes, register_oidc_user};
+    use crate::commons::{
+        create_s3_client, create_user_with_group_and_credentials, fetch_user_token,
+        init_test_nodes, register_oidc_user,
+    };
     use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
     use ulid::Ulid;
 
-    const OFFSET: u16 = 100;
+    const OFFSET: u16 = 0;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_create_credentials() {
@@ -78,10 +81,67 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_put_object() {}
+    async fn test_put_object() {
+        let test_nodes = init_test_nodes(2, OFFSET + 10).await.unwrap();
+        let node = test_nodes.node_services.first().unwrap();
+        let node_controller = node.openapi_data_endpoint.0.clone();
+
+        // Register dummy user and create token
+        let group_id = Ulid::new();
+        let (_, _, creds) = create_user_with_group_and_credentials(
+            "Hans",
+            group_id,
+            test_nodes.realm_key.to_bytes(),
+            node_controller.io_handler.store.as_ref(),
+            node_controller.token_handler.clone(),
+            node_controller.permission_manager.clone(),
+            node_controller.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Create S3 client
+        let client = create_s3_client(
+            &format!("http://{}", node.s3_endpoint),
+            &creds.access_key_id.to_string(),
+            &creds.secret_access_key,
+        )
+        .await
+        .unwrap();
+
+        let body = aws_sdk_s3::primitives::ByteStream::from_static(
+            "This is some dummy content".as_bytes(),
+        );
+        let resp = client
+            .put_object()
+            .bucket("some-project")
+            .key("subdir/content.txt")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        dbg!(&resp);
+
+        let response = client
+            .get_object()
+            .bucket("some-project")
+            .key("subdir/content.txt")
+            .send()
+            .await
+            .unwrap();
+
+        println!(
+            "{}",
+            String::from_utf8(response.body.collect().await.unwrap().to_vec()).unwrap()
+        );
+
+        // Find file with Kademlia at all nodes
+    }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_multipart_upload() {}
+    async fn test_multipart_upload() {
+        //TODO
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_object() {}
