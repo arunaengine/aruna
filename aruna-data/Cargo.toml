@@ -56,3 +56,4 @@ utoipa-swagger-ui = { workspace = true }
 
 [dev-dependencies]
 chrono = "0.4.41"
+reqwest = "0.12.22"
