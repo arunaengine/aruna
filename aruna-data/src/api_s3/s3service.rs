@@ -86,7 +86,7 @@ where
                 .get(&read_txn, LOCATION_DB_NAME, &hash)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?
                 .ok_or_else(|| s3_error!(NoSuchKey, "No such key"))?;
-            let (info, _): (ObjectInfo, usize) =
+            let info: ObjectInfo =
                 postcard::from_bytes(&*info_raw).map_err(|e| s3_error!(InternalError, "{}", e))?;
 
             Ok::<ObjectInfo, anyhow::Error>(info)
