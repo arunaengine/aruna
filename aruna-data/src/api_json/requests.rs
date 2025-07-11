@@ -67,14 +67,13 @@ where
         tokio::task::spawn_blocking(move || {
             let mut write_txn = store_clone.create_txn(true)?;
 
-            // Store object info with blake3 hash as key
+            // Store user access with access key id as key
             store_clone.put(
                 &mut write_txn,
                 ACCESS_DB_NAME,
                 &access_key_id_clone.to_bytes(),
                 &postcard::to_allocvec(&access_info_clone)?,
             )?;
-
             store_clone.commit(write_txn)?;
 
             Ok::<(), anyhow::Error>(())

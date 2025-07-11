@@ -529,7 +529,7 @@ where
     }
 
     pub async fn read_data(operator: &Operator, path: &str) -> anyhow::Result<FuturesBytesStream> {
-        let reader = get_reader(operator, path, Some(4 * 1024 * 1024), None).await?;
+        let reader = get_reader(operator, path, None, None).await?;
         Ok(reader.into_bytes_stream(..).await?)
     }
 
@@ -538,7 +538,7 @@ where
         path: &str,
         range: Range<u64>,
     ) -> anyhow::Result<FuturesBytesStream> {
-        let reader = get_reader(&operator, path, Some(4 * 1024 * 1024), None).await?;
+        let reader = get_reader(operator, path, None, None).await?;
         Ok(reader.into_bytes_stream(range).await?)
     }
 
@@ -550,7 +550,7 @@ where
     ) -> anyhow::Result<()> {
         //TODO:
         // - Create operators
-        // - Write (transformed) data to dest_location --> ???/<RealmId>/<GroupId>/uploads/<Hash>
+        // - Write (transformed) data to dest_location --> <group-id>/<random-ulid>
         // - Delete data at temp_location
         Ok(())
     }

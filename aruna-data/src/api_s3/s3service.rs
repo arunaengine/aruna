@@ -127,6 +127,8 @@ where
             content_length: Some(info.file_size as i64),
             last_modified: None,
             version_id: None,
+            checksum_sha256: Some(info.file_hashes.sha256),
+            e_tag: Some(info.file_hashes.md5),
             ..Default::default()
         };
 

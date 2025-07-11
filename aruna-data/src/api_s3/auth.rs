@@ -102,8 +102,6 @@ where
             )
             .await
             .map_err(|e| s3_error!(InternalError, "Permission check failed: {}", e))?;
-        println!("{} allowed for {perm_path}: {allowed}", cx.s3_op().name());
-        debug!("{} allowed: {}", cx.s3_op().name(), allowed);
 
         match allowed {
             true => {
