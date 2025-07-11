@@ -15,7 +15,7 @@ use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::{Credentials, RequestChecksumCalculation};
 use chrono::Months;
 use ed25519_dalek::SigningKey;
 use parking_lot::RwLock;
@@ -179,7 +179,7 @@ pub async fn init_test_nodes(num: usize, port_offset: u16) -> anyhow::Result<Tes
 
     Ok(TestServers {
         realm_key,
-        node_services: node_services,
+        node_services,
     })
 }
 
@@ -269,6 +269,8 @@ pub async fn create_s3_client(
     let creds = Credentials::new(access_key_id, secret_key, None, None, "Aruna_v3");
     let client_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
         .credentials_provider(creds)
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
         .load()
         .await;
     let s3_config = aws_sdk_s3::config::Builder::from(&client_config)

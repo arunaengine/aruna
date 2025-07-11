@@ -1,7 +1,7 @@
 use anyhow::Result;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::{Credentials, RequestChecksumCalculation};
 use fancy_regex::Regex;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
@@ -53,20 +53,25 @@ pub async fn make_bucket(bucket: String, config: HashMap<String, String>) -> Res
         "Aruna_Node", // Node id ?
     );
     let client_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
         .credentials_provider(creds)
         .load()
         .await;
     let s3_config = aws_sdk_s3::config::Builder::from(&client_config)
-        .region(Region::new("RegionOne")) //.region(Region::new(config.get("region").unwrap_or("RegionOne")))
+        .region(Region::new("eu-central-1")) //.region(Region::new(config.get("region").unwrap_or("RegionOne")))
         .endpoint_url(
             config
                 .get("endpoint")
                 .expect("Config is missing endpoint URL"),
         )
+        .force_path_style(match config.get("force_path_style") {
+            None => false,
+            Some(val) => val == "true",
+        })
         .build();
 
     let s3_client = Client::from_conf(s3_config);
-
     match s3_client
         .get_bucket_location()
         .bucket(bucket.clone())
