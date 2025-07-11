@@ -172,12 +172,16 @@ where
         }
     }
 
-    fn modify_bucket_occupancy(&self, bucket: &str, increase: bool) -> anyhow::Result<()> {
+    fn modify_bucket_occupancy<'a>(
+        &'a self,
+        bucket: &str,
+        increase: bool,
+        mut txn: &mut <St as Store<'a>>::Txn,
+    ) -> anyhow::Result<()> {
         // Write changes to database and "cache"
-        let mut write_txn = self.store.create_txn(true)?;
         if let Some(val_bytes) =
             self.store
-                .get(&write_txn, LOCATION_STATS_DB_NAME, bucket.as_ref())?
+                .get(txn, LOCATION_STATS_DB_NAME, bucket.as_ref())?
         {
             let mut occupancy = u64::from_be_bytes(val_bytes.as_ref().try_into()?);
             if increase {
@@ -186,13 +190,12 @@ where
                 occupancy -= 1;
             }
             self.store.put(
-                &mut write_txn,
+                &mut txn,
                 LOCATION_STATS_DB_NAME,
                 bucket.as_ref(),
                 &occupancy.to_be_bytes(),
             )?
         }
-        self.store.commit(write_txn)?;
 
         // Make changes in "cache"
         let mut lock = self.backend_stats.write();
@@ -303,8 +306,6 @@ where
             debug!("Decoded all chunks and wrote them into the backend");
 
             // Store & publish location + register permission
-            //TODO: Store frontend path?
-            //TODO: Store permissions?
             let hashes = writer.hasher.finalize()?;
             let blake3_hash = hashes.blake3.clone();
             let location = ObjectInfo {
@@ -322,7 +323,7 @@ where
                 .realm_id(self.realm_key)
                 .group_data(*group_id, backend_bucket, bp, blake3_hash)
                 .build()?;
-            self.store_location(&location, fp, Some((blake3_hash, perm_path)))?;
+            self.store_location(&location, fp, Some(perm_path))?;
             self.publish_hash(blake3_hash).await?
         } else {
             error!("Stream did not start with init message");
@@ -389,7 +390,6 @@ where
         let operator = get_backend_operator(
             &self.backend.backend_type,
             self.backend.access_config.clone(),
-            //&backend_path,
             &backend_bucket,
         )
         .await?;
@@ -440,11 +440,7 @@ where
             )
             .build()?;
 
-        self.store_location(
-            &info,
-            Some(frontend_path),
-            Some((blake3_hash, permission_path)),
-        )?;
+        self.store_location(&info, Some(frontend_path), Some(permission_path))?;
         self.publish_hash(blake3_hash).await?;
 
         Ok(info)
@@ -521,11 +517,7 @@ where
                 file_hashes: hashes,
             };
 
-            self_clone.store_location(
-                &location,
-                Some(frontend_path_clone),
-                Some((blake3_hash, perm_path)),
-            )?;
+            self_clone.store_location(&location, Some(frontend_path_clone), Some(perm_path))?;
 
             // Publish hash in Kademlia
             self_clone.publish_hash(blake3_hash).await?;
@@ -640,21 +632,21 @@ where
         &self,
         location: &ObjectInfo,
         frontend_path: Option<String>,
-        permission: Option<(blake3::Hash, Path)>,
+        resource_permission: Option<Path>,
     ) -> anyhow::Result<()> {
-        let data_hash = location.file_hashes.blake3.as_bytes();
+        let data_hash = location.file_hashes.blake3.clone();
 
         // Store object info with blake3 hash as key
         let mut write_txn = self.store.create_txn(true)?;
         self.store.put(
             &mut write_txn,
             LOCATION_DB_NAME,
-            data_hash,
+            data_hash.as_bytes(),
             &postcard::to_allocvec(location)?,
         )?;
 
         // Increase bucket occupancy
-        self.modify_bucket_occupancy(&location.storage_root, true)?;
+        self.modify_bucket_occupancy(&location.storage_root, true, &mut write_txn)?;
 
         // If provided store frontend path mapping
         if let Some(path) = frontend_path {
@@ -662,14 +654,14 @@ where
                 &mut write_txn,
                 PATH_LOCATION_DB_NAME,
                 path.as_bytes(),
-                data_hash,
+                data_hash.as_bytes(),
             )?;
         }
 
         // If provided store permission path
-        if let Some((blake3_hash, path)) = permission {
+        if let Some(path) = resource_permission {
             self.permission_manager.add_resource(
-                ResourceId::ContentHash(blake3_hash),
+                ResourceId::ContentHash(data_hash),
                 &path,
                 self.store.as_ref(),
                 &mut write_txn,
