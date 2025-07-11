@@ -1,11 +1,10 @@
 use crate::util::s3::{validate_s3_bucket_name, validate_s3_object_key};
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::{Builder, FuturesAsyncReader, FuturesBytesStream, Operator, Reader, services};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::env::join_paths;
 use std::fmt::Display;
 use std::path::Path;
 use std::str::FromStr;
@@ -59,9 +58,12 @@ pub async fn get_backend_operator(
     } else {
         match config.entry("root".to_string()) {
             Entry::Occupied(mut entry) => {
-                let base_root = entry.get();
-                let new_root = join_paths([Path::new(base_root), Path::new(root)])?;
-                entry.insert(new_root.to_string_lossy().to_string());
+                let base_path = Path::new(entry.get());
+                let extended_path = base_path.join(root);
+                let path_str = extended_path
+                    .to_str()
+                    .ok_or_else(|| anyhow!("Invalid backend root path provided"))?;
+                entry.insert(path_str.to_string());
             }
             Entry::Vacant(entry) => {
                 entry.insert(root.to_string());
