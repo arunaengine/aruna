@@ -34,7 +34,7 @@ mod tests {
         ));
 
         // Unauthorized request
-        let unathorized_response = base_request
+        let unauthorized_response = base_request
             .try_clone()
             .unwrap()
             .json(&CreateS3CredentialsRequest {
@@ -43,8 +43,8 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert!(unathorized_response.status().is_client_error());
-        assert_eq!(unathorized_response.status().as_u16(), 401);
+        assert!(unauthorized_response.status().is_client_error());
+        assert_eq!(unauthorized_response.status().as_u16(), 401);
 
         // Invalid request
         let invalid_response = base_request
@@ -80,9 +80,9 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_put_object() {
-        let test_nodes = init_test_nodes(2, OFFSET + 10).await.unwrap();
+        let test_nodes = init_test_nodes(1, OFFSET + 10).await.unwrap();
         let node = test_nodes.node_services.first().unwrap();
         let node_controller = node.openapi_data_endpoint.0.clone();
 
@@ -100,7 +100,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Create S3 client
+        // Create S3 client and put object
         let client = create_s3_client(
             &format!("http://{}", node.s3_endpoint),
             &creds.access_key_id.to_string(),
@@ -122,7 +122,7 @@ mod tests {
             .unwrap();
         dbg!(&resp);
 
-        let response = client
+        let mut response = client
             .get_object()
             .bucket("some-project")
             .key("subdir/content.txt")
@@ -130,12 +130,13 @@ mod tests {
             .await
             .unwrap();
 
-        println!(
-            "{}",
-            String::from_utf8(response.body.collect().await.unwrap().to_vec()).unwrap()
-        );
+        let mut content = vec![];
+        while let Some(bytes) = response.body.try_next().await.unwrap() {
+            content.extend_from_slice(bytes.as_ref());
+        }
+        assert_eq!(String::from_utf8(content).unwrap(), "This is some dummy content");
 
-        // Find file with Kademlia at all nodes
+        //TODO: Find file with Kademlia at other nodes
     }
 
     #[tokio::test(flavor = "multi_thread")]

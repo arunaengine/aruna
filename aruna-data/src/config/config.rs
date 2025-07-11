@@ -136,8 +136,17 @@ impl Config {
                 path: format!("/tmp/aruna-data/test-{}/node-{}", Ulid::new(), node_idx),
             },
             backend: BackendConfig {
-                backend_type: Backend::Memory,
-                access_config: HashMap::from_iter([("root".to_string(), "/tmp".to_string())]), // Empty sufficient?
+                //backend_type: Backend::Memory,
+                //access_config: HashMap::from_iter([("root".to_string(), "/tmp".to_string())]),
+                backend_type: Backend::S3,
+                access_config: HashMap::from_iter([
+                    ("access_key_id".to_string(), "minioadmin".to_string()),
+                    ("secret_access_key".to_string(), "minioadmin".to_string()),
+                    ("endpoint".to_string(), "http://localhost:9000".to_string()),
+                    ("region".to_string(), "eu-central-1".to_string()),
+                    ("disable_config_load".to_string(), "true".to_string()),
+                    ("force_path_style".to_string(), "true".to_string()),
+                ]),
                 max_bucket_size: 100,
                 encryption: false,
                 compression: false,
