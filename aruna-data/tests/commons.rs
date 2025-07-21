@@ -7,15 +7,15 @@ use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::config::config::Config;
 use aruna_data::io::controller::Controller;
 use aruna_data::io::io_handler::REPLICATION_PROTOCOL_ID;
+use aruna_data::util::opendal::Backend;
 use aruna_net::actor::NetworkActorBuilder;
 use aruna_permission::paths::RealmKey;
 use aruna_permission::token::Issuer;
 use aruna_permission::{OidcToken, PermissionManager, TokenSystem, UserIdentity};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
-use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::{Credentials, RequestChecksumCalculation};
+use blake3::Hasher;
 use chrono::Months;
 use ed25519_dalek::SigningKey;
 use parking_lot::RwLock;
@@ -188,7 +188,7 @@ pub async fn init_test_nodes(
     })
 }
 
-pub async fn create_user_with_group_and_credentials<St>(
+pub async fn register_user_with_group_and_credentials<St>(
     name: &str,
     group_id: Ulid,
     realm_key: RealmKey,

@@ -3,17 +3,19 @@ pub mod commons;
 #[cfg(test)]
 mod tests {
     use crate::commons::{
-        create_s3_client, create_user_with_group_and_credentials, fetch_user_token,
-        init_test_nodes, register_oidc_user,
+        fetch_user_token, init_test_nodes, register_oidc_user,
+        register_user_with_group_and_credentials, upload_data,
     };
     use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
+    use aruna_data::util::s3::create_s3_client;
+    use blake3::Hasher;
     use ulid::Ulid;
 
     const OFFSET: u16 = 0;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_create_credentials() {
-        let test_nodes = init_test_nodes(1, OFFSET).await.unwrap();
+        let test_nodes = init_test_nodes(1, OFFSET, vec![]).await.unwrap();
         let node = test_nodes.node_services.first().unwrap();
         let node_controller = node.openapi_data_endpoint.0.clone();
 
@@ -82,13 +84,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_object() {
-        let test_nodes = init_test_nodes(1, OFFSET + 10).await.unwrap();
+        let test_nodes = init_test_nodes(1, OFFSET + 10, vec![]).await.unwrap();
         let node = test_nodes.node_services.first().unwrap();
         let node_controller = node.openapi_data_endpoint.0.clone();
 
         // Register dummy user and create token
         let group_id = Ulid::new();
-        let (_, _, creds) = create_user_with_group_and_credentials(
+        let (_, _, creds) = register_user_with_group_and_credentials(
             "Hans",
             group_id,
             test_nodes.realm_key.to_bytes(),
@@ -100,18 +102,19 @@ mod tests {
         .await
         .unwrap();
 
-        // Create S3 client and put object
+        // Create S3 client and upload some data
         let client = create_s3_client(
             &format!("http://{}", node.s3_endpoint),
+            None,
             &creds.access_key_id.to_string(),
             &creds.secret_access_key,
+            true,
         )
         .await
         .unwrap();
 
-        let body = aws_sdk_s3::primitives::ByteStream::from_static(
-            "This is some dummy content".as_bytes(),
-        );
+        let body_content = "This is some dummy content";
+        let body = aws_sdk_s3::primitives::ByteStream::from_static(body_content.as_bytes());
         let resp = client
             .put_object()
             .bucket("some-project")
@@ -120,7 +123,14 @@ mod tests {
             .send()
             .await
             .unwrap();
-        dbg!(&resp);
+        assert_eq!(
+            resp.e_tag,
+            Some("f82323ba75cec986a7abd74c97795c2c".to_string())
+        );
+        assert_eq!(
+            resp.checksum_sha256,
+            Some("913ed33e2e8642b4be2c3608d44c8ac44cd571f241d847e472f8dfb78ebf99e6".to_string())
+        );
 
         let mut response = client
             .get_object()
@@ -134,9 +144,24 @@ mod tests {
         while let Some(bytes) = response.body.try_next().await.unwrap() {
             content.extend_from_slice(bytes.as_ref());
         }
-        assert_eq!(String::from_utf8(content).unwrap(), "This is some dummy content");
+        assert_eq!(
+            String::from_utf8(content).unwrap(),
+            "This is some dummy content"
+        );
 
-        //TODO: Find file with Kademlia at other nodes
+        // Find file hash with Kademlia at node
+        let blake3_hash = Hasher::new().update(body_content.as_bytes()).finalize();
+        let result = node_controller
+            .io_handler
+            .kademlia
+            .find_value(*blake3_hash.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.first().unwrap().addr,
+            node_controller.io_handler.get_node_addr()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

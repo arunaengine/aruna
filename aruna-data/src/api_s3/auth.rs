@@ -19,6 +19,7 @@ pub struct UserAccess {
     pub user_id: UserIdentity,
     pub group_id: Ulid,
     pub secret: String,
+    //pub expiry: SystemTime
     //filter
 }
 
