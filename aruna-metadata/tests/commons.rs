@@ -22,6 +22,7 @@ use aruna_storage::storage::{
 };
 use chrono::Months;
 use ed25519_dalek::SigningKey;
+use iroh::NodeAddr;
 use parking_lot::RwLock;
 use rand::rngs::OsRng;
 #[allow(unused)] // used for tracing of commented in
@@ -39,45 +40,40 @@ use tracing_subscriber::prelude::*;
 use ulid::Ulid;
 
 pub static SUBSCRIBERS: AtomicU16 = AtomicU16::new(0);
-const TEST_CONFIG: TestConfig = TestConfig {
+pub const TEST_CONFIG: TestConfig = TestConfig {
     socket_addr: "127.0.0.1",
     path: "/dev/shm/tests",
     p2p_port: 50000,
     api_port: 8080,
 };
 
-struct TestConfig {
-    socket_addr: &'static str,
-    path: &'static str,
-    p2p_port: u16,
-    api_port: u16,
+pub struct TestConfig {
+    pub socket_addr: &'static str,
+    pub path: &'static str,
+    pub p2p_port: u16,
+    pub api_port: u16,
 }
 
 pub struct TestServers {
     pub realm_key: SigningKey,
-    pub addr_server_pairs: Vec<(
-        Arc<Controller<LmdbStore, TantivySearch, P2PNetwork>>,
-        String,
-    )>,
+    pub addr_server_pairs: Vec<Server>,
 }
 
-pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
-    //let logging_env_filter = EnvFilter::try_from_default_env()
-    //   .unwrap_or("none".into())
-    //   .add_directive("aruna_metadata=error".parse().unwrap());
-    //add_directive("aruna_storage=info".parse().unwrap())
-    //add_directive("tower_http=info".parse().unwrap())
-    //add_directive("aruna_net=info".parse().unwrap());
+#[derive(Clone)]
+pub struct Server {
+    pub controller: Arc<Controller<LmdbStore, TantivySearch, P2PNetwork>>,
+    pub path: String,
+    pub addr: NodeAddr,
+}
 
-    // let fmt_layer = tracing_subscriber::fmt::layer()
-    //     .with_file(true)
-    //     .with_line_number(true)
-    //     .with_filter(logging_env_filter);
-    // tracing_subscriber::registry().with(fmt_layer).init();
+pub async fn init_server(
+    config: TestConfig,
+    realm_key: SigningKey,
+    offset: u16,
+    bootstrap_addr: Option<NodeAddr>,
+) -> Result<Server> {
+    let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let realm_key = SigningKey::generate(&mut OsRng);
-
-    let mut server_url_pairs = Vec::new();
     let databases = vec![
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,
@@ -91,11 +87,9 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         PUBLIC_MAPPINGS_DB_NAME,
     ];
 
-    let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
     let tantivy_path = format!(
         "{}/test-{}-{}/node_{}/tantivy",
-        TEST_CONFIG.path,
+        config.path,
         subscriber,
         Ulid::new(),
         0
@@ -106,7 +100,7 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     };
     let store_path = format!(
         "{}/test-{}-{}/node_{}/heed",
-        TEST_CONFIG.path,
+        config.path,
         Ulid::new(),
         subscriber,
         0
@@ -149,10 +143,10 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         P2PNetwork::new(NetworkConfig {
             secret_key: None,
             socket_addr: SocketAddrV4::new(
-                Ipv4Addr::from_str(TEST_CONFIG.socket_addr).unwrap(),
-                TEST_CONFIG.p2p_port + offset + subscriber,
+                Ipv4Addr::from_str(config.socket_addr).unwrap(),
+                config.p2p_port + offset + subscriber,
             ),
-            bootstrap_nodes: vec![],
+            bootstrap_nodes: bootstrap_addr.map(|addr| vec![addr]).unwrap_or_default(),
             realm_key: realm_key.clone(),
         })
         .await
@@ -167,111 +161,67 @@ pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
         .await
         .unwrap();
 
-    let api_port = TEST_CONFIG.api_port + offset + subscriber;
+    let api_port = config.api_port + offset + subscriber;
     let controller_clone = controller.clone();
-    tokio::spawn(async move { RestServer::run(controller_clone, api_port).await });
+    let rest_addr = Ipv4Addr::new(0, 0, 0, 0);
+    tokio::spawn(
+        async move { RestServer::run(controller_clone, rest_addr.clone(), api_port).await },
+    );
 
     let bootstrap_addr = controller.network.get_addr().await.unwrap();
-    server_url_pairs.push((controller, format!("http://localhost:{}/api/v3", api_port)));
+    Ok(Server {
+        controller,
+        path: format!("http://localhost:{}/api/v3", api_port),
+        addr: bootstrap_addr,
+    })
+}
 
-    for node in 1..5 {
-        let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tantivy_path = format!(
-            "{}/test-{}-{}/node_{}/tantivy",
-            TEST_CONFIG.path,
-            subscriber,
-            Ulid::new(),
-            node
-        );
-        let search_config = TantivyConfig {
-            path: tantivy_path,
-            index_buffer: 1_000_000_000,
-        };
-        let store_path = format!(
-            "{}/test-{}-{}/node_{}/heed",
-            TEST_CONFIG.path,
-            subscriber,
-            Ulid::new(),
-            node
-        );
-        let store_config = LmdbConfig {
-            path: store_path,
-            databases: databases.clone(),
-        };
+pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
+    //let logging_env_filter = EnvFilter::try_from_default_env()
+    //   .unwrap_or("none".into())
+    //   .add_directive("aruna_metadata=error".parse().unwrap());
+    //add_directive("aruna_storage=info".parse().unwrap())
+    //add_directive("tower_http=info".parse().unwrap())
+    //add_directive("aruna_net=info".parse().unwrap());
 
-        let store = LmdbStore::new(store_config)?;
+    // let fmt_layer = tracing_subscriber::fmt::layer()
+    //     .with_file(true)
+    //     .with_line_number(true)
+    //     .with_filter(logging_env_filter);
+    // tracing_subscriber::registry().with(fmt_layer).init();
 
-        let permission_manager = PermissionManager::new().await.unwrap();
-        let read_txn = store.create_txn(false).unwrap();
-        permission_manager
-            .load_policies(&store, &read_txn)
-            .await
-            .unwrap();
-        store.commit(read_txn).unwrap();
+    let realm_key = SigningKey::generate(&mut OsRng);
+    let mut servers = Vec::new();
+    let init_node = init_server(TEST_CONFIG, realm_key.clone(), offset, None).await?;
 
-        // Token Handler
-        let token_handler = Arc::new(RwLock::new(
-            TokenSystem::new(
-                realm_key.verifying_key().as_bytes(),
-                vec![aruna_permission::token::Issuer {
-                    issuer_name: "http://localhost:1998/realms/test".to_string(),
-                    pubkey_url: "http://localhost:1998/realms/test/protocol/openid-connect/certs"
-                        .to_string(),
-                    aud: vec!["test".to_string(), "test-long".to_string()],
-                }],
-            )
-            .unwrap(),
-        ));
+    let bootstrap_addr = init_node.addr.clone();
+    servers.push(init_node);
 
-        let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-            Persistor::new(store, search_config, permission_manager, token_handler)
-                .await
-                .unwrap(),
-        );
-
-        let network = Arc::new(
-            P2PNetwork::new(NetworkConfig {
-                secret_key: None,
-                socket_addr: SocketAddrV4::new(
-                    Ipv4Addr::from_str(TEST_CONFIG.socket_addr).unwrap(),
-                    TEST_CONFIG.p2p_port + offset + subscriber,
-                ),
-                bootstrap_nodes: vec![bootstrap_addr.clone()],
-                realm_key: realm_key.clone(),
-            })
-            .await
-            .unwrap(),
-        );
-
-        let controller = Arc::new(Controller::<LmdbStore, TantivySearch, P2PNetwork>::new(
-            persistor,
-            network.clone(),
-        ));
-        Network::start_actor(network, controller.clone())
-            .await
-            .unwrap();
-
-        let api_port = TEST_CONFIG.api_port + offset + subscriber;
-        let controller_clone = controller.clone();
-        tokio::spawn(async move { RestServer::run(controller_clone, api_port).await });
-        server_url_pairs.push((controller, format!("http://localhost:{}/api/v3", api_port)));
+    for _ in 1..5 {
+        let next_node = init_server(
+            TEST_CONFIG,
+            realm_key.clone(),
+            offset,
+            Some(bootstrap_addr.clone()),
+        )
+        .await?;
+        servers.push(next_node);
     }
 
-    for (controller, _url) in &server_url_pairs {
+    for Server { controller, .. } in &servers {
         controller.network.update_realm().await?;
     }
 
     Ok(TestServers {
         realm_key,
-        addr_server_pairs: server_url_pairs,
+        addr_server_pairs: servers,
     })
 }
 
 pub async fn create_user_with_token(
-    test: &TestServers,
+    server: &Server,
     name: String,
 ) -> Result<(UserIdentity, String)> {
-    let (controller, _) = test.addr_server_pairs.first().unwrap();
 
     let request = AddUserRequest { name: name.clone() };
     let response = request
@@ -293,11 +243,11 @@ pub async fn create_user_with_token(
                 family_name: None,
                 additional_claims: HashMap::default(),
             },
-            controller,
+            &server.controller,
         )
         .await?;
     let user_identity = response.user.id;
-    let user_token = controller
+    let user_token = server.controller
         .persistence
         .token_handler
         .read()

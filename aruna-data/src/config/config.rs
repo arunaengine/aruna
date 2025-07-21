@@ -94,8 +94,8 @@ impl Config {
         };
 
         let openapi_frontend = OpenApiFrontend {
-            address: dotenvy::var("OPENAPI_ADDRESS")?.to_string(),
-            port: dotenvy::var("OPENAPI_PORT")?.parse()?,
+            address: dotenvy::var("DATA_OPENAPI_ADDRESS")?.to_string(),
+            port: dotenvy::var("DATA_OPENAPI_PORT")?.parse()?,
         };
 
         let s3_frontend = S3Frontend {

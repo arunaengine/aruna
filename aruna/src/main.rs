@@ -1,65 +1,30 @@
-use anyhow::anyhow;
-use aruna_data::api_s3::s3server::S3Server;
-use aruna_data::config::config::Config as DataConfig;
-use aruna_data::{ACCESS_DB_NAME, IOHandler, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
+use aruna_data::{ACCESS_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME};
 use aruna_metadata::{
-    api::server::RestServer,
     error::ArunaMetadataError,
-    network::network_trait::{Network, NetworkConfig, P2PNetwork},
-    persistence::{
-        persistor::{Persistor, tables::*},
-        search::tantivy::{TantivyConfig, TantivySearch},
-    },
-    transactions::controller::Controller,
+    network::network_trait::{Network, NetworkConfig, P2PNetwork}, persistence::persistor::tables::{GROUPS_DB_NAME, GROUPS_MAPPINGS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME, RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME},
 };
-use aruna_permission::{PermissionError, PermissionManager, TokenSystem, token::Issuer};
+use aruna_permission::{PermissionManager, TokenSystem, };
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
 };
-use data_encoding::HEXLOWER;
-use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::DecodePrivateKey;
-use futures_util::TryFutureExt;
-use iroh::{KeyParsingError, PublicKey};
-use iroh::{NodeAddr, SecretKey};
+use config::{parse_config, start_data, start_metadata, Config};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use parking_lot::RwLock;
-use rand::rngs::OsRng;
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
-    num::ParseIntError,
     str::FromStr,
     sync::Arc,
     time::Duration,
 };
-use thiserror::Error;
-use tokio::try_join;
-use tracing::{debug, error, trace};
+use tracing::trace;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;
 
-#[derive(Debug, Error)]
-pub enum ArunaError {
-    #[error("ArunaMetadataError: {0}")]
-    MetadataError(#[from] ArunaMetadataError),
-    #[error("DotenvyError: {0}")]
-    DotenvyError(#[from] dotenvy::Error),
-    #[error("DataError: {0}")]
-    DataError(#[from] anyhow::Error),
-    #[error("KeyParsingError: {0}")]
-    KeyParsingError(#[from] KeyParsingError),
-    #[error("ParseIntError: {0}")]
-    ParseIntError(#[from] ParseIntError),
-    #[error("SigningKeyError: {0}")]
-    SigningKeyError(#[from] ed25519_dalek::pkcs8::Error),
-    #[error("PermissionError: {0}")]
-    PermissionError(#[from] PermissionError),
-    #[error("SerdeError: {0}")]
-    SerdeError(#[from] serde_json::error::Error),
-}
+pub mod config;
+pub mod error;
 
 #[tokio::main]
 pub async fn main() {
@@ -116,6 +81,7 @@ pub async fn main() {
     let databases = vec![
         ACCESS_DB_NAME,
         LOCATION_DB_NAME,
+        LOCATION_STATS_DB_NAME,
         PATH_LOCATION_DB_NAME,
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,
@@ -184,140 +150,4 @@ pub async fn main() {
     let (metadata, data) = tokio::join!(metadata_future, data_future);
     metadata.unwrap();
     data.unwrap();
-}
-
-#[derive(Clone, Debug)]
-pub struct Config {
-    pub otel_server: String,
-    pub otel_service_name: String,
-    pub bootstrap_nodes: Vec<NodeAddr>,
-    pub path: String,
-    pub issuers: Vec<Issuer>,
-    pub realm_key: SigningKey,
-    pub search_config: TantivyConfig,
-    pub config: DataConfig,
-}
-
-pub async fn start_data(
-    config: Config,
-    store: LmdbStore,
-    network: Arc<P2PNetwork>,
-    perm_manager: PermissionManager,
-    token_handler: Arc<RwLock<TokenSystem>>,
-) -> Result<(), ArunaError> {
-    // Create and run IOHandler
-    let node_addr = network.chandler.get_node_addr().await?;
-    let io_handler = IOHandler::<LmdbStore>::new(
-        node_addr.clone(),
-        network.chandler.clone(),
-        network.chandler.get_kademlia_actor_handle().await?,
-        config.config.backend.clone(),
-        Arc::new(store),
-        perm_manager.clone(),
-        config.config.general.realm_key.to_bytes(),
-    )
-    .await?;
-    let s3server = S3Server::new(
-        config.config.frontend.s3_frontend.clone(),
-        io_handler.clone(),
-        config.config.backend.clone(),
-        perm_manager.clone(),
-        config.config.general.realm_key.to_bytes(),
-    )
-    .await?;
-
-    let controller = Arc::new(aruna_data::io::controller::Controller::<LmdbStore>::new(
-        io_handler,
-        perm_manager,
-        token_handler,
-    ));
-    let rest_handle = tokio::spawn(async move {
-        aruna_data::api_json::server::RestServer::run(
-            controller,
-            Ipv4Addr::from_str(&config.config.frontend.openapi_frontend.address)?,
-            8081, //config.config.frontend.openapi_frontend.port,
-        )
-        .await
-    })
-    .map_err(|e| {
-        error!(error = ?e, msg = e.to_string());
-        anyhow!("an error occurred {e}")
-    });
-
-    match try_join!(s3server.run(), rest_handle) {
-        Ok(_) => Ok(()),
-        Err(err) => {
-            error!("{}", err);
-            panic!("Meh.")
-        }
-    }
-}
-
-pub async fn start_metadata<S>(
-    config: Config,
-    store: S,
-    network: Arc<P2PNetwork>,
-    perm_manager: PermissionManager,
-    token_handler: Arc<RwLock<TokenSystem>>,
-) -> Result<(), ArunaError>
-where
-    for<'a> S: Store<'a> + 'static,
-{
-    let persistor: Arc<Persistor<S, TantivySearch>> =
-        Arc::new(Persistor::new(store, config.search_config, perm_manager, token_handler).await?);
-
-    let controller = Arc::new(Controller::<S, TantivySearch, P2PNetwork>::new(
-        persistor,
-        network.clone(),
-    ));
-    Network::start_actor(network, controller.clone()).await?;
-
-    let controller_clone = controller.clone();
-    tokio::spawn(async move {
-        RestServer::run(
-            controller_clone,
-            config.config.frontend.openapi_frontend.port,
-        )
-        .await
-    });
-
-    Ok(())
-}
-
-pub fn parse_config() -> Result<Config, ArunaError> {
-    let otel_server = dotenvy::var("OTEL_SERVER")?;
-    let otel_service_name = dotenvy::var("OTEL_SERVICE_NAME")?;
-
-    // let p2p_key = SecretKey::generate(&mut OsRng);
-    // println!("{:?}", &HEXLOWER.encode(&p2p_key.to_bytes()));
-
-    let path = dotenvy::var("DB_PATH")?;
-    let key = &dotenvy::var("REALM_KEY")?;
-    let signing_key = SigningKey::from_pkcs8_pem(key)?;
-
-    let issuers = serde_json::from_str(&dotenvy::var("ISSUERS")?)?;
-
-    let bootstrap_nodes: Vec<NodeAddr> = match dotenvy::var("BOOTSTRAP_NODES") {
-        Ok(env_var) => serde_json::from_str(&env_var)?,
-        Err(_) => vec![],
-    };
-
-    let tantivy_path = format!("{path}/tantivy");
-    let search_config = TantivyConfig {
-        path: tantivy_path,
-        index_buffer: 1_000_000_000,
-    };
-
-    let data_config = DataConfig::load_from_env()?;
-
-    Ok(Config {
-        otel_server,
-        otel_service_name,
-        bootstrap_nodes,
-        path,
-        issuers,
-        search_config,
-        realm_key: signing_key,
-        config: data_config,
-    })
 }

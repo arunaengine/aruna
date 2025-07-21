@@ -25,7 +25,7 @@ axum = "0.8.4"
 axum-extra = {version = "0.10.1", features = ["query"]}
 blake3 = { version = "1.8.2", features = ["serde"] }
 casbin = { version = "2.10.1", features = ["explain", "logging"]}
-# casbin = "2.10.1"
+chrono = { version = "0.4.41", features = ["serde"]}
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "pem"] }
 futures = "0.3.31"

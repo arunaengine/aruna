@@ -11,6 +11,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }
 blake3 = { workspace = true }
+chrono = { workspace = true }
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
 iroh = { workspace = true }
@@ -39,7 +40,6 @@ aruna-realm = {path = "../aruna-realm"}
 aruna-permission = {path = "../aruna-permission"}
 automerge = "0.6.1"
 autosurgeon = "0.8.7"
-chrono = { version = "0.4.41", features = ["serde"]}
 hex = "0.4.3"
 rayon = "1.10.0"
 reqwest = { version = "0.12.15", features = ["json"] }

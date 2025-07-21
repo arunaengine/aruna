@@ -5,7 +5,7 @@ use crate::{
 };
 use aruna_storage::storage::store::Store;
 use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
@@ -17,6 +17,7 @@ impl RestServer {
     #[tracing::instrument(level = "trace", skip(handler, rest_port))]
     pub async fn run<St, Se, N>(
         handler: Arc<Controller<St, Se, N>>,
+        rest_address: Ipv4Addr,
         rest_port: u16,
     ) -> Result<(), ArunaMetadataError>
     where
@@ -24,7 +25,7 @@ impl RestServer {
         Se: Search + 'static,
         N: Network + 'static,
     {
-        let socket_address = SocketAddr::from(([0, 0, 0, 0], rest_port));
+        let socket_address = SocketAddr::from((rest_address, rest_port));
         let listener = tokio::net::TcpListener::bind(socket_address).await.unwrap();
 
         let (router, api) = OpenApiRouter::with_openapi(ArunaApi::openapi())

@@ -1,15 +1,15 @@
 pub mod commons;
 
 #[cfg(test)]
-mod tests {
-    use crate::commons::{TestServers, create_user_with_token, init_lmdb_servers};
+mod api_tests {
+    use crate::commons::{Server, TestServers, create_user_with_token, init_lmdb_servers};
     use aruna_metadata::{
         models::{
-            structs::Resource,
             requests::{
                 AddGroupRequest, CreateProjectRequest, CreateProjectResponse,
                 CreateResourceRequest, GetResourceResponse, SearchResponse,
             },
+            structs::Resource,
         },
         transactions::request::Request,
     };
@@ -18,21 +18,25 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_user_creation() {
-        let ref test @ TestServers {
+        let TestServers {
             addr_server_pairs: ref servers,
             ..
         } = init_lmdb_servers(OFFSET).await.unwrap();
 
-        let (user1_identity, _) = create_user_with_token(&test, "create_user_test1".to_string())
-            .await
-            .unwrap();
-        let (user2_identity, _) = create_user_with_token(&test, "create_user_test2".to_string())
-            .await
-            .unwrap();
+        let first_node = servers.iter().next().unwrap();
+
+        let (user1_identity, _) =
+            create_user_with_token(first_node, "create_user_test1".to_string())
+                .await
+                .unwrap();
+        let (user2_identity, _) =
+            create_user_with_token(first_node, "create_user_test2".to_string())
+                .await
+                .unwrap();
 
         std::thread::sleep(Duration::from_secs(5));
 
-        for (controller, _) in servers.iter() {
+        for Server { controller, .. } in servers.iter() {
             assert!(
                 controller
                     .persistence
@@ -54,20 +58,24 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_create() {
-        let ref test @ TestServers {
+        let TestServers {
             addr_server_pairs: ref servers,
             ..
         } = init_lmdb_servers(OFFSET).await.unwrap();
 
-        let (controller, first_url) = servers.first().unwrap();
+        let ref first_node @ Server {
+            controller,
+            path: first_url,
+            ..
+        } = servers.first().unwrap();
         let client = reqwest::Client::new();
 
         let (user1_identity, user1_token) =
-            create_user_with_token(&test, "create_resource_test1".to_string())
+            create_user_with_token(&first_node, "create_resource_test1".to_string())
                 .await
                 .unwrap();
         let (user2_identity, user2_token) =
-            create_user_with_token(&test, "create_resource_test2".to_string())
+            create_user_with_token(&first_node, "create_resource_test2".to_string())
                 .await
                 .unwrap();
 
@@ -137,7 +145,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_secs(5));
 
-        for (_, base_url) in servers.iter() {
+        for Server { path: base_url, .. } in servers.iter() {
             let response: GetResourceResponse = client
                 .get(format!("{base_url}/resources"))
                 .header::<&str, &str>(
@@ -199,12 +207,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_search_authorization() {
-        let ref test @ TestServers {
+        let TestServers {
             addr_server_pairs: ref servers,
             ..
         } = init_lmdb_servers(OFFSET).await.unwrap();
 
-        let (controller, first_url) = servers.first().unwrap();
+        let ref test @ Server {
+            controller,
+            path: first_url,
+            ..
+        } = servers.first().unwrap();
         let client = reqwest::Client::new();
 
         let (user1_identity, user1_token) =
@@ -332,7 +344,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_secs(10));
 
-        for (_, base_url) in servers.iter() {
+        for Server { path: base_url, .. } in servers.iter() {
             let response: SearchResponse = client
                 .get(format!("{base_url}/info/search"))
                 .header::<&str, &str>(
@@ -368,12 +380,16 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_search_queries() {
-        let ref test @ TestServers {
+        let TestServers {
             addr_server_pairs: ref servers,
             ..
         } = init_lmdb_servers(OFFSET).await.unwrap();
 
-        let (controller, first_url) = servers.first().unwrap();
+        let ref test @ Server {
+            controller,
+            path: first_url,
+            ..
+        } = servers.first().unwrap();
         let client = reqwest::Client::new();
 
         let (user_identity, user_token) =
@@ -447,7 +463,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_secs(5));
 
-        for (_, base_url) in servers.iter() {
+        for Server { path: base_url, .. } in servers.iter() {
             let response: SearchResponse = client
                 .get(format!("{base_url}/info/search"))
                 .header::<&str, &str>(
