@@ -75,14 +75,14 @@ pub struct IOHandler<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
+    realm_key: RealmKey,
     node_addr: NodeAddr,
     network: NetworkActorHandle,
-    kademlia: Kademlia,
     backend: BackendConfig,
     backend_stats: Arc<RwLock<BTreeMap<String, u64>>>,
+    pub kademlia: Kademlia,
     pub store: Arc<St>,
     pub permission_manager: PermissionManager,
-    realm_key: RealmKey,
 }
 
 impl<St> IOHandler<St>
@@ -134,7 +134,7 @@ where
             .collect::<BTreeMap<String, u64>>())
     }
 
-    fn get_node_addr(&self) -> NodeAddr {
+    pub fn get_node_addr(&self) -> NodeAddr {
         self.node_addr.clone()
     }
 
@@ -147,6 +147,7 @@ where
             .backend_stats
             .read()
             .iter()
+            //.inspect(|ele| debug!("{:#?}", ele))
             .find(|(_, v)| *v < &self.backend.max_bucket_size)
         {
             Ok(bucket.to_string())
@@ -155,12 +156,16 @@ where
             let bucket_name = if let Some((bucket, _)) = self.backend_stats.read().last_key_value()
             {
                 let parts = bucket.split('-').collect::<Vec<_>>();
-                if parts.len() != 2 {
+                if parts.len() != 3 {
                     return Err(anyhow::anyhow!("Invalid backend bucket name"));
                 }
-                format!("aruna-{}", parts[1].parse::<u64>()? + 1)
+                format!(
+                    "aruna-{}-{}",
+                    Ulid::from_string(parts[1])?.to_string().to_lowercase(),
+                    parts[1].parse::<u64>()? + 1
+                )
             } else {
-                "aruna-1".to_string()
+                format!("aruna-{}-1", Ulid::new().to_string().to_lowercase())
             };
 
             if self.backend.backend_type == Backend::S3 {
@@ -179,9 +184,9 @@ where
         mut txn: &mut <St as Store<'a>>::Txn,
     ) -> anyhow::Result<()> {
         // Write changes to database and "cache"
-        if let Some(val_bytes) =
-            self.store
-                .get(txn, LOCATION_STATS_DB_NAME, bucket.as_ref())?
+        if let Some(val_bytes) = self
+            .store
+            .get(txn, LOCATION_STATS_DB_NAME, bucket.as_ref())?
         {
             let mut occupancy = u64::from_be_bytes(val_bytes.as_ref().try_into()?);
             if increase {
