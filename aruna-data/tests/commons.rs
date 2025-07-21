@@ -45,7 +45,11 @@ pub struct NodeServices {
     pub openapi_data_endpoint: (Arc<Controller<LmdbStore>>, String),
 }
 
-pub async fn init_test_nodes(num: usize, port_offset: u16) -> anyhow::Result<TestServers> {
+pub async fn init_test_nodes(
+    num: usize,
+    port_offset: u16,
+    backend_types: Vec<Backend>,
+) -> anyhow::Result<TestServers> {
     let realm_key = SigningKey::generate(&mut OsRng);
     let mut node_services = vec![];
     let mut bootstrap_nodes = vec![];
@@ -60,7 +64,7 @@ pub async fn init_test_nodes(num: usize, port_offset: u16) -> anyhow::Result<Tes
         aruna_data::PATH_LOCATION_DB_NAME,
     ];
 
-    for _ in 0..num {
+    for idx in 0..num {
         // Create dummy config
         let node_idx = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p2p_port = P2P_BASE_PORT + port_offset + node_idx;
@@ -72,6 +76,7 @@ pub async fn init_test_nodes(num: usize, port_offset: u16) -> anyhow::Result<Tes
             p2p_port,
             openapi_port,
             s3_port,
+            backend_types.get(idx).unwrap_or_default(),
         );
 
         // Init network
