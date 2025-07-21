@@ -10,14 +10,21 @@ use std::path::Path;
 use std::str::FromStr;
 use ulid::Ulid;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 // Currently supported backends
 pub enum Backend {
+    #[default]
     S3,
     HTTP,
     Memory,
     Postgres,
     FileSystem,
+}
+
+impl Default for &Backend {
+    fn default() -> Self {
+        &Backend::S3
+    }
 }
 
 impl FromStr for Backend {
