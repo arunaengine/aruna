@@ -26,7 +26,7 @@ impl Hasher {
         Ok(Hashes {
             blake3: self.blake3.finalize(),
             sha256: format!("{:x}", self.sha256.clone().finalize()),
-            md5: format!("{:x}", self.md5.clone().compute()),
+            md5: format!("{:x}", self.md5.clone().finalize()),
         })
     }
 }
