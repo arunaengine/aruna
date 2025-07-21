@@ -40,38 +40,44 @@ pub fn validate_s3_object_key(key: &str) -> Result<bool> {
     Ok(S3_KEY_REGEX.is_match(key)? && key.len() <= 1024)
 }
 
+pub async fn create_s3_client(
+    endpoint: &str,
+    region: Option<String>,
+    access_key_id: &str,
+    secret_key: &str,
+    force_path_style: bool,
+) -> Result<Client> {
+    let creds = Credentials::new(access_key_id, secret_key, None, None, "Aruna_v3");
+    let client_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+        .credentials_provider(creds)
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
+        .load()
+        .await;
+    let s3_config = aws_sdk_s3::config::Builder::from(&client_config)
+        .region(Region::new(region.unwrap_or("eu-central-1".to_string())))
+        .endpoint_url(endpoint)
+        .force_path_style(force_path_style)
+        .build();
+
+    Ok(Client::from_conf(s3_config))
+}
+
 pub async fn make_bucket(bucket: String, config: HashMap<String, String>) -> Result<()> {
-    let creds = Credentials::new(
+    let s3_client = create_s3_client(
+        config
+            .get("endpoint")
+            .expect("Config is missing endpoint URL"),
+        None,
         config
             .get("access_key_id")
             .expect("Config is missing access key id"),
         config
             .get("secret_access_key")
             .expect("Config is missing secret access key"),
-        None,
-        None,
-        "Aruna_Node", // Node id ?
-    );
-    let client_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
-        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
-        .credentials_provider(creds)
-        .load()
-        .await;
-    let s3_config = aws_sdk_s3::config::Builder::from(&client_config)
-        .region(Region::new("eu-central-1")) //.region(Region::new(config.get("region").unwrap_or("RegionOne")))
-        .endpoint_url(
-            config
-                .get("endpoint")
-                .expect("Config is missing endpoint URL"),
-        )
-        .force_path_style(match config.get("force_path_style") {
-            None => false,
-            Some(val) => val == "true",
-        })
-        .build();
-
-    let s3_client = Client::from_conf(s3_config);
+        true,
+    )
+    .await?;
     match s3_client
         .get_bucket_location()
         .bucket(bucket.clone())

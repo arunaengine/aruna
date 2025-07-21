@@ -261,22 +261,20 @@ pub fn fetch_user_token(
     Ok(token_handler.read().generate_token(&user_identity)?)
 }
 
-pub async fn create_s3_client(
-    endpoint: &str,
-    access_key_id: &str,
-    secret_key: &str,
-) -> Result<Client> {
-    let creds = Credentials::new(access_key_id, secret_key, None, None, "Aruna_v3");
-    let client_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
-        .credentials_provider(creds)
-        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)
-        .load()
-        .await;
-    let s3_config = aws_sdk_s3::config::Builder::from(&client_config)
-        .region(Region::new("RegionOne"))
-        .endpoint_url(endpoint)
-        .build();
-
-    Ok(Client::from_conf(s3_config))
+pub async fn upload_data(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    data: &'static [u8],
+) -> Result<String> {
+    let hash = Hasher::new().update(data).finalize();
+    let body = aws_sdk_s3::primitives::ByteStream::from_static(data);
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(body)
+        .send()
+        .await?;
+    Ok(hash.to_string())
 }
