@@ -170,7 +170,85 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_get_object() {}
+    async fn test_get_object() {
+        // Initialize multiple nodes with a user
+        let test_nodes = init_test_nodes(2, OFFSET + 20, vec![]).await.unwrap();
+        let node = test_nodes.node_services.first().unwrap();
+        let node_controller = node.openapi_data_endpoint.0.clone();
+
+        //TODO: Put object to specific node
+        // Register dummy user and create token
+        let group_id = Ulid::new();
+        let (_, _, creds) = register_user_with_group_and_credentials(
+            "Horst",
+            group_id,
+            test_nodes.realm_key.to_bytes(),
+            node_controller.io_handler.store.as_ref(),
+            node_controller.token_handler.clone(),
+            node_controller.permission_manager.clone(),
+            node_controller.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Create S3 client and upload some data
+        let client = create_s3_client(
+            &format!("http://{}", node.s3_endpoint),
+            None,
+            &creds.access_key_id.to_string(),
+            &creds.secret_access_key,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let bucket = "other-bucket";
+        let key = "dummy.txt";
+        let content_hash = upload_data(&client, "other-bucket", "dummy.txt", "Some other content".as_bytes())
+            .await
+            .unwrap();
+
+        // Get object with invalid request
+        let invalid_client = create_s3_client(&format!("http://{}", node.s3_endpoint), None, "", "", true)
+            .await
+            .unwrap();
+
+        let err_res = invalid_client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        assert!(err_res.is_err());
+
+        //TODO: Get object with invalid permissions
+        // Get object with valid request from specific node
+        let mut response = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let mut content = vec![];
+        let mut hasher = Hasher::new();
+        while let Some(bytes) = response.body.try_next().await.unwrap() {
+            hasher.update(bytes.as_ref());
+            content.extend_from_slice(bytes.as_ref());
+        }
+        let hash = hasher.finalize();
+        assert_eq!(
+            String::from_utf8(content).unwrap(),
+            "Some other content"
+        );
+        assert_eq!(content_hash, hash.to_string());
+
+        //TODO: Get object with valid request from other node in same realm
+
+        //TODO: Get object with valid request from other node in other realm (should fail)
+
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_replicate_object() {}
