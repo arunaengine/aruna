@@ -1,7 +1,6 @@
 use anyhow::anyhow;
 use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::config::config::Config as DataConfig;
-use aruna_data::util::opendal::get_operator;
 use aruna_data::{ACCESS_DB_NAME, IOHandler, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 use aruna_metadata::{
     api::server::RestServer,
@@ -22,8 +21,8 @@ use data_encoding::HEXLOWER;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use futures_util::TryFutureExt;
-use iroh::{NodeAddr, SecretKey};
 use iroh::{KeyParsingError, PublicKey};
+use iroh::{NodeAddr, SecretKey};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -206,28 +205,13 @@ pub async fn start_data(
     perm_manager: PermissionManager,
     token_handler: Arc<RwLock<TokenSystem>>,
 ) -> Result<(), ArunaError> {
-    let op_conf = config.config.backend.access.clone();
-    let operator = get_operator(&config.config.backend.backend_type, op_conf).await?;
-    match operator.check().await {
-        Ok(_) => debug!(
-            "Connection to {} backend succeeded",
-            config.config.backend.backend_type
-        ),
-        Err(err) => {
-            error!("Connection to backend failed: {}", err);
-            //anyhow::bail!("Connection to backend failed: {}", err);
-        }
-    }
-
-    let kademlia = network.chandler.get_kademlia_actor_handle().await?;
-    let node_addr = network.chandler.get_node_addr().await?;
-
     // Create and run IOHandler
+    let node_addr = network.chandler.get_node_addr().await?;
     let io_handler = IOHandler::<LmdbStore>::new(
         node_addr.clone(),
-        operator,
         network.chandler.clone(),
-        kademlia,
+        network.chandler.get_kademlia_actor_handle().await?,
+        config.config.backend.clone(),
         Arc::new(store),
         perm_manager.clone(),
         config.config.general.realm_key.to_bytes(),
@@ -236,8 +220,8 @@ pub async fn start_data(
     let s3server = S3Server::new(
         config.config.frontend.s3_frontend.clone(),
         io_handler.clone(),
+        config.config.backend.clone(),
         perm_manager.clone(),
-        node_addr.node_id,
         config.config.general.realm_key.to_bytes(),
     )
     .await?;
