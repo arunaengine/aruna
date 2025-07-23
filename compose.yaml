@@ -34,6 +34,11 @@ services:
     command: "server /data --console-address ':9001'"
   aruna:
     image: aruna:latest
+    pull_policy: never
+    build: 
+      context: .
+      tags:
+        - aruna:latest
     network_mode: "host"
     environment:
       REALM_KEY: |-
@@ -41,7 +46,7 @@ services:
         MFECAQEwBQYDK2VwBCIEIJucl73sk/By4tUQqsv1qopNy1Bi+EWhPugOxB+dyFRW
         gSEAtOYxE8jy2F90OEGr7NixCoc6pDIHMG2GwhKWfJqMGQA=
         -----END PRIVATE KEY-----
-      P2P_KEY: "358ea489d2f7d91466eff6edbb7d69b507346dc199d963915138865c03ffe1db"
+      P2P_KEY: "83257bf8205619d904bf4f7b007a1178924c2cd8c7aec6341c63fbfccddee8e0"
       P2P_ADDRESS: "0.0.0.0"
       P2P_PORT: 1230
       ISSUERS: |
@@ -58,14 +63,17 @@ services:
       BACKEND_ENCRYPTION: false
       BACKEND_COMPRESSION: false
       BACKEND_DEDUPLICATION: false
+      BACKEND_MAX_BUCKET_SIZE: 100000
       BACKEND_ACCESS_ENDPOINT: "http://localhost:9000"
       BACKEND_ACCESS_REGION: "eu-central-1"
       BACKEND_ACCESS_REGION_DISABLE_CONFIG_LOAD: true
       BACKEND_ACCESS_BUCKET: "aruna"
       BACKEND_ACCESS_ACCESS_KEY_ID: "minioadmin"
       BACKEND_ACCESS_SECRET_ACCESS_KEY: "minioadmin"
-      OPENAPI_ADDRESS: "0.0.0.0"
-      OPENAPI_PORT: 8080
+      DATA_OPENAPI_ADDRESS: "0.0.0.0"
+      DATA_OPENAPI_PORT: 8080
+      METADATA_OPENAPI_ADDRESS: "0.0.0.0"
+      METADATA_OPENAPI_PORT: 8081
       S3_SERVER: "0.0.0.0:1337"
       S3_HOSTNAME: "localhost:1337"
       S3_CORS_EXCEPTION: "http://localhost:3000"
