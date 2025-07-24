@@ -1,12 +1,12 @@
 use crate::{
     error::ArunaMetadataError,
-    models::requests::{ForwardRequest, ForwardResponse},
+    models::requests::{ForwardRequest, ForwardResponse, Request},
     network::util::send_message,
     persistence::{
         persistor::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
         search::generic::Search,
     },
-    transactions::{controller::Controller, request::Request},
+    transactions::controller::Controller,
 };
 use aruna_net::{
     actor::NetworkActorBuilder,
@@ -20,12 +20,11 @@ use iroh::{NodeAddr, PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddrV4, sync::Arc};
 use tracing::{Instrument, error};
-use ulid::Ulid;
 
 use super::util::read_message;
 
-pub static METADATA_PROTOCOL_ID: u32 = 3;
-pub static REPLICATION_POLICY: usize = 1;
+pub const METADATA_PROTOCOL_ID: u32 = 3;
+pub const REPLICATION_POLICY: usize = 2;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 //pub struct MetadataMessage<R: Request> {
@@ -94,7 +93,7 @@ pub trait Network: Sync + Send + Sized {
     async fn forward(
         &self,
         body: Body,
-        subject_id: &Ulid,
+        subject_hash: &[u8; 32],
         target_node: NodeAddr,
     ) -> Result<ForwardResponse, ArunaMetadataError>;
     async fn create_stream(&self, target: PublicKey) -> Result<Self::Stream, ArunaMetadataError>;
@@ -179,7 +178,7 @@ impl Network for NetworkDummy {
     async fn forward(
         &self,
         _body: Body,
-        _subject_id: &Ulid,
+        _subject_hash: &[u8; 32],
         _target_node: NodeAddr,
     ) -> Result<ForwardResponse, ArunaMetadataError> {
         Err(ArunaMetadataError::NetworkError(
@@ -373,24 +372,19 @@ impl Network for P2PNetwork {
         Ok(response)
     }
 
-    #[tracing::instrument(level = "trace", skip(self, subject_id))]
+    #[tracing::instrument(level = "trace", skip(self, subject_hash))]
     async fn forward(
         &self,
         body: Body,
-        subject_id: &Ulid,
+        subject_hash: &[u8; 32],
         target_node: NodeAddr,
     ) -> Result<ForwardResponse, ArunaMetadataError> {
         let node_addr = self.chandler.get_node_addr().await?;
 
-        // Calc hash
-        let mut chunk_hasher = blake3::Hasher::new();
-        chunk_hasher.update(subject_id.to_bytes().as_slice());
-        let id_hash = chunk_hasher.finalize();
-
         let message = MetadataMessage {
             from: *node_addr.node_id.as_bytes(),
             to: *target_node.node_id.as_bytes(),
-            subject: *id_hash.as_bytes(),
+            subject: *subject_hash,
             body,
         };
 
@@ -578,17 +572,16 @@ impl P2PNetwork {
                             .persistence
                             .handle_user_merges(doc.save())
                             .await?;
-                        self.store(&subject).await?;
                     }
                     ReplicationSubject::Object(None) => {
                         controller
                             .persistence
                             .handle_object_merges(path, doc.save())
                             .await?;
-                        self.store(&subject).await?;
                     }
                     _ => continue,
                 }
+                self.store(&subject).await?;
                 recv_stream
                     .send_stream
                     .finish()
@@ -629,6 +622,107 @@ impl P2PNetwork {
                 }
                 Body::Request { token, request } => {
                     let body = match request {
+                        // User requests:
+                        ForwardRequest::AddUser(req) => {
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    Box::new(ForwardResponse::AddUser(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    )),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::GetResource(Err(e)),
+                                ))),
+                            }
+                        }
+                        ForwardRequest::GetUser(req) => {
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    Box::new(ForwardResponse::GetUser(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    )),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::GetResource(Err(e)),
+                                ))),
+                            }
+                        }
+                        ForwardRequest::CreateToken(req) => {
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    Box::new(ForwardResponse::CreateToken(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    )),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::GetResource(Err(e)),
+                                ))),
+                            }
+                        }
+
+                        // Group request:
+                        ForwardRequest::AddGroup(req) => {
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    Box::new(ForwardResponse::AddGroup(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    )),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::GetResource(Err(e)),
+                                ))),
+                            }
+                        }
+                        ForwardRequest::AddUserToGroup(req) => {
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    Box::new(ForwardResponse::AddUserToGroup(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    )),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::GetResource(Err(e)),
+                                ))),
+                            }
+                        }
+                        ForwardRequest::GetGroup(req) => {
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    Box::new(ForwardResponse::GetGroup(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    )),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::GetResource(Err(e)),
+                                ))),
+                            }
+                        }
+
+                        // Resource requests:
+                        ForwardRequest::CreateProject(req) => {
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    Box::new(ForwardResponse::CreateProject(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    )),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::Search(Err(e)),
+                                ))),
+                            }
+                        }
+                        ForwardRequest::CreateResource(req) => {
+                            match req.authorize(token, controller).await {
+                                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
+                                    Box::new(ForwardResponse::CreateResource(
+                                        req.clone().run_request(auth_ctx, controller).await,
+                                    )),
+                                )),
+                                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                                    ForwardResponse::Search(Err(e)),
+                                ))),
+                            }
+                        }
                         ForwardRequest::GetResource(req) => {
                             match req.authorize(token, controller).await {
                                 Ok(auth_ctx) => Body::Response(Response::ForwardResponse(
@@ -678,7 +772,7 @@ impl P2PNetwork {
                     .await?;
                 }
                 Body::Response { .. } => {
-                    todo!("Backchannel for updated merged docs or sync protocol");
+                    // TODO: todo!("Backchannel for updated merged docs or sync protocol");
                     // Nothing to do here, there are currently no messages that send responses
                     // after replication/forwarding back
                 }

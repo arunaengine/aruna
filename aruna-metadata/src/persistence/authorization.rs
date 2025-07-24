@@ -1,6 +1,6 @@
 use aruna_permission::{Action, OidcToken, Path, ResourceId, UserIdentity};
 use aruna_storage::storage::store::Store;
-use tracing::{Instrument, error};
+use tracing::error;
 use ulid::Ulid;
 
 use crate::{error::ArunaMetadataError, logerr};
@@ -207,10 +207,11 @@ where
                         action,
                         &self.store,
                     )
-                    .await?;
+                    .await
+                    .map_err(logerr!())?;
                 Ok(Some((user_identity, path)))
             }
-            None => match self.check_public(&resource_id).await? {
+            None => match self.check_public(&resource_id).await.map_err(logerr!())? {
                 true => Ok(None),
                 false => Err(ArunaMetadataError::Unauthorized),
             },

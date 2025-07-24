@@ -1,19 +1,22 @@
-use super::request::Request;
 use crate::{
     error::ArunaMetadataError,
     logerr,
-    models::structs::TypedDoc,
+    models::{
+        requests::Request,
+        structs::{PolicyResult, TypedDoc},
+    },
     network::network_trait::Network,
     persistence::{
         persistor::{Persistor, tables::USER_DB_NAME},
         search::generic::Search,
     },
 };
-use aruna_permission::{Path, UserIdentity};
+use aruna_permission::Path;
 use aruna_storage::storage::store::Store;
 use automerge::sync::Message;
 use iroh::NodeAddr;
 use std::sync::Arc;
+use tokio::task::JoinSet;
 use tracing::Instrument;
 
 pub struct Controller<St, Se, N>
@@ -40,26 +43,28 @@ where
         }
     }
     #[tracing::instrument(level = "trace", skip(self, request, token))]
-    pub async fn request<R: Request<St, Se, N>>(
+    pub async fn request<R: Request<St, Se, N> + Send>(
         &self,
-        request: R,
+        mut request: R,
         token: Option<String>,
     ) -> Result<R::Response, ArunaMetadataError> {
-        match request.forward_or_return(&token, self).await? {
-            Some(response) => Ok(response),
-            None => {
-                let user_identity = request.authorize(token, self).await?;
-                let result = request.run_request(user_identity, self).await?;
-                Ok(result)
+        match &mut request.run_policy(&token, self).await? {
+            PolicyResult::Deny(reason) => Err(ArunaMetadataError::Forbidden(reason.to_string())),
+            PolicyResult::Forward => request.forward(&token, self).await,
+            PolicyResult::Modify | PolicyResult::Accept => {
+                match request.sync_or_forward(&token, self).await? {
+                    Some(response) => Ok(response),
+                    None => {
+                        let user_identity = request.authorize(token, self).await?;
+                        request.run_request(user_identity, self).await
+                    }
+                }
             }
         }
     }
 
     #[tracing::instrument(level = "trace", skip(self, token))]
-    pub async fn get_or_sync_user(
-        &self,
-        token: String,
-    ) -> Result<UserIdentity, ArunaMetadataError> {
+    pub async fn sync_user(&self, token: String) -> Result<(), ArunaMetadataError> {
         let identity = self
             .persistence
             .get_identity(token)
@@ -90,9 +95,12 @@ where
                 path,
                 nodes.into_iter(),
             )
-            .await?;
+            .await
+            .join_all()
+            .await;
+            self.network.store(subject_hash).await?;
         }
-        Ok(identity)
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self, doc, nodes))]
@@ -103,7 +111,8 @@ where
         doc_id: Vec<u8>,
         path: Path,
         nodes: impl Iterator<Item = NodeAddr>,
-    ) -> Result<(), ArunaMetadataError> {
+    ) -> JoinSet<Result<(), ArunaMetadataError>> {
+        let mut tasks = tokio::task::JoinSet::new();
         for node in nodes {
             let inner_doc = doc.get_inner();
             let network = self.network.clone();
@@ -111,7 +120,7 @@ where
             let doc = doc.clone();
             let doc_id = doc_id.clone();
             let path = path.clone();
-            tokio::spawn(
+            tasks.spawn(
                 async move {
                     let mut stream = network.create_stream(node.node_id).await?;
                     let mut document = inner_doc;
@@ -182,6 +191,6 @@ where
                 .in_current_span(),
             );
         }
-        Ok(())
+        tasks
     }
 }

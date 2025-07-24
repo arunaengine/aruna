@@ -1,16 +1,16 @@
-use std::collections::HashSet;
-
-use super::request::Request;
+use crate::logerr;
+use crate::models::requests::Request;
 use crate::{
     error::ArunaMetadataError,
     models::{
-        structs::Resource,
         requests::{SearchRequest, SearchResponse},
+        structs::Resource,
     },
     network::network_trait::Network,
     persistence::search::generic::Search,
 };
 use aruna_storage::storage::store::Store;
+use std::collections::HashSet;
 use tracing::error;
 use ulid::Ulid;
 
@@ -31,7 +31,7 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Vec<Ulid>>, crate::error::ArunaMetadataError> {
         if let Some(token) = token {
-            let user_identity = controller.get_or_sync_user(token).await?;
+            let user_identity = controller.persistence.get_identity(token).await?;
             match controller.persistence.get_user_groups(&user_identity).await {
                 Ok(groups) => Ok(Some(groups)),
                 Err(err) => {
@@ -44,12 +44,27 @@ where
         }
     }
 
-    #[tracing::instrument(level = "trace", skip(controller))]
-    async fn forward_or_return(
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn sync_or_forward(
         &self,
         token: &Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        if let Some(token) = token {
+            controller
+                .sync_user(token.clone())
+                .await
+                .map_err(logerr!())?;
+        }
+        Ok(Some(self.forward(token, controller).await?))
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let body = crate::network::network_trait::Body::Request {
             token: token.clone(),
             request: crate::models::requests::ForwardRequest::Search(self.clone()),
@@ -70,7 +85,7 @@ where
             } else {
                 match controller
                     .network
-                    .forward(body.clone(), &Ulid::default(), node.clone())
+                    .forward(body.clone(), &[0u8; 32], node.clone())
                     .await
                 {
                     Ok(crate::models::requests::ForwardResponse::Search(response)) => {
@@ -94,9 +109,9 @@ where
                 }
             }
         }
-        Ok(Some(SearchResponse {
+        Ok(SearchResponse {
             resources: results.into_iter().collect(),
-        }))
+        })
     }
 
     #[tracing::instrument(level = "trace", skip(controller))]

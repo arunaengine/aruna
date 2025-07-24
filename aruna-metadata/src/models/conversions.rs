@@ -1,8 +1,9 @@
+use tracing::trace;
 use ulid::Ulid;
 
 use crate::error::ArunaMetadataError;
 
-use super::structs::{Group, Resource, User};
+use super::{requests::{GetUserRequest, GetUserRequestOuter}, structs::{Group, Resource, User}};
 
 impl TryFrom<&[u8]> for Resource {
     type Error = ArunaMetadataError;
@@ -49,6 +50,15 @@ impl TryFrom<Group> for Vec<u8> {
     fn try_from(value: Group) -> Result<Self, Self::Error> {
         let bytes = postcard::to_allocvec(&value)?;
         Ok(bytes)
+    }
+}
+impl TryFrom<GetUserRequestOuter> for GetUserRequest {
+    type Error = ArunaMetadataError;
+    fn try_from(value: GetUserRequestOuter) -> Result<Self, Self::Error> {
+        trace!("{value:?}");
+        Ok(GetUserRequest {
+            id: aruna_permission::UserIdentity::from_string(value.id)?
+        })
     }
 }
 

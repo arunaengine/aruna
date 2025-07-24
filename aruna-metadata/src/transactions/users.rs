@@ -1,4 +1,6 @@
-use super::request::Request;
+use crate::error::ArunaMetadataError;
+use crate::logerr;
+use crate::models::requests::{ForwardResponse, Request};
 use crate::{
     models::requests::{
         AddUserRequest, AddUserResponse, CreateTokenRequest, CreateTokenResponse, GetUserRequest,
@@ -39,13 +41,48 @@ where
         }
     }
 
-    #[tracing::instrument(level = "trace", skip(_controller))]
-    async fn forward_or_return(
+    #[tracing::instrument(level = "trace", skip(_controller, _token))]
+    async fn sync_or_forward(
         &self,
-        user: &Option<String>,
+        _token: &Option<String>,
         _controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
         Ok(None)
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let body = crate::network::network_trait::Body::Request {
+            token: token.clone(),
+            request: crate::models::requests::ForwardRequest::AddUser(self.clone()),
+        };
+
+        let nodes = controller.network.get_realm_nodes().await?;
+        let self_addr = controller.network.get_addr().await?;
+        let mut nodes = nodes
+            .iter()
+            .filter(|node_addr| node_addr.node_id != self_addr.node_id);
+
+        let Some(first_node) = nodes.next() else {
+            return Err(crate::error::ArunaMetadataError::NetworkError(
+                "No node to forward request to found".to_string(),
+            ));
+        };
+
+        match controller
+            .network
+            .forward(body, &[0u8; 32], first_node.clone())
+            .await?
+        {
+            ForwardResponse::AddUser(response) => Ok(response?),
+            e => Err(crate::error::ArunaMetadataError::NetworkError(format!(
+                "Got wrong forward response {e:?}"
+            ))),
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(controller))]
@@ -90,11 +127,9 @@ where
                 path,
                 members,
             )
-            .await?;
-        let token = controller
-            .persistence
-            .create_token(&user.id, None)
-            .await?;
+            .await
+            .detach_all();
+        let token = controller.persistence.create_token(&user.id, None).await?;
 
         Ok(AddUserResponse { user, token })
     }
@@ -120,17 +155,82 @@ where
         let Some(token) = token else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        controller.persistence.get_identity(token).await
+        let identity = controller.persistence.get_identity(token).await?;
+        if identity != self.id {
+            // TODO: Querying users that are not self is currently unimplemented
+            Err(crate::error::ArunaMetadataError::Unauthorized)
+        } else {
+            Ok(identity)
+        }
     }
 
-    #[tracing::instrument(level = "trace", skip(_controller))]
-    async fn forward_or_return(
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn sync_or_forward(
         &self,
-        user: &Option<String>,
-        _controller: &super::controller::Controller<St, Se, N>,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
-        // TODO: Forward when cross realm and user querying other users is implemented
-        Ok(None)
+        let identity = controller
+            .persistence
+            .get_identity(
+                token
+                    .clone()
+                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+            )
+            .await
+            .map_err(logerr!())?;
+        if identity.realm_key != controller.network.get_realm_key().await? {
+            Ok(Some(self.forward(token, controller).await?))
+        } else {
+            controller
+                .sync_user(
+                    token
+                        .clone()
+                        .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+                )
+                .await?;
+            Ok(None)
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let body = crate::network::network_trait::Body::Request {
+            token: token.clone(),
+            request: crate::models::requests::ForwardRequest::GetUser(self.clone()),
+        };
+
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(&self.id.to_bytes());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+
+        let nodes = controller.network.find(subject_hash).await?;
+        let self_addr = controller.network.get_addr().await?;
+        let mut nodes = nodes
+            .iter()
+            .filter(|node_addr| node_addr.node_id != self_addr.node_id);
+
+        let Some(first_node) = nodes.next() else {
+            return Err(crate::error::ArunaMetadataError::NetworkError(
+                "No node to forward request to found".to_string(),
+            ));
+        };
+
+        match controller
+            .network
+            .forward(body, subject_hash, first_node.clone())
+            .await?
+        {
+            ForwardResponse::GetUser(response) => Ok(response?),
+            e => Err(crate::error::ArunaMetadataError::NetworkError(format!(
+                "Got wrong forward response {e:?}"
+            ))),
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(controller))]
@@ -165,20 +265,93 @@ where
         token: Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError> {
-        // TODO: Handle permissions when user is requesting other users
         let Some(token) = token else {
             return Err(crate::error::ArunaMetadataError::Unauthorized);
         };
-        controller.persistence.get_identity(token).await
+        let identity = controller.persistence.get_identity(token).await?;
+        if identity.realm_key != controller.network.get_realm_key().await? {
+            return Err(crate::error::ArunaMetadataError::Unauthorized);
+        } else {
+            Ok(identity)
+        }
     }
 
-    #[tracing::instrument(level = "trace", skip(_controller))]
-    async fn forward_or_return(
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn sync_or_forward(
         &self,
-        user: &Option<String>,
-        _controller: &super::controller::Controller<St, Se, N>,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
-        Ok(None)
+        let identity = controller
+            .persistence
+            .get_identity(
+                token
+                    .clone()
+                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+            )
+            .await
+            .map_err(logerr!())?;
+        if identity.realm_key != controller.network.get_realm_key().await? {
+            Ok(Some(self.forward(token, controller).await?))
+        } else {
+            controller
+                .sync_user(
+                    token
+                        .clone()
+                        .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+                )
+                .await?;
+            Ok(None)
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let identity = controller
+            .persistence
+            .get_identity(
+                token
+                    .clone()
+                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+            )
+            .await
+            .map_err(logerr!())?;
+        let body = crate::network::network_trait::Body::Request {
+            token: token.clone(),
+            request: crate::models::requests::ForwardRequest::CreateToken(self.clone()),
+        };
+
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(&identity.to_bytes());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+
+        let nodes = controller.network.find(subject_hash).await?;
+        let self_addr = controller.network.get_addr().await?;
+        let mut nodes = nodes
+            .iter()
+            .filter(|node_addr| node_addr.node_id != self_addr.node_id);
+
+        let Some(first_node) = nodes.next() else {
+            return Err(crate::error::ArunaMetadataError::NetworkError(
+                "No node to forward request to found".to_string(),
+            ));
+        };
+
+        match controller
+            .network
+            .forward(body, subject_hash, first_node.clone())
+            .await?
+        {
+            ForwardResponse::CreateToken(response) => Ok(response?),
+            e => Err(crate::error::ArunaMetadataError::NetworkError(format!(
+                "Got wrong forward response {e:?}"
+            ))),
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(controller))]

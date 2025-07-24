@@ -18,6 +18,7 @@ use autosurgeon::reconcile;
 use iroh::PublicKey;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
+use tracing::trace;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, atomic::AtomicU32},
@@ -233,6 +234,33 @@ where
 
                 store.commit(read_txn)?;
                 Ok(resource)
+            })
+        })
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+        Ok(result)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn get_group(&self, group_id: Ulid) -> Result<Group, ArunaMetadataError> {
+        let store = self.store.clone();
+        let current_span = tracing::Span::current();
+        let result = tokio::task::spawn_blocking(move || {
+            current_span.in_scope(|| {
+                let read_txn = store.create_txn(false)?;
+                let byte_id = group_id.to_bytes();
+                let Some(res) = store.get(&read_txn, GROUPS_DB_NAME, &byte_id)? else {
+                    trace!("Group with id {} not found", group_id.to_string());
+                    return Err(ArunaMetadataError::NotFound(format!(
+                        "{} not found", group_id.to_string()
+                    )));
+                };
+
+                let doc = automerge::AutoCommit::load(res.as_ref())?;
+                let group: Group = autosurgeon::hydrate(&doc)?;
+
+                store.commit(read_txn)?;
+                Ok(group)
             })
         })
         .await
@@ -592,15 +620,16 @@ where
 
                     let mut group_doc =
                         automerge::AutoCommit::load(group_bytes.as_ref())?.with_actor(actor_id);
-
                     let mut group: Group = autosurgeon::hydrate(&group_doc)?;
                     let mut handles = Vec::new();
 
                     for (user, roles_to_add) in user_roles {
                         let identity = UserIdentity::from_string(user.clone())?;
                         let roles = group.members.entry(user).or_insert(roles_to_add.clone());
-                        roles.extend(roles_to_add.into_iter());
                         for role in roles {
+                            if !group.roles.contains(role) {
+                                group.roles.push(role.to_string());
+                            }
                             let handle = permission.add_user_prepare(
                                 group_id,
                                 &identity,

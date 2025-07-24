@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::error;
 use ulid::Ulid;
 
 use crate::casbin::DBNAME;
@@ -56,10 +57,17 @@ impl UserIdentity {
 
     pub fn from_string(user_id: String) -> Result<Self> {
         let (ulid, realm_key) = user_id.split_once('@').ok_or_else(|| {
+            error!("Invalid format for UserIdentity");
             ConversionError::InvalidFormat("Invalid format for UserIdentity".to_string())
         })?;
-        let ulid = Ulid::from_string(ulid).map_err(|e| ConversionError::InvalidUlid(e))?;
-        let realm_key = hex::decode(realm_key).map_err(|e| ConversionError::InvalidRealmKey(e))?;
+        let ulid = Ulid::from_string(ulid).map_err(|e| {
+            error!(?e);
+            ConversionError::InvalidUlid(e)
+        })?;
+        let realm_key = hex::decode(realm_key).map_err(|e| {
+            error!(?e);
+            ConversionError::InvalidRealmKey(e)
+        })?;
 
         let realm_key: &[u8; 32] = realm_key
             .as_slice()
@@ -628,14 +636,31 @@ impl PermissionManager {
         let member_role = format!("{}_member", group_id);
 
         // Create admin role with full group access
-        let admin_path = Path::builder()
+        let admin_group_path = Path::builder().realm_id(realm_id).group(group_id).build()?;
+
+        let admin_group_role_policy = vec![
+            admin_role.clone(),
+            admin_group_path.to_string(),
+            "write".to_string(),
+            "allow".to_string(),
+        ];
+
+        store.put(
+            txn,
+            DBNAME,
+            format!("p:{}", admin_group_role_policy.join(":")).as_bytes(),
+            &[],
+        )?;
+
+        // Create admin role with full access to group resources
+        let admin_group_wildcard_path = Path::builder()
             .realm_id(realm_id)
             .group_wildcard(group_id)
             .build()?;
 
-        let admin_role_policy = vec![
+        let admin_group_wildcard_role_policy = vec![
             admin_role.clone(),
-            admin_path.to_string(),
+            admin_group_wildcard_path.to_string(),
             "write".to_string(),
             "allow".to_string(),
         ];
@@ -643,19 +668,19 @@ impl PermissionManager {
         store.put(
             txn,
             DBNAME,
-            format!("p:{}", admin_role_policy.join(":")).as_bytes(),
+            format!("p:{}", admin_group_wildcard_role_policy.join(":")).as_bytes(),
             &[],
         )?;
 
         // Create member role with resources-only access
-        let member_path = Path::builder()
+        let member_resource_path = Path::builder()
             .realm_id(realm_id)
             .group_resources_wildcard(group_id)
             .build()?;
 
-        let member_role_policy = vec![
+        let member_resource_role_policy = vec![
             member_role.clone(),
-            member_path.to_string(),
+            member_resource_path.to_string(),
             "write".to_string(),
             "allow".to_string(),
         ];
@@ -663,7 +688,24 @@ impl PermissionManager {
         store.put(
             txn,
             DBNAME,
-            format!("p:{}", member_role_policy.join(":")).as_bytes(),
+            format!("p:{}", member_resource_role_policy.join(":")).as_bytes(),
+            &[],
+        )?;
+
+        // Create member role with group read-only access
+        let member_group_path = Path::builder().realm_id(realm_id).group(group_id).build()?;
+
+        let member_group_role_policy = vec![
+            member_role.clone(),
+            member_group_path.to_string(),
+            "read".to_string(),
+            "allow".to_string(),
+        ];
+
+        store.put(
+            txn,
+            DBNAME,
+            format!("p:{}", member_group_role_policy.join(":")).as_bytes(),
             &[],
         )?;
 
@@ -678,8 +720,10 @@ impl PermissionManager {
 
         Ok(CreateGroupPrepare {
             policy: vec![
-                CasbinPolicy::new(admin_role_policy)?,
-                CasbinPolicy::new(member_role_policy)?,
+                CasbinPolicy::new(admin_group_role_policy)?,
+                CasbinPolicy::new(admin_group_wildcard_role_policy)?,
+                CasbinPolicy::new(member_resource_role_policy)?,
+                CasbinPolicy::new(member_group_role_policy)?,
             ],
             role: vec![CasbinRole::new(member_role_mapping)?],
         })

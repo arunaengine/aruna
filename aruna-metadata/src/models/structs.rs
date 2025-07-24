@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-
 use super::conversions::autosurgeon_bytes;
 use super::conversions::autosurgeon_date_time;
 use super::conversions::autosurgeon_ulid;
@@ -300,4 +299,13 @@ pub struct Group {
 pub enum HandleHelper {
     AddGroup(CreateGroupPrepare),
     AddUser(AddUserPrepare),
+}
+
+#[derive(Clone)]
+pub enum PolicyResult
+{
+    Deny(String),
+    Accept,
+    Forward,
+    Modify,
 }

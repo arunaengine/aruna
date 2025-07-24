@@ -84,7 +84,7 @@ where
         drop(lock);
         Ok(())
     }
-    #[tracing::instrument(level = "trace", skip(self))]
+    #[tracing::instrument(level = "trace", skip(self, msg, doc))]
     pub async fn handle_replication(
         &self,
         node: PublicKey,
@@ -146,7 +146,7 @@ where
         Ok(response)
     }
 
-    #[tracing::instrument(level = "trace", skip(self))]
+    #[tracing::instrument(level = "trace", skip(self, doc))]
     pub async fn handle_group_merges(&self, doc: Vec<u8>) -> Result<(), ArunaMetadataError> {
         let store = self.store.clone();
         let permission = self.permission_manager.clone();
@@ -160,70 +160,55 @@ where
                     // Parse document, actor_id and ulid
                     let mut doc = automerge::AutoCommit::load(doc.as_ref())?;
                     let foreign_group: Group = autosurgeon::hydrate(&doc)?;
+
                     let ulid_bytes = foreign_group.id.to_bytes();
+                    let mut handles = vec![];
 
                     // Decide if merge or create
-                    let (mut merged_resource, handle) =
-                        match store.get(&wtxn, GROUPS_DB_NAME, &ulid_bytes)? {
-                            Some(existing_doc) => {
-                                let mut existing_group =
-                                    automerge::AutoCommit::load(existing_doc.as_ref())?;
-                                existing_group.merge(&mut doc)?;
-                                //TODO: Add users & admins to perm handler
-                                (existing_group, vec![])
-                            }
-                            None => {
-                                let mut handles = vec![];
-                                let Some((admin, _)) = foreign_group
-                                    .members
-                                    .iter()
-                                    .find(|(_, r)| r.iter().any(|r| r == "admin"))
-                                else {
-                                    warn!("No admin found in group");
-                                    return Ok(vec![]);
-                                };
-                                let identity = UserIdentity::from_string(admin.clone())?;
-                                let handle = permission.create_group_prepare(
-                                    foreign_group.id,
-                                    &identity,
-                                    foreign_group.realm_key,
-                                    &store,
-                                    &mut wtxn,
-                                )?;
+                    let mut merged_resource = match store.get(&wtxn, GROUPS_DB_NAME, &ulid_bytes)? {
+                        Some(existing_doc) => {
+                            let mut existing_group =
+                                automerge::AutoCommit::load(existing_doc.as_ref())?;
 
-                                let path = Path::builder()
-                                    .realm_id(foreign_group.realm_key)
-                                    .group(foreign_group.id)
-                                    .build()
-                                    .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
+                            let old_group: Group = autosurgeon::hydrate(&existing_group)?;
 
-                                permission.add_resource(
-                                    ResourceId::Ulid(foreign_group.id),
-                                    &path,
-                                    &store,
-                                    &mut wtxn,
-                                )?;
-                                handles.push(HandleHelper::AddGroup(handle));
+                            for entry in &foreign_group.members {
+                                let (id, roles) = entry;
 
-                                for user in &foreign_group.members {
-                                    let (id, roles) = user;
+                                let identity = UserIdentity::from_string(id.clone())?;
+                                for role in roles {
+                                    match old_group.members.get(id) {
+                                        Some(_existing_entry) => {
+                                            if !roles.contains(role) {
+                                                let handle = permission.add_user_prepare(
+                                                    foreign_group.id,
+                                                    &identity,
+                                                    role,
+                                                    &store,
+                                                    &mut wtxn,
+                                                )?;
 
-                                    let identity = UserIdentity::from_string(id.clone())?;
-                                    for role in roles {
-                                        if id == admin && role == "admin" {
-                                            continue;
+                                                handles.push(HandleHelper::AddUser(handle));
+                                            }
                                         }
-                                        let handle = permission.add_user_prepare(
-                                            foreign_group.id,
-                                            &identity,
-                                            role,
-                                            &store,
-                                            &mut wtxn,
-                                        )?;
-                                        handles.push(HandleHelper::AddUser(handle));
+                                        None => {
+                                            let handle = permission.add_user_prepare(
+                                                foreign_group.id,
+                                                &identity,
+                                                role,
+                                                &store,
+                                                &mut wtxn,
+                                            )?;
+                                            handles.push(HandleHelper::AddUser(handle));
+                                        }
                                     }
                                 }
+                            }
 
+                            existing_group.merge(&mut doc)?;
+
+                            if let None = store.get(&wtxn, GROUPS_MAPPINGS_DB_NAME, &ulid_bytes)? {
+                                warn!("No mapping found for group {}", foreign_group.id.to_string());
                                 let mut bitmap = Vec::new();
                                 RoaringBitmap::new().serialize_into(&mut bitmap)?; // TODO: Group mappings
                                 store.put(
@@ -232,10 +217,70 @@ where
                                     &ulid_bytes,
                                     &bitmap,
                                 )?;
-
-                                (doc, handles)
                             }
-                        };
+
+                            existing_group
+                        }
+                        None => {
+                            let Some((admin, _)) = foreign_group
+                                .members
+                                .iter()
+                                .find(|(_, r)| r.iter().any(|r| r == "admin"))
+                            else {
+                                warn!("No admin found in group");
+                                return Ok(vec![]);
+                            };
+                            let identity = UserIdentity::from_string(admin.clone())?;
+                            let handle = permission.create_group_prepare(
+                                foreign_group.id,
+                                &identity,
+                                foreign_group.realm_key,
+                                &store,
+                                &mut wtxn,
+                            )?;
+                            handles.push(HandleHelper::AddGroup(handle));
+
+                            let path = Path::builder()
+                                .realm_id(foreign_group.realm_key)
+                                .group(foreign_group.id)
+                                .build()
+                                .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
+
+                            permission.add_resource(
+                                ResourceId::Ulid(foreign_group.id),
+                                &path,
+                                &store,
+                                &mut wtxn,
+                            )?;
+
+                            for entry in &foreign_group.members {
+                                let (id, roles) = entry;
+                                let identity = UserIdentity::from_string(id.clone())?;
+                                for role in roles {
+                                    if id == admin && role == "admin" {
+                                        continue;
+                                    }
+                                    let handle = permission.add_user_prepare(
+                                        foreign_group.id,
+                                        &identity,
+                                        role,
+                                        &store,
+                                        &mut wtxn,
+                                    )?;
+                                    handles.push(HandleHelper::AddUser(handle));
+                                }
+                            }
+
+                            let mut bitmap = Vec::new();
+                            RoaringBitmap::new().serialize_into(&mut bitmap)?; // TODO: Group mappings
+                            store.put(&mut wtxn, GROUPS_MAPPINGS_DB_NAME, &ulid_bytes, &bitmap)?;
+
+                            doc
+                        }
+                    };
+
+                    // let debug_group: Group = autosurgeon::hydrate(&merged_resource)?;
+                    // trace!("{}", debug_group.id.to_string());
 
                     let res = merged_resource.save();
 
@@ -243,7 +288,7 @@ where
                     store.put(&mut wtxn, GROUPS_DB_NAME, &ulid_bytes, &res)?;
 
                     store.commit(wtxn)?;
-                    Ok(handle)
+                    Ok(handles)
                 })
             },
         )

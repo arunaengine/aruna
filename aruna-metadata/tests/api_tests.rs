@@ -6,14 +6,16 @@ mod api_tests {
     use aruna_metadata::{
         models::{
             requests::{
-                AddGroupRequest, CreateProjectRequest, CreateProjectResponse,
-                CreateResourceRequest, GetResourceResponse, SearchResponse,
+                AddGroupRequest, AddGroupResponse, AddUserToGroupRequest, AddUserToGroupResponse,
+                CreateProjectRequest, CreateProjectResponse, CreateResourceRequest,
+                GetGroupResponse, GetResourceResponse, GetUserResponse, Request,
+                SearchResponse,
             },
             structs::Resource,
         },
-        transactions::request::Request,
+        network::network_trait::Network,
     };
-    use std::time::Duration;
+    use std::{collections::BTreeMap, time::Duration};
     const OFFSET: u16 = 0;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -25,14 +27,18 @@ mod api_tests {
 
         let first_node = servers.iter().next().unwrap();
 
+        let pubkey = first_node.controller.network.get_realm_key().await.unwrap();
+
         let (user1_identity, _) =
             create_user_with_token(first_node, "create_user_test1".to_string())
                 .await
                 .unwrap();
+        assert_eq!(user1_identity.realm_key, pubkey);
         let (user2_identity, _) =
             create_user_with_token(first_node, "create_user_test2".to_string())
                 .await
                 .unwrap();
+        assert_eq!(user2_identity.realm_key, pubkey);
 
         std::thread::sleep(Duration::from_secs(5));
 
@@ -53,6 +59,146 @@ mod api_tests {
                     .unwrap()
                     .is_some()
             );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_group_creation() {
+        // Init
+        let TestServers {
+            addr_server_pairs: ref servers,
+            ..
+        } = init_lmdb_servers(OFFSET).await.unwrap();
+        let client = reqwest::Client::new();
+
+        let first_node = servers.iter().next().unwrap();
+        let (user_identity1, user_token1) =
+            create_user_with_token(first_node, "group_test_user".to_string())
+                .await
+                .unwrap();
+
+        let (user_identity2, user_token2) =
+            create_user_with_token(first_node, "group_test_user_to_add".to_string())
+                .await
+                .unwrap();
+
+        // Test
+        let first_url = first_node.path.clone();
+        let request = AddGroupRequest {
+            name: "group_test_group".to_string(),
+        };
+
+        let response = client
+            .post(format!("{first_url}/groups"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user_token1.to_string()).as_ref(),
+            )
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json::<AddGroupResponse>()
+            .await
+            .unwrap();
+        let group_id = response.group.id;
+
+        let request = AddUserToGroupRequest {
+            group_id,
+            user_roles: BTreeMap::from([(user_identity2.to_string(), vec!["reader".to_string()])]),
+        };
+        let _: AddUserToGroupResponse = client
+            .post(format!("{first_url}/groups/user"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user_token1.to_string()).as_ref(),
+            )
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+
+        let response: GetGroupResponse = client
+            .get(format!("{first_url}/groups"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user_token1.to_string()).as_ref(),
+            )
+            .query(&[("id".to_string(), group_id.to_string())])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let group = response.group;
+
+        std::thread::sleep(Duration::from_secs(5));
+
+        for Server {
+            controller, path, ..
+        } in servers.iter()
+        {
+           let _: GetUserResponse = client
+                .get(format!("{path}/users"))
+                .header::<&str, &str>(
+                    "Authorization",
+                    format!("Bearer {}", user_token1.to_string()).as_ref(),
+                )
+                .query(&[("id".to_string(), user_identity1.to_string())])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let _: GetUserResponse = client
+                .get(format!("{path}/users"))
+                .header::<&str, &str>(
+                    "Authorization",
+                    format!("Bearer {}", user_token2.to_string()).as_ref(),
+                )
+                .query(&[("id".to_string(), user_identity2.to_string())])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let user1_groups = controller
+                .persistence
+                .get_user_groups(&user_identity1)
+                .await
+                .unwrap();
+            let user2_groups = controller
+                .persistence
+                .get_user_groups(&user_identity2)
+                .await
+                .unwrap();
+            assert_eq!(user1_groups, user2_groups);
+            assert!(user1_groups.contains(&group_id));
+            assert!(user2_groups.contains(&group_id));
+            assert_eq!(
+                client
+                    .get(format!("{first_url}/groups"))
+                    .header::<&str, &str>(
+                        "Authorization",
+                        format!("Bearer {}", user_token1.to_string()).as_ref(),
+                    )
+                    .query(&[("id".to_string(), group_id.to_string())])
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<GetGroupResponse>()
+                    .await
+                    .unwrap()
+                    .group,
+                group
+            )
         }
     }
 
@@ -90,7 +236,7 @@ mod api_tests {
         let group1 = response.group.id;
 
         let request = AddGroupRequest {
-            name: "gcreate_test_group2".to_string(),
+            name: "create_test_group2".to_string(),
         };
         let response = request
             .run_request(user2_identity.clone(), controller)

@@ -1,12 +1,63 @@
 use std::collections::BTreeMap;
-
 use crate::error::ArunaMetadataError;
-
 use super::structs::{Author, Group, KeyValue, Resource, User, VisibilityClass};
 use aruna_permission::UserIdentity;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
+use crate::transactions::controller::Controller;
+use crate::{
+    models::structs::PolicyResult, network::network_trait::Network, persistence::search::generic::Search
+};
+use aruna_storage::storage::store::Store;
+
+
+#[async_trait::async_trait]
+pub trait Request<St, Se, N>
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    type Response;
+    type AuthContext;
+
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &Controller<St, Se, N>,
+    ) -> Result<Self::AuthContext, crate::error::ArunaMetadataError>;
+
+    async fn run_request(
+        self,
+        auth_result: Self::AuthContext,
+        controller: &Controller<St, Se, N>,
+    ) -> Result<Self::Response, ArunaMetadataError>;
+
+    async fn run_policy(
+        &mut self,
+        _token: &Option<String>,
+        _controller: &Controller<St, Se, N>,
+    ) -> Result<PolicyResult, ArunaMetadataError> {
+        Ok(PolicyResult::Accept)
+    }
+
+    /// Syncs the prerequisites of the request to the node.
+    /// It returns an Option<Response> with either the Self::Response of the forwarded request
+    /// or None for local execution.
+    async fn sync_or_forward(
+        &self,
+        token: &Option<String>,
+        controller: &Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, ArunaMetadataError>;
+
+    /// Forwards the request 
+    async fn forward(
+        &self,
+        token: &Option<String>,
+        controller: &Controller<St, Se, N>,
+    ) -> Result<Self::Response, ArunaMetadataError>;
+}
 
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
@@ -114,6 +165,16 @@ pub struct AddGroupRequest {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddGroupResponse {
+    pub group: Group,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams)]
+pub struct GetGroupRequest {
+    pub id: Ulid,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetGroupResponse {
     pub group: Group,
 }
 
@@ -279,6 +340,19 @@ impl GetInner for ResourceUpdateRequests {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub enum ForwardRequest {
+    // User requests
+    AddUser(AddUserRequest),
+    GetUser(GetUserRequest),
+    CreateToken(CreateTokenRequest),
+
+    // Group requests
+    AddGroup(AddGroupRequest),
+    AddUserToGroup(AddUserToGroupRequest),
+    GetGroup(GetGroupRequest),
+
+    // Resource requests
+    CreateProject(CreateProjectRequest),
+    CreateResource(CreateResourceRequest),
     GetResource(GetResourceRequest),
     UpdateResource(ResourceUpdateRequests),
     Search(SearchRequest),
@@ -286,17 +360,37 @@ pub enum ForwardRequest {
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub enum ForwardResponse {
+    // User requests
+    AddUser(Result<AddUserResponse, ArunaMetadataError>),
+    GetUser(Result<GetUserResponse, ArunaMetadataError>),
+    CreateToken(Result<CreateTokenResponse, ArunaMetadataError>),
+
+    // Group requests
+    AddGroup(Result<AddGroupResponse, ArunaMetadataError>),
+    AddUserToGroup(Result<AddUserToGroupResponse, ArunaMetadataError>),
+    GetGroup(Result<GetGroupResponse, ArunaMetadataError>),
+
+    // Resource requests
+    CreateProject(Result<CreateProjectResponse, ArunaMetadataError>),
+    CreateResource(Result<CreateResourceResponse, ArunaMetadataError>),
     GetResource(Result<GetResourceResponse, ArunaMetadataError>),
     UpdateResource(Result<ResourceUpdateResponses, ArunaMetadataError>),
     Search(Result<SearchResponse, ArunaMetadataError>),
 }
-
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,
 )]
+pub struct GetUserRequestOuter {
+    pub id: String,
+}
+
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize,
+)]
 pub struct GetUserRequest {
-    #[schema(value_type=String)]
-    #[param(value_type=String)]
+    // TODO: Fix, this is not working
+    //#[schema(value_type=String)]
+    //#[param(value_type=String)]
     pub id: UserIdentity,
 }
 

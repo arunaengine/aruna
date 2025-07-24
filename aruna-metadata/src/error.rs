@@ -188,7 +188,10 @@ impl From<aruna_realm::error::RealmError> for ArunaMetadataError {
 impl From<aruna_permission::error::PermissionError> for ArunaMetadataError {
     fn from(e: aruna_permission::error::PermissionError) -> Self {
         tracing::trace!(?e);
-        ArunaMetadataError::Unauthorized
+        match e {
+            aruna_permission::PermissionError::PermissionDenied => ArunaMetadataError::Forbidden(format!("{}", e.to_string())),
+            _ => ArunaMetadataError::ServerError(format!("{}", e.to_string())),
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use aruna_metadata::{
     api::server::RestServer,
-    models::requests::AddUserRequest,
+    models::requests::{AddUserRequest, Request},
     network::network_trait::{Network, NetworkConfig, P2PNetwork},
     persistence::{
         persistor::{
@@ -13,7 +13,7 @@ use aruna_metadata::{
         },
         search::tantivy::{TantivyConfig, TantivySearch},
     },
-    transactions::{controller::Controller, request::Request},
+    transactions::controller::Controller,
 };
 use aruna_permission::{OidcToken, PermissionManager, TokenSystem, UserIdentity};
 use aruna_storage::storage::{
@@ -122,7 +122,7 @@ pub async fn init_server(
     // Token Handler
     let token_handler = Arc::new(RwLock::new(
         TokenSystem::new(
-            &realm_key.verifying_key().as_bytes().clone(),
+            &realm_key.as_bytes().clone(),
             vec![aruna_permission::token::Issuer {
                 issuer_name: "http://localhost:1998/realms/test".to_string(),
                 pubkey_url: "http://localhost:1998/realms/test/protocol/openid-connect/certs"
@@ -178,17 +178,17 @@ pub async fn init_server(
 
 pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
     //let logging_env_filter = EnvFilter::try_from_default_env()
-    //   .unwrap_or("none".into())
-    //   .add_directive("aruna_metadata=error".parse().unwrap());
-    //add_directive("aruna_storage=info".parse().unwrap())
-    //add_directive("tower_http=info".parse().unwrap())
-    //add_directive("aruna_net=info".parse().unwrap());
+    //    .unwrap_or("none".into())
+    //    .add_directive("aruna_metadata=trace".parse().unwrap())
+    //    .add_directive("aruna_permission=trace".parse().unwrap());
+    ////add_directive("tower_http=info".parse().unwrap())
+    ////add_directive("aruna_net=info".parse().unwrap());
 
-    // let fmt_layer = tracing_subscriber::fmt::layer()
-    //     .with_file(true)
-    //     .with_line_number(true)
-    //     .with_filter(logging_env_filter);
-    // tracing_subscriber::registry().with(fmt_layer).init();
+    //let fmt_layer = tracing_subscriber::fmt::layer()
+    //    .with_file(true)
+    //    .with_line_number(true)
+    //    .with_filter(logging_env_filter);
+    //tracing_subscriber::registry().with(fmt_layer).init();
 
     let realm_key = SigningKey::generate(&mut OsRng);
     let mut servers = Vec::new();
@@ -222,7 +222,6 @@ pub async fn create_user_with_token(
     server: &Server,
     name: String,
 ) -> Result<(UserIdentity, String)> {
-
     let request = AddUserRequest { name: name.clone() };
     let response = request
         .run_request(
@@ -247,7 +246,8 @@ pub async fn create_user_with_token(
         )
         .await?;
     let user_identity = response.user.id;
-    let user_token = server.controller
+    let user_token = server
+        .controller
         .persistence
         .token_handler
         .read()

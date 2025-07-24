@@ -1,3 +1,4 @@
+use super::utils::{extract_token, into_axum_response};
 use crate::{
     error::ArunaMetadataError, models::requests::*, network::network_trait::Network,
     persistence::search::generic::Search, transactions::controller::Controller,
@@ -9,14 +10,14 @@ use axum::{
     http::HeaderMap,
     response::IntoResponse,
 };
+use tracing::trace;
 use std::sync::Arc;
 use tags::*;
-use super::utils::{extract_token, into_axum_response};
 
 mod tags {
     pub const RESOURCES: &str = "resources";
     // pub const REALMS: &str = "realms";
-    // pub const GROUPS: &str = "groups";
+    pub const GROUPS: &str = "groups";
     pub const USERS: &str = "users";
     // pub const GLOBAL: &str = "global";
     pub const INFO: &str = "info";
@@ -522,13 +523,11 @@ where
 }
 
 /// Authorizes and returns a user
-/// TODO: Add to server after cross realm verification 
-///       and foreign users querying local users is implemented
 #[utoipa::path(
     get,
     path = "/users",
     params (
-        GetUserRequest
+        GetUserRequestOuter
     ),
     responses(
         (status = 200, body = GetUserResponse),
@@ -543,14 +542,22 @@ where
 pub async fn get_user<St, Se, N>(
     State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
-    Json(request): Json<GetUserRequest>,
+    axum_extra::extract::Query(request): axum_extra::extract::Query<GetUserRequestOuter>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
     Se: Search + 'static,
     N: Network + 'static,
 {
-    into_axum_response(state.request(request, extract_token(&headers)).await)
+    // TODO: FIXME: This is ugly
+    match GetUserRequest::try_from(request) {
+        Ok(request) => state
+            .request(request, extract_token(&headers))
+            .await
+            .map(|r| (axum::http::StatusCode::OK, Json(r)).into_response())
+            .unwrap_or_else(|e| e.into_axum_tuple().into_response()),
+        Err(err) => err.into_axum_tuple().into_response(),
+    }
 }
 
 /// Add a new group
@@ -565,7 +572,7 @@ where
     security(
         ("auth" = [])
     ),
-    tag = USERS,
+    tag = GROUPS,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
 pub async fn add_group<St, Se, N>(
@@ -592,13 +599,43 @@ where
     security(
         ("auth" = [])
     ),
-    tag = USERS,
+    tag = GROUPS,
 )]
 #[tracing::instrument(level = "trace", skip(state))]
 pub async fn add_user_to_group<St, Se, N>(
     State(state): State<Arc<Controller<St, Se, N>>>,
     headers: HeaderMap,
     Json(request): Json<AddUserToGroupRequest>,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+
+/// Add a new group
+#[utoipa::path(
+    get,
+    path = "/groups",
+    params(
+        GetGroupRequest,
+    ),
+    responses(
+        (status = 200, body = GetGroupResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = GROUPS,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn get_group<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    headers: HeaderMap,
+    axum_extra::extract::Query(request): axum_extra::extract::Query<GetGroupRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
