@@ -448,57 +448,55 @@ where
         token: &Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
-        let identity = if let Some(token) = token {
-            controller.persistence.get_identity(token.clone()).await?
-        } else {
-            return Err(crate::error::ArunaMetadataError::Unauthorized);
-        };
-        let realm_key = controller.network.get_realm_key().await?;
+        controller
+            .sync_user(
+                token
+                    .clone()
+                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+            )
+            .await
+            .map_err(logerr!())?;
 
-        // TODO: Fix
-        if identity.realm_key != realm_key {
-            Ok(Some(self.forward(token, controller).await?))
-        } else {
-            controller
-                .sync_user(
-                    token
-                        .clone()
-                        .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
-                )
-                .await
-                .map_err(logerr!())?;
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        let nodes = controller.network.find_verified(subject_hash).await?;
 
-            let mut chunk_hasher = blake3::Hasher::new();
-            chunk_hasher.update(self.id.to_bytes().as_slice());
-            let subject = chunk_hasher.finalize();
-            let subject_hash = subject.as_bytes();
-            let nodes = controller.network.find_verified(subject_hash).await?;
-
-            if !nodes.contains(&controller.network.get_addr().await?) {
-                let doc = controller
+        if !nodes.contains(&controller.network.get_addr().await?) {
+            let group_id= self.id;
+            let subject_hash = subject_hash.clone();
+            let clone: super::controller::Controller<St, Se, N> = controller.clone();
+            tokio::spawn(async move {
+                let doc = clone
                     .persistence
-                    .get_or_create_doc(self.id.to_bytes(), GROUPS_DB_NAME)
+                    .get_or_create_doc(group_id.to_bytes(), GROUPS_DB_NAME)
                     .await?;
+                let realm_key = clone.network.get_realm_key().await?;
 
                 let path = Path::builder()
                     .realm_id(realm_key)
-                    .group(self.id)
+                    .group(group_id)
                     .build()
                     .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
 
-                controller
+               clone 
                     .sync_loop(
                         crate::models::structs::TypedDoc::Group(doc),
-                        *subject_hash,
-                        self.id.to_bytes(),
+                        subject_hash,
+                        group_id.to_bytes(),
                         path,
                         nodes.into_iter(),
                     )
                     .await
                     .join_all()
                     .await;
-                controller.network.store(subject_hash).await?;
-            }
+                clone.network.store(&subject_hash).await?;
+                Ok::<(), ArunaMetadataError>(())
+            });
+
+            Ok(Some(self.forward(token, controller).await?))
+        } else {
             Ok(None)
         }
     }

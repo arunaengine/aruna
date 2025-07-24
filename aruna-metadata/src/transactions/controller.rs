@@ -29,6 +29,20 @@ where
     pub persistence: Arc<Persistor<St, Se>>,
 }
 
+impl<St, Se, N> Clone for Controller<St, Se, N>
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    fn clone(&self) -> Self {
+        Controller {
+            network: self.network.clone(),
+            persistence: self.persistence.clone(),
+        }
+    }
+}
+
 impl<St, Se, N> Controller<St, Se, N>
 where
     for<'a> St: Store<'a> + 'static,
