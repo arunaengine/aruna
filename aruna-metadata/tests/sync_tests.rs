@@ -6,7 +6,7 @@ mod sync_tests {
         models::requests::{
             AddGroupRequest, AddUserToGroupRequest, AddUserToGroupResponse, CreateProjectRequest,
             CreateProjectResponse, CreateResourceRequest, CreateResourceResponse,
-            GetResourceResponse, Request,
+            Request,
         },
         network::network_trait::Network,
     };

@@ -1,14 +1,21 @@
 use aruna_data::{ACCESS_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME};
 use aruna_metadata::{
     error::ArunaMetadataError,
-    network::network_trait::{Network, NetworkConfig, P2PNetwork}, persistence::persistor::tables::{GROUPS_DB_NAME, GROUPS_MAPPINGS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME, RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME},
+    network::{
+        network_trait::Network,
+        p2p_network::{NetworkConfig, P2PNetwork},
+    },
+    persistence::persistor::tables::{
+        GROUPS_DB_NAME, GROUPS_MAPPINGS_DB_NAME, PUBLIC_MAPPINGS_DB_NAME, RESOURCE_DB_NAME,
+        RESOURCE_MAPPINGS_DB_NAME, USER_DB_NAME,
+    },
 };
-use aruna_permission::{PermissionManager, TokenSystem, };
+use aruna_permission::{PermissionManager, TokenSystem};
 use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
 };
-use config::{parse_config, start_data, start_metadata, Config};
+use config::{Config, parse_config, start_data, start_metadata};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::trace::SdkTracerProvider;

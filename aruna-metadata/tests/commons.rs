@@ -2,7 +2,7 @@ use anyhow::Result;
 use aruna_metadata::{
     api::server::RestServer,
     models::requests::{AddUserRequest, Request},
-    network::network_trait::{Network, NetworkConfig, P2PNetwork},
+    network::{network_trait::{Network}, p2p_network::{ NetworkConfig, P2PNetwork}},
     persistence::{
         persistor::{
             Persistor,
@@ -30,7 +30,6 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     str::FromStr,
     sync::{Arc, atomic::AtomicU16},
-    time::Duration,
 };
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::prelude::*;

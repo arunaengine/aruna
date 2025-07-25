@@ -1,3 +1,4 @@
 pub mod network_trait;
-mod forwarding;
+pub mod p2p_network;
+mod message_handling;
 pub mod util;

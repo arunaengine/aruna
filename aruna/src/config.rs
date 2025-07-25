@@ -1,10 +1,10 @@
 use anyhow::anyhow;
+use aruna_data::IOHandler;
 use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::config::config::Config as DataConfig;
-use aruna_data::IOHandler;
 use aruna_metadata::{
     api::server::RestServer,
-    network::network_trait::{Network, P2PNetwork},
+    network::{network_trait::Network, p2p_network::P2PNetwork},
     persistence::{
         persistor::Persistor,
         search::tantivy::{TantivyConfig, TantivySearch},
@@ -12,20 +12,13 @@ use aruna_metadata::{
     transactions::controller::Controller,
 };
 use aruna_permission::{PermissionManager, TokenSystem, token::Issuer};
-use aruna_storage::storage::{
-    lmdb::LmdbStore,
-    store::Store,
-};
+use aruna_storage::storage::{lmdb::LmdbStore, store::Store};
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use futures_util::TryFutureExt;
 use iroh::NodeAddr;
 use parking_lot::RwLock;
-use std::{
-    net::Ipv4Addr,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{net::Ipv4Addr, str::FromStr, sync::Arc};
 use tokio::try_join;
 use tracing::error;
 
