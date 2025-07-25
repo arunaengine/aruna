@@ -3,7 +3,7 @@ use crate::{
     logerr,
     models::{
         requests::Request,
-        structs::{PolicyResult, TypedDoc},
+        structs::{PolicyResult, TaskPayload, TypedDoc},
     },
     network::network_trait::Network,
     persistence::{
@@ -16,11 +16,12 @@ use crate::{
 };
 use aruna_permission::Path;
 use aruna_storage::storage::store::Store;
+use aruna_task::{error::ArunaTaskError, task_trait::TaskExecutor, Task, TaskHandler};
 use automerge::sync::Message;
 use iroh::NodeAddr;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use tracing::{trace, Instrument};
+use tracing::{Instrument, error, trace};
 use ulid::Ulid;
 
 pub struct Controller<St, Se, N>
@@ -122,10 +123,7 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self, group_id))]
-    pub async fn sync_group(
-        &self,
-        group_id: Ulid,
-    ) -> Result<(), ArunaMetadataError> {
+    pub async fn sync_group(&self, group_id: Ulid) -> Result<(), ArunaMetadataError> {
         let mut chunk_hasher = blake3::Hasher::new();
         chunk_hasher.update(group_id.to_bytes().as_slice());
         let subject = chunk_hasher.finalize();
@@ -162,6 +160,18 @@ where
 
     #[tracing::instrument(level = "trace", skip(self, doc, nodes))]
     pub async fn sync_loop(
+        &self,
+        doc: TypedDoc,
+        subject_hash: [u8; 32],
+        doc_id: Vec<u8>,
+        path: Path,
+        nodes: impl Iterator<Item = NodeAddr>,
+    ) -> JoinSet<Result<(), ArunaMetadataError>> {
+        todo!("Use task handler")
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, doc, nodes))]
+    async fn distribute_sync(
         &self,
         doc: TypedDoc,
         subject_hash: [u8; 32],
@@ -249,5 +259,45 @@ where
             );
         }
         tasks
+    }
+}
+
+#[async_trait::async_trait]
+impl<St, Se, N> TaskExecutor for Controller<St, Se, N>
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    async fn execute(&self, task: Task) -> Result<(), ArunaTaskError> {
+        let res: TaskPayload = postcard::from_bytes(&task.payload)?;
+
+        match res {
+            TaskPayload::Sync {
+                doc,
+                subject_hash,
+                doc_id,
+                path,
+                nodes,
+            } => {
+                let doc: TypedDoc = doc.try_into().map_err(|err: ArunaMetadataError| {
+                    error!("{err}");
+                    ArunaTaskError::ExecutionError(err.to_string())
+                })?;
+                for x in self
+                    .distribute_sync(doc, subject_hash, doc_id, path, nodes.into_iter())
+                    .await
+                    .join_all()
+                    .await
+                {
+                    x.map_err(|err| {
+                        error!("{err}");
+                        ArunaTaskError::ExecutionError(err.to_string())
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }

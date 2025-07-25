@@ -1,15 +1,17 @@
-use std::collections::BTreeMap;
 use super::conversions::autosurgeon_bytes;
 use super::conversions::autosurgeon_date_time;
 use super::conversions::autosurgeon_ulid;
 use super::conversions::autosurgeon_user_identity;
+use aruna_permission::Path;
 use aruna_permission::UserIdentity;
 use aruna_permission::manager::AddUserPrepare;
 use aruna_permission::manager::CreateGroupPrepare;
 use automerge::AutoCommit;
 use autosurgeon::{Hydrate, Reconcile};
 use chrono::{DateTime, Utc};
+use iroh::NodeAddr;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use ulid::Ulid;
 use utoipa::ToSchema;
 
@@ -302,10 +304,28 @@ pub enum HandleHelper {
 }
 
 #[derive(Clone)]
-pub enum PolicyResult
-{
+pub enum PolicyResult {
     Deny(String),
     Accept,
     Forward,
     Modify,
+}
+
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum TypedSavedDoc {
+    Resource(Vec<u8>),
+    Group(Vec<u8>),
+    User(Vec<u8>),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum TaskPayload {
+    Sync {
+        doc: TypedSavedDoc,
+        subject_hash: [u8; 32],
+        doc_id: Vec<u8>,
+        path: Path,
+        nodes: Vec<NodeAddr>,
+    },
 }

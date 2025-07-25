@@ -209,6 +209,7 @@ dependencies = [
  "aruna-permission",
  "aruna-realm",
  "aruna-storage",
+ "aruna-task",
  "async-trait",
  "automerge",
  "autosurgeon",
@@ -328,6 +329,30 @@ dependencies = [
  "redb",
  "thiserror 2.0.12",
  "tracing",
+]
+
+[[package]]
+name = "aruna-task"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "aruna-storage",
+ "async-trait",
+ "chrono",
+ "iroh",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "parking_lot",
+ "postcard",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.12",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "ulid",
 ]
 
 [[package]]

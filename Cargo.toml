@@ -6,7 +6,8 @@ members = [
     "aruna-data",
     "aruna-realm",
     "aruna-storage",
-    "aruna-permission"
+    "aruna-permission",
+    "aruna-task"
 ]
 resolver = "2"
 

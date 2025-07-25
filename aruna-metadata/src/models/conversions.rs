@@ -3,7 +3,10 @@ use ulid::Ulid;
 
 use crate::error::ArunaMetadataError;
 
-use super::{requests::{GetUserRequest, GetUserRequestOuter}, structs::{Group, Resource, User}};
+use super::{
+    requests::{GetUserRequest, GetUserRequestOuter},
+    structs::{Group, Resource, TypedDoc, TypedSavedDoc, User},
+};
 
 impl TryFrom<&[u8]> for Resource {
     type Error = ArunaMetadataError;
@@ -57,7 +60,28 @@ impl TryFrom<GetUserRequestOuter> for GetUserRequest {
     fn try_from(value: GetUserRequestOuter) -> Result<Self, Self::Error> {
         trace!("{value:?}");
         Ok(GetUserRequest {
-            id: aruna_permission::UserIdentity::from_string(value.id)?
+            id: aruna_permission::UserIdentity::from_string(value.id)?,
+        })
+    }
+}
+
+impl From<TypedDoc> for TypedSavedDoc {
+    fn from(value: TypedDoc) -> Self {
+        match value {
+            TypedDoc::Resource(mut d) => TypedSavedDoc::Resource(d.save()),
+            TypedDoc::Group(mut d) => TypedSavedDoc::Group(d.save()),
+            TypedDoc::User(mut d) => TypedSavedDoc::User(d.save()),
+        }
+    }
+}
+
+impl TryFrom<TypedSavedDoc> for TypedDoc {
+    type Error = ArunaMetadataError;
+    fn try_from(value: TypedSavedDoc) -> Result<Self, Self::Error> {
+        Ok(match value {
+            TypedSavedDoc::Resource(d) => TypedDoc::Resource(automerge::AutoCommit::load(&d)?),
+            TypedSavedDoc::Group(d) => TypedDoc::Group(automerge::AutoCommit::load(&d)?),
+            TypedSavedDoc::User(d) => TypedDoc::User(automerge::AutoCommit::load(&d)?),
         })
     }
 }

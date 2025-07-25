@@ -38,6 +38,7 @@ aruna-net = {path = "../aruna-net"}
 aruna-storage = {path = "../aruna-storage"}
 aruna-realm = {path = "../aruna-realm"}
 aruna-permission = {path = "../aruna-permission"}
+aruna-task = {path = "../aruna-task"}
 automerge = "0.6.1"
 autosurgeon = "0.8.7"
 hex = "0.4.3"
