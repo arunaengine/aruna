@@ -21,10 +21,11 @@ use crate::{
         authorization::Authorize, persistor::tables::GROUPS_DB_NAME, search::generic::Search,
     },
 };
+use aruna_permission::paths::PathComponent;
 use aruna_permission::{Action, Path, UserIdentity, paths::PathBuilder};
 use aruna_storage::storage::store::Store;
 use rand::seq::IteratorRandom;
-use tracing::error;
+use tracing::{error, trace};
 use ulid::Ulid;
 
 #[async_trait::async_trait]
@@ -61,15 +62,123 @@ where
         token: &Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
-        controller
-            .sync_user(
-                token
-                    .clone()
-                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
-            )
-            .await
-            .map_err(logerr!())?;
-         //todo!("Sync authorization paths");
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.parent_id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        let nodes = controller.network.find_verified(subject_hash).await?;
+
+        if nodes.is_empty() {
+            return Err(ArunaMetadataError::NotFound(format!(
+                "Parent with id {} not found",
+                self.parent_id
+            )));
+        }
+        let self_addr = controller.network.get_addr().await?;
+        if !nodes.contains(&self_addr) {
+            controller
+                .sync_user(
+                    token
+                        .clone()
+                        .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+                )
+                .await
+                .map_err(logerr!())?;
+
+            let node = nodes
+                .iter()
+                .filter(|addr| addr != &&self_addr)
+                .next()
+                .ok_or_else(|| {
+                    ArunaMetadataError::NotFound(format!(
+                        "Parent with id {} not found",
+                        self.parent_id
+                    ))
+                })?;
+
+            let response = controller
+                .network
+                .authorize(
+                    subject_hash,
+                    token.clone(),
+                    Action::Write,
+                    self.parent_id,
+                    node.clone(),
+                )
+                .await?;
+
+            trace!(?response);
+
+            match response {
+                crate::network::network_trait::AuthorizeResponse::Path(path) => {
+                    let group_id = path
+                        .components()
+                        .iter()
+                        .find_map(|component| match component {
+                            PathComponent::GroupId(id) => Some(id),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            ArunaMetadataError::ServerError("Group not found in path".to_string())
+                        })?;
+
+                    let mut chunk_hasher = blake3::Hasher::new();
+                    chunk_hasher.update(group_id.to_bytes().as_slice());
+                    let subject = chunk_hasher.finalize();
+                    let subject_hash = subject.as_bytes();
+                    let nodes = controller.network.find_verified(subject_hash).await?;
+
+                    if !nodes.contains(&controller.network.get_addr().await?) {
+                        controller
+                            .sync_user(
+                                token
+                                    .clone()
+                                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+                            )
+                            .await
+                            .map_err(logerr!())?;
+
+                        let doc = controller
+                            .persistence
+                            .get_or_create_doc(group_id.to_bytes().to_vec(), GROUPS_DB_NAME)
+                            .await?;
+
+                        let path = Path::builder()
+                            .realm_id(controller.network.get_realm_key().await?)
+                            .group(*group_id)
+                            .build()
+                            .map_err(|e| {
+                                crate::error::ArunaMetadataError::ServerError(e.to_string())
+                            })?;
+
+                        controller
+                            .sync_loop(
+                                crate::models::structs::TypedDoc::Group(doc),
+                                *subject_hash,
+                                group_id.to_bytes().to_vec(),
+                                path,
+                                nodes.into_iter(),
+                            )
+                            .await
+                            .join_all()
+                            .await;
+                        controller.network.store(subject_hash).await?;
+                    }
+                    controller
+                        .persistence
+                        .add_path(&self.parent_id, path)
+                        .await?
+                }
+                crate::network::network_trait::AuthorizeResponse::Public => {
+                    // This should not happen, because Action::Write should never result in a Public
+                    // response
+                    return Err(ArunaMetadataError::Unauthorized);
+                }
+                crate::network::network_trait::AuthorizeResponse::Error(aruna_metadata_error) => {
+                    return Err(aruna_metadata_error);
+                }
+            }
+        }
         Ok(None)
     }
 

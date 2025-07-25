@@ -25,7 +25,6 @@ use ed25519_dalek::SigningKey;
 use iroh::NodeAddr;
 use parking_lot::RwLock;
 use rand::rngs::OsRng;
-#[allow(unused)] // used for tracing of commented in
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, SocketAddrV4},
@@ -33,9 +32,7 @@ use std::{
     sync::{Arc, atomic::AtomicU16},
     time::Duration,
 };
-#[allow(unused)]
 use tracing_subscriber::EnvFilter;
-#[allow(unused)]
 use tracing_subscriber::prelude::*;
 use ulid::Ulid;
 
@@ -67,11 +64,25 @@ pub struct Server {
 }
 
 pub async fn init_server(
-    config: TestConfig,
     realm_key: SigningKey,
     offset: u16,
     bootstrap_addr: Option<NodeAddr>,
+    with_tracing: bool,
 ) -> Result<Server> {
+    if with_tracing {
+        let logging_env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or("none".into())
+            .add_directive("aruna_metadata=trace".parse().unwrap())
+            .add_directive("aruna_permission=trace".parse().unwrap());
+        //add_directive("tower_http=info".parse().unwrap())
+        //add_directive("aruna_net=info".parse().unwrap());
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_file(true)
+            .with_line_number(true)
+            .with_filter(logging_env_filter);
+        tracing_subscriber::registry().with(fmt_layer).init();
+    }
     let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let databases = vec![
@@ -89,7 +100,7 @@ pub async fn init_server(
 
     let tantivy_path = format!(
         "{}/test-{}-{}/node_{}/tantivy",
-        config.path,
+        TEST_CONFIG.path,
         subscriber,
         Ulid::new(),
         0
@@ -100,7 +111,7 @@ pub async fn init_server(
     };
     let store_path = format!(
         "{}/test-{}-{}/node_{}/heed",
-        config.path,
+        TEST_CONFIG.path,
         Ulid::new(),
         subscriber,
         0
@@ -143,8 +154,8 @@ pub async fn init_server(
         P2PNetwork::new(NetworkConfig {
             secret_key: None,
             socket_addr: SocketAddrV4::new(
-                Ipv4Addr::from_str(config.socket_addr).unwrap(),
-                config.p2p_port + offset + subscriber,
+                Ipv4Addr::from_str(TEST_CONFIG.socket_addr).unwrap(),
+                TEST_CONFIG.p2p_port + offset + subscriber,
             ),
             bootstrap_nodes: bootstrap_addr.map(|addr| vec![addr]).unwrap_or_default(),
             realm_key: realm_key.clone(),
@@ -161,7 +172,7 @@ pub async fn init_server(
         .await
         .unwrap();
 
-    let api_port = config.api_port + offset + subscriber;
+    let api_port = TEST_CONFIG.api_port + offset + subscriber;
     let controller_clone = controller.clone();
     let rest_addr = Ipv4Addr::new(0, 0, 0, 0);
     tokio::spawn(
@@ -177,32 +188,19 @@ pub async fn init_server(
 }
 
 pub async fn init_lmdb_servers(offset: u16) -> Result<TestServers> {
-    //let logging_env_filter = EnvFilter::try_from_default_env()
-    //    .unwrap_or("none".into())
-    //    .add_directive("aruna_metadata=trace".parse().unwrap())
-    //    .add_directive("aruna_permission=trace".parse().unwrap());
-    ////add_directive("tower_http=info".parse().unwrap())
-    ////add_directive("aruna_net=info".parse().unwrap());
-
-    //let fmt_layer = tracing_subscriber::fmt::layer()
-    //    .with_file(true)
-    //    .with_line_number(true)
-    //    .with_filter(logging_env_filter);
-    //tracing_subscriber::registry().with(fmt_layer).init();
-
     let realm_key = SigningKey::generate(&mut OsRng);
     let mut servers = Vec::new();
-    let init_node = init_server(TEST_CONFIG, realm_key.clone(), offset, None).await?;
+    let init_node = init_server(realm_key.clone(), offset, None, false).await?;
 
     let bootstrap_addr = init_node.addr.clone();
     servers.push(init_node);
 
     for _ in 1..5 {
         let next_node = init_server(
-            TEST_CONFIG,
             realm_key.clone(),
             offset,
             Some(bootstrap_addr.clone()),
+            false,
         )
         .await?;
         servers.push(next_node);

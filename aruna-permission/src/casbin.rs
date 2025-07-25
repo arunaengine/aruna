@@ -37,6 +37,7 @@ impl Enforcer {
         // Create the casbin enforcer
         let mut inner =
             casbin::Enforcer::new(DefaultModel::from_str(MODEL_CONF).await?, adapter).await?;
+        // inner.enable_log(true);
 
         // Load the policy
         inner.load_policy().await?;

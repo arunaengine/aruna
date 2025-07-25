@@ -26,11 +26,18 @@ use std::{
 use ulid::Ulid;
 
 pub mod tables {
+    // Table where resources are stored
     pub const RESOURCE_DB_NAME: &str = "metatadata_resources";
+    // Table where search_index -> resource_ids is stored
     pub const RESOURCE_MAPPINGS_DB_NAME: &str = "metadata_resource_mappings";
+    // Table where users are stored
     pub const USER_DB_NAME: &str = "metadata_users";
+    // Table where groups are stored
     pub const GROUPS_DB_NAME: &str = "metadata_groups";
+    // Table where group_id -> RoaringBitmap<search_index> is stored
     pub const GROUPS_MAPPINGS_DB_NAME: &str = "metadata_group_mappings";
+    // Table where all public resource a stored in one RoaringBitmap<search_index> under
+    // Ulid::default()
     pub const PUBLIC_MAPPINGS_DB_NAME: &str = "metadata_public_mappings";
 }
 type ConnectionStates =

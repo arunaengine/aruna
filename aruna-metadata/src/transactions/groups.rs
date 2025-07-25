@@ -267,16 +267,6 @@ where
             trace!("Forwarding message");
             Ok(Some(self.forward(token, controller).await?))
         } else {
-            trace!("Sync user");
-            controller
-                .sync_user(
-                    token
-                        .clone()
-                        .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
-                )
-                .await
-                .map_err(logerr!())?;
-
             let mut chunk_hasher = blake3::Hasher::new();
             chunk_hasher.update(self.group_id.to_bytes().as_slice());
             let subject = chunk_hasher.finalize();
@@ -284,7 +274,16 @@ where
             let nodes = controller.network.find_verified(subject_hash).await?;
 
             if !nodes.contains(&controller.network.get_addr().await?) {
-                trace!("Sync group");
+
+                controller
+                    .sync_user(
+                        token
+                            .clone()
+                            .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+                    )
+                    .await
+                    .map_err(logerr!())?;
+
                 let doc = controller
                     .persistence
                     .get_or_create_doc(self.group_id.to_bytes(), GROUPS_DB_NAME)
@@ -448,15 +447,6 @@ where
         token: &Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
-        controller
-            .sync_user(
-                token
-                    .clone()
-                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
-            )
-            .await
-            .map_err(logerr!())?;
-
         let mut chunk_hasher = blake3::Hasher::new();
         chunk_hasher.update(self.id.to_bytes().as_slice());
         let subject = chunk_hasher.finalize();
@@ -464,15 +454,21 @@ where
         let nodes = controller.network.find_verified(subject_hash).await?;
 
         if !nodes.contains(&controller.network.get_addr().await?) {
-            let group_id= self.id;
+            let group_id = self.id;
             let subject_hash = subject_hash.clone();
-            let clone: super::controller::Controller<St, Se, N> = controller.clone();
+            let token_clone = token.clone();
+            let controller_clone: super::controller::Controller<St, Se, N> = controller.clone();
             tokio::spawn(async move {
-                let doc = clone
+                // No need to sync user and wait if we forward anyway
+                controller_clone
+                    .sync_user(token_clone.ok_or_else(|| ArunaMetadataError::Unauthorized)?)
+                    .await
+                    .map_err(logerr!())?;
+                let doc = controller_clone
                     .persistence
                     .get_or_create_doc(group_id.to_bytes(), GROUPS_DB_NAME)
                     .await?;
-                let realm_key = clone.network.get_realm_key().await?;
+                let realm_key = controller_clone.network.get_realm_key().await?;
 
                 let path = Path::builder()
                     .realm_id(realm_key)
@@ -480,7 +476,9 @@ where
                     .build()
                     .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
 
-               clone 
+                // We need to join_all here and wait for completion to store only if sync is
+                // successfull
+                controller_clone
                     .sync_loop(
                         crate::models::structs::TypedDoc::Group(doc),
                         subject_hash,
@@ -491,7 +489,7 @@ where
                     .await
                     .join_all()
                     .await;
-                clone.network.store(&subject_hash).await?;
+                controller_clone.network.store(&subject_hash).await?;
                 Ok::<(), ArunaMetadataError>(())
             });
 

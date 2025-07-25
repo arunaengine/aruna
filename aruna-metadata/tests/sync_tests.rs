@@ -1,18 +1,18 @@
 pub mod commons;
 
 mod sync_tests {
-    use crate::commons::{Server, TestConfig, create_user_with_token, init_server};
+    use crate::commons::{Server, create_user_with_token, init_server};
     use aruna_metadata::{
         models::requests::{
             AddGroupRequest, AddUserToGroupRequest, AddUserToGroupResponse, CreateProjectRequest,
-            CreateProjectResponse, Request,
+            CreateProjectResponse, CreateResourceRequest, CreateResourceResponse,
+            GetResourceResponse, Request,
         },
         network::network_trait::Network,
     };
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
     use std::collections::BTreeMap;
-    use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
     const OFFSET: u16 = 100;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -23,19 +23,9 @@ mod sync_tests {
             controller: ref first_controller,
             ref addr,
             ..
-        } = init_server(
-            TestConfig {
-                socket_addr: "127.0.0.1",
-                path: "/dev/shm/sync_tests",
-                p2p_port: 60000,
-                api_port: 9080,
-            },
-            signing_key.clone(),
-            OFFSET,
-            None,
-        )
-        .await
-        .unwrap();
+        } = init_server(signing_key.clone(), OFFSET, None, false)
+            .await
+            .unwrap();
 
         let client = reqwest::Client::new();
 
@@ -57,19 +47,9 @@ mod sync_tests {
         // Test if group gets synced when creating project
         let Server {
             path, controller, ..
-        } = init_server(
-            TestConfig {
-                socket_addr: "127.0.0.1",
-                path: "/dev/shm/sync_tests",
-                p2p_port: 60000,
-                api_port: 9080,
-            },
-            signing_key.clone(),
-            OFFSET,
-            Some(addr.clone()),
-        )
-        .await
-        .unwrap();
+        } = init_server(signing_key.clone(), OFFSET, Some(addr.clone()), false)
+            .await
+            .unwrap();
         controller.network.update_realm().await.unwrap();
 
         // Group not yet synced
@@ -118,34 +98,10 @@ mod sync_tests {
         // Test if group gets synced when adding user
         let Server {
             path, controller, ..
-        } = init_server(
-            TestConfig {
-                socket_addr: "127.0.0.1",
-                path: "/dev/shm/sync_tests",
-                p2p_port: 60000,
-                api_port: 9080,
-            },
-            signing_key,
-            OFFSET,
-            Some(addr.clone()),
-        )
-        .await
-        .unwrap();
+        } = init_server(signing_key, OFFSET, Some(addr.clone()), false)
+            .await
+            .unwrap();
         controller.network.update_realm().await.unwrap();
-
-        let logging_env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or("none".into())
-            .add_directive("aruna_metadata=trace".parse().unwrap())
-            .add_directive("aruna_permission=trace".parse().unwrap())
-            .add_directive("casbin=trace".parse().unwrap());
-        //.add_directive("tower_http=info".parse().unwrap())
-        //.add_directive("aruna_net=info".parse().unwrap());
-
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_file(true)
-            .with_line_number(true)
-            .with_filter(logging_env_filter);
-        tracing_subscriber::registry().with(fmt_layer).init();
 
         // Group not yet synced
         assert!(
@@ -194,5 +150,110 @@ mod sync_tests {
                 .await
                 .unwrap(),
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_sync_paths() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+
+        let ref test @ Server {
+            controller: ref first_controller,
+            ref addr,
+            path: ref first_path,
+        } = init_server(signing_key.clone(), OFFSET, None, false)
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::new();
+
+        let (user_identity, user_token) =
+            create_user_with_token(&test, "sync_paths_user".to_string())
+                .await
+                .unwrap();
+
+        let request = AddGroupRequest {
+            name: "sync_paths_group".to_string(),
+        };
+        let response = request
+            .run_request(user_identity.clone(), &first_controller)
+            .await
+            .unwrap();
+
+        let group_id = response.group.id;
+
+        let create_resource = CreateProjectRequest {
+            name: format!("sync_paths_project"),
+            visibility: aruna_metadata::models::structs::VisibilityClass::Private,
+            group_id,
+            ..Default::default()
+        };
+
+        let response = client
+            .post(format!("{first_path}/resources/project"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user_token.to_string()).as_ref(),
+            )
+            .json(&create_resource)
+            .send()
+            .await
+            .unwrap()
+            .json::<CreateProjectResponse>()
+            .await
+            .unwrap();
+
+        let project_id = response.resource.id;
+
+        // Test if group gets synced when creating project
+        let Server {
+            path: second_path,
+            controller,
+            ..
+        } = init_server(signing_key.clone(), OFFSET, Some(addr.clone()), false)
+            .await
+            .unwrap();
+        controller.network.update_realm().await.unwrap();
+
+        let create_resource = CreateResourceRequest {
+            name: format!("other_project"),
+            visibility: aruna_metadata::models::structs::VisibilityClass::Private,
+            parent_id: project_id,
+            ..Default::default()
+        };
+
+        let response = client
+            .post(format!("{second_path}/resources"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user_token.to_string()).as_ref(),
+            )
+            .json(&create_resource)
+            .send()
+            .await
+            .unwrap()
+            .json::<CreateResourceResponse>()
+            .await
+            .unwrap();
+
+        let object_id = response.resource.id;
+
+        assert!(matches!(
+            controller.persistence.get_resource(project_id).await,
+            Err(aruna_metadata::error::ArunaMetadataError::NotFound(_))
+        ));
+
+        let _ = client
+            .get(format!("{first_path}/resources"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user_token.to_string()).as_ref(),
+            )
+            .query(&[("id", object_id)])
+            .send()
+            .await
+            .unwrap()
+            .json::<CreateResourceResponse>()
+            .await
+            .unwrap();
     }
 }

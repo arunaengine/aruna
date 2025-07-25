@@ -10,7 +10,6 @@ use axum::{
     http::HeaderMap,
     response::IntoResponse,
 };
-use tracing::trace;
 use std::sync::Arc;
 use tags::*;
 

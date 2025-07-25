@@ -1,5 +1,6 @@
 use aruna_permission::{Action, OidcToken, Path, ResourceId, UserIdentity};
 use aruna_storage::storage::store::Store;
+use roaring::RoaringBitmap;
 use tracing::error;
 use ulid::Ulid;
 
@@ -8,6 +9,7 @@ use crate::{error::ArunaMetadataError, logerr};
 use super::{
     persistor::{Persistor, tables::*},
     search::generic::Search,
+    utils::idx_from_cow,
 };
 
 #[async_trait::async_trait]
@@ -34,9 +36,21 @@ where
             current_span.in_scope(|| {
                 let txn = store.create_txn(false)?;
 
-                let mapping = store.get(&txn, RESOURCE_MAPPINGS_DB_NAME, id.as_slice())?;
-
-                Ok(mapping.is_some())
+                if let Some(mapping) = store.get(&txn, RESOURCE_MAPPINGS_DB_NAME, id.as_slice())? {
+                    let default_ulid = Ulid::default().to_bytes();
+                    let public_mappings = store
+                        .get(&txn, PUBLIC_MAPPINGS_DB_NAME, &default_ulid)?
+                        .ok_or_else(|| {
+                            error!("No public mappings initialized");
+                            ArunaMetadataError::ServerError("No public mappings found".to_string())
+                        })?;
+                    let map = RoaringBitmap::deserialize_from(public_mappings.as_ref())?;
+                    Ok(map.contains(idx_from_cow(mapping)?))
+                } else {
+                    Err(ArunaMetadataError::NotFound(
+                        "Resource not found".to_string(),
+                    ))
+                }
             })
         })
         .await
@@ -182,6 +196,29 @@ where
             })
         }
     }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn add_path(&self, resource_id: &Ulid, path: Path) -> Result<(), ArunaMetadataError> {
+        let store = self.store.clone();
+        let resource_id = *resource_id;
+        let permission_handler = self.permission_manager.clone();
+        let current_span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || -> Result<(), ArunaMetadataError> {
+            current_span.in_scope(|| {
+                let mut txn = store.create_txn(true)?;
+                permission_handler.add_resource(
+                    ResourceId::Ulid(resource_id),
+                    &path,
+                    &store,
+                    &mut txn,
+                )?;
+                store.commit(txn)?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?
+    }
 }
 
 #[async_trait::async_trait]
@@ -197,8 +234,10 @@ where
         action: Action,
         resource_id: Ulid,
     ) -> Result<Option<(UserIdentity, Path)>, ArunaMetadataError> {
-        match user_identity {
-            Some(user_identity) => {
+        match (user_identity, &action) {
+            // This is explicit by design, so that when another Action will be added,
+            // it returns an error
+            (Some(user_identity), Action::Read | Action::Write) => {
                 let path = self
                     .permission_manager
                     .check_permission(
@@ -211,10 +250,13 @@ where
                     .map_err(logerr!())?;
                 Ok(Some((user_identity, path)))
             }
-            None => match self.check_public(&resource_id).await.map_err(logerr!())? {
-                true => Ok(None),
-                false => Err(ArunaMetadataError::Unauthorized),
-            },
+            (None, Action::Read) => {
+                match self.check_public(&resource_id).await.map_err(logerr!())? {
+                    true => Ok(None),
+                    false => Err(ArunaMetadataError::Unauthorized),
+                }
+            }
+            (None, Action::Write) => Err(ArunaMetadataError::Unauthorized),
         }
     }
 }

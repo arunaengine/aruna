@@ -3,7 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::network_trait::MetadataMessage;
 use crate::error::ArunaMetadataError;
 
-pub(super) async fn read_message(
+pub async fn read_message(
     recv_stream: &mut RecvStream,
 ) -> Result<MetadataMessage, ArunaMetadataError> {
     let len = recv_stream.read_u32().await?;
@@ -18,7 +18,7 @@ pub(super) async fn read_message(
     Ok(message)
 }
 
-pub(super) async fn send_message(
+pub async fn send_message(
     message: MetadataMessage,
     send_stream: &mut SendStream,
 ) -> Result<(), ArunaMetadataError> {
