@@ -267,47 +267,17 @@ where
             trace!("Forwarding message");
             Ok(Some(self.forward(token, controller).await?))
         } else {
-            let mut chunk_hasher = blake3::Hasher::new();
-            chunk_hasher.update(self.group_id.to_bytes().as_slice());
-            let subject = chunk_hasher.finalize();
-            let subject_hash = subject.as_bytes();
-            let nodes = controller.network.find_verified(subject_hash).await?;
+            controller
+                .sync_user(
+                    token
+                        .clone()
+                        .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+                )
+                .await
+                .map_err(logerr!())?;
 
-            if !nodes.contains(&controller.network.get_addr().await?) {
+            controller.sync_group(self.group_id).await?;
 
-                controller
-                    .sync_user(
-                        token
-                            .clone()
-                            .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
-                    )
-                    .await
-                    .map_err(logerr!())?;
-
-                let doc = controller
-                    .persistence
-                    .get_or_create_doc(self.group_id.to_bytes(), GROUPS_DB_NAME)
-                    .await?;
-
-                let path = Path::builder()
-                    .realm_id(controller.network.get_realm_key().await?)
-                    .group(self.group_id)
-                    .build()
-                    .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
-
-                controller
-                    .sync_loop(
-                        crate::models::structs::TypedDoc::Group(doc),
-                        *subject_hash,
-                        self.group_id.to_bytes(),
-                        path,
-                        nodes.into_iter(),
-                    )
-                    .await
-                    .join_all()
-                    .await;
-                controller.network.store(subject_hash).await?;
-            }
             Ok(None)
         }
     }
@@ -458,6 +428,8 @@ where
             let subject_hash = subject_hash.clone();
             let token_clone = token.clone();
             let controller_clone: super::controller::Controller<St, Se, N> = controller.clone();
+            // This is an optimization that assumes, syncing is slower than forwarding.
+            // This starts and detaches sync and forwards the request
             tokio::spawn(async move {
                 // No need to sync user and wait if we forward anyway
                 controller_clone

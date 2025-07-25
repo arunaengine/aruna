@@ -2,7 +2,10 @@ use anyhow::Result;
 use aruna_metadata::{
     api::server::RestServer,
     models::requests::{AddUserRequest, Request},
-    network::{network_trait::{Network}, p2p_network::{ NetworkConfig, P2PNetwork}},
+    network::{
+        network_trait::Network,
+        p2p_network::{NetworkConfig, P2PNetwork},
+    },
     persistence::{
         persistor::{
             Persistor,

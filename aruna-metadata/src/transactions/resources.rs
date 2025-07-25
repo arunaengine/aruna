@@ -18,7 +18,7 @@ use crate::{
     },
     network::network_trait::{Network, REPLICATION_POLICY},
     persistence::{
-        authorization::Authorize, persistor::tables::GROUPS_DB_NAME, search::generic::Search,
+        authorization::Authorize, search::generic::Search,
     },
 };
 use aruna_permission::paths::PathComponent;
@@ -76,15 +76,6 @@ where
         }
         let self_addr = controller.network.get_addr().await?;
         if !nodes.contains(&self_addr) {
-            controller
-                .sync_user(
-                    token
-                        .clone()
-                        .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
-                )
-                .await
-                .map_err(logerr!())?;
-
             let node = nodes
                 .iter()
                 .filter(|addr| addr != &&self_addr)
@@ -121,49 +112,15 @@ where
                         .ok_or_else(|| {
                             ArunaMetadataError::ServerError("Group not found in path".to_string())
                         })?;
-
-                    let mut chunk_hasher = blake3::Hasher::new();
-                    chunk_hasher.update(group_id.to_bytes().as_slice());
-                    let subject = chunk_hasher.finalize();
-                    let subject_hash = subject.as_bytes();
-                    let nodes = controller.network.find_verified(subject_hash).await?;
-
-                    if !nodes.contains(&controller.network.get_addr().await?) {
-                        controller
-                            .sync_user(
-                                token
-                                    .clone()
-                                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
-                            )
-                            .await
-                            .map_err(logerr!())?;
-
-                        let doc = controller
-                            .persistence
-                            .get_or_create_doc(group_id.to_bytes().to_vec(), GROUPS_DB_NAME)
-                            .await?;
-
-                        let path = Path::builder()
-                            .realm_id(controller.network.get_realm_key().await?)
-                            .group(*group_id)
-                            .build()
-                            .map_err(|e| {
-                                crate::error::ArunaMetadataError::ServerError(e.to_string())
-                            })?;
-
-                        controller
-                            .sync_loop(
-                                crate::models::structs::TypedDoc::Group(doc),
-                                *subject_hash,
-                                group_id.to_bytes().to_vec(),
-                                path,
-                                nodes.into_iter(),
-                            )
-                            .await
-                            .join_all()
-                            .await;
-                        controller.network.store(subject_hash).await?;
-                    }
+                    controller
+                        .sync_user(
+                            token
+                                .clone()
+                                .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+                        )
+                        .await
+                        .map_err(logerr!())?;
+                    controller.sync_group(*group_id).await.map_err(logerr!())?;
                     controller
                         .persistence
                         .add_path(&self.parent_id, path)
@@ -698,46 +655,14 @@ where
         token: &Option<String>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
-        let mut chunk_hasher = blake3::Hasher::new();
-        chunk_hasher.update(self.group_id.to_bytes().as_slice());
-        let subject = chunk_hasher.finalize();
-        let subject_hash = subject.as_bytes();
-        let nodes = controller.network.find_verified(subject_hash).await?;
-
-        if !nodes.contains(&controller.network.get_addr().await?) {
-            controller
-                .sync_user(
-                    token
-                        .clone()
-                        .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
-                )
-                .await
-                .map_err(logerr!())?;
-
-            let doc = controller
-                .persistence
-                .get_or_create_doc(self.group_id.to_bytes(), GROUPS_DB_NAME)
-                .await?;
-
-            let path = Path::builder()
-                .realm_id(controller.network.get_realm_key().await?)
-                .group(self.group_id)
-                .build()
-                .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
-
-            controller
-                .sync_loop(
-                    crate::models::structs::TypedDoc::Group(doc),
-                    *subject_hash,
-                    self.group_id.to_bytes(),
-                    path,
-                    nodes.into_iter(),
-                )
-                .await
-                .join_all()
-                .await;
-            controller.network.store(subject_hash).await?;
-        }
+        controller
+            .sync_user(
+                token
+                    .clone()
+                    .ok_or_else(|| ArunaMetadataError::Unauthorized)?,
+            )
+            .await?;
+        controller.sync_group(self.group_id).await?;
         Ok(None)
     }
 

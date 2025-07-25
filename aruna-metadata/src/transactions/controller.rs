@@ -7,7 +7,10 @@ use crate::{
     },
     network::network_trait::Network,
     persistence::{
-        persistor::{Persistor, tables::USER_DB_NAME},
+        persistor::{
+            Persistor,
+            tables::{GROUPS_DB_NAME, USER_DB_NAME},
+        },
         search::generic::Search,
     },
 };
@@ -17,7 +20,8 @@ use automerge::sync::Message;
 use iroh::NodeAddr;
 use std::sync::Arc;
 use tokio::task::JoinSet;
-use tracing::Instrument;
+use tracing::{trace, Instrument};
+use ulid::Ulid;
 
 pub struct Controller<St, Se, N>
 where
@@ -106,6 +110,45 @@ where
                 crate::models::structs::TypedDoc::User(doc),
                 *subject_hash,
                 identity.to_bytes(),
+                path,
+                nodes.into_iter(),
+            )
+            .await
+            .join_all()
+            .await;
+            self.network.store(subject_hash).await?;
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, group_id))]
+    pub async fn sync_group(
+        &self,
+        group_id: Ulid,
+    ) -> Result<(), ArunaMetadataError> {
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(group_id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+        let nodes = self.network.find_verified(subject_hash).await?;
+
+        if !nodes.contains(&self.network.get_addr().await?) {
+            trace!("Syncing group {}", group_id.to_string());
+            let doc = self
+                .persistence
+                .get_or_create_doc(group_id.to_bytes().to_vec(), GROUPS_DB_NAME)
+                .await?;
+
+            let path = Path::builder()
+                .realm_id(self.network.get_realm_key().await?)
+                .group(group_id)
+                .build()
+                .map_err(|e| crate::error::ArunaMetadataError::ServerError(e.to_string()))?;
+
+            self.sync_loop(
+                crate::models::structs::TypedDoc::Group(doc),
+                *subject_hash,
+                group_id.to_bytes().to_vec(),
                 path,
                 nodes.into_iter(),
             )
