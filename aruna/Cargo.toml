@@ -10,6 +10,7 @@ aruna-metadata = { path = "../aruna-metadata" }
 aruna-permission = { path = "../aruna-permission" }
 aruna-data = { path = "../aruna-data" }
 aruna-storage = { path = "../aruna-storage" }
+aruna-task = { path = "../aruna-task" }
 data-encoding = "2.9.0"
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }

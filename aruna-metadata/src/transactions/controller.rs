@@ -5,7 +5,7 @@ use crate::{
         requests::Request,
         structs::{PolicyResult, TaskPayload, TypedDoc},
     },
-    network::network_trait::Network,
+    network::network_trait::{Network, REPLICATION_POLICY},
     persistence::{
         persistor::{
             Persistor,
@@ -16,11 +16,11 @@ use crate::{
 };
 use aruna_permission::Path;
 use aruna_storage::storage::store::Store;
-use aruna_task::{error::ArunaTaskError, task_trait::TaskExecutor, Task, TaskHandler};
+use aruna_task::{Task, TaskHandler, error::ArunaTaskError, task_trait::TaskExecutor};
 use automerge::sync::Message;
 use iroh::NodeAddr;
 use std::sync::Arc;
-use tokio::task::JoinSet;
+use tokio::{sync::Notify, task::JoinSet};
 use tracing::{Instrument, error, trace};
 use ulid::Ulid;
 
@@ -32,6 +32,8 @@ where
 {
     pub network: Arc<N>,
     pub persistence: Arc<Persistor<St, Se>>,
+    pub executor_idx: u8,
+    pub task_handler: TaskHandler<St>,
 }
 
 impl<St, Se, N> Clone for Controller<St, Se, N>
@@ -44,6 +46,8 @@ where
         Controller {
             network: self.network.clone(),
             persistence: self.persistence.clone(),
+            executor_idx: self.executor_idx.clone(),
+            task_handler: self.task_handler.clone(),
         }
     }
 }
@@ -54,12 +58,23 @@ where
     Se: Search + 'static,
     N: Network + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(persistence, network))]
-    pub fn new(persistence: Arc<Persistor<St, Se>>, network: Arc<N>) -> Self {
-        Self {
+    #[tracing::instrument(level = "trace", skip(persistence, network, task_handler))]
+    pub async fn new(
+        persistence: Arc<Persistor<St, Se>>,
+        network: Arc<N>,
+        task_handler: TaskHandler<St>,
+    ) -> Self {
+        let mut controller = Self {
             persistence,
             network,
-        }
+            executor_idx: 0,
+            task_handler: task_handler.clone(),
+        };
+        controller.executor_idx = controller
+            .task_handler
+            .add_executor(controller.clone_box())
+            .await;
+        controller
     }
     #[tracing::instrument(level = "trace", skip(self, request, token))]
     pub async fn request<R: Request<St, Se, N> + Send>(
@@ -113,10 +128,9 @@ where
                 identity.to_bytes(),
                 path,
                 nodes.into_iter(),
+                true,
             )
-            .await
-            .join_all()
-            .await;
+            .await?;
             self.network.store(subject_hash).await?;
         }
         Ok(())
@@ -149,10 +163,9 @@ where
                 group_id.to_bytes().to_vec(),
                 path,
                 nodes.into_iter(),
+                true,
             )
-            .await
-            .join_all()
-            .await;
+            .await?;
             self.network.store(subject_hash).await?;
         }
         Ok(())
@@ -166,8 +179,39 @@ where
         doc_id: Vec<u8>,
         path: Path,
         nodes: impl Iterator<Item = NodeAddr>,
-    ) -> JoinSet<Result<(), ArunaMetadataError>> {
-        todo!("Use task handler")
+        wait: bool,
+    ) -> Result<(), ArunaMetadataError> {
+        let distribution_strategy = match doc {
+            TypedDoc::Resource(_) => {
+                aruna_task::DistributionStrategy::LimitedRealm(REPLICATION_POLICY as u32)
+            }
+            TypedDoc::Group(_) | TypedDoc::User(_) => aruna_task::DistributionStrategy::AllInRealm,
+        };
+        let retry_strategy = aruna_task::RetryStrategy::Forever;
+        let notify = match wait {
+            true => Some(Arc::new(Notify::new())),
+            false => None,
+        };
+        let payload = TaskPayload::Sync {
+            doc: doc.into(),
+            subject_hash,
+            doc_id,
+            path,
+            nodes: nodes.collect(),
+        };
+        self.task_handler
+            .register_task(
+                distribution_strategy,
+                retry_strategy,
+                self.executor_idx,
+                postcard::to_allocvec(&payload)?,
+                notify.clone(),
+            )
+            .await?;
+        if let Some(notify) = notify {
+            notify.notified().await
+        }
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self, doc, nodes))]
@@ -299,5 +343,8 @@ where
         }
 
         Ok(())
+    }
+    fn clone_box(&self) -> Box<dyn TaskExecutor + 'static> {
+        Box::new(self.clone())
     }
 }

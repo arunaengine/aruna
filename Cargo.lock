@@ -130,6 +130,7 @@ dependencies = [
  "aruna-net",
  "aruna-permission",
  "aruna-storage",
+ "aruna-task",
  "chrono",
  "data-encoding",
  "dotenvy",

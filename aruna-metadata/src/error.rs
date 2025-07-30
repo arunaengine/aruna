@@ -86,7 +86,6 @@ pub enum ArunaMetadataError {
     #[error("Network error: {0}")]
     NetworkError(String),
 }
-
 impl ArunaMetadataError {
     pub fn into_axum_tuple(self) -> (axum::http::StatusCode, Json<String>) {
         match self {
@@ -189,7 +188,9 @@ impl From<aruna_permission::error::PermissionError> for ArunaMetadataError {
     fn from(e: aruna_permission::error::PermissionError) -> Self {
         tracing::trace!(?e);
         match e {
-            aruna_permission::PermissionError::PermissionDenied => ArunaMetadataError::Forbidden(format!("{}", e.to_string())),
+            aruna_permission::PermissionError::PermissionDenied => {
+                ArunaMetadataError::Forbidden(format!("{}", e.to_string()))
+            }
             _ => ArunaMetadataError::ServerError(format!("{}", e.to_string())),
         }
     }
@@ -201,5 +202,11 @@ impl From<ReadMessageError> for ArunaMetadataError {
             from: "Vec<u8>".to_string(),
             to: "automerge::Message".to_string(),
         }
+    }
+}
+
+impl From<aruna_task::error::ArunaTaskError> for ArunaMetadataError {
+    fn from(e: aruna_task::error::ArunaTaskError) -> Self {
+        ArunaMetadataError::ServerError(e.to_string())
     }
 }

@@ -17,9 +17,7 @@ use crate::{
         structs::{Resource, ResourceVariant},
     },
     network::network_trait::{Network, REPLICATION_POLICY},
-    persistence::{
-        authorization::Authorize, search::generic::Search,
-    },
+    persistence::{authorization::Authorize, search::generic::Search},
 };
 use aruna_permission::paths::PathComponent;
 use aruna_permission::{Action, Path, UserIdentity, paths::PathBuilder};
@@ -257,9 +255,9 @@ where
                 resource.id.to_bytes().to_vec(),
                 path,
                 realm_nodes.into_iter(),
+                false,
             )
-            .await
-            .detach_all();
+            .await?;
 
         Ok(CreateResourceResponse { resource })
     }
@@ -593,9 +591,9 @@ where
                 ToBytes::to_bytes(resource.id),
                 path,
                 members,
+                false,
             )
-            .await
-            .detach_all();
+            .await?;
 
         Ok(response)
     }
@@ -781,9 +779,9 @@ where
                 resource.id.to_bytes().to_vec(),
                 path,
                 realm_nodes.into_iter(),
+                false,
             )
-            .await
-            .detach_all();
+            .await?;
 
         Ok(CreateProjectResponse { resource })
     }

@@ -1,9 +1,8 @@
 use aruna_metadata::error::ArunaMetadataError;
 use aruna_permission::PermissionError;
+use aruna_task::error::ArunaTaskError;
 use iroh::KeyParsingError;
-use std::
-    num::ParseIntError
-;
+use std::num::ParseIntError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,4 +25,6 @@ pub enum ArunaError {
     SerdeError(#[from] serde_json::error::Error),
     #[error("IpV4ParsingError: {0}")]
     IpV4ParsingError(#[from] std::net::AddrParseError),
+    #[error("TaskError: {0}")]
+    TaskError(#[from] ArunaTaskError),
 }

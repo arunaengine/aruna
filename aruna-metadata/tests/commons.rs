@@ -23,6 +23,7 @@ use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
 };
+use aruna_task::TaskHandler;
 use chrono::Months;
 use ed25519_dalek::SigningKey;
 use iroh::NodeAddr;
@@ -147,7 +148,7 @@ pub async fn init_server(
     ));
 
     let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-        Persistor::new(store, search_config, permission_manager, token_handler)
+        Persistor::new(store.clone(), search_config, permission_manager, token_handler)
             .await
             .unwrap(),
     );
@@ -165,11 +166,13 @@ pub async fn init_server(
         .await
         .unwrap(),
     );
+    let task_handler = TaskHandler::new(store.clone()).await?;
 
     let controller = Arc::new(Controller::<LmdbStore, TantivySearch, P2PNetwork>::new(
         persistor,
         network.clone(),
-    ));
+        task_handler,
+    ).await);
     Network::start_actor(network, controller.clone())
         .await
         .unwrap();

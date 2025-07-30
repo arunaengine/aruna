@@ -15,6 +15,7 @@ use aruna_storage::storage::{
     lmdb::{LmdbConfig, LmdbStore},
     store::Store,
 };
+use aruna_task::TaskHandler;
 use config::{Config, parse_config, start_data, start_metadata};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
@@ -144,6 +145,7 @@ pub async fn main() {
         )
         .unwrap(),
     ));
+    let task_handler = TaskHandler::new(store.clone()).await.unwrap();
 
     let metadata_future = start_metadata(
         config.clone(),
@@ -151,6 +153,7 @@ pub async fn main() {
         network.clone(),
         permission_manager.clone(),
         token_handler.clone(),
+        task_handler,
     );
     let data_future = start_data(config, store, network, permission_manager, token_handler);
 

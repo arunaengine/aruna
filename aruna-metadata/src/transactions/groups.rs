@@ -208,9 +208,9 @@ where
                 ToBytes::to_bytes(group.id),
                 path,
                 members,
+                false,
             )
-            .await
-            .detach_all();
+            .await?;
 
         Ok(AddGroupResponse { group })
     }
@@ -370,9 +370,9 @@ where
                 ToBytes::to_bytes(self.group_id),
                 path,
                 members,
+                false,
             )
-            .await
-            .detach_all();
+            .await?;
 
         Ok(AddUserToGroupResponse {})
     }
@@ -457,10 +457,9 @@ where
                         group_id.to_bytes(),
                         path,
                         nodes.into_iter(),
+                        true,
                     )
-                    .await
-                    .join_all()
-                    .await;
+                    .await?;
                 controller_clone.network.store(&subject_hash).await?;
                 Ok::<(), ArunaMetadataError>(())
             });

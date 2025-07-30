@@ -13,6 +13,7 @@ use aruna_metadata::{
 };
 use aruna_permission::{PermissionManager, TokenSystem, token::Issuer};
 use aruna_storage::storage::{lmdb::LmdbStore, store::Store};
+use aruna_task::TaskHandler;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use futures_util::TryFutureExt;
@@ -99,6 +100,7 @@ pub async fn start_metadata<S>(
     network: Arc<P2PNetwork>,
     perm_manager: PermissionManager,
     token_handler: Arc<RwLock<TokenSystem>>,
+    task_handler: TaskHandler<S>,
 ) -> Result<(), ArunaError>
 where
     for<'a> S: Store<'a> + 'static,
@@ -106,10 +108,10 @@ where
     let persistor: Arc<Persistor<S, TantivySearch>> =
         Arc::new(Persistor::new(store, config.search_config, perm_manager, token_handler).await?);
 
-    let controller = Arc::new(Controller::<S, TantivySearch, P2PNetwork>::new(
-        persistor,
-        network.clone(),
-    ));
+    let controller = Arc::new(
+        Controller::<S, TantivySearch, P2PNetwork>::new(persistor, network.clone(), task_handler)
+            .await,
+    );
     Network::start_actor(network, controller.clone()).await?;
 
     let controller_clone = controller.clone();

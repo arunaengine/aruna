@@ -126,9 +126,9 @@ where
                 user.id.to_bytes(),
                 path,
                 members,
+                false,
             )
-            .await
-            .detach_all();
+            .await?;
         let token = controller.persistence.create_token(&user.id, None).await?;
 
         Ok(AddUserResponse { user, token })
