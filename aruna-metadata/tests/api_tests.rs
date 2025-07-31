@@ -28,39 +28,50 @@ mod api_tests {
 
         let pubkey = first_node.controller.network.get_realm_key().await.unwrap();
 
-        let (user1_identity, _) =
+        let (user1_identity, token1) =
             create_user_with_token(first_node, "create_user_test1".to_string())
                 .await
                 .unwrap();
         assert_eq!(user1_identity.realm_key, pubkey);
-        let (user2_identity, _) =
+        let (user2_identity, token2) =
             create_user_with_token(first_node, "create_user_test2".to_string())
                 .await
                 .unwrap();
         assert_eq!(user2_identity.realm_key, pubkey);
 
-        std::thread::sleep(Duration::from_secs(10));
+        let client = reqwest::Client::new();
 
         for Server {
-            controller, path, ..
+            path, ..
         } in servers.iter()
         {
-            println!("{}", path);
             assert!(
-                controller
-                    .persistence
-                    .get_user(&user1_identity)
+                client
+                    .get(format!("{path}/users"))
+                    .header::<&str, &str>(
+                        "Authorization",
+                        format!("Bearer {}", token1.to_string()).as_ref(),
+                    )
+                    .query(&[("id", user1_identity.to_string())])
+                    .send()
                     .await
                     .unwrap()
-                    .is_some()
+                    .json::<GetUserResponse>()
+                    .await.is_ok()
             );
             assert!(
-                controller
-                    .persistence
-                    .get_user(&user2_identity)
+                client
+                    .get(format!("{path}/users"))
+                    .header::<&str, &str>(
+                        "Authorization",
+                        format!("Bearer {}", token2.to_string()).as_ref(),
+                    )
+                    .query(&[("id", user2_identity.to_string())])
+                    .send()
                     .await
                     .unwrap()
-                    .is_some()
+                    .json::<GetUserResponse>()
+                    .await.is_ok()
             );
         }
     }
@@ -290,8 +301,6 @@ mod api_tests {
             .unwrap()
             .resource;
         let object_id2 = object2.id;
-
-        std::thread::sleep(Duration::from_secs(10));
 
         for Server { path: base_url, .. } in servers.iter() {
             let response: GetResourceResponse = client
