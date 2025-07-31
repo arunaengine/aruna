@@ -91,6 +91,7 @@ pub async fn main() {
         LOCATION_DB_NAME,
         LOCATION_STATS_DB_NAME,
         PATH_LOCATION_DB_NAME,
+        aruna_task::TASK_DB_NAME,
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,
         aruna_permission::OIDC_IDENTITIES_DB,

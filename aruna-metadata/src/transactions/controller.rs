@@ -204,11 +204,13 @@ where
                 distribution_strategy,
                 retry_strategy,
                 self.executor_idx,
-                postcard::to_allocvec(&payload)?,
+                postcard::to_allocvec(&payload).map_err(logerr!())?,
                 notify.clone(),
             )
-            .await?;
+            .await
+            .map_err(logerr!())?;
         if let Some(notify) = notify {
+            trace!("Waiting ...");
             notify.notified().await
         }
         Ok(())
@@ -225,6 +227,7 @@ where
     ) -> JoinSet<Result<(), ArunaMetadataError>> {
         let mut tasks = tokio::task::JoinSet::new();
         for node in nodes {
+            trace!("Syncing to node {}", node.node_id);
             let inner_doc = doc.get_inner();
             let network = self.network.clone();
             let persistence = self.persistence.clone();
@@ -313,8 +316,10 @@ where
     Se: Search + 'static,
     N: Network + 'static,
 {
+    #[tracing::instrument(level = "trace", skip(self, task))]
     async fn execute(&self, task: Task) -> Result<(), ArunaTaskError> {
-        let res: TaskPayload = postcard::from_bytes(&task.payload)?;
+        trace!("Execution metadata task");
+        let res: TaskPayload = postcard::from_bytes(&task.payload).map_err(logerr!())?;
 
         match res {
             TaskPayload::Sync {

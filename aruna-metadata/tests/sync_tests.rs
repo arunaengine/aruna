@@ -160,6 +160,7 @@ mod sync_tests {
             controller: ref first_controller,
             ref addr,
             path: ref first_path,
+            ..
         } = init_server(signing_key.clone(), OFFSET, None, false)
             .await
             .unwrap();

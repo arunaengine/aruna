@@ -76,19 +76,25 @@ pub async fn init_server(
         let logging_env_filter = EnvFilter::try_from_default_env()
             .unwrap_or("none".into())
             .add_directive("aruna_metadata=trace".parse().unwrap())
-            .add_directive("aruna_permission=trace".parse().unwrap());
-        //add_directive("tower_http=info".parse().unwrap())
-        //add_directive("aruna_net=info".parse().unwrap());
+            //.add_directive("aruna_permission=trace".parse().unwrap())
+            //add_directive("tower_http=info".parse().unwrap())
+            //add_directive("aruna_net=info".parse().unwrap())
+            .add_directive("aruna_task=trace".parse().unwrap());
 
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_file(true)
             .with_line_number(true)
             .with_filter(logging_env_filter);
-        tracing_subscriber::registry().with(fmt_layer).init();
+        //let console_layer = console_subscriber::spawn();
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            //.with(console_layer)
+            .init();
     }
     let subscriber = SUBSCRIBERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let databases = vec![
+        aruna_task::TASK_DB_NAME,
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,
         aruna_permission::OIDC_IDENTITIES_DB,
@@ -148,9 +154,14 @@ pub async fn init_server(
     ));
 
     let persistor: Arc<Persistor<LmdbStore, TantivySearch>> = Arc::new(
-        Persistor::new(store.clone(), search_config, permission_manager, token_handler)
-            .await
-            .unwrap(),
+        Persistor::new(
+            store.clone(),
+            search_config,
+            permission_manager,
+            token_handler,
+        )
+        .await
+        .unwrap(),
     );
 
     let network = Arc::new(
@@ -168,11 +179,14 @@ pub async fn init_server(
     );
     let task_handler = TaskHandler::new(store.clone()).await?;
 
-    let controller = Arc::new(Controller::<LmdbStore, TantivySearch, P2PNetwork>::new(
-        persistor,
-        network.clone(),
-        task_handler,
-    ).await);
+    let controller = Arc::new(
+        Controller::<LmdbStore, TantivySearch, P2PNetwork>::new(
+            persistor,
+            network.clone(),
+            task_handler,
+        )
+        .await,
+    );
     Network::start_actor(network, controller.clone())
         .await
         .unwrap();

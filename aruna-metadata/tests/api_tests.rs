@@ -8,8 +8,7 @@ mod api_tests {
             requests::{
                 AddGroupRequest, AddGroupResponse, AddUserToGroupRequest, AddUserToGroupResponse,
                 CreateProjectRequest, CreateProjectResponse, CreateResourceRequest,
-                GetGroupResponse, GetResourceResponse, GetUserResponse, Request,
-                SearchResponse,
+                GetGroupResponse, GetResourceResponse, GetUserResponse, Request, SearchResponse,
             },
             structs::Resource,
         },
@@ -40,9 +39,13 @@ mod api_tests {
                 .unwrap();
         assert_eq!(user2_identity.realm_key, pubkey);
 
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(10));
 
-        for Server { controller, .. } in servers.iter() {
+        for Server {
+            controller, path, ..
+        } in servers.iter()
+        {
+            println!("{}", path);
             assert!(
                 controller
                     .persistence
@@ -121,7 +124,6 @@ mod api_tests {
             .await
             .unwrap();
 
-
         let response: GetGroupResponse = client
             .get(format!("{first_url}/groups"))
             .header::<&str, &str>(
@@ -137,13 +139,13 @@ mod api_tests {
             .unwrap();
         let group = response.group;
 
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(10));
 
         for Server {
             controller, path, ..
         } in servers.iter()
         {
-           let _: GetUserResponse = client
+            let _: GetUserResponse = client
                 .get(format!("{path}/users"))
                 .header::<&str, &str>(
                     "Authorization",
@@ -289,7 +291,7 @@ mod api_tests {
             .resource;
         let object_id2 = object2.id;
 
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(10));
 
         for Server { path: base_url, .. } in servers.iter() {
             let response: GetResourceResponse = client
@@ -607,7 +609,7 @@ mod api_tests {
                 .resource;
         }
 
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(Duration::from_secs(10));
 
         for Server { path: base_url, .. } in servers.iter() {
             let response: SearchResponse = client
