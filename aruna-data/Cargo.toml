@@ -8,6 +8,7 @@ anyhow = {workspace = true}
 aruna-net = { path = "../aruna-net" }
 aruna-storage = { path = "../aruna-storage" }
 aruna-permission = { path = "../aruna-permission" }
+aruna-realm = { path = "../aruna-realm" }
 async-trait = {workspace = true}
 aws-config = "1.8.1"
 aws-sdk-s3 = "1.96.0"

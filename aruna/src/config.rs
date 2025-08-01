@@ -1,7 +1,7 @@
 use anyhow::anyhow;
-use aruna_data::IOHandler;
 use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::config::config::Config as DataConfig;
+use aruna_data::{IOHandler, network::network_handler::NetworkHandler};
 use aruna_metadata::{
     api::server::RestServer,
     network::{network_trait::Network, p2p_network::P2PNetwork},
@@ -47,31 +47,29 @@ pub async fn start_data(
     token_handler: Arc<RwLock<TokenSystem>>,
 ) -> Result<(), ArunaError> {
     // Create and run IOHandler
-    let node_addr = network.chandler.get_node_addr().await?;
     let io_handler = IOHandler::<LmdbStore>::new(
-        node_addr.clone(),
-        network.chandler.clone(),
-        network.chandler.get_kademlia_actor_handle().await?,
         config.config.backend.clone(),
-        Arc::new(store),
+        store,
         perm_manager.clone(),
-        config.config.general.realm_key.to_bytes(),
-    )
-    .await?;
-    let s3server = S3Server::new(
-        config.config.frontend.s3_frontend.clone(),
-        io_handler.clone(),
-        config.config.backend.clone(),
-        perm_manager.clone(),
-        config.config.general.realm_key.to_bytes(),
+        token_handler,
     )
     .await?;
 
-    let controller = Arc::new(aruna_data::io::controller::Controller::<LmdbStore>::new(
-        io_handler,
-        perm_manager,
-        token_handler,
-    ));
+    let network_handler = NetworkHandler::new(
+        network.chandler.clone(),
+        network.chandler.get_kademlia_actor_handle().await?,
+        network.get_realm_key().await?,
+    )
+    .await?;
+
+    let controller =
+        aruna_data::io::controller::Controller::<LmdbStore>::new(io_handler, network_handler).await;
+    let s3server = S3Server::new(
+        config.config.frontend.s3_frontend.clone(),
+        controller.clone(),
+    )
+    .await?;
+
     let rest_handle = tokio::spawn(async move {
         aruna_data::api_json::server::RestServer::run(
             controller,

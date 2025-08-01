@@ -22,11 +22,11 @@ mod tests {
         // Register dummy user and create token
         let user_id = register_oidc_user(
             "Hans",
-            node_controller.io_handler.store.as_ref(),
-            node_controller.token_handler.clone(),
+            &node_controller.io_handler.store,
+            node_controller.io_handler.token_handler.clone(),
         )
         .unwrap();
-        let user_token = fetch_user_token(&user_id, node_controller.token_handler.clone()).unwrap();
+        let user_token = fetch_user_token(&user_id, node_controller.io_handler.token_handler.clone()).unwrap();
 
         // Create simple http client and base request
         let client = reqwest::Client::new();
@@ -94,9 +94,9 @@ mod tests {
             "Hans",
             group_id,
             test_nodes.realm_key.to_bytes(),
-            node_controller.io_handler.store.as_ref(),
-            node_controller.token_handler.clone(),
-            node_controller.permission_manager.clone(),
+            &node_controller.io_handler.store,
+            node_controller.io_handler.token_handler.clone(),
+            node_controller.io_handler.permission_manager.clone(),
             node_controller.clone(),
         )
         .await
@@ -152,15 +152,14 @@ mod tests {
         // Find file hash with Kademlia at node
         let blake3_hash = Hasher::new().update(body_content.as_bytes()).finalize();
         let result = node_controller
-            .io_handler
-            .kademlia
-            .find_value(*blake3_hash.as_bytes())
+            .network
+            .find(blake3_hash)
             .await
             .unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
             result.first().unwrap().addr,
-            node_controller.io_handler.get_node_addr()
+            node_controller.network.get_node_addr()
         );
     }
 
@@ -183,9 +182,9 @@ mod tests {
             "Horst",
             group_id,
             test_nodes.realm_key.to_bytes(),
-            node_controller.io_handler.store.as_ref(),
-            node_controller.token_handler.clone(),
-            node_controller.permission_manager.clone(),
+            &node_controller.io_handler.store,
+            node_controller.io_handler.token_handler.clone(),
+            node_controller.io_handler.permission_manager.clone(),
             node_controller.clone(),
         )
         .await

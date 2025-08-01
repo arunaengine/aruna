@@ -1,4 +1,5 @@
 use anyhow::Result;
+use aruna_data::network::network_handler::NetworkHandler;
 use aruna_data::IOHandler;
 use aruna_data::api_json::request::Request;
 use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
@@ -42,7 +43,7 @@ pub struct TestServers {
 #[derive(Clone)]
 pub struct NodeServices {
     pub s3_endpoint: String,
-    pub openapi_data_endpoint: (Arc<Controller<LmdbStore>>, String),
+    pub openapi_data_endpoint: (Controller<LmdbStore>, String),
 }
 
 pub async fn init_test_nodes(
@@ -103,13 +104,13 @@ pub async fn init_test_nodes(
             path: config.persistence.path.to_string(),
             databases: databases.clone(),
         };
-        let lmdb_store = Arc::new(LmdbStore::new(lmdb_config)?);
+        let lmdb_store = LmdbStore::new(lmdb_config)?;
 
         // Init PermissionManager and load policies from persistence
         let permission_manager = PermissionManager::new().await?;
         let mut read_txn = lmdb_store.create_txn(false)?;
         permission_manager
-            .load_policies(lmdb_store.as_ref(), &mut read_txn)
+            .load_policies(&lmdb_store, &mut read_txn)
             .await?;
         lmdb_store.commit(read_txn)?;
 
@@ -133,33 +134,26 @@ pub async fn init_test_nodes(
 
         // Create and run IOHandler
         let io_handler = IOHandler::<LmdbStore>::new(
-            node_addr.clone(),
-            actor_handle,
-            kademlia,
             config.backend.clone(),
             lmdb_store,
             permission_manager.clone(),
-            config.general.realm_key.to_bytes(),
+            token_handler.clone(),
         )
         .await?;
+
+        let network = NetworkHandler::new(actor_handle, kademlia, realm_key.to_bytes()).await?;
+
+        let controller = Controller::<LmdbStore>::new(io_handler, network).await;
 
         // Create and run S3 server
         let s3server = S3Server::new(
             config.frontend.s3_frontend.clone(),
-            io_handler.clone(),
-            config.backend.clone(),
-            permission_manager.clone(),
-            config.general.realm_key.to_bytes(),
+            controller.clone(),
         )
         .await?;
         tokio::spawn(async move { s3server.run().await });
 
         // Create and run rest server
-        let controller = Arc::new(Controller::<LmdbStore>::new(
-            io_handler,
-            permission_manager,
-            token_handler,
-        ));
         let controller_clone = controller.clone();
         tokio::spawn(async move {
             RestServer::run(
@@ -195,7 +189,7 @@ pub async fn register_user_with_group_and_credentials<St>(
     store: &St,
     token_handler: Arc<RwLock<TokenSystem>>,
     permission_handler: PermissionManager,
-    controller: Arc<Controller<LmdbStore>>,
+    controller: Controller<LmdbStore>,
 ) -> Result<(UserIdentity, String, CreateS3CredentialsResponse)>
 where
     for<'a> St: Store<'a> + 'static,
@@ -215,7 +209,7 @@ where
     let credentials = CreateS3CredentialsRequest {
         group_id: group_id.to_string(),
     }
-    .run_request(Some(user_identity.clone()), controller.as_ref())
+    .run_request(Some(user_identity.clone()), &controller)
     .await?;
 
     Ok((user_identity, token, credentials))

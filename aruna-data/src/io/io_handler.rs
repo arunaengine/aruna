@@ -3,28 +3,28 @@ use crate::io::io_handler::tables::{
     LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME,
 };
 use crate::io::messages::{MessageType, ReplicationMessage};
+use crate::network::network_handler::NetworkHandler;
 use crate::util::bao_tree::{
-    FuturesAsyncReaderWrapper, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper,
+    OpenDalWriter, RecvStreamWrapper,
 };
 use crate::util::hash::Hasher;
 use crate::util::opendal::{
-    Backend, create_paths, get_backend_operator, get_data_async_reader, get_data_stream, get_reader,
+    Backend, create_paths, get_backend_operator, get_data_stream, get_reader,
 };
 use crate::util::s3::make_bucket;
 use anyhow::anyhow;
-use aruna_net::Kademlia;
-use aruna_net::actor_handle::{NetworkActorHandle, ReceiveStreams};
+use aruna_net::actor_handle::ReceiveStreams;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::{Path, PathBuilder, RealmKey};
-use aruna_permission::{ResourceId, UserIdentity};
+use aruna_permission::{ResourceId, TokenSystem, UserIdentity};
 use aruna_storage::storage::store::Store;
-use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
+use bao_tree::io::fsm::decode_ranges;
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, BlockSize, ByteRanges};
 use bytes::{Bytes, BytesMut};
 use futures::{AsyncWriteExt, StreamExt};
-use iroh::{NodeAddr, NodeId};
+use iroh::NodeAddr;
 use opendal::{FuturesBytesStream, Operator};
 use parking_lot::RwLock;
 use s3s::StdError;
@@ -35,7 +35,7 @@ use std::io::ErrorKind;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 use ulid::Ulid;
 
 pub const REPLICATION_PROTOCOL_ID: u32 = 2;
@@ -75,14 +75,11 @@ pub struct IOHandler<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    realm_key: RealmKey,
-    node_addr: NodeAddr,
-    network: NetworkActorHandle,
     backend: BackendConfig,
     backend_stats: Arc<RwLock<BTreeMap<String, u64>>>,
-    pub kademlia: Kademlia,
-    pub store: Arc<St>,
+    pub store: St,
     pub permission_manager: PermissionManager,
+    pub token_handler: Arc<RwLock<TokenSystem>>,
 }
 
 impl<St> IOHandler<St>
@@ -91,29 +88,22 @@ where
 {
     #[tracing::instrument(
         level = "trace",
-        skip(node_addr, backend, network, kademlia, store, permission_manager)
+        skip(backend, store, permission_manager, token_handler)
     )]
     pub async fn new(
-        node_addr: NodeAddr,
-        network: NetworkActorHandle,
-        kademlia: Kademlia,
         backend: BackendConfig,
-        store: Arc<St>,
+        store: St,
         permission_manager: PermissionManager,
-        realm_key: RealmKey,
+        token_handler: Arc<RwLock<TokenSystem>>,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let io_handler = Arc::new(Self {
-            node_addr,
             backend,
-            backend_stats: Arc::new(RwLock::new(Self::load_stats(store.as_ref())?)),
-            network,
-            kademlia,
+            backend_stats: Arc::new(RwLock::new(Self::load_stats(&store)?)),
             store,
             permission_manager,
-            realm_key,
+            token_handler,
         });
 
-        io_handler.clone().run().await;
         Ok(io_handler)
     }
 
@@ -132,14 +122,6 @@ where
                 )
             })
             .collect::<BTreeMap<String, u64>>())
-    }
-
-    pub fn get_node_addr(&self) -> NodeAddr {
-        self.node_addr.clone()
-    }
-
-    fn _get_node_id(&self) -> NodeId {
-        self.node_addr.node_id
     }
 
     async fn eval_suitable_bucket(&self) -> anyhow::Result<String> {
@@ -217,35 +199,6 @@ where
         Ok(())
     }
 
-    pub async fn run(self: Arc<Self>) {
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    // Handle incoming streams
-                    Ok(inc_stream) = self.network.receive() => {
-                        let self_clone = self.clone();
-
-                        trace!("{:?} Received stream from: {:?}", self.node_addr, inc_stream.sender);
-                        tokio::spawn(
-                            async move {
-                                if let Err(e) = self_clone.handle_incoming_p2p_stream(
-                                    inc_stream,
-                                ).await{
-                                    error!("Failed to handle incoming stream: {e:#}");
-                                }
-                            }
-                        );
-                    }
-
-                    // Check for shutdown signal
-                    _ = tokio::signal::ctrl_c() => {
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
     //Note: Currently P2P streams are only used by replication
     pub async fn handle_incoming_p2p_stream(
         &self,
@@ -254,10 +207,12 @@ where
             mut send_stream,
             mut recv_stream,
         }: ReceiveStreams,
-    ) -> Result<(), StdError> {
+        realm_key: RealmKey,
+        self_addr: NodeAddr,
+    ) -> Result<blake3::Hash, StdError> {
         // Read init message
         let message = ReplicationMessage::read(&mut recv_stream).await?;
-        if let MessageType::InitReplicationRequest {
+        let hash = if let MessageType::InitReplicationRequest {
             user_id,
             group_id,
             path,
@@ -284,7 +239,7 @@ where
 
             // Handle replication init message
             let response = self
-                .handle_replication_init(&operator, message.id, &bp)
+                .handle_replication_init(&operator, message.id, &bp, self_addr)
                 .await?;
             response.send(&mut send_stream).await?;
 
@@ -325,22 +280,22 @@ where
                 file_hashes: hashes,
             };
             let perm_path = PathBuilder::new()
-                .realm_id(self.realm_key)
+                .realm_id(realm_key)
                 .group_data(*group_id, backend_bucket, bp, blake3_hash)
                 .build()?;
             self.store_location(&location, fp, Some(perm_path))?;
-            self.publish_hash(blake3_hash).await?
+            root
         } else {
             error!("Stream did not start with init message");
             return Err(Box::new(std::io::Error::new(
                 ErrorKind::InvalidData,
                 "Stream did not start with init message",
             )));
-        }
+        };
 
         send_stream.finish()?;
         debug!("Handled stream.");
-        Ok(())
+        Ok(*hash)
     }
 
     async fn handle_replication_init(
@@ -348,6 +303,7 @@ where
         operator: &Operator,
         message_id: Ulid,
         path: &str,
+        self_addr: NodeAddr,
         //message: ReplicationMessage,
     ) -> Result<ReplicationMessage, StdError> {
         //TODO: Validate conditions to accept replication request
@@ -357,7 +313,7 @@ where
         if operator.exists(path).await? {
             return Ok(ReplicationMessage {
                 id: message_id,
-                sender: self.get_node_addr(),
+                sender: self_addr,
                 msg_type: MessageType::InitReplicationResponse {
                     ack: false,
                     reason: Some("Path is already occupied".to_string()),
@@ -367,7 +323,7 @@ where
 
         Ok(ReplicationMessage {
             id: message_id,
-            sender: self.get_node_addr(),
+            sender: self_addr,
             msg_type: MessageType::InitReplicationResponse {
                 ack: true,
                 reason: None,
@@ -378,11 +334,12 @@ where
     pub async fn handle_incoming_data_stream<S>(
         &self,
         user_identity: UserIdentity,
+        realm_key: RealmKey,
         group_id: Ulid,
         frontend_path: String,
         backend_path: String,
         mut data_stream: S,
-    ) -> Result<ObjectInfo, StdError>
+    ) -> Result<(blake3::Hash, ObjectInfo), StdError>
     where
         S: ByteStream<Item = Result<Bytes, StdError>> + Send + Sync + Unpin + 'static,
     {
@@ -436,7 +393,7 @@ where
         };
 
         let permission_path = PathBuilder::new()
-            .realm_id(self.realm_key)
+            .realm_id(realm_key)
             .group_data(
                 group_id,
                 frontend_bucket,
@@ -446,15 +403,15 @@ where
             .build()?;
 
         self.store_location(&info, Some(frontend_path), Some(permission_path))?;
-        self.publish_hash(blake3_hash).await?;
 
-        Ok(info)
+        Ok((blake3_hash, info))
     }
 
     pub async fn register_backend_data(
         &self,
         user_identity: UserIdentity,
         group: Ulid,
+        network: NetworkHandler,
         backend_path: &str,
         bucket: String,
         key: Option<String>,
@@ -501,7 +458,7 @@ where
 
             // Store location + Permission
             let perm_path = PathBuilder::new()
-                .realm_id(self_clone.realm_key)
+                .realm_id(network.get_realm_key())
                 .group_data(
                     group,
                     bucket.clone(),
@@ -525,7 +482,7 @@ where
             self_clone.store_location(&location, Some(frontend_path_clone), Some(perm_path))?;
 
             // Publish hash in Kademlia
-            self_clone.publish_hash(blake3_hash).await?;
+            network.store(blake3_hash).await?;
 
             Ok::<(), anyhow::Error>(())
         });
@@ -557,79 +514,6 @@ where
         // - Create operators
         // - Write (transformed) data to dest_location --> <group-id>/<random-ulid>
         // - Delete data at temp_location
-        Ok(())
-    }
-
-    pub async fn bao_tree_replicate(
-        &self,
-        user_id: UserIdentity,
-        group_id: Ulid,
-        replication_id: Ulid,
-        replication_node: NodeAddr,
-        replication_path: Option<String>,
-        object_info: &ObjectInfo,
-    ) -> anyhow::Result<()> {
-        // Create backend storage operator
-        let operator = get_backend_operator(
-            &self.backend.backend_type,
-            self.backend.access_config.clone(),
-            &object_info.storage_root,
-        )
-        .await?;
-
-        // Get data stream
-        let stream = get_data_async_reader(
-            &operator,
-            &object_info.storage_path,
-            None,
-            Some(BLOCK_SIZE.bytes()),
-        )
-        .await?;
-        let mut stream_wrapper = FuturesAsyncReaderWrapper {
-            stream,
-            info: object_info.clone(),
-        };
-        debug!("Fetched data stream from backend.");
-        let mut outboard =
-            PreOrderOutboard::<BytesMut>::create(&mut stream_wrapper, BLOCK_SIZE).await?;
-
-        // Send replication init
-        let (mut sx, mut rx) = self.network.create_stream(replication_node.node_id).await?;
-        let init_request = ReplicationMessage {
-            id: replication_id,
-            sender: self.get_node_addr(),
-            msg_type: MessageType::InitReplicationRequest {
-                user_id,
-                group_id,
-                path: replication_path,
-                size: object_info.file_size,
-                root: outboard.root,
-            },
-        };
-        init_request.send(&mut sx).await?;
-        debug!("Sent replication init message to {:?}", replication_node);
-
-        // Wait for response if replication node accepts
-        let response = ReplicationMessage::read(&mut rx).await?;
-        if let MessageType::InitReplicationResponse { ack, reason } = response.msg_type {
-            if !ack {
-                return Err(anyhow!(
-                    "Replication node {:?} rejected replication request: {:?}",
-                    replication_node,
-                    reason.ok_or_else(|| "No reason provided")
-                ));
-            }
-        }
-
-        // Send bao_tree encoded chunks
-        let ranges = ByteRanges::from(0..object_info.file_size);
-        let ranges = round_up_to_chunks(&ranges);
-        debug!("Chunk Ranges: {:#?}", ranges.boundaries());
-
-        let mut sx_wrapper = SendStreamWrapper(sx);
-        encode_ranges_validated(stream_wrapper, &mut outboard, &ranges, &mut sx_wrapper).await?;
-        debug!("Sent all chunks.");
-
         Ok(())
     }
 
@@ -668,7 +552,7 @@ where
             self.permission_manager.add_resource(
                 ResourceId::ContentHash(data_hash),
                 &path,
-                self.store.as_ref(),
+                &self.store,
                 &mut write_txn,
             )?
         }
@@ -677,10 +561,13 @@ where
         Ok(())
     }
 
-    async fn publish_hash(&self, hash: blake3::Hash) -> anyhow::Result<()> {
-        self.kademlia
-            .store(*hash.as_bytes(), self.get_node_addr(), None)
-            .await
+    pub async fn get_operator(&self, storage_root: &str) -> Result<Operator, anyhow::Error> {
+        get_backend_operator(
+            &self.backend.backend_type,
+            self.backend.access_config.clone(),
+            storage_root,
+        )
+        .await
     }
 }
 

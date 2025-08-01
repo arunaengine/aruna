@@ -1,10 +1,8 @@
 use super::s3service::ArunaS3Service;
-use crate::IOHandler;
 use crate::api_s3::auth::AuthProvider;
-use crate::config::config::{BackendConfig, S3Frontend};
+use crate::config::config::S3Frontend;
+use crate::io::controller::Controller;
 use anyhow::Result;
-use aruna_permission::manager::PermissionManager;
-use aruna_permission::paths::RealmKey;
 use aruna_storage::storage::lmdb::LmdbStore;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -24,7 +22,6 @@ use s3s::service::SharedS3Service;
 use std::convert::Infallible;
 use std::future::Ready;
 use std::future::ready;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::info;
 use tracing::{debug, error};
@@ -40,28 +37,18 @@ pub struct WrappingService(SharedS3Service);
 impl S3Server {
     #[tracing::instrument(
         level = "trace",
-        skip(frontend, io_handler, backend_config, permission_manager)
+        skip(frontend, controller)
     )]
-    pub async fn new(
-        frontend: S3Frontend,
-        io_handler: Arc<IOHandler<LmdbStore>>,
-        backend_config: BackendConfig,
-        permission_manager: PermissionManager,
-        realm_id: RealmKey,
-    ) -> Result<Self> {
-        let s3service = ArunaS3Service::new(io_handler.clone(), backend_config)
-            .await
-            .map_err(|e| {
-                error!(error = ?e, msg = e.to_string());
-                tonic::Status::unauthenticated(e.to_string())
-            })?;
+    pub async fn new(frontend: S3Frontend, controller: Controller<LmdbStore>) -> Result<Self> {
+        let s3service = ArunaS3Service::new(controller.clone()).await.map_err(|e| {
+            error!(error = ?e, msg = e.to_string());
+            tonic::Status::unauthenticated(e.to_string())
+        })?;
 
         let local_address = frontend.server.clone();
 
         let auth = AuthProvider {
-            store: io_handler.store.clone(),
-            permission_manager,
-            realm_key: realm_id,
+            controller: controller.clone(),
         };
 
         let service = {

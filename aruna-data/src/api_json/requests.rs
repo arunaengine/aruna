@@ -210,6 +210,7 @@ where
             .register_backend_data(
                 user,
                 group_id,
+                controller.network.clone(),
                 &self.backend_path,
                 self.bucket,
                 self.key,

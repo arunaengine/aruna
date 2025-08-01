@@ -1,7 +1,6 @@
 use crate::api_json::paths::*;
 use crate::io::controller::Controller;
 use aruna_storage::storage::store::Store;
-use std::sync::Arc;
 use utoipa::{
     Modify, OpenApi,
     openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme},
@@ -28,7 +27,7 @@ impl Modify for SecurityAddon {
     }
 }
 
-pub fn router<St>(store: Arc<Controller<St>>) -> OpenApiRouter
+pub fn router<St>(store: Controller<St>) -> OpenApiRouter
 where
     for<'a> St: Store<'a> + 'static,
 {

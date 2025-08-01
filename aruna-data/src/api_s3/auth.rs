@@ -1,16 +1,15 @@
 use crate::api_s3::util::get_s3_operation_permission;
+use crate::io::controller::Controller;
 use crate::io::io_handler::tables::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME};
 use anyhow::anyhow;
 use aruna_permission::UserIdentity;
-use aruna_permission::manager::PermissionManager;
-use aruna_permission::paths::{PathBuilder, RealmKey};
+use aruna_permission::paths::PathBuilder;
 use aruna_storage::storage::store::Store;
 use s3s::access::{S3Access, S3AccessContext};
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::path::S3Path;
 use s3s::{S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tracing::debug;
 use ulid::Ulid;
 
@@ -26,11 +25,9 @@ pub struct UserAccess {
 #[derive(Clone)]
 pub struct AuthProvider<St>
 where
-    for<'a> St: Store<'a>,
+    for<'a> St: Store<'a> + 'static,
 {
-    pub(crate) store: Arc<St>,
-    pub(crate) permission_manager: PermissionManager,
-    pub(crate) realm_key: RealmKey,
+    pub(crate) controller: Controller<St>,
 }
 
 #[async_trait::async_trait]
@@ -67,7 +64,7 @@ where
         let action = get_s3_operation_permission(cx.s3_op().name())
             .ok_or_else(|| s3_error!(InvalidRequest, "Unknown Operation"))?;
 
-        let builder = PathBuilder::new().realm_id(self.realm_key);
+        let builder = PathBuilder::new().realm_id(self.controller.network.get_realm_key());
         let perm_path = match cx.s3_path() {
             S3Path::Root => builder.group_admin(user_access.group_id),
             S3Path::Bucket { bucket } => {
@@ -94,12 +91,14 @@ where
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
         let allowed = self
+            .controller
+            .io_handler
             .permission_manager
             .check_path(
                 &user_access.user_id,
                 &perm_path,
                 action,
-                self.store.as_ref(),
+                &self.controller.io_handler.store,
             )
             .await
             .map_err(|e| s3_error!(InternalError, "Permission check failed: {}", e))?;
@@ -119,7 +118,7 @@ where
     for<'a> St: Store<'a> + 'static,
 {
     async fn query_user_access(&self, access_key_id: String) -> S3Result<UserAccess> {
-        let store_clone = self.store.clone();
+        let store_clone = self.controller.io_handler.store.clone();
         let user_access = tokio::task::spawn_blocking(move || {
             let mut read_txn = store_clone
                 .create_txn(false)
@@ -146,7 +145,7 @@ where
     }
 
     async fn _query_content_hash(&self, path: String) -> S3Result<[u8; 32]> {
-        let store_clone = self.store.clone();
+        let store_clone = self.controller.io_handler.store.clone();
         let content_hash = tokio::task::spawn_blocking(move || {
             let read_txn = store_clone
                 .create_txn(false)

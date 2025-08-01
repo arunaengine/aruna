@@ -1,9 +1,9 @@
 use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
-use crate::config::config::BackendConfig;
+use crate::io::controller::Controller;
 use crate::io::io_handler::ObjectInfo;
 use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
-use crate::util::opendal::{create_paths, get_backend_operator};
+use crate::util::opendal::create_paths;
 use anyhow::Result;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
@@ -12,7 +12,6 @@ use s3s::dto::{GetObjectInput, GetObjectOutput, PutObjectInput, PutObjectOutput,
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::path::Path;
-use std::sync::Arc;
 use tracing::{debug, error, warn};
 //TODO: Multipart --> Store parts, concatenate on finish
 
@@ -20,8 +19,7 @@ pub struct ArunaS3Service<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    io_handler: Arc<IOHandler<St>>,
-    storage_backend: BackendConfig,
+    controller: Controller<St>,
 }
 
 impl<St> Debug for ArunaS3Service<St>
@@ -38,14 +36,10 @@ impl<St> ArunaS3Service<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(io_handler, storage_backend))]
-    pub async fn new(
-        io_handler: Arc<IOHandler<St>>,
-        storage_backend: BackendConfig,
-    ) -> Result<Self> {
+    #[tracing::instrument(level = "trace", skip(controller))]
+    pub async fn new(controller: Controller<St>) -> Result<Self> {
         Ok(ArunaS3Service {
-            io_handler,
-            storage_backend,
+            controller,
         })
     }
 }
@@ -73,7 +67,7 @@ where
         let frontend_path = format!("{}/{}/{}", group_id, req.input.bucket, req.input.key);
 
         // Fetch object info
-        let store_clone = self.io_handler.store.clone();
+        let store_clone = self.controller.io_handler.store.clone();
         let info = tokio::task::spawn_blocking(move || {
             let read_txn = store_clone
                 .create_txn(false)
@@ -96,9 +90,7 @@ where
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
         // Create backend storage operator
-        let operator = get_backend_operator(
-            &self.storage_backend.backend_type,
-            self.storage_backend.access_config.clone(),
+        let operator = self.controller.io_handler.get_operator(
             &info.storage_root,
         )
         .await
@@ -159,7 +151,7 @@ where
             .ok_or_else(|| s3_error!(InternalError, "Frontend path creation failed"))?;
 
         // Check if frontend path is already occupied
-        let store_clone = self.io_handler.store.clone();
+        let store_clone = self.controller.io_handler.store.clone();
         let frontend_path_clone = frontend_path.clone();
         let exists = tokio::task::spawn_blocking(move || {
             let mut read_txn = store_clone.create_txn(false)?;
@@ -190,11 +182,28 @@ where
                 error!("Empty body is not allowed");
                 return Err(s3_error!(InvalidRequest, "Empty body is not allowed"));
             }
-            Some(data) => self
-                .io_handler
-                .handle_incoming_data_stream(user_id, group_id, frontend_path, backend_path, data)
-                .await
-                .map_err(|e| s3_error!(InternalError, "{}", e))?,
+            Some(data) => {
+                let (hash, info) = self
+                    .controller
+                    .io_handler
+                    .handle_incoming_data_stream(
+                        user_id,
+                        self.controller.network.get_realm_key(),
+                        group_id,
+                        frontend_path,
+                        backend_path,
+                        data,
+                    )
+                    .await
+                    .map_err(|e| s3_error!(InternalError, "{}", e))?;
+                self.controller
+                    .network
+                    .store(hash)
+                    .await
+                    .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+                info
+            }
         };
 
         if exists {

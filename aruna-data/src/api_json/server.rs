@@ -3,7 +3,7 @@ use crate::io::controller::Controller;
 use aruna_storage::storage::store::Store;
 use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};
 use std::net::Ipv4Addr;
-use std::{net::SocketAddr, sync::Arc};
+use std::net::SocketAddr;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
@@ -14,7 +14,7 @@ pub struct RestServer {}
 impl RestServer {
     #[tracing::instrument(level = "trace", skip(handler, rest_address, rest_port))]
     pub async fn run<St>(
-        handler: Arc<Controller<St>>,
+        handler: Controller<St>,
         rest_address: Ipv4Addr,
         rest_port: u16,
     ) -> anyhow::Result<()>

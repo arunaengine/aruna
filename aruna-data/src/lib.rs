@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 pub mod io;
 pub mod util;
+pub mod network;
 
 pub const ARUNA_NET_ALPN: &[u8] = b"aruna-net/0.1.0";
 
