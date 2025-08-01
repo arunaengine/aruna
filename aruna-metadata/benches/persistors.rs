@@ -12,6 +12,7 @@ use aruna_permission::{PermissionManager, TokenSystem};
 use aruna_storage::storage::fjall::{FjallConfig, FjallStore};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
+use aruna_task::TaskHandler;
 use parking_lot::RwLock;
 use std::sync::Arc;
 use ulid::Ulid;
@@ -30,6 +31,7 @@ impl TantivyFjall {
         let store_config = FjallConfig {
             path: store_path,
             databases: vec![
+                aruna_task::TASK_DB_NAME,
                 aruna_permission::DBNAME,
                 aruna_permission::RESOURCE_DB,
                 aruna_permission::OIDC_IDENTITIES_DB,
@@ -63,11 +65,13 @@ impl TantivyFjall {
                 .unwrap(),
         );
         let network = Arc::new(NetworkDummy::new(()).await.unwrap());
+        let task_handler = TaskHandler::new(store).await.unwrap();
 
         let controller = Arc::new(Controller::<FjallStore, TantivySearch, NetworkDummy>::new(
             persistor,
             network.clone(),
-        ));
+            task_handler,
+        ).await);
         network.start_actor(controller.clone()).await.unwrap();
         controller
     }
@@ -187,11 +191,13 @@ impl TantivyHeed {
                 .unwrap(),
         );
         let network = Arc::new(NetworkDummy::new(()).await.unwrap());
+        let task_handler = TaskHandler::new(store).await.unwrap();
 
         let controller = Arc::new(Controller::<LmdbStore, TantivySearch, NetworkDummy>::new(
             persistor,
             network.clone(),
-        ));
+            task_handler
+        ).await);
         network.start_actor(controller.clone()).await.unwrap();
         controller
     }
