@@ -71,7 +71,7 @@ pub async fn list_response(
                         ));
                     } else {
                         let object_with_location =
-                            cache.get_resource_cloned(&id, true).await.map_err(|e| {
+                            cache.get_resource_cloned(&id, false).await.map_err(|e| {
                                 tracing::error!(error = "No key found for path", ?e, ?path);
                                 s3_error!(NoSuchKey, "No key found for path: {}", path)
                             })?;
@@ -105,7 +105,7 @@ pub async fn list_response(
                 } else {
                     // If None split -> Entry
                     let object_with_location =
-                        cache.get_resource_cloned(&id, true).await.map_err(|e| {
+                        cache.get_resource_cloned(&id, false).await.map_err(|e| {
                             tracing::error!(error = "No key found for path", ?e, ?path);
                             s3_error!(NoSuchKey, "No key found for path: {}", path)
                         })?;
@@ -132,7 +132,7 @@ pub async fn list_response(
 
                 if path.strip_prefix(&prefix).is_some() {
                     let object_with_location =
-                        cache.get_resource_cloned(&id, true).await.map_err(|e| {
+                        cache.get_resource_cloned(&id, false).await.map_err(|e| {
                             tracing::error!(error = "No key found for path", ?e, ?path);
                             s3_error!(NoSuchKey, "No key found for path: {}", path)
                         })?;
@@ -160,7 +160,7 @@ pub async fn list_response(
                 }
 
                 let object_with_location =
-                    cache.get_resource_cloned(&id, true).await.map_err(|e| {
+                    cache.get_resource_cloned(&id, false).await.map_err(|e| {
                         tracing::error!(error = "No key found for path", ?e, ?path);
                         s3_error!(NoSuchKey, "No key found for path: {}", path)
                     })?;
