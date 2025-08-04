@@ -1,5 +1,6 @@
 use crate::replication::replication_handler::Direction;
 use crate::replication::replication_handler::ReplicationMessage;
+use crate::structs::FileFormat;
 use crate::structs::Object as DPObject;
 use crate::structs::ObjectType;
 use crate::structs::PubKey;
@@ -472,7 +473,7 @@ impl GrpcQueryHandler {
 
         // Check if data proxy local temp resource
         if let Some(loc) = self.cache.get_resource_cloned(object_id, false).await?.1 {
-            if loc.raw_content_len == 0 && loc.disk_content_len == 0 {
+            if loc.file_format == FileFormat::Pseudo {
                 // Early return as the resource does only exist locally
                 return Ok(());
             }

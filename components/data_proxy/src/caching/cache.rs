@@ -793,7 +793,7 @@ impl Cache {
                     bucket: "temp".to_string(),
                     key: object.name.clone(),
                     upload_id: None,
-                    file_format: crate::structs::FileFormat::Raw,
+                    file_format: crate::structs::FileFormat::Pseudo,
                     raw_content_len: 0,
                     disk_content_len: 0,
                     disk_hash: None,
