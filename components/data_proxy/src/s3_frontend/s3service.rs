@@ -1373,6 +1373,106 @@ impl S3 for ArunaS3Service {
 
     #[tracing::instrument(err)]
     #[allow(clippy::blocks_in_conditions)]
+    async fn delete_objects(
+        &self,
+        req: S3Request<DeleteObjectsInput>,
+    ) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let CheckAccessResult {
+            user_state,
+            headers,
+            ..
+        } = req
+            .extensions
+            .get::<CheckAccessResult>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing data context");
+                s3_error!(UnexpectedContent, "Missing data context")
+            })?;
+
+        let mut objects = Vec::new();
+        let lock = self.cache.auth.read().await;
+        let auth = match lock.as_ref() {
+            Some(auth) => auth,
+            None => {
+                return Err(s3_error!(
+                    InternalError,
+                    "Could not access authorization handler"
+                ));
+            }
+        };
+        // One loop for authorization
+        for ObjectIdentifier { key, .. } in &req.input.delete.objects {
+            let CheckAccessResult { objects_state, .. } = auth
+                .handle_object(
+                    &req.input.bucket,
+                    key,
+                    &http::Method::DELETE,
+                    req.credentials.as_ref(),
+                    &req.headers,
+                )
+                .await?;
+
+            let (states, _) = objects_state.require_regular()?;
+            let all = states.to_new_or_existing()?;
+            trace!(?all);
+            let (_, _, _, object, _) = all;
+            objects.push(object);
+        }
+
+        drop(lock);
+
+        let impersonating_token =
+            user_state.sign_impersonating_token(self.cache.auth.read().await.as_ref());
+
+        for object in objects {
+            match object {
+                NewOrExistingObject::Missing(_) => {
+                    //Do nothing.
+                }
+                NewOrExistingObject::Existing(object) => {
+                    if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
+                        if let Some(token) = &impersonating_token {
+                            handler
+                                .delete_object(&object.id, token)
+                                .await
+                                .map_err(|e| {
+                                    error!("Object deletion failed: {e}");
+                                    s3_error!(InternalError, "Object deletion failed")
+                                })?;
+
+                            self.cache.delete_object(object.id).await.map_err(|e| {
+                                error!("Object cache deletion failed: {e}");
+                                s3_error!(InternalError, "Object cache deletion failed")
+                            })?;
+                        }
+                    }
+                }
+                NewOrExistingObject::None => {
+                    return Err(s3_error!(
+                        InvalidObjectState,
+                        "Object in invalid state: None"
+                    ))
+                }
+            }
+        }
+
+        let mut resp = S3Response::new(DeleteObjectsOutput::default());
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+        Ok(resp)
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
     async fn delete_object(
         &self,
         req: S3Request<DeleteObjectInput>,
@@ -1395,7 +1495,10 @@ impl S3 for ArunaS3Service {
 
         let (states, _) = objects_state.require_regular()?;
 
-        let (_, _, _, object, _) = states.to_new_or_existing()?;
+        //let (_, _, _, object, _) = states.to_new_or_existing()?;
+        let all = states.to_new_or_existing()?;
+        trace!(?all);
+        let (_, _, _, object, _) = all;
 
         match object {
             NewOrExistingObject::Missing(_) => {
