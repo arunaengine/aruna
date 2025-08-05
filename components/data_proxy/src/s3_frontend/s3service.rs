@@ -312,7 +312,7 @@ impl S3 for ArunaS3Service {
         let CheckAccessResult {
             objects_state,
             user_state,
-            ..
+            headers,
         } = req
             .extensions
             .get::<CheckAccessResult>()
@@ -475,7 +475,19 @@ impl S3 for ArunaS3Service {
             ..Default::default()
         };
         debug!(?output);
-        Ok(S3Response::new(output))
+
+        let mut resp = S3Response::new(output);
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+        Ok(resp)
     }
 
     #[tracing::instrument(err)]
@@ -513,9 +525,17 @@ impl S3 for ArunaS3Service {
             }
             None => 1,
         };
-        let (parts, next_marker, is_truncated) =
-            self.cache
-                .list_parts(&req.input.upload_id, start_at, max_parts);
+        let (parts, next_marker, is_truncated) = self
+            .cache
+            .list_parts(&req.input.upload_id, start_at, max_parts)
+            .map_err(|e| {
+                error!("{e}");
+                s3_error!(
+                    NoSuchUpload,
+                    "No upload found for id {}",
+                    &req.input.upload_id
+                )
+            })?;
 
         let output = ListPartsOutput {
             bucket: Some(req.input.bucket),
@@ -1531,6 +1551,81 @@ impl S3 for ArunaS3Service {
         }
 
         let mut resp = S3Response::new(DeleteObjectOutput::default());
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+        Ok(resp)
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn abort_multipart_upload(
+        &self,
+        req: S3Request<AbortMultipartUploadInput>,
+    ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        let CheckAccessResult {
+            objects_state,
+            headers,
+            ..
+        } = req
+            .extensions
+            .get::<CheckAccessResult>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing data context");
+                s3_error!(UnexpectedContent, "Missing data context")
+            })?;
+
+        let (object, location) = objects_state.extract_object()?;
+        let mut location = location.ok_or_else(|| {
+            error!(error = "Unable to extract object location");
+            s3_error!(InternalError, "Unable to extract object location")
+        })?;
+
+        let upload_id = location
+            .upload_id
+            .as_ref()
+            .ok_or_else(|| {
+                error!(error = "Upload id must be specified");
+                s3_error!(InvalidPart, "Upload id must be specified")
+            })?
+            .to_string();
+
+        self.cache
+            .delete_multipart_upload(&upload_id)
+            .await
+            .map_err(|e| {
+                error!("{e}");
+                s3_error!(InternalError, "Unable to delete multipart upload")
+            })?;
+
+        self.backend
+            .abort_multipart_upload(location.clone(), upload_id)
+            .await
+            .map_err(|e| {
+                error!("{e}");
+                s3_error!(InternalError, "Unable to abort multipart")
+            })?;
+
+        location.disk_content_len = 0;
+        location.raw_content_len = 0;
+
+        self.cache
+            .update_location(object.id, location.clone())
+            .await
+            .map_err(|_| {
+                error!(error = "Unable to update location");
+                s3_error!(InternalError, "Unable to update location")
+            })?;
+
+        let mut resp = S3Response::new(AbortMultipartUploadOutput::default());
         if let Some(headers) = headers {
             for (k, v) in headers {
                 resp.headers.insert(

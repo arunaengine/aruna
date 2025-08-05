@@ -308,6 +308,27 @@ impl StorageBackend for S3Backend {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, location))]
+    async fn abort_multipart_upload(
+        &self,
+        location: ObjectLocation,
+        upload_id: String,
+    ) -> Result<()> {
+        let _ = self
+            .s3_client
+            .abort_multipart_upload()
+            .bucket(location.bucket)
+            .key(location.key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|e| {
+                error!(error = ?e, "Error aborting multipart upload");
+                e
+            })?;
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self, bucket))]
     async fn create_bucket(&self, bucket: String) -> Result<()> {
         self.check_and_create_bucket(bucket).await

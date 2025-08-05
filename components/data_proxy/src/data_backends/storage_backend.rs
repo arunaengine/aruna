@@ -81,6 +81,18 @@ pub trait StorageBackend: Debug + Send + Sync {
         upload_id: String,
     ) -> Result<()>;
 
+    /// Finishes multipart uploads
+    /// # Arguments
+    ///
+    /// * `location` - The location of the object
+    /// * `parts` - The sequence of all uploaded parts that contain their part_number and their ETag
+    /// * `upload_id` - The upload id of the multipart uploads
+    async fn abort_multipart_upload(
+        &self,
+        location: ObjectLocation,
+        upload_id: String,
+    ) -> Result<()>;
+
     /// Creates a bucket or the storage system equivalent
     /// # Arguments
     ///

@@ -304,6 +304,22 @@ impl StorageBackend for FSBackend {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, _location))]
+    async fn abort_multipart_upload(
+        &self,
+        _location: ObjectLocation,
+        upload_id: String,
+    ) -> Result<()> {
+        let mut dir = tokio::fs::read_dir(Path::new(&self.base_path).join(&upload_id)).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            tokio::fs::remove_file(entry.path()).await.map_err(|e| {
+                tracing::error!(error = ?e, msg = e.to_string());
+                e
+            })?;
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self, bucket))]
     async fn create_bucket(&self, bucket: String) -> Result<()> {
         self.check_and_create_bucket(bucket).await
