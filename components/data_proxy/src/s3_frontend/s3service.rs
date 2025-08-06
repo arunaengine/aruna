@@ -2126,4 +2126,267 @@ impl S3 for ArunaS3Service {
 
         Ok(resp)
     }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn copy_object(
+        &self,
+        req: S3Request<CopyObjectInput>,
+    ) -> S3Result<S3Response<CopyObjectOutput>> {
+        // Check access for target
+        let CheckAccessResult {
+            user_state,
+            headers,
+            objects_state,
+        } = req
+            .extensions
+            .get::<CheckAccessResult>()
+            .cloned()
+            .ok_or_else(|| {
+                error!(error = "Missing data context");
+                s3_error!(UnexpectedContent, "Missing data context")
+            })?;
+
+        // Query results from check access
+        let (states, _) = objects_state.require_regular()?;
+        let all = states.to_new_or_existing()?;
+        trace!(?all);
+        let (_, collection, dataset, new_object, path) = all;
+
+        // Authorize existing object and get object + location
+        let (existing_object, existing_location) =
+            if let CopySource::Bucket { key, bucket, .. } = &req.input.copy_source {
+                let lock = self.cache.auth.read().await;
+                let auth = match lock.as_ref() {
+                    Some(auth) => auth,
+                    None => {
+                        return Err(s3_error!(
+                            InternalError,
+                            "Could not access authorization handler"
+                        ));
+                    }
+                };
+                let CheckAccessResult { objects_state, .. } = auth
+                    .handle_object(
+                        bucket,
+                        key,
+                        &http::Method::GET,
+                        req.credentials.as_ref(),
+                        &req.headers,
+                    )
+                    .await?;
+                drop(lock);
+
+                let (states, location) = objects_state.require_regular()?;
+                let all = states.to_new_or_existing()?;
+                trace!(?all);
+                let (_, _, _, object, _) = all;
+
+                let NewOrExistingObject::Existing(object) = object else {
+                    return Err(s3_error!(NoSuchKey, "Source object not found"));
+                };
+                let Some(location) = location else {
+                    return Err(s3_error!(NoSuchKey, "Location of source object not found"));
+                };
+                (object, location)
+            } else {
+                return Err(s3_error!(
+                    InvalidRequest,
+                    "AWS Access points are unsupported"
+                ));
+            };
+
+        let md5hash = existing_object.hashes.get("MD5").cloned();
+        let sha256hash = existing_object.hashes.get("SHA256").cloned();
+
+        // Create missing objects for copy
+        let impersonating_token =
+            user_state.sign_impersonating_token(self.cache.auth.read().await.as_ref());
+
+        let (mut new_object, exists) = match new_object {
+            NewOrExistingObject::Missing(mut new_object) => {
+                let mut collection_id = None;
+                if let NewOrExistingObject::Missing(collection) = collection {
+                    trace!(?collection);
+                    if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
+                        if let Some(token) = &impersonating_token {
+                            let col = handler.create_collection(collection, token).await.map_err(
+                                |_| {
+                                    error!(error = "Unable to create collection");
+                                    s3_error!(InternalError, "Unable to create collection")
+                                },
+                            )?;
+                            collection_id = Some(col.id);
+                        }
+                    }
+                }
+
+                let mut dataset_id = None;
+                if let NewOrExistingObject::Missing(mut dataset) = dataset {
+                    trace!(?dataset);
+                    if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
+                        if let Some(token) = &impersonating_token {
+                            if let Some(collection_id) = collection_id {
+                                dataset.parents =
+                                    Some(HashSet::from_iter([TypedRelation::Collection(
+                                        collection_id,
+                                    )]));
+                            }
+                            let dataset =
+                                handler.create_dataset(dataset, token).await.map_err(|_| {
+                                    error!(error = "Unable to create dataset");
+                                    s3_error!(InternalError, "Unable to create dataset")
+                                })?;
+                            dataset_id = Some(dataset.id);
+                        }
+                    }
+                }
+
+                if let Some(dataset_id) = dataset_id {
+                    new_object.parents =
+                        Some(HashSet::from_iter([TypedRelation::Dataset(dataset_id)]));
+                } else if let Some(collection_id) = collection_id {
+                    new_object.parents = Some(HashSet::from_iter([TypedRelation::Collection(
+                        collection_id,
+                    )]));
+                }
+                (new_object, false)
+            }
+            NewOrExistingObject::Existing(mut object) => {
+                if object.object_status == Status::Initializing {
+                    (object, true)
+                } else {
+                    if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
+                        if let Some(token) = &impersonating_token {
+                            handler
+                                .init_object_update(object.clone(), token, true)
+                                .await
+                                .map_err(|_| {
+                                    error!(error = "Object update failed");
+                                    s3_error!(InternalError, "Object update failed")
+                                })?
+                        } else {
+                            error!("missing impersonating token");
+                            return Err(s3_error!(InternalError, "Token creation failed"));
+                        }
+                    } else {
+                        error!("ArunaServer client not available");
+                        return Err(s3_error!(InternalError, "ArunaServer client not available"));
+                    };
+                    object.hashes = existing_object.hashes.clone();
+                    object.synced = existing_object.synced;
+                    object.children = None; // This should be None anyway, because this is an Object
+                    object.dynamic = existing_object.dynamic;
+
+                    (object, true)
+                }
+            }
+            NewOrExistingObject::None => {
+                return Err(s3_error!(
+                    InvalidObjectState,
+                    "Object in invalid state: None"
+                ))
+            }
+        };
+
+        // Create new location
+        let new_location = self
+            .backend
+            .initialize_location(
+                &new_object,
+                Some(existing_location.raw_content_len),
+                path,
+                false,
+            )
+            .await
+            .map_err(|_| {
+                error!(error = "Unable to create object_location");
+                s3_error!(InternalError, "Unable to create object_location")
+            })?;
+        let content_len = new_location.raw_content_len;
+
+        // Copy data
+        self.backend
+            .copy_data(existing_location, new_location.clone())
+            .await
+            .map_err(|e| {
+                error!(error = ?e, "Unable to create and finish object");
+                s3_error!(InternalError, "{}", e.to_string())
+            })?;
+
+        // Finish object
+        if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
+            if let Some(token) = &impersonating_token {
+                if exists {
+                    new_object = handler
+                        .finish_object(
+                            new_object.id,
+                            content_len,
+                            existing_object.get_hashes(),
+                            token,
+                        )
+                        .await
+                        .map_err(|_| {
+                            error!(error = "Unable to finish object");
+                            s3_error!(InternalError, "Unable to finish object")
+                        })?;
+                } else {
+                    trace!(?new_object);
+                    new_object = handler
+                        .create_and_finish(new_object.clone(), content_len, token)
+                        .await
+                        .map_err(|e| {
+                            error!(error = ?e, "Unable to create and finish object");
+                            s3_error!(InvalidObjectState, "{}", e.to_string())
+                        })?;
+                }
+            }
+        }
+
+        trace!("Before finish");
+
+        // Finish location
+        self.cache
+            .add_location_with_binding(new_object.id, new_location)
+            .await
+            .map_err(|e| {
+                error!(error = ?e, msg = "Unable to add location with binding");
+                s3_error!(InternalError, "Unable to add location with binding")
+            })?;
+
+        trace!("After finish");
+
+        let response = CopyObjectOutput {
+            copy_object_result: Some(CopyObjectResult {
+                e_tag: md5hash,
+                checksum_sha256: sha256hash,
+                last_modified: Some(
+                    time::OffsetDateTime::from_unix_timestamp(
+                        (new_object.id.timestamp() / 1000) as i64,
+                    )
+                    .map_err(|_| {
+                        error!(error = "Unable to parse timestamp");
+                        s3_error!(InternalError, "Unable to parse timestamp")
+                    })?
+                    .into(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut resp = S3Response::new(response);
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+
+        trace!("Respond");
+        Ok(resp)
+    }
 }

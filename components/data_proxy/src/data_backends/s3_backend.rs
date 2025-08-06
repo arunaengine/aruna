@@ -394,6 +394,21 @@ impl StorageBackend for S3Backend {
             ..Default::default()
         })
     }
+
+    #[tracing::instrument(level = "trace", skip(self, source, target))]
+    /// Initialize a new location for a specific object
+    /// This takes the object_info into account and creates a new location for the object
+    async fn copy_data(&self, source: ObjectLocation, target: ObjectLocation) -> Result<()> {
+        self.check_and_create_bucket(target.bucket.clone()).await?;
+        self.s3_client
+            .copy_object()
+            .copy_source(&[source.bucket, source.key].join("/"))
+            .bucket(target.bucket)
+            .key(target.key)
+            .send()
+            .await?;
+        Ok(())
+    }
 }
 
 impl S3Backend {

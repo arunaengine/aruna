@@ -1,3 +1,6 @@
+volumes:
+  gateway_config:
+    driver: local
 services:
   nats:
     image: nats:latest
@@ -11,14 +14,17 @@ services:
       - 7700:7700
     environment:
       MEILI_MASTER_KEY: "MASTER_KEY"
-  yugabyte:
-    image: yugabytedb/yugabyte:2.19.2.0-b121
-    hostname: yugabyte
+  postgres:
+    image: postgres:14.18
+    hostname: postgres 
     ports:
-      - 5433:5433
-    command: 'bin/yugabyted start --tserver_flags="enable_wait_queues=true,enable_deadlock_detection=true,yb_enable_read_committed_isolation=true" --daemon=false'
+      - 5433:5432
+    environment:
+    - POSTGRES_USER=yugabyte
+    - POSTGRES_PASSWORD=yugabyte
+    - PGUSER=yugabyte
     healthcheck:
-      test: ["CMD-SHELL", 'ysqlsh -h yugabyte -p 5433 --command="\l"']
+      test: ["CMD-SHELL", "pg_isready"]
       interval: 30s
       timeout: 10s
       retries: 5
@@ -37,18 +43,27 @@ services:
   load_database:
     network_mode: "host"
     depends_on:
-      yugabyte:
+      postgres:
         condition: service_healthy
     restart: on-failure
-    image: postgres:alpine3.18
+    image: postgres:alpine3.21
     volumes:
       - ./components/server/tests/common/initial_data.sql:/data/initial_data.sql
       - ./components/server/src/database/schema.sql:/data/schema.sql
+      - ./components/data_proxy/src/database/schema.sql:/data/proxy_schema.sql
     command: >
-      sh -c "psql 'postgres://yugabyte@localhost:5433' -c 'DROP DATABASE IF EXISTS test' &&
-             psql 'postgres://yugabyte@localhost:5433' -c 'CREATE DATABASE test' &&
-             psql 'postgres://yugabyte@localhost:5433/test' < /data/schema.sql &&
-             psql 'postgres://yugabyte@localhost:5433/test' < /data/initial_data.sql"
-
-
-
+      sh -c "psql 'postgres://yugabyte:yugabyte@localhost:5433' -c 'DROP DATABASE IF EXISTS test' &&
+             psql 'postgres://yugabyte:yugabyte@localhost:5433' -c 'DROP DATABASE IF EXISTS proxy' &&
+             psql 'postgres://yugabyte:yugabyte@localhost:5433' -c 'CREATE DATABASE test' &&
+             psql 'postgres://yugabyte:yugabyte@localhost:5433' -c 'CREATE DATABASE proxy' &&
+             psql 'postgres://yugabyte:yugabyte@localhost:5433/proxy' < /data/proxy_schema.sql &&
+             psql 'postgres://yugabyte:yugabyte@localhost:5433/test' < /data/schema.sql &&
+             psql 'postgres://yugabyte:yugabyte@localhost:5433/test' < /data/initial_data.sql"
+  minio:
+    image: minio/minio
+    ports:
+      - 9000:9000
+      - 9001:9001
+    environment:
+      MINIO_DOMAIN: localhost:9000
+    command: "server /data --console-address ':9001'"

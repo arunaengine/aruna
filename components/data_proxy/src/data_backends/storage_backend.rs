@@ -81,11 +81,10 @@ pub trait StorageBackend: Debug + Send + Sync {
         upload_id: String,
     ) -> Result<()>;
 
-    /// Finishes multipart uploads
+    /// Aborts multipart uploads
     /// # Arguments
     ///
     /// * `location` - The location of the object
-    /// * `parts` - The sequence of all uploaded parts that contain their part_number and their ETag
     /// * `upload_id` - The upload id of the multipart uploads
     async fn abort_multipart_upload(
         &self,
@@ -114,4 +113,16 @@ pub trait StorageBackend: Debug + Send + Sync {
         names: [Option<(DieselUlid, String)>; 4],
         temp: bool,
     ) -> Result<ObjectLocation>;
+
+
+    /// Copies data from source to target
+    /// # Arguments
+    ///
+    /// * `source` - The location of the source object
+    /// * `target` - The location of the target object
+    async fn copy_data(
+        &self,
+        source: ObjectLocation,
+        target: ObjectLocation,
+    ) -> Result<()>;
 }

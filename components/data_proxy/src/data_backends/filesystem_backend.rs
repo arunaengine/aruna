@@ -382,4 +382,38 @@ impl StorageBackend for FSBackend {
             ..Default::default()
         })
     }
+
+    #[tracing::instrument(level = "trace", skip(self, source, target))]
+    /// Initialize a new location for a specific object
+    /// This takes the object_info into account and creates a new location for the object
+    async fn copy_data(&self, source: ObjectLocation, target: ObjectLocation) -> Result<()> {
+        let mut source_file = tokio::fs::File::open(
+            Path::new(&self.base_path)
+                .join(&source.bucket)
+                .join(&source.key),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, msg = e.to_string());
+            e
+        })?;
+
+        let mut target_file = tokio::fs::File::open(
+            Path::new(&self.base_path)
+                .join(&target.bucket)
+                .join(&target.key),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, msg = e.to_string());
+            e
+        })?;
+        tokio::io::copy(&mut source_file, &mut target_file)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = ?e, msg = e.to_string());
+                e
+            })?;
+        Ok(())
+    }
 }
