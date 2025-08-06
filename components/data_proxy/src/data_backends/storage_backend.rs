@@ -114,15 +114,10 @@ pub trait StorageBackend: Debug + Send + Sync {
         temp: bool,
     ) -> Result<ObjectLocation>;
 
-
     /// Copies data from source to target
     /// # Arguments
     ///
     /// * `source` - The location of the source object
     /// * `target` - The location of the target object
-    async fn copy_data(
-        &self,
-        source: ObjectLocation,
-        target: ObjectLocation,
-    ) -> Result<()>;
+    async fn copy_data(&self, source: ObjectLocation, target: ObjectLocation) -> Result<()>;
 }
