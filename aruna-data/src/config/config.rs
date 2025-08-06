@@ -1,5 +1,5 @@
+use crate::error::ArunaDataError;
 use crate::util::opendal::Backend;
-use anyhow::bail;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use iroh::SecretKey;
@@ -68,7 +68,7 @@ pub struct S3Frontend {
 }
 
 impl Config {
-    pub fn load_from_env() -> anyhow::Result<Config> {
+    pub fn load_from_env() -> Result<Config, ArunaDataError> {
         if let Ok(file) = dotenvy::var("ENV") {
             dotenvy::from_filename_override(file)?;
         }
@@ -201,7 +201,7 @@ impl S3Host for S3Frontend {
     }
 }
 
-fn load_access_config(prefix: &str) -> anyhow::Result<HashMap<String, String>> {
+fn load_access_config(prefix: &str) -> Result<HashMap<String, String>, ArunaDataError> {
     let mut map = HashMap::new();
 
     for (key, value) in dotenvy::vars() {
@@ -213,9 +213,14 @@ fn load_access_config(prefix: &str) -> anyhow::Result<HashMap<String, String>> {
     Ok(map)
 }
 
-fn strip_prefix(prefix: &str, target: &str) -> anyhow::Result<String> {
+fn strip_prefix(prefix: &str, target: &str) -> Result<String, ArunaDataError> {
     Ok(match target.strip_prefix(prefix) {
-        None => bail!("Key {target} should start with prefix {prefix}"),
+        None => {
+            return Err(ArunaDataError::InvalidParameter {
+                name: "Key".to_string(),
+                error: format!("Key {target} should start with prefix {prefix}"),
+            });
+        }
         Some(stripped_target) => stripped_target.to_lowercase(),
     })
 }

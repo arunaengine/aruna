@@ -1,5 +1,4 @@
 use anyhow::Result;
-use aruna_data::network::network_handler::NetworkHandler;
 use aruna_data::IOHandler;
 use aruna_data::api_json::request::Request;
 use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
@@ -8,6 +7,7 @@ use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::config::config::Config;
 use aruna_data::io::controller::Controller;
 use aruna_data::io::io_handler::REPLICATION_PROTOCOL_ID;
+use aruna_data::network::network_handler::NetworkHandler;
 use aruna_data::util::opendal::Backend;
 use aruna_net::actor::NetworkActorBuilder;
 use aruna_permission::paths::RealmKey;
@@ -146,11 +146,8 @@ pub async fn init_test_nodes(
         let controller = Controller::<LmdbStore>::new(io_handler, network).await;
 
         // Create and run S3 server
-        let s3server = S3Server::new(
-            config.frontend.s3_frontend.clone(),
-            controller.clone(),
-        )
-        .await?;
+        let s3server =
+            S3Server::new(config.frontend.s3_frontend.clone(), controller.clone()).await?;
         tokio::spawn(async move { s3server.run().await });
 
         // Create and run rest server

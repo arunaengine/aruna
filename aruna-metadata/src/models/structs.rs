@@ -311,7 +311,6 @@ pub enum PolicyResult {
     Modify,
 }
 
-
 #[derive(Clone, Serialize, Deserialize)]
 pub enum TypedSavedDoc {
     Resource(Vec<u8>),

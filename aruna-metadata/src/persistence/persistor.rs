@@ -18,11 +18,11 @@ use autosurgeon::reconcile;
 use iroh::PublicKey;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
-use tracing::trace;
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, atomic::AtomicU32},
 };
+use tracing::trace;
 use ulid::Ulid;
 
 pub mod tables {
@@ -259,7 +259,8 @@ where
                 let Some(res) = store.get(&read_txn, GROUPS_DB_NAME, &byte_id)? else {
                     trace!("Group with id {} not found", group_id.to_string());
                     return Err(ArunaMetadataError::NotFound(format!(
-                        "{} not found", group_id.to_string()
+                        "{} not found",
+                        group_id.to_string()
                     )));
                 };
 
@@ -618,12 +619,12 @@ where
                     let id = group_id.to_bytes();
 
                     let group_bytes =
-                        store
-                            .get(&write_txn, GROUPS_DB_NAME, &id)?
-                            .ok_or_else(|| ArunaMetadataError::InvalidParameter {
+                        store.get(&write_txn, GROUPS_DB_NAME, &id)?.ok_or_else(|| {
+                            ArunaMetadataError::InvalidParameter {
                                 name: "group_id".to_string(),
                                 error: "Group not found".to_string(),
-                            })?;
+                            }
+                        })?;
 
                     let mut group_doc =
                         automerge::AutoCommit::load(group_bytes.as_ref())?.with_actor(actor_id);

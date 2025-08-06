@@ -1,6 +1,6 @@
-use anyhow::anyhow;
 use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::config::config::Config as DataConfig;
+use aruna_data::error::ArunaDataError;
 use aruna_data::{IOHandler, network::network_handler::NetworkHandler};
 use aruna_metadata::{
     api::server::RestServer,
@@ -73,14 +73,19 @@ pub async fn start_data(
     let rest_handle = tokio::spawn(async move {
         aruna_data::api_json::server::RestServer::run(
             controller,
-            Ipv4Addr::from_str(&config.config.frontend.openapi_frontend.address)?,
+            Ipv4Addr::from_str(&config.config.frontend.openapi_frontend.address).map_err(|_| {
+                ArunaDataError::ConversionError {
+                    from: "&str".to_string(),
+                    to: "Ipv4Addr".to_string(),
+                }
+            })?,
             config.config.frontend.openapi_frontend.port,
         )
         .await
     })
     .map_err(|e| {
         error!(error = ?e, msg = e.to_string());
-        anyhow!("an error occurred {e}")
+        ArunaDataError::ServerError(e.to_string())
     });
 
     match try_join!(s3server.run(), rest_handle) {

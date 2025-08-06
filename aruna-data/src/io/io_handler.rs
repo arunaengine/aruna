@@ -1,18 +1,16 @@
 use crate::config::config::BackendConfig;
+use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::{
     LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME,
 };
 use crate::io::messages::{MessageType, ReplicationMessage};
 use crate::network::network_handler::NetworkHandler;
-use crate::util::bao_tree::{
-    OpenDalWriter, RecvStreamWrapper,
-};
+use crate::util::bao_tree::{OpenDalWriter, RecvStreamWrapper};
 use crate::util::hash::Hasher;
 use crate::util::opendal::{
     Backend, create_paths, get_backend_operator, get_data_stream, get_reader,
 };
 use crate::util::s3::make_bucket;
-use anyhow::anyhow;
 use aruna_net::actor_handle::ReceiveStreams;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::{Path, PathBuilder, RealmKey};
@@ -95,7 +93,7 @@ where
         store: St,
         permission_manager: PermissionManager,
         token_handler: Arc<RwLock<TokenSystem>>,
-    ) -> Result<Arc<Self>, anyhow::Error> {
+    ) -> Result<Arc<Self>, ArunaDataError> {
         let io_handler = Arc::new(Self {
             backend,
             backend_stats: Arc::new(RwLock::new(Self::load_stats(&store)?)),
@@ -107,7 +105,7 @@ where
         Ok(io_handler)
     }
 
-    fn load_stats<S>(store: &S) -> anyhow::Result<BTreeMap<String, u64>>
+    fn load_stats<S>(store: &S) -> Result<BTreeMap<String, u64>, ArunaDataError>
     where
         for<'a> S: Store<'a> + 'static,
     {
@@ -124,7 +122,7 @@ where
             .collect::<BTreeMap<String, u64>>())
     }
 
-    async fn eval_suitable_bucket(&self) -> anyhow::Result<String> {
+    async fn eval_suitable_bucket(&self) -> Result<String, ArunaDataError> {
         if let Some((bucket, _)) = self
             .backend_stats
             .read()
@@ -139,12 +137,20 @@ where
             {
                 let parts = bucket.split('-').collect::<Vec<_>>();
                 if parts.len() != 3 {
-                    return Err(anyhow::anyhow!("Invalid backend bucket name"));
+                    return Err(ArunaDataError::ServerError(
+                        "Invalid backend bucket name".to_string(),
+                    ));
                 }
                 format!(
                     "aruna-{}-{}",
                     Ulid::from_string(parts[1])?.to_string().to_lowercase(),
-                    parts[1].parse::<u64>()? + 1
+                    parts[1]
+                        .parse::<u64>()
+                        .map_err(|_e| ArunaDataError::ConversionError {
+                            from: "&str".to_string(),
+                            to: "u64".to_string()
+                        })?
+                        + 1
                 )
             } else {
                 format!("aruna-{}-1", Ulid::new().to_string().to_lowercase())
@@ -164,7 +170,7 @@ where
         bucket: &str,
         increase: bool,
         mut txn: &mut <St as Store<'a>>::Txn,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ArunaDataError> {
         // Write changes to database and "cache"
         if let Some(val_bytes) = self
             .store
@@ -339,7 +345,7 @@ where
         frontend_path: String,
         backend_path: String,
         mut data_stream: S,
-    ) -> Result<(blake3::Hash, ObjectInfo), StdError>
+    ) -> Result<(blake3::Hash, ObjectInfo), ArunaDataError>
     where
         S: ByteStream<Item = Result<Bytes, StdError>> + Send + Sync + Unpin + 'static,
     {
@@ -348,7 +354,7 @@ where
         let frontend_bucket = extract_frontend_bucket(&frontend_path)?;
         let key = frontend_path
             .strip_prefix(&format!("{}/", group_id))
-            .ok_or_else(|| anyhow!("Invalid frontend path provided"))?;
+            .ok_or_else(|| ArunaDataError::ServerError("Invalid frontend path provided".to_string()))?;
         let operator = get_backend_operator(
             &self.backend.backend_type,
             self.backend.access_config.clone(),
@@ -362,12 +368,12 @@ where
         let mut writer = operator
             .writer_with(&backend_path)
             .chunk(BLOCK_SIZE.bytes())
-            .await?
+            .await.map_err(|e| ArunaDataError::ServerError(e.to_string()))?
             .into_futures_async_write();
 
         // Fetch stream chunks
         while let Some(bytes) = data_stream.next().await {
-            let bytes = bytes?;
+            let bytes = bytes.map_err(|e| ArunaDataError::ServerError(e.to_string()))?;
 
             // Write first, then update hashes and written bytes
             writer.write_all(&bytes).await?;
@@ -416,7 +422,7 @@ where
         bucket: String,
         key: Option<String>,
         _create_frontend_path: bool,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, ArunaDataError> {
         // Create backend storage operator
         let operator = get_backend_operator(
             &self.backend.backend_type,
@@ -484,13 +490,16 @@ where
             // Publish hash in Kademlia
             network.store(blake3_hash).await?;
 
-            Ok::<(), anyhow::Error>(())
+            Ok::<(), ArunaDataError>(())
         });
 
         Ok(frontend_path)
     }
 
-    pub async fn read_data(operator: &Operator, path: &str) -> anyhow::Result<FuturesBytesStream> {
+    pub async fn read_data(
+        operator: &Operator,
+        path: &str,
+    ) -> Result<FuturesBytesStream, ArunaDataError> {
         let reader = get_reader(operator, path, None, None).await?;
         Ok(reader.into_bytes_stream(..).await?)
     }
@@ -499,7 +508,7 @@ where
         operator: &Operator,
         path: &str,
         range: Range<u64>,
-    ) -> anyhow::Result<FuturesBytesStream> {
+    ) -> Result<FuturesBytesStream, ArunaDataError> {
         let reader = get_reader(operator, path, None, None).await?;
         Ok(reader.into_bytes_stream(range).await?)
     }
@@ -509,7 +518,7 @@ where
         _dest_location: &str,
         _compress: bool,
         _encrypt: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ArunaDataError> {
         //TODO:
         // - Create operators
         // - Write (transformed) data to dest_location --> <group-id>/<random-ulid>
@@ -522,7 +531,7 @@ where
         location: &ObjectInfo,
         frontend_path: Option<String>,
         resource_permission: Option<Path>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ArunaDataError> {
         let data_hash = location.file_hashes.blake3.clone();
 
         // Store object info with blake3 hash as key
@@ -561,7 +570,7 @@ where
         Ok(())
     }
 
-    pub async fn get_operator(&self, storage_root: &str) -> Result<Operator, anyhow::Error> {
+    pub async fn get_operator(&self, storage_root: &str) -> Result<Operator, ArunaDataError> {
         get_backend_operator(
             &self.backend.backend_type,
             self.backend.access_config.clone(),
@@ -571,10 +580,13 @@ where
     }
 }
 
-fn extract_frontend_bucket(frontend_path: &str) -> anyhow::Result<String> {
+fn extract_frontend_bucket(frontend_path: &str) -> Result<String, ArunaDataError> {
     let parts = frontend_path.split("/").collect::<Vec<&str>>();
     if parts.len() < 2 {
-        return Err(anyhow!("Invalid frontend path: {}", frontend_path));
+        return Err(ArunaDataError::InvalidParameter {
+            name: "frontend_path".to_string(),
+            error: format!("{}", frontend_path),
+        });
     }
     Ok(parts[1].to_string())
 }

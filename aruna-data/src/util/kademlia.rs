@@ -1,11 +1,16 @@
-use anyhow::Result;
 use aruna_net::Kademlia;
 use iroh::NodeAddr;
 
-pub async fn get_data_locations(kademlia: &Kademlia, target: [u8; 32]) -> Result<Vec<NodeAddr>> {
+use crate::error::ArunaDataError;
+
+pub async fn get_data_locations(
+    kademlia: &Kademlia,
+    target: [u8; 32],
+) -> Result<Vec<NodeAddr>, ArunaDataError> {
     Ok(kademlia
         .find_value(target)
-        .await?
+        .await
+        .map_err(|e| ArunaDataError::ServerError(e.to_string()))?
         .into_iter()
         .map(|v| v.addr().clone())
         .collect())

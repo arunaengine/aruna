@@ -41,10 +41,7 @@ mod api_tests {
 
         let client = reqwest::Client::new();
 
-        for Server {
-            path, ..
-        } in servers.iter()
-        {
+        for Server { path, .. } in servers.iter() {
             assert!(
                 client
                     .get(format!("{path}/users"))
@@ -57,7 +54,8 @@ mod api_tests {
                     .await
                     .unwrap()
                     .json::<GetUserResponse>()
-                    .await.is_ok()
+                    .await
+                    .is_ok()
             );
             assert!(
                 client
@@ -71,7 +69,8 @@ mod api_tests {
                     .await
                     .unwrap()
                     .json::<GetUserResponse>()
-                    .await.is_ok()
+                    .await
+                    .is_ok()
             );
         }
     }

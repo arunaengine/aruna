@@ -1,14 +1,17 @@
 use aruna_storage::storage::store::Store;
 use error::ArunaTaskError;
 use iroh::NodeAddr;
-use tokio::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
     sync::{Arc, atomic::AtomicU8},
 };
 use task_trait::TaskExecutor;
-use tokio::{sync::{Notify, RwLock}, task::JoinSet};
+use tokio::sync::Mutex;
+use tokio::{
+    sync::{Notify, RwLock},
+    task::JoinSet,
+};
 use tracing::{error, trace, warn};
 use ulid::Ulid;
 
@@ -122,7 +125,9 @@ where
             queue,
             channel: receiver,
         };
-        TaskHandler::start_tasks(task_registry.clone(), message_handler).await.detach_all();
+        TaskHandler::start_tasks(task_registry.clone(), message_handler)
+            .await
+            .detach_all();
 
         Ok(TaskHandler {
             // This is stupid, just remove it
@@ -251,6 +256,10 @@ where
             Some(executor) => {
                 trace!("Got task");
                 // Run
+
+                // TODO:
+                // - Track retries
+                // - Add max retries to struct
                 let store = self.store.clone();
                 task.status = TaskStatus::Running;
                 task.last_accessed = chrono::Utc::now().timestamp();

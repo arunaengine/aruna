@@ -1,5 +1,9 @@
+use std::{array::TryFromSliceError, num::ParseIntError, str::ParseBoolError};
+
 use axum::Json;
 use axum::http::StatusCode;
+use iroh::KeyParsingError;
+use s3s::{S3Error, s3_error};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use utoipa::IntoResponses;
@@ -98,6 +102,61 @@ impl From<std::io::Error> for ArunaDataError {
     }
 }
 
+impl From<aruna_realm::error::RealmError> for ArunaDataError {
+    fn from(e: aruna_realm::error::RealmError) -> Self {
+        ArunaDataError::ServerError(e.to_string())
+    }
+}
+
+impl From<aruna_permission::error::PermissionError> for ArunaDataError {
+    fn from(e: aruna_permission::error::PermissionError) -> Self {
+        ArunaDataError::Forbidden(e.to_string())
+    }
+}
+
+impl From<dotenvy::Error> for ArunaDataError {
+    fn from(e: dotenvy::Error) -> Self {
+        ArunaDataError::ServerError(e.to_string())
+    }
+}
+
+impl From<ed25519_dalek::pkcs8::Error> for ArunaDataError {
+    fn from(_e: ed25519_dalek::pkcs8::Error) -> Self {
+        ArunaDataError::ConversionError {
+            from: "pkcs8 formatted String".to_string(),
+            to: "SingingKey".to_string(),
+        }
+    }
+}
+
+impl From<KeyParsingError> for ArunaDataError {
+    fn from(_e: KeyParsingError) -> Self {
+        ArunaDataError::ConversionError {
+            from: "String".to_string(),
+            to: "SecretKey".to_string(),
+        }
+    }
+}
+
+impl From<ParseIntError> for ArunaDataError {
+    fn from(_e: ParseIntError) -> Self {
+        ArunaDataError::ConversionError {
+            from: "String".to_string(),
+            to: "Int".to_string(),
+        }
+    }
+}
+
+impl From<ParseBoolError> for ArunaDataError {
+    fn from(_e: ParseBoolError) -> Self {
+        ArunaDataError::ConversionError {
+            from: "String".to_string(),
+            to: "Bool".to_string(),
+        }
+    }
+}
+
+
 impl From<ulid::DecodeError> for ArunaDataError {
     fn from(e: ulid::DecodeError) -> Self {
         ArunaDataError::InvalidParameter {
@@ -112,6 +171,57 @@ impl From<aruna_permission::error::PathError> for ArunaDataError {
         ArunaDataError::InvalidParameter {
             name: "path".to_string(),
             error: e.to_string(),
+        }
+    }
+}
+
+impl From<aruna_storage::error::ArunaStorageError> for ArunaDataError {
+    fn from(e: aruna_storage::error::ArunaStorageError) -> Self {
+        ArunaDataError::DatabaseError(e.to_string())
+    }
+}
+
+impl From<postcard::Error> for ArunaDataError {
+    fn from(e: postcard::Error) -> Self {
+        ArunaDataError::DeserializeError(e.to_string())
+    }
+}
+
+impl From<TryFromSliceError> for ArunaDataError {
+    fn from(e: TryFromSliceError) -> Self {
+        ArunaDataError::DeserializeError(e.to_string())
+    }
+}
+
+impl From<fancy_regex::Error> for ArunaDataError {
+    fn from(e: fancy_regex::Error) -> Self {
+        ArunaDataError::DeserializeError(e.to_string())
+    }
+}
+
+impl From<opendal::Error> for ArunaDataError {
+    fn from(e: opendal::Error) -> Self {
+        ArunaDataError::ServerError(e.to_string())
+    }
+}
+
+impl From<ArunaDataError> for S3Error {
+    fn from(e: ArunaDataError) -> Self {
+        match e {
+            ArunaDataError::Unauthorized => s3_error!(UnauthorizedAccess, "Unauthorized"),
+            // should probably be matched against bucket/key/tags/...
+            ArunaDataError::NotFound(e) => s3_error!(NoSuchResource, "{e}"),
+            ArunaDataError::Forbidden(e) => s3_error!(UnauthorizedAccess, "{e}"),
+            ArunaDataError::InvalidParameter { name, error } => {
+                s3_error!(InvalidRequest, "Invalid parameter {name}: {error}")
+            }
+            ArunaDataError::ParameterNotSpecified { name, error } => {
+                s3_error!(InvalidRequest, "Parameter {name} not specified: {error}")
+            }
+            ArunaDataError::ConflictParameter { name, error } => {
+                s3_error!(InvalidRequest, "Confliction parameter {name}: {error}")
+            }
+            _ => s3_error!(InternalError, "{e}"),
         }
     }
 }

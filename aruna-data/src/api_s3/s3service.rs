@@ -1,10 +1,10 @@
 use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
+use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
 use crate::io::io_handler::ObjectInfo;
 use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 use crate::util::opendal::create_paths;
-use anyhow::Result;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
 use futures_util::TryStreamExt;
@@ -37,10 +37,8 @@ where
     for<'a> St: Store<'a> + 'static,
 {
     #[tracing::instrument(level = "trace", skip(controller))]
-    pub async fn new(controller: Controller<St>) -> Result<Self> {
-        Ok(ArunaS3Service {
-            controller,
-        })
+    pub async fn new(controller: Controller<St>) -> Self {
+        ArunaS3Service { controller }
     }
 }
 
@@ -69,32 +67,27 @@ where
         // Fetch object info
         let store_clone = self.controller.io_handler.store.clone();
         let info = tokio::task::spawn_blocking(move || {
-            let read_txn = store_clone
-                .create_txn(false)
-                .map_err(|e| s3_error!(InternalError, "{}", e))?;
+            let read_txn = store_clone.create_txn(false)?;
             let hash = store_clone
-                .get(&read_txn, PATH_LOCATION_DB_NAME, frontend_path.as_bytes())
-                .map_err(|e| s3_error!(InternalError, "{}", e))?
-                .ok_or_else(|| s3_error!(NoSuchKey, "No such key"))?;
+                .get(&read_txn, PATH_LOCATION_DB_NAME, frontend_path.as_bytes())?
+                .ok_or_else(|| ArunaDataError::NotFound("No such key".to_string()))?;
             let info_raw = store_clone
-                .get(&read_txn, LOCATION_DB_NAME, &hash)
-                .map_err(|e| s3_error!(InternalError, "{}", e))?
-                .ok_or_else(|| s3_error!(NoSuchKey, "No such key"))?;
-            let info: ObjectInfo =
-                postcard::from_bytes(&*info_raw).map_err(|e| s3_error!(InternalError, "{}", e))?;
+                .get(&read_txn, LOCATION_DB_NAME, &hash)?
+                .ok_or_else(|| ArunaDataError::NotFound("No such key".to_string()))?;
+            let info: ObjectInfo = postcard::from_bytes(&*info_raw)?;
 
-            Ok::<ObjectInfo, anyhow::Error>(info)
+            Ok::<ObjectInfo, ArunaDataError>(info)
         })
         .await
-        .map_err(|e| s3_error!(InternalError, "{}", e))?
-        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        .map_err(|e| s3_error!(InternalError, "{}", e))??;
 
         // Create backend storage operator
-        let operator = self.controller.io_handler.get_operator(
-            &info.storage_root,
-        )
-        .await
-        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let operator = self
+            .controller
+            .io_handler
+            .get_operator(&info.storage_root)
+            .await?;
+            //.map_err(|e| s3_error!(InternalError, "{}", e))?;
 
         // Fetch reader stream
         let filename = Path::new(&info.storage_path)

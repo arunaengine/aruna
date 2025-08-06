@@ -1,4 +1,4 @@
-use crate::io::io_handler::Hashes;
+use crate::{error::ArunaDataError, io::io_handler::Hashes};
 use sha2::{Digest, Sha256};
 
 pub struct Hasher {
@@ -22,7 +22,7 @@ impl Hasher {
         self.md5.consume(bytes);
     }
 
-    pub fn finalize(&mut self) -> anyhow::Result<Hashes> {
+    pub fn finalize(&mut self) -> Result<Hashes, ArunaDataError> {
         Ok(Hashes {
             blake3: self.blake3.finalize(),
             sha256: format!("{:x}", self.sha256.clone().finalize()),

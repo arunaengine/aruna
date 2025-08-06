@@ -208,7 +208,10 @@ where
                             existing_group.merge(&mut doc)?;
 
                             if let None = store.get(&wtxn, GROUPS_MAPPINGS_DB_NAME, &ulid_bytes)? {
-                                warn!("No mapping found for group {}", foreign_group.id.to_string());
+                                warn!(
+                                    "No mapping found for group {}",
+                                    foreign_group.id.to_string()
+                                );
                                 let mut bitmap = Vec::new();
                                 RoaringBitmap::new().serialize_into(&mut bitmap)?; // TODO: Group mappings
                                 store.put(

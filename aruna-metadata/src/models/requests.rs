@@ -1,16 +1,16 @@
-use std::collections::BTreeMap;
-use crate::error::ArunaMetadataError;
 use super::structs::{Author, Group, KeyValue, Resource, User, VisibilityClass};
-use aruna_permission::UserIdentity;
-use serde::{Deserialize, Serialize};
-use ulid::Ulid;
-use utoipa::{IntoParams, ToSchema};
+use crate::error::ArunaMetadataError;
 use crate::transactions::controller::Controller;
 use crate::{
-    models::structs::PolicyResult, network::network_trait::Network, persistence::search::generic::Search
+    models::structs::PolicyResult, network::network_trait::Network,
+    persistence::search::generic::Search,
 };
+use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
-
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use ulid::Ulid;
+use utoipa::{IntoParams, ToSchema};
 
 #[async_trait::async_trait]
 pub trait Request<St, Se, N>
@@ -51,7 +51,7 @@ where
         controller: &Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, ArunaMetadataError>;
 
-    /// Forwards the request 
+    /// Forwards the request
     async fn forward(
         &self,
         token: &Option<String>,
@@ -168,7 +168,9 @@ pub struct AddGroupResponse {
     pub group: Group,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams)]
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,
+)]
 pub struct GetGroupRequest {
     pub id: Ulid,
 }
@@ -384,9 +386,7 @@ pub struct GetUserRequestOuter {
     pub id: String,
 }
 
-#[derive(
-    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize,
-)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct GetUserRequest {
     // TODO: Fix, this is not working
     //#[schema(value_type=String)]

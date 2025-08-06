@@ -1,4 +1,5 @@
 use super::openapi::{self, ArunaApi};
+use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
 use aruna_storage::storage::store::Store;
 use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};
@@ -17,7 +18,7 @@ impl RestServer {
         handler: Controller<St>,
         rest_address: Ipv4Addr,
         rest_port: u16,
-    ) -> anyhow::Result<()>
+    ) -> Result<(), ArunaDataError>
     where
         for<'a> St: Store<'a> + 'static,
     {

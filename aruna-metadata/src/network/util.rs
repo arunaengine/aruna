@@ -1,7 +1,7 @@
-use iroh::endpoint::{RecvStream, SendStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::network_trait::MetadataMessage;
 use crate::error::ArunaMetadataError;
+use iroh::endpoint::{RecvStream, SendStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub async fn read_message(
     recv_stream: &mut RecvStream,

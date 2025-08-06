@@ -67,11 +67,14 @@ impl TantivyFjall {
         let network = Arc::new(NetworkDummy::new(()).await.unwrap());
         let task_handler = TaskHandler::new(store).await.unwrap();
 
-        let controller = Arc::new(Controller::<FjallStore, TantivySearch, NetworkDummy>::new(
-            persistor,
-            network.clone(),
-            task_handler,
-        ).await);
+        let controller = Arc::new(
+            Controller::<FjallStore, TantivySearch, NetworkDummy>::new(
+                persistor,
+                network.clone(),
+                task_handler,
+            )
+            .await,
+        );
         network.start_actor(controller.clone()).await.unwrap();
         controller
     }
@@ -193,11 +196,14 @@ impl TantivyHeed {
         let network = Arc::new(NetworkDummy::new(()).await.unwrap());
         let task_handler = TaskHandler::new(store).await.unwrap();
 
-        let controller = Arc::new(Controller::<LmdbStore, TantivySearch, NetworkDummy>::new(
-            persistor,
-            network.clone(),
-            task_handler
-        ).await);
+        let controller = Arc::new(
+            Controller::<LmdbStore, TantivySearch, NetworkDummy>::new(
+                persistor,
+                network.clone(),
+                task_handler,
+            )
+            .await,
+        );
         network.start_actor(controller.clone()).await.unwrap();
         controller
     }

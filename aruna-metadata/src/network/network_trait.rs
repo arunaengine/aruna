@@ -1,9 +1,7 @@
 use crate::{
     error::ArunaMetadataError,
     models::requests::{ForwardRequest, ForwardResponse},
-    persistence::
-        search::generic::Search
-    ,
+    persistence::search::generic::Search,
     transactions::controller::Controller,
 };
 use aruna_permission::{Action, Path};
@@ -223,4 +221,3 @@ impl Network for NetworkDummy {
         Ok(AuthorizeResponse::Public)
     }
 }
-

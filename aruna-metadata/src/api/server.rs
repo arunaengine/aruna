@@ -5,7 +5,10 @@ use crate::{
 };
 use aruna_storage::storage::store::Store;
 use axum::{extract::DefaultBodyLimit, response::Redirect, routing::get};
-use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
+};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;

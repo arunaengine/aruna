@@ -1,11 +1,13 @@
+use super::{
+    network_trait::{
+        AuthorizeResponse, Body, METADATA_PROTOCOL_ID, MetadataMessage, Network,
+        ReplicationSubject, Response,
+    },
+    util::read_message,
+};
 use crate::{
-    error::ArunaMetadataError,
-    models::requests::ForwardResponse,
-    network::util::send_message,
-    persistence::
-        search::generic::Search
-    ,
-    transactions::controller::Controller,
+    error::ArunaMetadataError, models::requests::ForwardResponse, network::util::send_message,
+    persistence::search::generic::Search, transactions::controller::Controller,
 };
 use aruna_net::{
     actor::NetworkActorBuilder,
@@ -19,7 +21,6 @@ use iroh::{NodeAddr, PublicKey, SecretKey};
 use std::{net::SocketAddrV4, sync::Arc};
 use tracing::{Instrument, error};
 use ulid::Ulid;
-use super::{network_trait::{AuthorizeResponse, Body, MetadataMessage, Network, ReplicationSubject, Response, METADATA_PROTOCOL_ID}, util::read_message};
 
 pub struct NetworkConfig {
     pub secret_key: Option<SecretKey>,
@@ -325,4 +326,3 @@ impl Network for P2PNetwork {
         Ok(response)
     }
 }
-

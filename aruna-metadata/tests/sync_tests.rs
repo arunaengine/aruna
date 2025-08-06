@@ -5,8 +5,7 @@ mod sync_tests {
     use aruna_metadata::{
         models::requests::{
             AddGroupRequest, AddUserToGroupRequest, AddUserToGroupResponse, CreateProjectRequest,
-            CreateProjectResponse, CreateResourceRequest, CreateResourceResponse,
-            Request,
+            CreateProjectResponse, CreateResourceRequest, CreateResourceResponse, Request,
         },
         network::network_trait::Network,
     };

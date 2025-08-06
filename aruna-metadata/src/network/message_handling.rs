@@ -6,18 +6,23 @@ use iroh::PublicKey;
 use crate::{
     error::ArunaMetadataError,
     models::requests::{ForwardRequest, ForwardResponse, Request},
-    persistence::{authorization::Authorize, persistor::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME}, search::generic::Search},
+    persistence::{
+        authorization::Authorize,
+        persistor::tables::{GROUPS_DB_NAME, RESOURCE_DB_NAME, USER_DB_NAME},
+        search::generic::Search,
+    },
     transactions::controller::Controller,
 };
 
 use super::{
-    network_trait::{AuthorizeResponse, Body, MetadataMessage, Network, ReplicationSubject, Response},
+    network_trait::{
+        AuthorizeResponse, Body, MetadataMessage, Network, ReplicationSubject, Response,
+    },
     p2p_network::P2PNetwork,
     util::{read_message, send_message},
 };
 
-
-// All of these are rather lengthy functions (~100 locs), 
+// All of these are rather lengthy functions (~100 locs),
 // but only because of extensive matching and error returns
 impl P2PNetwork {
     #[tracing::instrument(

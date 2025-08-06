@@ -1,10 +1,11 @@
-use anyhow::Result;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, RequestChecksumCalculation};
 use fancy_regex::Regex;
 use lazy_static::lazy_static;
 use std::collections::HashMap;
+
+use crate::error::ArunaDataError;
 
 /// This regex matches all the rules from the official Amazon S3 bucket naming rules specification_
 /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
@@ -32,11 +33,11 @@ lazy_static! {
     pub static ref S3_KEY_REGEX: Regex = Regex::new(S3_KEY_PATTERN).expect("Regex must be valid");
 }
 
-pub fn validate_s3_bucket_name(key: &str) -> Result<bool> {
+pub fn validate_s3_bucket_name(key: &str) -> Result<bool, ArunaDataError> {
     Ok(S3_KEY_REGEX.is_match(key)? && key.len() <= 1024)
 }
 
-pub fn validate_s3_object_key(key: &str) -> Result<bool> {
+pub fn validate_s3_object_key(key: &str) -> Result<bool, ArunaDataError> {
     Ok(S3_KEY_REGEX.is_match(key)? && key.len() <= 1024)
 }
 
@@ -46,7 +47,7 @@ pub async fn create_s3_client(
     access_key_id: &str,
     secret_key: &str,
     force_path_style: bool,
-) -> Result<Client> {
+) -> Result<Client, ArunaDataError> {
     let creds = Credentials::new(access_key_id, secret_key, None, None, "Aruna_v3");
     let client_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
         .credentials_provider(creds)
@@ -63,7 +64,10 @@ pub async fn create_s3_client(
     Ok(Client::from_conf(s3_config))
 }
 
-pub async fn make_bucket(bucket: String, config: HashMap<String, String>) -> Result<()> {
+pub async fn make_bucket(
+    bucket: String,
+    config: HashMap<String, String>,
+) -> Result<(), ArunaDataError> {
     let s3_client = create_s3_client(
         config
             .get("endpoint")
@@ -89,7 +93,7 @@ pub async fn make_bucket(bucket: String, config: HashMap<String, String>) -> Res
             Ok(_) => Ok(()),
             Err(err) => {
                 tracing::error!(?e1, ?err, "Error creating bucket");
-                Err(anyhow::anyhow!(err))
+                Err(ArunaDataError::ServerError(err.to_string()))
             }
         },
     }

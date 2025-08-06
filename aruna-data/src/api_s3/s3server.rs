@@ -1,8 +1,8 @@
 use super::s3service::ArunaS3Service;
 use crate::api_s3::auth::AuthProvider;
 use crate::config::config::S3Frontend;
+use crate::error::ArunaDataError;
 use crate::io::controller::Controller;
-use anyhow::Result;
 use aruna_storage::storage::lmdb::LmdbStore;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -35,15 +35,12 @@ pub struct S3Server {
 pub struct WrappingService(SharedS3Service);
 
 impl S3Server {
-    #[tracing::instrument(
-        level = "trace",
-        skip(frontend, controller)
-    )]
-    pub async fn new(frontend: S3Frontend, controller: Controller<LmdbStore>) -> Result<Self> {
-        let s3service = ArunaS3Service::new(controller.clone()).await.map_err(|e| {
-            error!(error = ?e, msg = e.to_string());
-            tonic::Status::unauthenticated(e.to_string())
-        })?;
+    #[tracing::instrument(level = "trace", skip(frontend, controller))]
+    pub async fn new(
+        frontend: S3Frontend,
+        controller: Controller<LmdbStore>,
+    ) -> Result<Self, ArunaDataError> {
+        let s3service = ArunaS3Service::new(controller.clone()).await;
 
         let local_address = frontend.server.clone();
 
@@ -65,11 +62,11 @@ impl S3Server {
         })
     }
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<(), ArunaDataError> {
         // Run server
         let listener = TcpListener::bind(&self.address).await.map_err(|e| {
             error!(error = ?e, msg = e.to_string());
-            tonic::Status::unauthenticated(e.to_string())
+            ArunaDataError::ServerError(e.to_string())
         })?;
 
         let local_addr = listener.local_addr()?;

@@ -26,7 +26,8 @@ mod tests {
             node_controller.io_handler.token_handler.clone(),
         )
         .unwrap();
-        let user_token = fetch_user_token(&user_id, node_controller.io_handler.token_handler.clone()).unwrap();
+        let user_token =
+            fetch_user_token(&user_id, node_controller.io_handler.token_handler.clone()).unwrap();
 
         // Create simple http client and base request
         let client = reqwest::Client::new();
@@ -151,11 +152,7 @@ mod tests {
 
         // Find file hash with Kademlia at node
         let blake3_hash = Hasher::new().update(body_content.as_bytes()).finalize();
-        let result = node_controller
-            .network
-            .find(blake3_hash)
-            .await
-            .unwrap();
+        let result = node_controller.network.find(blake3_hash).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(
             result.first().unwrap().addr,
@@ -203,14 +200,20 @@ mod tests {
 
         let bucket = "other-bucket";
         let key = "dummy.txt";
-        let content_hash = upload_data(&client, "other-bucket", "dummy.txt", "Some other content".as_bytes())
-            .await
-            .unwrap();
+        let content_hash = upload_data(
+            &client,
+            "other-bucket",
+            "dummy.txt",
+            "Some other content".as_bytes(),
+        )
+        .await
+        .unwrap();
 
         // Get object with invalid request
-        let invalid_client = create_s3_client(&format!("http://{}", node.s3_endpoint), None, "", "", true)
-            .await
-            .unwrap();
+        let invalid_client =
+            create_s3_client(&format!("http://{}", node.s3_endpoint), None, "", "", true)
+                .await
+                .unwrap();
 
         let err_res = invalid_client
             .get_object()
@@ -237,16 +240,12 @@ mod tests {
             content.extend_from_slice(bytes.as_ref());
         }
         let hash = hasher.finalize();
-        assert_eq!(
-            String::from_utf8(content).unwrap(),
-            "Some other content"
-        );
+        assert_eq!(String::from_utf8(content).unwrap(), "Some other content");
         assert_eq!(content_hash, hash.to_string());
 
         //TODO: Get object with valid request from other node in same realm
 
         //TODO: Get object with valid request from other node in other realm (should fail)
-
     }
 
     #[tokio::test(flavor = "multi_thread")]
