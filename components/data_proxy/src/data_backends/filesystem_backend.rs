@@ -304,6 +304,22 @@ impl StorageBackend for FSBackend {
         Ok(())
     }
 
+    #[tracing::instrument(level = "trace", skip(self, _location))]
+    async fn abort_multipart_upload(
+        &self,
+        _location: ObjectLocation,
+        upload_id: String,
+    ) -> Result<()> {
+        let mut dir = tokio::fs::read_dir(Path::new(&self.base_path).join(&upload_id)).await?;
+        while let Some(entry) = dir.next_entry().await? {
+            tokio::fs::remove_file(entry.path()).await.map_err(|e| {
+                tracing::error!(error = ?e, msg = e.to_string());
+                e
+            })?;
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self, bucket))]
     async fn create_bucket(&self, bucket: String) -> Result<()> {
         self.check_and_create_bucket(bucket).await
@@ -365,5 +381,39 @@ impl StorageBackend for FSBackend {
             raw_content_len: expected_size.unwrap_or_default(),
             ..Default::default()
         })
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, source, target))]
+    /// Initialize a new location for a specific object
+    /// This takes the object_info into account and creates a new location for the object
+    async fn copy_data(&self, source: ObjectLocation, target: ObjectLocation) -> Result<()> {
+        let mut source_file = tokio::fs::File::open(
+            Path::new(&self.base_path)
+                .join(&source.bucket)
+                .join(&source.key),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, msg = e.to_string());
+            e
+        })?;
+
+        let mut target_file = tokio::fs::File::open(
+            Path::new(&self.base_path)
+                .join(&target.bucket)
+                .join(&target.key),
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = ?e, msg = e.to_string());
+            e
+        })?;
+        tokio::io::copy(&mut source_file, &mut target_file)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = ?e, msg = e.to_string());
+                e
+            })?;
+        Ok(())
     }
 }

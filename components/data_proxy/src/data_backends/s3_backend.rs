@@ -308,6 +308,27 @@ impl StorageBackend for S3Backend {
         }
     }
 
+    #[tracing::instrument(level = "trace", skip(self, location))]
+    async fn abort_multipart_upload(
+        &self,
+        location: ObjectLocation,
+        upload_id: String,
+    ) -> Result<()> {
+        let _ = self
+            .s3_client
+            .abort_multipart_upload()
+            .bucket(location.bucket)
+            .key(location.key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .map_err(|e| {
+                error!(error = ?e, "Error aborting multipart upload");
+                e
+            })?;
+        Ok(())
+    }
+
     #[tracing::instrument(level = "trace", skip(self, bucket))]
     async fn create_bucket(&self, bucket: String) -> Result<()> {
         self.check_and_create_bucket(bucket).await
@@ -372,6 +393,21 @@ impl StorageBackend for S3Backend {
             raw_content_len: expected_size.unwrap_or_default(),
             ..Default::default()
         })
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, source, target))]
+    /// Initialize a new location for a specific object
+    /// This takes the object_info into account and creates a new location for the object
+    async fn copy_data(&self, source: ObjectLocation, target: ObjectLocation) -> Result<()> {
+        self.check_and_create_bucket(target.bucket.clone()).await?;
+        self.s3_client
+            .copy_object()
+            .copy_source(&[source.bucket, source.key].join("/"))
+            .bucket(target.bucket)
+            .key(target.key)
+            .send()
+            .await?;
+        Ok(())
     }
 }
 

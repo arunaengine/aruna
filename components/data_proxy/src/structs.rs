@@ -159,6 +159,7 @@ pub enum FileFormat {
     RawCompressed,
     RawEncryptedCompressed([u8; 32]),
     Pithos([u8; 32]),
+    Pseudo, // Zero-byte single part uploads
 }
 
 impl FileFormat {
@@ -266,6 +267,7 @@ impl ObjectLocation {
                     ((self.disk_content_len as usize + 109) / (65536 + 28)) + 1
                 }
             }
+            FileFormat::Pseudo => 0,
         }
     }
 

@@ -81,6 +81,17 @@ pub trait StorageBackend: Debug + Send + Sync {
         upload_id: String,
     ) -> Result<()>;
 
+    /// Aborts multipart uploads
+    /// # Arguments
+    ///
+    /// * `location` - The location of the object
+    /// * `upload_id` - The upload id of the multipart uploads
+    async fn abort_multipart_upload(
+        &self,
+        location: ObjectLocation,
+        upload_id: String,
+    ) -> Result<()>;
+
     /// Creates a bucket or the storage system equivalent
     /// # Arguments
     ///
@@ -102,4 +113,11 @@ pub trait StorageBackend: Debug + Send + Sync {
         names: [Option<(DieselUlid, String)>; 4],
         temp: bool,
     ) -> Result<ObjectLocation>;
+
+    /// Copies data from source to target
+    /// # Arguments
+    ///
+    /// * `source` - The location of the source object
+    /// * `target` - The location of the target object
+    async fn copy_data(&self, source: ObjectLocation, target: ObjectLocation) -> Result<()>;
 }
