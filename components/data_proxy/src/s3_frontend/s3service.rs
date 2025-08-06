@@ -2150,7 +2150,6 @@ impl S3 for ArunaS3Service {
         // Query results from check access
         let (states, _) = objects_state.require_regular()?;
         let all = states.to_new_or_existing()?;
-        trace!(?all);
         let (_, collection, dataset, new_object, path) = all;
 
         // Authorize existing object and get object + location
@@ -2179,7 +2178,6 @@ impl S3 for ArunaS3Service {
 
                 let (states, location) = objects_state.require_regular()?;
                 let all = states.to_new_or_existing()?;
-                trace!(?all);
                 let (_, _, _, object, _) = all;
 
                 let NewOrExistingObject::Existing(object) = object else {
@@ -2207,7 +2205,6 @@ impl S3 for ArunaS3Service {
             NewOrExistingObject::Missing(mut new_object) => {
                 let mut collection_id = None;
                 if let NewOrExistingObject::Missing(collection) = collection {
-                    trace!(?collection);
                     if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
                         if let Some(token) = &impersonating_token {
                             let col = handler.create_collection(collection, token).await.map_err(
@@ -2223,7 +2220,6 @@ impl S3 for ArunaS3Service {
 
                 let mut dataset_id = None;
                 if let NewOrExistingObject::Missing(mut dataset) = dataset {
-                    trace!(?dataset);
                     if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
                         if let Some(token) = &impersonating_token {
                             if let Some(collection_id) = collection_id {
@@ -2331,7 +2327,6 @@ impl S3 for ArunaS3Service {
                             s3_error!(InternalError, "Unable to finish object")
                         })?;
                 } else {
-                    trace!(?new_object);
                     new_object = handler
                         .create_and_finish(new_object.clone(), content_len, token)
                         .await
@@ -2343,7 +2338,6 @@ impl S3 for ArunaS3Service {
             }
         }
 
-        trace!("Before finish");
 
         // Finish location
         self.cache
@@ -2354,7 +2348,6 @@ impl S3 for ArunaS3Service {
                 s3_error!(InternalError, "Unable to add location with binding")
             })?;
 
-        trace!("After finish");
 
         let response = CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
@@ -2386,7 +2379,6 @@ impl S3 for ArunaS3Service {
             }
         }
 
-        trace!("Respond");
         Ok(resp)
     }
 }
