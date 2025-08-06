@@ -2338,7 +2338,6 @@ impl S3 for ArunaS3Service {
             }
         }
 
-
         // Finish location
         self.cache
             .add_location_with_binding(new_object.id, new_location)
@@ -2347,7 +2346,6 @@ impl S3 for ArunaS3Service {
                 error!(error = ?e, msg = "Unable to add location with binding");
                 s3_error!(InternalError, "Unable to add location with binding")
             })?;
-
 
         let response = CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
