@@ -633,7 +633,7 @@ impl DatabaseHandler {
         let transaction_client = transaction.client();
 
         // Update object & Evaluate Rules
-        object.object.update(transaction_client).await?;
+        object.object.update_authors(transaction_client).await?;
         self.evaluate_rules(&vec![object.object.id], transaction_client)
             .await?;
 

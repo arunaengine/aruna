@@ -776,7 +776,7 @@ impl Cache {
     #[tracing::instrument(level = "trace", skip(self, object))]
     pub async fn insert_temp_resource(&self, object: Object) -> Result<()> {
         // Return Ok if already exists
-        if let Ok((rwlock_object, _)) = self.get_resource(&object.id).await {
+        if let Ok((rwlock_object, _)) = self.get_resource(&object.id) {
             let cache_object = rwlock_object.read().await;
             if *cache_object == object {
                 return Ok(());
@@ -836,7 +836,7 @@ impl Cache {
     pub async fn upsert_object(&self, object: Object) -> Result<()> {
         trace!(?object, "upserting object");
 
-        if let Ok((rwlock_object, _)) = self.get_resource(&object.id).await {
+        if let Ok((rwlock_object, _)) = self.get_resource(&object.id) {
             let cache_object = rwlock_object.read().await;
             if *cache_object == object {
                 return Ok(());
@@ -998,7 +998,7 @@ impl Cache {
 
     #[tracing::instrument(level = "trace", skip(self))]
     #[allow(clippy::type_complexity)]
-    pub async fn get_resource(
+    pub fn get_resource(
         &self,
         resource_id: &DieselUlid,
     ) -> Result<(Arc<RwLock<Object>>, Arc<RwLock<Option<ObjectLocation>>>)> {
@@ -1015,7 +1015,7 @@ impl Cache {
         resource_id: &DieselUlid,
         skip_location: bool,
     ) -> Result<(Object, Option<ObjectLocation>)> {
-        let (obj, loc) = self.get_resource(resource_id).await?;
+        let (obj, loc) = self.get_resource(resource_id)?;
         let obj = obj.read().await.clone();
         let loc = if !skip_location {
             loc.read().await.clone()
@@ -1111,7 +1111,7 @@ impl Cache {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn get_resource_name(&self, id: &DieselUlid) -> Option<String> {
-        let (res, _) = self.get_resource(id).await.ok()?;
+        let (res, _) = self.get_resource(id).ok()?;
         let res = res.read().await.name.clone();
         Some(res)
     }
@@ -1158,7 +1158,7 @@ impl Cache {
 
     #[tracing::instrument(level = "trace", skip(self, id))]
     pub async fn get_location_cloned(&self, id: &DieselUlid) -> Option<ObjectLocation> {
-        let (_, loc) = self.get_resource(id).await.ok()?;
+        let (_, loc) = self.get_resource(id).ok()?;
         let loc = loc.read().await;
         loc.clone()
     }
