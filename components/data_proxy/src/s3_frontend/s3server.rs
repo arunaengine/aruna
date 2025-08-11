@@ -2,6 +2,7 @@ use super::auth::AuthProvider;
 use super::s3service::ArunaS3Service;
 use crate::caching::cache;
 use crate::data_backends::storage_backend::StorageBackend;
+use crate::CONFIG;
 use crate::CORS_REGEX;
 use anyhow::Result;
 use futures_core::future::BoxFuture;
@@ -236,19 +237,35 @@ impl WrappingService {
                 error!("{e}");
                 s3_error!(InvalidURI, "Invalid URI encoding")
             })?;
-        let authority = req
+
+        let url = req
             .headers()
             .get(HOST)
-            .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?;
-        let bucket = authority
+            .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?
             .to_str()
             .map_err(|e| {
                 error!("{e}");
                 s3_error!(InvalidURI, "Invalid URI encoding")
-            })?
-            .split(".")
+            })?;
+        let url_without_host = url
+            .split(
+                &CONFIG
+                    .frontend
+                    .as_ref()
+                    .ok_or_else(|| s3_error!(InternalError, "No s3 frontend configured"))?
+                    .hostname,
+            )
             .next()
-            .ok_or_else(|| s3_error!(InvalidURI, "No bucket found in URI"))?;
+            .ok_or_else(|| s3_error!(InternalError, "Invalid host url set"))?;
+        let bucket = match url_without_host.split(".").next() {
+            Some(sub_bucket) => sub_bucket,
+            None => {
+                url_without_host
+                    .split("/")
+                    .next()
+                    .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
+            }
+        };
         let project_id = self
             .inner
             .cache
