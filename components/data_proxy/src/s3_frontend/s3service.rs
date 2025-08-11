@@ -61,8 +61,17 @@ use tracing::warn;
 use tracing::Instrument;
 
 pub struct ArunaS3Service {
-    backend: Arc<Box<dyn StorageBackend>>,
-    cache: Arc<Cache>,
+    pub backend: Arc<Box<dyn StorageBackend>>,
+    pub cache: Arc<Cache>,
+}
+
+impl Clone for ArunaS3Service {
+    fn clone(&self) -> Self {
+        Self {
+            backend: self.backend.clone(),
+            cache: self.cache.clone(),
+        }
+    }
 }
 
 impl Debug for ArunaS3Service {
@@ -1234,17 +1243,7 @@ impl S3 for ArunaS3Service {
                 })?;
 
             client
-                .add_or_replace_key_value_project(
-                    &token,
-                    bucket_obj.clone(),
-                    Some((
-                        "app.aruna-storage.org/cors",
-                        &serde_json::to_string(&config).map_err(|_| {
-                            error!(error = "Unable to serialize cors configuration");
-                            s3_error!(InvalidArgument, "Unable to serialize cors configuration")
-                        })?,
-                    )),
-                )
+                .add_cors_to_project(&token, bucket_obj.clone(), config)
                 .await
                 .map_err(|_| {
                     error!(error = "Unable to update KeyValues");
@@ -1283,7 +1282,7 @@ impl S3 for ArunaS3Service {
                 })?;
 
             client
-                .add_or_replace_key_value_project(&token, bucket_obj.clone(), None)
+                .remove_cors_from_project(&token, bucket_obj.clone())
                 .await
                 .map_err(|_| {
                     error!(error = "Unable to update KeyValues");

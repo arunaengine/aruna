@@ -655,6 +655,17 @@ impl Object {
         client.query(&prepared, &[id, &title]).await?;
         Ok(())
     }
+
+    pub async fn update_authors(&self, client: &Client) -> Result<()> {
+        let query = "UPDATE objects
+        SET authors = $2
+        WHERE id = $1 ;";
+
+        let prepared = client.prepare(query).await?;
+
+        client.query(&prepared, &[&self.id, &self.authors]).await?;
+        Ok(())
+    }
     pub async fn update(&self, client: &Client) -> Result<()> {
         let query = "UPDATE objects 
         SET description = $2, key_values = $3, data_class = $4

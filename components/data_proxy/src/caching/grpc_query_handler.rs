@@ -500,31 +500,57 @@ impl GrpcQueryHandler {
     }
 
     #[tracing::instrument(level = "trace", skip(self, obj, token))]
-    pub async fn add_or_replace_key_value_project(
+    pub async fn add_cors_to_project(
         &self,
         token: &str,
         obj: DPObject,
-        kv: Option<(&str, &str)>,
+        cors_config: crate::structs::CORSConfiguration,
     ) -> Result<()> {
-        let remove_cors = obj
+        let kv = KeyValue {
+            key: "app.aruna-storage.org/cors".to_string(),
+            value: serde_json::to_string(&cors_config)?,
+            variant: KeyValueVariant::Label as i32,
+        };
+
+        let mut req = Request::new(UpdateProjectKeyValuesRequest {
+            project_id: obj.id.to_string(),
+            add_key_values: vec![kv],
+            remove_key_values: vec![],
+        });
+
+        Self::add_token_to_md(req.metadata_mut(), token)?;
+
+        self.project_service
+            .clone()
+            .update_project_key_values(req)
+            .await
+            .map_err(|e| {
+                error!(error = ?e, msg = e.to_string());
+                e
+            })?;
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, obj, token))]
+    pub async fn remove_cors_from_project(&self, token: &str, obj: DPObject) -> Result<()> {
+        let cors = match obj
             .key_values
             .iter()
             .filter(|e| e.key == "app.aruna-storage.org/cors")
             .cloned()
-            .collect();
-
+            .next()
+        {
+            Some(cors) => cors,
+            None => KeyValue {
+                key: "app.aruna-storage.org/cors".to_string(),
+                value: String::new(),
+                variant: KeyValueVariant::Label as i32,
+            },
+        };
         let mut req = Request::new(UpdateProjectKeyValuesRequest {
             project_id: obj.id.to_string(),
-            add_key_values: kv
-                .map(|(k, v)| {
-                    vec![KeyValue {
-                        key: k.to_string(),
-                        value: v.to_string(),
-                        variant: KeyValueVariant::Label as i32,
-                    }]
-                })
-                .unwrap_or_default(),
-            remove_key_values: remove_cors,
+            add_key_values: vec![],
+            remove_key_values: vec![cors],
         });
 
         Self::add_token_to_md(req.metadata_mut(), token)?;
