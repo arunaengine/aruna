@@ -31,7 +31,6 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::error;
 use tracing::info;
-use tracing::trace;
 
 pub struct S3Server {
     s3service: S3Service,
@@ -123,7 +122,6 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
 
     #[tracing::instrument(level = "trace", skip(self, req))]
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
-        trace!("{:?}", req.headers());
         // Catch OPTIONS requests
         if req.method() == Method::OPTIONS {
             let clone = self.clone();
@@ -187,8 +185,6 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
                     *status = StatusCode::from_u16(206).unwrap();
                 }
 
-                trace!("{:?}", r.headers());
-
                 r.map(Body::from)
             })
         });
@@ -244,10 +240,6 @@ impl WrappingService {
             .headers()
             .get(HOST)
             .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?;
-
-        trace!("{:?}", authority);
-        // .authority()
-        // .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?;
         let bucket = authority
             .to_str()
             .map_err(|e| {
