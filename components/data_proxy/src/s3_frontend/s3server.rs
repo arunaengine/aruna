@@ -20,6 +20,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::header::HOST;
+use s3s::host::SingleDomain;
 use s3s::s3_error;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
@@ -61,11 +62,12 @@ impl S3Server {
                 error!(error = ?e, msg = e.to_string());
                 tonic::Status::unauthenticated(e.to_string())
             })?;
-
+        let auth_provider = AuthProvider::new(cache).await;
         let service = {
             let mut b = S3ServiceBuilder::new(s3service.clone());
-            b.set_base_domain(hostname);
-            b.set_auth(AuthProvider::new(cache).await);
+            b.set_host(SingleDomain::new(&hostname.into())?);
+            b.set_access(auth_provider.clone());
+            b.set_auth(auth_provider);
             b.build()
         };
 

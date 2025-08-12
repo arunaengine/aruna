@@ -1383,6 +1383,7 @@ impl S3 for ArunaS3Service {
                             )
                         }),
                         name: Some(o.name),
+                        bucket_region: None, // TODO: Set region?
                     });
                 }
                 let bs = if buckets.is_empty() {
@@ -1396,6 +1397,8 @@ impl S3 for ArunaS3Service {
                         display_name: None,
                         id: Some(user_id.to_string()),
                     }),
+                    ..Default::default() // TODO: Pagination (continuation token and prefix
+                    // handling)
                 }))
             }
             None => Err(s3_error!(InvalidAccessKeyId, "Invalid access key / user")),

@@ -37,11 +37,13 @@ impl Database {
     */
 
     pub async fn initialize_db(&self) -> Result<()> {
-        let client = self.connection_pool.get().await?;
+        let mut client = self.connection_pool.get().await?;
+        let transaction = client.transaction().await?;
 
         dotenvy::from_filename(".env")?;
         let initial = tokio::fs::read_to_string(dotenvy::var("DATABASE_SCHEMA")?).await?;
-        client.batch_execute(&initial).await?;
+        transaction.batch_execute(&initial).await?;
+        transaction.commit().await?;
         Ok(())
     }
 

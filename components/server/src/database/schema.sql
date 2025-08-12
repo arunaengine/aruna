@@ -1,72 +1,72 @@
 /* ----- Type ENUMs ------------------------------------------------ */
 -- All ENUM types have to be created before their usage in a table
 DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'ObjectStatus') THEN
-        CREATE TYPE "ObjectStatus" AS ENUM (
-            'INITIALIZING',
-            'VALIDATING',
-            'AVAILABLE',
-	        'UNAVAILABLE',
-            'ERROR',
-            'DELETED'
-        );
-    END IF;
-END
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'ObjectStatus') THEN
+            CREATE TYPE "ObjectStatus" AS ENUM (
+                'INITIALIZING',
+                'VALIDATING',
+                'AVAILABLE',
+    	        'UNAVAILABLE',
+                'ERROR',
+                'DELETED'
+            );
+        END IF;
+    END
 $$;
 
 DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'DataClass') THEN
-        CREATE TYPE "DataClass" AS ENUM ('PUBLIC', 'PRIVATE', 'WORKSPACE', 'CONFIDENTIAL');
-    END IF;
-END
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'DataClass') THEN
+            CREATE TYPE "DataClass" AS ENUM ('PUBLIC', 'PRIVATE', 'WORKSPACE', 'CONFIDENTIAL');
+        END IF;
+    END
 $$;
 
 DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'PermissionLevel') THEN
-        CREATE TYPE "PermissionLevel" AS ENUM ('DENY', 'NONE', 'READ', 'APPEND', 'WRITE', 'ADMIN');
-    END IF;
-END
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'PermissionLevel') THEN
+            CREATE TYPE "PermissionLevel" AS ENUM ('DENY', 'NONE', 'READ', 'APPEND', 'WRITE', 'ADMIN');
+        END IF;
+    END
 $$;
 
 DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'ObjectType') THEN
-        CREATE TYPE "ObjectType" AS ENUM (
-            'PROJECT',
-            'COLLECTION',
-            'DATASET',
-            'OBJECT'
-        );
-    END IF;
-END
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'ObjectType') THEN
+            CREATE TYPE "ObjectType" AS ENUM (
+                'PROJECT',
+                'COLLECTION',
+                'DATASET',
+                'OBJECT'
+            );
+        END IF;
+    END
 $$;
 
 DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'HashType') THEN
-        CREATE TYPE "HashType" AS ENUM (
-            'MD5',
-            'SHA256'
-        );
-    END IF;
-END
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'HashType') THEN
+            CREATE TYPE "HashType" AS ENUM (
+                'MD5',
+                'SHA256'
+            );
+        END IF;
+    END
 $$;
 
 DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'EndpointStatus') THEN
-        CREATE TYPE "EndpointStatus" AS ENUM (
-            'INITIALIZING',
-            'AVAILABLE',
-            'DEGRADED',
-            'UNAVAILABLE',
-            'MAINTENANCE'
-        );
-    END IF;
-END
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'EndpointStatus') THEN
+            CREATE TYPE "EndpointStatus" AS ENUM (
+                'INITIALIZING',
+                'AVAILABLE',
+                'DEGRADED',
+                'UNAVAILABLE',
+                'MAINTENANCE'
+            );
+        END IF;
+    END
 $$;
 
 DO $$
@@ -317,4 +317,4 @@ CREATE TABLE IF NOT EXISTS announcements (
 -- Insert predefined relation types
 INSERT INTO relation_types (relation_name) VALUES ('BELONGS_TO'), ('VERSION'), ('METADATA'), ('ORIGIN'), ('POLICY'), ('DELETED') ON CONFLICT (relation_name) DO NOTHING;
 -- Create partial unique index for BELONGS_TO relations only
-CREATE UNIQUE INDEX IF NOT EXISTS belongs_to_idx ON internal_relations (origin_pid, relation_name, target_name) WHERE relation_name = ('BELONGS_TO')
+CREATE UNIQUE INDEX IF NOT EXISTS belongs_to_idx ON internal_relations (origin_pid, relation_name, target_name) WHERE relation_name = ('BELONGS_TO');

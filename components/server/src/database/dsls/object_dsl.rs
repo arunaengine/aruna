@@ -1298,7 +1298,6 @@ pub fn extract_paths_from_graph(edge_list: Vec<InternalRelation>) -> Result<Vec<
             projects.insert(edge.origin_pid);
         }
     }
-    dbg!(&children_map);
 
     let mut queue: VecDeque<(Hierarchy, DieselUlid)> = VecDeque::new();
     let mut results: Vec<Hierarchy> = vec![];

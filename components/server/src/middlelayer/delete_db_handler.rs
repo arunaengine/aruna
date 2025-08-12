@@ -208,6 +208,7 @@ impl DatabaseHandler {
         InternalRelation::set_deleted(&relation_ids_to_delete, transaction_client).await?;
 
         // Delete Objects
+        println!("DELETING ... ");
         Object::set_deleted(&object_ids_to_delete, transaction_client).await?;
 
         // Evaluate rules
@@ -216,6 +217,7 @@ impl DatabaseHandler {
         self.evaluate_rules(&all, transaction_client).await?;
         // Commit transaction
         transaction.commit().await?;
+        println!(" ... DELETED ");
 
         // Fetch hierarchies and object relations for notifications
         let deleted_objects =
