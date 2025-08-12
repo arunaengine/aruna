@@ -11,6 +11,7 @@ use http::header::ACCESS_CONTROL_ALLOW_HEADERS;
 use http::header::ACCESS_CONTROL_ALLOW_METHODS;
 use http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use http::header::ORIGIN;
+use http::header::VARY;
 use http::HeaderValue;
 use http::Method;
 use http::StatusCode;
@@ -32,6 +33,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::error;
 use tracing::info;
+use tracing::trace;
 
 pub struct S3Server {
     s3service: S3Service,
@@ -246,8 +248,7 @@ impl WrappingService {
             .map_err(|e| {
                 error!("{e}");
                 s3_error!(InvalidURI, "Invalid URI encoding")
-            })?;
-        let url_without_host = url
+            })?
             .split(
                 &CONFIG
                     .frontend
@@ -257,12 +258,21 @@ impl WrappingService {
             )
             .next()
             .ok_or_else(|| s3_error!(InternalError, "Invalid host url set"))?;
-        let bucket = match url_without_host.split(".").next() {
+
+        let bucket = match url.split(".").next() {
+            Some(empty) if empty.is_empty() => {
+                let mut iter = req.uri().path().split("/");
+                trace!(?iter);
+                iter.next(); // first one is empty
+                iter.next() // next one is bucket
+                    .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
+            }
             Some(sub_bucket) => sub_bucket,
             None => {
-                url_without_host
-                    .split("/")
-                    .next()
+                let mut iter = req.uri().path().split("/");
+                trace!(?iter);
+                iter.next(); // first one is empty
+                iter.next() // next one is bucket
                     .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
             }
         };
@@ -304,6 +314,9 @@ impl WrappingService {
             })
             .ok_or_else(|| s3_error!(NoSuchBucketPolicy, "No cors policy found for bucket"))?;
         let mut builder = hyper::Response::builder();
+        if !rule.allowed_origins.contains(&"*".to_string()) {
+            builder = builder.header(VARY, HeaderValue::from_static("Origin"));
+        }
         for origin in rule.allowed_origins.iter() {
             builder = builder.header(
                 ACCESS_CONTROL_ALLOW_ORIGIN,

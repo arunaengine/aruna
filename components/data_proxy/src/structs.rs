@@ -1875,11 +1875,15 @@ impl CORSConfiguration {
         header: Option<Vec<String>>,
     ) -> Option<HashMap<String, String>> {
         for cors_rule in self.0 {
-            if cors_rule.allowed_origins.contains(&origin)
+            if (cors_rule.allowed_origins.contains(&origin)
+                || cors_rule.allowed_origins.contains(&"*".to_string()))
                 && cors_rule.allowed_methods.contains(&method)
             {
                 let mut headers = HashMap::new();
                 if !cors_rule.allowed_origins.is_empty() {
+                    if !cors_rule.allowed_origins.contains(&"*".to_string()) {
+                        headers.insert("Vary".to_string(), "Origin".to_string());
+                    }
                     headers.insert(
                         "Access-Control-Allow-Origin".to_string(),
                         cors_rule.allowed_origins.join(", "),
