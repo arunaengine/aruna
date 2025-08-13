@@ -298,23 +298,47 @@ pub fn checksum_resource(gen_res: generic_resource::Resource) -> anyhow::Result<
         generic_resource::Resource::Project(mut proj) => {
             proj.stats = None;
             Ok(general_purpose::STANDARD_NO_PAD
-                .encode(xxh3_128(&bincode::serde::encode_to_vec(&proj, bincode::config::legacy())?).to_be_bytes())
+                .encode(
+                    xxh3_128(&bincode::serde::encode_to_vec(
+                        &proj,
+                        bincode::config::legacy(),
+                    )?)
+                    .to_be_bytes(),
+                )
                 .to_string())
         }
         generic_resource::Resource::Collection(mut col) => {
             col.stats = None;
             Ok(general_purpose::STANDARD_NO_PAD
-                .encode(xxh3_128(&bincode::serde::encode_to_vec(&col, bincode::config::legacy())?).to_be_bytes())
+                .encode(
+                    xxh3_128(&bincode::serde::encode_to_vec(
+                        &col,
+                        bincode::config::legacy(),
+                    )?)
+                    .to_be_bytes(),
+                )
                 .to_string())
         }
         generic_resource::Resource::Dataset(mut ds) => {
             ds.stats = None;
             Ok(general_purpose::STANDARD_NO_PAD
-                .encode(xxh3_128(&bincode::serde::encode_to_vec(&ds, bincode::config::legacy())?).to_be_bytes())
+                .encode(
+                    xxh3_128(&bincode::serde::encode_to_vec(
+                        &ds,
+                        bincode::config::legacy(),
+                    )?)
+                    .to_be_bytes(),
+                )
                 .to_string())
         }
         generic_resource::Resource::Object(obj) => Ok(general_purpose::STANDARD_NO_PAD
-            .encode(xxh3_128(&bincode::serde::encode_to_vec(&obj, bincode::config::legacy())?).to_be_bytes())
+            .encode(
+                xxh3_128(&bincode::serde::encode_to_vec(
+                    &obj,
+                    bincode::config::legacy(),
+                )?)
+                .to_be_bytes(),
+            )
             .to_string()),
     }
 }
@@ -322,7 +346,13 @@ pub fn checksum_resource(gen_res: generic_resource::Resource) -> anyhow::Result<
 ///ToDo: Rust Doc
 pub fn checksum_user(user: &User) -> anyhow::Result<String> {
     Ok(general_purpose::STANDARD_NO_PAD
-        .encode(xxh3_128(&bincode::serde::encode_to_vec(&user.attributes, bincode::config::legacy())?).to_be_bytes())
+        .encode(
+            xxh3_128(&bincode::serde::encode_to_vec(
+                &user.attributes,
+                bincode::config::legacy(),
+            )?)
+            .to_be_bytes(),
+        )
         .to_string())
 }
 

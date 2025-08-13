@@ -9,7 +9,7 @@ use aruna_server::{
 };
 use chrono::NaiveDateTime;
 use diesel_ulid::DieselUlid;
-use rand::{seq::IteratorRandom, rng as thread_rng, Rng};
+use rand::{rng as thread_rng, seq::IteratorRandom, Rng};
 
 mod common;
 

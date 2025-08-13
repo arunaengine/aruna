@@ -1398,7 +1398,7 @@ impl S3 for ArunaS3Service {
                         id: Some(user_id.to_string()),
                     }),
                     ..Default::default() // TODO: Pagination (continuation token and prefix
-                    // handling)
+                                         // handling)
                 }))
             }
             None => Err(s3_error!(InvalidAccessKeyId, "Invalid access key / user")),

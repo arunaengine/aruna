@@ -535,7 +535,9 @@ impl GrpcQueryHandler {
     pub async fn remove_cors_from_project(&self, token: &str, obj: DPObject) -> Result<()> {
         let cors = match obj
             .key_values
-            .iter().find(|e| e.key == "app.aruna-storage.org/cors").cloned()
+            .iter()
+            .find(|e| e.key == "app.aruna-storage.org/cors")
+            .cloned()
         {
             Some(cors) => cors,
             None => KeyValue {
