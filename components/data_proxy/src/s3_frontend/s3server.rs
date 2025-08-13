@@ -34,7 +34,6 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::error;
 use tracing::info;
-use tracing::trace;
 
 pub struct S3Server {
     s3service: S3Service,
@@ -264,7 +263,6 @@ impl WrappingService {
         let bucket = match url.split(".").next() {
             Some(empty) if empty.is_empty() => {
                 let mut iter = req.uri().path().split("/");
-                trace!(?iter);
                 iter.next(); // first one is empty
                 iter.next() // next one is bucket
                     .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
@@ -272,7 +270,6 @@ impl WrappingService {
             Some(sub_bucket) => sub_bucket,
             None => {
                 let mut iter = req.uri().path().split("/");
-                trace!(?iter);
                 iter.next(); // first one is empty
                 iter.next() // next one is bucket
                     .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
