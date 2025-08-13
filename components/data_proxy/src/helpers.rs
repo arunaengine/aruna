@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use anyhow::Result;
 use http::Method;
-use rand::distributions::DistString;
+use rand::distr::SampleString as DistString;
 use reqsign::{AwsCredential, AwsV4Signer};
 use url::Url;
 
@@ -139,8 +139,8 @@ pub fn is_method_read(method: &Method) -> bool {
 }
 
 pub fn random_string(len: usize) -> String {
-    use rand::distributions::Alphanumeric;
-    use rand::thread_rng;
+    use rand::distr::Alphanumeric;
+    use rand::rng as thread_rng;
     Alphanumeric
         .sample_string(&mut thread_rng(), len)
         .to_ascii_lowercase()

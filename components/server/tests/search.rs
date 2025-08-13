@@ -9,7 +9,7 @@ use aruna_server::{
 };
 use chrono::NaiveDateTime;
 use diesel_ulid::DieselUlid;
-use rand::{seq::IteratorRandom, thread_rng, Rng};
+use rand::{seq::IteratorRandom, rng as thread_rng, Rng};
 
 mod common;
 
@@ -120,20 +120,20 @@ fn generate_random_object_document() -> ObjectDocument {
         .choose_multiple(&mut rng, 2)
         .to_vec()
         .join("-");
-    let object_type = ObjectType::try_from(rng.gen_range(1..5)).unwrap();
+    let object_type = ObjectType::try_from(rng.random_range(1..5)).unwrap();
     let rand_count = match object_type {
         ObjectType::OBJECT => 1,
-        _ => rng.gen_range(2..123),
+        _ => rng.random_range(2..123),
     };
-    let rand_size = rng.gen_range(123..123456789);
-    let hook_run_success = rng.gen_bool(0.5).to_string();
-    let created_at = format!("{}-01-01 23:59:59", rng.gen_range(2001..2023));
+    let rand_size = rng.random_range(123..123456789);
+    let hook_run_success = rng.random_bool(0.5).to_string();
+    let created_at = format!("{}-01-01 23:59:59", rng.random_range(2001..2023));
 
     ObjectDocument {
         id: DieselUlid::generate(),
         object_type,
         object_type_id: object_type as u8,
-        status: ObjectStatus::try_from(rng.gen_range(1..6)).unwrap(),
+        status: ObjectStatus::try_from(rng.random_range(1..6)).unwrap(),
         name: project_name,
         title: "this is a project_title".to_string(),
         description: "ChatGPT should create some hallucinated description of this project."
@@ -169,7 +169,7 @@ fn generate_random_object_document() -> ObjectDocument {
             .unwrap()
             .and_utc()
             .timestamp(),
-        dynamic: rng.gen_bool(0.5).to_string().parse::<bool>().unwrap(),
+        dynamic: rng.random_bool(0.5).to_string().parse::<bool>().unwrap(),
         metadata_license: "AllRightsReserved".to_string(),
         data_license: "AllRightsReserved".to_string(),
     }

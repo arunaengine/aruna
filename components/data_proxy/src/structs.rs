@@ -169,7 +169,7 @@ impl FileFormat {
         allow_compression: bool,
     ) -> Result<Self> {
         let mut enc_key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut enc_key);
+        rand::rng().fill_bytes(&mut enc_key);
 
         Ok(match (allow_pithos, allow_encryption, allow_compression) {
             (true, _, _) => FileFormat::Pithos(enc_key),

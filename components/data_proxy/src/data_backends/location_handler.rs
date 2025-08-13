@@ -10,8 +10,8 @@ use nom::{
     sequence::{preceded, terminated},
     IResult, Parser,
 };
-use rand::distributions::Alphanumeric;
-use rand::thread_rng;
+use rand::distr::Alphanumeric;
+use rand::rng as thread_rng;
 use rand::Rng;
 
 use crate::CONFIG;

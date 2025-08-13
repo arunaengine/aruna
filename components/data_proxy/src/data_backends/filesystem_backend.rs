@@ -7,7 +7,7 @@ use diesel_ulid::DieselUlid;
 use digest::Digest;
 use futures_util::StreamExt;
 use md5::Md5;
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rand::{distr::Alphanumeric, rng as thread_rng, Rng};
 use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::pin;

@@ -32,7 +32,7 @@ use aruna_server::{
 use dashmap::DashMap;
 use diesel_ulid::DieselUlid;
 use postgres_types::Json;
-use rand::{distributions::Alphanumeric, seq::IteratorRandom, thread_rng, Rng};
+use rand::{distr::Alphanumeric, seq::IteratorRandom, rng as thread_rng, Rng};
 use tonic::{
     metadata::{AsciiMetadataKey, AsciiMetadataValue},
     Request,
