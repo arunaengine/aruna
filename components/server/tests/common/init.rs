@@ -62,7 +62,8 @@ pub async fn init_database() -> Arc<Database> {
     )
     .unwrap();
 
-    db.initialize_db().await.unwrap();
+    // Creates deadlocks. IDK why ¯\_(ツ)_/¯
+    // db.initialize_db().await.unwrap();
 
     Arc::new(db)
 }

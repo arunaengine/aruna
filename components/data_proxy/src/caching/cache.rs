@@ -22,7 +22,7 @@ use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
 use diesel_ulid::DieselUlid;
 use jsonwebtoken::DecodingKey;
-use rand::{distributions::Alphanumeric, thread_rng, Rng};
+use rand::{distr::Alphanumeric, rng as thread_rng, Rng};
 use s3s::auth::SecretKey;
 use s3s::dto::Part;
 use std::collections::{HashMap, VecDeque};

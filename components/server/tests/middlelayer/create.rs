@@ -17,8 +17,8 @@ use aruna_server::database::enums::{DataClass, ObjectStatus, ObjectType, Replica
 use aruna_server::middlelayer::create_request_types::CreateRequest;
 use diesel_ulid::DieselUlid;
 use itertools::Itertools;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
+use rand::distr::Alphanumeric;
+use rand::{rng as thread_rng, Rng};
 
 fn random_name() -> String {
     thread_rng()

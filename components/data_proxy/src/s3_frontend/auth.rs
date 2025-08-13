@@ -1,12 +1,14 @@
 use crate::caching::cache::Cache;
 use s3s::{
-    auth::{S3Auth, S3AuthContext, SecretKey},
+    access::{S3Access, S3AccessContext},
+    auth::{S3Auth, SecretKey},
     s3_error, S3Result,
 };
 use std::sync::Arc;
 use tracing::debug;
 
 /// Aruna authprovider
+#[derive(Clone)]
 pub struct AuthProvider {
     cache: Arc<Cache>,
 }
@@ -30,9 +32,12 @@ impl S3Auth for AuthProvider {
             .map_err(|_| s3_error!(AccessDenied, "Invalid access key"))?;
         Ok(secret)
     }
+}
 
+#[async_trait::async_trait]
+impl S3Access for AuthProvider {
     #[tracing::instrument(level = "trace", skip(self, cx))]
-    async fn check_access(&self, cx: &mut S3AuthContext<'_>) -> S3Result<()> {
+    async fn check(&self, cx: &mut S3AccessContext<'_>) -> S3Result<()> {
         debug!(path = ?cx.s3_path());
 
         match self.cache.auth.read().await.as_ref() {

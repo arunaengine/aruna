@@ -138,7 +138,7 @@ impl S3 for ArunaS3Service {
         let CheckAccessResult {
             user_state,
             objects_state,
-            ..
+            headers,
         } = req
             .extensions
             .get::<CheckAccessResult>()
@@ -262,7 +262,19 @@ impl S3 for ArunaS3Service {
             Some(objects_state.try_slice()?),
         ));
         debug!(?response);
-        Ok(S3Response::new(response))
+
+        let mut resp = S3Response::new(response);
+        if let Some(headers) = headers {
+            for (k, v) in headers {
+                resp.headers.insert(
+                    HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header name"))?,
+                    HeaderValue::from_str(&v)
+                        .map_err(|_| s3_error!(InternalError, "Unable to parse header value"))?,
+                );
+            }
+        }
+        Ok(resp)
     }
 
     #[tracing::instrument(err)]
@@ -1371,6 +1383,7 @@ impl S3 for ArunaS3Service {
                             )
                         }),
                         name: Some(o.name),
+                        bucket_region: None, // TODO: Set region?
                     });
                 }
                 let bs = if buckets.is_empty() {
@@ -1384,6 +1397,8 @@ impl S3 for ArunaS3Service {
                         display_name: None,
                         id: Some(user_id.to_string()),
                     }),
+                    ..Default::default() // TODO: Pagination (continuation token and prefix
+                                         // handling)
                 }))
             }
             None => Err(s3_error!(InvalidAccessKeyId, "Invalid access key / user")),

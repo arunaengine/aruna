@@ -10,8 +10,8 @@ use nom::{
     sequence::{preceded, terminated},
     IResult, Parser,
 };
-use rand::distributions::Alphanumeric;
-use rand::thread_rng;
+use rand::distr::Alphanumeric;
+use rand::rng as thread_rng;
 use rand::Rng;
 
 use crate::CONFIG;
@@ -139,7 +139,7 @@ impl CompiledVariant {
     }
 
     pub fn compile(input: &str) -> IResult<&str, Self> {
-        alt((Self::compile_s3, Self::compile_filesystem))(input)
+        alt((Self::compile_s3, Self::compile_filesystem)).parse(input)
     }
 
     pub fn compile_s3(scheme: &str) -> IResult<&str, Self> {
@@ -228,10 +228,13 @@ impl CompiledVariant {
             tag("/").map(|_| Arguments::Slash),
             take_while(|c| c != '{' && c != '}' && c != '/')
                 .map(|x: &str| Arguments::Text(x.to_string())),
-        ))(input)
+        ))
+        .parse(input)
     }
 
     pub fn compile_tags(input: &str) -> IResult<&str, Vec<Arguments>> {
-        many_till(Self::compile_tag, eof)(input).map(|(x, (y, _))| (x, y))
+        many_till(Self::compile_tag, eof)
+            .parse(input)
+            .map(|(x, (y, _))| (x, y))
     }
 }

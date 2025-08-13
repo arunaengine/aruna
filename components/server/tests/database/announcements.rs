@@ -2,7 +2,7 @@ use aruna_rust_api::api::storage::models::v2::PageRequest;
 use aruna_server::database::{crud::CrudDb, dsls::info_dsl::Announcement};
 use diesel_ulid::DieselUlid;
 use itertools::Itertools;
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use tokio_postgres::GenericClient;
 
 use crate::common::{init, test_utils};
@@ -139,7 +139,7 @@ async fn get_test() {
 
     // Get announcements filtered by id
     let ids = announcements
-        .choose_multiple(&mut rand::thread_rng(), 2)
+        .choose_multiple(&mut rand::rng(), 2)
         .map(|a| a.id)
         .collect_vec();
     let filtered_anns = Announcement::get_by_ids(client, &ids, None).await.unwrap();

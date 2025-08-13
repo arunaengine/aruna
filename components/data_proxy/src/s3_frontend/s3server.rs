@@ -2,6 +2,7 @@ use super::auth::AuthProvider;
 use super::s3service::ArunaS3Service;
 use crate::caching::cache;
 use crate::data_backends::storage_backend::StorageBackend;
+use crate::CONFIG;
 use crate::CORS_REGEX;
 use anyhow::Result;
 use futures_core::future::BoxFuture;
@@ -10,6 +11,7 @@ use http::header::ACCESS_CONTROL_ALLOW_HEADERS;
 use http::header::ACCESS_CONTROL_ALLOW_METHODS;
 use http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
 use http::header::ORIGIN;
+use http::header::VARY;
 use http::HeaderValue;
 use http::Method;
 use http::StatusCode;
@@ -18,6 +20,7 @@ use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::header::HOST;
+use s3s::host::SingleDomain;
 use s3s::s3_error;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
@@ -58,11 +61,12 @@ impl S3Server {
                 error!(error = ?e, msg = e.to_string());
                 tonic::Status::unauthenticated(e.to_string())
             })?;
-
+        let auth_provider = AuthProvider::new(cache).await;
         let service = {
             let mut b = S3ServiceBuilder::new(s3service.clone());
-            b.set_base_domain(hostname);
-            b.set_auth(AuthProvider::new(cache).await);
+            b.set_host(SingleDomain::new(&hostname.into())?);
+            b.set_access(auth_provider.clone());
+            b.set_auth(auth_provider);
             b.build()
         };
 
@@ -236,19 +240,41 @@ impl WrappingService {
                 error!("{e}");
                 s3_error!(InvalidURI, "Invalid URI encoding")
             })?;
-        let authority = req
+
+        let url = req
             .headers()
             .get(HOST)
-            .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?;
-        let bucket = authority
+            .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?
             .to_str()
             .map_err(|e| {
                 error!("{e}");
                 s3_error!(InvalidURI, "Invalid URI encoding")
             })?
-            .split(".")
+            .split(
+                &CONFIG
+                    .frontend
+                    .as_ref()
+                    .ok_or_else(|| s3_error!(InternalError, "No s3 frontend configured"))?
+                    .hostname,
+            )
             .next()
-            .ok_or_else(|| s3_error!(InvalidURI, "No bucket found in URI"))?;
+            .ok_or_else(|| s3_error!(InternalError, "Invalid host url set"))?;
+
+        let bucket = match url.split(".").next() {
+            Some(empty) if empty.is_empty() => {
+                let mut iter = req.uri().path().split("/");
+                iter.next(); // first one is empty
+                iter.next() // next one is bucket
+                    .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
+            }
+            Some(sub_bucket) => sub_bucket,
+            None => {
+                let mut iter = req.uri().path().split("/");
+                iter.next(); // first one is empty
+                iter.next() // next one is bucket
+                    .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
+            }
+        };
         let project_id = self
             .inner
             .cache
@@ -287,6 +313,9 @@ impl WrappingService {
             })
             .ok_or_else(|| s3_error!(NoSuchBucketPolicy, "No cors policy found for bucket"))?;
         let mut builder = hyper::Response::builder();
+        if !rule.allowed_origins.contains(&"*".to_string()) {
+            builder = builder.header(VARY, HeaderValue::from_static("Origin"));
+        }
         for origin in rule.allowed_origins.iter() {
             builder = builder.header(
                 ACCESS_CONTROL_ALLOW_ORIGIN,

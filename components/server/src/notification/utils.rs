@@ -4,7 +4,7 @@ use aruna_rust_api::api::notification::services::v2::{announcement_event::EventV
 use base64::{engine::general_purpose, Engine};
 use diesel_ulid::DieselUlid;
 use hmac::{Hmac, Mac};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, Rng};
 use sha2::Sha256;
 use xxhash_rust::xxh3::xxh3_128;
 
@@ -153,7 +153,7 @@ pub fn calculate_base64_xxhash(payload: &[u8]) -> String {
 ///ToDo: Rust Doc
 pub fn calculate_reply_hmac(reply_subject: &str, secret: String) -> Reply {
     // Generate random salt value
-    let salt = rand::thread_rng()
+    let salt = rand::rng()
         .sample_iter(&Alphanumeric)
         .take(10)
         .map(char::from)

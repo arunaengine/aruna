@@ -536,9 +536,8 @@ impl GrpcQueryHandler {
         let cors = match obj
             .key_values
             .iter()
-            .filter(|e| e.key == "app.aruna-storage.org/cors")
+            .find(|e| e.key == "app.aruna-storage.org/cors")
             .cloned()
-            .next()
         {
             Some(cors) => cors,
             None => KeyValue {
