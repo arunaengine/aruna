@@ -1,7 +1,7 @@
 use crate::api_json::request::Request;
 use crate::api_s3::auth::UserAccess;
 use crate::error::ArunaDataError;
-use crate::io::controller::Controller;
+use crate::controller::controller::Controller;
 use crate::io::io_handler::tables::ACCESS_DB_NAME;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;

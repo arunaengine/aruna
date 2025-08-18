@@ -5,7 +5,7 @@ use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3Credent
 use aruna_data::api_json::server::RestServer;
 use aruna_data::api_s3::s3server::S3Server;
 use aruna_data::config::config::Config;
-use aruna_data::io::controller::Controller;
+use aruna_data::controller::controller::Controller;
 use aruna_data::io::io_handler::REPLICATION_PROTOCOL_ID;
 use aruna_data::network::network_handler::NetworkHandler;
 use aruna_data::util::opendal::Backend;
@@ -15,6 +15,7 @@ use aruna_permission::token::Issuer;
 use aruna_permission::{OidcToken, PermissionManager, TokenSystem, UserIdentity};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
+use aruna_task::TaskHandler;
 use aws_sdk_s3::Client;
 use blake3::Hasher;
 use chrono::Months;
@@ -55,6 +56,7 @@ pub async fn init_test_nodes(
     let mut node_services = vec![];
     let mut bootstrap_nodes = vec![];
     let databases = vec![
+        aruna_task::TASK_DB_NAME,
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,
         aruna_permission::OIDC_IDENTITIES_DB,
@@ -106,6 +108,8 @@ pub async fn init_test_nodes(
         };
         let lmdb_store = LmdbStore::new(lmdb_config)?;
 
+        let task_handler = TaskHandler::new(lmdb_store.clone()).await?;
+
         // Init PermissionManager and load policies from persistence
         let permission_manager = PermissionManager::new().await?;
         let mut read_txn = lmdb_store.create_txn(false)?;
@@ -143,7 +147,7 @@ pub async fn init_test_nodes(
 
         let network = NetworkHandler::new(actor_handle, kademlia, realm_key.to_bytes()).await?;
 
-        let controller = Controller::<LmdbStore>::new(io_handler, network).await;
+        let controller = Controller::<LmdbStore>::new(io_handler, network, task_handler).await;
 
         // Create and run S3 server
         let s3server =

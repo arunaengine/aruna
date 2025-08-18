@@ -1,5 +1,6 @@
 use crate::api_json::request::Request;
 use crate::io::io_handler::BLOCK_SIZE;
+use crate::io::io_handler::ObjectInfo;
 use crate::io::messages::{MessageType, ReplicationMessage};
 use crate::network::network_handler::NetworkHandler;
 use crate::util::bao_tree::{FuturesAsyncReaderWrapper, SendStreamWrapper};
@@ -7,18 +8,19 @@ use crate::util::opendal::get_data_async_reader;
 use crate::{IOHandler, error::ArunaDataError};
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
-use bao_tree::io::fsm::{encode_ranges_validated, CreateOutboard};
+use aruna_task::task_trait::TaskExecutor;
+use aruna_task::Task;
+use aruna_task::TaskHandler;
+use aruna_task::error::ArunaTaskError;
+use bao_tree::ByteRanges;
+use bao_tree::io::fsm::{CreateOutboard, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
-use bao_tree::ByteRanges;
 use bytes::BytesMut;
 use iroh::NodeAddr;
-use ulid::Ulid;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
-use anyhow::anyhow;
-
-use super::io_handler::ObjectInfo;
+use ulid::Ulid;
 
 #[derive(Clone)]
 pub struct Controller<St>
@@ -27,17 +29,23 @@ where
 {
     pub io_handler: Arc<IOHandler<St>>,
     pub network: NetworkHandler,
+    pub task_handler: TaskHandler<St>,
 }
 
 impl<St> Controller<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
-    #[tracing::instrument(level = "trace", skip(io_handler, network))]
-    pub async fn new(io_handler: Arc<IOHandler<St>>, network: NetworkHandler) -> Self {
+    #[tracing::instrument(level = "trace", skip(io_handler, network, task_handler))]
+    pub async fn new(
+        io_handler: Arc<IOHandler<St>>,
+        network: NetworkHandler,
+        task_handler: TaskHandler<St>,
+    ) -> Self {
         let controller = Self {
             io_handler,
             network,
+            task_handler,
         };
         controller.clone().run().await;
         controller
@@ -72,44 +80,42 @@ where
             //let self_addr = self.network.get_node_addr().clone();
             loop {
                 tokio::select! {
-                        // Handle incoming streams
-                        Ok(inc_stream) = network.receive() => {
-                            let io_handler = self.io_handler.clone();
-                            let network = network.clone();
+                    // Handle incoming streams
+                    Ok(inc_stream) = network.receive() => {
+                        let io_handler = self.io_handler.clone();
+                        let network = network.clone();
 
-                            trace!("{:?} Received stream from: {:?}", network.get_node_addr(), inc_stream.sender);
-                            tokio::spawn(
-                                async move {
-                                    if let Err(e) = io_handler.handle_incoming_p2p_stream(
-                                        inc_stream,
-                                        network.get_realm_key(),
-                                        network.get_node_addr(),
+                        trace!("{:?} Received stream from: {:?}", network.get_node_addr(), inc_stream.sender);
+                        tokio::spawn(
+                            async move {
+                                if let Err(e) = io_handler.handle_incoming_p2p_stream(
+                                    inc_stream,
+                                    network.get_realm_key(),
+                                    network.get_node_addr(),
 
-                                    ).await{
-                                        error!("Failed to handle incoming stream: {e:#}");
-                                    }
+                                ).await{
+                                    error!("Failed to handle incoming stream: {e:#}");
                                 }
-                            );
-                        }
-
-                        // Check for shutdown signal
-                        _ = tokio::signal::ctrl_c() => {
-                            break;
-                        }
+                            }
+                        );
                     }
+
+                    // Check for shutdown signal
+                    _ = tokio::signal::ctrl_c() => {
+                        break;
+                    }
+                }
             }
         });
     }
 
-    pub async fn get_identity(&self, token: String) -> anyhow::Result<UserIdentity> {
+    pub async fn get_identity(&self, token: String) -> Result<UserIdentity, ArunaDataError> {
         let store = self.io_handler.store.clone();
         let token_handler = self.io_handler.token_handler.clone();
         // TODO: Query user from kademlia
-        tokio::task::spawn_blocking(move || -> anyhow::Result<UserIdentity> {
+        tokio::task::spawn_blocking(move || -> Result<UserIdentity, ArunaDataError> {
             let txn = store.create_txn(false)?;
-            let user_identity = token_handler
-                .write()
-                .get_identity(&token, &store, &txn)?;
+            let user_identity = token_handler.write().get_identity(&token, &store, &txn)?;
             store.commit(txn)?;
             Ok(user_identity)
         })
@@ -124,12 +130,12 @@ where
         replication_node: NodeAddr,
         replication_path: Option<String>,
         object_info: &ObjectInfo,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ArunaDataError> {
         // Create backend storage operator
-        let operator = self.io_handler.get_operator(
-            &object_info.storage_root,
-        )
-        .await?;
+        let operator = self
+            .io_handler
+            .get_operator(&object_info.storage_root)
+            .await?;
 
         // Get data stream
         let stream = get_data_async_reader(
@@ -167,11 +173,11 @@ where
         let response = ReplicationMessage::read(&mut rx).await?;
         if let MessageType::InitReplicationResponse { ack, reason } = response.msg_type {
             if !ack {
-                return Err(anyhow!(
+                return Err(ArunaDataError::ServerError(format!(
                     "Replication node {:?} rejected replication request: {:?}",
                     replication_node,
                     reason.ok_or_else(|| "No reason provided")
-                ));
+                )));
             }
         }
 
@@ -185,5 +191,50 @@ where
         debug!("Sent all chunks.");
 
         Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl<St> TaskExecutor for Controller<St>
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    #[tracing::instrument(level = "trace", skip(self, task))]
+    async fn execute(&self, task: Task) -> Result<(), ArunaTaskError> {
+        todo!();
+        Ok(())
+        // trace!("Execution metadata task");
+        // let res: TaskPayload = postcard::from_bytes(&task.payload).map_err(logerr!())?;
+
+        // match res {
+        //     TaskPayload::Sync {
+        //         doc,
+        //         subject_hash,
+        //         doc_id,
+        //         path,
+        //         nodes,
+        //     } => {
+        //         let doc: TypedDoc = doc.try_into().map_err(|err: ArunaMetadataError| {
+        //             error!("{err}");
+        //             ArunaTaskError::ExecutionError(err.to_string())
+        //         })?;
+        //         for x in self
+        //             .distribute_sync(doc, subject_hash, doc_id, path, nodes.into_iter())
+        //             .await
+        //             .join_all()
+        //             .await
+        //         {
+        //             x.map_err(|err| {
+        //                 error!("{err}");
+        //                 ArunaTaskError::ExecutionError(err.to_string())
+        //             })?;
+        //         }
+        //     }
+        // }
+
+        // Ok(())
+    }
+    fn clone_box(&self) -> Box<dyn TaskExecutor + 'static> {
+        Box::new(self.clone())
     }
 }

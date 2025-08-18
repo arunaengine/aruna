@@ -1,5 +1,5 @@
 use crate::error::ArunaDataError;
-use crate::io::controller::Controller;
+use crate::controller::controller::Controller;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 

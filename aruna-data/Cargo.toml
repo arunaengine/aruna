@@ -6,25 +6,26 @@ edition = {workspace = true}
 [dependencies]
 anyhow = {workspace = true}
 aruna-net = { path = "../aruna-net" }
-aruna-storage = { path = "../aruna-storage" }
 aruna-permission = { path = "../aruna-permission" }
 aruna-realm = { path = "../aruna-realm" }
+aruna-storage = { path = "../aruna-storage" }
+aruna-task = { path = "../aruna-task" }
 async-trait = {workspace = true}
-aws-config = "1.8.1"
-aws-sdk-s3 = "1.96.0"
+aws-config = "1.8.4"
+aws-sdk-s3 = "1.101.0"
 axum = { workspace = true }
 bao-tree = "0.15.1"
 blake3 = {workspace = true}
 bytes = "1.10.1"
 dotenvy = {workspace = true}
 ed25519-dalek = { workspace = true }
-fancy-regex = "0.14.0"
+fancy-regex = "0.16.1"
 futures = "0.3.31"
 futures-core = "0.3.31"
 futures-util = { workspace = true }
 http = "1.3.1"
 hyper = {version = "1.6.0", features = ["full"]}
-hyper-util = { version = "0.1.15", features = [
+hyper-util = { version = "0.1.16", features = [
     "server",
     "http1",
     "http2",
@@ -35,7 +36,7 @@ iroh = {workspace = true}
 iroh-io = "0.6.2"
 lazy_static = "1.5.0"
 md5 = "0.8.0"
-opendal = { version = "0.53.3", features = ["services-s3", "services-http", "services-postgresql", "services-fs"] }
+opendal = { version = "0.54.0", features = ["services-s3", "services-http", "services-postgresql", "services-fs"] }
 parking_lot = {workspace = true}
 postcard = {workspace = true}
 rand = { workspace = true }
@@ -44,8 +45,8 @@ serde = { workspace = true }
 sha2 = "0.10.9"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tonic = "0.13.1"
-tower-http = { version = "0.6.2", features = ["cors", "trace"] }
+tonic = "0.14.0"
+tower-http = { version = "0.6.6", features = ["cors", "trace"] }
 tracing = {workspace = true} 
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }

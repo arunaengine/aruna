@@ -1,5 +1,5 @@
 use crate::api_s3::util::get_s3_operation_permission;
-use crate::io::controller::Controller;
+use crate::controller::controller::Controller;
 use crate::io::io_handler::tables::{ACCESS_DB_NAME, PATH_LOCATION_DB_NAME};
 use anyhow::anyhow;
 use aruna_permission::UserIdentity;

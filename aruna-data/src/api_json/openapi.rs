@@ -1,5 +1,5 @@
 use crate::api_json::paths::*;
-use crate::io::controller::Controller;
+use crate::controller::controller::Controller;
 use aruna_storage::storage::store::Store;
 use utoipa::{
     Modify, OpenApi,

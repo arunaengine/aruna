@@ -2,10 +2,11 @@ use std::{array::TryFromSliceError, num::ParseIntError, str::ParseBoolError};
 
 use axum::Json;
 use axum::http::StatusCode;
-use iroh::KeyParsingError;
+use iroh::{endpoint::{ReadExactError, WriteError}, KeyParsingError};
 use s3s::{S3Error, s3_error};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::task::JoinError;
 use utoipa::IntoResponses;
 
 #[macro_export]
@@ -46,8 +47,8 @@ pub enum ArunaDataError {
     NotFound(String),
     // 500 Internal Server Error
     #[response(status = 500)]
-    #[error("Deserialize error {0}")]
-    DeserializeError(String),
+    #[error("Serialization error {0}")]
+    SerializationError(String),
     #[response(status = 500)]
     #[error("I/O error: {0}")]
     //IoError(#[from] std::io::Error),
@@ -183,24 +184,48 @@ impl From<aruna_storage::error::ArunaStorageError> for ArunaDataError {
 
 impl From<postcard::Error> for ArunaDataError {
     fn from(e: postcard::Error) -> Self {
-        ArunaDataError::DeserializeError(e.to_string())
+        ArunaDataError::SerializationError(e.to_string())
+    }
+}
+
+impl From<bao_tree::io::EncodeError> for ArunaDataError {
+    fn from(e: bao_tree::io::EncodeError) -> Self {
+        ArunaDataError::SerializationError(e.to_string())
     }
 }
 
 impl From<TryFromSliceError> for ArunaDataError {
     fn from(e: TryFromSliceError) -> Self {
-        ArunaDataError::DeserializeError(e.to_string())
+        ArunaDataError::SerializationError(e.to_string())
     }
 }
 
 impl From<fancy_regex::Error> for ArunaDataError {
     fn from(e: fancy_regex::Error) -> Self {
-        ArunaDataError::DeserializeError(e.to_string())
+        ArunaDataError::SerializationError(e.to_string())
     }
 }
 
 impl From<opendal::Error> for ArunaDataError {
     fn from(e: opendal::Error) -> Self {
+        ArunaDataError::ServerError(e.to_string())
+    }
+}
+
+impl From<JoinError> for ArunaDataError {
+    fn from(e: JoinError) -> Self {
+        ArunaDataError::ServerError(e.to_string())
+    }
+}
+
+impl From<WriteError> for ArunaDataError {
+    fn from(e: WriteError) -> Self {
+        ArunaDataError::ServerError(e.to_string())
+    }
+}
+
+impl From<ReadExactError> for ArunaDataError {
+    fn from(e: ReadExactError) -> Self {
         ArunaDataError::ServerError(e.to_string())
     }
 }

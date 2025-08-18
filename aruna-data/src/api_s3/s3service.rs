@@ -1,18 +1,25 @@
-use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
+use crate::controller::controller::Controller;
 use crate::error::ArunaDataError;
-use crate::io::controller::Controller;
 use crate::io::io_handler::ObjectInfo;
 use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 use crate::util::opendal::create_paths;
+use crate::util::s3::{Destination, ReplicationTask};
+use crate::IOHandler;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
 use futures_util::TryStreamExt;
-use s3s::dto::{GetObjectInput, GetObjectOutput, PutObjectInput, PutObjectOutput, StreamingBlob};
+use s3s::dto::{
+    CreateBucketInput, CreateBucketOutput, DeleteBucketReplicationInput,
+    DeleteBucketReplicationOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
+    GetObjectInput, GetObjectOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    PutObjectInput, PutObjectOutput, StreamingBlob,
+};
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::path::Path;
 use tracing::{debug, error, warn};
+
 //TODO: Multipart --> Store parts, concatenate on finish
 
 pub struct ArunaS3Service<St>
@@ -87,7 +94,7 @@ where
             .io_handler
             .get_operator(&info.storage_root)
             .await?;
-            //.map_err(|e| s3_error!(InternalError, "{}", e))?;
+        //.map_err(|e| s3_error!(InternalError, "{}", e))?;
 
         // Fetch reader stream
         let filename = Path::new(&info.storage_path)
@@ -212,5 +219,89 @@ where
             ..Default::default()
         };
         Ok(S3Response::new(inner_response))
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn create_bucket(
+        &self,
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
+        todo!("Add bucket path to permission handler");
+        todo!("Add bucket mapping to database?");
+    }
+
+    #[allow(clippy::blocks_in_conditions)]
+    async fn put_bucket_replication(
+        &self,
+        req: S3Request<PutBucketReplicationInput>,
+    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        let UserAccess { group_id, .. } =
+            req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+                error!(error = "Missing user context");
+                s3_error!(UnexpectedContent, "Missing user context")
+            })?;
+        let replication_policy = req.input.replication_configuration;
+        for rule in replication_policy.rules {
+            let distribution_strategy = aruna_task::DistributionStrategy::LimitedRealm(2);
+            let retry_strategy = aruna_task::RetryStrategy::Forever;
+            let destination = Destination::from_arn(rule.destination.bucket)?;
+
+            let bucket_path = format!("{}/{}", group_id, req.input.bucket);
+
+            todo!("Check if path/bucket exists?");
+
+            let replication_task = ReplicationTask {
+                source_bucket: todo!("Only bucket replication"),
+                source_filter: todo!("skip filters for now"),
+                target: todo!(),
+                existing_object_replication: rule
+                    .existing_object_replication
+                    .map(|status| match status.status.as_str() {
+                        "Enabled" => true,
+                        "Disabled" => false,
+                        _ => false,
+                    })
+                    .unwrap_or(false),
+            };
+            let payload = postcard::to_allocvec(&replication_task).unwrap();
+            self.controller
+                .task_handler
+                .register_task(
+                    distribution_strategy,
+                    retry_strategy,
+                    todo!("self.executor_idx"),
+                    payload,
+                    None,
+                )
+                .await
+                .map_err(|e| {
+                    error!("{e}");
+                    s3_error!(InternalError, "Could not register replication task")
+                })?;
+            //self.controller.task_handler.register_task(rule);
+        }
+        todo!()
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn get_bucket_replication(
+        &self,
+        req: S3Request<GetBucketReplicationInput>,
+    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        todo!()
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn delete_bucket_replication(
+        &self,
+        req: S3Request<DeleteBucketReplicationInput>,
+    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        Err(s3_error!(
+            NotImplemented,
+            "Deleting bucket replications is not implemented"
+        ))
     }
 }

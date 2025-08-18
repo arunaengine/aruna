@@ -44,6 +44,7 @@ pub mod tables {
     pub const LOCATION_DB_NAME: &str = "locations";
     pub const LOCATION_STATS_DB_NAME: &str = "location_stats";
     pub const PATH_LOCATION_DB_NAME: &str = "path_locations_mapping";
+    pub const BUCKET_MAPPINGS: &str = "bucket_mapping";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

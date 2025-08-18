@@ -1,11 +1,39 @@
+use crate::error::ArunaDataError;
 use aws_config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
 use aws_sdk_s3::config::{Credentials, RequestChecksumCalculation};
 use fancy_regex::Regex;
 use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::error::ArunaDataError;
+#[derive(Serialize, Deserialize)]
+pub struct ReplicationTask {
+    pub target: Destination,
+    pub source_bucket: String,
+    pub source_filter: Vec<Filter>,
+    pub existing_object_replication: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct Destination {
+    pub endpoint_id: Option<String>,
+    pub bucket: String,
+    pub key: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum Filter {
+    Prefix(String),
+    Tag(String),
+    And(And),
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum And {
+    Prefix(String),
+    Tag(String),
+}
 
 /// This regex matches all the rules from the official Amazon S3 bucket naming rules specification_
 /// https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html
@@ -99,6 +127,48 @@ pub async fn make_bucket(
     }
 }
 
+impl Destination {
+    pub fn from_arn(arn: String) -> Result<Self, ArunaDataError> {
+        let mut iterator = arn.split(":");
+        let _arn = iterator.next();
+        let _partition = iterator.next();
+        let _service = iterator.next();
+        // TODO: alias for node_id
+        let region = iterator.next().map(|r| r.to_string()); // node_id
+        let _account_id = iterator.next();
+        // TODO: Should we allow keys here? aws only allows ARNs for buckets
+        let bucket = iterator.next().map(|b| b.to_string()).ok_or_else(|| {
+            ArunaDataError::InvalidParameter {
+                name: "ARN".to_string(),
+                error: "Invalid ARN for replication task: No path specified".to_string(),
+            }
+        })?; // bucket
+        let _version = iterator.next();
+
+        if bucket.is_empty() {
+            return Err(ArunaDataError::InvalidParameter {
+                name: "ARN".to_string(),
+                error: "Invalid ARN for replication task: Invalid bucket".to_string(),
+            });
+        }
+        if let Some(node_id) = &region {
+            if node_id.contains("*") {
+                return Err(ArunaDataError::InvalidParameter {
+                    name: "ARN".to_string(),
+                    error: "Invalid ARN for replication task: Region wildcars are not allowed"
+                        .to_string(),
+                });
+            }
+        }
+
+        Ok(Destination {
+            endpoint_id: region,
+            bucket,
+            key: todo!(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +204,29 @@ mod tests {
         // Too long (over 1024 characters)
         let long_key = "a".repeat(1025);
         assert!(!validate_s3_object_key(&long_key).unwrap());
+    }
+
+    #[test]
+    fn test_arns() {
+        assert_eq!(
+            Destination::from_arn("arn:aws:s3:my-node-id:account_id:my-test-bucket".to_string())
+                .unwrap(),
+            Destination {
+                endpoint_id: Some("my-node-id".to_string()),
+                bucket: "my-test-bucket".to_string(),
+                key: None,
+            }
+        );
+        assert_eq!(
+            Destination::from_arn("arn:::node-id::my-test-bucket".to_string()).unwrap(),
+            Destination {
+                endpoint_id: None,
+                bucket: "my-test-bucket".to_string(),
+                key: None,
+            }
+        );
+        assert!(Destination::from_arn("arn:::node-id::".to_string()).is_err(),);
+        assert!(Destination::from_arn("arn:::node-id::*".to_string()).is_err(),);
+        assert!(Destination::from_arn("arn:::*::bucket".to_string()).is_err(),);
     }
 }

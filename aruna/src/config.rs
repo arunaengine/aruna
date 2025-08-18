@@ -45,6 +45,7 @@ pub async fn start_data(
     network: Arc<P2PNetwork>,
     perm_manager: PermissionManager,
     token_handler: Arc<RwLock<TokenSystem>>,
+    task_handler: TaskHandler<LmdbStore>,
 ) -> Result<(), ArunaError> {
     // Create and run IOHandler
     let io_handler = IOHandler::<LmdbStore>::new(
@@ -63,7 +64,7 @@ pub async fn start_data(
     .await?;
 
     let controller =
-        aruna_data::io::controller::Controller::<LmdbStore>::new(io_handler, network_handler).await;
+        aruna_data::controller::controller::Controller::<LmdbStore>::new(io_handler, network_handler, task_handler).await;
     let s3server = S3Server::new(
         config.config.frontend.s3_frontend.clone(),
         controller.clone(),

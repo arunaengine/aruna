@@ -1,10 +1,11 @@
-use anyhow::anyhow;
 use aruna_permission::UserIdentity;
 use iroh::NodeAddr;
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
+
+use crate::error::ArunaDataError;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MessageType {
@@ -29,9 +30,8 @@ pub struct ReplicationMessage {
 }
 
 impl ReplicationMessage {
-    pub async fn send(self, sender: &mut SendStream) -> anyhow::Result<()> {
-        let request_buf = postcard::to_allocvec(&self)
-            .map_err(|e| anyhow!("Failed to serialize response: {e:#}"))?;
+    pub async fn send(self, sender: &mut SendStream) -> Result<(), ArunaDataError> {
+        let request_buf = postcard::to_allocvec(&self)?;
         sender.write_u32(request_buf.len() as u32).await?;
         sender.write_all(&request_buf).await?;
         sender.flush().await?;
@@ -39,7 +39,7 @@ impl ReplicationMessage {
         Ok(())
     }
 
-    pub async fn read(receiver: &mut RecvStream) -> anyhow::Result<Self> {
+    pub async fn read(receiver: &mut RecvStream) -> Result<Self, ArunaDataError> {
         let msg_len = receiver.read_u32().await?;
         let mut buf = vec![0; msg_len as usize];
         receiver.read_exact(&mut buf).await?;

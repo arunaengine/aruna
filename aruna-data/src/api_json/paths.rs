@@ -1,7 +1,7 @@
 use super::util::{extract_token, into_axum_response};
 use crate::api_json::requests::*;
 use crate::error::ArunaDataError;
-use crate::io::controller::Controller;
+use crate::controller::controller::Controller;
 use aruna_storage::storage::store::Store;
 use axum::{Json, extract::State, http::HeaderMap, response::IntoResponse};
 use tags::*;

@@ -2,7 +2,7 @@ use super::s3service::ArunaS3Service;
 use crate::api_s3::auth::AuthProvider;
 use crate::config::config::S3Frontend;
 use crate::error::ArunaDataError;
-use crate::io::controller::Controller;
+use crate::controller::controller::Controller;
 use aruna_storage::storage::lmdb::LmdbStore;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;

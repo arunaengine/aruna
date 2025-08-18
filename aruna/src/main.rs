@@ -154,9 +154,9 @@ pub async fn main() {
         network.clone(),
         permission_manager.clone(),
         token_handler.clone(),
-        task_handler,
+        task_handler.clone(),
     );
-    let data_future = start_data(config, store, network, permission_manager, token_handler);
+    let data_future = start_data(config, store, network, permission_manager, token_handler, task_handler);
 
     let (metadata, data) = tokio::join!(metadata_future, data_future);
     metadata.unwrap();
