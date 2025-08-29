@@ -238,10 +238,17 @@ where
 
             // Create paths
             let (fp, bp) = if let Some(path) = path {
-                create_paths(path, None, group_id, false)?
+                let (bucket, key) = path
+                    .split_once("/")
+                    .map(|(b, k)| (b, Some(k)))
+                    .unwrap_or((path, None));
+                create_paths(key, bucket, group_id, false)?
             } else {
                 // Randomized path if no custom path is provided
-                (None, format!("{}/{}", group_id, Ulid::new()))
+                (
+                    Some(format!("{}/{}", group_id, root)),
+                    format!("{}/{}", group_id, Ulid::new()),
+                )
             };
 
             // Handle replication init message
@@ -355,7 +362,9 @@ where
         let frontend_bucket = extract_frontend_bucket(&frontend_path)?;
         let key = frontend_path
             .strip_prefix(&format!("{}/", group_id))
-            .ok_or_else(|| ArunaDataError::ServerError("Invalid frontend path provided".to_string()))?;
+            .ok_or_else(|| {
+                ArunaDataError::ServerError("Invalid frontend path provided".to_string())
+            })?;
         let operator = get_backend_operator(
             &self.backend.backend_type,
             self.backend.access_config.clone(),
@@ -369,7 +378,8 @@ where
         let mut writer = operator
             .writer_with(&backend_path)
             .chunk(BLOCK_SIZE.bytes())
-            .await.map_err(|e| ArunaDataError::ServerError(e.to_string()))?
+            .await
+            .map_err(|e| ArunaDataError::ServerError(e.to_string()))?
             .into_futures_async_write();
 
         // Fetch stream chunks

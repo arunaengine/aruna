@@ -1,3 +1,4 @@
+use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
 use crate::controller::controller::Controller;
 use crate::error::ArunaDataError;
@@ -5,7 +6,6 @@ use crate::io::io_handler::ObjectInfo;
 use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
 use crate::util::opendal::create_paths;
 use crate::util::s3::{Destination, ReplicationTask};
-use crate::IOHandler;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
 use futures_util::TryStreamExt;
@@ -143,9 +143,8 @@ where
         })?;
 
         // Create paths
-        let origin_path = format!("{}/{}", req.input.bucket, req.input.key);
         let (maybe_frontend_path, backend_path) =
-            create_paths(&origin_path, None, &group_id, false)
+            create_paths(Some(&req.input.key), &req.input.bucket, &group_id, false)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
         let frontend_path = maybe_frontend_path
             .ok_or_else(|| s3_error!(InternalError, "Frontend path creation failed"))?;
@@ -154,16 +153,28 @@ where
         let store_clone = self.controller.io_handler.store.clone();
         let frontend_path_clone = frontend_path.clone();
         let exists = tokio::task::spawn_blocking(move || {
-            let mut read_txn = store_clone.create_txn(false)?;
+            let read_txn = store_clone.create_txn(false)?;
 
-            // Try fetch content hash associated with frontend path
+            // Try fetch content hash associated with frontend bucket
             let res = store_clone.get(
-                &mut read_txn,
+                &read_txn,
                 PATH_LOCATION_DB_NAME,
                 frontend_path_clone.as_bytes(),
             )?;
 
-            Ok::<bool, anyhow::Error>(res.is_some())
+            let exists = res.is_some();
+
+            // Try fetch content hash associated with frontend bucket+key
+            let res = store_clone.get(
+                &read_txn,
+                PATH_LOCATION_DB_NAME,
+                frontend_path_clone.as_bytes(),
+            )?;
+
+            let exists = res.is_some();
+            store_clone.commit(read_txn)?;
+
+            Ok::<bool, anyhow::Error>(exists)
         })
         .await
         .map_err(|e| s3_error!(InternalError, "{}", e))?
@@ -227,6 +238,51 @@ where
         &self,
         req: S3Request<CreateBucketInput>,
     ) -> S3Result<S3Response<CreateBucketOutput>> {
+        debug!("Received CreateBucket Request: {:#?}", req);
+        // Extract access check result
+        let UserAccess {
+            user_id, group_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        // Create paths
+        let (maybe_frontend_path, backend_path) =
+            create_paths(None, &req.input.bucket, &group_id, false)
+                .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let frontend_path = maybe_frontend_path
+            .ok_or_else(|| s3_error!(InternalError, "Frontend path creation failed"))?;
+
+        // Check if frontend path is already occupied
+        let store_clone = self.controller.io_handler.store.clone();
+        let frontend_path_clone = frontend_path.clone();
+        let exists = tokio::task::spawn_blocking(move || {
+            let read_txn = store_clone.create_txn(false)?;
+
+            // Try fetch content hash associated with frontend path
+            let res = store_clone.get(
+                &read_txn,
+                PATH_LOCATION_DB_NAME,
+                frontend_path_clone.as_bytes(),
+            )?;
+            let exists = res.is_some();
+            store_clone.commit(read_txn)?;
+
+            Ok::<bool, anyhow::Error>(exists)
+        })
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))?
+        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        if exists {
+            return Err(s3_error!(
+                BucketAlreadyExists,
+                "Bucket {} already exists",
+                req.input.bucket
+            ));
+        }
+
         todo!("Add bucket path to permission handler");
         todo!("Add bucket mapping to database?");
     }

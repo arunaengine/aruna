@@ -12,6 +12,7 @@ pub enum MessageType {
     InitReplicationRequest {
         user_id: UserIdentity,
         group_id: Ulid,
+        // TODO: Why is this an Option?
         path: Option<String>,
         size: u64,
         root: blake3::Hash,

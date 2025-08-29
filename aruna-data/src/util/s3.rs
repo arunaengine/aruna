@@ -11,17 +11,20 @@ use std::collections::HashMap;
 pub struct ReplicationTask {
     pub target: Destination,
     pub source_bucket: String,
-    pub source_filter: Vec<Filter>,
-    pub existing_object_replication: bool,
+    pub source_filter: Vec<Filter>, // TODO: Remove filters -> Only allow bucket full-sync
+    pub existing_object_replication: bool, // Should be removed for the same reasons
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Destination {
-    pub endpoint_id: Option<String>,
+    pub endpoint_id: Option<String>, // Destination should always have the same
+    // group/bucket/content mappings, so bucket should be removed
     pub bucket: String,
+    // Key should be ignored
     pub key: Option<String>,
 }
 
+// Filters can be removed
 #[derive(Serialize, Deserialize)]
 pub enum Filter {
     Prefix(String),
@@ -56,13 +59,13 @@ const S3_KEY_PATTERN: &str =
     r#"^(?!.*[\x00-\x1F\x7F\\{}^%`\]"<>#|~])[\x20-\x7E\u0080-\uFFFF]{1,1024}$"#;
 
 lazy_static! {
-    pub static ref BUCKET_REGEX: Regex =
+    pub static ref S3_BUCKET_REGEX: Regex =
         Regex::new(S3_BUCKET_PATTERN).expect("Regex must be valid");
     pub static ref S3_KEY_REGEX: Regex = Regex::new(S3_KEY_PATTERN).expect("Regex must be valid");
 }
 
 pub fn validate_s3_bucket_name(key: &str) -> Result<bool, ArunaDataError> {
-    Ok(S3_KEY_REGEX.is_match(key)? && key.len() <= 1024)
+    Ok(S3_BUCKET_REGEX.is_match(key)? && key.len() <= 1024)
 }
 
 pub fn validate_s3_object_key(key: &str) -> Result<bool, ArunaDataError> {
@@ -134,10 +137,18 @@ impl Destination {
         let _partition = iterator.next();
         let _service = iterator.next();
         // TODO: alias for node_id
-        let region = iterator.next().map(|r| r.to_string()); // node_id
+        let region = if let Some(r) = iterator.next() {
+            if r.is_empty() {
+                None
+            } else {
+                Some(r.to_string())
+            }
+        } else {
+            None
+        }; // node_id
         let _account_id = iterator.next();
         // TODO: Should we allow keys here? aws only allows ARNs for buckets
-        let bucket = iterator.next().map(|b| b.to_string()).ok_or_else(|| {
+        let bucket_key = iterator.next().map(|b| b.to_string()).ok_or_else(|| {
             ArunaDataError::InvalidParameter {
                 name: "ARN".to_string(),
                 error: "Invalid ARN for replication task: No path specified".to_string(),
@@ -145,7 +156,12 @@ impl Destination {
         })?; // bucket
         let _version = iterator.next();
 
-        if bucket.is_empty() {
+        let (bucket, key) = match bucket_key.split_once("/") {
+            Some((bucket, key)) => (bucket.to_string(), Some(key.to_string())),
+            None => (bucket_key.to_string(), None),
+        };
+
+        if bucket.is_empty() || bucket.contains("*") {
             return Err(ArunaDataError::InvalidParameter {
                 name: "ARN".to_string(),
                 error: "Invalid ARN for replication task: Invalid bucket".to_string(),
@@ -164,7 +180,7 @@ impl Destination {
         Ok(Destination {
             endpoint_id: region,
             bucket,
-            key: todo!(),
+            key,
         })
     }
 }
@@ -218,7 +234,7 @@ mod tests {
             }
         );
         assert_eq!(
-            Destination::from_arn("arn:::node-id::my-test-bucket".to_string()).unwrap(),
+            Destination::from_arn("arn:::::my-test-bucket".to_string()).unwrap(),
             Destination {
                 endpoint_id: None,
                 bucket: "my-test-bucket".to_string(),
@@ -228,5 +244,17 @@ mod tests {
         assert!(Destination::from_arn("arn:::node-id::".to_string()).is_err(),);
         assert!(Destination::from_arn("arn:::node-id::*".to_string()).is_err(),);
         assert!(Destination::from_arn("arn:::*::bucket".to_string()).is_err(),);
+
+        assert_eq!(
+            Destination::from_arn(
+                "arn:aws:s3:my-node-id:account_id:my-test-bucket/a/test/key".to_string()
+            )
+            .unwrap(),
+            Destination {
+                endpoint_id: Some("my-node-id".to_string()),
+                bucket: "my-test-bucket".to_string(),
+                key: Some("a/test/key".to_string()),
+            }
+        );
     }
 }
