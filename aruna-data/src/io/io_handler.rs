@@ -44,7 +44,7 @@ pub mod tables {
     pub const LOCATION_DB_NAME: &str = "locations";
     pub const LOCATION_STATS_DB_NAME: &str = "location_stats";
     pub const PATH_LOCATION_DB_NAME: &str = "path_locations_mapping";
-    pub const BUCKET_MAPPINGS: &str = "bucket_mapping";
+    pub const BUCKET_STATE_DB_NAME: &str = "bucket_mapping";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,8 +56,8 @@ pub struct Hashes {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObjectInfo {
-    created_by: UserIdentity,
-    created_at: SystemTime,
+    pub created_by: UserIdentity,
+    pub created_at: SystemTime,
     pub staging: bool,
     pub compressed: bool,
     pub encrypted: bool,
@@ -67,6 +67,17 @@ pub struct ObjectInfo {
     pub storage_path: String,
     pub file_size: u64,
     pub file_hashes: Hashes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketState {
+    created_by: UserIdentity,
+    created_at: SystemTime,
+    pub name: String,
+    // TODO:
+    // - Create MerkleTree for bucket for syncing buckets
+    // pub merkle_tree: MerkleTree,
+    pub root_hash: Option<blake3::Hash>, // None if empty
 }
 
 #[derive(Clone)]
@@ -123,7 +134,7 @@ where
             .collect::<BTreeMap<String, u64>>())
     }
 
-    async fn eval_suitable_bucket(&self) -> Result<String, ArunaDataError> {
+    pub async fn eval_suitable_bucket(&self) -> Result<String, ArunaDataError> {
         if let Some((bucket, _)) = self
             .backend_stats
             .read()
@@ -297,7 +308,7 @@ where
                 .realm_id(realm_key)
                 .group_data(*group_id, backend_bucket, bp, blake3_hash)
                 .build()?;
-            self.store_location(&location, fp, Some(perm_path))?;
+            self.store_location(location, fp, Some(perm_path)).await?;
             root
         } else {
             error!("Stream did not start with init message");
@@ -419,7 +430,8 @@ where
             )
             .build()?;
 
-        self.store_location(&info, Some(frontend_path), Some(permission_path))?;
+        self.store_location(info.clone(), Some(frontend_path), Some(permission_path))
+            .await?;
 
         Ok((blake3_hash, info))
     }
@@ -496,7 +508,9 @@ where
                 file_hashes: hashes,
             };
 
-            self_clone.store_location(&location, Some(frontend_path_clone), Some(perm_path))?;
+            self_clone
+                .store_location(location, Some(frontend_path_clone), Some(perm_path))
+                .await?;
 
             // Publish hash in Kademlia
             network.store(blake3_hash).await?;
@@ -537,46 +551,51 @@ where
         Ok(())
     }
 
-    fn store_location(
+    pub async fn store_location(
         &self,
-        location: &ObjectInfo,
+        location: ObjectInfo,
         frontend_path: Option<String>,
         resource_permission: Option<Path>,
     ) -> Result<(), ArunaDataError> {
         let data_hash = location.file_hashes.blake3.clone();
-
-        // Store object info with blake3 hash as key
-        let mut write_txn = self.store.create_txn(true)?;
-        self.store.put(
-            &mut write_txn,
-            LOCATION_DB_NAME,
-            data_hash.as_bytes(),
-            &postcard::to_allocvec(location)?,
-        )?;
-
-        // Increase bucket occupancy
-        self.modify_bucket_occupancy(&location.storage_root, true, &mut write_txn)?;
-
-        // If provided store frontend path mapping
-        if let Some(path) = frontend_path {
-            self.store.put(
+        let self_clone = self.clone();
+        tokio::task::spawn_blocking(move || {
+            // Store object info with blake3 hash as key
+            let mut write_txn = self_clone.store.create_txn(true)?;
+            self_clone.store.put(
                 &mut write_txn,
-                PATH_LOCATION_DB_NAME,
-                path.as_bytes(),
+                LOCATION_DB_NAME,
                 data_hash.as_bytes(),
+                &postcard::to_allocvec(&location)?,
             )?;
-        }
 
-        // If provided store permission path
-        if let Some(path) = resource_permission {
-            self.permission_manager.add_resource(
-                ResourceId::ContentHash(data_hash),
-                &path,
-                &self.store,
-                &mut write_txn,
-            )?
-        }
-        self.store.commit(write_txn)?;
+            // Increase bucket occupancy
+            self_clone.modify_bucket_occupancy(&location.storage_root, true, &mut write_txn)?;
+
+            // If provided store frontend path mapping
+            if let Some(path) = frontend_path {
+                self_clone.store.put(
+                    &mut write_txn,
+                    PATH_LOCATION_DB_NAME,
+                    path.as_bytes(),
+                    data_hash.as_bytes(),
+                )?;
+            }
+
+            // If provided store permission path
+            if let Some(path) = resource_permission {
+                self_clone.permission_manager.add_resource(
+                    ResourceId::ContentHash(data_hash),
+                    &path,
+                    &self_clone.store,
+                    &mut write_txn,
+                )?
+            }
+            self_clone.store.commit(write_txn)?;
+            Ok::<(), ArunaDataError>(())
+        })
+        .await
+        .map_err(|e| ArunaDataError::TransactionFailure(e.to_string()))??;
 
         Ok(())
     }

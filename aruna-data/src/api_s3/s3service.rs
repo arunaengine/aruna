@@ -2,10 +2,11 @@ use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
 use crate::controller::controller::Controller;
 use crate::error::ArunaDataError;
-use crate::io::io_handler::ObjectInfo;
 use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
+use crate::io::io_handler::{Hashes, ObjectInfo};
 use crate::util::opendal::create_paths;
 use crate::util::s3::{Destination, ReplicationTask};
+use aruna_permission::paths::PathBuilder;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
 use futures_util::TryStreamExt;
@@ -15,9 +16,10 @@ use s3s::dto::{
     GetObjectInput, GetObjectOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
     PutObjectInput, PutObjectOutput, StreamingBlob,
 };
-use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
+use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::path::Path;
+use std::time::SystemTime;
 use tracing::{debug, error, warn};
 
 //TODO: Multipart --> Store parts, concatenate on finish
@@ -147,22 +149,27 @@ where
             create_paths(Some(&req.input.key), &req.input.bucket, &group_id, false)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
         let frontend_path = maybe_frontend_path
-            .ok_or_else(|| s3_error!(InternalError, "Frontend path creation failed"))?;
+            .ok_or_else(|| s3_error!(InvalidKeyPath, "Invalid path provided"))?;
 
         // Check if frontend path is already occupied
+        let (bucket_path, _) = create_paths(None, &req.input.bucket, &group_id, false)
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let bucket_path =
+            bucket_path.ok_or_else(|| s3_error!(InvalidBucketName, "Invalid bucket"))?;
         let store_clone = self.controller.io_handler.store.clone();
         let frontend_path_clone = frontend_path.clone();
         let exists = tokio::task::spawn_blocking(move || {
             let read_txn = store_clone.create_txn(false)?;
 
             // Try fetch content hash associated with frontend bucket
-            let res = store_clone.get(
-                &read_txn,
-                PATH_LOCATION_DB_NAME,
-                frontend_path_clone.as_bytes(),
-            )?;
+            let res = store_clone.get(&read_txn, PATH_LOCATION_DB_NAME, bucket_path.as_bytes())?;
 
-            let exists = res.is_some();
+            if !res.is_some() {
+                return Err(ArunaDataError::InvalidParameter {
+                    name: "bucket".to_string(),
+                    error: "Bucket does not exist".to_string(),
+                });
+            };
 
             // Try fetch content hash associated with frontend bucket+key
             let res = store_clone.get(
@@ -174,7 +181,7 @@ where
             let exists = res.is_some();
             store_clone.commit(read_txn)?;
 
-            Ok::<bool, anyhow::Error>(exists)
+            Ok::<bool, ArunaDataError>(exists)
         })
         .await
         .map_err(|e| s3_error!(InternalError, "{}", e))?
@@ -257,34 +264,84 @@ where
         // Check if frontend path is already occupied
         let store_clone = self.controller.io_handler.store.clone();
         let frontend_path_clone = frontend_path.clone();
-        let exists = tokio::task::spawn_blocking(move || {
-            let read_txn = store_clone.create_txn(false)?;
-
+        let bucket = req.input.bucket.clone();
+        tokio::task::spawn_blocking(move || {
+            let read_txn = store_clone
+                .create_txn(false)
+                .map_err(|e| s3_error!(InternalError, "{}", e))?;
             // Try fetch content hash associated with frontend path
-            let res = store_clone.get(
-                &read_txn,
-                PATH_LOCATION_DB_NAME,
-                frontend_path_clone.as_bytes(),
-            )?;
-            let exists = res.is_some();
-            store_clone.commit(read_txn)?;
+            let res = store_clone
+                .get(
+                    &read_txn,
+                    PATH_LOCATION_DB_NAME,
+                    frontend_path_clone.as_bytes(),
+                )
+                .map_err(|e| s3_error!(InternalError, "{}", e))?;
+            if res.is_some() {
+                return Err(s3_error!(
+                    BucketAlreadyExists,
+                    "Bucket {} already exists",
+                    bucket
+                ));
+            };
 
-            Ok::<bool, anyhow::Error>(exists)
+            store_clone
+                .commit(read_txn)
+                .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+            Ok::<(), S3Error>(())
         })
         .await
         .map_err(|e| s3_error!(InternalError, "{}", e))?
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
-        if exists {
-            return Err(s3_error!(
-                BucketAlreadyExists,
-                "Bucket {} already exists",
-                req.input.bucket
-            ));
-        }
+        let permission_path = PathBuilder::new()
+            .realm_id(self.controller.network.get_realm_key())
+            .group_data_bucket(group_id, req.input.bucket.clone())
+            .build()
+            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
 
-        todo!("Add bucket path to permission handler");
-        todo!("Add bucket mapping to database?");
+        let backend_bucket = self.controller.io_handler.eval_suitable_bucket().await?;
+        let info = ObjectInfo {
+            created_by: user_id,
+            created_at: SystemTime::now(),
+            staging: false,
+            compressed: false,
+            encrypted: false,
+            storage_root: backend_bucket.clone(),
+            storage_path: backend_path.clone(),
+            file_size: 0,
+            file_hashes: Hashes {
+                blake3: blake3::hash(&[0u8]),
+                sha256: String::new(),
+                md5: String::new(),
+            },
+        };
+
+        self.controller
+            .io_handler
+            .store_location(info.clone(), Some(frontend_path), Some(permission_path))
+            .await?;
+
+        let operator = self
+            .controller
+            .io_handler
+            .get_operator(&info.storage_root)
+            .await?;
+        let location = format!("{}/{}/", backend_bucket, backend_path);
+        operator
+            .create_dir(&location)
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
+
+        // todo!("Add bucket path to permission handler");
+        // todo!("Add bucket mapping to database?");
+
+        // TODO: Add location
+        let inner_response = CreateBucketOutput {
+            location: Some(location),
+        };
+        Ok(S3Response::new(inner_response))
     }
 
     #[allow(clippy::blocks_in_conditions)]
@@ -292,6 +349,12 @@ where
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        // TODO:
+        return Err(s3_error!(
+            NotImplemented,
+            "Bucket replications are not implemented"
+        ));
+
         let UserAccess { group_id, .. } =
             req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
                 error!(error = "Missing user context");
@@ -346,7 +409,11 @@ where
         &self,
         req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
-        todo!()
+        // TODO:
+        Err(s3_error!(
+            NotImplemented,
+            "Bucket replications are not implemented"
+        ))
     }
 
     #[tracing::instrument(err)]
@@ -355,6 +422,7 @@ where
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        // TODO:
         Err(s3_error!(
             NotImplemented,
             "Deleting bucket replications is not implemented"

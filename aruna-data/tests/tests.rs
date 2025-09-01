@@ -114,6 +114,15 @@ mod tests {
         .await
         .unwrap();
 
+        // Create bucket
+        let _resp = client
+            .create_bucket()
+            .bucket("some-project")
+            .send()
+            .await
+            .unwrap();
+
+        // Put object
         let body_content = "This is some dummy content";
         let body = aws_sdk_s3::primitives::ByteStream::from_static(body_content.as_bytes());
         let resp = client
@@ -199,6 +208,15 @@ mod tests {
         .unwrap();
 
         let bucket = "other-bucket";
+
+        // Create bucket
+        let _resp = client
+            .create_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap();
+
         let key = "dummy.txt";
         let content_hash = upload_data(
             &client,
