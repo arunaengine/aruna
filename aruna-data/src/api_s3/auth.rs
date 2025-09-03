@@ -72,7 +72,7 @@ where
             }
             S3Path::Object { bucket, key } => {
                 debug!("Bucket: {}, Key: {}", bucket, key);
-                let kkey = key.to_string();
+                let kkey = key.to_string(); // For real?
                 let path = std::path::Path::new(&kkey);
                 let parent = path.parent().ok_or_else(|| s3_error!(InvalidKeyPath))?;
 

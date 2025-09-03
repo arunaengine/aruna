@@ -2,8 +2,10 @@ use crate::IOHandler;
 use crate::api_s3::auth::UserAccess;
 use crate::controller::controller::Controller;
 use crate::error::ArunaDataError;
-use crate::io::io_handler::tables::{LOCATION_DB_NAME, PATH_LOCATION_DB_NAME};
-use crate::io::io_handler::{Hashes, ObjectInfo};
+use crate::io::io_handler::tables::{
+    BUCKET_STATE_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME,
+};
+use crate::io::io_handler::{BucketState, Hashes, ObjectInfo, SPECIAL_BUCKET};
 use crate::util::opendal::create_paths;
 use crate::util::s3::{Destination, ReplicationTask};
 use aruna_permission::paths::PathBuilder;
@@ -17,10 +19,13 @@ use s3s::dto::{
     PutObjectInput, PutObjectOutput, StreamingBlob,
 };
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
+use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::path::Path;
 use std::time::SystemTime;
 use tracing::{debug, error, warn};
+use ulid::Ulid;
 
 //TODO: Multipart --> Store parts, concatenate on finish
 
@@ -70,16 +75,23 @@ where
                 s3_error!(UnexpectedContent, "Missing user context")
             })?;
 
-        // Extend provided path
-        let frontend_path = format!("{}/{}/{}", group_id, req.input.bucket, req.input.key);
-
         // Fetch object info
         let store_clone = self.controller.io_handler.store.clone();
+        let bucket = format!("{}/{}", group_id, req.input.bucket);
+        let key = req.input.key;
         let info = tokio::task::spawn_blocking(move || {
             let read_txn = store_clone.create_txn(false)?;
-            let hash = store_clone
-                .get(&read_txn, PATH_LOCATION_DB_NAME, frontend_path.as_bytes())?
-                .ok_or_else(|| ArunaDataError::NotFound("No such key".to_string()))?;
+            let frontend_path = format!("{}/{}", bucket, key);
+
+            let hash = if &bucket != SPECIAL_BUCKET {
+                store_clone
+                    .get(&read_txn, PATH_LOCATION_DB_NAME, frontend_path.as_bytes())?
+                    .ok_or_else(|| ArunaDataError::NotFound("No such key".to_string()))?
+            } else {
+                Cow::from(key.as_bytes())
+            };
+
+            // Extend provided path
             let info_raw = store_clone
                 .get(&read_txn, LOCATION_DB_NAME, &hash)?
                 .ok_or_else(|| ArunaDataError::NotFound("No such key".to_string()))?;
@@ -162,7 +174,7 @@ where
             let read_txn = store_clone.create_txn(false)?;
 
             // Try fetch content hash associated with frontend bucket
-            let res = store_clone.get(&read_txn, PATH_LOCATION_DB_NAME, bucket_path.as_bytes())?;
+            let res = store_clone.get(&read_txn, BUCKET_STATE_DB_NAME, bucket_path.as_bytes())?;
 
             if !res.is_some() {
                 return Err(ArunaDataError::InvalidParameter {
@@ -262,18 +274,30 @@ where
             .ok_or_else(|| s3_error!(InternalError, "Frontend path creation failed"))?;
 
         // Check if frontend path is already occupied
-        let store_clone = self.controller.io_handler.store.clone();
+        let self_clone = self.controller.clone();
         let frontend_path_clone = frontend_path.clone();
+        let backend_bucket = self
+            .controller
+            .io_handler
+            .eval_suitable_bucket()
+            .await?
+            .clone();
+        let backend_bucket_clone = backend_bucket.clone();
+        let backend_path_clone = backend_path.clone();
         let bucket = req.input.bucket.clone();
         tokio::task::spawn_blocking(move || {
-            let read_txn = store_clone
-                .create_txn(false)
+            let mut write_txn = self_clone
+                .io_handler
+                .store
+                .create_txn(true)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
             // Try fetch content hash associated with frontend path
-            let res = store_clone
+            let res = self_clone
+                .io_handler
+                .store
                 .get(
-                    &read_txn,
-                    PATH_LOCATION_DB_NAME,
+                    &write_txn,
+                    BUCKET_STATE_DB_NAME,
                     frontend_path_clone.as_bytes(),
                 )
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
@@ -285,8 +309,40 @@ where
                 ));
             };
 
-            store_clone
-                .commit(read_txn)
+            let permission_path = PathBuilder::new()
+                .realm_id(self_clone.network.get_realm_key())
+                .group_data_bucket(group_id, req.input.bucket.clone())
+                .build()
+                .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
+
+            // TODO: This currently just randomly creates folders in s3
+            // - [ ] Only create backend folder if one bucket config is set or
+            //       only create dir when used with filesystem backend
+            let info = BucketState {
+                created_by: user_id,
+                created_at: SystemTime::now(),
+                id: Ulid::new(),
+                name: req.input.bucket,
+                merkle_tree: BTreeSet::new(),
+                root_hash: None,
+                backend_bucket: Some(backend_bucket_clone.clone()),
+                backend_path: Some(backend_path_clone.clone()),
+            };
+
+            self_clone.io_handler.store_bucket(
+                info.clone(),
+                frontend_path,
+                permission_path,
+                &mut write_txn,
+            )?;
+
+            // todo!("Add bucket path to permission handler");
+            // todo!("Add bucket mapping to database?");
+
+            self_clone
+                .io_handler
+                .store
+                .commit(write_txn)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
             Ok::<(), S3Error>(())
@@ -295,38 +351,10 @@ where
         .map_err(|e| s3_error!(InternalError, "{}", e))?
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
-        let permission_path = PathBuilder::new()
-            .realm_id(self.controller.network.get_realm_key())
-            .group_data_bucket(group_id, req.input.bucket.clone())
-            .build()
-            .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
-
-        let backend_bucket = self.controller.io_handler.eval_suitable_bucket().await?;
-        let info = ObjectInfo {
-            created_by: user_id,
-            created_at: SystemTime::now(),
-            staging: false,
-            compressed: false,
-            encrypted: false,
-            storage_root: backend_bucket.clone(),
-            storage_path: backend_path.clone(),
-            file_size: 0,
-            file_hashes: Hashes {
-                blake3: blake3::hash(&[0u8]),
-                sha256: String::new(),
-                md5: String::new(),
-            },
-        };
-
-        self.controller
-            .io_handler
-            .store_location(info.clone(), Some(frontend_path), Some(permission_path))
-            .await?;
-
         let operator = self
             .controller
             .io_handler
-            .get_operator(&info.storage_root)
+            .get_operator(&backend_bucket)
             .await?;
         let location = format!("{}/{}/", backend_bucket, backend_path);
         operator
@@ -334,11 +362,9 @@ where
             .await
             .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
 
-        // todo!("Add bucket path to permission handler");
-        // todo!("Add bucket mapping to database?");
-
-        // TODO: Add location
         let inner_response = CreateBucketOutput {
+            // TODO:
+            // - [] Location should be ignored when multi bucket config is set
             location: Some(location),
         };
         Ok(S3Response::new(inner_response))

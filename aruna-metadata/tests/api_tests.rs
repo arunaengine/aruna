@@ -77,6 +77,7 @@ mod api_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_group_creation() {
+        // TODO: Fix group sync issue
         // Init
         let TestServers {
             addr_server_pairs: ref servers,

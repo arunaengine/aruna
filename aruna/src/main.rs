@@ -1,4 +1,4 @@
-use aruna_data::{ACCESS_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME};
+use aruna_data::{BUCKET_LOCATION_DB_NAME, BUCKET_STATE_DB_NAME, ACCESS_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME};
 use aruna_metadata::{
     error::ArunaMetadataError,
     network::{
@@ -91,6 +91,8 @@ pub async fn main() {
         LOCATION_DB_NAME,
         LOCATION_STATS_DB_NAME,
         PATH_LOCATION_DB_NAME,
+        BUCKET_STATE_DB_NAME,
+        BUCKET_LOCATION_DB_NAME,
         aruna_task::TASK_DB_NAME,
         aruna_permission::DBNAME,
         aruna_permission::RESOURCE_DB,

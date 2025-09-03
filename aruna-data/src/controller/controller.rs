@@ -6,12 +6,13 @@ use crate::network::network_handler::NetworkHandler;
 use crate::util::bao_tree::{FuturesAsyncReaderWrapper, SendStreamWrapper};
 use crate::util::opendal::get_data_async_reader;
 use crate::{IOHandler, error::ArunaDataError};
+use aruna_permission::Path;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
-use aruna_task::task_trait::TaskExecutor;
 use aruna_task::Task;
 use aruna_task::TaskHandler;
 use aruna_task::error::ArunaTaskError;
+use aruna_task::task_trait::TaskExecutor;
 use bao_tree::ByteRanges;
 use bao_tree::io::fsm::{CreateOutboard, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
@@ -128,7 +129,9 @@ where
         group_id: Ulid,
         replication_id: Ulid,
         replication_node: NodeAddr,
-        replication_path: Option<String>,
+        bucket: String,
+        key: Option<String>,
+        permission_path: Path,
         object_info: &ObjectInfo,
     ) -> Result<(), ArunaDataError> {
         // Create backend storage operator
@@ -161,7 +164,9 @@ where
             msg_type: MessageType::InitReplicationRequest {
                 user_id,
                 group_id,
-                path: replication_path,
+                bucket,
+                key,
+                permission_path,
                 size: object_info.file_size,
                 root: outboard.root,
             },
@@ -201,8 +206,10 @@ where
 {
     #[tracing::instrument(level = "trace", skip(self, task))]
     async fn execute(&self, task: Task) -> Result<(), ArunaTaskError> {
-        todo!();
-        Ok(())
+        return Err(ArunaTaskError::ExecutionError(
+            "Task execution is not implemented yet".to_string(),
+        ));
+        // TODO
         // trace!("Execution metadata task");
         // let res: TaskPayload = postcard::from_bytes(&task.payload).map_err(logerr!())?;
 

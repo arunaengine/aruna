@@ -1,4 +1,4 @@
-use aruna_permission::UserIdentity;
+use aruna_permission::{Path, UserIdentity};
 use iroh::NodeAddr;
 use iroh::endpoint::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
@@ -12,8 +12,9 @@ pub enum MessageType {
     InitReplicationRequest {
         user_id: UserIdentity,
         group_id: Ulid,
-        // TODO: Why is this an Option?
-        path: Option<String>,
+        bucket: String,
+        permission_path: Path,
+        key: Option<String>,
         size: u64,
         root: blake3::Hash,
     },

@@ -294,7 +294,7 @@ pub struct Group {
     #[autosurgeon(with = "autosurgeon_bytes")]
     pub realm_key: [u8; 32],
     pub name: String,
-    pub roles: Vec<String>,
+    pub roles: Vec<String>, // Must contain role paths + permissions
     pub members: BTreeMap<String, Vec<String>>, // UserIndentity to role mappings
 }
 

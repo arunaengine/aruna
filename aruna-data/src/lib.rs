@@ -11,6 +11,6 @@ pub mod controller;
 pub const ARUNA_NET_ALPN: &[u8] = b"aruna-net/0.1.0";
 
 pub use crate::io::io_handler::tables::{
-    ACCESS_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME,
+    ACCESS_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME, BUCKET_LOCATION_DB_NAME, BUCKET_STATE_DB_NAME
 };
 pub use io::io_handler::IOHandler;

@@ -210,12 +210,7 @@ mod tests {
         let bucket = "other-bucket";
 
         // Create bucket
-        let _resp = client
-            .create_bucket()
-            .bucket(bucket)
-            .send()
-            .await
-            .unwrap();
+        let _resp = client.create_bucket().bucket(bucket).send().await.unwrap();
 
         let key = "dummy.txt";
         let content_hash = upload_data(
@@ -267,11 +262,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_replicate_object() {}
+    async fn test_replicate_object() {
+        // TODO
+    }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_register_data() {}
+    async fn test_register_data() {
+        // TODO
+    }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_location_stats() {}
+    async fn test_location_stats() {
+        // TODO
+    }
 }
