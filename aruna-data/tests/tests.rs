@@ -8,7 +8,12 @@ mod tests {
     };
     use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
     use aruna_data::util::s3::create_s3_client;
+    use aws_sdk_s3::types::{
+        Destination, ReplicationConfiguration, ReplicationRule, ReplicationStatus,
+    };
     use blake3::Hasher;
+    use iroh::node_info;
+    use s3s::dto::ReplicationRuleStatus;
     use ulid::Ulid;
 
     const OFFSET: u16 = 0;
@@ -263,7 +268,126 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_replicate_object() {
-        // TODO
+        // Initialize multiple nodes with a user
+        let test_nodes = init_test_nodes(2, OFFSET + 30, vec![]).await.unwrap();
+        let node = test_nodes.node_services.first().unwrap();
+        let node_controller = node.openapi_data_endpoint.0.clone();
+
+        //TODO: Put object to specific node
+        // Register dummy user and create token
+        let group_id = Ulid::new();
+        let (_, _, creds) = register_user_with_group_and_credentials(
+            "Horst",
+            group_id,
+            test_nodes.realm_key.to_bytes(),
+            &node_controller.io_handler.store,
+            node_controller.io_handler.token_handler.clone(),
+            node_controller.io_handler.permission_manager.clone(),
+            node_controller.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Create S3 client and upload some data
+        let client = create_s3_client(
+            &format!("http://{}", node.s3_endpoint),
+            None,
+            &creds.access_key_id.to_string(),
+            &creds.secret_access_key,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let bucket = "other-bucket";
+
+        // Create bucket
+        let _resp = client.create_bucket().bucket(bucket).send().await.unwrap();
+
+        let key = "dummy.txt";
+        let content_hash = upload_data(
+            &client,
+            "other-bucket",
+            "dummy.txt",
+            "Some other content".as_bytes(),
+        )
+        .await
+        .unwrap();
+
+        // Create S3 client and upload some data
+        let other_node = test_nodes.node_services.last().unwrap();
+        let other_node_controller = node.openapi_data_endpoint.0.clone();
+        let node_id = other_node_controller
+            .network
+            .get_node_addr()
+            .node_id
+            .to_string();
+
+        let _resp = client
+            .put_bucket_replication()
+            .bucket(bucket)
+            .replication_configuration(
+                ReplicationConfiguration::builder()
+                    .role(String::new())
+                    .rules(
+                        ReplicationRule::builder()
+                            .id("MyNewReplicationRule".to_string())
+                            .destination(
+                                Destination::builder()
+                                    .bucket(format!("arn:aws:s3:{}:account_id:{}", node_id, bucket))
+                                    .build()
+                                    .unwrap(),
+                            )
+                            .status(aws_sdk_s3::types::ReplicationRuleStatus::Enabled)
+                            .build()
+                            .unwrap(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let (_, _, creds) = register_user_with_group_and_credentials(
+            "Horst",
+            group_id,
+            test_nodes.realm_key.to_bytes(),
+            &other_node_controller.io_handler.store,
+            other_node_controller.io_handler.token_handler.clone(),
+            other_node_controller.io_handler.permission_manager.clone(),
+            other_node_controller.clone(),
+        )
+        .await
+        .unwrap();
+
+        let other_client = create_s3_client(
+            &format!("http://{}", other_node.s3_endpoint),
+            None,
+            &creds.access_key_id.to_string(),
+            &creds.secret_access_key,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let mut response = other_client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let mut content = vec![];
+        let mut hasher = Hasher::new();
+        while let Some(bytes) = response.body.try_next().await.unwrap() {
+            hasher.update(bytes.as_ref());
+            content.extend_from_slice(bytes.as_ref());
+        }
+        let hash = hasher.finalize();
+        assert_eq!(String::from_utf8(content).unwrap(), "Some other content");
+        assert_eq!(content_hash, hash.to_string());
     }
 
     #[tokio::test(flavor = "multi_thread")]

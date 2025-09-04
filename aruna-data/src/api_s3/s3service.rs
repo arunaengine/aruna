@@ -5,9 +5,9 @@ use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::{
     BUCKET_STATE_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME,
 };
-use crate::io::io_handler::{BucketState, Hashes, ObjectInfo, SPECIAL_BUCKET};
+use crate::io::io_handler::{BucketState, ObjectInfo, SPECIAL_BUCKET};
 use crate::util::opendal::create_paths;
-use crate::util::s3::{Destination, ReplicationTask};
+use crate::util::s3::{Destination, ReplicationRule};
 use aruna_permission::paths::PathBuilder;
 use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
@@ -375,31 +375,77 @@ where
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        // TODO:
-        return Err(s3_error!(
-            NotImplemented,
-            "Bucket replications are not implemented"
-        ));
+        let UserAccess {
+            group_id, user_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
 
-        let UserAccess { group_id, .. } =
-            req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
-                error!(error = "Missing user context");
-                s3_error!(UnexpectedContent, "Missing user context")
-            })?;
+        // Check if bucket exists
+        let (bucket_path, _) = create_paths(None, &req.input.bucket, &group_id, false)
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let bucket_path =
+            bucket_path.ok_or_else(|| s3_error!(InvalidBucketName, "Invalid bucket"))?;
+        let store_clone = self.controller.io_handler.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let read_txn = store_clone.create_txn(false)?;
+
+            // Try fetch content hash associated with frontend bucket
+            let res = store_clone.get(&read_txn, BUCKET_STATE_DB_NAME, bucket_path.as_bytes())?;
+
+            if !res.is_some() {
+                return Err(ArunaDataError::InvalidParameter {
+                    name: "bucket".to_string(),
+                    error: "Bucket does not exist".to_string(),
+                });
+            };
+
+            store_clone.commit(read_txn)?;
+
+            Ok::<(), ArunaDataError>(())
+        })
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))?
+        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        // Parse policies and rules
         let replication_policy = req.input.replication_configuration;
+
+        // TODO:
+        // - [ ] Start replication task for each rule
         for rule in replication_policy.rules {
             let distribution_strategy = aruna_task::DistributionStrategy::LimitedRealm(2);
             let retry_strategy = aruna_task::RetryStrategy::Forever;
             let destination = Destination::from_arn(rule.destination.bucket)?;
+            let target_node = if let Some(endpoint_id) = &destination.endpoint_id {
+                let nodes = self.controller.network.get_realm_nodes().await?;
+                nodes
+                    .into_iter()
+                    .find(|nodes| &nodes.node_id.to_string() == endpoint_id)
+                    .ok_or_else(|| {
+                        s3_error!(
+                            EndpointNotFound,
+                            "Endpoint with id {} not found",
+                            endpoint_id
+                        )
+                    })?
+            } else {
+                return Err(s3_error!(
+                    NotImplemented,
+                    "Same node replication is not implemented"
+                ));
+            };
 
-            let bucket_path = format!("{}/{}", group_id, req.input.bucket);
-
-            todo!("Check if path/bucket exists?");
-
-            let replication_task = ReplicationTask {
-                source_bucket: todo!("Only bucket replication"),
-                source_filter: todo!("skip filters for now"),
-                target: todo!(),
+            let replication_rule = ReplicationRule {
+                user_id: user_id.clone(),
+                group_id,
+                source_bucket: req.input.bucket.clone(),
+                source_filter: match rule.filter {
+                    Some(r) => Some(r.try_into()?),
+                    None => None,
+                },
+                target: destination,
                 existing_object_replication: rule
                     .existing_object_replication
                     .map(|status| match status.status.as_str() {
@@ -409,24 +455,39 @@ where
                     })
                     .unwrap_or(false),
             };
-            let payload = postcard::to_allocvec(&replication_task).unwrap();
-            self.controller
-                .task_handler
-                .register_task(
-                    distribution_strategy,
-                    retry_strategy,
-                    todo!("self.executor_idx"),
-                    payload,
-                    None,
+
+            let replication_tasks = self
+                .controller
+                .io_handler
+                .store_replication_rule(
+                    target_node,
+                    self.controller.network.get_realm_key(),
+                    replication_rule,
                 )
-                .await
-                .map_err(|e| {
-                    error!("{e}");
-                    s3_error!(InternalError, "Could not register replication task")
-                })?;
-            //self.controller.task_handler.register_task(rule);
+                .await?;
+
+            // Register each object individually
+            for task in &replication_tasks {
+                let payload = postcard::to_allocvec(task).unwrap();
+                let executor_idx = 5;
+                self.controller
+                    .task_handler
+                    .register_task(
+                        distribution_strategy.clone(),
+                        retry_strategy.clone(),
+                        executor_idx,
+                        payload,
+                        None,
+                    )
+                    .await
+                    .map_err(|e| {
+                        error!("{e}");
+                        s3_error!(InternalError, "Could not register replication task")
+                    })?;
+            }
         }
-        todo!()
+
+        Ok(S3Response::new(PutBucketReplicationOutput {}))
     }
 
     #[tracing::instrument(err)]

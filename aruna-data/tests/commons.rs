@@ -67,6 +67,7 @@ pub async fn init_test_nodes(
         aruna_data::PATH_LOCATION_DB_NAME,
         aruna_data::BUCKET_STATE_DB_NAME,
         aruna_data::BUCKET_LOCATION_DB_NAME,
+        aruna_data::REPLICATION_RULES_DB_NAME,
     ];
 
     for idx in 0..num {

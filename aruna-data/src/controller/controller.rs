@@ -1,12 +1,11 @@
 use crate::api_json::request::Request;
 use crate::io::io_handler::BLOCK_SIZE;
-use crate::io::io_handler::ObjectInfo;
 use crate::io::messages::{MessageType, ReplicationMessage};
 use crate::network::network_handler::NetworkHandler;
 use crate::util::bao_tree::{FuturesAsyncReaderWrapper, SendStreamWrapper};
 use crate::util::opendal::get_data_async_reader;
+use crate::util::s3::ReplicationTask;
 use crate::{IOHandler, error::ArunaDataError};
-use aruna_permission::Path;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use aruna_task::Task;
@@ -18,10 +17,8 @@ use bao_tree::io::fsm::{CreateOutboard, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bytes::BytesMut;
-use iroh::NodeAddr;
 use std::sync::Arc;
 use tracing::{debug, error, trace};
-use ulid::Ulid;
 
 #[derive(Clone)]
 pub struct Controller<St>
@@ -91,7 +88,6 @@ where
                             async move {
                                 if let Err(e) = io_handler.handle_incoming_p2p_stream(
                                     inc_stream,
-                                    network.get_realm_key(),
                                     network.get_node_addr(),
 
                                 ).await{
@@ -125,14 +121,14 @@ where
 
     pub async fn bao_tree_replicate(
         &self,
-        user_id: UserIdentity,
-        group_id: Ulid,
-        replication_id: Ulid,
-        replication_node: NodeAddr,
-        bucket: String,
-        key: Option<String>,
-        permission_path: Path,
-        object_info: &ObjectInfo,
+        ReplicationTask {
+            user_id,
+            group_id,
+            replication_id,
+            replication_node,
+            permission_path,
+            object_info,
+        }: ReplicationTask,
     ) -> Result<(), ArunaDataError> {
         // Create backend storage operator
         let operator = self
@@ -164,11 +160,12 @@ where
             msg_type: MessageType::InitReplicationRequest {
                 user_id,
                 group_id,
-                bucket,
-                key,
                 permission_path,
                 size: object_info.file_size,
                 root: outboard.root,
+                bucket: object_info.bucket,
+                key: object_info.key,
+                partial: object_info.partial,
             },
         };
         init_request.send(&mut sx).await?;
@@ -206,40 +203,14 @@ where
 {
     #[tracing::instrument(level = "trace", skip(self, task))]
     async fn execute(&self, task: Task) -> Result<(), ArunaTaskError> {
-        return Err(ArunaTaskError::ExecutionError(
-            "Task execution is not implemented yet".to_string(),
-        ));
-        // TODO
-        // trace!("Execution metadata task");
-        // let res: TaskPayload = postcard::from_bytes(&task.payload).map_err(logerr!())?;
+        trace!("Execution metadata task");
+        let task: ReplicationTask = postcard::from_bytes(&task.payload)?;
 
-        // match res {
-        //     TaskPayload::Sync {
-        //         doc,
-        //         subject_hash,
-        //         doc_id,
-        //         path,
-        //         nodes,
-        //     } => {
-        //         let doc: TypedDoc = doc.try_into().map_err(|err: ArunaMetadataError| {
-        //             error!("{err}");
-        //             ArunaTaskError::ExecutionError(err.to_string())
-        //         })?;
-        //         for x in self
-        //             .distribute_sync(doc, subject_hash, doc_id, path, nodes.into_iter())
-        //             .await
-        //             .join_all()
-        //             .await
-        //         {
-        //             x.map_err(|err| {
-        //                 error!("{err}");
-        //                 ArunaTaskError::ExecutionError(err.to_string())
-        //             })?;
-        //         }
-        //     }
-        // }
+        self.bao_tree_replicate(task)
+            .await
+            .map_err(|e| ArunaTaskError::ExecutionError(e.to_string()))?;
 
-        // Ok(())
+        Ok(())
     }
     fn clone_box(&self) -> Box<dyn TaskExecutor + 'static> {
         Box::new(self.clone())
