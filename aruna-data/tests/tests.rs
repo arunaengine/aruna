@@ -2,6 +2,8 @@ pub mod commons;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::commons::{
         fetch_user_token, init_test_nodes, register_oidc_user,
         register_user_with_group_and_credentials, upload_data,
@@ -12,8 +14,11 @@ mod tests {
         Destination, ReplicationConfiguration, ReplicationRule, ReplicationStatus,
     };
     use blake3::Hasher;
-    use iroh::node_info;
+    use iroh::{NodeAddr, node_info};
     use s3s::dto::ReplicationRuleStatus;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::{EnvFilter, Layer};
     use ulid::Ulid;
 
     const OFFSET: u16 = 0;
@@ -90,7 +95,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_put_object() {
-        let test_nodes = init_test_nodes(1, OFFSET + 10, vec![]).await.unwrap();
+        let test_nodes = init_test_nodes(1, OFFSET, vec![]).await.unwrap();
         let node = test_nodes.node_services.first().unwrap();
         let node_controller = node.openapi_data_endpoint.0.clone();
 
@@ -182,7 +187,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_get_object() {
         // Initialize multiple nodes with a user
-        let test_nodes = init_test_nodes(2, OFFSET + 20, vec![]).await.unwrap();
+        let test_nodes = init_test_nodes(2, OFFSET, vec![]).await.unwrap();
         let node = test_nodes.node_services.first().unwrap();
         let node_controller = node.openapi_data_endpoint.0.clone();
 
@@ -268,9 +273,21 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_replicate_object() {
+        let logging_env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or("none".into())
+            .add_directive("aruna_data=trace".parse().unwrap())
+            .add_directive("aruna_task=trace".parse().unwrap());
+
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_file(true)
+            .with_line_number(true)
+            .with_filter(logging_env_filter);
+
+        tracing_subscriber::registry().with(fmt_layer).init();
+
         // Initialize multiple nodes with a user
-        let test_nodes = init_test_nodes(2, OFFSET + 30, vec![]).await.unwrap();
-        let node = test_nodes.node_services.first().unwrap();
+        let mut test_nodes = init_test_nodes(2, OFFSET, vec![]).await.unwrap();
+        let node = test_nodes.node_services.pop().unwrap();
         let node_controller = node.openapi_data_endpoint.0.clone();
 
         //TODO: Put object to specific node
@@ -299,7 +316,7 @@ mod tests {
         .await
         .unwrap();
 
-        let bucket = "other-bucket";
+        let bucket = "replication-bucket";
 
         // Create bucket
         let _resp = client.create_bucket().bucket(bucket).send().await.unwrap();
@@ -307,7 +324,7 @@ mod tests {
         let key = "dummy.txt";
         let content_hash = upload_data(
             &client,
-            "other-bucket",
+            bucket,
             "dummy.txt",
             "Some other content".as_bytes(),
         )
@@ -315,8 +332,13 @@ mod tests {
         .unwrap();
 
         // Create S3 client and upload some data
-        let other_node = test_nodes.node_services.last().unwrap();
-        let other_node_controller = node.openapi_data_endpoint.0.clone();
+        let other_node = test_nodes.node_services.pop().unwrap();
+        assert_ne!(
+            other_node.openapi_data_endpoint.0.network.get_node_addr(),
+            node.openapi_data_endpoint.0.network.get_node_addr()
+        );
+
+        let other_node_controller = other_node.openapi_data_endpoint.0.clone();
         let node_id = other_node_controller
             .network
             .get_node_addr()
@@ -370,6 +392,8 @@ mod tests {
         )
         .await
         .unwrap();
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
 
         let mut response = other_client
             .get_object()

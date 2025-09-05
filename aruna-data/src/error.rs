@@ -2,7 +2,10 @@ use std::{array::TryFromSliceError, num::ParseIntError, str::ParseBoolError};
 
 use axum::Json;
 use axum::http::StatusCode;
-use iroh::{endpoint::{ReadExactError, WriteError}, KeyParsingError};
+use iroh::{
+    KeyParsingError,
+    endpoint::{ReadExactError, WriteError},
+};
 use s3s::{S3Error, s3_error};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -14,6 +17,7 @@ macro_rules! logerr {
     () => {
         |e| {
             tracing::error!("Error: {:?}", e);
+            e
         }
     };
 }
@@ -156,7 +160,6 @@ impl From<ParseBoolError> for ArunaDataError {
         }
     }
 }
-
 
 impl From<ulid::DecodeError> for ArunaDataError {
     fn from(e: ulid::DecodeError) -> Self {

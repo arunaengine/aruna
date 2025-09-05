@@ -1,8 +1,8 @@
 use super::s3service::ArunaS3Service;
 use crate::api_s3::auth::AuthProvider;
 use crate::config::config::S3Frontend;
-use crate::error::ArunaDataError;
 use crate::controller::controller::Controller;
+use crate::error::ArunaDataError;
 use aruna_storage::storage::lmdb::LmdbStore;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -108,7 +108,7 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
 
     #[tracing::instrument(level = "trace", skip(self, req))]
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
-        debug!("Received request: {:#?}", req);
+        //debug!("Received request: {:#?}", req);
 
         // Catch OPTIONS requests
         if req.method() == Method::OPTIONS {

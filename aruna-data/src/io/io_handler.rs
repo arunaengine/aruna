@@ -1,4 +1,3 @@
-use crate::REPLICATION_RULES_DB_NAME;
 use crate::config::config::BackendConfig;
 use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::{
@@ -12,6 +11,7 @@ use crate::util::opendal::{
     Backend, create_paths, get_backend_operator, get_data_stream, get_reader,
 };
 use crate::util::s3::{ReplicationRule, ReplicationTask, make_bucket};
+use crate::{REPLICATION_RULES_DB_NAME, logerr};
 use aruna_net::actor_handle::ReceiveStreams;
 use aruna_permission::manager::PermissionManager;
 use aruna_permission::paths::{Path, PathBuilder, RealmKey};
@@ -32,9 +32,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::ops::Range;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use ulid::Ulid;
 
 pub const REPLICATION_PROTOCOL_ID: u32 = 2;
@@ -229,6 +230,7 @@ where
     }
 
     //Note: Currently P2P streams are only used by replication
+    #[tracing::instrument(level = "trace", skip(self, _sender, send_stream, recv_stream))]
     pub async fn handle_incoming_p2p_stream(
         &self,
         ReceiveStreams {
@@ -237,7 +239,9 @@ where
             mut recv_stream,
         }: ReceiveStreams,
         self_addr: NodeAddr,
+        realm_key: RealmKey,
     ) -> Result<blake3::Hash, StdError> {
+        trace!("Handle Replication @ {}", self_addr.node_id);
         // Read init message
         let message = ReplicationMessage::read(&mut recv_stream).await?;
         let hash = if let MessageType::InitReplicationRequest {
@@ -260,12 +264,61 @@ where
             )
             .await?;
 
+            let bucket_name = extract_frontend_bucket(bucket)?;
+            if !partial {
+                let self_clone = self.clone();
+                let bucket_clone = bucket.clone();
+                let bucket_name_clone = bucket_name.clone();
+                let user_id_clone = user_id.clone();
+                let backend_bucket_clone = backend_bucket.clone();
+
+                let (bucket_path, backend_path) =
+                    create_paths(None, &bucket_name, &group_id, false)?;
+                let bucket_path = bucket_path.ok_or_else(|| {
+                    ArunaDataError::ServerError("No bucket frontend path set".to_string())
+                })?;
+                let permission = PathBuilder::new()
+                    .realm_id(realm_key)
+                    .group_data_bucket(*group_id, bucket_name.clone())
+                    .build()?;
+                tokio::task::spawn_blocking(move || {
+                    let mut wtxn = self_clone.store.create_txn(true)?;
+
+                    // Try fetch content hash associated with frontend bucket
+                    let res = self_clone.store.get(
+                        &wtxn,
+                        BUCKET_STATE_DB_NAME,
+                        bucket_clone.as_bytes(),
+                    )?;
+
+                    if let None = res {
+                        let state = BucketState {
+                            created_by: user_id_clone,
+                            created_at: SystemTime::now(),
+                            id: Ulid::new(),
+                            name: bucket_name_clone,
+                            merkle_tree: BTreeSet::new(),
+                            root_hash: None,
+                            backend_bucket: Some(backend_bucket_clone.clone()),
+                            backend_path: Some(backend_path.clone()),
+                        };
+                        self_clone.store_bucket(state, bucket_path, permission, &mut wtxn)?;
+                    };
+
+                    self_clone.store.commit(wtxn)?;
+
+                    Ok::<(), ArunaDataError>(())
+                })
+                .await??;
+            }
+
             // Create paths
-            let (frontend_path, backend_path) = create_paths(Some(key), bucket, group_id, false)?;
+            let (frontend_path, backend_path) =
+                create_paths(Some(key), &bucket_name, group_id, false)?;
 
             // Handle replication init message
             let response = self
-                .handle_replication_init(&operator, message.id, &backend_path, self_addr)
+                .handle_replication_init(&operator, message.id, &backend_path, self_addr.clone())
                 .await?;
             response.send(&mut send_stream).await?;
 
@@ -312,21 +365,26 @@ where
             };
             let self_clone = self.clone();
             let (bucket, path) = (bucket.clone(), permission_path.clone());
-            tokio::task::spawn_blocking(|| {
-                let self_clone = self_clone;
-                let mut wtxn = self_clone.store.create_txn(true)?;
+            let current_span = tracing::Span::current();
+            let self_addr_clone = self_addr.node_id.clone();
+            tokio::task::spawn_blocking(move || {
+                current_span.in_scope(|| {
+                    trace!("Store replicated object @ {}", self_addr_clone);
+                    let self_clone = self_clone;
+                    let mut wtxn = self_clone.store.create_txn(true)?;
 
-                self_clone.store_location(
-                    location,
-                    bucket,
-                    frontend_path,
-                    Some(path),
-                    &mut wtxn,
-                )?;
+                    self_clone.store_location(
+                        location,
+                        bucket,
+                        frontend_path,
+                        Some(path),
+                        &mut wtxn,
+                    )?;
 
-                self_clone.store.commit(wtxn)?;
+                    self_clone.store.commit(wtxn)?;
 
-                Ok::<(), ArunaDataError>(())
+                    Ok::<(), ArunaDataError>(())
+                })
             })
             .await??;
 
@@ -529,15 +587,10 @@ where
             let key_clone = match key {
                 Some(ref key) => key.clone(),
                 None => backend_path_clone.clone(),
-            }; 
+            };
             let perm_path = PathBuilder::new()
                 .realm_id(network.get_realm_key())
-                .group_data(
-                    group,
-                    bucket.clone(),
-                    key_clone.clone(),
-                    blake3_hash,
-                )
+                .group_data(group, bucket.clone(), key_clone.clone(), blake3_hash)
                 .build()?;
 
             let self_clone = self_clone.clone();
@@ -655,7 +708,7 @@ where
         write_txn: &'b mut <St as Store<'a>>::Txn,
     ) -> Result<(), ArunaDataError> {
         // Store object info with blake3 hash as key
-        println!("Create bucket {}", bucket_path);
+        trace!("Create bucket {}", bucket_path);
         self.store.put(
             write_txn,
             BUCKET_STATE_DB_NAME,
@@ -681,15 +734,13 @@ where
         resource_permission: Option<Path>,
         write_txn: &'b mut <St as Store<'a>>::Txn,
     ) -> Result<(), ArunaDataError> {
-        println!("Store location");
         let data_hash = location.file_hashes.blake3.clone();
 
-        println!("Frontend bucket {}", frontend_bucket);
+        // Update bucket
         let bucket = self
             .store
             .get(&write_txn, BUCKET_STATE_DB_NAME, frontend_bucket.as_bytes())?
             .ok_or_else(|| ArunaDataError::NotFound("Bucket not found".to_string()))?;
-        println!("Here");
         let mut bucket: BucketState = postcard::from_bytes(&bucket)?;
         bucket.merkle_tree.insert(data_hash.to_string());
         bucket.root_hash = Some(blake3::hash(
@@ -706,10 +757,6 @@ where
                 })?
                 .as_bytes(),
         ));
-
-        println!("There");
-
-        println!("Store location1");
         self.store.put(
             write_txn,
             BUCKET_STATE_DB_NAME,
@@ -717,7 +764,8 @@ where
             &postcard::to_allocvec(&bucket)?,
         )?;
 
-        println!("Store location2");
+        // Create location
+        trace!("Storing object with hash {}", data_hash);
         self.store.put(
             write_txn,
             LOCATION_DB_NAME,
@@ -725,28 +773,23 @@ where
             &postcard::to_allocvec(&location)?,
         )?;
 
-        println!("Store location3");
         // Increase bucket occupancy
         self.modify_bucket_occupancy(&location.storage_root, true, write_txn)?;
 
-        println!("Store location4");
         // If provided store frontend path mapping
         if let Some(path) = frontend_path {
-            println!("Writing path {}", path);
+            trace!("Writing path {}", path);
             self.store.put(
                 write_txn,
                 PATH_LOCATION_DB_NAME,
                 path.as_bytes(),
                 data_hash.as_bytes(),
             )?;
-        } else {
-            println!("No path");
         }
 
-        println!("Store location5");
         // If provided store permission path
         if let Some(path) = resource_permission {
-            println!("Writing perm {}", path);
+            trace!("Writing perm {}", path);
             self.permission_manager.add_resource(
                 ResourceId::ContentHash(data_hash),
                 &path,
@@ -776,69 +819,92 @@ where
     ) -> Result<Vec<ReplicationTask>, ArunaDataError> {
         let self_clone = self.clone();
         let rule_clone = rule.clone();
+
+        let current_span = tracing::Span::current();
         let tasks: Vec<ReplicationTask> = tokio::task::spawn_blocking(move || {
-            let mut wtxn = self_clone.store.create_txn(true)?;
-            let ReplicationRule {
-                user_id,
-                group_id,
-                source_bucket,
-                source_filter,
-                ..
-            } = rule;
+            current_span.in_scope(|| {
+                let mut wtxn = self_clone.store.create_txn(true).map_err(logerr!())?;
+                let ReplicationRule {
+                    user_id,
+                    group_id,
+                    source_bucket,
+                    source_filter,
+                    ..
+                } = rule;
 
-            let bucket_state = self_clone
-                .store
-                .get(&wtxn, BUCKET_STATE_DB_NAME, source_bucket.as_bytes())?
-                .ok_or_else(|| {
-                    ArunaDataError::NotFound(format!("Bucket {} not found", source_bucket))
-                })?;
-            let bucket_state: BucketState = postcard::from_bytes(&bucket_state)?;
-
-            self_clone.store.put(
-                &mut wtxn,
-                REPLICATION_RULES_DB_NAME,
-                source_bucket.as_bytes(),
-                &postcard::to_allocvec(&rule_clone)?,
-            )?;
-
-            let mut collected_tasks: Vec<ReplicationTask> = Vec::new();
-            for object_hash in bucket_state.merkle_tree.iter() {
-                let object_info = self_clone
+                let bucket_state = self_clone
                     .store
-                    .get(&wtxn, LOCATION_DB_NAME, object_hash.as_bytes())?
+                    .get(&wtxn, BUCKET_STATE_DB_NAME, source_bucket.as_bytes())
+                    .map_err(logerr!())?
                     .ok_or_else(|| {
-                        ArunaDataError::NotFound(format!(
-                            "Object with hash {} not found",
-                            object_hash
-                        ))
+                        error!("Bucket {} not found", source_bucket);
+                        ArunaDataError::NotFound(format!("Bucket {} not found", source_bucket))
                     })?;
+                let bucket_state: BucketState =
+                    postcard::from_bytes(&bucket_state).map_err(logerr!())?;
 
-                let object_info: ObjectInfo = postcard::from_bytes(&object_info)?;
-                if let Some(_filter) = &source_filter {
-                    warn!("Filters are currently not supported")
+                self_clone.store.put(
+                    &mut wtxn,
+                    REPLICATION_RULES_DB_NAME,
+                    source_bucket.as_bytes(),
+                    &postcard::to_allocvec(&rule_clone).map_err(logerr!())?,
+                )?;
+
+                let mut collected_tasks: Vec<ReplicationTask> = Vec::new();
+                for object_hash in bucket_state.merkle_tree.iter() {
+                    let hash = blake3::Hash::from_str(&object_hash).map_err(|e| {
+                        error!("{}", e);
+                        ArunaDataError::ConversionError {
+                            from: "String".to_string(),
+                            to: "blake3::Hash".to_string(),
+                        }
+                    })?;
+                    let object_info = self_clone
+                        .store
+                        .get(&wtxn, LOCATION_DB_NAME, hash.as_bytes())
+                        .map_err(logerr!())?
+                        .ok_or_else(|| {
+                            ArunaDataError::NotFound(format!(
+                                "Object with hash {} not found",
+                                object_hash
+                            ))
+                        })?;
+
+                    let object_info: ObjectInfo =
+                        postcard::from_bytes(&object_info).map_err(logerr!())?;
+                    if let Some(_filter) = &source_filter {
+                        warn!("Filters are currently not supported")
+                    }
+
+                    let bucket_name =
+                        extract_frontend_bucket(&object_info.bucket).map_err(logerr!())?;
+                    let permission_path = PathBuilder::new()
+                        .realm_id(realm_key)
+                        .group_data(
+                            group_id,
+                            bucket_name,
+                            object_info.key.clone(),
+                            object_info.file_hashes.blake3,
+                        )
+                        .build()
+                        .map_err(logerr!())?;
+
+                    let replication_task = ReplicationTask {
+                        user_id: user_id.clone(),
+                        group_id,
+                        replication_id: Ulid::new(),
+                        replication_node: target.clone(),
+                        permission_path,
+                        object_info,
+                    };
+
+                    collected_tasks.push(replication_task);
                 }
 
-                let bucket_name = extract_frontend_bucket(&object_info.key)?;
-                let permission_path = PathBuilder::new()
-                    .realm_id(realm_key)
-                    .group_data(group_id, bucket_name, object_info.key.clone(), object_info.file_hashes.blake3)
-                    .build()?;
+                self_clone.store.commit(wtxn).map_err(logerr!())?;
 
-                let replication_task = ReplicationTask {
-                    user_id: user_id.clone(),
-                    group_id,
-                    replication_id: Ulid::new(),
-                    replication_node: target.clone(),
-                    permission_path,
-                    object_info,
-                };
-
-                collected_tasks.push(replication_task);
-            }
-
-            self_clone.store.commit(wtxn)?;
-
-            Ok::<Vec<ReplicationTask>, ArunaDataError>(collected_tasks)
+                Ok::<Vec<ReplicationTask>, ArunaDataError>(collected_tasks)
+            })
         })
         .await??;
         Ok(tasks)

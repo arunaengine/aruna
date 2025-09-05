@@ -10,7 +10,7 @@ use s3s::auth::{S3Auth, SecretKey};
 use s3s::path::S3Path;
 use s3s::{S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, trace};
 use ulid::Ulid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,23 +117,27 @@ impl<St> AuthProvider<St>
 where
     for<'a> St: Store<'a> + 'static,
 {
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn query_user_access(&self, access_key_id: String) -> S3Result<UserAccess> {
         let store_clone = self.controller.io_handler.store.clone();
         let user_access = tokio::task::spawn_blocking(move || {
-            let mut read_txn = store_clone
+            let read_txn = store_clone
                 .create_txn(false)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
             // Fetch access info for user
-            let info: UserAccess = if let Some(info_raw) = store_clone.get(
-                &mut read_txn,
+            let info: UserAccess = match store_clone.get(
+                &read_txn,
                 ACCESS_DB_NAME,
                 &Ulid::from_string(&access_key_id)?.to_bytes(),
             )? {
-                postcard::from_bytes(&*info_raw)?
-            } else {
-                return Err(anyhow!("No access info found"));
+                Some(info_raw) => postcard::from_bytes(&*info_raw)?,
+                None => {
+                    return Err(anyhow!("No access info found"));
+                }
             };
+
+            store_clone.commit(read_txn)?;
 
             Ok::<UserAccess, anyhow::Error>(info)
         })
@@ -144,6 +148,7 @@ where
         Ok(user_access)
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn _query_content_hash(&self, path: String) -> S3Result<[u8; 32]> {
         let store_clone = self.controller.io_handler.store.clone();
         let content_hash = tokio::task::spawn_blocking(move || {

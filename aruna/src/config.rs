@@ -63,8 +63,12 @@ pub async fn start_data(
     )
     .await?;
 
-    let controller =
-        aruna_data::controller::controller::Controller::<LmdbStore>::new(io_handler, network_handler, task_handler).await;
+    let controller = aruna_data::controller::controller::Controller::<LmdbStore>::new(
+        io_handler,
+        network_handler,
+        task_handler,
+    )
+    .await;
     let s3server = S3Server::new(
         config.config.frontend.s3_frontend.clone(),
         controller.clone(),

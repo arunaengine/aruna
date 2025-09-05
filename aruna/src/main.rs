@@ -1,4 +1,7 @@
-use aruna_data::{BUCKET_LOCATION_DB_NAME, BUCKET_STATE_DB_NAME, ACCESS_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICATION_RULES_DB_NAME};
+use aruna_data::{
+    ACCESS_DB_NAME, BUCKET_LOCATION_DB_NAME, BUCKET_STATE_DB_NAME, LOCATION_DB_NAME,
+    LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME, REPLICATION_RULES_DB_NAME,
+};
 use aruna_metadata::{
     error::ArunaMetadataError,
     network::{
@@ -159,7 +162,14 @@ pub async fn main() {
         token_handler.clone(),
         task_handler.clone(),
     );
-    let data_future = start_data(config, store, network, permission_manager, token_handler, task_handler);
+    let data_future = start_data(
+        config,
+        store,
+        network,
+        permission_manager,
+        token_handler,
+        task_handler,
+    );
 
     let (metadata, data) = tokio::join!(metadata_future, data_future);
     metadata.unwrap();

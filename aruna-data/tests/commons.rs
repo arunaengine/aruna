@@ -36,6 +36,7 @@ const OPENAPI_BASE_PORT: u16 = 33000;
 const S3_BASE_PORT: u16 = 34000;
 const P2P_BASE_PORT: u16 = 35000;
 
+#[derive(Debug)]
 pub struct TestServers {
     pub realm_key: SigningKey,
     pub node_services: Vec<NodeServices>,
@@ -45,6 +46,25 @@ pub struct TestServers {
 pub struct NodeServices {
     pub s3_endpoint: String,
     pub openapi_data_endpoint: (Controller<LmdbStore>, String),
+}
+
+impl std::fmt::Debug for NodeServices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeServices")
+            .field("S3 Endpoint", &self.s3_endpoint)
+            .field("OpenAPI Endpoint", &self.openapi_data_endpoint.1)
+            .field(
+                "Node ID",
+                &self
+                    .openapi_data_endpoint
+                    .0
+                    .network
+                    .get_node_addr()
+                    .node_id
+                    .to_string(),
+            )
+            .finish()
+    }
 }
 
 pub async fn init_test_nodes(
@@ -198,6 +218,10 @@ pub async fn register_user_with_group_and_credentials<St>(
 where
     for<'a> St: Store<'a> + 'static,
 {
+    println!(
+        "Adding creds @ {}",
+        controller.network.get_node_addr().node_id
+    );
     // Create user and generate an Aruna token
     let user_identity = register_oidc_user(name, store, token_handler.clone())?;
     let token = fetch_user_token(&user_identity, token_handler.clone())?;

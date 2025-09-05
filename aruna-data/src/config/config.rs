@@ -133,8 +133,8 @@ impl Config {
                 p2p_port,
             },
             persistence: Persistence {
-                //path: format!("/dev/shm/test-{}/node-{}", Ulid::new(), node_idx),
-                path: format!("/tmp/aruna-data/test-{}/node-{}", Ulid::new(), node_idx),
+                path: format!("/dev/shm/tests/test-{}/node-{}", Ulid::new(), node_idx),
+                //path: format!("/tmp/aruna-data/test-{}/node-{}", Ulid::new(), node_idx),
             },
             backend: BackendConfig {
                 backend_type: backend_type.clone(),

@@ -1,7 +1,7 @@
 use crate::api_json::request::Request;
 use crate::api_s3::auth::UserAccess;
-use crate::error::ArunaDataError;
 use crate::controller::controller::Controller;
+use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::ACCESS_DB_NAME;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
@@ -76,8 +76,9 @@ where
             )?;
             store_clone.commit(write_txn)?;
 
-            Ok::<(), anyhow::Error>(())
-        });
+            Ok::<(), ArunaDataError>(())
+        })
+        .await??;
 
         Ok(CreateS3CredentialsResponse {
             access_key_id,

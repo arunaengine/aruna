@@ -22,7 +22,9 @@ use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
+use std::io::Read;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::SystemTime;
 use tracing::{debug, error, warn};
 use ulid::Ulid;
@@ -88,7 +90,12 @@ where
                     .get(&read_txn, PATH_LOCATION_DB_NAME, frontend_path.as_bytes())?
                     .ok_or_else(|| ArunaDataError::NotFound("No such key".to_string()))?
             } else {
-                Cow::from(key.as_bytes())
+                let hash =
+                    blake3::Hash::from_str(&key).map_err(|_e| ArunaDataError::ConversionError {
+                        from: "String".to_string(),
+                        to: "blake3::Hash".to_string(),
+                    })?;
+                Cow::from(hash.as_bytes().to_vec())
             };
 
             // Extend provided path
@@ -388,11 +395,12 @@ where
         let bucket_path =
             bucket_path.ok_or_else(|| s3_error!(InvalidBucketName, "Invalid bucket"))?;
         let store_clone = self.controller.io_handler.store.clone();
+        let bucket_clone = bucket_path.clone();
         tokio::task::spawn_blocking(move || {
             let read_txn = store_clone.create_txn(false)?;
 
             // Try fetch content hash associated with frontend bucket
-            let res = store_clone.get(&read_txn, BUCKET_STATE_DB_NAME, bucket_path.as_bytes())?;
+            let res = store_clone.get(&read_txn, BUCKET_STATE_DB_NAME, bucket_clone.as_bytes())?;
 
             if !res.is_some() {
                 return Err(ArunaDataError::InvalidParameter {
@@ -440,7 +448,7 @@ where
             let replication_rule = ReplicationRule {
                 user_id: user_id.clone(),
                 group_id,
-                source_bucket: req.input.bucket.clone(),
+                source_bucket: bucket_path.clone(),
                 source_filter: match rule.filter {
                     Some(r) => Some(r.try_into()?),
                     None => None,
@@ -469,15 +477,14 @@ where
             // Register each object individually
             for task in &replication_tasks {
                 let payload = postcard::to_allocvec(task).unwrap();
-                let executor_idx = 5;
                 self.controller
                     .task_handler
                     .register_task(
                         distribution_strategy.clone(),
                         retry_strategy.clone(),
-                        executor_idx,
+                        self.controller.executor_idx,
                         payload,
-                        None,
+                        None, // No backchannel needed here
                     )
                     .await
                     .map_err(|e| {

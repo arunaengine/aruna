@@ -28,6 +28,7 @@ where
     pub io_handler: Arc<IOHandler<St>>,
     pub network: NetworkHandler,
     pub task_handler: TaskHandler<St>,
+    pub executor_idx: u8,
 }
 
 impl<St> Controller<St>
@@ -40,11 +41,16 @@ where
         network: NetworkHandler,
         task_handler: TaskHandler<St>,
     ) -> Self {
-        let controller = Self {
+        let mut controller = Self {
             io_handler,
             network,
             task_handler,
+            executor_idx: 0,
         };
+        controller.executor_idx = controller
+            .task_handler
+            .add_executor(controller.clone_box())
+            .await;
         controller.clone().run().await;
         controller
     }
@@ -84,16 +90,19 @@ where
                         let network = network.clone();
 
                         trace!("{:?} Received stream from: {:?}", network.get_node_addr(), inc_stream.sender);
+                        let current_span = tracing::Span::current();
                         tokio::spawn(
+                            current_span.in_scope(||
                             async move {
                                 if let Err(e) = io_handler.handle_incoming_p2p_stream(
                                     inc_stream,
                                     network.get_node_addr(),
+                                    network.get_realm_key(),
 
                                 ).await{
                                     error!("Failed to handle incoming stream: {e:#}");
                                 }
-                            }
+                            })
                         );
                     }
 
