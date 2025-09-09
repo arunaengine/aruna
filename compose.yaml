@@ -1,6 +1,6 @@
 services:
   keycloak:
-    image: quay.io/keycloak/keycloak:26.3.0-0
+    image: quay.io/keycloak/keycloak:26.3.3
     ports:
       - 1998:8080
     environment:
@@ -17,14 +17,26 @@ services:
       timeout: 5s
       retries: 30
   jaeger:
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 6G
     environment:
       COLLECTOR_OTLP_ENABLED: true
     ports:
       - 16686:16686 
       - 4317:4317 
       - 4318:4318
-    image: jaegertracing/all-in-one:1.70.0
+      - 5778:5778
+      - 9411:9411
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.10.0
   minio:
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 6G
     image: minio/minio
     ports:
       - 9000:9000
@@ -32,7 +44,12 @@ services:
     environment:
       MINIO_DOMAIN: minio:9000
     command: "server /data --console-address ':9001'"
-  aruna:
+  aruna-1:
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
     image: aruna:latest
     pull_policy: never
     build: 
@@ -67,7 +84,7 @@ services:
       BACKEND_ACCESS_ENDPOINT: "http://localhost:9000"
       BACKEND_ACCESS_REGION: "eu-central-1"
       BACKEND_ACCESS_REGION_DISABLE_CONFIG_LOAD: true
-      BACKEND_ACCESS_BUCKET: "aruna"
+      # BACKEND_ACCESS_BUCKET: "aruna-1"
       BACKEND_ACCESS_ACCESS_KEY_ID: "minioadmin"
       BACKEND_ACCESS_SECRET_ACCESS_KEY: "minioadmin"
       DATA_OPENAPI_ADDRESS: "0.0.0.0"
@@ -78,7 +95,139 @@ services:
       S3_HOSTNAME: "localhost:1337"
       S3_CORS_EXCEPTION: "http://localhost:3000"
       OTEL_SERVER: "http://localhost:4317"
-      OTEL_SERVICE_NAME: "aruna"
+      OTEL_SERVICE_NAME: "aruna-1"
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:8080/api/v3/info || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 30
     depends_on:
       keycloak:
+        condition: service_healthy
+  aruna-2:
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+    image: aruna:latest
+    pull_policy: never
+    build: 
+      context: .
+      tags:
+        - aruna:latest
+    network_mode: "host"
+    environment:
+      REALM_KEY: |-
+        -----BEGIN PRIVATE KEY-----
+        MFECAQEwBQYDK2VwBCIEIJucl73sk/By4tUQqsv1qopNy1Bi+EWhPugOxB+dyFRW
+        gSEAtOYxE8jy2F90OEGr7NixCoc6pDIHMG2GwhKWfJqMGQA=
+        -----END PRIVATE KEY-----
+      P2P_KEY: "01835408d1554aa8f424f9669635393675a9642528e57be3dec4be34531de4ce"
+      P2P_ADDRESS: "0.0.0.0"
+      P2P_PORT: 1231
+      BOOTSTRAP_NODES: |-
+        [
+          {"node_id":"8e5c2c3e4771f91e7af9dd70a48cee50cb67070c3bef6ed9fcad821c85874b0f","relay_url":null,"direct_addresses":["127.0.0.1:1230"]}
+        ]
+      ISSUERS: |
+          [
+            {
+              "issuer_name": "http://localhost:1998/realms/test",
+              "pubkey_url": "http://localhost:1998/realms/test/protocol/openid-connect/certs",
+              "aud": ["test", "test-long"]
+            }
+          ]
+      VARIANT: "LMDB"
+      DB_PATH: "/database"
+      BACKEND_TYPE: "s3"
+      BACKEND_ENCRYPTION: false
+      BACKEND_COMPRESSION: false
+      BACKEND_DEDUPLICATION: false
+      BACKEND_MAX_BUCKET_SIZE: 100000
+      BACKEND_ACCESS_ENDPOINT: "http://localhost:9000"
+      BACKEND_ACCESS_REGION: "eu-central-1"
+      BACKEND_ACCESS_REGION_DISABLE_CONFIG_LOAD: true
+      # BACKEND_ACCESS_BUCKET: "aruna-2"
+      BACKEND_ACCESS_ACCESS_KEY_ID: "minioadmin"
+      BACKEND_ACCESS_SECRET_ACCESS_KEY: "minioadmin"
+      DATA_OPENAPI_ADDRESS: "0.0.0.0"
+      DATA_OPENAPI_PORT: 8082
+      METADATA_OPENAPI_ADDRESS: "0.0.0.0"
+      METADATA_OPENAPI_PORT: 8083
+      S3_SERVER: "0.0.0.0:1338"
+      S3_HOSTNAME: "localhost:1338"
+      S3_CORS_EXCEPTION: "http://localhost:3000"
+      OTEL_SERVER: "http://localhost:4317"
+      OTEL_SERVICE_NAME: "aruna-2"
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -f http://localhost:8080/api/v3/info || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      aruna-1:
+        condition: service_healthy
+  aruna-3:
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 4G
+    image: aruna:latest
+    pull_policy: never
+    build: 
+      context: .
+      tags:
+        - aruna:latest
+    network_mode: "host"
+    environment:
+      REALM_KEY: |-
+        -----BEGIN PRIVATE KEY-----
+        MFECAQEwBQYDK2VwBCIEIJucl73sk/By4tUQqsv1qopNy1Bi+EWhPugOxB+dyFRW
+        gSEAtOYxE8jy2F90OEGr7NixCoc6pDIHMG2GwhKWfJqMGQA=
+        -----END PRIVATE KEY-----
+      P2P_KEY: "7a793872997fc6a973c2141d0a0227feeb261df4aa74f0ac0ff5f829da5516aa"
+      P2P_ADDRESS: "0.0.0.0"
+      P2P_PORT: 1232
+      BOOTSTRAP_NODES: |-
+        [
+          {"node_id":"8e5c2c3e4771f91e7af9dd70a48cee50cb67070c3bef6ed9fcad821c85874b0f","relay_url":null,"direct_addresses":["127.0.0.1:1230"]}
+        ]
+      ISSUERS: |
+          [
+            {
+              "issuer_name": "http://localhost:1998/realms/test",
+              "pubkey_url": "http://localhost:1998/realms/test/protocol/openid-connect/certs",
+              "aud": ["test", "test-long"]
+            }
+          ]
+      VARIANT: "LMDB"
+      DB_PATH: "/database"
+      BACKEND_TYPE: "s3"
+      BACKEND_ENCRYPTION: false
+      BACKEND_COMPRESSION: false
+      BACKEND_DEDUPLICATION: false
+      BACKEND_MAX_BUCKET_SIZE: 100000
+      BACKEND_ACCESS_ENDPOINT: "http://localhost:9000"
+      BACKEND_ACCESS_REGION: "eu-central-1"
+      BACKEND_ACCESS_REGION_DISABLE_CONFIG_LOAD: true
+      # BACKEND_ACCESS_BUCKET: "aruna-3"
+      BACKEND_ACCESS_ACCESS_KEY_ID: "minioadmin"
+      BACKEND_ACCESS_SECRET_ACCESS_KEY: "minioadmin"
+      DATA_OPENAPI_ADDRESS: "0.0.0.0"
+      DATA_OPENAPI_PORT: 8084
+      METADATA_OPENAPI_ADDRESS: "0.0.0.0"
+      METADATA_OPENAPI_PORT: 8085
+      S3_SERVER: "0.0.0.0:1339"
+      S3_HOSTNAME: "localhost:1339"
+      S3_CORS_EXCEPTION: "http://localhost:3000"
+      OTEL_SERVER: "http://localhost:4317"
+      OTEL_SERVICE_NAME: "aruna-3"
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      aruna-2:
         condition: service_healthy

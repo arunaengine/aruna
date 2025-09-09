@@ -195,7 +195,8 @@ mod tests {
     use ulid::Ulid;
 
     use crate::models::structs::{
-        Author, Hash, HashAlgorithm, KeyValue, Resource, ResourceVariant, User, VisibilityClass,
+        Author, Data, Hash, HashAlgorithm, KeyValue, Resource, ResourceVariant, User,
+        VisibilityClass,
     };
 
     #[test]
@@ -235,11 +236,15 @@ mod tests {
             license_id: Ulid::new(),
             locked: true,
             deleted: false,
-            location: vec!["proxy.data.org".to_string()],
-            hashes: vec![Hash {
-                algorithm: HashAlgorithm::MD5,
-                value: "ExampleHashString".to_string(),
+            data: vec![Data::ContentHash {
+                datahash: "716f6e863f744b9ac22c97ec7b76ea5f5908bc5b2f67c61510bfc4751384ea7a"
+                    .to_string(),
             }],
+            // location: vec!["proxy.data.org".to_string()],
+            // hashes: vec![Hash {
+            //     algorithm: HashAlgorithm::MD5,
+            //     value: "ExampleHashString".to_string(),
+            // }],
         };
         // Convert into bytes
         let user_bytes: Vec<u8> = user.clone().try_into().unwrap();
@@ -295,11 +300,15 @@ mod tests {
             license_id: Ulid::new(),
             locked: true,
             deleted: false,
-            location: vec!["proxy.data.org".to_string()],
-            hashes: vec![Hash {
-                algorithm: HashAlgorithm::MD5,
-                value: "ExampleHashString".to_string(),
+            data: vec![Data::ContentHash {
+                datahash: "716f6e863f744b9ac22c97ec7b76ea5f5908bc5b2f67c61510bfc4751384ea7a"
+                    .to_string(),
             }],
+            // location: vec!["proxy.data.org".to_string()],
+            // hashes: vec![Hash {
+            //     algorithm: HashAlgorithm::MD5,
+            //     value: "ExampleHashString".to_string(),
+            // }],
         };
 
         let mut doc = automerge::AutoCommit::new();

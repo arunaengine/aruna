@@ -9,6 +9,7 @@ use tags::*;
 mod tags {
     pub const USERS: &str = "users";
     pub const RESOURCES: &str = "resources";
+    pub const INFO: &str = "info";
 }
 
 /// Create new credentials for a user
@@ -103,4 +104,52 @@ where
     for<'a> St: Store<'a> + 'static,
 {
     into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+
+/// TODO: Locate data resources over the network
+#[utoipa::path(
+    post,
+    path = "/data/locate",
+    request_body = LocateDataRequest,
+    responses(
+        (status = 200, body = LocateDataResponse), ArunaDataError),
+    security(
+        ("auth" = [])
+    ),
+    tag = RESOURCES,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn locate<St>(
+    State(state): State<Controller<St>>,
+    headers: HeaderMap,
+    Json(request): Json<LocateDataRequest>,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+
+/// Get server info
+#[utoipa::path(
+    get,
+    path = "/info",
+    responses(
+        (status = 200, body = GetInfoResponse),
+        ArunaDataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = INFO,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn get_info<St>(
+    State(state): State<Controller<St>>,
+    headers: HeaderMap,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    into_axum_response(state.request(GetInfoRequest{}, extract_token(&headers)).await)
 }

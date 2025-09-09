@@ -1,5 +1,6 @@
 use super::structs::{Author, Group, KeyValue, Resource, User, VisibilityClass};
 use crate::error::ArunaMetadataError;
+use crate::models::structs::Data;
 use crate::transactions::controller::Controller;
 use crate::{
     models::structs::PolicyResult, network::network_trait::Network,
@@ -7,6 +8,7 @@ use crate::{
 };
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
+use iroh::NodeAddr;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ulid::Ulid;
@@ -300,6 +302,19 @@ pub struct UpdateResourceAuthorsResponse {
     pub resource: Resource,
 }
 
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
+)]
+pub struct UpdateResourceDataRequest {
+    pub id: Ulid,
+    pub data_to_add: Vec<Data>,
+    pub data_to_remove: Vec<Data>,
+}
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct UpdateResourceDataResponse {
+    pub resource: Resource,
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub enum ResourceUpdateRequests {
     Name(UpdateResourceNameRequest),
@@ -310,6 +325,7 @@ pub enum ResourceUpdateRequests {
     Labels(UpdateResourceLabelsRequest),
     Identifiers(UpdateResourceIdentifiersRequest),
     Authors(UpdateResourceAuthorsRequest),
+    Data(UpdateResourceDataRequest),
 }
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub enum ResourceUpdateResponses {
@@ -321,6 +337,7 @@ pub enum ResourceUpdateResponses {
     Labels(UpdateResourceLabelsResponse),
     Identifiers(UpdateResourceIdentifiersResponse),
     Authors(UpdateResourceAuthorsResponse),
+    Data(UpdateResourceDataResponse),
 }
 pub trait GetInner {
     fn get_id(&self) -> Ulid;
@@ -336,6 +353,7 @@ impl GetInner for ResourceUpdateRequests {
             ResourceUpdateRequests::Labels(req) => req.id,
             ResourceUpdateRequests::Identifiers(req) => req.id,
             ResourceUpdateRequests::Authors(req) => req.id,
+            ResourceUpdateRequests::Data(req) => req.id,
         }
     }
 }
@@ -407,4 +425,14 @@ pub struct CreateTokenRequest {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateTokenResponse {
     pub token: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetInfoRequest {}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetInfoResponse {
+    pub realm_id: String,
+    pub node_id: String,
+    pub node_addr: String,
 }

@@ -7,7 +7,8 @@ members = [
     "aruna-realm",
     "aruna-storage",
     "aruna-permission",
-    "aruna-task"
+    "aruna-task",
+    "hacks"
 ]
 resolver = "2"
 
@@ -27,12 +28,13 @@ axum-extra = {version = "0.10.1", features = ["query"]}
 blake3 = { version = "1.8.2", features = ["serde"] }
 casbin = { version = "2.10.1", features = ["explain", "logging"]}
 chrono = { version = "0.4.41", features = ["serde"]}
+data-encoding = "2.9.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core", "pem"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
-iroh = "0.90.0"
-iroh-base = "0.90.0"
+iroh = "0.91.2"
+iroh-base = "0.91.2"
 opentelemetry = "0.30.0"
 opentelemetry-otlp = { version = "0.30.0", features = ["grpc-tonic"]}
 opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"]}

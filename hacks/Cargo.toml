@@ -1,0 +1,16 @@
+[package]
+name = "hacks"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8.4"
+tokio = { version = "1.47.1", features = ["full"] }
+tower = "0.5.2"
+reqwest = { version = "0.12.23", features = ["json"]}
+openidconnect = "4.0.1"
+anyhow = "1.0.99"
+
+[[bin]]
+name = "auth_mock"
+path = "auth_mock.rs"

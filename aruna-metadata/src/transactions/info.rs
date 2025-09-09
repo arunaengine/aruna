@@ -1,5 +1,5 @@
 use crate::logerr;
-use crate::models::requests::Request;
+use crate::models::requests::{GetInfoRequest, GetInfoResponse, Request};
 use crate::{
     error::ArunaMetadataError,
     models::{
@@ -10,6 +10,7 @@ use crate::{
     persistence::search::generic::Search,
 };
 use aruna_storage::storage::store::Store;
+use data_encoding::HEXLOWER;
 use std::collections::HashSet;
 use tracing::error;
 use ulid::Ulid;
@@ -122,5 +123,61 @@ where
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let resources = controller.persistence.search(groups, self.query).await?;
         Ok(SearchResponse { resources })
+    }
+}
+
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for GetInfoRequest
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    type Response = GetInfoResponse;
+    type AuthContext = Option<Vec<Ulid>>; // (Identity, Groups)
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Vec<Ulid>>, crate::error::ArunaMetadataError> {
+        Ok(None)
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn sync_or_forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        Ok(None)
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        Err(ArunaMetadataError::NotFound(
+            "Forwarding GetInfoRequest is not implemented".to_string(),
+        ))
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn run_request(
+        self,
+        groups: Option<Vec<Ulid>>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let realm_id = HEXLOWER.encode(&controller.network.get_realm_key().await?);
+        let node_addr = controller.network.get_addr().await?;
+        let node_id = node_addr.node_id.to_string();
+        Ok(GetInfoResponse {
+            realm_id,
+            node_id,
+            node_addr: serde_json::to_string(&node_addr)?,
+        })
     }
 }

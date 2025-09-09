@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Display;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::error;
+use tracing::{error, trace};
 use ulid::Ulid;
 
 use crate::casbin::DBNAME;
@@ -537,6 +537,7 @@ impl PermissionManager {
     where
         for<'a> S: Store<'a> + 'static,
     {
+        trace!("Checking path...");
         let store = store.clone();
         let permission_manager = self.clone();
         let identity = identity.clone();
@@ -544,6 +545,7 @@ impl PermissionManager {
         let current_span = tracing::Span::current();
         let ulid = tokio::task::spawn_blocking(move || -> Result<Ulid> {
             current_span.in_scope(|| {
+                trace!("Resolving permission ulid...");
                 let txn = store.create_txn(false)?;
 
                 let permission_ulid =
@@ -555,6 +557,8 @@ impl PermissionManager {
             })
         })
         .await??;
+
+        trace!("Enforce rule...");
         let res = self.enforcer.read().await.enforce(
             &ulid.to_string(),
             &path.to_string(),

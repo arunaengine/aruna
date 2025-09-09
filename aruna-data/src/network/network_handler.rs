@@ -11,7 +11,7 @@ use iroh::{
 };
 use tracing::warn;
 
-use crate::error::ArunaDataError;
+use crate::{error::ArunaDataError, io::io_handler::REPLICATION_PROTOCOL_ID};
 
 #[derive(Clone)]
 pub struct NetworkHandler {
@@ -29,6 +29,10 @@ impl NetworkHandler {
         kademlia: Kademlia,
         realm_key: RealmKey,
     ) -> Result<Self, ArunaDataError> {
+        let network = network
+            .new_actor_handle(REPLICATION_PROTOCOL_ID)
+            .await
+            .map_err(|e| ArunaDataError::ServerError(e.to_string()))?;
         let node_addr = network
             .get_node_addr()
             .await

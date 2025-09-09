@@ -290,6 +290,10 @@ pub async fn make_bucket(
 }
 
 impl Destination {
+    /// Parses arn into Destination
+    /// ARN format:
+    ///    AWS      arn:partition:service:region:account-id:resource-type/resource-id
+    ///    ARUNA    arn:realm-id:s3:node-id:group-id:resource-type/resource-id
     pub fn from_arn(arn: String) -> Result<Self, ArunaDataError> {
         let mut iterator = arn.split(":");
         let _arn = iterator.next();

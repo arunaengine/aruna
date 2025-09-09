@@ -13,6 +13,6 @@ FROM alpine:3.22
 WORKDIR /run
 RUN apk update
 RUN apk upgrade
-RUN apk add libgcc gcompat ca-certificates openssl-dev
+RUN apk add libgcc gcompat ca-certificates openssl-dev curl
 COPY --from=builder /build/target/release/aruna .
 CMD [ "/run/aruna" ]

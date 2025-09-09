@@ -24,7 +24,7 @@ use std::future::Ready;
 use std::future::ready;
 use tokio::net::TcpListener;
 use tracing::info;
-use tracing::{debug, error};
+use tracing::error;
 
 pub struct S3Server {
     s3service: S3Service,

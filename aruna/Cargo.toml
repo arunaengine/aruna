@@ -11,7 +11,7 @@ aruna-permission = { path = "../aruna-permission" }
 aruna-data = { path = "../aruna-data" }
 aruna-storage = { path = "../aruna-storage" }
 aruna-task = { path = "../aruna-task" }
-data-encoding = "2.9.0"
+data-encoding = { workspace = true } 
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }

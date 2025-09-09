@@ -462,6 +462,51 @@ where
     }
 }
 
+
+/// Update resource title
+#[utoipa::path(
+    post,
+    path = "/resources/data",
+    request_body = UpdateResourceDataRequest,
+    responses(
+        (status = 200, body = UpdateResourceDataResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = RESOURCES,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn update_resource_data<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateResourceDataRequest>,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    match state
+        .request(
+            ResourceUpdateRequests::Data(request),
+            extract_token(&headers),
+        )
+        .await
+    {
+        Ok(ResourceUpdateResponses::Data(res)) => {
+            (axum::http::StatusCode::OK, Json(res)).into_response()
+        }
+        Ok(_) => ArunaMetadataError::DeserializeError(
+            "Internal response serialization error".to_string(),
+        )
+        .into_axum_tuple()
+        .into_response(),
+        Err(e) => e.into_axum_tuple().into_response(),
+    }
+}
+
 /// Search for resources
 #[utoipa::path(
     get,
@@ -586,7 +631,7 @@ where
 {
     into_axum_response(state.request(request, extract_token(&headers)).await)
 }
-/// Add a new group
+/// Add a user to group
 #[utoipa::path(
     post,
     path = "/groups/user",
@@ -614,7 +659,7 @@ where
     into_axum_response(state.request(request, extract_token(&headers)).await)
 }
 
-/// Add a new group
+/// Get group
 #[utoipa::path(
     get,
     path = "/groups",
@@ -642,4 +687,30 @@ where
     N: Network + 'static,
 {
     into_axum_response(state.request(request, extract_token(&headers)).await)
+}
+
+/// Get server info
+#[utoipa::path(
+    get,
+    path = "/info",
+    responses(
+        (status = 200, body = GetInfoResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = INFO,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn get_info<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    headers: HeaderMap,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    into_axum_response(state.request(GetInfoRequest{}, extract_token(&headers)).await)
 }

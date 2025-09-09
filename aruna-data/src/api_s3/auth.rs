@@ -22,6 +22,21 @@ pub struct UserAccess {
     //filter
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModifyAccess {
+    pub user_id: UserIdentity,
+    pub group_id: Ulid,
+    pub bucket: String,
+    pub key: Option<String>,
+    pub modifier: Access,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Access {
+    Read,
+    Write,
+}
+
 #[derive(Clone)]
 pub struct AuthProvider<St>
 where
@@ -90,6 +105,8 @@ where
         .build()
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
+        debug!(?perm_path);
+
         let allowed = self
             .controller
             .io_handler
@@ -102,6 +119,7 @@ where
             )
             .await
             .map_err(|e| s3_error!(InternalError, "Permission check failed: {}", e))?;
+        debug!(allowed);
 
         match allowed {
             true => {

@@ -1,6 +1,7 @@
 use crate::logerr;
 use crate::models::requests::{
     CreateResourceRequest, CreateResourceResponse, ForwardResponse, Request,
+    UpdateResourceDataResponse,
 };
 use crate::{
     error::ArunaMetadataError,
@@ -220,8 +221,9 @@ where
             license_id: self.license_id.unwrap_or_default(),
             locked: false,
             deleted: false,
-            location: Vec::new(),
-            hashes: Vec::new(),
+            data: vec![],
+            // location: Vec::new(),
+            // hashes: Vec::new(),
         };
 
         let path = PathBuilder::from_path(auth_result.1)
@@ -561,6 +563,17 @@ where
                     resource: resource.clone(),
                 })
             }
+            ResourceUpdateRequests::Data(req) => {
+                if !req.data_to_remove.is_empty() {
+                    resource.data.retain(|a| !req.data_to_remove.contains(a));
+                }
+                if !req.data_to_add.is_empty() {
+                    resource.data.extend(req.data_to_add);
+                }
+                ResourceUpdateResponses::Data(UpdateResourceDataResponse {
+                    resource: resource.clone(),
+                })
+            }
         };
 
         let node_id = controller.network.get_addr().await?.node_id;
@@ -739,8 +752,9 @@ where
             license_id: self.license_id.unwrap_or_default(),
             locked: false,
             deleted: false,
-            location: Vec::new(),
-            hashes: Vec::new(),
+            data: vec![],
+            // location: Vec::new(),
+            // hashes: Vec::new(),
         };
         let node_id = controller.network.get_addr().await?.node_id;
 

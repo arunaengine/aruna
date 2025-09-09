@@ -61,8 +61,31 @@ pub struct Resource {
     #[autosurgeon(with = "autosurgeon_ulid")]
     pub license_id: Ulid,
     pub locked: bool,
-    pub location: Vec<String>, // Part of index ?
-    pub hashes: Vec<Hash>,
+    pub data: Vec<Data>,
+    // pub location: Vec<String>, // Part of index ?
+    // pub hashes: Vec<Hash>,
+}
+
+#[derive(
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Debug,
+    Serialize,
+    Deserialize,
+    ToSchema,
+    Reconcile,
+    Hydrate,
+    Hash,
+)]
+pub enum Data {
+    ContentHash {
+        // ARN ?
+        datahash: String,
+    },
+    Link(String),
 }
 
 #[derive(

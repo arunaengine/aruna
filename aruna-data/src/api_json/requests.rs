@@ -5,6 +5,7 @@ use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::ACCESS_DB_NAME;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
+use data_encoding::HEXLOWER;
 use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
 use serde::{Deserialize, Serialize};
@@ -232,5 +233,95 @@ where
         _controller: &Controller<St>,
     ) -> Result<Option<Self::Response>, ArunaDataError> {
         Ok(None)
+    }
+}
+
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
+)]
+pub struct LocateDataRequest {
+    group_id: String,
+    backend_path: String,
+    bucket: String,
+    key: Option<String>,
+    create_s3_path: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct LocateDataResponse {
+    path: String,
+}
+
+#[async_trait::async_trait]
+impl<St> Request<St> for LocateDataRequest
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    type Response = LocateDataResponse;
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn run_request(
+        self,
+        _user: Option<UserIdentity>,
+        _controller: &Controller<St>,
+    ) -> Result<Self::Response, ArunaDataError> {
+        todo!()
+    }
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &Controller<St>,
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
+        Ok(None)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetInfoRequest {}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetInfoResponse {
+    pub realm_id: String,
+    pub node_id: String,
+    pub node_addr: String,
+}
+
+#[async_trait::async_trait]
+impl<St> Request<St> for GetInfoRequest
+where
+    for<'a> St: Store<'a> + 'static,
+{
+    type Response = GetInfoResponse;
+
+    #[tracing::instrument(level = "trace", skip(_controller))]
+    async fn forward_or_return(
+        &self,
+        user: &Option<String>,
+        _controller: &Controller<St>,
+    ) -> Result<Option<Self::Response>, ArunaDataError> {
+        Ok(None)
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn run_request(
+        self,
+        _user: Option<UserIdentity>,
+        controller: &Controller<St>,
+    ) -> Result<Self::Response, crate::error::ArunaDataError> {
+        let realm_id = HEXLOWER.encode(&controller.network.get_realm_key());
+        let node_addr = controller.network.get_node_addr();
+        let node_id = node_addr.node_id.to_string();
+        Ok(GetInfoResponse {
+            realm_id,
+            node_id,
+            node_addr: serde_json::to_string(&node_addr).map_err(|_e| {
+                ArunaDataError::ConversionError {
+                    from: "NodeAddr".to_string(),
+                    to: "String".to_string(),
+                }
+            })?,
+        })
     }
 }

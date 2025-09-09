@@ -1,5 +1,5 @@
 use crate::IOHandler;
-use crate::api_s3::auth::UserAccess;
+use crate::api_s3::auth::{ModifyAccess, UserAccess};
 use crate::controller::controller::Controller;
 use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::{
@@ -15,14 +15,14 @@ use futures_util::TryStreamExt;
 use s3s::dto::{
     CreateBucketInput, CreateBucketOutput, DeleteBucketReplicationInput,
     DeleteBucketReplicationOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
-    GetObjectInput, GetObjectOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-    PutObjectInput, PutObjectOutput, StreamingBlob,
+    GetObjectInput, GetObjectOutput, PutBucketPolicyInput, PutBucketPolicyOutput,
+    PutBucketReplicationInput, PutBucketReplicationOutput, PutObjectInput, PutObjectOutput,
+    StreamingBlob,
 };
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
-use std::io::Read;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::SystemTime;
@@ -292,7 +292,7 @@ where
         let backend_bucket_clone = backend_bucket.clone();
         let backend_path_clone = backend_path.clone();
         let bucket = req.input.bucket.clone();
-        tokio::task::spawn_blocking(move || {
+        let state = tokio::task::spawn_blocking(move || {
             let mut write_txn = self_clone
                 .io_handler
                 .store
@@ -352,7 +352,7 @@ where
                 .commit(write_txn)
                 .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
-            Ok::<(), S3Error>(())
+            Ok::<BucketState, S3Error>(info)
         })
         .await
         .map_err(|e| s3_error!(InternalError, "{}", e))?
@@ -368,6 +368,12 @@ where
             .create_dir(&location)
             .await
             .map_err(|e| s3_error!(InternalError, "{}", e.to_string()))?;
+
+        self.controller
+            .network
+            .store(blake3::hash(state.id.to_bytes().as_slice()))
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
         let inner_response = CreateBucketOutput {
             // TODO:
@@ -521,5 +527,74 @@ where
             NotImplemented,
             "Deleting bucket replications is not implemented"
         ))
+    }
+
+    #[allow(clippy::blocks_in_conditions)]
+    async fn put_bucket_policy(
+        &self,
+        req: S3Request<PutBucketPolicyInput>,
+    ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
+        return Err(s3_error!(
+            NotImplemented,
+            "Deleting bucket replications is not implemented"
+        ));
+
+        let UserAccess {
+            group_id, user_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        // Check if bucket exists
+        let (bucket_path, _) = create_paths(None, &req.input.bucket, &group_id, false)
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let bucket_path =
+            bucket_path.ok_or_else(|| s3_error!(InvalidBucketName, "Invalid bucket"))?;
+        let store_clone = self.controller.io_handler.store.clone();
+        let bucket_clone = bucket_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let read_txn = store_clone.create_txn(false)?;
+
+            // Try fetch content hash associated with frontend bucket
+            let res = store_clone.get(&read_txn, BUCKET_STATE_DB_NAME, bucket_clone.as_bytes())?;
+
+            if !res.is_some() {
+                return Err(ArunaDataError::InvalidParameter {
+                    name: "bucket".to_string(),
+                    error: "Bucket does not exist".to_string(),
+                });
+            };
+
+            store_clone.commit(read_txn)?;
+
+            Ok::<(), ArunaDataError>(())
+        })
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))?
+        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        // Parse policies and rules
+        let bucket_policy: ModifyAccess = serde_json::from_str(&req.input.policy).map_err(|e| {
+            error!("{}", e.to_string());
+            s3_error!(InvalidPolicyDocument, "Invalid BucketPolicy provided")
+        })?;
+
+        let store_clone = self.controller.io_handler.store.clone();
+        let bucket_clone = bucket_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut wtxn = store_clone.create_txn(true)?;
+
+            todo!("Mutate group permissions");
+
+            store_clone.commit(wtxn)?;
+
+            Ok::<(), ArunaDataError>(())
+        })
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))?
+        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        todo!()
     }
 }

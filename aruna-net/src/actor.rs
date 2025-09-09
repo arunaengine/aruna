@@ -105,7 +105,7 @@ impl NetworkActorBuilder {
             endpoint.add_node_addr(node_addr.clone())?;
         }
         let init_actor_handle = InitActorHandle::new(self.command.sender().clone());
-        let node_addr = endpoint.node_addr().initialized().await?;
+        let node_addr = endpoint.node_addr().initialized().await;
         NetworkActor::new(
             endpoint,
             self.command,
@@ -329,10 +329,7 @@ impl NetworkActor {
                             },
                             NetworkRequests::GetNodeAddr { return_channel } => {
                                 // Get the node address and send it to the command channel
-                                let Ok(node_addr) = self.endpoint.node_addr().initialized().await else {
-                                    warn!("cannot get node address");
-                                    continue;
-                                };
+                                let node_addr = self.endpoint.node_addr().initialized().await;
                                 if return_channel.send(node_addr).is_err() {
                                     warn!("cannot send node address");
                                     continue;
