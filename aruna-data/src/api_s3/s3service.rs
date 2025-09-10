@@ -5,7 +5,7 @@ use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::{
     BUCKET_STATE_DB_NAME, LOCATION_DB_NAME, PATH_LOCATION_DB_NAME,
 };
-use crate::io::io_handler::{BucketState, ObjectInfo, SPECIAL_BUCKET};
+use crate::io::io_handler::{BucketState, MultipartUpload, ObjectInfo, SPECIAL_BUCKET};
 use crate::util::opendal::create_paths;
 use crate::util::s3::{Destination, ReplicationRule};
 use aruna_permission::paths::PathBuilder;
@@ -13,11 +13,12 @@ use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
 use futures_util::TryStreamExt;
 use s3s::dto::{
-    CreateBucketInput, CreateBucketOutput, DeleteBucketReplicationInput,
-    DeleteBucketReplicationOutput, GetBucketReplicationInput, GetBucketReplicationOutput,
-    GetObjectInput, GetObjectOutput, PutBucketPolicyInput, PutBucketPolicyOutput,
-    PutBucketReplicationInput, PutBucketReplicationOutput, PutObjectInput, PutObjectOutput,
-    StreamingBlob,
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetObjectInput, GetObjectOutput, PutBucketPolicyInput,
+    PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutObjectInput,
+    PutObjectOutput, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use std::borrow::Cow;
@@ -596,5 +597,195 @@ where
         .map_err(|e| s3_error!(InternalError, "{}", e))?;
 
         todo!()
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn create_multipart_upload(
+        &self,
+        req: S3Request<CreateMultipartUploadInput>,
+    ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        debug!("Received PUT Request: {:#?}", req);
+        // Extract access check result
+        let UserAccess {
+            user_id, group_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        // Create paths
+        let (maybe_frontend_path, backend_path) =
+            create_paths(Some(&req.input.key), &req.input.bucket, &group_id, false)
+                .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let frontend_path = maybe_frontend_path
+            .ok_or_else(|| s3_error!(InvalidKeyPath, "Invalid path provided"))?;
+
+        // Check if frontend path is already occupied
+        let (bucket_path, _) = create_paths(None, &req.input.bucket, &group_id, false)
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let bucket_path =
+            bucket_path.ok_or_else(|| s3_error!(InvalidBucketName, "Invalid bucket"))?;
+        let bucket_path_clone = bucket_path.clone();
+        let store_clone = self.controller.io_handler.store.clone();
+        let frontend_path_clone = frontend_path.clone();
+        let exists = tokio::task::spawn_blocking(move || {
+            let read_txn = store_clone.create_txn(false)?;
+
+            // Try fetch content hash associated with frontend bucket
+            let res = store_clone.get(
+                &read_txn,
+                BUCKET_STATE_DB_NAME,
+                bucket_path_clone.as_bytes(),
+            )?;
+
+            if !res.is_some() {
+                return Err(ArunaDataError::InvalidParameter {
+                    name: "bucket".to_string(),
+                    error: "Bucket does not exist".to_string(),
+                });
+            };
+
+            // Try fetch content hash associated with frontend bucket+key
+            let res = store_clone.get(
+                &read_txn,
+                PATH_LOCATION_DB_NAME,
+                frontend_path_clone.as_bytes(),
+            )?;
+
+            let exists = res.is_some();
+            store_clone.commit(read_txn)?;
+
+            Ok::<bool, ArunaDataError>(exists)
+        })
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))?
+        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        if exists {
+            warn!(
+                "Frontend path: {} is already occupied and will be overwritten.",
+                frontend_path
+            )
+        }
+
+        let backend_bucket = self.controller.io_handler.eval_suitable_bucket().await?;
+        let multipart = MultipartUpload {
+            id: Ulid::new(),
+            bucket: bucket_path,
+            key: req.input.key,
+            created_by: user_id,
+            created_at: SystemTime::now(),
+            staging: true,
+            compressed: false,
+            encrypted: false,
+            partial: false,
+            storage_root: backend_bucket,
+            storage_path: backend_path,
+            parts: vec![],
+            finished: false,
+            frontend_path: Some(frontend_path),
+        };
+
+        self.controller
+            .io_handler
+            .create_multipart_upload(multipart.clone())
+            .await?;
+
+        //TODO: Set other response fields?
+        // - Version ?
+        let inner_response = CreateMultipartUploadOutput {
+            bucket: Some(multipart.bucket),
+            key: Some(multipart.key),
+            upload_id: Some(multipart.id.to_string()),
+            ..Default::default()
+        };
+        Ok(S3Response::new(inner_response))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn upload_part(
+        &self,
+        req: S3Request<UploadPartInput>,
+    ) -> S3Result<S3Response<UploadPartOutput>> {
+        let UserAccess { .. } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        let hash = match req.input.body {
+            None => {
+                error!("Empty body is not allowed");
+                return Err(s3_error!(InvalidRequest, "Empty body is not allowed"));
+            }
+            Some(data) => {
+                self.controller
+                    .io_handler
+                    .add_part(
+                        Ulid::from_string(&req.input.upload_id)
+                            .map_err(|_e| s3_error!(NoSuchUpload, "Invalid upload id provided"))?,
+                        req.input.part_number as usize,
+                        data,
+                    )
+                    .await?
+            }
+        };
+        let inner_response = UploadPartOutput {
+            e_tag: Some(hash.to_string()),
+            ..Default::default()
+        };
+        Ok(S3Response::new(inner_response))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn complete_multipart_upload(
+        &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let UserAccess {
+            user_id, group_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let parts = req
+            .input
+            .multipart_upload
+            .ok_or_else(|| s3_error!(InvalidRequest, "No multipart filed specified"))?
+            .parts
+            .ok_or_else(|| s3_error!(InvalidRequest, "No parts specified"))?
+            .into_iter()
+            .map(|p| -> Result<(usize, String), ArunaDataError> {
+                Ok((
+                    p.part_number.ok_or_else(|| {
+                        ArunaDataError::NotFound("Part number not found".to_string())
+                    })? as usize,
+                    p.e_tag
+                        .ok_or_else(|| ArunaDataError::NotFound("Etag not found".to_string()))?,
+                ))
+            })
+            .collect::<Result<Vec<(usize, String)>, ArunaDataError>>()?;
+
+        let (bucket, key, etag) = self
+            .controller
+            .io_handler
+            .finish_multipart_upload(
+                self.controller.network.get_realm_key(),
+                group_id,
+                Ulid::from_string(&req.input.upload_id)
+                    .map_err(|_e| s3_error!(InvalidRequest, "Invalid upload id provided"))?,
+                parts,
+            )
+            .await?;
+
+        let inner_response = CompleteMultipartUploadOutput {
+            bucket: Some(bucket),
+            e_tag: Some(etag),
+            key: Some(key),
+            ..Default::default()
+        };
+        Ok(S3Response::new(inner_response))
     }
 }

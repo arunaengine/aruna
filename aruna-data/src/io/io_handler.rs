@@ -1,7 +1,8 @@
 use crate::config::config::BackendConfig;
 use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::{
-    BUCKET_STATE_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, PATH_LOCATION_DB_NAME,
+    BUCKET_STATE_DB_NAME, LOCATION_DB_NAME, LOCATION_STATS_DB_NAME, MULTIPART_DB_NAME,
+    PATH_LOCATION_DB_NAME,
 };
 use crate::io::messages::{MessageType, ReplicationMessage};
 use crate::network::network_handler::NetworkHandler;
@@ -50,6 +51,7 @@ pub mod tables {
     pub const BUCKET_STATE_DB_NAME: &str = "bucket_states";
     pub const BUCKET_LOCATION_DB_NAME: &str = "bucket_locations_mapping";
     pub const REPLICATION_RULES_DB_NAME: &str = "replication_rules";
+    pub const MULTIPART_DB_NAME: &str = "multipart";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +85,7 @@ pub struct BucketState {
     pub created_by: UserIdentity,
     pub created_at: SystemTime,
     pub name: String,
+
     // TODO:
     // - Create MerkleTree for bucket for syncing buckets
     // pub merkle_tree: MerkleTree,
@@ -90,6 +93,26 @@ pub struct BucketState {
     pub root_hash: Option<blake3::Hash>, // None if empty
     pub backend_bucket: Option<String>,
     pub backend_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartUpload {
+    pub id: Ulid,
+    pub parts: Vec<(String, String, Hashes)>, // Storage paths (bucket, key, hashes)
+    pub finished: bool,
+    pub frontend_path: Option<String>,
+
+    // ObjectInfo part
+    pub bucket: String,
+    pub key: String,
+    pub created_by: UserIdentity,
+    pub created_at: SystemTime,
+    pub staging: bool,
+    pub compressed: bool,
+    pub encrypted: bool,
+    pub partial: bool,
+    pub storage_root: String,
+    pub storage_path: String,
 }
 
 #[derive(Clone)]
@@ -364,7 +387,7 @@ where
                 file_hashes: hashes,
             };
             let self_clone = self.clone();
-            let (bucket, path) = (bucket.clone(), permission_path.clone());
+            let path = permission_path.clone();
             let current_span = tracing::Span::current();
             let self_addr_clone = self_addr.node_id.clone();
             tokio::task::spawn_blocking(move || {
@@ -373,13 +396,7 @@ where
                     let self_clone = self_clone;
                     let mut wtxn = self_clone.store.create_txn(true)?;
 
-                    self_clone.store_location(
-                        location,
-                        bucket,
-                        frontend_path,
-                        Some(path),
-                        &mut wtxn,
-                    )?;
+                    self_clone.store_location(location, frontend_path, Some(path), &mut wtxn)?;
 
                     self_clone.store.commit(wtxn)?;
 
@@ -520,7 +537,6 @@ where
             let mut write_txn = self_clone.store.create_txn(true)?;
             self_clone.store_location(
                 info_clone,
-                bucket,
                 Some(frontend_path),
                 Some(permission_path),
                 &mut write_txn,
@@ -649,7 +665,6 @@ where
 
                 self_clone.store_location(
                     location,
-                    bucket,
                     Some(frontend_path_clone),
                     Some(perm_path),
                     &mut write_txn,
@@ -729,7 +744,6 @@ where
     pub fn store_location<'a, 'b>(
         &'a self,
         location: ObjectInfo,
-        frontend_bucket: String,
         frontend_path: Option<String>,
         resource_permission: Option<Path>,
         write_txn: &'b mut <St as Store<'a>>::Txn,
@@ -739,7 +753,7 @@ where
         // Update bucket
         let bucket = self
             .store
-            .get(&write_txn, BUCKET_STATE_DB_NAME, frontend_bucket.as_bytes())?
+            .get(&write_txn, BUCKET_STATE_DB_NAME, location.bucket.as_bytes())?
             .ok_or_else(|| ArunaDataError::NotFound("Bucket not found".to_string()))?;
         let mut bucket: BucketState = postcard::from_bytes(&bucket)?;
         bucket.merkle_tree.insert(data_hash.to_string());
@@ -760,7 +774,7 @@ where
         self.store.put(
             write_txn,
             BUCKET_STATE_DB_NAME,
-            frontend_bucket.as_bytes(),
+            location.bucket.as_bytes(),
             &postcard::to_allocvec(&bucket)?,
         )?;
 
@@ -908,6 +922,232 @@ where
         })
         .await??;
         Ok(tasks)
+    }
+
+    pub async fn create_multipart_upload(
+        &self,
+        multipart_upload: MultipartUpload,
+    ) -> Result<(), ArunaDataError> {
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut wtxn = store.create_txn(true)?;
+
+            store.put(
+                &mut wtxn,
+                MULTIPART_DB_NAME,
+                multipart_upload.id.to_bytes().as_slice(),
+                &postcard::to_allocvec(&multipart_upload)?,
+            )?;
+            store.commit(wtxn)?;
+
+            Ok::<(), ArunaDataError>(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    pub async fn add_part<S>(
+        &self,
+        multipart_upload: Ulid,
+        part_number: usize,
+        mut data_stream: S,
+    ) -> Result<blake3::Hash, ArunaDataError>
+    where
+        S: ByteStream<Item = Result<Bytes, StdError>> + Send + Sync + Unpin + 'static,
+    {
+        let backend_bucket = self.eval_suitable_bucket().await?;
+        let backend_path = format!("multipart-{}-{}", multipart_upload.to_string(), part_number);
+
+        let operator = get_backend_operator(
+            &self.backend.backend_type,
+            self.backend.access_config.clone(),
+            &backend_bucket,
+        )
+        .await?;
+
+        let mut hasher = Hasher::new();
+        let mut written_bytes = 0;
+        let mut writer = operator
+            .writer_with(&backend_path)
+            .chunk(BLOCK_SIZE.bytes())
+            .await
+            .map_err(|e| ArunaDataError::ServerError(e.to_string()))?
+            .into_futures_async_write();
+
+        // Fetch stream chunks
+        while let Some(bytes) = data_stream.next().await {
+            let bytes = bytes.map_err(|e| ArunaDataError::ServerError(e.to_string()))?;
+
+            // Write first, then update hashes and written bytes
+            writer.write_all(&bytes).await?;
+            hasher.update(&bytes);
+            written_bytes = written_bytes + bytes.len();
+        }
+        writer.flush().await?;
+        writer.close().await?;
+
+        // Store some technical metadata in persistence and publish content-hash
+        let hashes = hasher.finalize()?;
+        let blake3_hash = hashes.blake3.clone();
+
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut wtxn = store.create_txn(true)?;
+            let upload_id = multipart_upload.to_bytes();
+            let multipart = store
+                .get(&wtxn, MULTIPART_DB_NAME, upload_id.as_slice())?
+                .ok_or_else(|| {
+                    ArunaDataError::NotFound(format!(
+                        "Upload with id {} not found",
+                        multipart_upload
+                    ))
+                })?;
+            let mut multipart: MultipartUpload = postcard::from_bytes(&multipart)?;
+            multipart
+                .parts
+                .insert(part_number, (backend_bucket, backend_path, hashes));
+
+            store.put(
+                &mut wtxn,
+                MULTIPART_DB_NAME,
+                upload_id.as_slice(),
+                &postcard::to_allocvec(&multipart)?,
+            )?;
+
+            store.commit(wtxn)?;
+
+            Ok::<(), ArunaDataError>(())
+        })
+        .await??;
+        Ok(blake3_hash)
+    }
+
+    pub async fn finish_multipart_upload(
+        &self,
+        realm_key: RealmKey,
+        group_id: Ulid,
+        multipart_upload: Ulid,
+        parts: Vec<(usize, String)>,
+    ) -> Result<(String, String, String), ArunaDataError> {
+        let store = self.store.clone();
+
+        let etags = parts
+            .iter()
+            .map(|(_, etag)| {
+                blake3::Hash::from_str(etag).map_err(|_| ArunaDataError::ConversionError {
+                    from: "&str".to_string(),
+                    to: "blake3::Hash".to_string(),
+                })
+            })
+            .collect::<Result<Vec<blake3::Hash>, ArunaDataError>>()?;
+        let multipart = tokio::task::spawn_blocking(move || {
+            let mut wtxn = store.create_txn(true)?;
+
+            let upload_id = multipart_upload.to_bytes();
+            let multipart = store
+                .get(&mut wtxn, MULTIPART_DB_NAME, upload_id.as_slice())?
+                .ok_or_else(|| {
+                    ArunaDataError::NotFound(format!(
+                        "Upload with id {} not found",
+                        multipart_upload
+                    ))
+                })?;
+            let mut multipart: MultipartUpload = postcard::from_bytes(&multipart)?;
+            multipart
+                .parts
+                .retain(|(_, _, hashes)| etags.contains(&hashes.blake3));
+            multipart.finished = true;
+
+            store.commit(wtxn)?;
+
+            Ok::<MultipartUpload, ArunaDataError>(multipart)
+        })
+        .await??;
+
+        let mut hasher = Hasher::new();
+        let mut written_bytes = 0;
+
+        let operator = get_backend_operator(
+            &self.backend.backend_type,
+            self.backend.access_config.clone(),
+            &multipart.storage_root,
+        )
+        .await?;
+
+        let mut writer = operator
+            .writer_with(&multipart.storage_path)
+            .chunk(BLOCK_SIZE.bytes())
+            .await
+            .map_err(|e| ArunaDataError::ServerError(e.to_string()))?;
+
+        for (bucket, key, _hashes) in multipart.parts {
+            let reader = get_reader(&self.get_operator(&bucket).await?, &key, None, None).await?;
+            let buffer = reader.read(..).await?;
+
+            let bytes = buffer.to_bytes();
+            let bytes = bytes.iter().as_slice();
+            hasher.update(bytes);
+            written_bytes = written_bytes + buffer.len();
+
+            writer.write(buffer).await?;
+        }
+        writer.close().await?;
+
+        let handler = self.clone();
+        let bucket_name =
+            extract_frontend_bucket(multipart.frontend_path.as_ref().ok_or_else(|| {
+                ArunaDataError::NotFound("Frontendpath for multipart upload".to_string())
+            })?)?;
+        let location = ObjectInfo {
+            bucket: multipart.bucket,
+            key: multipart.key.clone(),
+            created_by: multipart.created_by,
+            created_at: multipart.created_at,
+            staging: multipart.staging,
+            compressed: multipart.compressed,
+            encrypted: multipart.encrypted,
+            partial: multipart.partial,
+            storage_root: multipart.storage_root,
+            storage_path: multipart.storage_path,
+            file_size: written_bytes as u64,
+            file_hashes: hasher.finalize()?,
+        };
+
+        let bucket = location.bucket.clone();
+        let key = location.key.clone();
+
+        let etag = location.file_hashes.blake3.clone();
+
+        let permission = PathBuilder::new()
+            .realm_id(realm_key)
+            .group_data(
+                group_id,
+                bucket_name,
+                multipart.key,
+                etag,
+            )
+            .build()?;
+        tokio::task::spawn_blocking(move || {
+            let mut wtxn = handler.store.create_txn(true)?;
+
+            handler.store_location(
+                location,
+                multipart.frontend_path,
+                Some(permission),
+                &mut wtxn,
+            )?;
+
+            handler
+                .store
+                .remove(&mut wtxn, MULTIPART_DB_NAME, &multipart_upload.to_bytes())?;
+
+            handler.store.commit(wtxn)?;
+
+            Ok::<(), ArunaDataError>(())
+        })
+        .await??;
+
+        Ok((bucket, key, etag.to_string()))
     }
 }
 

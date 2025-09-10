@@ -11,14 +11,9 @@ mod tests {
     use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
     use aruna_data::util::s3::create_s3_client;
     use aws_sdk_s3::types::{
-        Destination, ReplicationConfiguration, ReplicationRule, ReplicationStatus,
+        Destination, ReplicationConfiguration, ReplicationRule,
     };
     use blake3::Hasher;
-    use iroh::{NodeAddr, node_info};
-    use s3s::dto::ReplicationRuleStatus;
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::{EnvFilter, Layer};
     use ulid::Ulid;
 
     const OFFSET: u16 = 0;
@@ -273,18 +268,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_replicate_object() {
-        let logging_env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or("none".into())
-            .add_directive("aruna_data=trace".parse().unwrap())
-            .add_directive("aruna_task=trace".parse().unwrap());
-
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_file(true)
-            .with_line_number(true)
-            .with_filter(logging_env_filter);
-
-        tracing_subscriber::registry().with(fmt_layer).init();
-
         // Initialize multiple nodes with a user
         let mut test_nodes = init_test_nodes(2, OFFSET, vec![]).await.unwrap();
         let node = test_nodes.node_services.pop().unwrap();
