@@ -1,6 +1,6 @@
 use super::structs::{Author, Group, KeyValue, Resource, User, VisibilityClass};
 use crate::error::ArunaMetadataError;
-use crate::models::structs::Data;
+use crate::models::structs::{Change, Data};
 use crate::transactions::controller::Controller;
 use crate::{
     models::structs::PolicyResult, network::network_trait::Network,
@@ -8,7 +8,6 @@ use crate::{
 };
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
-use iroh::NodeAddr;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ulid::Ulid;
@@ -374,6 +373,7 @@ pub enum ForwardRequest {
     CreateProject(CreateProjectRequest),
     CreateResource(CreateResourceRequest),
     GetResource(GetResourceRequest),
+    GetResourceHistory(GetResourceHistoryRequest),
     UpdateResource(ResourceUpdateRequests),
     Search(SearchRequest),
 }
@@ -394,6 +394,7 @@ pub enum ForwardResponse {
     CreateProject(Result<CreateProjectResponse, ArunaMetadataError>),
     CreateResource(Result<CreateResourceResponse, ArunaMetadataError>),
     GetResource(Result<GetResourceResponse, ArunaMetadataError>),
+    GetResourceHistory(Result<GetResourceHistoryResponse, ArunaMetadataError>),
     UpdateResource(Result<ResourceUpdateResponses, ArunaMetadataError>),
     Search(Result<SearchResponse, ArunaMetadataError>),
 }
@@ -435,4 +436,14 @@ pub struct GetInfoResponse {
     pub realm_id: String,
     pub node_id: String,
     pub node_addr: String,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams)]
+pub struct GetResourceHistoryRequest {
+    pub id: Ulid,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetResourceHistoryResponse {
+    pub history: Vec<Change>,
 }

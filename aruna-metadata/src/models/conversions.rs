@@ -1,7 +1,13 @@
-use tracing::trace;
+use aruna_permission::UserIdentity;
+use automerge::ExpandedChange;
+use serde_json::json;
+use tracing::{error, trace};
 use ulid::Ulid;
 
-use crate::error::ArunaMetadataError;
+use crate::{
+    error::ArunaMetadataError,
+    models::structs::{Actor, Change},
+};
 
 use super::{
     requests::{GetUserRequest, GetUserRequestOuter},
@@ -82,6 +88,62 @@ impl TryFrom<TypedSavedDoc> for TypedDoc {
             TypedSavedDoc::Resource(d) => TypedDoc::Resource(automerge::AutoCommit::load(&d)?),
             TypedSavedDoc::Group(d) => TypedDoc::Group(automerge::AutoCommit::load(&d)?),
             TypedSavedDoc::User(d) => TypedDoc::User(automerge::AutoCommit::load(&d)?),
+        })
+    }
+}
+
+impl TryFrom<String> for Actor {
+    type Error = ArunaMetadataError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let (user_identity, rest) = value.split_at(96);
+        let (realm_key, node_id) = rest.split_at(64);
+        let unhexed_user = hex::decode(user_identity).map_err(|e| {
+            error!("{}", e);
+            ArunaMetadataError::ConversionError {
+                from: "Hex".to_string(),
+                to: "Vec<u8>".to_string(),
+            }
+        })?;
+        let user_identity = UserIdentity::from_bytes(&unhexed_user)?;
+        Ok(Actor {
+            user_identity: user_identity.to_string(),
+            realm_key: realm_key.to_string(),
+            node_id: node_id.to_string(),
+        })
+    }
+}
+
+impl TryFrom<ExpandedChange> for Change {
+    type Error = ArunaMetadataError;
+    fn try_from(value: ExpandedChange) -> Result<Self, Self::Error> {
+        Ok(Change {
+            operations: value
+                .operations
+                .iter()
+                .map(|o| {
+                    let id = o.obj.clone();
+                    let key = o.key.clone();
+                    let predecessor = o.pred.clone();
+                    let action = o.action.clone();
+                    let insert = o.insert;
+
+                    json!({
+                            "id": id.to_string(),
+                            "key": key,
+                            "predecessor": predecessor,
+                            "action": action,
+                            "insert": insert,
+                    })
+                })
+                .collect(),
+            actor_id: value.actor_id.to_string().try_into()?,
+            hash: value.hash.map(|h| h.to_string()),
+            seq: value.seq,
+            start_op: value.start_op.into(),
+            time: value.time,
+            message: value.message,
+            deps: value.deps.iter().map(|d| d.to_string()).collect(),
+            extra_bytes: value.extra_bytes,
         })
     }
 }
@@ -195,8 +257,7 @@ mod tests {
     use ulid::Ulid;
 
     use crate::models::structs::{
-        Author, Data, Hash, HashAlgorithm, KeyValue, Resource, ResourceVariant, User,
-        VisibilityClass,
+        Author, Data, KeyValue, Resource, ResourceVariant, User, VisibilityClass,
     };
 
     #[test]

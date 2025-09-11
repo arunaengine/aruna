@@ -714,3 +714,35 @@ where
 {
     into_axum_response(state.request(GetInfoRequest{}, extract_token(&headers)).await)
 }
+
+// Get resource history
+#[utoipa::path(
+    get,
+    path = "/resources/history",
+    params(
+        GetResourceHistoryRequest,
+    ),
+    responses(
+        (status = 200, body = GetResourceHistoryResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        (), // <-- make optional authentication
+        ("auth" = []),
+    ),
+    tag = RESOURCES,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn get_resource_history<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    axum_extra::extract::Query(request): axum_extra::extract::Query<GetResourceHistoryRequest>,
+    header: HeaderMap,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    into_axum_response(state.request(request, extract_token(&header)).await)
+}
+

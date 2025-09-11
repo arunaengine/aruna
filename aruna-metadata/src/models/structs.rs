@@ -11,6 +11,7 @@ use autosurgeon::{Hydrate, Reconcile};
 use chrono::{DateTime, Utc};
 use iroh::NodeAddr;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use ulid::Ulid;
 use utoipa::ToSchema;
@@ -350,4 +351,24 @@ pub enum TaskPayload {
         path: Path,
         nodes: Vec<NodeAddr>,
     },
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug, ToSchema)]
+pub struct Change {
+    pub operations: Vec<Value>,
+    pub actor_id: Actor,
+    pub hash: Option<String>,
+    pub seq: u64,
+    pub start_op: u64,
+    pub time: i64,
+    pub message: Option<String>,
+    pub deps: Vec<String>,
+    pub extra_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Debug, ToSchema)]
+pub struct Actor {
+    pub user_identity: String,
+    pub realm_key: String,
+    pub node_id: String,
 }

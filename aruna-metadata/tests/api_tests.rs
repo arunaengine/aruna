@@ -2,19 +2,30 @@ pub mod commons;
 
 #[cfg(test)]
 mod api_tests {
-    use crate::commons::{Server, TestServers, create_user_with_token, init_lmdb_servers};
+    use crate::commons::{
+        Server, TestServers, create_user_with_token, init_lmdb_servers, init_server,
+    };
     use aruna_metadata::{
         models::{
             requests::{
                 AddGroupRequest, AddGroupResponse, AddUserToGroupRequest, AddUserToGroupResponse,
                 CreateProjectRequest, CreateProjectResponse, CreateResourceRequest,
-                GetGroupResponse, GetResourceResponse, GetUserResponse, Request, SearchResponse,
+                GetGroupResponse, GetResourceHistoryResponse,
+                GetResourceResponse, GetUserResponse, Request, ResourceUpdateRequests,
+                SearchResponse, UpdateResourceAuthorsRequest, UpdateResourceDataRequest,
+                UpdateResourceDescriptionRequest, UpdateResourceIdentifiersRequest,
+                UpdateResourceLabelsRequest, UpdateResourceLicenseRequest,
+                UpdateResourceNameRequest, UpdateResourceTitleRequest,
+                UpdateResourceVisibilityRequest,
             },
-            structs::Resource,
+            structs::{Author, Data, KeyValue, Resource},
         },
         network::network_trait::Network,
     };
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
     use std::{collections::BTreeMap, time::Duration};
+    use ulid::Ulid;
     const OFFSET: u16 = 0;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -674,5 +685,167 @@ mod api_tests {
                 "test_search_2".to_string()
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_resource_updates() {
+        let realm_key = SigningKey::generate(&mut OsRng);
+        let ref node @ Server {
+            ref controller,
+            ref path,
+            ..
+        } = init_server(realm_key.clone(), OFFSET, None, false)
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::new();
+
+        let (user1_identity, user1_token) =
+            create_user_with_token(&node, "create_resource_test1".to_string())
+                .await
+                .unwrap();
+        let (user2_identity, user2_token) =
+            create_user_with_token(&node, "create_resource_test2".to_string())
+                .await
+                .unwrap();
+
+        let request = AddGroupRequest {
+            name: "create_test_group1".to_string(),
+        };
+        let response = request
+            .run_request(user1_identity.clone(), &controller)
+            .await
+            .unwrap();
+
+        let group_id = response.group.id;
+
+        let request = AddUserToGroupRequest {
+            group_id,
+            user_roles: BTreeMap::from([(user2_identity.to_string(), vec!["member".to_string()])]),
+        };
+        request
+            .run_request(user1_identity.clone(), &controller)
+            .await
+            .unwrap();
+
+        let create_resource = CreateProjectRequest {
+            name: format!("test_resource_from_user1"),
+            visibility: aruna_metadata::models::structs::VisibilityClass::Private,
+            group_id,
+            ..Default::default()
+        };
+
+        let project: Resource = client
+            .post(format!("{path}/resources/project"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user1_token.to_string()).as_ref(),
+            )
+            .json(&create_resource)
+            .send()
+            .await
+            .unwrap()
+            .json::<CreateProjectResponse>()
+            .await
+            .unwrap()
+            .resource;
+        let project_id = project.id;
+
+        let update_resource_name = UpdateResourceNameRequest {
+            id: project_id,
+            name: "a new project name".to_string(),
+        };
+
+        let update_resource_title = UpdateResourceTitleRequest {
+            id: project_id,
+            title: "A new title".to_string(),
+        };
+
+        let update_resource_description = UpdateResourceDescriptionRequest {
+            id: project_id,
+            description: "A new description".to_string(),
+        };
+
+        let update_resource_visibility = UpdateResourceVisibilityRequest {
+            id: project_id,
+            visibility: aruna_metadata::models::structs::VisibilityClass::Public,
+        };
+
+        let update_resource_license = UpdateResourceLicenseRequest {
+            id: project_id,
+            license_id: Ulid::new(),
+        };
+
+        let update_resource_labels = UpdateResourceLabelsRequest {
+            id: project_id,
+            labels_to_add: vec![KeyValue {
+                key: "a new key".to_string(),
+                value: "a new value".to_string(),
+            }],
+            labels_to_remove: vec![],
+        };
+
+        let update_resource_ids = UpdateResourceIdentifiersRequest {
+            id: project_id,
+            ids_to_add: vec!["https://a.doi.org/1203971450".to_string()],
+            ids_to_remove: vec![],
+        };
+
+        let update_resource_authors = UpdateResourceAuthorsRequest {
+            id: project_id,
+            authors_to_add: vec![Author {
+                first: "Jane".to_string(),
+                last: "Doe".to_string(),
+                id: "https://www.albumoftheyear.org/album/4323-converge-jane-doe.php".to_string(),
+            }],
+            authors_to_remove: vec![],
+        };
+
+        let update_resource_data = UpdateResourceDataRequest {
+            id: project_id,
+            data_to_add: vec![Data::Link("https://this.is.a.link.to.data.org".to_string())],
+            data_to_remove: vec![],
+        };
+
+        let requests = vec![
+            ResourceUpdateRequests::Name(update_resource_name),
+            ResourceUpdateRequests::Title(update_resource_title),
+            ResourceUpdateRequests::Description(update_resource_description),
+            ResourceUpdateRequests::Visibility(update_resource_visibility),
+            ResourceUpdateRequests::License(update_resource_license),
+            ResourceUpdateRequests::Labels(update_resource_labels),
+            ResourceUpdateRequests::Identifiers(update_resource_ids),
+            ResourceUpdateRequests::Authors(update_resource_authors),
+            ResourceUpdateRequests::Data(update_resource_data),
+        ];
+
+        for (idx, request) in requests.into_iter().enumerate() {
+            if idx % 2 == 0 {
+                controller
+                    .request(request, Some(user1_token.clone()))
+                    .await
+                    .unwrap();
+            } else {
+                controller
+                    .request(request, Some(user2_token.clone()))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let response: GetResourceHistoryResponse = client
+            .get(format!("{path}/resources/history"))
+            .header::<&str, &str>(
+                "Authorization",
+                format!("Bearer {}", user1_token.to_string()).as_ref(),
+            )
+            .query(&[("id".to_string(), project_id.to_string())])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response.history.len(), 10);
     }
 }

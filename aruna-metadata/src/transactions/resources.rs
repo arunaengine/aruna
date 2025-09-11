@@ -1,8 +1,9 @@
 use crate::logerr;
 use crate::models::requests::{
-    CreateResourceRequest, CreateResourceResponse, ForwardResponse, Request,
-    UpdateResourceDataResponse,
+    CreateResourceRequest, CreateResourceResponse, ForwardResponse, GetResourceHistoryRequest,
+    GetResourceHistoryResponse, Request, UpdateResourceDataResponse,
 };
+use crate::models::structs::Change;
 use crate::{
     error::ArunaMetadataError,
     models::{
@@ -23,6 +24,7 @@ use crate::{
 use aruna_permission::paths::PathComponent;
 use aruna_permission::{Action, Path, UserIdentity, paths::PathBuilder};
 use aruna_storage::storage::store::Store;
+use automerge::ExpandedChange;
 use rand::seq::IteratorRandom;
 use tracing::{error, trace};
 use ulid::Ulid;
@@ -231,9 +233,10 @@ where
             .build()
             .map_err(|e| ArunaMetadataError::ServerError(e.to_string()))?;
         let node_id = controller.network.get_addr().await?.node_id;
+        let realm_key = controller.network.get_realm_key().await?;
         let doc = controller
             .persistence
-            .add_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
+            .add_resource(node_id.as_bytes(), &realm_key, &user, path.clone(), resource.clone())
             .await?;
 
         let mut chunk_hasher = blake3::Hasher::new();
@@ -577,9 +580,10 @@ where
         };
 
         let node_id = controller.network.get_addr().await?.node_id;
+        let realm_key = controller.network.get_realm_key().await?;
         let doc = controller
             .persistence
-            .update_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
+            .update_resource(node_id.as_bytes(), &realm_key, &user, path.clone(), resource.clone())
             .await?;
 
         let mut chunk_hasher = blake3::Hasher::new();
@@ -757,6 +761,7 @@ where
             // hashes: Vec::new(),
         };
         let node_id = controller.network.get_addr().await?.node_id;
+        let realm_key = controller.network.get_realm_key().await?;
 
         let path = Path::builder()
             .realm_id(realm_id)
@@ -769,7 +774,7 @@ where
 
         let doc = controller
             .persistence
-            .add_resource(node_id.as_bytes(), &user, path.clone(), resource.clone())
+            .add_resource(node_id.as_bytes(),&realm_key, &user, path.clone(), resource.clone())
             .await?;
 
         let mut chunk_hasher = blake3::Hasher::new();
@@ -798,5 +803,125 @@ where
             .await?;
 
         Ok(CreateProjectResponse { resource })
+    }
+}
+
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for GetResourceHistoryRequest
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    type Response = GetResourceHistoryResponse;
+    type AuthContext = Option<UserIdentity>;
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn authorize(
+        &self,
+        token: Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<UserIdentity>, crate::error::ArunaMetadataError> {
+        let (action, id) = (Action::Read, self.id);
+
+        let identity = match token {
+            Some(token) => Some(controller.persistence.get_identity(token).await?),
+            None => None,
+        };
+        if let Some((i, _)) = controller
+            .persistence
+            .authorize(identity, action, id)
+            .await?
+        {
+            Ok(Some(i))
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn sync_or_forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+
+        let self_addr = controller.network.get_addr().await?;
+        let nodes = controller.network.find(subject_hash).await?;
+        if nodes.contains(&self_addr) {
+            if let Some(token) = token {
+                controller
+                    .sync_user(token.clone())
+                    .await
+                    .map_err(logerr!())?;
+            }
+            Ok(None)
+        } else {
+            Ok(Some(self.forward(token, controller).await?))
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let body = crate::network::network_trait::Body::Request {
+            token: token.clone(),
+            request: crate::models::requests::ForwardRequest::GetResourceHistory(self.clone()),
+        };
+        let self_addr = controller.network.get_addr().await?;
+
+        let mut chunk_hasher = blake3::Hasher::new();
+        chunk_hasher.update(self.id.to_bytes().as_slice());
+        let subject = chunk_hasher.finalize();
+        let subject_hash = subject.as_bytes();
+
+        let nodes = controller.network.find(subject_hash).await?;
+        if nodes.is_empty() {
+            return Err(crate::error::ArunaMetadataError::NetworkError(
+                "No node to forward request to found".to_string(),
+            ));
+        }
+        let mut nodes = nodes
+            .iter()
+            .filter(|addr| addr.node_id != self_addr.node_id);
+
+        let Some(first_node) = nodes.next() else {
+            return Err(crate::error::ArunaMetadataError::NetworkError(
+                "No node to forward request to found".to_string(),
+            ));
+        };
+        match controller
+            .network
+            .forward(body, subject_hash, first_node.clone())
+            .await?
+        {
+            crate::models::requests::ForwardResponse::GetResourceHistory(response) => Ok(response?),
+            e => Err(ArunaMetadataError::NetworkError(format!(
+                "Got wrong forward response {e:?}"
+            ))),
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn run_request(
+        self,
+        _user: Option<UserIdentity>, // authorize checks if resource is pub
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let persistor = controller.persistence.clone();
+        let resource: Vec<ExpandedChange> = persistor.get_resource_history(self.id).await?;
+        Ok(GetResourceHistoryResponse {
+            history: resource
+                .into_iter()
+                .map(|r: ExpandedChange| Change::try_from(r))
+                .collect::<Result<Vec<Change>, ArunaMetadataError>>()?,
+        })
     }
 }

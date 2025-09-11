@@ -1080,8 +1080,8 @@ where
             .await
             .map_err(|e| ArunaDataError::ServerError(e.to_string()))?;
 
-        for (bucket, key, _hashes) in multipart.parts {
-            let reader = get_reader(&self.get_operator(&bucket).await?, &key, None, None).await?;
+        for (bucket, key, _hashes) in &multipart.parts {
+            let reader = get_reader(&self.get_operator(bucket).await?, key, None, None).await?;
             let buffer = reader.read(..).await?;
 
             let bytes = buffer.to_bytes();
@@ -1120,12 +1120,7 @@ where
 
         let permission = PathBuilder::new()
             .realm_id(realm_key)
-            .group_data(
-                group_id,
-                bucket_name,
-                multipart.key,
-                etag,
-            )
+            .group_data(group_id, bucket_name, multipart.key, etag)
             .build()?;
         tokio::task::spawn_blocking(move || {
             let mut wtxn = handler.store.create_txn(true)?;
@@ -1146,6 +1141,25 @@ where
             Ok::<(), ArunaDataError>(())
         })
         .await??;
+
+        let parts = multipart.parts;
+        let backend_type = self.backend.backend_type.clone();
+        let backend_config = self.backend.access_config.clone();
+
+        tokio::spawn(async move {
+            // TODO: Add to task handler
+            for (bucket, key, _) in parts {
+                let operator = get_backend_operator(
+                    &backend_type,
+                    backend_config.clone(),
+                    &bucket,
+                )
+                .await?;
+
+                operator.delete(&key).await?;
+            }
+            Ok::<(), ArunaDataError>(())
+        });
 
         Ok((bucket, key, etag))
     }

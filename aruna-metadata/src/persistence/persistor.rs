@@ -13,7 +13,7 @@ use aruna_permission::{
     manager::{AddUserPrepare, CreateGroupPrepare},
 };
 use aruna_storage::storage::store::Store;
-use automerge::{ActorId, AutoCommit, sync::State};
+use automerge::{ActorId, AutoCommit, ExpandedChange, sync::State};
 use autosurgeon::reconcile;
 use iroh::PublicKey;
 use parking_lot::{Mutex, RwLock};
@@ -156,6 +156,7 @@ where
     pub async fn add_resource(
         &self,
         node_key: &[u8; 32],
+        realm_key: &[u8; 32],
         user: &UserIdentity,
         path: Path,
         resource: Resource,
@@ -164,8 +165,8 @@ where
         let permission_manager = self.permission_manager.clone();
         let actor_id = ActorId::from(
             [
-                user.user_ulid.to_bytes().as_slice(),
-                user.realm_key.as_slice(),
+                user.to_bytes().as_slice(),
+                realm_key.as_slice(),
                 node_key.as_slice(),
             ]
             .concat(),
@@ -249,6 +250,40 @@ where
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn get_resource_history(
+        &self,
+        resource_id: Ulid,
+    ) -> Result<Vec<ExpandedChange>, ArunaMetadataError> {
+        let store = self.store.clone();
+        let current_span = tracing::Span::current();
+        let result = tokio::task::spawn_blocking(move || {
+            current_span.in_scope(|| {
+                let read_txn = store.create_txn(false)?;
+                let byte_id = resource_id.to_bytes();
+                let Some(res) = store.get(&read_txn, RESOURCE_DB_NAME, &byte_id)? else {
+                    return Err(ArunaMetadataError::NotFound(format!(
+                        "{resource_id} not found"
+                    )));
+                };
+
+                let mut doc = automerge::AutoCommit::load(res.as_ref())?;
+                let changes = doc.get_changes(&[]);
+
+                let mut history: Vec<ExpandedChange> = Vec::new();
+                for change in changes {
+                    history.push(change.decode())
+                }
+
+                store.commit(read_txn)?;
+                Ok(history)
+            })
+        })
+        .await
+        .map_err(|_e| ArunaMetadataError::ServerError("Join task error".to_string()))??;
+        Ok(result)
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
     pub async fn get_group(&self, group_id: Ulid) -> Result<Group, ArunaMetadataError> {
         let store = self.store.clone();
         let current_span = tracing::Span::current();
@@ -280,6 +315,7 @@ where
     pub async fn add_user(
         &self,
         node_key: &[u8; 32],
+        realm_key: &[u8; 32],
         user_name: String,
         oidc_token: OidcToken,
     ) -> Result<(User, AutoCommit), ArunaMetadataError> {
@@ -289,6 +325,7 @@ where
         let iss = oidc_token.iss;
         let sub = oidc_token.sub;
         let node_key = *node_key;
+        let realm_key = *realm_key;
 
         let current_span = tracing::Span::current();
         let result = tokio::task::spawn_blocking(move || {
@@ -302,8 +339,8 @@ where
                 )?;
                 let actor_id = ActorId::from(
                     [
-                        user_identity.user_ulid.to_bytes().as_slice(),
-                        user_identity.realm_key.as_slice(),
+                        user_identity.to_bytes().as_slice(),
+                        realm_key.as_slice(),
                         node_key.as_slice(),
                     ]
                     .concat(),
@@ -424,23 +461,22 @@ where
     pub async fn update_resource(
         &self,
         node_key: &[u8; 32],
+        realm_key: &[u8; 32],
         user_identity: &UserIdentity,
         path: Path,
         resource: Resource,
     ) -> Result<AutoCommit, ArunaMetadataError> {
-        // Clones for spawn_blocking
         let store = self.store.clone();
         let search = self.search.clone();
-        let user_id = user_identity.user_ulid;
         let resource_id = resource.id.to_bytes();
         let res_clone = resource.clone();
 
         let group_id = group_from_path(path)?;
-        // Generate actor id
+
         let actor_id = ActorId::from(
             [
-                user_id.to_bytes().as_slice(),
-                user_identity.realm_key.as_slice(),
+                user_identity.to_bytes().as_slice(),
+                realm_key.as_slice(),
                 node_key.as_slice(),
             ]
             .concat(),
@@ -469,6 +505,7 @@ where
                     let mut doc = automerge::AutoCommit::load(res.as_ref())?.with_actor(actor_id);
                     let visibility = visiblity_from_doc(&doc)?;
                     reconcile(&mut doc, resource.clone())?;
+
                     doc.commit();
                     let res = doc.save();
 
@@ -520,8 +557,8 @@ where
         // Generate actor id
         let actor_id = ActorId::from(
             [
-                user.user_ulid.to_bytes().as_slice(),
-                &user.realm_key,
+                user.to_bytes().as_slice(),
+                realm_key.as_slice(),
                 node_key.as_slice(),
             ]
             .concat(),

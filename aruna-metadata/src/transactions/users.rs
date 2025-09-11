@@ -92,9 +92,10 @@ where
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let node_id = controller.network.get_addr().await?.node_id;
+        let realm_key = controller.network.get_realm_key().await?;
         let (user, doc) = controller
             .persistence
-            .add_user(node_id.as_bytes(), self.name, auth_ctx)
+            .add_user(node_id.as_bytes(), &realm_key, self.name, auth_ctx)
             .await?;
 
         // Store user hash in DHT

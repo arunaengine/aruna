@@ -136,29 +136,29 @@ where
     type Response = GetInfoResponse;
     type AuthContext = Option<Vec<Ulid>>; // (Identity, Groups)
 
-    #[tracing::instrument(level = "trace", skip(controller, token))]
+    #[tracing::instrument(level = "trace", skip(_controller, _token))]
     async fn authorize(
         &self,
-        token: Option<String>,
-        controller: &super::controller::Controller<St, Se, N>,
+        _token: Option<String>,
+        _controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Vec<Ulid>>, crate::error::ArunaMetadataError> {
         Ok(None)
     }
 
-    #[tracing::instrument(level = "trace", skip(controller, token))]
+    #[tracing::instrument(level = "trace", skip(_controller, _token))]
     async fn sync_or_forward(
         &self,
-        token: &Option<String>,
-        controller: &super::controller::Controller<St, Se, N>,
+        _token: &Option<String>,
+        _controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
         Ok(None)
     }
 
-    #[tracing::instrument(level = "trace", skip(controller))]
+    #[tracing::instrument(level = "trace", skip(_controller))]
     async fn forward(
         &self,
         token: &Option<String>,
-        controller: &super::controller::Controller<St, Se, N>,
+        _controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         Err(ArunaMetadataError::NotFound(
             "Forwarding GetInfoRequest is not implemented".to_string(),
@@ -168,7 +168,7 @@ where
     #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
-        groups: Option<Vec<Ulid>>,
+        _groups: Option<Vec<Ulid>>,
         controller: &super::controller::Controller<St, Se, N>,
     ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
         let realm_id = HEXLOWER.encode(&controller.network.get_realm_key().await?);

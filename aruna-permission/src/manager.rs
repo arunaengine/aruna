@@ -1245,4 +1245,17 @@ mod tests {
         txn.commit().unwrap();
         cleanup_test_dir(&test_dir);
     }
+
+    #[tokio::test]
+    async fn test_user_identity() {
+        let realm_key = create_test_realm_key(30);
+        let identity = UserIdentity {
+            user_ulid: Ulid::new(),
+            realm_key,
+        };
+        let to_string = identity.to_string();
+        assert_eq!(identity, UserIdentity::from_string(to_string).unwrap());
+        let to_bytes = identity.to_bytes();
+        assert_eq!(identity, UserIdentity::from_bytes(&to_bytes).unwrap());
+    }
 }
