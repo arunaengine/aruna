@@ -1028,7 +1028,7 @@ where
         group_id: Ulid,
         multipart_upload: Ulid,
         parts: Vec<(usize, String)>,
-    ) -> Result<(String, String, String), ArunaDataError> {
+    ) -> Result<(String, String, blake3::Hash), ArunaDataError> {
         let store = self.store.clone();
 
         let etags = parts
@@ -1147,7 +1147,7 @@ where
         })
         .await??;
 
-        Ok((bucket, key, etag.to_string()))
+        Ok((bucket, key, etag))
     }
 }
 

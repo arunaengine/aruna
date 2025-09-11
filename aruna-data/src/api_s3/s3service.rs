@@ -750,6 +750,7 @@ where
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+
         let parts = req
             .input
             .multipart_upload
@@ -780,9 +781,15 @@ where
             )
             .await?;
 
+        self.controller
+            .network
+            .store(etag)
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
         let inner_response = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
-            e_tag: Some(etag),
+            e_tag: Some(etag.to_string()),
             key: Some(key),
             ..Default::default()
         };

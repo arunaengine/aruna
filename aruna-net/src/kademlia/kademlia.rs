@@ -12,7 +12,7 @@ use n0_future::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{Instrument, error, info, trace, warn};
+use tracing::{debug, error, info, trace, warn, Instrument};
 use ulid::Ulid;
 
 pub const KADEMLIA_PROTOCOL_ID: u32 = 1;
@@ -177,7 +177,7 @@ impl Kademlia {
 
         // Log maintenance results if significant
         if pruned_count > 0 {
-            println!("Maintenance: pruned {pruned_count} expired resource entries");
+            debug!("Maintenance: pruned {pruned_count} expired resource entries");
         }
     }
 

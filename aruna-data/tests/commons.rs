@@ -88,6 +88,7 @@ pub async fn init_test_nodes(
         aruna_data::BUCKET_STATE_DB_NAME,
         aruna_data::BUCKET_LOCATION_DB_NAME,
         aruna_data::REPLICATION_RULES_DB_NAME,
+        aruna_data::MULTIPART_DB_NAME,
     ];
 
     for idx in 0..num {
@@ -218,10 +219,6 @@ pub async fn register_user_with_group_and_credentials<St>(
 where
     for<'a> St: Store<'a> + 'static,
 {
-    println!(
-        "Adding creds @ {}",
-        controller.network.get_node_addr().node_id
-    );
     // Create user and generate an Aruna token
     let user_identity = register_oidc_user(name, store, token_handler.clone())?;
     let token = fetch_user_token(&user_identity, token_handler.clone())?;

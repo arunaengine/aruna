@@ -2,8 +2,6 @@ pub mod commons;
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use crate::commons::{
         fetch_user_token, init_test_nodes, register_oidc_user,
         register_user_with_group_and_credentials, upload_data,
@@ -11,9 +9,11 @@ mod tests {
     use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
     use aruna_data::util::s3::create_s3_client;
     use aws_sdk_s3::types::{
-        Destination, ReplicationConfiguration, ReplicationRule,
+        CompletedMultipartUpload, CompletedPart, Destination, ReplicationConfiguration,
+        ReplicationRule,
     };
     use blake3::Hasher;
+    use std::time::Duration;
     use ulid::Ulid;
 
     const OFFSET: u16 = 0;
@@ -177,6 +177,108 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_multipart_upload() {
         //TODO
+        let test_nodes = init_test_nodes(1, OFFSET, vec![]).await.unwrap();
+        let node = test_nodes.node_services.first().unwrap();
+        let node_controller = node.openapi_data_endpoint.0.clone();
+
+        // Register dummy user and create token
+        let group_id = Ulid::new();
+        let (_, _, creds) = register_user_with_group_and_credentials(
+            "Hans",
+            group_id,
+            test_nodes.realm_key.to_bytes(),
+            &node_controller.io_handler.store,
+            node_controller.io_handler.token_handler.clone(),
+            node_controller.io_handler.permission_manager.clone(),
+            node_controller.clone(),
+        )
+        .await
+        .unwrap();
+
+        // Create S3 client and upload some data
+        let client = create_s3_client(
+            &format!("http://{}", node.s3_endpoint),
+            None,
+            &creds.access_key_id.to_string(),
+            &creds.secret_access_key,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let bucket = "multipart-bucket";
+
+        // Create bucket
+        let _resp = client.create_bucket().bucket(bucket).send().await.unwrap();
+
+        let key = "multipartsubdir/content.bytes";
+
+        // Put object
+        let resp = client
+            .create_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = resp.upload_id.unwrap();
+        let mut finish = CompletedMultipartUpload::builder();
+        let mut object_before = Vec::new();
+
+        for i in 0..10 {
+            let part = vec![u8::MAX; 512];
+            object_before.extend(part.iter());
+            let response = client
+                .upload_part()
+                .upload_id(upload_id.clone())
+                .bucket(bucket)
+                .key(key)
+                .part_number(i)
+                .body(part.into())
+                .send()
+                .await
+                .unwrap();
+            finish = finish.parts(
+                CompletedPart::builder()
+                    .part_number(i)
+                    .e_tag(response.e_tag.unwrap())
+                    .build(),
+            );
+        }
+
+        client
+            .complete_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .multipart_upload(finish.build())
+            .send()
+            .await
+            .unwrap();
+
+        let mut response = client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let mut object_after = vec![];
+        while let Some(bytes) = response.body.try_next().await.unwrap() {
+            object_after.extend_from_slice(bytes.as_ref());
+        }
+        let hash_before = blake3::hash(&object_before);
+        let hash_after = blake3::hash(&object_after);
+        assert_eq!(hash_before, hash_after);
+
+        // Find file hash with Kademlia at node
+        let result = node_controller.network.find(hash_before).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result.first().unwrap().addr,
+            node_controller.network.get_node_addr()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
