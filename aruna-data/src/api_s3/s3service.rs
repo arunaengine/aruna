@@ -142,7 +142,7 @@ where
             last_modified: None,
             version_id: None,
             checksum_sha256: Some(info.file_hashes.sha256),
-            e_tag: Some(info.file_hashes.md5),
+            e_tag: Some(info.file_hashes.blake3.to_string()),
             ..Default::default()
         };
 
@@ -251,7 +251,7 @@ where
         //TODO: Set other response fields?
         // - Version ?
         let inner_response = PutObjectOutput {
-            e_tag: Some(object_info.file_hashes.md5),
+            e_tag: Some(object_info.file_hashes.blake3.to_string()),
             size: Some(object_info.file_size as i64),
             checksum_sha256: Some(object_info.file_hashes.sha256),
             ..Default::default()

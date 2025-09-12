@@ -6,7 +6,9 @@ mod tests {
         fetch_user_token, init_test_nodes, register_oidc_user,
         register_user_with_group_and_credentials, upload_data,
     };
-    use aruna_data::api_json::requests::{CreateS3CredentialsRequest, CreateS3CredentialsResponse};
+    use aruna_data::api_json::requests::{
+        CreateS3CredentialsRequest, CreateS3CredentialsResponse, LocateDataRequest, LocateDataResponse,
+    };
     use aruna_data::util::s3::create_s3_client;
     use aws_sdk_s3::types::{
         CompletedMultipartUpload, CompletedPart, Destination, ReplicationConfiguration,
@@ -129,6 +131,7 @@ mod tests {
 
         // Put object
         let body_content = "This is some dummy content";
+        let etag = blake3::hash(body_content.as_bytes());
         let body = aws_sdk_s3::primitives::ByteStream::from_static(body_content.as_bytes());
         let resp = client
             .put_object()
@@ -140,7 +143,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resp.e_tag,
-            Some("f82323ba75cec986a7abd74c97795c2c".to_string())
+            Some(etag.to_string())
         );
         assert_eq!(
             resp.checksum_sha256,
@@ -371,9 +374,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_replicate_object() {
         // Initialize multiple nodes with a user
-        let mut test_nodes = init_test_nodes(2, OFFSET, vec![]).await.unwrap();
+        let mut test_nodes = init_test_nodes(3, OFFSET, vec![]).await.unwrap();
         let node = test_nodes.node_services.pop().unwrap();
         let node_controller = node.openapi_data_endpoint.0.clone();
+        let node_id = node_controller
+            .network
+            .get_node_addr()
+            .node_id
+            .to_string();
 
         //TODO: Put object to specific node
         // Register dummy user and create token
@@ -424,7 +432,7 @@ mod tests {
         );
 
         let other_node_controller = other_node.openapi_data_endpoint.0.clone();
-        let node_id = other_node_controller
+        let other_node_id = other_node_controller
             .network
             .get_node_addr()
             .node_id
@@ -441,7 +449,7 @@ mod tests {
                             .id("MyNewReplicationRule".to_string())
                             .destination(
                                 Destination::builder()
-                                    .bucket(format!("arn:aws:s3:{}:account_id:{}", node_id, bucket))
+                                    .bucket(format!("arn:aws:s3:{}:account_id:{}", other_node_id, bucket))
                                     .build()
                                     .unwrap(),
                             )
@@ -497,6 +505,25 @@ mod tests {
         let hash = hasher.finalize();
         assert_eq!(String::from_utf8(content).unwrap(), "Some other content");
         assert_eq!(content_hash, hash.to_string());
+
+        let node_without_data = test_nodes.node_services.pop().unwrap();
+
+        let client = reqwest::Client::new();
+        let response: LocateDataResponse = client
+            .get(&format!(
+                "http://{}/api/v3/data/location",
+                node_without_data.openapi_data_endpoint.1
+            ))
+            .query(&[("hash".to_string(), hash.to_string())])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert!(response.location.iter().any(|l| l.node_id == node_id));
+        assert!(response.location.iter().any(|l| l.node_id == other_node_id));
     }
 
     #[tokio::test(flavor = "multi_thread")]

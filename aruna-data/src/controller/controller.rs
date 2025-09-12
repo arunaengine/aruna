@@ -94,14 +94,21 @@ where
                         tokio::spawn(
                             current_span.in_scope(||
                             async move {
-                                if let Err(e) = io_handler.handle_incoming_p2p_stream(
+                                match io_handler.handle_incoming_p2p_stream(
                                     inc_stream,
                                     network.get_node_addr(),
                                     network.get_realm_key(),
 
-                                ).await{
-                                    error!("Failed to handle incoming stream: {e:#}");
-                                }
+                                ).await {
+                                    Ok(hash) => {
+                                        if let Err(e) = network.store(hash).await {
+                                            error!("Failed to handle incoming stream: {e:#}");
+                                        }
+                                    },
+                                    Err(e) => {
+                                        error!("Failed to handle incoming stream: {e:#}");
+                                    },
+                                };
                             })
                         );
                     }

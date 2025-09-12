@@ -159,6 +159,7 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum 0.8.4",
+ "axum-extra",
  "bao-tree",
  "blake3",
  "bytes",

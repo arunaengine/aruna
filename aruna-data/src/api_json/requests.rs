@@ -6,11 +6,12 @@ use crate::io::io_handler::tables::ACCESS_DB_NAME;
 use aruna_permission::UserIdentity;
 use aruna_storage::storage::store::Store;
 use data_encoding::HEXLOWER;
+use iroh::NodeAddr;
 use rand::distributions::Alphanumeric;
 use rand::{Rng, thread_rng};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
@@ -237,19 +238,32 @@ where
 }
 
 #[derive(
-    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Debug,
+    Serialize,
+    Deserialize,
+    ToSchema,
+    Default,
+    IntoParams,
 )]
 pub struct LocateDataRequest {
-    group_id: String,
-    backend_path: String,
-    bucket: String,
-    key: Option<String>,
-    create_s3_path: bool,
+    pub hash: String,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct LocateDataResponse {
-    path: String,
+    pub location: Vec<Location>,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct Location {
+    pub node_id: String,
+    pub relay_url: Option<String>,
+    pub direct_addresses: Vec<String>,
 }
 
 #[async_trait::async_trait]
@@ -259,13 +273,33 @@ where
 {
     type Response = LocateDataResponse;
 
-    #[tracing::instrument(level = "trace", skip(_controller))]
+    #[tracing::instrument(level = "trace", skip(controller))]
     async fn run_request(
         self,
         _user: Option<UserIdentity>,
-        _controller: &Controller<St>,
+        controller: &Controller<St>,
     ) -> Result<Self::Response, ArunaDataError> {
-        todo!()
+        let hash =
+            blake3::Hash::from_hex(&self.hash).map_err(|_| ArunaDataError::InvalidParameter {
+                name: "hash".to_string(),
+                error: "Invalid hash provided".to_string(),
+            })?;
+        let nodes: Vec<Location> = controller
+            .network
+            .find(hash)
+            .await?
+            .iter()
+            .map(|node| node.addr.clone().into())
+            .collect();
+
+        if nodes.is_empty() {
+            return Err(ArunaDataError::NotFound(format!(
+                "Object with hash {} not found",
+                self.hash
+            )));
+        }
+
+        Ok(LocateDataResponse { location: nodes })
     }
 
     #[tracing::instrument(level = "trace", skip(_controller))]

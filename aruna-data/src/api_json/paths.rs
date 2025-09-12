@@ -108,9 +108,11 @@ where
 
 /// TODO: Locate data resources over the network
 #[utoipa::path(
-    post,
-    path = "/data/locate",
-    request_body = LocateDataRequest,
+    get,
+    path = "/data/location",
+    params (
+       LocateDataRequest 
+    ),
     responses(
         (status = 200, body = LocateDataResponse), ArunaDataError),
     security(
@@ -122,7 +124,7 @@ where
 pub async fn locate<St>(
     State(state): State<Controller<St>>,
     headers: HeaderMap,
-    Json(request): Json<LocateDataRequest>,
+    axum_extra::extract::Query(request): axum_extra::extract::Query<LocateDataRequest>,
 ) -> impl IntoResponse
 where
     for<'a> St: Store<'a> + 'static,
