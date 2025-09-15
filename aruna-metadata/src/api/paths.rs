@@ -715,6 +715,32 @@ where
     into_axum_response(state.request(GetInfoRequest{}, extract_token(&headers)).await)
 }
 
+/// Get server info
+#[utoipa::path(
+    get,
+    path = "/info/realm",
+    responses(
+        (status = 200, body = GetRealmInfoResponse),
+        ArunaMetadataError,
+    ),
+    security(
+        ("auth" = [])
+    ),
+    tag = INFO,
+)]
+#[tracing::instrument(level = "trace", skip(state))]
+pub async fn get_realm_info<St, Se, N>(
+    State(state): State<Arc<Controller<St, Se, N>>>,
+    headers: HeaderMap,
+) -> impl IntoResponse
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    into_axum_response(state.request(GetRealmInfoRequest{}, extract_token(&headers)).await)
+}
+
 // Get resource history
 #[utoipa::path(
     get,

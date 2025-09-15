@@ -5,7 +5,8 @@ mod sync_tests {
     use aruna_metadata::{
         models::requests::{
             AddGroupRequest, AddUserToGroupRequest, AddUserToGroupResponse, CreateProjectRequest,
-            CreateProjectResponse, CreateResourceRequest, CreateResourceResponse, Request,
+            CreateProjectResponse, CreateResourceRequest, CreateResourceResponse,
+            GetRealmInfoResponse, Request,
         },
         network::network_trait::Network,
     };
@@ -255,5 +256,140 @@ mod sync_tests {
             .json::<CreateResourceResponse>()
             .await
             .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_realm_info() {
+        let signing_key = SigningKey::generate(&mut OsRng);
+
+        let Server {
+            path: ref first_path,
+            addr: ref first_addr,
+            controller: ref first_controller,
+        } = init_server(signing_key.clone(), OFFSET, None, false)
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::new();
+
+        let one_node = client
+            .get(format!("{first_path}/info/realm"))
+            .send()
+            .await
+            .unwrap()
+            .json::<GetRealmInfoResponse>()
+            .await
+            .unwrap();
+
+        assert!(
+            one_node
+                .nodes
+                .iter()
+                .any(|n| n.node_id == first_addr.node_id.to_string())
+        );
+        assert_eq!(one_node.nodes.len(), 1);
+
+        // Test if group gets synced when creating project
+        let Server {
+            path: ref second_path,
+            controller: ref second_controller,
+            addr: ref second_addr,
+        } = init_server(signing_key.clone(), OFFSET, Some(first_addr.clone()), false)
+            .await
+            .unwrap();
+
+        second_controller.network.update_realm().await.unwrap();
+        first_controller.network.update_realm().await.unwrap();
+
+        let two_nodes_1 = client
+            .get(format!("{first_path}/info/realm"))
+            .send()
+            .await
+            .unwrap()
+            .json::<GetRealmInfoResponse>()
+            .await
+            .unwrap();
+
+        let two_nodes_2 = client
+            .get(format!("{second_path}/info/realm"))
+            .send()
+            .await
+            .unwrap()
+            .json::<GetRealmInfoResponse>()
+            .await
+            .unwrap();
+        dbg!(&two_nodes_1);
+        dbg!(&two_nodes_2);
+
+        assert!(
+            two_nodes_1
+                .nodes
+                .iter()
+                .any(|n| n.node_id == first_addr.node_id.to_string())
+        );
+        assert!(
+            two_nodes_1
+                .nodes
+                .iter()
+                .any(|n| n.node_id == second_addr.node_id.to_string())
+        );
+        assert_eq!(two_nodes_1.nodes.len(), 2);
+        assert!(
+            two_nodes_2
+                .nodes
+                .iter()
+                .any(|n| n.node_id == first_addr.node_id.to_string())
+        );
+        assert!(
+            two_nodes_2
+                .nodes
+                .iter()
+                .any(|n| n.node_id == second_addr.node_id.to_string())
+        );
+        assert_eq!(two_nodes_2.nodes.len(), 2);
+
+        let mut others = Vec::new();
+
+        for _ in 0..3 {
+            let server = init_server(signing_key.clone(), OFFSET, Some(first_addr.clone()), false)
+                .await
+                .unwrap();
+            others.push(server);
+        }
+        second_controller.network.update_realm().await.unwrap();
+        first_controller.network.update_realm().await.unwrap();
+
+        for addr in others {
+            addr.controller.network.update_realm().await.unwrap();
+
+            let five_nodes = client
+                .get(format!("{}/info/realm", addr.path))
+                .send()
+                .await
+                .unwrap()
+                .json::<GetRealmInfoResponse>()
+                .await
+                .unwrap();
+
+            assert!(
+                five_nodes
+                    .nodes
+                    .iter()
+                    .any(|n| n.node_id == first_addr.node_id.to_string())
+            );
+            assert!(
+                five_nodes
+                    .nodes
+                    .iter()
+                    .any(|n| n.node_id == second_addr.node_id.to_string())
+            );
+            assert!(
+                five_nodes
+                    .nodes
+                    .iter()
+                    .any(|n| n.node_id == addr.addr.node_id.to_string())
+            );
+            assert_eq!(five_nodes.nodes.len(), 5);
+        }
     }
 }

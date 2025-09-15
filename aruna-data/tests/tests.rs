@@ -7,7 +7,7 @@ mod tests {
         register_user_with_group_and_credentials, upload_data,
     };
     use aruna_data::api_json::requests::{
-        CreateS3CredentialsRequest, CreateS3CredentialsResponse, LocateDataRequest, LocateDataResponse,
+        CreateS3CredentialsRequest, CreateS3CredentialsResponse, LocateDataResponse,
     };
     use aruna_data::util::s3::create_s3_client;
     use aws_sdk_s3::types::{

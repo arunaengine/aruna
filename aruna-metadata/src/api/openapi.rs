@@ -58,6 +58,7 @@ where
         .routes(routes!(update_resource_data))
         .routes(routes!(search))
         .routes(routes!(get_info))
+        .routes(routes!(get_realm_info))
         .routes(routes!(add_user))
         .routes(routes!(get_user))
         .routes(routes!(add_group))

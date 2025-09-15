@@ -359,6 +359,15 @@ impl P2PNetwork {
                     ForwardResponse::Search(Err(e)),
                 ))),
             },
+
+            ForwardRequest::GetRealmInfo(req) => match req.authorize(token, controller).await {
+                Ok(auth_ctx) => Body::Response(Response::ForwardResponse(Box::new(
+                    ForwardResponse::GetRealmInfo(req.clone().run_request(auth_ctx, controller).await),
+                ))),
+                Err(e) => Body::Response(Response::ForwardResponse(Box::new(
+                    ForwardResponse::GetRealmInfo(Err(e)),
+                ))),
+            },
         };
         body
     }

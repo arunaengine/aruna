@@ -1,5 +1,7 @@
 use crate::logerr;
-use crate::models::requests::{GetInfoRequest, GetInfoResponse, Request};
+use crate::models::requests::{
+    GetInfoRequest, GetInfoResponse, GetRealmInfoRequest, GetRealmInfoResponse, Request,
+};
 use crate::{
     error::ArunaMetadataError,
     models::{
@@ -178,6 +180,106 @@ where
             realm_id,
             node_id,
             node_addr: serde_json::to_string(&node_addr)?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl<St, Se, N> Request<St, Se, N> for GetRealmInfoRequest
+where
+    for<'a> St: Store<'a> + 'static,
+    Se: Search + 'static,
+    N: Network + 'static,
+{
+    type Response = GetRealmInfoResponse;
+    type AuthContext = (); // (Identity, Groups)
+
+    #[tracing::instrument(level = "trace", skip(_controller, _token))]
+    async fn authorize(
+        &self,
+        _token: Option<String>,
+        _controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<(), crate::error::ArunaMetadataError> {
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller, token))]
+    async fn sync_or_forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Option<Self::Response>, crate::error::ArunaMetadataError> {
+        Ok(Some(self.forward(token, controller).await?))
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn forward(
+        &self,
+        token: &Option<String>,
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let body = crate::network::network_trait::Body::Request {
+            token: token.clone(),
+            request: crate::models::requests::ForwardRequest::GetRealmInfo(GetInfoRequest {}),
+        };
+
+        let self_addr = controller.network.get_addr().await?;
+        let nodes = controller.network.get_realm_nodes().await?;
+
+        let mut results: HashSet<GetInfoResponse, ahash::RandomState> = HashSet::default();
+
+        for node in nodes {
+            if node == self_addr {
+                let result = self.clone().run_request((), controller).await?;
+                for r in result.nodes {
+                    results.insert(r);
+                }
+            } else {
+                match controller
+                    .network
+                    .forward(body.clone(), &[0u8; 32], node.clone())
+                    .await
+                {
+                    Ok(crate::models::requests::ForwardResponse::GetRealmInfo(response)) => {
+                        let response = match response {
+                            Ok(res) => res,
+                            Err(err) => {
+                                error!("{err}");
+                                continue;
+                            }
+                        };
+                        results.insert(response);
+                    }
+                    e => {
+                        error!(?e);
+                        return Err(ArunaMetadataError::NetworkError(format!(
+                            "Got wrong forward response {e:?}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(GetRealmInfoResponse {
+            nodes: results.into_iter().collect(),
+        })
+    }
+
+    #[tracing::instrument(level = "trace", skip(controller))]
+    async fn run_request(
+        self,
+        _groups: (),
+        controller: &super::controller::Controller<St, Se, N>,
+    ) -> Result<Self::Response, crate::error::ArunaMetadataError> {
+        let realm_id = HEXLOWER.encode(&controller.network.get_realm_key().await?);
+        let node_addr = controller.network.get_addr().await?;
+        let node_id = node_addr.node_id.to_string();
+
+        Ok(GetRealmInfoResponse {
+            nodes: vec![GetInfoResponse {
+                realm_id,
+                node_id,
+                node_addr: serde_json::to_string(&node_addr)?,
+            }],
         })
     }
 }

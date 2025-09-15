@@ -508,7 +508,7 @@ where
     #[allow(clippy::blocks_in_conditions)]
     async fn get_bucket_replication(
         &self,
-        req: S3Request<GetBucketReplicationInput>,
+        _req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
         // TODO:
         Err(s3_error!(
@@ -521,7 +521,7 @@ where
     #[allow(clippy::blocks_in_conditions)]
     async fn delete_bucket_replication(
         &self,
-        req: S3Request<DeleteBucketReplicationInput>,
+        _req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
         // TODO:
         Err(s3_error!(
@@ -745,7 +745,7 @@ where
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let UserAccess {
-            user_id, group_id, ..
+            group_id, ..
         } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")

@@ -239,7 +239,7 @@ pub async fn create_s3_client(
     force_path_style: bool,
 ) -> Result<Client, ArunaDataError> {
     let creds = Credentials::new(access_key_id, secret_key, None, None, "Aruna_v3");
-    let client_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+    let client_config = aws_config::defaults(BehaviorVersion::latest())
         .credentials_provider(creds)
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
         .response_checksum_validation(aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired)

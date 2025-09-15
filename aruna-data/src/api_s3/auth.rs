@@ -10,7 +10,7 @@ use s3s::auth::{S3Auth, SecretKey};
 use s3s::path::S3Path;
 use s3s::{S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, trace};
+use tracing::debug;
 use ulid::Ulid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

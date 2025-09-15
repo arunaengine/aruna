@@ -376,6 +376,9 @@ pub enum ForwardRequest {
     GetResourceHistory(GetResourceHistoryRequest),
     UpdateResource(ResourceUpdateRequests),
     Search(SearchRequest),
+
+    // Realm requests
+    GetRealmInfo(GetInfoRequest),
 }
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
@@ -397,6 +400,7 @@ pub enum ForwardResponse {
     GetResourceHistory(Result<GetResourceHistoryResponse, ArunaMetadataError>),
     UpdateResource(Result<ResourceUpdateResponses, ArunaMetadataError>),
     Search(Result<SearchResponse, ArunaMetadataError>),
+    GetRealmInfo(Result<GetInfoResponse, ArunaMetadataError>)
 }
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,
@@ -431,14 +435,24 @@ pub struct CreateTokenResponse {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct GetInfoRequest {}
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, Hash)]
 pub struct GetInfoResponse {
     pub realm_id: String,
     pub node_id: String,
     pub node_addr: String,
 }
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetRealmInfoRequest {}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
+pub struct GetRealmInfoResponse {
+    pub nodes: Vec<GetInfoResponse>,
+}
+
+#[derive(
+    Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,
+)]
 pub struct GetResourceHistoryRequest {
     pub id: Ulid,
 }
