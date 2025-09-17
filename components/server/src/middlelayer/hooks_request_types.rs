@@ -321,6 +321,7 @@ impl CustomTemplate {
         object: &Object,
         secret: String,
         download_url: Option<String>,
+        token: String,
         upload_credentials: GetCredentialsResponse,
         pubkey_serial: i32,
     ) -> Result<String> {
@@ -364,6 +365,7 @@ impl CustomTemplate {
                 serde_json::to_string(&object.endpoints.0)?,
             ),
             (r"\{\{download_url\}\}", download_url),
+            (r"\{\{token\}\}", token),
             (r"\{\{access_key\}\}", access_key),
             (r"\{\{secret_key\}\}", secret_key),
         ];

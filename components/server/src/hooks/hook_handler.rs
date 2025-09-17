@@ -33,6 +33,15 @@ use reqwest::header::CONTENT_TYPE;
 use std::sync::Arc;
 
 #[derive(Clone)]
+pub struct TemplateInput {
+    pub secret: String,
+    pub download: Option<String>,
+    pub pubkey_serial: i16,
+    pub token: String,
+    pub upload_credentials: GetCredentialsResponse,
+}
+
+#[derive(Clone)]
 pub struct HookHandler {
     pub reciever: Receiver<HookMessage>,
     pub authorizer: Arc<PermissionHandler>,
@@ -181,7 +190,13 @@ impl HookHandler {
                 // If ObjectType is not OBJECT, only s3 credentials are generated.
                 // This should allow for generic external hooks that can also be
                 // triggered for other ObjectTypes than OBJECTs
-                let (secret, download, pubkey_serial, upload_credentials) = self
+                let TemplateInput {
+                    secret,
+                    download,
+                    pubkey_serial,
+                    upload_credentials,
+                    token,
+                } = self
                     .get_template_input(object.clone(), hook.clone(), user_id)
                     .await?;
 
@@ -215,6 +230,7 @@ impl HookHandler {
                             secret,
                             download,
                             pubkey_serial: pubkey_serial.into(),
+                            token: Some(token),
                             access_key: Some(upload_credentials.access_key),
                             secret_key: Some(upload_credentials.secret_key),
                         };
@@ -227,6 +243,7 @@ impl HookHandler {
                             &object.object,
                             secret,
                             download,
+                            token,
                             upload_credentials,
                             pubkey_serial.into(),
                         )?;
@@ -405,13 +422,13 @@ impl HookHandler {
         object: ObjectWithRelations,
         hook: HookWithAssociatedProject,
         user_id: DieselUlid,
-    ) -> Result<(String, Option<String>, i16, GetCredentialsResponse)> {
+    ) -> Result<TemplateInput> {
         let object_id = object.object.id;
         // This creates only presigned download urls for available objects.
         // If ObjectType is not OBJECT, only s3 credentials are generated.
         // This should allow for generic external hooks that can also be
         // triggered for other ObjectTypes than OBJECTs
-        let (secret, download, pubkey_serial, upload_credentials) = {
+        let (secret, download, pubkey_serial, upload_credentials, token) = {
             let (secret, pubkey_serial) = self
                 .authorizer
                 .token_handler
@@ -427,10 +444,16 @@ impl HookHandler {
                 object_id: Some(ObjectMapping::PROJECT(hook.project_id)),
                 user_rights: crate::database::enums::DbPermissionLevel::APPEND,
             };
+            let expiry = Some(append_only_token.expires_at.into());
             let token_id = self
                 .database_handler
                 .create_hook_token(&user_id, append_only_token)
                 .await?;
+
+            let token_secret = self
+                .authorizer
+                .token_handler
+                .sign_user_token(&user_id, &token_id, expiry)?;
 
             let associated_project = hook.project_id;
 
@@ -464,8 +487,20 @@ impl HookHandler {
                 (ObjectType::OBJECT, ObjectStatus::AVAILABLE) => Some(download),
                 _ => None,
             };
-            (secret, download, pubkey_serial, upload_credentials)
+            (
+                secret,
+                download,
+                pubkey_serial,
+                upload_credentials,
+                token_secret,
+            )
         };
-        Ok((secret, download, pubkey_serial, upload_credentials))
+        Ok(TemplateInput {
+            secret,
+            download,
+            pubkey_serial,
+            upload_credentials,
+            token,
+        })
     }
 }
