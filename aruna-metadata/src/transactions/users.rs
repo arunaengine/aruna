@@ -132,7 +132,11 @@ where
             .await?;
         let token = controller.persistence.create_token(&user.id, None).await?;
 
-        Ok(AddUserResponse { user, token })
+        Ok(AddUserResponse {
+            user_id: user.id.to_string(),
+            user,
+            token,
+        })
     }
 }
 

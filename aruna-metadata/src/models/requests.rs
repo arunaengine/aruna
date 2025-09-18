@@ -155,6 +155,7 @@ pub struct AddUserRequest {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddUserResponse {
+    pub user_id: String,
     pub user: User,
     pub token: String,
 }
