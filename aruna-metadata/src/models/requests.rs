@@ -1,4 +1,4 @@
-use super::structs::{Author, Group, KeyValue, Resource, User, VisibilityClass};
+use super::structs::{Author, Group, KeyValue, Resource, VisibilityClass};
 use crate::error::ArunaMetadataError;
 use crate::models::structs::{Change, Data};
 use crate::transactions::controller::Controller;
@@ -156,7 +156,8 @@ pub struct AddUserRequest {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct AddUserResponse {
     pub user_id: String,
-    pub user: User,
+    pub realm_key: String,
+    pub user_name: String,
     pub token: String,
 }
 
@@ -420,7 +421,9 @@ pub struct GetUserRequest {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]
 pub struct GetUserResponse {
-    pub user: User,
+    pub user_id: String,
+    pub realm_id: String,
+    pub user_name: String,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema)]

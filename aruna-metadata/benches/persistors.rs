@@ -8,7 +8,7 @@ use aruna_metadata::{
     },
     transactions::controller::Controller,
 };
-use aruna_permission::{PermissionManager, TokenSystem};
+use aruna_permission::{PermissionManager, TokenSystem, UserIdentity};
 use aruna_storage::storage::fjall::{FjallConfig, FjallStore};
 use aruna_storage::storage::lmdb::{LmdbConfig, LmdbStore};
 use aruna_storage::storage::store::Store;
@@ -86,13 +86,13 @@ impl TantivyFjall {
             name: "bench_user1".to_string(),
         };
         let res = controller.request(create_user, None).await.unwrap();
-        let user1 = res.user.id;
+        let user1 = UserIdentity::from_string(res.user_id).unwrap();
 
         let create_user = AddUserRequest {
             name: "bench_user2".to_string(),
         };
         let res = controller.request(create_user, None).await.unwrap();
-        let user2 = res.user.id;
+        let user2 = UserIdentity::from_string(res.user_id).unwrap();
         (user1.user_ulid, user2.user_ulid)
     }
 
@@ -215,13 +215,13 @@ impl TantivyHeed {
             name: "bench_user1".to_string(),
         };
         let res = controller.request(create_user, None).await.unwrap();
-        let user1 = res.user.id;
+        let user1 = UserIdentity::from_string(res.user_id).unwrap();
 
         let create_user = AddUserRequest {
             name: "bench_user2".to_string(),
         };
         let res = controller.request(create_user, None).await.unwrap();
-        let user2 = res.user.id;
+        let user2 = UserIdentity::from_string(res.user_id).unwrap();
         (user1.user_ulid, user2.user_ulid)
     }
 
@@ -314,13 +314,13 @@ impl TantivyHeed {
 //             name: "bench_user1".to_string(),
 //         };
 //         let res = controller.request(create_user, None).await.unwrap();
-//         let user1 = res.user.id;
+//         let user1 = res.user_id;
 //
 //         let create_user = AddUserRequest {
 //             name: "bench_user2".to_string(),
 //         };
 //         let res = controller.request(create_user, None).await.unwrap();
-//         let user2 = res.user.id;
+//         let user2 = res.user_id;
 //         (user1, user2)
 //     }
 //

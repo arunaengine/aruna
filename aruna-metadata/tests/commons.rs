@@ -262,7 +262,7 @@ pub async fn create_user_with_token(
             &server.controller,
         )
         .await?;
-    let user_identity = response.user.id;
+    let user_identity = UserIdentity::from_string(response.user_id).unwrap();
     let user_token = server
         .controller
         .persistence

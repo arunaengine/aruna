@@ -34,7 +34,7 @@ fn e2e_benchmark(c: &mut Criterion) {
             .json()
             .await
             .unwrap();
-        let user1 = response.user.id;
+        let user1 = response.user_id;
         println!("{}", user1.to_string());
 
         let request = AddUserRequest {
@@ -50,7 +50,7 @@ fn e2e_benchmark(c: &mut Criterion) {
             .json()
             .await
             .unwrap();
-        let user2 = response.user.id;
+        let user2 = response.user_id;
         println!("{}", user2.to_string());
 
         (client, user1, user2)

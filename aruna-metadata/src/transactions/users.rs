@@ -133,8 +133,9 @@ where
         let token = controller.persistence.create_token(&user.id, None).await?;
 
         Ok(AddUserResponse {
+            user_name: user.name,
             user_id: user.id.to_string(),
-            user,
+            realm_key: hex::encode(user.realm_key),
             token,
         })
     }
@@ -250,7 +251,11 @@ where
                 "User not found".to_string(),
             ));
         };
-        Ok(GetUserResponse { user })
+        Ok(GetUserResponse {
+            user_id: user.id.to_string(),
+            user_name: user.name,
+            realm_id: hex::encode(user.realm_key),
+        })
     }
 }
 

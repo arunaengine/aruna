@@ -64,7 +64,6 @@ impl TryFrom<Group> for Vec<u8> {
 impl TryFrom<GetUserRequestOuter> for GetUserRequest {
     type Error = ArunaMetadataError;
     fn try_from(value: GetUserRequestOuter) -> Result<Self, Self::Error> {
-        trace!("{value:?}");
         Ok(GetUserRequest {
             id: aruna_permission::UserIdentity::from_string(value.id)?,
         })
