@@ -244,7 +244,7 @@ pub mod autosurgeon_user_identity {
         identity: &UserIdentity,
         mut reconciler: R,
     ) -> Result<(), R::Error> {
-        reconciler.bytes(identity.to_bytes())
+        reconciler.str(identity.to_string())
     }
 }
 
