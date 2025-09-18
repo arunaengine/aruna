@@ -226,7 +226,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let response = CompleteMultipartUploadOutput {
-            e_tag: Some(format!("-{}", object.id)),
+            e_tag: Some(format!("-{}", object.id.to_string())),
             ..Default::default()
         };
 
@@ -1972,9 +1972,8 @@ impl S3 for ArunaS3Service {
             })?;
 
         let output = PutObjectOutput {
-            e_tag: md5_initial,
+            e_tag: Some(format!("-{}", new_object.id.to_string())),
             checksum_sha256: sha_initial,
-            version_id: Some(new_object.id.to_string()),
             ..Default::default()
         };
         debug!(?output);

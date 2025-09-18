@@ -118,7 +118,7 @@ services:
              psql 'postgres://yugabyte@yugabyte:5433/proxy_02' < /data/init/proxy_schema.sql &&
              psql 'postgres://yugabyte@yugabyte:5433/test' < /data/init/initial_data.sql"
   server:
-    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-server:2.0.4
+    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-server:latest
     depends_on:
       load_database:
         condition: service_completed_successfully
