@@ -126,7 +126,6 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
 
     #[tracing::instrument(level = "trace", skip(self, req))]
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
-
         // Check if response gets CORS header pass
         let mut origin_exception = false;
         if let Some(origin) = req.headers().get("Origin") {
