@@ -92,6 +92,7 @@ pub struct BasicTemplate {
     pub secret: String,
     pub download: Option<String>,
     pub pubkey_serial: i32,
+    pub token: Option<String>,
     pub access_key: Option<String>,
     pub secret_key: Option<String>,
 }

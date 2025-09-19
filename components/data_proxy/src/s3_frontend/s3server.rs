@@ -126,6 +126,15 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
 
     #[tracing::instrument(level = "trace", skip(self, req))]
     fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+        // Check if response gets CORS header pass
+        let mut origin_exception = false;
+        if let Some(origin) = req.headers().get("Origin") {
+            if let Some(cors_regex) = &*CORS_REGEX {
+                origin_exception =
+                    cors_regex.is_match(origin.to_str().expect("Invalid Origin header"));
+            }
+        }
+
         // Catch OPTIONS requests
         if req.method() == Method::OPTIONS {
             let clone = self.clone();
@@ -140,15 +149,6 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
                     }
                 }
             });
-        }
-
-        // Check if response gets CORS header pass
-        let mut origin_exception = false;
-        if let Some(origin) = req.headers().get("Origin") {
-            if let Some(cors_regex) = &*CORS_REGEX {
-                origin_exception =
-                    cors_regex.is_match(origin.to_str().expect("Invalid Origin header"));
-            }
         }
 
         let service = self.shared.clone();
