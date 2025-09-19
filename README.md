@@ -1,8 +1,8 @@
 [![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/License-Apache_2.0-brightgreen.svg)](https://github.com/ArunaStorage/aruna/blob/main/LICENSE-APACHE)
-[![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/ArunaStorage/aruna/blob/main/LICENSE-MIT)
-![CI](https://github.com/ArunaStorage/aruna/actions/workflows/test.yml/badge.svg)
-[![Codecov](https://codecov.io/github/ArunaStorage/aruna/coverage.svg?branch=main)](https://codecov.io/gh/ArunaStorage/aruna)
+[![License](https://img.shields.io/badge/License-Apache_2.0-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-APACHE)
+[![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-MIT)
+![CI](https://github.com/arunaengine/aruna/actions/workflows/test.yml/badge.svg)
+[![Codecov](https://codecov.io/github/arunaengine/aruna/coverage.svg?branch=main)](https://codecov.io/gh/ArunaStorage/aruna)
 [![dependency status](https://deps.rs/repo/github/ArunaStorage/aruna/status.svg?path=components%2Fserver)](https://deps.rs/repo/github/ArunaStorage/aruna?path=components%2Fserver)
 ___
 
@@ -19,8 +19,8 @@ ___
 
 **Aruna** is a geo-redundant data orchestration engine that manages scientific data and a rich set of associated metadata according to [FAIR](https://www.go-fair.org/fair-principles/) principles.
 
-It supports multiple data storage backends (e.g. S3, File ...) via [data proxies](https://github.com/ArunaStorage/aruna/tree/main/components/data_proxy) that expose an S3-compatible interface.
-The main [server](https://github.com/ArunaStorage/aruna/tree/main/components/server) handles metadata, user and resource hierarchies while the [data proxies](https://github.com/ArunaStorage/aruna/tree/main/components/data_proxy) handle the data itself.
+It supports multiple data storage backends (e.g. S3, File ...) via [data proxies](https://github.com/arunaengine/aruna/tree/main/components/data_proxy) that expose an S3-compatible interface.
+The main [server](https://github.com/arunaengine/aruna/tree/main/components/server) handles metadata, user and resource hierarchies while the [data proxies](https://github.com/arunaengine/aruna/tree/main/components/data_proxy) handle the data itself.
 Data proxies can communicate with each other in a peer-to-peer-like network and share data.
 
 This repository is split into two components, the server and the data proxy.
@@ -44,7 +44,7 @@ This repository is split into two components, the server and the data proxy.
 
 ## Getting started
 
-Aruna is build as a managed service for our scientific partners or as a self-deployed open source collection of components for your own needs. Visit [aruna-storage.org](https://aruna-storage.org) to learn more about our managed data management service. 
+Aruna is build as a managed service for our scientific partners or as a self-deployed open source collection of components for your own needs. Visit [aruna-engine.org](https://aruna-engine.org) to learn more about our managed data management service. 
 
 ### How to run a local test instance
 
@@ -81,13 +81,13 @@ Additionally this will also run the following aruna specific components:
 
 Test tokens and Website credentials for the local test deployment can be found in [here](./components/server/tests/common/keycloak/fake-tokens.md).
 
-A detailed user guide is found in the [Documentation](https://arunastorage.github.io/documentation/latest/). For language specific details please visit our specific documentations:
+A detailed user guide is found in the [Documentation](https://docs.aruna-engine.org/latest). For language specific details please visit our specific documentations:
 
 **TLDR:**
-- **REST**: see our [Swagger Documentation](https://aruna-storage.org/swagger-ui/)
+- **REST**: see our [Swagger Documentation](https://aruna-engine.org/swagger-ui/)
 - **Python**: [PyPI](https://pypi.org/project/Aruna-Python-API/) 
 - **Rust**: [Crates.io](https://crates.io/crates/aruna-rust-api)
-- **Go**: [Go package](https://github.com/ArunaStorage/go-api/releases/)
+- **Go**: [Go package](https://github.com/arunaengine/go-api/releases/)
 
 
 ## License
