@@ -69,7 +69,7 @@ tonic = { workspace = true }
 tower = { workspace = true }
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "time"] }
 url = { workspace = true }
 zstd = "0.13.3"
 hyper-util = { version = "0.1.16", features = [
