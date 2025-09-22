@@ -139,7 +139,7 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
         if req.method() == Method::OPTIONS {
             let clone = self.clone();
             return Box::pin(async move {
-                match clone.get_bucket_cors(req).await {
+                match clone.get_bucket_cors(origin_exception, req).await {
                     Ok(resp) => Ok(resp),
                     Err(err) => {
                         error!("{err}");
@@ -229,8 +229,19 @@ impl<T, S: Clone> Service<T> for MakeService<S> {
 impl WrappingService {
     async fn get_bucket_cors(
         &self,
+        origin_exception: bool,
         req: hyper::Request<hyper::body::Incoming>,
     ) -> Result<hyper::Response<Body>, S3Error> {
+        if origin_exception {
+            let resp =hyper::Response::builder()
+                .header(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("*"))
+                .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
+                .header(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"))
+                .body(Body::empty())
+                .map_err(|_| s3_error!(InvalidRequest, "Invalid OPTIONS request"))?;
+            return Ok(resp);
+        }
+
         let origin = req
             .headers()
             .get(ORIGIN)
