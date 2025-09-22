@@ -233,7 +233,7 @@ impl WrappingService {
         req: hyper::Request<hyper::body::Incoming>,
     ) -> Result<hyper::Response<Body>, S3Error> {
         if origin_exception {
-            let resp =hyper::Response::builder()
+            let resp = hyper::Response::builder()
                 .header(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("*"))
                 .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
                 .header(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"))
