@@ -2,7 +2,10 @@ use super::replication_request_types::ReplicationVariant;
 use crate::{
     database::{
         crud::CrudDb,
-        dsls::object_dsl::{EndpointInfo, Object},
+        dsls::{
+            endpoint_dsl::Endpoint,
+            object_dsl::{EndpointInfo, Object},
+        },
         enums::{ObjectType, ReplicationStatus, ReplicationType},
     },
     middlelayer::db_handler::DatabaseHandler,
@@ -38,6 +41,11 @@ impl DatabaseHandler {
                         return Err(anyhow!("Resource not found"));
                     };
                     let proxy_id = DieselUlid::from_str(&request.endpoint_id)?;
+
+                    if Endpoint::get(proxy_id, &client).await?.is_none() {
+                        return Err(anyhow!("Endpoint does not exist"));
+                    }
+
                     let endpoint_status_objects = EndpointInfo {
                         replication: ReplicationType::FullSync,
                         status: Some(ReplicationStatus::Waiting),
@@ -73,6 +81,11 @@ impl DatabaseHandler {
                         }
                     };
                     let proxy_id = DieselUlid::from_str(&request.endpoint_id)?;
+
+                    if Endpoint::get(proxy_id, &client).await?.is_none() {
+                        return Err(anyhow!("Endpoint does not exist"));
+                    }
+
                     let origin = Object::get(resource_id, &client)
                         .await?
                         .ok_or_else(|| anyhow!("Object not found"))?;
