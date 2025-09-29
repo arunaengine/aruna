@@ -206,6 +206,7 @@ where
             if self.backend.backend_type == Backend::S3 {
                 // Try create bucket in backend if S3
                 make_bucket(bucket_name.clone(), self.backend.access_config.clone()).await?;
+                self.backend_stats.write().insert(bucket_name.clone(), 0);
             }
 
             Ok(bucket_name)
@@ -1080,7 +1081,16 @@ where
             .await
             .map_err(|e| ArunaDataError::ServerError(e.to_string()))?;
 
-        for (_idx, (bucket, key, _hashes)) in multipart.parts.iter() {
+        //for (_idx, (bucket, key, _hashes)) in multipart.parts.iter() {
+        for (idx, etag) in parts.iter() {
+            let (bucket, key, _hashes) =
+                multipart
+                    .parts
+                    .get(idx)
+                    .ok_or_else(|| ArunaDataError::InvalidParameter {
+                        name: "part".to_string(),
+                        error: format!("part with idx {} does not exist", idx),
+                    })?;
             let reader = get_reader(&self.get_operator(bucket).await?, key, None, None).await?;
             let buffer = reader.read(..).await?;
 
@@ -1112,6 +1122,12 @@ where
             file_size: written_bytes as u64,
             file_hashes: hasher.finalize()?,
         };
+
+        trace!(
+            "FINISH MP
+{:?}",
+            location
+        );
 
         let bucket = location.bucket.clone();
         let key = location.key.clone();

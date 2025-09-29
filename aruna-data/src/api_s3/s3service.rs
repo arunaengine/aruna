@@ -27,7 +27,7 @@ use std::fmt::Debug;
 use std::path::Path;
 use std::str::FromStr;
 use std::time::SystemTime;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use ulid::Ulid;
 
 //TODO: Multipart --> Store parts, concatenate on finish
@@ -110,6 +110,9 @@ where
         .await
         .map_err(|e| s3_error!(InternalError, "{}", e))??;
 
+        trace!("GET OBJECT 
+{:?}", info);
+
         // Create backend storage operator
         let operator = self
             .controller
@@ -124,6 +127,7 @@ where
             .ok_or_else(|| s3_error!(InvalidKeyPath, "Path is not a file"))?
             .to_str()
             .ok_or_else(|| s3_error!(InternalError, "String conversion failed"))?;
+        trace!("{filename}");
 
         let stream = IOHandler::<LmdbStore>::read_data(&operator, &info.storage_path)
             .await
@@ -138,7 +142,8 @@ where
         let output = GetObjectOutput {
             body,
             content_disposition: Some(format!(r#"attachment;filename="{}""#, filename)),
-            content_length: Some(info.file_size as i64),
+            //content_length: Some(info.file_size as i64),
+            content_length: None,
             last_modified: None,
             version_id: None,
             checksum_sha256: Some(info.file_hashes.sha256),
@@ -336,6 +341,8 @@ where
                 backend_bucket: Some(backend_bucket_clone.clone()),
                 backend_path: Some(backend_path_clone.clone()),
             };
+            trace!("CREATE BUCKET 
+{:?}", info);
 
             self_clone.io_handler.store_bucket(
                 info.clone(),
@@ -364,7 +371,8 @@ where
             .io_handler
             .get_operator(&backend_bucket)
             .await?;
-        let location = format!("{}/{}/", backend_bucket, backend_path);
+        let location = format!("{}/", backend_path);
+
         operator
             .create_dir(&location)
             .await
