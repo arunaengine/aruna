@@ -22,7 +22,7 @@ use s3s::dto::{
 };
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Debug;
 use std::path::Path;
 use std::str::FromStr;
@@ -682,7 +682,7 @@ where
             partial: false,
             storage_root: backend_bucket,
             storage_path: backend_path,
-            parts: vec![],
+            parts: HashMap::new(),
             finished: false,
             frontend_path: Some(frontend_path),
         };

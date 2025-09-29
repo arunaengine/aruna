@@ -95,20 +95,33 @@ impl Realm {
         trace!("Verifying address signature for {:?}", addr);
         let addr_bytes = match postcard::to_allocvec(addr) {
             Ok(bytes) => bytes,
-            Err(_) => return false,
+            Err(e) => {
+                error!("{}", e.to_string());
+                return false;
+            }
         };
 
         if signature.len() != 64 {
+            error!("Signature len does not match");
             return false;
         }
 
         let sig_bytes: [u8; 64] = match signature.try_into() {
             Ok(array) => array,
-            Err(_) => return false,
+            Err(e) => {
+                error!("{}", e.to_string());
+                return false;
+            }
         };
 
         let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        self.key.verify(&addr_bytes, &signature).is_ok()
+        match self.key.verify(&addr_bytes, &signature) {
+            Ok(_) => true,
+            Err(e) => {
+                error!("{}", e.to_string());
+                false
+            }
+        }
     }
 
     // Get our own node address from the network

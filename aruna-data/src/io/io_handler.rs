@@ -30,7 +30,7 @@ use parking_lot::RwLock;
 use s3s::StdError;
 use s3s::stream::ByteStream;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::ErrorKind;
 use std::ops::Range;
 use std::str::FromStr;
@@ -98,7 +98,7 @@ pub struct BucketState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MultipartUpload {
     pub id: Ulid,
-    pub parts: Vec<(String, String, Hashes)>, // Storage paths (bucket, key, hashes)
+    pub parts: HashMap<usize, (String, String, Hashes)>, // Storage paths (bucket, key, hashes)
     pub finished: bool,
     pub frontend_path: Option<String>,
 
@@ -1055,7 +1055,7 @@ where
             let mut multipart: MultipartUpload = postcard::from_bytes(&multipart)?;
             multipart
                 .parts
-                .retain(|(_, _, hashes)| etags.contains(&hashes.blake3));
+                .retain(|idx, (_, _, hashes)| etags.contains(&hashes.blake3));
             multipart.finished = true;
 
             store.commit(wtxn)?;
@@ -1080,7 +1080,7 @@ where
             .await
             .map_err(|e| ArunaDataError::ServerError(e.to_string()))?;
 
-        for (bucket, key, _hashes) in &multipart.parts {
+        for (_idx, (bucket, key, _hashes)) in multipart.parts.iter() {
             let reader = get_reader(&self.get_operator(bucket).await?, key, None, None).await?;
             let buffer = reader.read(..).await?;
 
@@ -1148,13 +1148,9 @@ where
 
         tokio::spawn(async move {
             // TODO: Add to task handler
-            for (bucket, key, _) in parts {
-                let operator = get_backend_operator(
-                    &backend_type,
-                    backend_config.clone(),
-                    &bucket,
-                )
-                .await?;
+            for (_idx, (bucket, key, _)) in parts.iter() {
+                let operator =
+                    get_backend_operator(&backend_type, backend_config.clone(), &bucket).await?;
 
                 operator.delete(&key).await?;
             }
