@@ -1,5 +1,5 @@
-use crate::IOHandler;
 use crate::api_s3::auth::{ModifyAccess, UserAccess};
+use crate::api_s3::util::evaluate_s3_range;
 use crate::controller::controller::Controller;
 use crate::error::ArunaDataError;
 use crate::io::io_handler::tables::{
@@ -9,7 +9,6 @@ use crate::io::io_handler::{BucketState, MultipartUpload, ObjectInfo, SPECIAL_BU
 use crate::util::opendal::create_paths;
 use crate::util::s3::{Destination, ReplicationRule};
 use aruna_permission::paths::PathBuilder;
-use aruna_storage::storage::lmdb::LmdbStore;
 use aruna_storage::storage::store::Store;
 use futures_util::TryStreamExt;
 use s3s::dto::{
@@ -110,8 +109,7 @@ where
         .await
         .map_err(|e| s3_error!(InternalError, "{}", e))??;
 
-        trace!("GET OBJECT 
-{:?}", info);
+        trace!("GET OBJECT {:?}", info);
 
         // Create backend storage operator
         let operator = self
@@ -129,9 +127,14 @@ where
             .ok_or_else(|| s3_error!(InternalError, "String conversion failed"))?;
         trace!("{filename}");
 
-        let stream = IOHandler::<LmdbStore>::read_data(&operator, &info.storage_path)
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        // Evaluate if range request
+        let (stream, accept_ranges, content_range, content_length) = evaluate_s3_range(
+            req.input.range,
+            info.file_size,
+            &info.storage_path,
+            &operator,
+        )
+        .await?;
 
         let body = Some(StreamingBlob::wrap(stream.map_err(|e| {
             error!("Unable to wrap reader stream: {}", e);
@@ -141,9 +144,10 @@ where
         //TODO: Set more response fields (?)
         let output = GetObjectOutput {
             body,
+            accept_ranges,
+            content_range,
+            content_length: Some(content_length),
             content_disposition: Some(format!(r#"attachment;filename="{}""#, filename)),
-            //content_length: Some(info.file_size as i64),
-            content_length: None,
             last_modified: None,
             version_id: None,
             checksum_sha256: Some(info.file_hashes.sha256),
@@ -341,8 +345,7 @@ where
                 backend_bucket: Some(backend_bucket_clone.clone()),
                 backend_path: Some(backend_path_clone.clone()),
             };
-            trace!("CREATE BUCKET 
-{:?}", info);
+            trace!("CREATE BUCKET {:?}", info);
 
             self_clone.io_handler.store_bucket(
                 info.clone(),
@@ -752,12 +755,11 @@ where
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        let UserAccess {
-            group_id, ..
-        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
-            error!(error = "Missing user context");
-            s3_error!(UnexpectedContent, "Missing user context")
-        })?;
+        let UserAccess { group_id, .. } =
+            req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+                error!(error = "Missing user context");
+                s3_error!(UnexpectedContent, "Missing user context")
+            })?;
 
         let parts = req
             .input

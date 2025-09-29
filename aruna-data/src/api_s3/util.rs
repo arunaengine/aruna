@@ -9,6 +9,11 @@ use hyper::body::Frame;
 use s3s::dto::{CreateBucketInput, CreateMultipartUploadInput, UploadPartInput};
 */
 use aruna_permission::manager::Action;
+use aruna_storage::storage::lmdb::LmdbStore;
+use opendal::{FuturesBytesStream, Operator};
+use s3s::{S3Error, s3_error};
+
+use crate::IOHandler;
 
 pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
     match operation_name {
@@ -115,6 +120,72 @@ pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
         // Unknown operation
         _ => None,
     }
+}
+
+pub async fn evaluate_s3_range(
+    input_range: Option<s3s::dto::Range>,
+    file_size: u64,
+    storage_path: &str,
+    operator: &Operator,
+) -> Result<(FuturesBytesStream, Option<String>, Option<String>, i64), S3Error> {
+    Ok(if let Some(range) = input_range {
+        let (range, bytes_range, content_range) = match range {
+            s3s::dto::Range::Int { first, last } => match last {
+                Some(end) => {
+                    // File size is maximum
+                    let end = if end >= file_size { file_size - 1 } else { end };
+
+                    (
+                        std::ops::Range { start: first, end },
+                        format!("bytes {}-{}/{}", first, end, (end + 1) - first),
+                        (end - first) as i64,
+                    )
+                }
+                None => (
+                    std::ops::Range {
+                        start: first,
+                        end: file_size,
+                    },
+                    format!("bytes {}-{}/{}", first, file_size - 1, file_size - first),
+                    (file_size - first) as i64,
+                ),
+            },
+            s3s::dto::Range::Suffix { length } => {
+                // File size is maximum
+                let length = if length > file_size {
+                    file_size
+                } else {
+                    length
+                };
+
+                (
+                    std::ops::Range {
+                        start: 0,
+                        end: length,
+                    },
+                    format!("bytes 0-{}/{}", length - 1, file_size),
+                    length as i64,
+                )
+            }
+        };
+
+        let stream = IOHandler::<LmdbStore>::read_data_range(&operator, storage_path, range)
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        (
+            stream,
+            Some("bytes".to_string()),
+            Some(bytes_range),
+            content_range,
+        )
+    } else {
+        let stream = IOHandler::<LmdbStore>::read_data(&operator, storage_path)
+            .await
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        (stream, None, None, file_size as i64)
+    })
 }
 
 /*
