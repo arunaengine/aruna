@@ -462,7 +462,6 @@ where
     }
 }
 
-
 /// Update resource title
 #[utoipa::path(
     post,
@@ -712,7 +711,11 @@ where
     Se: Search + 'static,
     N: Network + 'static,
 {
-    into_axum_response(state.request(GetInfoRequest{}, extract_token(&headers)).await)
+    into_axum_response(
+        state
+            .request(GetInfoRequest {}, extract_token(&headers))
+            .await,
+    )
 }
 
 /// Get server info
@@ -738,7 +741,11 @@ where
     Se: Search + 'static,
     N: Network + 'static,
 {
-    into_axum_response(state.request(GetRealmInfoRequest{}, extract_token(&headers)).await)
+    into_axum_response(
+        state
+            .request(GetRealmInfoRequest {}, extract_token(&headers))
+            .await,
+    )
 }
 
 // Get resource history
@@ -771,4 +778,3 @@ where
 {
     into_axum_response(state.request(request, extract_token(&header)).await)
 }
-

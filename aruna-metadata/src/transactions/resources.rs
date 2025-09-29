@@ -236,7 +236,13 @@ where
         let realm_key = controller.network.get_realm_key().await?;
         let doc = controller
             .persistence
-            .add_resource(node_id.as_bytes(), &realm_key, &user, path.clone(), resource.clone())
+            .add_resource(
+                node_id.as_bytes(),
+                &realm_key,
+                &user,
+                path.clone(),
+                resource.clone(),
+            )
             .await?;
 
         let mut chunk_hasher = blake3::Hasher::new();
@@ -583,7 +589,13 @@ where
         let realm_key = controller.network.get_realm_key().await?;
         let doc = controller
             .persistence
-            .update_resource(node_id.as_bytes(), &realm_key, &user, path.clone(), resource.clone())
+            .update_resource(
+                node_id.as_bytes(),
+                &realm_key,
+                &user,
+                path.clone(),
+                resource.clone(),
+            )
             .await?;
 
         let mut chunk_hasher = blake3::Hasher::new();
@@ -774,7 +786,13 @@ where
 
         let doc = controller
             .persistence
-            .add_resource(node_id.as_bytes(),&realm_key, &user, path.clone(), resource.clone())
+            .add_resource(
+                node_id.as_bytes(),
+                &realm_key,
+                &user,
+                path.clone(),
+                resource.clone(),
+            )
             .await?;
 
         let mut chunk_hasher = blake3::Hasher::new();

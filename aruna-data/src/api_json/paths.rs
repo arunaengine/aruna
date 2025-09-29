@@ -111,7 +111,7 @@ where
     get,
     path = "/data/location",
     params (
-       LocateDataRequest 
+       LocateDataRequest
     ),
     responses(
         (status = 200, body = LocateDataResponse), ArunaDataError),
@@ -153,5 +153,9 @@ pub async fn get_info<St>(
 where
     for<'a> St: Store<'a> + 'static,
 {
-    into_axum_response(state.request(GetInfoRequest{}, extract_token(&headers)).await)
+    into_axum_response(
+        state
+            .request(GetInfoRequest {}, extract_token(&headers))
+            .await,
+    )
 }

@@ -23,8 +23,8 @@ use std::convert::Infallible;
 use std::future::Ready;
 use std::future::ready;
 use tokio::net::TcpListener;
-use tracing::info;
 use tracing::error;
+use tracing::info;
 
 pub struct S3Server {
     s3service: S3Service,

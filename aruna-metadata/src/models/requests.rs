@@ -402,7 +402,7 @@ pub enum ForwardResponse {
     GetResourceHistory(Result<GetResourceHistoryResponse, ArunaMetadataError>),
     UpdateResource(Result<ResourceUpdateResponses, ArunaMetadataError>),
     Search(Result<SearchResponse, ArunaMetadataError>),
-    GetRealmInfo(Result<GetInfoResponse, ArunaMetadataError>)
+    GetRealmInfo(Result<GetInfoResponse, ArunaMetadataError>),
 }
 #[derive(
     Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize, ToSchema, IntoParams,

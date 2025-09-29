@@ -12,7 +12,7 @@ use n0_future::{FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{debug, error, info, trace, warn, Instrument};
+use tracing::{Instrument, debug, error, info, trace, warn};
 use ulid::Ulid;
 
 pub const KADEMLIA_PROTOCOL_ID: u32 = 1;

@@ -331,7 +331,8 @@ impl P2PNetwork {
                     ForwardResponse::GetResource(Err(e)),
                 ))),
             },
-            ForwardRequest::GetResourceHistory(req) => match req.authorize(token, controller).await {
+            ForwardRequest::GetResourceHistory(req) => match req.authorize(token, controller).await
+            {
                 Ok(auth_ctx) => Body::Response(Response::ForwardResponse(Box::new(
                     ForwardResponse::GetResourceHistory(
                         req.clone().run_request(auth_ctx, controller).await,
@@ -362,7 +363,9 @@ impl P2PNetwork {
 
             ForwardRequest::GetRealmInfo(req) => match req.authorize(token, controller).await {
                 Ok(auth_ctx) => Body::Response(Response::ForwardResponse(Box::new(
-                    ForwardResponse::GetRealmInfo(req.clone().run_request(auth_ctx, controller).await),
+                    ForwardResponse::GetRealmInfo(
+                        req.clone().run_request(auth_ctx, controller).await,
+                    ),
                 ))),
                 Err(e) => Body::Response(Response::ForwardResponse(Box::new(
                     ForwardResponse::GetRealmInfo(Err(e)),

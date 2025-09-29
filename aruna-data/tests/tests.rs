@@ -141,10 +141,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            resp.e_tag,
-            Some(etag.to_string())
-        );
+        assert_eq!(resp.e_tag, Some(etag.to_string()));
         assert_eq!(
             resp.checksum_sha256,
             Some("913ed33e2e8642b4be2c3608d44c8ac44cd571f241d847e472f8dfb78ebf99e6".to_string())
@@ -377,11 +374,7 @@ mod tests {
         let mut test_nodes = init_test_nodes(3, OFFSET, vec![]).await.unwrap();
         let node = test_nodes.node_services.pop().unwrap();
         let node_controller = node.openapi_data_endpoint.0.clone();
-        let node_id = node_controller
-            .network
-            .get_node_addr()
-            .node_id
-            .to_string();
+        let node_id = node_controller.network.get_node_addr().node_id.to_string();
 
         //TODO: Put object to specific node
         // Register dummy user and create token
@@ -449,7 +442,10 @@ mod tests {
                             .id("MyNewReplicationRule".to_string())
                             .destination(
                                 Destination::builder()
-                                    .bucket(format!("arn:aws:s3:{}:account_id:{}", other_node_id, bucket))
+                                    .bucket(format!(
+                                        "arn:aws:s3:{}:account_id:{}",
+                                        other_node_id, bucket
+                                    ))
                                     .build()
                                     .unwrap(),
                             )
