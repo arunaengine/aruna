@@ -15,9 +15,10 @@ use s3s::dto::{
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
     CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
     DeleteBucketReplicationInput, DeleteBucketReplicationOutput, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetObjectInput, GetObjectOutput, PutBucketPolicyInput,
-    PutBucketPolicyOutput, PutBucketReplicationInput, PutBucketReplicationOutput, PutObjectInput,
-    PutObjectOutput, StreamingBlob, UploadPartInput, UploadPartOutput,
+    GetBucketReplicationOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
+    PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput,
+    PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, StreamingBlob, UploadPartInput,
+    UploadPartOutput,
 };
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use std::borrow::Cow;
@@ -150,7 +151,7 @@ where
             content_disposition: Some(format!(r#"attachment;filename="{}""#, filename)),
             last_modified: None,
             version_id: None,
-            checksum_sha256: Some(info.file_hashes.sha256),
+            // TODO: Needs to be base64 encoded: checksum_sha256: Some(info.file_hashes.sha256),
             e_tag: Some(info.file_hashes.blake3.to_string()),
             ..Default::default()
         };
@@ -804,5 +805,65 @@ where
             ..Default::default()
         };
         Ok(S3Response::new(inner_response))
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        debug!("Received GET Request: {:#?}", req);
+        // Extract access check result
+        let UserAccess { group_id, .. } =
+            req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+                error!(error = "Missing user context");
+                s3_error!(UnexpectedContent, "Missing user context")
+            })?;
+
+        // Fetch object info
+        let store_clone = self.controller.io_handler.store.clone();
+        let bucket = format!("{}/{}", group_id, req.input.bucket);
+        let key = req.input.key;
+        let info = tokio::task::spawn_blocking(move || {
+            let read_txn = store_clone.create_txn(false)?;
+            let frontend_path = format!("{}/{}", bucket, key);
+
+            let hash = if &bucket != SPECIAL_BUCKET {
+                store_clone
+                    .get(&read_txn, PATH_LOCATION_DB_NAME, frontend_path.as_bytes())?
+                    .ok_or_else(|| ArunaDataError::NotFound("No such key".to_string()))?
+            } else {
+                let hash =
+                    blake3::Hash::from_str(&key).map_err(|_e| ArunaDataError::ConversionError {
+                        from: "String".to_string(),
+                        to: "blake3::Hash".to_string(),
+                    })?;
+                Cow::from(hash.as_bytes().to_vec())
+            };
+
+            // Extend provided path
+            let info_raw = store_clone
+                .get(&read_txn, LOCATION_DB_NAME, &hash)?
+                .ok_or_else(|| ArunaDataError::NotFound("No such key".to_string()))?;
+            let info: ObjectInfo = postcard::from_bytes(&*info_raw)?;
+
+            Ok::<ObjectInfo, ArunaDataError>(info)
+        })
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))??;
+
+        trace!("HEAD OBJECT {:?}", info);
+
+        //TODO: Set more response fields (?)
+        let output = HeadObjectOutput {
+            last_modified: Some(info.created_at.into()),
+            // TODO: Needs to be base64 encoded: checksum_sha256: Some(info.file_hashes.sha256),
+            content_length: Some(info.file_size as i64),
+            e_tag: Some(info.file_hashes.blake3.to_string()),
+            ..Default::default()
+        };
+
+        Ok(S3Response::new(output))
     }
 }
