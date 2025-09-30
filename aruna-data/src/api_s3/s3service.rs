@@ -1,3 +1,4 @@
+use crate::REPLICATION_RULES_DB_NAME;
 use crate::api_s3::auth::{ModifyAccess, UserAccess};
 use crate::api_s3::util::evaluate_s3_range;
 use crate::controller::controller::Controller;
@@ -17,8 +18,8 @@ use s3s::dto::{
     DeleteBucketReplicationInput, DeleteBucketReplicationOutput, GetBucketReplicationInput,
     GetBucketReplicationOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
     PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput,
-    PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, StreamingBlob, UploadPartInput,
-    UploadPartOutput,
+    PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
+    StreamingBlob, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3Error, S3Request, S3Response, S3Result, s3_error};
 use std::borrow::Cow;
@@ -520,13 +521,87 @@ where
     #[allow(clippy::blocks_in_conditions)]
     async fn get_bucket_replication(
         &self,
-        _req: S3Request<GetBucketReplicationInput>,
+        req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
-        // TODO:
-        Err(s3_error!(
-            NotImplemented,
-            "Bucket replications are not implemented"
-        ))
+        let UserAccess {
+            group_id, user_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        // Check if bucket exists
+        let (bucket_path, _) = create_paths(None, &req.input.bucket, &group_id, false)
+            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        let bucket_path =
+            bucket_path.ok_or_else(|| s3_error!(InvalidBucketName, "Invalid bucket"))?;
+        let store_clone = self.controller.io_handler.store.clone();
+        let bucket_clone = bucket_path.clone();
+        let rule = tokio::task::spawn_blocking(move || {
+            let read_txn = store_clone.create_txn(false)?;
+
+            // Try fetch content hash associated with frontend bucket
+            let res = store_clone.get(&read_txn, BUCKET_STATE_DB_NAME, bucket_clone.as_bytes())?;
+
+            if !res.is_some() {
+                return Err(ArunaDataError::InvalidParameter {
+                    name: "bucket".to_string(),
+                    error: "Bucket does not exist".to_string(),
+                });
+            };
+
+            let replication_policy = store_clone.get(
+                &read_txn,
+                REPLICATION_RULES_DB_NAME,
+                bucket_clone.as_bytes(),
+            )?;
+
+            let rule: Option<ReplicationRule> = match replication_policy {
+                Some(r) => Some(postcard::from_bytes(&r)?),
+                None => None,
+            };
+
+            store_clone.commit(read_txn)?;
+
+            Ok::<Option<ReplicationRule>, ArunaDataError>(rule)
+        })
+        .await
+        .map_err(|e| s3_error!(InternalError, "{}", e))?
+        .map_err(|e| s3_error!(InternalError, "{}", e))?;
+
+        let rules = match rule {
+            Some(rule) => Some(ReplicationConfiguration {
+                role: user_id.to_string(),
+                rules: vec![s3s::dto::ReplicationRule {
+                    delete_marker_replication: None,
+                    destination: s3s::dto::Destination {
+                        bucket: rule.target.bucket,
+                        access_control_translation: None,
+                        account: None,
+                        encryption_configuration: None,
+                        metrics: None,
+                        replication_time: None,
+                        storage_class: None,
+                    },
+                    existing_object_replication: Some(s3s::dto::ExistingObjectReplication {
+                        status: s3s::dto::ExistingObjectReplicationStatus::from_str(
+                            &rule.existing_object_replication.to_string(),
+                        )?,
+                    }),
+                    filter: None,
+                    id: None,
+                    prefix: None,
+                    priority: None,
+                    source_selection_criteria: None,
+                    status: s3s::dto::ReplicationRuleStatus::from_str("ENABLED")?,
+                }],
+            }),
+            None => None,
+        };
+
+        Ok(S3Response::new(GetBucketReplicationOutput {
+            replication_configuration: rules,
+        }))
     }
 
     #[tracing::instrument(err)]
