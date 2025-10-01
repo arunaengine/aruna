@@ -137,7 +137,7 @@ pub async fn evaluate_s3_range(
 
                     (
                         std::ops::Range { start: first, end },
-                        format!("bytes {}-{}/{}", first, end, (end + 1) - first),
+                        format!("bytes {}-{}/{}", first, end, file_size),
                         (end - first) as i64,
                     )
                 }
@@ -146,7 +146,7 @@ pub async fn evaluate_s3_range(
                         start: first,
                         end: file_size,
                     },
-                    format!("bytes {}-{}/{}", first, file_size - 1, file_size - first),
+                    format!("bytes {}-{}/{}", first, file_size - 1, file_size),
                     (file_size - first) as i64,
                 ),
             },
