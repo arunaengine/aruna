@@ -16,21 +16,21 @@ services:
       interval: 5s
       timeout: 5s
       retries: 30
-  jaeger:
-    deploy:
-      resources:
-        limits:
-          cpus: '4'
-          memory: 6G
-    environment:
-      COLLECTOR_OTLP_ENABLED: true
-    ports:
-      - 16686:16686 
-      - 4317:4317 
-      - 4318:4318
-      - 5778:5778
-      - 9411:9411
-    image: cr.jaegertracing.io/jaegertracing/jaeger:2.10.0
+  # jaeger:
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: '4'
+  #         memory: 6G
+  #   environment:
+  #     COLLECTOR_OTLP_ENABLED: true
+  #   ports:
+  #     - 16686:16686 
+  #     - 4317:4317 
+  #     - 4318:4318
+  #     - 5778:5778
+  #     - 9411:9411
+  #   image: cr.jaegertracing.io/jaegertracing/jaeger:2.10.0
   minio:
     deploy:
       resources:

@@ -136,7 +136,10 @@ pub async fn evaluate_s3_range(
                     let end = if end >= file_size { file_size - 1 } else { end };
 
                     (
-                        std::ops::Range { start: first, end },
+                        std::ops::Range {
+                            start: first,
+                            end: end + 1,
+                        },
                         format!("bytes {}-{}/{}", first, end, file_size),
                         (end - first) as i64,
                     )
