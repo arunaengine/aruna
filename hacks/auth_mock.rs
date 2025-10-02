@@ -62,9 +62,16 @@ type OIDCClient = openidconnect::Client<
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().unwrap();
+    let bind_addr = dotenvy::var("BIND_ADDR").unwrap();
+    let issuer_url = dotenvy::var("ISSUER_URL").unwrap();
+    let client_secret = dotenvy::var("CLIENT_SECRET").unwrap();
+    let redirect_url = dotenvy::var("REDIRECT_URL").unwrap();
     // build our application with a single route
     // our router
-    let client = get_oidc_client().await.unwrap();
+    let client = get_oidc_client(issuer_url, client_secret, redirect_url)
+        .await
+        .unwrap();
     let shared_state = Arc::new(Mutex::new(AuthState {
         client,
         pkce_verifier: None,
@@ -78,7 +85,7 @@ async fn main() {
         .with_state(shared_state);
 
     // run our app with hyper, listening globally on port 3000
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let listener = tokio::net::TcpListener::bind(bind_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -150,14 +157,18 @@ async fn callback(
     Ok(response)
 }
 
-async fn get_oidc_client() -> Result<Clients> {
+async fn get_oidc_client(
+    issuer_url: String,
+    client_secret: String,
+    redirect_url: String,
+) -> Result<Clients> {
     let http_client = reqwest::ClientBuilder::new()
         // Following redirects opens the client up to SSRF vulnerabilities.
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
 
     let provider_metadata = CoreProviderMetadata::discover_async(
-        IssuerUrl::new("http://localhost:1998/realms/test".to_string())?,
+        IssuerUrl::new(issuer_url)?,
         &http_client,
     )
     .await?;
@@ -167,14 +178,10 @@ async fn get_oidc_client() -> Result<Clients> {
     let core_client = CoreClient::from_provider_metadata(
         provider_metadata,
         ClientId::new("test".to_string()),
-        Some(ClientSecret::new(
-            "QgBl9I2CD3eVhL7LFvkHrYUK7oKL3LE2".to_string(),
-        )),
+        Some(ClientSecret::new(client_secret)),
     )
     // Set the URL the user will be redirected to after the authorization process.
-    .set_redirect_uri(RedirectUrl::new(
-        "http://localhost:3000/callback".to_string(),
-    )?);
+    .set_redirect_uri(RedirectUrl::new(redirect_url)?);
 
     Ok(Clients {
         oidc: core_client,

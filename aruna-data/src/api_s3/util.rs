@@ -141,7 +141,7 @@ pub async fn evaluate_s3_range(
                             end: end + 1,
                         },
                         format!("bytes {}-{}/{}", first, end, file_size),
-                        (end - first) as i64,
+                        (end + 1 - first) as i64,
                     )
                 }
                 None => (
@@ -156,7 +156,7 @@ pub async fn evaluate_s3_range(
             s3s::dto::Range::Suffix { length } => {
                 // File size is maximum
                 let length = if length > file_size {
-                    file_size
+                    file_size - 1
                 } else {
                     length
                 };
@@ -164,10 +164,10 @@ pub async fn evaluate_s3_range(
                 (
                     std::ops::Range {
                         start: 0,
-                        end: length,
+                        end: length + 1,
                     },
-                    format!("bytes 0-{}/{}", length - 1, file_size),
-                    length as i64,
+                    format!("bytes 0-{}/{}", length, file_size),
+                    (length + 1) as i64,
                 )
             }
         };
