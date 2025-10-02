@@ -62,7 +62,6 @@ type OIDCClient = openidconnect::Client<
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().unwrap();
     let bind_addr = dotenvy::var("BIND_ADDR").unwrap();
     let issuer_url = dotenvy::var("ISSUER_URL").unwrap();
     let client_secret = dotenvy::var("CLIENT_SECRET").unwrap();
