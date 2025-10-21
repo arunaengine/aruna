@@ -160,6 +160,7 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
         // FIXME: This is neccessary for MultipartUploadRequests, because currently only the
         // response including cors headers gets returned inside the keep-alive-body. See
         // https://github.com/s3s-project/s3s/blob/85f3842d03175537753584ad9d4f25e819aa9025/crates/s3s/src/ops/generated.rs#L613-L650
+        // This could be changed to a Box::pin(async move {...})
         let headers = if req.method() == Method::POST && req.uri().to_string().contains("uploadId")
         {
             match self.get_cors_headers(origin_exception, &req) {
