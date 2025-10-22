@@ -790,15 +790,6 @@ impl S3 for ArunaS3Service {
             (None, None)
         };
 
-        trace!(
-            ?query_ranges,
-            ?edit_list,
-            ?actual_size,
-            ?actual_range,
-            ?accept_ranges,
-            ?content_range
-        );
-
         // Spawn get_object to fetch bytes from storage
         let backend = self.backend.clone();
         let loc_clone = location.clone();
@@ -822,7 +813,6 @@ impl S3 for ArunaS3Service {
                 );
 
                 if let Some(key) = decryption_key {
-                    //asrw = asrw.add_transformer(ChaChaResilient::new_with_lengths(key, vec![actual_size]));
                     asrw = asrw.add_transformer(ChaCha20DecParts::new_with_lengths(
                         key,
                         vec![actual_size],
