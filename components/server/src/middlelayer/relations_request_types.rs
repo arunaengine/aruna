@@ -53,6 +53,7 @@ impl ModifyRelations {
                 &self.0.add_relations,
                 resource_id,
                 transaction_client,
+                DbPermissionLevel::APPEND,
             )
             .await?;
         let (external_rm_relations, temp_rm_int_relations, mut removed_to_check) =
@@ -60,6 +61,7 @@ impl ModifyRelations {
                 &self.0.remove_relations,
                 resource_id,
                 transaction_client,
+                DbPermissionLevel::WRITE,
             )
             .await?;
         if !temp_rm_int_relations
@@ -101,6 +103,7 @@ impl ModifyRelations {
         api_relations: &Vec<Relation>,
         resource_id: DieselUlid,
         transaction_client: &Client,
+        permission_level: DbPermissionLevel,
     ) -> Result<(Vec<ExternalRelation>, Vec<InternalRelation>, Vec<Context>)> {
         let mut external_relations: Vec<ExternalRelation> = Vec::new();
         let mut internal_relations: Vec<InternalRelation> = Vec::new();
@@ -114,7 +117,7 @@ impl ModifyRelations {
                     relation::Relation::Internal(internal) => {
                         resources_to_check.push(Context::res_ctx(
                             DieselUlid::from_str(&internal.resource_id)?,
-                            DbPermissionLevel::WRITE,
+                            permission_level,
                             true,
                         ));
                         internal_relations
