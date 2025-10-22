@@ -512,10 +512,16 @@ impl GrpcQueryHandler {
             variant: KeyValueVariant::Label as i32,
         };
 
+        let remove_key_values = obj
+            .key_values
+            .into_iter()
+            .filter(|k| k.key == "app.aruna-storage.org/cors")
+            .collect();
+
         let mut req = Request::new(UpdateProjectKeyValuesRequest {
             project_id: obj.id.to_string(),
             add_key_values: vec![kv],
-            remove_key_values: vec![],
+            remove_key_values: remove_key_values,
         });
 
         Self::add_token_to_md(req.metadata_mut(), token)?;

@@ -160,6 +160,22 @@ impl DatabaseHandler {
                 "Both add_key_values and remove_key_values are empty.",
             ));
         }
+        if !rm_key_values.0.is_empty() {
+            let object = Object::get(id, transaction_client)
+                .await?
+                .ok_or(anyhow!("Dataset does not exist."))?;
+            for kv in rm_key_values.0 {
+                if kv.variant == KeyValueVariant::STATIC_LABEL {
+                    return Err(anyhow!("Cannot remove static labels."));
+                }
+                if kv.variant == KeyValueVariant::HOOK_STATUS {
+                    return Err(anyhow!(
+                        "Cannot remove hook_status outside of hook_callback"
+                    ));
+                }
+                object.remove_key_value(transaction_client, kv).await?;
+            }
+        }
         if !add_key_values.0.is_empty() {
             for kv in add_key_values.0 {
                 match kv.variant {
@@ -182,22 +198,6 @@ impl DatabaseHandler {
             }
         }
 
-        if !rm_key_values.0.is_empty() {
-            let object = Object::get(id, transaction_client)
-                .await?
-                .ok_or(anyhow!("Dataset does not exist."))?;
-            for kv in rm_key_values.0 {
-                if kv.variant == KeyValueVariant::STATIC_LABEL {
-                    return Err(anyhow!("Cannot remove static labels."));
-                }
-                if kv.variant == KeyValueVariant::HOOK_STATUS {
-                    return Err(anyhow!(
-                        "Cannot remove hook_status outside of hook_callback"
-                    ));
-                }
-                object.remove_key_value(transaction_client, kv).await?;
-            }
-        }
         self.evaluate_rules(&vec![id], transaction_client).await?;
         transaction.commit().await?;
 
