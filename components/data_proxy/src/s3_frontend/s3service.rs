@@ -226,7 +226,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let response = CompleteMultipartUploadOutput {
-            e_tag: Some(format!("-{}", object.id.to_string())),
+            e_tag: Some(format!("-{}", object.id)),
             ..Default::default()
         };
 
@@ -790,9 +790,16 @@ impl S3 for ArunaS3Service {
             (None, None)
         };
 
-        trace!(?edit_list);
+        trace!(
+            ?query_ranges,
+            ?edit_list,
+            ?actual_size,
+            ?actual_range,
+            ?accept_ranges,
+            ?content_range
+        );
 
-        // Spawn get_object to fetch bytes from storage storage
+        // Spawn get_object to fetch bytes from storage
         let backend = self.backend.clone();
         let loc_clone = location.clone();
         trace!(?loc_clone, ?query_ranges, "spawning get_object");
@@ -815,6 +822,7 @@ impl S3 for ArunaS3Service {
                 );
 
                 if let Some(key) = decryption_key {
+                    //asrw = asrw.add_transformer(ChaChaResilient::new_with_lengths(key, vec![actual_size]));
                     asrw = asrw.add_transformer(ChaCha20DecParts::new_with_lengths(
                         key,
                         vec![actual_size],
@@ -1972,7 +1980,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let output = PutObjectOutput {
-            e_tag: Some(format!("-{}", new_object.id.to_string())),
+            e_tag: Some(format!("-{}", new_object.id)),
             checksum_sha256: sha_initial,
             ..Default::default()
         };

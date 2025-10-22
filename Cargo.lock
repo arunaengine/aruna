@@ -68,9 +68,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.98"
+version = "1.0.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e16d2d3311acee920a9eb8d33b8cbc1787ce4a264e85f964c2404b969bdcd487"
+checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "arrayvec"
@@ -162,9 +162,9 @@ dependencies = [
 
 [[package]]
 name = "async-channel"
-version = "2.3.1"
+version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "89b47800b0be77592da0afd425cc03468052844aff33b84e33cc696f64e77b6a"
+checksum = "924ed96dd52d1b75e9c1a3e6275715fd320f5f9439fb5a4a11fa51f4221158d2"
 dependencies = [
  "concurrent-queue",
  "event-listener-strategy",
@@ -174,18 +174,16 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.23"
+version = "0.4.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b37fc50485c4f3f736a4fb14199f6d5f5ba008d7f28fe710306c92780f004c07"
+checksum = "5a89bce6054c720275ac2432fbba080a66a2106a44a1b804553930ca6909f4e0"
 dependencies = [
- "flate2",
+ "compression-codecs",
+ "compression-core",
  "futures-core",
  "futures-io",
- "memchr",
  "pin-project-lite",
  "tokio",
- "zstd",
- "zstd-safe",
 ]
 
 [[package]]
@@ -259,16 +257,16 @@ dependencies = [
 
 [[package]]
 name = "async_zip"
-version = "0.0.17"
+version = "0.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00b9f7252833d5ed4b00aa9604b563529dd5e11de9c23615de2dcdf91eb87b52"
+checksum = "0d8c50d65ce1b0e0cb65a785ff615f78860d7754290647d3b983208daa4f85e6"
 dependencies = [
  "async-compression",
  "chrono",
  "crc32fast",
  "futures-lite",
  "pin-project",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "tokio",
  "tokio-util",
 ]
@@ -1164,6 +1162,25 @@ dependencies = [
  "lazy_static",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "compression-codecs"
+version = "0.4.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef8a506ec4b81c460798f572caead636d57d3d7e940f998160f52bd254bf2d23"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "memchr",
+ "zstd",
+ "zstd-safe",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e47641d3deaf41fb1538ac1f54735925e275eaf3bf4d55c81b137fba797e5cbb"
 
 [[package]]
 name = "concurrent-queue"
@@ -3447,9 +3464,9 @@ checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pithos_lib"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bab8b0e8f95bbafe9e51b5efe86152c0336805c0f82a9bbb8fab0e3d88e9da3f"
+checksum = "1b49684a42666d41dff794eb97a2d6b2176203dad1fa15e2f8ed92c8329addb4"
 dependencies = [
  "anyhow",
  "async-channel",

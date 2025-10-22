@@ -162,7 +162,7 @@ pub fn bucket_path_from_pathstring(path: &str) -> Result<(String, String)> {
             Err(anyhow::anyhow!("Invalid path format"))
         }
     } else {
-        return Err(anyhow::anyhow!("Invalid path format"));
+        Err(anyhow::anyhow!("Invalid path format"))
     }
 }
 
