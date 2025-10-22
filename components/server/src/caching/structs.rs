@@ -137,8 +137,8 @@ impl ObjectWithRelations {
 pub struct ProxyCacheIterator<'a> {
     resource_iter:
         Box<dyn Iterator<Item = RefMulti<'a, DieselUlid, ObjectWithRelations>> + 'a + Send + Sync>,
-    user_iter: Box<(dyn Iterator<Item = RefMulti<'a, DieselUlid, User>> + 'a + Send + Sync)>,
-    pub_key_iter: Box<(dyn Iterator<Item = RefMulti<'a, i16, PubKeyEnum>> + 'a + Send + Sync)>,
+    user_iter: Box<dyn Iterator<Item = RefMulti<'a, DieselUlid, User>> + 'a + Send + Sync>,
+    pub_key_iter: Box<dyn Iterator<Item = RefMulti<'a, i16, PubKeyEnum>> + 'a + Send + Sync>,
     endpoint_id: DieselUlid,
     cache: Arc<Cache>,
 }
@@ -146,10 +146,10 @@ pub struct ProxyCacheIterator<'a> {
 impl<'a> ProxyCacheIterator<'a> {
     pub fn new(
         resource_iter: Box<
-            (dyn Iterator<Item = RefMulti<'a, DieselUlid, ObjectWithRelations>> + 'a + Send + Sync),
+            dyn Iterator<Item = RefMulti<'a, DieselUlid, ObjectWithRelations>> + 'a + Send + Sync,
         >,
-        user_iter: Box<(dyn Iterator<Item = RefMulti<'a, DieselUlid, User>> + 'a + Send + Sync)>,
-        pub_key_iter: Box<(dyn Iterator<Item = RefMulti<'a, i16, PubKeyEnum>> + 'a + Send + Sync)>,
+        user_iter: Box<dyn Iterator<Item = RefMulti<'a, DieselUlid, User>> + 'a + Send + Sync>,
+        pub_key_iter: Box<dyn Iterator<Item = RefMulti<'a, i16, PubKeyEnum>> + 'a + Send + Sync>,
         endpoint_id: DieselUlid,
         cache: Arc<Cache>,
     ) -> ProxyCacheIterator<'a> {

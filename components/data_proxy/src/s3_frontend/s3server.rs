@@ -160,70 +160,29 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
         // FIXME: This is neccessary for MultipartUploadRequests, because currently only the
         // response including cors headers gets returned inside the keep-alive-body. See
         // https://github.com/s3s-project/s3s/blob/85f3842d03175537753584ad9d4f25e819aa9025/crates/s3s/src/ops/generated.rs#L613-L650
-        // This could be changed to a Box::pin(async move {...})
-        let headers = if req.method() == Method::POST && req.uri().to_string().contains("uploadId")
-        {
-            match self.get_cors_headers(origin_exception, &req) {
-                Ok(map) => Some(map),
-                Err(e) => {
-                    error!(?e);
-                    None
-                }
-            }
-        } else {
-            None
+        if req.method() == Method::POST && req.uri().to_string().contains("uploadId") {
+            let clone = self.clone();
+            return Box::pin(async move {
+                let headers = match clone.get_cors_headers(origin_exception, &req).await {
+                    Ok(map) => Some(map),
+                    Err(e) => {
+                        error!(?e);
+                        None
+                    }
+                };
+
+                let resp = clone.shared.call(req);
+                let res =
+                    resp.map(move |r| clone.modify_response_headers(r, origin_exception, headers));
+
+                res.await
+            });
         };
 
-        let service = self.shared.clone();
-        let resp = service.call(req);
+        let clone = self.clone();
+        let resp = clone.shared.call(req);
 
-        let res = resp.map(move |r| {
-            r.map(|mut r| {
-                if r.headers().contains_key("Transfer-Encoding") {
-                    r.headers_mut().remove("Content-Length");
-                }
-
-                if let Some(headers) = headers {
-                    for (k, v) in headers {
-                        if let Some(k) = k {
-                            r.headers_mut().entry(k).or_insert(v);
-                        }
-                    }
-                }
-
-                // Expose 'ETag' header if present
-                if r.headers().contains_key("ETag") {
-                    r.headers_mut().append(
-                        "Access-Control-Expose-Headers",
-                        HeaderValue::from_static("ETag"),
-                    );
-                }
-
-                // Add CORS * if request origin matches exception regex
-                if origin_exception {
-                    r.headers_mut()
-                        .entry(ACCESS_CONTROL_ALLOW_ORIGIN)
-                        .or_insert(HeaderValue::from_static("*"));
-                    r.headers_mut()
-                        .entry(ACCESS_CONTROL_ALLOW_METHODS)
-                        .or_insert(HeaderValue::from_static("*"));
-                    r.headers_mut()
-                        .entry(ACCESS_CONTROL_ALLOW_HEADERS)
-                        .or_insert(HeaderValue::from_static("*"));
-                }
-
-                // Workaround to return 206 (Partial Content) for range responses
-                if r.headers().contains_key("Content-Range")
-                    && r.headers().contains_key("Accept-Ranges")
-                    && r.status().as_u16() == 200
-                {
-                    let status = r.status_mut();
-                    *status = StatusCode::from_u16(206).unwrap();
-                }
-
-                r.map(Body::from)
-            })
-        });
+        let res = resp.map(move |r| clone.modify_response_headers(r, origin_exception, None));
         res.boxed()
     }
 }
@@ -390,7 +349,7 @@ impl WrappingService {
         Ok(resp)
     }
 
-    fn get_cors_headers(
+    async fn get_cors_headers(
         &self,
         origin_exception: bool,
         req: &hyper::Request<hyper::body::Incoming>,
@@ -457,13 +416,9 @@ impl WrappingService {
             s3_error!(NoSuchBucket, "No bucket found with id {}", project_id)
         })?;
 
-        // FIXME: Maybe a try_read() is not the right thing to do here
         let cors = project
-            .try_read()
-            .map_err(|e| {
-                error!("{e}");
-                s3_error!(InternalError, "Error acquiring read lock")
-            })?
+            .read()
+            .await
             .key_values
             .clone()
             .into_iter()
@@ -519,5 +474,60 @@ impl WrappingService {
             })?,
         );
         Ok(header_map)
+    }
+
+    fn modify_response_headers(
+        &self,
+        resp: Result<hyper::Response<Body>, S3Error>,
+        origin_exception: bool,
+        headers: Option<hyper::HeaderMap>,
+    ) -> Result<hyper::Response<Body>, S3Error> {
+        let res = resp.map(|mut r| {
+            if r.headers().contains_key("Transfer-Encoding") {
+                r.headers_mut().remove("Content-Length");
+            }
+
+            if let Some(headers) = headers {
+                for (k, v) in headers {
+                    if let Some(k) = k {
+                        r.headers_mut().entry(k).or_insert(v);
+                    }
+                }
+            }
+
+            // Expose 'ETag' header if present
+            if r.headers().contains_key("ETag") {
+                r.headers_mut().append(
+                    "Access-Control-Expose-Headers",
+                    HeaderValue::from_static("ETag"),
+                );
+            }
+
+            // Add CORS * if request origin matches exception regex
+            if origin_exception {
+                r.headers_mut()
+                    .entry(ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .or_insert(HeaderValue::from_static("*"));
+                r.headers_mut()
+                    .entry(ACCESS_CONTROL_ALLOW_METHODS)
+                    .or_insert(HeaderValue::from_static("*"));
+                r.headers_mut()
+                    .entry(ACCESS_CONTROL_ALLOW_HEADERS)
+                    .or_insert(HeaderValue::from_static("*"));
+            }
+
+            // Workaround to return 206 (Partial Content) for range responses
+            if r.headers().contains_key("Content-Range")
+                && r.headers().contains_key("Accept-Ranges")
+                && r.status().as_u16() == 200
+            {
+                let status = r.status_mut();
+                *status = StatusCode::from_u16(206).unwrap();
+            }
+
+            r.map(Body::from)
+        });
+
+        res
     }
 }
