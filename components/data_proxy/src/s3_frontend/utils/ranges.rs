@@ -81,12 +81,12 @@ pub fn calculate_ranges(
         ));
     }
 
-    return Ok((
+    Ok((
         Some(format!("bytes={}-{}", aruna_range.from, aruna_range.to)),
         None,
         aruna_range.to - aruna_range.from,
         Some(aruna_range),
-    ));
+    ))
 }
 
 #[tracing::instrument(level = "trace", skip(range))]

@@ -184,7 +184,7 @@ impl StorageBackend for S3Backend {
                     e
                 })?;
         }
-        return Ok(());
+        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip(self, location))]

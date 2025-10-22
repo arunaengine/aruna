@@ -120,7 +120,11 @@ impl DataHandler {
         let is_compressed = before_location.file_format.is_compressed();
 
         let parts = cache.get_parts(&upload_id);
-        let part_lens = parts.iter().map(|part| part.size).collect::<Vec<_>>();
+        let mut part_lens = parts
+            .iter()
+            .map(|part| part.size % 65564)
+            .collect::<Vec<_>>();
+        part_lens.retain(|len| *len != 0);
 
         trace!(part_lens = ?part_lens, "Part lengths");
 
@@ -173,22 +177,6 @@ impl DataHandler {
                 asr = asr.add_transformer(sha_transformer);
                 asr = asr.add_transformer(md5_transformer);
 
-                if new_location_clone.is_compressed() && !new_location_clone.is_pithos() {
-                    trace!("adding zstd decompressor");
-                    asr = asr.add_transformer(ZstdEnc::new());
-                }
-
-                if let Some(enc_key) = &new_location_clone.get_encryption_key() {
-                    if !new_location_clone.is_pithos() {
-                        asr = asr.add_transformer(ChaCha20Enc::new_with_fixed(*enc_key).map_err(
-                            |e| {
-                                error!(error = ?e, msg = "Unable to initialize ChaCha20Enc");
-                                e
-                            },
-                        )?);
-                    }
-                }
-
                 if new_location_clone.is_pithos() {
                     tx.send(pithos_lib::helpers::notifications::Message::FileContext(
                         ctx,
@@ -196,6 +184,20 @@ impl DataHandler {
                     .await?;
                     asr = asr.add_transformer(PithosTransformer::new());
                     asr = asr.add_transformer(FooterGenerator::new(None));
+                } else {
+                    if new_location_clone.is_compressed() {
+                        trace!("adding zstd decompressor");
+                        asr = asr.add_transformer(ZstdEnc::new());
+                    }
+
+                    if let Some(enc_key) = &new_location_clone.get_encryption_key() {
+                        asr = asr.add_transformer(ChaCha20Enc::new_with_fixed(*enc_key).map_err(
+                            |e| {
+                                error!(error = ?e, msg = "Unable to initialize ChaCha20Enc");
+                                e
+                            },
+                        )?);
+                    }
                 }
 
                 let (final_sha, final_sha_recv) =
