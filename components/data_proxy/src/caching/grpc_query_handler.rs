@@ -521,7 +521,7 @@ impl GrpcQueryHandler {
         let mut req = Request::new(UpdateProjectKeyValuesRequest {
             project_id: obj.id.to_string(),
             add_key_values: vec![kv],
-            remove_key_values: remove_key_values,
+            remove_key_values,
         });
 
         Self::add_token_to_md(req.metadata_mut(), token)?;
