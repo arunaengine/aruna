@@ -1884,10 +1884,8 @@ impl CORSConfiguration {
                     if !cors_rule.allowed_origins.contains(&"*".to_string()) {
                         headers.insert("Vary".to_string(), "Origin".to_string());
                     }
-                    headers.insert(
-                        "Access-Control-Allow-Origin".to_string(),
-                        cors_rule.allowed_origins.join(", "),
-                    );
+                    // Only 'Access-Control-Allow-Origin' header with single origin is allowed in response
+                    headers.insert("Access-Control-Allow-Origin".to_string(), origin);
                 }
                 if !cors_rule.allowed_methods.is_empty() {
                     headers.insert(
