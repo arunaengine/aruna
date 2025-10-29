@@ -576,9 +576,7 @@ impl Cache {
                                 current_path.push('/');
                             }
                             current_path.push_str(name);
-                            if with_intermediates {
-                                final_result.push((*id, current_path.clone()));
-                            } else if x == 2 {
+                            if with_intermediates || x == 2 {
                                 final_result.push((*id, current_path.clone()));
                             }
                         }
