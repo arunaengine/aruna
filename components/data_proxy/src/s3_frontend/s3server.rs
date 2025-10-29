@@ -260,7 +260,7 @@ impl WrappingService {
 
         // Extract bucket/project from host url
         let bucket = match url.split(".").next() {
-            Some(empty) if empty.is_empty() => {
+            Some("") => {
                 let mut iter = req.uri().path().split("/");
                 iter.next(); // first one is empty
                 iter.next() // next one is bucket

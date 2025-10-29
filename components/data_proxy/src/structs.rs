@@ -1853,14 +1853,10 @@ impl From<CORSConfiguration> for GetBucketCorsOutput {
             .map(|x| CORSRule::into(x.clone()))
             .collect::<Vec<S3SCORSRule>>();
         if cors_rule.is_empty() {
-            GetBucketCorsOutput {
-                cors_rules: None,
-                ..Default::default()
-            }
+            GetBucketCorsOutput { cors_rules: None }
         } else {
             GetBucketCorsOutput {
                 cors_rules: Some(cors_rule),
-                ..Default::default()
             }
         }
     }
