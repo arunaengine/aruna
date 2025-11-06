@@ -72,12 +72,10 @@ impl DataHandler {
             levels
         } else {
             let mut object_id = object.id;
-            if let Some(version) = &object.versions {
-                version.iter().next().map(|v| {
-                    if let VersionVariant::IsVersion(id) = v {
-                        object_id = *id
-                    }
-                });
+            if let Some(versions) = &object.versions {
+                if let Some(VersionVariant::IsVersion(id)) = versions.iter().next() {
+                    object_id = *id
+                }
             }
             cache.get_single_parent(&object_id).await.map_err(|e| {
                 error!(error = ?e, msg = e.to_string());
