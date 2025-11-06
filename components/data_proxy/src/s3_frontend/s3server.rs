@@ -313,7 +313,8 @@ impl WrappingService {
             .find(|rule| {
                 (rule.allowed_origins.contains(&origin.to_string())
                     || rule.allowed_origins.contains(&"*".to_string()))
-                    && rule.allowed_methods.contains(&req.method().to_string())
+                    && (rule.allowed_methods.contains(&req.method().to_string())
+                        || req.method() == &Method::OPTIONS)
             })
             .ok_or_else(|| s3_error!(NoSuchBucketPolicy, "No cors policy found for bucket"))?;
 
