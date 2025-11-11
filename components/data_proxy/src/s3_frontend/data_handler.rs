@@ -118,21 +118,18 @@ impl DataHandler {
         let is_compressed = before_location.file_format.is_compressed();
 
         let parts = cache.get_parts(&upload_id);
-        let mut part_lens = parts
+        if parts.is_empty() {
+            // Cannot finish location without parts
+            error!("No parts found for upload id: {upload_id}");
+            return Err(anyhow!("No parts found for upload id: {upload_id}"));
+        }
+
+        let mut residues = parts
             .iter()
             .map(|part| part.size % 65564)
             .collect::<Vec<_>>();
-        part_lens.retain(|len| *len != 0);
-
-        trace!(part_lens = ?part_lens, "Part lengths");
-
-        if part_lens.is_empty() {
-            error!("No part lengths found");
-            if let Err(e) = cleanup_location(&object, before_location, new_location, cache).await {
-                error!(error = ?e, msg = "Failed to clean up location");
-            }
-            return Err(anyhow!("No part lengths found"));
-        }
+        residues.retain(|len| *len != 0);
+        trace!(residues = ?residues, "Part residues");
 
         let aswr_handle = tokio::spawn(
             async move {
@@ -150,13 +147,10 @@ impl DataHandler {
                 pin!(tx_receive);
                 // Bind to variable to extend the lifetime of arsw to the end of the function
                 let mut asr = GenericStreamReadWriter::new_with_sink(tx_receive, sink);
-
                 asr.add_message_receiver(rx).await?;
 
-                tracing::debug!(part_lens = ?part_lens, "Part lengths");
-
                 if let Some(key) = clone_key {
-                    asr = asr.add_transformer(ChaChaResilient::new_with_lengths(key, part_lens));
+                    asr = asr.add_transformer(ChaChaResilient::new_with_lengths(key, residues));
                 }
 
                 if is_compressed {
