@@ -237,14 +237,14 @@ impl ObjectLocation {
     pub fn count_blocks(&self) -> usize {
         match &self.file_format {
             FileFormat::Raw => {
-                if self.raw_content_len as usize % 65536 == 0 {
+                if (self.raw_content_len as usize).is_multiple_of(65536) {
                     self.raw_content_len as usize / 65536
                 } else {
                     (self.raw_content_len as usize / 65536) + 1
                 }
             }
             FileFormat::RawCompressed => {
-                if self.disk_content_len as usize % 65536 == 0 {
+                if (self.disk_content_len as usize).is_multiple_of(65536) {
                     self.disk_content_len as usize / 65536
                 } else {
                     (self.disk_content_len as usize / 65536) + 1
@@ -253,7 +253,7 @@ impl ObjectLocation {
             FileFormat::RawEncrypted(_) =>
             // 109 is the overhead for a new key in footer
             {
-                if (self.raw_content_len as usize + 109) % (65536 + 28) == 0 {
+                if (self.raw_content_len as usize + 109).is_multiple_of(65536 + 28) {
                     (self.raw_content_len as usize + 109) / (65536 + 28)
                 } else {
                     ((self.raw_content_len as usize + 109) / (65536 + 28)) + 1
@@ -261,7 +261,7 @@ impl ObjectLocation {
             }
             FileFormat::RawEncryptedCompressed(_) | FileFormat::Pithos(_) => {
                 // 109 is the overhead for a new key in footer
-                if (self.disk_content_len as usize + 109) % (65536 + 28) == 0 {
+                if (self.disk_content_len as usize + 109).is_multiple_of(65536 + 28) {
                     (self.disk_content_len as usize + 109) / (65536 + 28)
                 } else {
                     ((self.disk_content_len as usize + 109) / (65536 + 28)) + 1
