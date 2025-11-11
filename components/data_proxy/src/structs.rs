@@ -1324,6 +1324,7 @@ impl ResourceStates {
             self.objects[3].is_missing(),
         ) {
             (false, true, true, true)
+            | (false, true, false, true)
             | (false, false, true, true)
             | (false, false, false, true)
             | (false, false, false, false) => {}
@@ -1463,11 +1464,15 @@ impl ResourceStates {
             (1, 2) | (2, 3) | (3, 4) => {
                 self.objects[3] = ResourceState::new_missing(name, ResourceVariant::Object)
             }
-            (1, 4) => {
-                self.objects[1] = ResourceState::new_missing(name, ResourceVariant::Collection)
+            (1, 3) | (1, 4) => {
+                if let ResourceState::None = self.objects[1] {
+                    self.objects[1] = ResourceState::new_missing(name, ResourceVariant::Collection)
+                }
             }
-            (1, 3) | (2, 4) => {
-                self.objects[2] = ResourceState::new_missing(name, ResourceVariant::Dataset)
+            (2, 4) => {
+                if let ResourceState::None = self.objects[2] {
+                    self.objects[2] = ResourceState::new_missing(name, ResourceVariant::Dataset)
+                }
             }
             (a, b) => bail!("Invalid index {}, {}", a, b),
         }
