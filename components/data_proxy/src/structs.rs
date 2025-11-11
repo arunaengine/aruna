@@ -1465,12 +1465,12 @@ impl ResourceStates {
                 self.objects[3] = ResourceState::new_missing(name, ResourceVariant::Object)
             }
             (1, 3) | (1, 4) => {
-                if let ResourceState::None = self.objects[1] {
+                if matches!(self.objects[1], ResourceState::None) {
                     self.objects[1] = ResourceState::new_missing(name, ResourceVariant::Collection)
                 }
             }
             (2, 4) => {
-                if let ResourceState::None = self.objects[2] {
+                if matches!(self.objects[2], ResourceState::None) {
                     self.objects[2] = ResourceState::new_missing(name, ResourceVariant::Dataset)
                 }
             }
