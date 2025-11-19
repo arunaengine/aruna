@@ -7,33 +7,25 @@ use crate::CORS_REGEX;
 use anyhow::Result;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
-use http::header::ACCESS_CONTROL_ALLOW_HEADERS;
-use http::header::ACCESS_CONTROL_ALLOW_METHODS;
-use http::header::ACCESS_CONTROL_ALLOW_ORIGIN;
-use http::header::ORIGIN;
-use http::header::VARY;
-use http::HeaderValue;
-use http::Method;
-use http::StatusCode;
+use http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+    ORIGIN, VARY,
+};
+use http::{HeaderValue, Method, StatusCode};
 use hyper::service::Service;
-use hyper_util::rt::TokioExecutor;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::header::HOST;
 use s3s::host::SingleDomain;
 use s3s::s3_error;
-use s3s::service::S3Service;
-use s3s::service::S3ServiceBuilder;
-use s3s::service::SharedS3Service;
+use s3s::service::{S3Service, S3ServiceBuilder, SharedS3Service};
 use s3s::Body;
 use s3s::S3Error;
 use std::convert::Infallible;
-use std::future::ready;
-use std::future::Ready;
+use std::future::{ready, Ready};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tracing::error;
-use tracing::info;
+use tracing::{error, info};
 
 pub struct S3Server {
     s3service: S3Service,
@@ -145,19 +137,22 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
         if req.method() == Method::OPTIONS {
             let clone = self.clone();
             return Box::pin(async move {
-                match clone.get_options_cors(origin_exception, req).await {
-                    Ok(resp) => Ok(resp),
-                    Err(err) => {
-                        error!("{err}");
-                        hyper::Response::builder()
-                            .body(Body::empty())
-                            .map_err(|_| s3_error!(InvalidRequest, "Invalid OPTIONS request"))
+                let mut response = hyper::Response::builder();
+                match clone.get_cors_headers(origin_exception, &req).await {
+                    Ok(cors_header) => {
+                        for (k, v) in cors_header.iter() {
+                            response = response.header(k, v);
+                        }
                     }
+                    Err(err) => error!("{err}"),
                 }
+                response
+                    .body(Body::empty())
+                    .map_err(|_| s3_error!(InvalidRequest, "Invalid OPTIONS request"))
             });
         }
 
-        // FIXME: This is neccessary for MultipartUploadRequests, because currently only the
+        // FIXME: This is necessary for MultipartUploadRequests, because currently only the
         // response including cors headers gets returned inside the keep-alive-body. See
         // https://github.com/s3s-project/s3s/blob/85f3842d03175537753584ad9d4f25e819aa9025/crates/s3s/src/ops/generated.rs#L613-L650
         if req.method() == Method::POST && req.uri().to_string().contains("uploadId") {
@@ -217,143 +212,14 @@ impl<T, S: Clone> Service<T> for MakeService<S> {
         ready(Ok(self.0.clone()))
     }
 }
+
 impl WrappingService {
-    async fn get_options_cors(
-        &self,
-        origin_exception: bool,
-        req: hyper::Request<hyper::body::Incoming>,
-    ) -> Result<hyper::Response<Body>, S3Error> {
-        if origin_exception {
-            let resp = hyper::Response::builder()
-                .header(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("*"))
-                .header(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"))
-                .header(ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("*"))
-                .body(Body::empty())
-                .map_err(|_| s3_error!(InvalidRequest, "Invalid OPTIONS request"))?;
-            return Ok(resp);
-        }
-
-        let origin = req
-            .headers()
-            .get(ORIGIN)
-            .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?
-            .to_str()
-            .map_err(|e| {
-                error!("{e}");
-                s3_error!(InvalidURI, "Invalid URI encoding")
-            })?;
-
-        let url = req
-            .headers()
-            .get(HOST)
-            .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?
-            .to_str()
-            .map_err(|e| {
-                error!("{e}");
-                s3_error!(InvalidURI, "Invalid URI encoding")
-            })?
-            .split(
-                &CONFIG
-                    .frontend
-                    .as_ref()
-                    .ok_or_else(|| s3_error!(InternalError, "No s3 frontend configured"))?
-                    .hostname,
-            )
-            .next()
-            .ok_or_else(|| s3_error!(InternalError, "Invalid host url set"))?;
-
-        let bucket = match url.split(".").next() {
-            Some(empty) if empty.is_empty() => {
-                let mut iter = req.uri().path().split("/");
-                iter.next(); // first one is empty
-                iter.next() // next one is bucket
-                    .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
-            }
-            Some(sub_bucket) => sub_bucket,
-            None => {
-                let mut iter = req.uri().path().split("/");
-                iter.next(); // first one is empty
-                iter.next() // next one is bucket
-                    .ok_or_else(|| s3_error!(InvalidURI, "No bucket set"))?
-            }
-        };
-        let project_id = self
-            .inner
-            .cache
-            .get_path(bucket)
-            .ok_or_else(|| s3_error!(NoSuchBucket, "No bucket found with name {}", bucket))?;
-        let (project, _) = self.inner.cache.get_resource(&project_id).map_err(|e| {
-            error!("{e}");
-            s3_error!(NoSuchBucket, "No bucket found with id {}", project_id)
-        })?;
-        let cors = project
-            .read()
-            .await
-            .key_values
-            .clone()
-            .into_iter()
-            .find(|kv| kv.key == "app.aruna-storage.org/cors")
-            .map(|kv| kv.value)
-            .ok_or_else(|| {
-                s3_error!(
-                    NoSuchBucketPolicy,
-                    "No cors rules for bucket found {}",
-                    bucket
-                )
-            })?;
-        let cors: crate::structs::CORSConfiguration =
-            serde_json::from_str(&cors).map_err(|_| {
-                error!(error = "Unable to deserialize cors from JSON");
-                s3_error!(InvalidObjectState, "Unable to deserialize cors from JSON")
-            })?;
-        let rule = cors
-            .0
-            .iter()
-            .find(|rule| {
-                rule.allowed_origins.contains(&origin.to_string())
-                    || rule.allowed_origins.contains(&"*".to_string())
-            })
-            .ok_or_else(|| s3_error!(NoSuchBucketPolicy, "No cors policy found for bucket"))?;
-        let mut builder = hyper::Response::builder();
-        if !rule.allowed_origins.contains(&"*".to_string()) {
-            builder = builder.header(VARY, HeaderValue::from_static("Origin"));
-        }
-        for origin in rule.allowed_origins.iter() {
-            builder = builder.header(
-                ACCESS_CONTROL_ALLOW_ORIGIN,
-                HeaderValue::from_str(origin).map_err(|e| {
-                    error!("{e}");
-                    s3_error!(InvalidPolicyDocument, "Invalid header name for policy")
-                })?,
-            );
-        }
-        if let Some(headers) = &rule.allowed_headers {
-            builder = builder.header(
-                ACCESS_CONTROL_ALLOW_HEADERS,
-                HeaderValue::from_str(&headers.join(",")).map_err(|e| {
-                    error!("{e}");
-                    s3_error!(InvalidPolicyDocument, "Invalid header name for policy")
-                })?,
-            )
-        }
-        let resp = builder
-            .header(
-                ACCESS_CONTROL_ALLOW_METHODS,
-                HeaderValue::from_str(&rule.allowed_methods.join(",")).map_err(|e| {
-                    error!("{e}");
-                    s3_error!(InvalidPolicyDocument, "Invalid header name for policy")
-                })?,
-            )
-            .body(Body::empty())
-            .map_err(|_| s3_error!(InvalidRequest, "Invalid OPTIONS request"))?;
-        Ok(resp)
-    }
-
     async fn get_cors_headers(
         &self,
         origin_exception: bool,
         req: &hyper::Request<hyper::body::Incoming>,
     ) -> Result<hyper::HeaderMap, S3Error> {
+        // Return all * if origin exception matches
         if origin_exception {
             let mut map = hyper::HeaderMap::new();
             map.insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("*"));
@@ -362,10 +228,11 @@ impl WrappingService {
             return Ok(map);
         }
 
+        // Evaluate mandatory headers of request
         let origin = req
             .headers()
             .get(ORIGIN)
-            .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?
+            .ok_or_else(|| s3_error!(InvalidRequest, "Origin header missing"))?
             .to_str()
             .map_err(|e| {
                 error!("{e}");
@@ -375,7 +242,7 @@ impl WrappingService {
         let url = req
             .headers()
             .get(HOST)
-            .ok_or_else(|| s3_error!(InvalidURI, "No authority provided in URI"))?
+            .ok_or_else(|| s3_error!(InvalidHostHeader, "Host header missing"))?
             .to_str()
             .map_err(|e| {
                 error!("{e}");
@@ -391,8 +258,9 @@ impl WrappingService {
             .next()
             .ok_or_else(|| s3_error!(InternalError, "Invalid host url set"))?;
 
+        // Extract bucket/project from host url
         let bucket = match url.split(".").next() {
-            Some(empty) if empty.is_empty() => {
+            Some("") => {
                 let mut iter = req.uri().path().split("/");
                 iter.next(); // first one is empty
                 iter.next() // next one is bucket
@@ -416,6 +284,7 @@ impl WrappingService {
             s3_error!(NoSuchBucket, "No bucket found with id {}", project_id)
         })?;
 
+        // Convert Project key-value to CORSConfiguration
         let cors = project
             .read()
             .await
@@ -436,19 +305,23 @@ impl WrappingService {
                 error!(error = "Unable to deserialize cors from JSON");
                 s3_error!(InvalidObjectState, "Unable to deserialize cors from JSON")
             })?;
+
+        // Check if request origin matches allowed headers in rule
         let rule = cors
             .0
             .iter()
             .find(|rule| {
-                rule.allowed_origins.contains(&origin.to_string())
-                    || rule.allowed_origins.contains(&"*".to_string())
+                (rule.allowed_origins.contains(&origin.to_string())
+                    || rule.allowed_origins.contains(&"*".to_string()))
+                    && (rule.allowed_methods.contains(&req.method().to_string())
+                        || req.method() == Method::OPTIONS)
             })
             .ok_or_else(|| s3_error!(NoSuchBucketPolicy, "No cors policy found for bucket"))?;
+
+        // Collect CORS headers
         let mut header_map = hyper::HeaderMap::new();
         if !rule.allowed_origins.contains(&"*".to_string()) {
             header_map.append(VARY, HeaderValue::from_static("Origin"));
-        }
-        for origin in rule.allowed_origins.iter() {
             header_map.append(
                 ACCESS_CONTROL_ALLOW_ORIGIN,
                 HeaderValue::from_str(origin).map_err(|e| {
@@ -456,7 +329,10 @@ impl WrappingService {
                     s3_error!(InvalidPolicyDocument, "Invalid header name for policy")
                 })?,
             );
+        } else {
+            header_map.append(ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
         }
+
         if let Some(headers) = &rule.allowed_headers {
             header_map.append(
                 ACCESS_CONTROL_ALLOW_HEADERS,

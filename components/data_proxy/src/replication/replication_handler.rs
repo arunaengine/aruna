@@ -517,12 +517,12 @@ impl ReplicationHandler {
                                 } else {
                                     let parent = {
                                         let mut current_version_id = object_id;
-                                        if let Some(version) = &object.versions {
-                                            version.iter().next().map(|v| {
-                                                if let VersionVariant::IsVersion(id) = v {
-                                                    current_version_id = *id
-                                                }
-                                            });
+                                        if let Some(versions) = &object.versions {
+                                            if let Some(VersionVariant::IsVersion(id)) =
+                                                versions.iter().next()
+                                            {
+                                                current_version_id = *id
+                                            }
                                         }
                                         cache.get_single_parent(&current_version_id).await.map_err(
                                             |e| {
