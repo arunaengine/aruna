@@ -237,14 +237,14 @@ impl ObjectLocation {
     pub fn count_blocks(&self) -> usize {
         match &self.file_format {
             FileFormat::Raw => {
-                if self.raw_content_len as usize % 65536 == 0 {
+                if (self.raw_content_len as usize).is_multiple_of(65536) {
                     self.raw_content_len as usize / 65536
                 } else {
                     (self.raw_content_len as usize / 65536) + 1
                 }
             }
             FileFormat::RawCompressed => {
-                if self.disk_content_len as usize % 65536 == 0 {
+                if (self.disk_content_len as usize).is_multiple_of(65536) {
                     self.disk_content_len as usize / 65536
                 } else {
                     (self.disk_content_len as usize / 65536) + 1
@@ -253,7 +253,7 @@ impl ObjectLocation {
             FileFormat::RawEncrypted(_) =>
             // 109 is the overhead for a new key in footer
             {
-                if (self.raw_content_len as usize + 109) % (65536 + 28) == 0 {
+                if (self.raw_content_len as usize + 109).is_multiple_of(65536 + 28) {
                     (self.raw_content_len as usize + 109) / (65536 + 28)
                 } else {
                     ((self.raw_content_len as usize + 109) / (65536 + 28)) + 1
@@ -261,7 +261,7 @@ impl ObjectLocation {
             }
             FileFormat::RawEncryptedCompressed(_) | FileFormat::Pithos(_) => {
                 // 109 is the overhead for a new key in footer
-                if (self.disk_content_len as usize + 109) % (65536 + 28) == 0 {
+                if (self.disk_content_len as usize + 109).is_multiple_of(65536 + 28) {
                     (self.disk_content_len as usize + 109) / (65536 + 28)
                 } else {
                     ((self.disk_content_len as usize + 109) / (65536 + 28)) + 1
@@ -1324,6 +1324,7 @@ impl ResourceStates {
             self.objects[3].is_missing(),
         ) {
             (false, true, true, true)
+            | (false, true, false, true)
             | (false, false, true, true)
             | (false, false, false, true)
             | (false, false, false, false) => {}
@@ -1463,11 +1464,15 @@ impl ResourceStates {
             (1, 2) | (2, 3) | (3, 4) => {
                 self.objects[3] = ResourceState::new_missing(name, ResourceVariant::Object)
             }
-            (1, 4) => {
-                self.objects[1] = ResourceState::new_missing(name, ResourceVariant::Collection)
+            (1, 3) | (1, 4) => {
+                if matches!(self.objects[1], ResourceState::None) {
+                    self.objects[1] = ResourceState::new_missing(name, ResourceVariant::Collection)
+                }
             }
-            (1, 3) | (2, 4) => {
-                self.objects[2] = ResourceState::new_missing(name, ResourceVariant::Dataset)
+            (2, 4) => {
+                if matches!(self.objects[2], ResourceState::None) {
+                    self.objects[2] = ResourceState::new_missing(name, ResourceVariant::Dataset)
+                }
             }
             (a, b) => bail!("Invalid index {}, {}", a, b),
         }
@@ -1853,14 +1858,10 @@ impl From<CORSConfiguration> for GetBucketCorsOutput {
             .map(|x| CORSRule::into(x.clone()))
             .collect::<Vec<S3SCORSRule>>();
         if cors_rule.is_empty() {
-            GetBucketCorsOutput {
-                cors_rules: None,
-                ..Default::default()
-            }
+            GetBucketCorsOutput { cors_rules: None }
         } else {
             GetBucketCorsOutput {
                 cors_rules: Some(cors_rule),
-                ..Default::default()
             }
         }
     }
@@ -1884,10 +1885,8 @@ impl CORSConfiguration {
                     if !cors_rule.allowed_origins.contains(&"*".to_string()) {
                         headers.insert("Vary".to_string(), "Origin".to_string());
                     }
-                    headers.insert(
-                        "Access-Control-Allow-Origin".to_string(),
-                        cors_rule.allowed_origins.join(", "),
-                    );
+                    // Only 'Access-Control-Allow-Origin' header with single origin is allowed in response
+                    headers.insert("Access-Control-Allow-Origin".to_string(), origin);
                 }
                 if !cors_rule.allowed_methods.is_empty() {
                     headers.insert(
