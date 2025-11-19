@@ -1386,7 +1386,7 @@ impl Cache {
         upload_id: &str,
         start_at: u64,
         limit: usize,
-    ) -> Result<(Vec<Part>, Option<String>, bool)> {
+    ) -> Option<(Vec<Part>, Option<String>, bool)> {
         let mut all_parts: Vec<UploadPart> =
             if let Some(parts) = self.multi_parts.get(upload_id).map(|e| e.value().clone()) {
                 parts
@@ -1394,7 +1394,7 @@ impl Cache {
                     .filter(|p| p.part_number > start_at)
                     .collect::<Vec<_>>()
             } else {
-                return Err(anyhow!("Upload id {upload_id} not found"));
+                return None;
             };
 
         all_parts.sort_by(|a, b| a.part_number.cmp(&b.part_number));
@@ -1413,7 +1413,7 @@ impl Cache {
             }
         }
 
-        Ok((response_parts, next_part_marker, is_truncated))
+        Some((response_parts, next_part_marker, is_truncated))
     }
 
     #[tracing::instrument(level = "trace", skip(self, upload_id))]

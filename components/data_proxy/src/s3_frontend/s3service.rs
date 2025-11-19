@@ -517,7 +517,11 @@ impl S3 for ArunaS3Service {
         &self,
         req: S3Request<ListPartsInput>,
     ) -> S3Result<S3Response<ListPartsOutput>> {
-        let CheckAccessResult { headers, .. } = req
+        let CheckAccessResult {
+            objects_state,
+            headers,
+            ..
+        } = req
             .extensions
             .get::<CheckAccessResult>()
             .cloned()
@@ -525,6 +529,14 @@ impl S3 for ArunaS3Service {
                 error!(error = "No context found");
                 s3_error!(InternalError, "No context found")
             })?;
+
+        let (object, location) = objects_state.require_regular()?;
+        let _ = object.require_object()?;
+
+        let location = location.ok_or_else(|| {
+            error!(error = "Unable to get resource");
+            s3_error!(NoSuchKey, "Object not found")
+        })?;
 
         let max_parts = match req.input.max_parts {
             Some(k) if k < 1000 => k as usize,
@@ -544,32 +556,41 @@ impl S3 for ArunaS3Service {
                     return Err(s3_error!(InvalidArgument, "Invalid part number marker"));
                 }
             }
-            None => 1,
+            None => 0,
         };
-        let (parts, next_marker, is_truncated) = self
-            .cache
-            .list_parts(&req.input.upload_id, start_at, max_parts)
-            .map_err(|e| {
-                error!("{e}");
-                s3_error!(
-                    NoSuchUpload,
-                    "No upload found for id {}",
-                    &req.input.upload_id
-                )
-            })?;
+
+        let (parts, next_part_number_marker, is_truncated) =
+            match self
+                .cache
+                .list_parts(&req.input.upload_id, start_at, max_parts)
+            {
+                Some((p, n, t)) => (Some(p), n, Some(t)),
+                None => {
+                    if location.upload_id.is_some() {
+                        (None, None, None)
+                    } else {
+                        return Err(s3_error!(
+                            NoSuchUpload,
+                            "No upload found for id {}",
+                            &req.input.upload_id
+                        ));
+                    }
+                }
+            };
 
         let output = ListPartsOutput {
             bucket: Some(req.input.bucket),
-            is_truncated: Some(is_truncated),
+            is_truncated,
             key: Some(req.input.key),
             max_parts: req.input.max_parts,
-            next_part_number_marker: next_marker,
+            next_part_number_marker,
             owner: None, //Todo?
             part_number_marker: req.input.part_number_marker,
-            parts: Some(parts),
+            parts,
             upload_id: Some(req.input.upload_id),
             ..Default::default()
         };
+
         debug!(?output);
         let mut resp = S3Response::new(output);
         if let Some(headers) = headers {
