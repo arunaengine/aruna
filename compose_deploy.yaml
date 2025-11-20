@@ -118,7 +118,7 @@ services:
              psql 'postgres://yugabyte@yugabyte:5433/proxy_02' < /data/init/proxy_schema.sql &&
              psql 'postgres://yugabyte@yugabyte:5433/test' < /data/init/initial_data.sql"
   server:
-    image: server:latest
+    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-server:latest
     depends_on:
       load_database:
         condition: service_completed_successfully
@@ -130,7 +130,7 @@ services:
       MEILISEARCH_HOST: http://meili:7700
       NATS_HOST: nats:4222
   proxy_01:
-    image: proxy:latest
+    image: harbor.computational.bio.uni-giessen.de/aruna/arunadataproxy:latest
     depends_on:
       load_database:
         condition: service_completed_successfully
@@ -144,7 +144,7 @@ services:
     volumes:
       - proxy_config_01:/run/config/
   proxy_02:
-    image: proxy:latest
+    image: harbor.computational.bio.uni-giessen.de/aruna/arunadataproxy:latest
     depends_on:
       load_database:
         condition: service_completed_successfully
