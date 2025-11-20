@@ -395,12 +395,7 @@ impl Cache {
         self.check_lock();
         self.issuer_info
             .get_mut(issuer_name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Issuer {} not found in cache, cannot update",
-                    issuer_name.to_string()
-                )
-            })?
+            .ok_or_else(|| anyhow!("Issuer {} not found in cache, cannot update", issuer_name))?
             .refresh_jwks()
             .await
     }
@@ -867,7 +862,7 @@ impl Cache {
         &self,
         endpoint_id: &DieselUlid,
         cache: Arc<Cache>,
-    ) -> ProxyCacheIterator {
+    ) -> ProxyCacheIterator<'_> {
         let object_cache = Box::new(self.object_cache.iter());
         let user = Box::new(self.user_cache.iter());
         let pubkeys = Box::new(self.pubkeys.iter());
