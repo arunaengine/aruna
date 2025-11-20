@@ -5,7 +5,7 @@ use crate::database::dsls::internal_relation_dsl::{
 };
 use crate::database::dsls::object_dsl::{KeyValue, KeyValueVariant, Object, ObjectWithRelations};
 use crate::database::dsls::user_dsl::User;
-use crate::database::enums::{DbPermissionLevel, ObjectMapping, ObjectType};
+use crate::database::enums::{DbPermissionLevel, ObjectMapping, ObjectStatus, ObjectType};
 use crate::middlelayer::create_request_types::CreateRequest;
 use crate::middlelayer::db_handler::DatabaseHandler;
 use ahash::RandomState;
@@ -32,13 +32,15 @@ impl DatabaseHandler {
                 let name = request.get_name()?;
                 let object = Object::check_existing_projects(name, &client).await?;
                 if let Some(object) = object {
-                    return if is_dataproxy {
-                        // return existing project
-                        Ok((object, None))
-                    } else {
-                        // return err
-                        Err(anyhow!("Project exists!"))
-                    };
+                    if !matches!(object.object.object_status, ObjectStatus::DELETED) {
+                        return if is_dataproxy {
+                            // return existing project
+                            Ok((object, None))
+                        } else {
+                            // return err
+                            Err(anyhow!("Project exists!"))
+                        };
+                    }
                 };
             }
             ObjectType::DATASET | ObjectType::COLLECTION => {
