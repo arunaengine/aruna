@@ -170,7 +170,7 @@ services:
     ports:
       - 3000:3000
   gateway:
-    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-rest-gateway:latest
+    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-rest-gateway:2.0.0
     depends_on:
       server:
         condition: service_started
