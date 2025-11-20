@@ -531,7 +531,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let (object, location) = objects_state.require_regular()?;
-        let object = object.require_object()?;
+        let _ = object.require_object()?;
 
         let location = location.ok_or_else(|| {
             error!(error = "Unable to get resource");
