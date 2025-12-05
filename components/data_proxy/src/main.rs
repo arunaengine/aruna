@@ -42,7 +42,7 @@ mod helpers;
 use crate::config::Config;
 use crate::data_backends::filesystem_backend::FSBackend;
 use crate::grpc_api::ingestion_service::DataproxyIngestionServiceImpl;
-use crate::replication::replication_handler::ReplicationHandler;
+use crate::replication::replication_message_handler::ReplicationHandler;
 use std::backtrace::Backtrace;
 use std::time::Duration;
 

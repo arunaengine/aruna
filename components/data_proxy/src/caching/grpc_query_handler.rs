@@ -1,5 +1,5 @@
-use crate::replication::replication_handler::Direction;
-use crate::replication::replication_handler::ReplicationMessage;
+use crate::replication::replication_message_handler::Direction;
+use crate::replication::replication_message_handler::ReplicationMessage;
 use crate::structs::FileFormat;
 use crate::structs::Object as DPObject;
 use crate::structs::ObjectType;
@@ -1088,7 +1088,7 @@ impl GrpcQueryHandler {
     }
 
     #[tracing::instrument(level = "trace", skip(self, object))]
-    async fn handle_replication(&self, object: Object) -> Result<()> {
+    pub async fn handle_replication(&self, object: Object) -> Result<()> {
         // if ObjectStatus::AVAILABLE ...
         if object.status == 3 {
             // ... object should be synced in at least one ep

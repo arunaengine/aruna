@@ -3,7 +3,7 @@ use crate::auth::auth::AuthHandler;
 use crate::caching::grpc_query_handler::sort_objects;
 use crate::data_backends::storage_backend::StorageBackend;
 use crate::database::persistence::{delete_parts_by_object_id, delete_parts_by_upload_id};
-use crate::replication::replication_handler::ReplicationMessage;
+use crate::replication::replication_message_handler::ReplicationMessage;
 use crate::s3_frontend::data_handler::DataHandler;
 use crate::structs::{
     AccessKeyPermissions, Bundle, DbPermissionLevel, LocationBinding, ObjectType, TypedId,
@@ -16,7 +16,7 @@ use crate::{
 use ahash::RandomState;
 use anyhow::Result;
 use anyhow::{anyhow, bail};
-use aruna_rust_api::api::storage::models::v2::User as GrpcUser;
+use aruna_rust_api::api::storage::models::v2::{DataEndpoint, User as GrpcUser};
 use async_channel::Sender;
 use crossbeam_skiplist::SkipMap;
 use dashmap::DashMap;
@@ -289,7 +289,34 @@ impl Cache {
 
         for object in database_objects {
             let mut location = None;
+
             if object.object_type == ObjectType::Object {
+                if let Some(client) = self.aruna_client.read().await.as_ref() {
+                    client
+                        .handle_replication(aruna_rust_api::api::storage::models::v2::Object {
+                            id: object.id.to_string(),
+                            name: object.name.clone(),
+                            status: object.object_status.into(),
+                            dynamic: object.dynamic,
+                            endpoints: object.endpoints.iter().map(|e| DataEndpoint {
+                                id: e.id.to_string(),
+                                status: e.status.clone().map(|s| match s {
+                                    crate::structs::SyncStatus::Waiting => aruna_rust_api::api::storage::models::v2::ReplicationStatus::Waiting as i32,
+                                    crate::structs::SyncStatus::Running => aruna_rust_api::api::storage::models::v2::ReplicationStatus::Running as i32,
+                                    crate::structs::SyncStatus::Finished => aruna_rust_api::api::storage::models::v2::ReplicationStatus::Finished as i32,
+                                    crate::structs::SyncStatus::Error => aruna_rust_api::api::storage::models::v2::ReplicationStatus::Error as i32,
+
+                                }),
+                                variant: Some(match e.variant{
+                                    crate::structs::SyncVariant::FullSync => aruna_rust_api::api::storage::models::v2::data_endpoint::Variant::FullSync(aruna_rust_api::api::storage::models::v2::FullSync{}),
+                                    crate::structs::SyncVariant::PartialSync(inheritance) =>  aruna_rust_api::api::storage::models::v2::data_endpoint::Variant::PartialSync(inheritance),
+                                }),
+                            }).collect(),
+                            ..Default::default()
+                        })
+                        .await?;
+                };
+
                 let binding = all_bindings.get(&object.id);
                 if let Some(binding) = binding {
                     location = all_locations.remove(&binding.location_id);

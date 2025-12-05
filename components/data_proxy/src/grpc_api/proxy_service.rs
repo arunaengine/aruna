@@ -2,7 +2,7 @@ use crate::{
     auth::auth_helpers::get_token_from_md,
     caching::cache::Cache,
     data_backends::storage_backend::StorageBackend,
-    replication::replication_handler::ReplicationMessage,
+    replication::replication_message_handler::ReplicationMessage,
     s3_frontend::utils::replication_sink::ReplicationSink,
     structs::{Object, ObjectLocation, PubKey},
     CONFIG,
