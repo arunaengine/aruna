@@ -145,7 +145,7 @@ impl AuthHandler {
         Ok(Self {
             cache,
             self_id: config.proxy.endpoint_id,
-            rule_engine: RuleEngine::new(&config)?,
+            rule_engine: RuleEngine::new(config)?,
             encoding_key: (config.proxy.serial, encoding_key),
         })
     }

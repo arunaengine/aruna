@@ -351,7 +351,7 @@ impl Cache {
         };
         let cache = self.get_cache().await?.clone();
         let backend = backend.clone();
-        let pubkey = self.self_pubkey.clone();
+        let pubkey = self.self_pubkey;
 
         tokio::spawn(async move {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(10));

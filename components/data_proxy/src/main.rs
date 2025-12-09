@@ -89,11 +89,10 @@ async fn main() -> Result<()> {
 
     // Evaluate CORS regex
     let cors_regex = if let Some(frontend) = &config.frontend {
-        if let Some(cors_regex) = &frontend.cors_exception {
-            Some(Regex::new(cors_regex).expect("CORS exception regex invalid"))
-        } else {
-            None
-        }
+        frontend
+            .cors_exception
+            .as_ref()
+            .map(|cors_regex| Regex::new(cors_regex).expect("CORS exception regex invalid"))
     } else {
         None
     };
