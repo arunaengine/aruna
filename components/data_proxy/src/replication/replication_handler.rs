@@ -1,5 +1,5 @@
+use crate::config::Proxy;
 use crate::structs::{FileFormat, VersionVariant};
-use crate::CONFIG;
 use crate::{
     caching::cache::Cache, data_backends::storage_backend::StorageBackend,
     s3_frontend::utils::buffered_s3_sink::BufferedS3Sink, structs::ObjectLocation,
@@ -55,7 +55,7 @@ pub struct ReplicationHandler {
     pub receiver: Receiver<ReplicationMessage>,
     pub backend: Arc<Box<dyn StorageBackend>>,
     pub cache: Arc<Cache>,
-    pub self_id: String,
+    config: Proxy,
 }
 
 #[derive(Clone, Debug)]
@@ -123,14 +123,14 @@ impl ReplicationHandler {
     pub fn new(
         receiver: Receiver<ReplicationMessage>,
         backend: Arc<Box<dyn StorageBackend>>,
-        self_id: String,
         cache: Arc<Cache>,
+        config: Proxy,
     ) -> Self {
         Self {
             receiver,
             backend,
-            self_id,
             cache,
+            config,
         }
     }
 
@@ -162,7 +162,7 @@ impl ReplicationHandler {
         });
 
         let batch_processing_interval =
-            std::time::Duration::from_secs(CONFIG.proxy.replication_interval.unwrap_or(30));
+            std::time::Duration::from_secs(self.config.replication_interval.unwrap_or(30));
         trace!(?batch_processing_interval);
         // Process DashMap entries in batches
         let process: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
@@ -220,7 +220,7 @@ impl ReplicationHandler {
 
         // Iterates over each endpoint
         for endpoint in batch.iter() {
-            let self_id = self.self_id.clone();
+            let self_id = self.config.endpoint_id.to_string();
             // Collects all objects for each direction
             let pull: Vec<DieselUlid> = endpoint
                 .iter()
@@ -486,6 +486,7 @@ impl ReplicationHandler {
                 let finished_objects: Arc<DashMap<Direction, bool, RandomState>> =
                     Arc::new(DashMap::default()); // Syncs if object is already synced
                 let finished_clone = finished_objects.clone();
+                let reader_key = self.config.get_private_key_x25519()?;
                 tokio::spawn(async move {
                     // For now, every entry of the object_handler_map is processed
                     // consecutively
@@ -551,6 +552,7 @@ impl ReplicationHandler {
                                     request_sdx.clone(),
                                     sync_sender.clone(),
                                     &mut location,
+                                    reader_key,
                                     backend.clone(),
                                     object_state.read().await.get_chunks()?,
                                 )
@@ -735,6 +737,7 @@ impl ReplicationHandler {
         stream_sender: tokio::sync::mpsc::Sender<PullReplicationRequest>,
         sync_sender: Sender<RcvSync>,
         location: &mut ObjectLocation,
+        reader_key: [u8; 32],
         backend: Arc<Box<dyn StorageBackend>>,
         max_chunks: i64,
     ) -> Result<()> {
@@ -882,7 +885,7 @@ impl ReplicationHandler {
             .0,
         );
 
-        let (extractor, rx) = FooterExtractor::new(Some(CONFIG.proxy.get_private_key_x25519()?));
+        let (extractor, rx) = FooterExtractor::new(Some(reader_key));
 
         awr = awr.add_transformer(extractor);
 

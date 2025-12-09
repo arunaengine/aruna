@@ -5,7 +5,6 @@ use crate::{
     replication::replication_handler::ReplicationMessage,
     s3_frontend::utils::replication_sink::ReplicationSink,
     structs::{Object, ObjectLocation, PubKey},
-    CONFIG,
 };
 use anyhow::{anyhow, Result};
 use bytes::{BufMut, BytesMut};
@@ -19,6 +18,7 @@ use pithos_lib::{
     },
 };
 
+use crate::config::Proxy;
 use aruna_rust_api::api::dataproxy::services::v2::{
     dataproxy_replication_service_server::DataproxyReplicationService, error_message::Error,
     ErrorMessage, Handshake, RetryChunkMessage, Skip,
@@ -43,6 +43,7 @@ use tracing::{error, info_span, trace, Instrument};
 
 #[derive(Clone)]
 pub struct DataproxyReplicationServiceImpl {
+    config: Proxy,
     pub cache: Arc<Cache>,
     pub sender: Sender<ReplicationMessage>,
     pub backend: Arc<Box<dyn StorageBackend>>,
@@ -51,11 +52,13 @@ pub struct DataproxyReplicationServiceImpl {
 impl DataproxyReplicationServiceImpl {
     #[tracing::instrument(level = "trace", skip(cache))]
     pub fn new(
+        config: Proxy,
         cache: Arc<Cache>,
         sender: Sender<ReplicationMessage>,
         backend: Arc<Box<dyn StorageBackend>>,
     ) -> Self {
         Self {
+            config,
             cache,
             sender,
             backend,
@@ -325,6 +328,7 @@ impl DataproxyReplicationService for DataproxyReplicationServiceImpl {
 
         // Responding loop
         let proxy_replication_service = DataproxyReplicationServiceImpl {
+            config: self.config.clone(),
             cache: self.cache.clone(),
             sender: self.sender.clone(),
             backend: self.backend.clone(),
@@ -663,7 +667,7 @@ impl DataproxyReplicationServiceImpl {
         while let Ok(Ok(bytes)) = footer_receiver.try_recv() {
             buf.put(bytes)
         }
-        let readers_priv_key = CONFIG.proxy.clone().get_private_key_x25519()?;
+        let readers_priv_key = self.config.get_private_key_x25519()?;
 
         let parser: Footer = FooterParser::new(&buf)?
             .add_recipient(&readers_priv_key)

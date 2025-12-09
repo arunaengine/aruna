@@ -3,6 +3,7 @@ use super::utils::buffered_s3_sink::BufferedS3Sink;
 use super::utils::ranges::calculate_ranges;
 use crate::bundler::bundle_helper::get_bundle;
 use crate::caching::cache::Cache;
+use crate::config::Proxy;
 use crate::data_backends::storage_backend::StorageBackend;
 use crate::s3_frontend::utils::list_objects::list_response;
 use crate::structs::CheckAccessResult;
@@ -11,7 +12,6 @@ use crate::structs::Object as ProxyObject;
 use crate::structs::ObjectsState;
 use crate::structs::PartETag;
 use crate::structs::TypedRelation;
-use crate::CONFIG;
 use anyhow::Result;
 use aruna_rust_api::api::storage::models::v2::Hash;
 use aruna_rust_api::api::storage::models::v2::Hashalgorithm;
@@ -61,6 +61,7 @@ use tracing::warn;
 use tracing::Instrument;
 
 pub struct ArunaS3Service {
+    config: Proxy,
     pub backend: Arc<Box<dyn StorageBackend>>,
     pub cache: Arc<Cache>,
 }
@@ -68,6 +69,7 @@ pub struct ArunaS3Service {
 impl Clone for ArunaS3Service {
     fn clone(&self) -> Self {
         Self {
+            config: self.config.clone(),
             backend: self.backend.clone(),
             cache: self.cache.clone(),
         }
@@ -83,8 +85,13 @@ impl Debug for ArunaS3Service {
 
 impl ArunaS3Service {
     #[tracing::instrument(level = "trace", skip(backend, cache))]
-    pub async fn new(backend: Arc<Box<dyn StorageBackend>>, cache: Arc<Cache>) -> Result<Self> {
+    pub async fn new(
+        config: Proxy,
+        backend: Arc<Box<dyn StorageBackend>>,
+        cache: Arc<Cache>,
+    ) -> Result<Self> {
         Ok(ArunaS3Service {
+            config,
             backend: backend.clone(),
             cache,
         })
@@ -260,6 +267,10 @@ impl S3 for ArunaS3Service {
             self.backend.clone(),
             old_location,
             Some(objects_state.try_slice()?),
+            self.config.get_public_key_x25519().map_err(|_| {
+                error!(error = "Unable to fetch public key from config");
+                s3_error!(InternalError, "Unable to fetch public key from config")
+            })?,
         ));
         debug!(?response);
 
@@ -702,7 +713,7 @@ impl S3 for ArunaS3Service {
 
             let mut parser = FooterParser::new(&output).unwrap();
 
-            let key = CONFIG.proxy.clone().get_private_key_x25519().map_err(|e| {
+            let key = self.config.get_private_key_x25519().map_err(|e| {
                 error!(?e, error = "Unable to get private key");
                 s3_error!(InternalError, "Unable to get private key")
             })?;
@@ -1820,8 +1831,16 @@ impl S3 for ArunaS3Service {
                 }
 
                 if location.is_pithos() {
+                    let self_recipient = self.config.get_public_key_x25519().map_err(|_| {
+                        error!(error = "Unable to get public key from config");
+                        s3_error!(InternalError, "Unable to get public key from config")
+                    })?;
                     let ctx = new_object
-                        .get_file_context(Some(location.clone()), req.input.content_length)
+                        .get_file_context(
+                            Some(location.clone()),
+                            req.input.content_length,
+                            vec![self_recipient],
+                        )
                         .map_err(|_| {
                             error!(error = "Unable to get file context");
                             s3_error!(InternalError, "Unable to get file context")
@@ -1838,7 +1857,8 @@ impl S3 for ArunaS3Service {
                 awr = awr.add_transformer(final_sha_trans);
                 awr = awr.add_transformer(final_size_trans);
 
-                awr.process().await.map_err(|_| {
+                awr.process().await.map_err(|e| {
+                    dbg!(e);
                     error!(error = "Internal data transformer processing error");
                     s3_error!(InternalError, "Internal data transformer processing error")
                 })?;

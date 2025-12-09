@@ -164,7 +164,7 @@ impl Persistence {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Frontend {
     pub server: String,
     pub hostname: String,

@@ -2,7 +2,7 @@ use anyhow::Result;
 use deadpool_postgres::{Client, Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use tokio_postgres::NoTls;
 
-use crate::{config::Persistence, CONFIG};
+use crate::config::{Config as ProxyConfig, Persistence};
 
 pub struct Database {
     connection_pool: Pool,
@@ -10,7 +10,7 @@ pub struct Database {
 
 impl Database {
     #[tracing::instrument(level = "trace", skip())]
-    pub async fn new() -> Result<Self> {
+    pub async fn new(config: &ProxyConfig) -> Result<Self> {
         let Persistence::Postgres {
             host,
             port,
@@ -18,7 +18,7 @@ impl Database {
             password,
             database,
             schema,
-        } = CONFIG
+        } = config
             .persistence
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("persistence configuration not found"))?;
@@ -62,7 +62,7 @@ impl Database {
             e
         })?;
         client.batch_execute(&initial).await.map_err(|e| {
-            tracing::error!(error = ?e, msg = e.to_string());
+            tracing::error!(error = ?e,msg = e.to_string());
             e
         })?;
         Ok(())

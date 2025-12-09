@@ -11,7 +11,6 @@ use grpc_api::bundler::BundlerServiceImpl;
 use grpc_api::{
     proxy_service::DataproxyReplicationServiceImpl, user_service::DataproxyUserServiceImpl,
 };
-use lazy_static::lazy_static;
 use regex::Regex;
 use std::panic;
 use std::{net::SocketAddr, sync::Arc};
@@ -45,25 +44,6 @@ use crate::grpc_api::ingestion_service::DataproxyIngestionServiceImpl;
 use crate::replication::replication_handler::ReplicationHandler;
 use std::backtrace::Backtrace;
 use std::time::Duration;
-
-lazy_static! {
-    static ref CONFIG: Config = {
-        dotenvy::from_filename(".env").ok();
-        let config_file = dotenvy::var("CONFIG").unwrap_or("config.toml".to_string());
-        let mut config: Config =
-            toml::from_str(std::fs::read_to_string(config_file).unwrap().as_str()).unwrap();
-        config.validate().unwrap();
-        config
-    };
-    static ref CORS_REGEX: Option<Regex> = {
-        if let Some(frontend) = &CONFIG.frontend {
-            if let Some(cors_regex) = &frontend.cors_exception {
-                return Some(Regex::new(cors_regex).expect("CORS exception regex invalid"));
-            }
-        }
-        None
-    };
-}
 
 #[tracing::instrument(level = "trace", skip())]
 #[tokio::main]
@@ -101,40 +81,40 @@ async fn main() -> Result<()> {
 
     trace!("init storage backend");
 
-    let backend: Box<dyn StorageBackend> = match CONFIG.backend {
-        config::Backend::S3 { .. } => {
-            Box::new(S3Backend::new(CONFIG.proxy.endpoint_id.to_string()).await?)
+    // Load config from config.toml/env vars
+    dotenvy::from_filename(".env").ok();
+    let config_file = dotenvy::var("CONFIG").unwrap_or("config.toml".to_string());
+    let mut config: Config = toml::from_str(std::fs::read_to_string(config_file)?.as_str())?;
+    config.validate()?;
+
+    // Evaluate CORS regex
+    let cors_regex = if let Some(frontend) = &config.frontend {
+        if let Some(cors_regex) = &frontend.cors_exception {
+            Some(Regex::new(cors_regex).expect("CORS exception regex invalid"))
+        } else {
+            None
         }
-        config::Backend::FileSystem { .. } => {
-            Box::new(FSBackend::new(CONFIG.proxy.endpoint_id.to_string()).await?)
-        }
+    } else {
+        None
     };
 
+    // Init storage backend connection
+    let backend: Box<dyn StorageBackend> = match config.backend {
+        config::Backend::S3 { .. } => Box::new(S3Backend::new(&config).await?),
+        config::Backend::FileSystem { .. } => Box::new(FSBackend::new(&config).await?),
+    };
     let storage_backend: Arc<Box<dyn StorageBackend>> = Arc::new(backend);
 
     trace!("init cache");
     let (sender, receiver) = async_channel::bounded(1000);
-    let cache = Cache::new(
-        CONFIG.proxy.aruna_url.clone(),
-        CONFIG.persistence.is_some(),
-        CONFIG.proxy.endpoint_id,
-        CONFIG
-            .proxy
-            .clone()
-            .private_key
-            .ok_or_else(|| anyhow!("Private key not set"))?,
-        CONFIG.proxy.serial,
-        sender.clone(),
-        Some(storage_backend.clone()),
-    )
-    .await?;
+    let cache = Cache::new(&config, sender.clone(), Some(storage_backend.clone())).await?;
 
     trace!("init replication handler");
     let replication_handler = ReplicationHandler::new(
         receiver,
         storage_backend.clone(),
-        CONFIG.proxy.endpoint_id.to_string(),
         cache.clone(),
+        config.proxy.clone(),
     );
     tokio::spawn(async move {
         let replication = replication_handler.run().await;
@@ -145,13 +125,13 @@ async fn main() -> Result<()> {
 
     trace!("init s3 server");
     let cache_clone = cache.clone();
-    let s3_server = if let Some(frontend) = &CONFIG.frontend {
+    let s3_server = if let Some(frontend) = &config.frontend {
         Some(
             s3_frontend::s3server::S3Server::new(
-                &frontend.server,
-                frontend.hostname.to_string(),
-                storage_backend.clone(),
+                &config,
+                cors_regex,
                 cache,
+                storage_backend.clone(),
             )
             .await?,
         )
@@ -160,14 +140,14 @@ async fn main() -> Result<()> {
     };
     trace!("init grpc server");
 
-    let proxy_grpc_addr = CONFIG.proxy.grpc_server.parse::<SocketAddr>()?;
-
+    let proxy_grpc_addr = config.proxy.grpc_server.parse::<SocketAddr>()?;
     let grpc_server_handle = tokio::spawn(
         async move {
             let mut builder = Server::builder()
                 .http2_keepalive_interval(Some(Duration::from_secs(15)))
                 .add_service(DataproxyReplicationServiceServer::new(
                     DataproxyReplicationServiceImpl::new(
+                        config.proxy.clone(),
                         cache_clone.clone(),
                         sender,
                         storage_backend.clone(),
@@ -177,13 +157,17 @@ async fn main() -> Result<()> {
                     DataproxyUserServiceImpl::new(cache_clone.clone()),
                 ));
 
-            if CONFIG.proxy.enable_ingest {
+            if config.proxy.enable_ingest {
                 builder = builder.add_service(DataproxyIngestionServiceServer::new(
-                    DataproxyIngestionServiceImpl::new(cache_clone.clone(), storage_backend),
+                    DataproxyIngestionServiceImpl::new(
+                        cache_clone.clone(),
+                        storage_backend,
+                        config.proxy.admin_ids,
+                    ),
                 ));
             }
 
-            if let Some(frontend) = &CONFIG.frontend {
+            if let Some(frontend) = &config.frontend {
                 builder = builder.add_service(BundlerServiceServer::new(BundlerServiceImpl::new(
                     cache_clone.clone(),
                     frontend.hostname.to_string(),

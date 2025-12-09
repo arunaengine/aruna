@@ -14,7 +14,6 @@ use rand::distr::Alphanumeric;
 use rand::rng as thread_rng;
 use rand::Rng;
 
-use crate::CONFIG;
 //backend_scheme="s3://{{PROJECT_NAME}}-{{RANDOM:10}}/{{COLLECTION_NAME}}/{{DATASET_NAME}}/{{RANDOM:10}}_{{OBJECT_NAME}}"
 #[derive(Debug, Clone)]
 pub enum Arguments {
@@ -33,7 +32,11 @@ pub enum Arguments {
 }
 
 impl Arguments {
-    pub fn with_hierarchy(&self, hierarchy: &[Option<(DieselUlid, String)>; 4]) -> Option<String> {
+    pub fn with_hierarchy(
+        &self,
+        proxy_id: &DieselUlid,
+        hierarchy: &[Option<(DieselUlid, String)>; 4],
+    ) -> Option<String> {
         match self {
             Arguments::Project => hierarchy.first().cloned().flatten().map(|(_, b)| b),
             Arguments::ProjectId => hierarchy
@@ -59,9 +62,7 @@ impl Arguments {
                 .cloned()
                 .flatten()
                 .map(|(a, _)| a.to_string().to_ascii_lowercase()),
-            Arguments::EndpointId => {
-                Some(CONFIG.proxy.endpoint_id.to_string().to_ascii_lowercase())
-            }
+            Arguments::EndpointId => Some(proxy_id.to_string().to_ascii_lowercase()),
             Arguments::Random(x) => Some(
                 thread_rng()
                     .sample_iter(&Alphanumeric)
@@ -89,16 +90,12 @@ pub struct CompiledVariant {
     pub key_arguments: Vec<Arguments>,
     #[allow(dead_code)]
     pub schema: SchemaVariant,
+    proxy_id: DieselUlid,
 }
 
 impl CompiledVariant {
-    pub fn new(scheme: &str) -> Result<Self> {
-        match Self::compile(scheme) {
-            Ok((_, x)) => Ok(x),
-            Err(e) => {
-                bail!("Error parsing scheme: {}", e)
-            }
-        }
+    pub fn new(scheme: &str, proxy_id: DieselUlid) -> Result<Self> {
+        Self::compile(scheme, proxy_id)
     }
 
     pub fn to_names(&self, hierarchy: [Option<(DieselUlid, String)>; 4]) -> (String, String) {
@@ -106,7 +103,7 @@ impl CompiledVariant {
         for bucket_string in self
             .bucket_arguments
             .iter()
-            .filter_map(|x| x.with_hierarchy(&hierarchy))
+            .filter_map(|x| x.with_hierarchy(&self.proxy_id, &hierarchy))
         {
             if &bucket_string == "/" {
                 if bucket.is_empty() || bucket.ends_with('/') {
@@ -122,7 +119,7 @@ impl CompiledVariant {
         for part_string in self
             .key_arguments
             .iter()
-            .filter_map(|x| x.with_hierarchy(&hierarchy))
+            .filter_map(|x| x.with_hierarchy(&self.proxy_id, &hierarchy))
         {
             if part_string == "/" {
                 if key.ends_with('/') {
@@ -138,8 +135,14 @@ impl CompiledVariant {
         (bucket, key)
     }
 
-    pub fn compile(input: &str) -> IResult<&str, Self> {
-        alt((Self::compile_s3, Self::compile_filesystem)).parse(input)
+    pub fn compile(input: &str, proxy_id: DieselUlid) -> Result<CompiledVariant> {
+        match alt((Self::compile_s3, Self::compile_filesystem)).parse(input) {
+            Ok((_, mut compiled)) => {
+                compiled.proxy_id = proxy_id;
+                Ok(compiled)
+            }
+            Err(e) => bail!("Error parsing scheme: {}", e),
+        }
     }
 
     pub fn compile_s3(scheme: &str) -> IResult<&str, Self> {
@@ -173,6 +176,7 @@ impl CompiledVariant {
                 bucket_arguments: bucket,
                 key_arguments: key,
                 schema: SchemaVariant::S3,
+                proxy_id: DieselUlid::default(),
             },
         ))
     }
@@ -209,6 +213,7 @@ impl CompiledVariant {
                 bucket_arguments: bucket,
                 key_arguments: key,
                 schema: SchemaVariant::S3,
+                proxy_id: DieselUlid::default(),
             },
         ))
     }

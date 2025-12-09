@@ -1,9 +1,8 @@
 use super::auth::AuthProvider;
 use super::s3service::ArunaS3Service;
 use crate::caching::cache;
+use crate::config::{Config, Frontend};
 use crate::data_backends::storage_backend::StorageBackend;
-use crate::CONFIG;
-use crate::CORS_REGEX;
 use anyhow::Result;
 use futures_core::future::BoxFuture;
 use futures_util::FutureExt;
@@ -15,6 +14,7 @@ use http::{HeaderValue, Method, StatusCode};
 use hyper::service::Service;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use regex::Regex;
 use s3s::header::HOST;
 use s3s::host::SingleDomain;
 use s3s::s3_error;
@@ -28,50 +28,58 @@ use tokio::net::TcpListener;
 use tracing::{error, info};
 
 pub struct S3Server {
+    config: Frontend,
+    cors_regex: Option<Regex>,
     s3service: S3Service,
-    address: String,
     inner_raw: ArunaS3Service,
 }
 
 #[derive(Clone)]
 pub struct WrappingService {
+    config: Frontend,
+    cors_regex: Option<Regex>,
     shared: SharedS3Service,
     inner: ArunaS3Service,
 }
 
 impl S3Server {
-    #[tracing::instrument(level = "trace", skip(address, hostname, backend, cache))]
+    #[tracing::instrument(level = "trace", skip(config, cors_regex, backend, cache))]
     pub async fn new(
-        address: impl Into<String> + Copy,
-        hostname: impl Into<String>,
-        backend: Arc<Box<dyn StorageBackend>>,
+        config: &Config,
+        cors_regex: Option<Regex>,
         cache: Arc<cache::Cache>,
+        backend: Arc<Box<dyn StorageBackend>>,
     ) -> Result<Self> {
-        let s3service = ArunaS3Service::new(backend, cache.clone())
+        let s3service = ArunaS3Service::new(config.proxy.clone(), backend, cache.clone())
             .await
             .map_err(|e| {
                 error!(error = ?e, msg = e.to_string());
                 tonic::Status::unauthenticated(e.to_string())
             })?;
+        let frontend_config = config
+            .frontend
+            .clone()
+            .expect("No frontend config provided");
         let auth_provider = AuthProvider::new(cache).await;
         let service = {
             let mut b = S3ServiceBuilder::new(s3service.clone());
-            b.set_host(SingleDomain::new(&hostname.into())?);
+            b.set_host(SingleDomain::new(&frontend_config.hostname)?);
             b.set_access(auth_provider.clone());
             b.set_auth(auth_provider);
             b.build()
         };
 
         Ok(Self {
+            config: frontend_config,
+            cors_regex,
             s3service: service,
-            address: address.into(),
             inner_raw: s3service,
         })
     }
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn run(self) -> Result<()> {
         // Run server
-        let listener = TcpListener::bind(&self.address).await.map_err(|e| {
+        let listener = TcpListener::bind(&self.config.server).await.map_err(|e| {
             error!(error = ?e, msg = e.to_string());
             tonic::Status::unauthenticated(e.to_string())
         })?;
@@ -79,8 +87,10 @@ impl S3Server {
         let local_addr = listener.local_addr()?;
 
         let service = WrappingService {
+            config: self.config,
+            cors_regex: self.cors_regex,
             shared: self.s3service.into_shared(),
-            inner: self.inner_raw.clone(),
+            inner: self.inner_raw,
         };
 
         let connection = ConnBuilder::new(TokioExecutor::new());
@@ -121,7 +131,7 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
         // Check if response gets CORS header pass
         let mut origin_exception = false;
         if let Some(origin) = req.headers().get("Origin") {
-            if let Some(cors_regex) = &*CORS_REGEX {
+            if let Some(cors_regex) = &self.cors_regex {
                 match origin.to_str() {
                     Ok(origin) => {
                         origin_exception = cors_regex.is_match(origin);
@@ -248,13 +258,7 @@ impl WrappingService {
                 error!("{e}");
                 s3_error!(InvalidURI, "Invalid URI encoding")
             })?
-            .split(
-                &CONFIG
-                    .frontend
-                    .as_ref()
-                    .ok_or_else(|| s3_error!(InternalError, "No s3 frontend configured"))?
-                    .hostname,
-            )
+            .split(&self.config.hostname)
             .next()
             .ok_or_else(|| s3_error!(InternalError, "Invalid host url set"))?;
 

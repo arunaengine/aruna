@@ -1,17 +1,17 @@
 use super::location_handler::CompiledVariant;
 use super::storage_backend::StorageBackend;
-use crate::config::Backend;
+use crate::config::{Backend, Config};
 use crate::helpers::random_string;
 use crate::structs::FileFormat;
 use crate::structs::Object;
 use crate::structs::ObjectLocation;
 use crate::structs::PartETag;
-use crate::CONFIG;
 use anyhow::anyhow;
 use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
-use aws_sdk_s3::config::RequestChecksumCalculation;
+use aws_config::BehaviorVersion;
+use aws_sdk_s3::config::{Credentials, RequestChecksumCalculation};
 use aws_sdk_s3::primitives::SdkBody;
 use aws_sdk_s3::{
     config::Region,
@@ -41,7 +41,7 @@ pub struct S3Backend {
 
 impl S3Backend {
     #[tracing::instrument]
-    pub async fn new(endpoint_id: String) -> Result<Self> {
+    pub async fn new(config: &Config) -> Result<Self> {
         let Backend::S3 {
             tmp,
             backend_scheme,
@@ -50,25 +50,42 @@ impl S3Backend {
             compression,
             dropbox_bucket,
             force_path_style,
+            access_key,
+            secret_key,
             ..
-        } = &CONFIG.backend
+        } = &config.backend
         else {
             return Err(anyhow!("Invalid backend"));
         };
 
         let temp = tmp
             .clone()
-            .unwrap_or_else(|| format!("temp-{endpoint_id}").to_ascii_lowercase());
+            .unwrap_or_else(|| format!("temp-{}", config.proxy.endpoint_id).to_ascii_lowercase());
 
-        let compiled_schema = CompiledVariant::new(backend_scheme.as_str())?;
+        let compiled_schema =
+            CompiledVariant::new(backend_scheme.as_str(), config.proxy.endpoint_id)?;
 
         let s3_endpoint = host.clone().ok_or_else(|| anyhow!("Missing s3 host"))?;
         tracing::debug!("S3 Endpoint: {}", s3_endpoint);
 
+        let creds = Credentials::new(
+            access_key
+                .clone()
+                .expect("Access key should be set at this point."),
+            secret_key
+                .clone()
+                .expect("Secret key should be set at this point."),
+            None,
+            None,
+            "S3 storage backend", // Endpoint name?
+        );
         #[allow(deprecated)]
-        let config = aws_config::load_from_env().await;
+        let base_config = aws_config::defaults(BehaviorVersion::latest())
+            .credentials_provider(creds)
+            .load()
+            .await;
         let s3_config = match force_path_style {
-            Some(force_path_style) => aws_sdk_s3::config::Builder::from(&config)
+            Some(force_path_style) => aws_sdk_s3::config::Builder::from(&base_config)
                 .region(Region::new("RegionOne"))
                 .force_path_style(*force_path_style)
                 .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
@@ -78,7 +95,7 @@ impl S3Backend {
                 .clone()
                 .endpoint_url(&s3_endpoint)
                 .build(),
-            _ => aws_sdk_s3::config::Builder::from(&config)
+            _ => aws_sdk_s3::config::Builder::from(&base_config)
                 .region(Region::new("RegionOne"))
                 .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
                 .response_checksum_validation(
@@ -92,7 +109,7 @@ impl S3Backend {
 
         let handler = S3Backend {
             s3_client,
-            endpoint_id,
+            endpoint_id: config.proxy.endpoint_id.to_string(),
             temp,
             schema: compiled_schema,
             use_pithos: *encryption || *compression,

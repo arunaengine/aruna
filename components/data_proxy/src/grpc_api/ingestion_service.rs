@@ -4,7 +4,6 @@ use crate::{
     data_backends::storage_backend::StorageBackend,
     helpers::bucket_path_from_pathstring,
     structs::{FileFormat, ObjectLocation, TypedRelation},
-    CONFIG,
 };
 use aruna_rust_api::api::dataproxy::services::v2::{
     dataproxy_ingestion_service_server::DataproxyIngestionService,
@@ -19,12 +18,21 @@ use tracing::error;
 pub struct DataproxyIngestionServiceImpl {
     pub cache: Arc<Cache>,
     pub backend: Arc<Box<dyn StorageBackend>>,
+    admin_ids: Vec<DieselUlid>,
 }
 
 impl DataproxyIngestionServiceImpl {
     #[tracing::instrument(level = "trace", skip(cache))]
-    pub fn new(cache: Arc<Cache>, backend: Arc<Box<dyn StorageBackend>>) -> Self {
-        Self { cache, backend }
+    pub fn new(
+        cache: Arc<Cache>,
+        backend: Arc<Box<dyn StorageBackend>>,
+        admin_ids: Vec<DieselUlid>,
+    ) -> Self {
+        Self {
+            cache,
+            backend,
+            admin_ids,
+        }
     }
 }
 
@@ -52,7 +60,7 @@ impl DataproxyIngestionService for DataproxyIngestionServiceImpl {
                 ));
             }
 
-            if !CONFIG.proxy.admin_ids.contains(&u) {
+            if !self.admin_ids.contains(&u) {
                 error!(error = "Only admins are allowed to ingest objects");
                 return Err(tonic::Status::unauthenticated("Invalid permissions"));
             }

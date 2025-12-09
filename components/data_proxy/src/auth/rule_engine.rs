@@ -1,5 +1,4 @@
-use crate::config::RuleTarget;
-use crate::CONFIG;
+use crate::config::{Config, RuleTarget};
 use anyhow::anyhow;
 use anyhow::Result;
 use cel_interpreter::Context;
@@ -25,14 +24,14 @@ pub(super) struct RuleEngine {
 }
 
 impl RuleEngine {
-    pub fn new() -> Result<Self> {
+    pub fn new(config: &Config) -> Result<Self> {
         let mut root_expressions = vec![];
         let mut object_expressions = vec![];
         let mut bundle_expressions = vec![];
         let mut object_package_expressions = vec![];
         let mut replication_inbound_expressions = vec![];
         let mut replication_outbound_expressions = vec![];
-        for rule in CONFIG.get_rules().iter() {
+        for rule in config.get_rules().iter() {
             match rule.target {
                 RuleTarget::ROOT => {
                     root_expressions.push(

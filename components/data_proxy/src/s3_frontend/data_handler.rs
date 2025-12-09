@@ -45,6 +45,7 @@ impl DataHandler {
         backend: Arc<Box<dyn StorageBackend>>,
         before_location: ObjectLocation,
         path_level: Option<[Option<(DieselUlid, String)>; 4]>,
+        recipient_pubkey: [u8; 32],
     ) -> Result<()> {
         let token = if let Some(handler) = cache.auth.read().await.as_ref() {
             let Some(created_by) = object.created_by else {
@@ -106,6 +107,7 @@ impl DataHandler {
         let ctx = object.get_file_context(
             Some(new_location.clone()),
             Some(before_location.disk_content_len),
+            vec![recipient_pubkey],
         )?;
 
         let (tx_send, tx_receive) = async_channel::bounded(10);

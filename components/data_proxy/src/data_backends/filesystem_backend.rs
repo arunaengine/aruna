@@ -12,15 +12,14 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::pin;
 
+use super::{location_handler::CompiledVariant, storage_backend::StorageBackend};
+use crate::config::Config;
 use crate::helpers::random_string;
 use crate::structs::FileFormat;
 use crate::{
     config::Backend,
     structs::{Object, ObjectLocation, PartETag},
-    CONFIG,
 };
-
-use super::{location_handler::CompiledVariant, storage_backend::StorageBackend};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -38,7 +37,7 @@ pub struct FSBackend {
 impl FSBackend {
     #[tracing::instrument(level = "debug")]
     #[allow(dead_code)]
-    pub async fn new(_endpoint_id: String) -> Result<Self> {
+    pub async fn new(config: &Config) -> Result<Self> {
         let Backend::FileSystem {
             root_path,
             encryption,
@@ -46,7 +45,7 @@ impl FSBackend {
             dropbox_folder,
             backend_scheme,
             tmp,
-        } = &CONFIG.backend
+        } = &config.backend
         else {
             return Err(anyhow!("Invalid backend"));
         };
@@ -55,10 +54,11 @@ impl FSBackend {
             .clone()
             .unwrap_or_else(|| "/tmp".to_string().to_ascii_lowercase());
 
-        let compiled_schema = CompiledVariant::new(backend_scheme.as_str())?;
+        let compiled_schema =
+            CompiledVariant::new(backend_scheme.as_str(), config.proxy.endpoint_id)?;
 
         let handler = FSBackend {
-            _endpoint_id,
+            _endpoint_id: config.proxy.endpoint_id.to_string(),
             temp,
             base_path: root_path.clone(),
             schema: compiled_schema,

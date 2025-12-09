@@ -33,10 +33,9 @@ cors_exception = "http://localhost:3000"
 [backend.s3]
 # s3 host
 host = "http://localhost:9000"
-# (UNSUPPORTED) currently only env AWS_ACCESS_KEY_ID
-# access_key="minioadmin"
-# (UNSUPPORTED) currently only env AWS_SECRET_ACCESS
-# secret_key="minioadmin"
+# (UNSUPPORTED) currently only env AWS_ACCESS_KEY_ID && AWS_SECRET_ACCESS
+access_key="minioadmin"
+secret_key="minioadmin"
 encryption = true
 compression = true
 deduplication = true     # COMING SOON If deduplication is enabled, the backend will check if an object with the same hash already exists and return the existing object if it does

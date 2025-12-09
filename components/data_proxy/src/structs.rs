@@ -36,7 +36,6 @@ use tracing::{debug, error};
 
 use crate::auth::auth::AuthHandler;
 use crate::helpers::IntoOption;
-use crate::CONFIG;
 
 /* ----- Constants ----- */
 pub const ALL_RIGHTS_RESERVED: &str = "AllRightsReserved";
@@ -352,6 +351,7 @@ impl Object {
         &self,
         location: Option<ObjectLocation>,
         expected_size: Option<i64>,
+        recipients: Vec<[u8; 32]>,
     ) -> Result<FileContext> {
         let location_size = expected_size
             .or_else(|| location.as_ref().map(|l| l.raw_content_len))
@@ -380,7 +380,7 @@ impl Object {
                     }
                 })
                 .unwrap_or_default(),
-            recipients_pubkeys: vec![CONFIG.proxy.get_public_key_x25519()?],
+            recipients_pubkeys: recipients, //vec![CONFIG.proxy.get_public_key_x25519()?],
             ..Default::default()
         })
     }

@@ -5,6 +5,7 @@ use super::rule_structs::RootRuleInputBuilder;
 use crate::auth::rule_structs::BundleRuleInputBuilder;
 use crate::auth::rule_structs::PackageObjectRuleInputBuilder;
 use crate::caching::cache::Cache;
+use crate::config::Config;
 use crate::helpers::is_method_read;
 use crate::structs::AccessKeyPermissions;
 use crate::structs::CheckAccessResult;
@@ -126,18 +127,16 @@ impl<'de> Deserialize<'de> for Intent {
 }
 
 impl AuthHandler {
-    #[tracing::instrument(
-        level = "trace",
-        skip(cache, self_id, encode_secret, encoding_key_serial)
-    )]
-    pub fn new(
-        cache: Arc<Cache>,
-        self_id: DieselUlid,
-        encode_secret: String,
-        encoding_key_serial: i32,
-    ) -> Result<Self, anyhow::Error> {
-        let private_pem =
-            format!("-----BEGIN PRIVATE KEY-----{encode_secret}-----END PRIVATE KEY-----");
+    #[tracing::instrument(level = "trace", skip(cache, config))]
+    pub fn new(cache: Arc<Cache>, config: &Config) -> Result<Self, anyhow::Error> {
+        let private_pem = format!(
+            "-----BEGIN PRIVATE KEY-----{}-----END PRIVATE KEY-----",
+            config
+                .proxy
+                .private_key
+                .as_ref()
+                .ok_or_else(|| anyhow!("Private key not set"))?
+        );
         let encoding_key = EncodingKey::from_ed_pem(private_pem.as_bytes()).map_err(|e| {
             error!(error = ?e, msg = e.to_string());
             e
@@ -145,9 +144,9 @@ impl AuthHandler {
 
         Ok(Self {
             cache,
-            self_id,
-            rule_engine: RuleEngine::new()?,
-            encoding_key: (encoding_key_serial, encoding_key),
+            self_id: config.proxy.endpoint_id,
+            rule_engine: RuleEngine::new(&config)?,
+            encoding_key: (config.proxy.serial, encoding_key),
         })
     }
 

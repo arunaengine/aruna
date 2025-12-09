@@ -1,6 +1,7 @@
 use super::grpc_query_handler::GrpcQueryHandler;
 use crate::auth::auth::AuthHandler;
 use crate::caching::grpc_query_handler::sort_objects;
+use crate::config::Config;
 use crate::data_backends::storage_backend::StorageBackend;
 use crate::database::persistence::{delete_parts_by_object_id, delete_parts_by_upload_id};
 use crate::replication::replication_handler::ReplicationMessage;
@@ -37,7 +38,7 @@ pub struct Cache {
     // Map DieselUlid as key and (User, Vec<String>) as value -> Vec<String> is a list of registered access keys -> access_keys
     #[allow(clippy::type_complexity)]
     users: DashMap<DieselUlid, Arc<RwLock<(User, Vec<String>)>>, RandomState>,
-    // Permissions Maybe TODO: Arc<RwLock<AccessKeyPermissions>>?
+    // Permissions
     access_keys: DashMap<String, Arc<RwLock<AccessKeyPermissions>>, RandomState>,
     // Map with ObjectId as key and Object as value
     #[allow(clippy::type_complexity)]
@@ -78,26 +79,13 @@ pub struct Cache {
     backend: Option<Arc<Box<dyn StorageBackend>>>,
 
     pub(crate) self_arc: RwLock<Option<Arc<Cache>>>,
+    self_pubkey: [u8; 32],
 }
 
 impl Cache {
-    #[tracing::instrument(
-        level = "debug",
-        skip(
-            notifications_url,
-            with_persistence,
-            self_id,
-            encoding_key,
-            encoding_key_serial,
-            backend
-        )
-    )]
+    #[tracing::instrument(level = "debug", skip(config, sender, backend))]
     pub async fn new(
-        notifications_url: Option<impl Into<String>>,
-        with_persistence: bool,
-        self_id: DieselUlid,
-        encoding_key: String,
-        encoding_key_serial: i32,
+        config: &Config,
         sender: Sender<ReplicationMessage>,
         backend: Option<Arc<Box<dyn StorageBackend>>>,
     ) -> Result<Arc<Self>> {
@@ -116,28 +104,28 @@ impl Cache {
             sender,
             backend,
             self_arc: RwLock::new(None),
+            self_pubkey: config.proxy.get_public_key_x25519()?,
         });
         cache.self_arc.write().await.replace(cache.clone());
 
         // Initialize auth handler
-        let auth_handler =
-            AuthHandler::new(cache.clone(), self_id, encoding_key, encoding_key_serial)?;
+        let auth_handler = AuthHandler::new(cache.clone(), config)?;
 
         // Set auth handler in cache
         cache.set_auth(auth_handler).await;
 
         // Set database conn in cache
-        let _temp_locations = if with_persistence {
-            let persistence = Database::new().await?;
+        let _temp_locations = if config.persistence.is_some() {
+            let persistence = Database::new(config).await?;
             cache.set_persistence(persistence).await?
         } else {
             vec![]
         };
 
         // Fully sync cache (and database if persistent DataProxy)
-        if let Some(url) = notifications_url {
+        if let Some(url) = &config.proxy.aruna_url {
             let notication_handler: Arc<GrpcQueryHandler> = Arc::new(
-                GrpcQueryHandler::new(url, cache.clone(), self_id.to_string())
+                GrpcQueryHandler::new(url, cache.clone(), config.proxy.endpoint_id.to_string())
                     .await
                     .map_err(|e| {
                         error!(error = ?e, msg = e.to_string());
@@ -363,6 +351,7 @@ impl Cache {
         };
         let cache = self.get_cache().await?.clone();
         let backend = backend.clone();
+        let pubkey = self.self_pubkey.clone();
 
         tokio::spawn(async move {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
@@ -385,6 +374,7 @@ impl Cache {
                             backend,
                             temp_location,
                             None,
+                            pubkey,
                         )
                         .await
                         {
@@ -973,7 +963,7 @@ impl Cache {
         Ok(())
     }
 
-    fn get_paths_of_id(&self, id: &DieselUlid) -> Vec<String> {
+    fn _get_paths_of_id(&self, id: &DieselUlid) -> Vec<String> {
         self.paths
             .iter()
             .filter_map(|p| {
