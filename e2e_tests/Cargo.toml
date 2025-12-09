@@ -5,3 +5,31 @@ authors.workspace = true
 edition.workspace = true
 repository.workspace = true
 license.workspace = true
+
+[dev-dependencies]
+anyhow = "1.0"
+aruna_server = { path = "../components/server" }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+data_proxy = { path = "../components/data_proxy" }
+aruna-rust-api = { workspace = true }
+async-channel = { workspace = true }
+async-nats = "0.45.0"
+chrono = {workspace = true}
+dashmap = {workspace = true}
+deadpool-postgres = { workspace = true }
+diesel-ulid = {workspace = true}
+futures = {workspace = true}
+futures-core = "0.3.31"
+futures-util = "0.3.31"
+itertools = "0.14.0"
+maybe-once = { version = "0.17.4", features = ["tokio"] }
+postgres-types = {workspace = true}
+prost = "0.14.1"
+prost-wkt-types = {workspace = true}
+rand = { workspace = true }
+testcontainers = "0.25.2"
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tonic = { workspace = true }
+tracing = "0.1.41"
