@@ -1,12 +1,13 @@
 [workspace]
 members = [
     "components/*",
+    "e2e_tests"
 ]
 resolver = "2"
 
 [workspace.package]
 version = "2.0.4"
-authors = ["Sebastian Beyvers <sb@pus.de>", "Jannis Hochmuth <jannis.hochmuth@cb.jlug.de>", "Lukas Brehm <lukas.brehm@cb.jlug.de>"]
+authors = ["Sebastian Beyvers <sb@pus.de>", "Jannis Schlegel <jannis.schlegel@uni-giessen.de>", "Lukas Brehm <lukas.brehm@cb.jlug.de>"]
 edition = "2021"
 repository = "https://github.com/ArunaStorage/aruna"
 license = "MIT OR Apache-2.0"
