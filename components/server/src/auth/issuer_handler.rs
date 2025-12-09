@@ -2,6 +2,7 @@ use crate::caching::structs::PubKeyEnum;
 use anyhow::{anyhow, bail, Result};
 use chrono::{NaiveDateTime, Utc};
 use jsonwebtoken::{decode_header, jwk::JwkSet, DecodingKey};
+use std::fmt::Debug;
 
 use super::token_handler::ArunaTokenClaims;
 
@@ -19,6 +20,19 @@ pub struct Issuer {
     pub last_updated: NaiveDateTime,
     pub audiences: Option<Vec<String>>,
     pub issuer_type: IssuerType,
+}
+
+impl Debug for Issuer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.issuer_name)?;
+        f.write_fmt(format_args!("{:?}", self.pubkey_endpoint))?;
+        self.decoding_keys.iter().for_each(|(k, _)| {
+            f.write_fmt(format_args!("{k} - DecodingKey")).unwrap();
+        });
+        f.write_fmt(format_args!("{:?}", self.last_updated))?;
+        f.write_fmt(format_args!("{:?}", self.audiences))?;
+        f.write_fmt(format_args!("{:?}", self.issuer_type))
+    }
 }
 
 impl Issuer {

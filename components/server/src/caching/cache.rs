@@ -859,7 +859,7 @@ impl Cache {
     }
 
     pub fn get_proxy_cache_iterator(
-        &self,
+        &'_ self,
         endpoint_id: &DieselUlid,
         cache: Arc<Cache>,
     ) -> ProxyCacheIterator<'_> {

@@ -49,7 +49,7 @@ impl DatabaseHandler {
             None,
             "ARUNA_SERVER", // Endpoint name?
         );
-        let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
             .credentials_provider(creds)
             .load()
             .await;

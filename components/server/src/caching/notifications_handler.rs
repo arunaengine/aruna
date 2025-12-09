@@ -127,7 +127,7 @@ impl NotificationHandler {
                         }
                     }
 
-                    // Acknowlege received message in every case because the only way cache update can fail is through the database query.
+                    // Acknowledge received message in every case because the only way cache update can fail is through the database query.
                     //   We have to trust that messages will only be sent if all database operations have been
                     //   successful in advance and the database has a consistent status in relation to the message being sent.
                     //   This means that in case of an error, the message does not represent the current state of the database,

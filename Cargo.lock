@@ -1705,7 +1705,6 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "lazy_static",
- "maybe-once",
  "md-5",
  "mime_guess",
  "nom 8.0.0",
@@ -1722,7 +1721,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "testcontainers",
  "time",
  "tokio",
  "tokio-postgres",
@@ -2963,17 +2961,6 @@ name = "itoa"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a5f13b858c8d314ee3e8f639011f7ccefe71f97f96e50151fb991f267928e2c"
-
-[[package]]
-name = "java-properties"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "37bf6f484471c451f2b51eabd9e66b3fa7274550c5ec4b6c3d6070840945117f"
-dependencies = [
- "encoding_rs",
- "lazy_static",
- "regex",
-]
 
 [[package]]
 name = "jobserver"
@@ -4888,17 +4875,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-java-properties"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8b5db85b934578ef8a8acc8ef7956b313d9e920d4d4160ef7862bd4c85d4bc7"
-dependencies = [
- "encoding_rs",
- "java-properties",
- "serde",
-]
-
-[[package]]
 name = "serde_core"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5413,7 +5389,6 @@ dependencies = [
  "parse-display",
  "pin-project-lite",
  "serde",
- "serde-java-properties",
  "serde_json",
  "serde_with",
  "thiserror 2.0.17",
