@@ -180,7 +180,7 @@ where
             } else {
                 // Just digest bytes from buf
                 self.counter -= buf.len() as u64;
-                DynDigest::update(&mut self.hasher, &buf);
+                DynDigest::update(&mut self.hasher, buf);
                 &[]
             };
 
@@ -311,8 +311,8 @@ mod test {
             compression: true,
             ..Default::default()
         }))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         sx.send(Message::FileContext(FileContext {
             file_path: "file2.txt".to_string(),
@@ -321,8 +321,8 @@ mod test {
             compression: false,
             ..Default::default()
         }))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         // Create a new GenericReadWriter
         let mut output: Vec<u8> = Vec::new();
@@ -355,8 +355,8 @@ mod test {
             compression: true,
             ..Default::default()
         }))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         sx.send(Message::FileContext(FileContext {
             file_path: "file2.txt".to_string(),
@@ -365,8 +365,8 @@ mod test {
             compression: false,
             ..Default::default()
         }))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         // Create a new GenericReadWriter
         let mut output: Vec<u8> = Vec::new();
@@ -415,8 +415,8 @@ mod test {
             ),
             ..Default::default()
         }))
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         asr = asr.add_transformer(uncompressed_probe);
         asr = asr.add_transformer(sha_transformer);
