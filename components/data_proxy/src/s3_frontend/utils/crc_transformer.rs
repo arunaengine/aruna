@@ -1,7 +1,7 @@
 use anyhow::anyhow;
 use anyhow::Result;
-use base64::prelude::*;
 use async_channel::{Receiver, Sender, TryRecvError};
+use base64::prelude::*;
 use digest::DynDigest;
 use pithos_lib::helpers::notifications::{Message, Notifier};
 use pithos_lib::transformer::{Transformer, TransformerType};
@@ -396,10 +396,16 @@ mod test {
         let mut output = Vec::new();
 
         let mut asr = GenericReadWriter::new_with_writer(input.as_ref(), &mut output);
-        let (uncompressed_probe, _) = SizeProbe::new();
-        let (sha_transformer, _) =
+        let (uncompressed_probe, size_rx) = SizeProbe::new();
+        let (sha_t, sha_rx) =
             HashingTransformer::new_with_backchannel(Sha256::new(), "sha256".to_string());
-        let (crc64nvme_transformer, crc64nvme_recv) =
+        let (md5_t, md5_rx) =
+            HashingTransformer::new_with_backchannel(Md5::new(), "md5".to_string());
+        let (crc32_t, crc32_rx) =
+            CrcTransformer::new_with_backchannel(CrcDigest::new(CrcAlgorithm::Crc32IsoHdlc), false);
+        let (crc32c_t, crc32c_rx) =
+            CrcTransformer::new_with_backchannel(CrcDigest::new(CrcAlgorithm::Crc32Iscsi), false);
+        let (crc64nvme_t, crc64nvme_rx) =
             CrcTransformer::new_with_backchannel(CrcDigest::new(CrcAlgorithm::Crc64Nvme), false);
 
         let (tx, rx) = async_channel::bounded(10);
@@ -423,14 +429,31 @@ mod test {
         .await
         .unwrap();
 
+        asr = asr.add_transformer(crc32_t);
+        asr = asr.add_transformer(crc32c_t);
+        asr = asr.add_transformer(crc64nvme_t);
+        asr = asr.add_transformer(sha_t);
+        asr = asr.add_transformer(md5_t);
         asr = asr.add_transformer(uncompressed_probe);
-        asr = asr.add_transformer(sha_transformer);
-        asr = asr.add_transformer(crc64nvme_transformer);
         asr = asr.add_transformer(PithosTransformer::new());
         asr = asr.add_transformer(FooterGenerator::new(None));
         asr.process().await.unwrap();
 
-        let crc64nvme = crc64nvme_recv.try_recv().unwrap();
-        assert_eq!(crc64nvme, "9c6658ea321baf04")
+        let size = size_rx.try_recv().unwrap();
+        let sha = sha_rx.try_recv().unwrap();
+        let md5 = md5_rx.try_recv().unwrap();
+        let crc32 = crc32_rx.try_recv().unwrap();
+        let crc32c = crc32c_rx.try_recv().unwrap();
+        let crc64nvme = crc64nvme_rx.try_recv().unwrap();
+
+        assert_eq!(size, 33);
+        assert_eq!(
+            sha,
+            "37fd9687137ccc6df9d776395a915bebf66d93954e1edc82aa5a0dabb74a55f1"
+        );
+        assert_eq!(md5, "4456eda9b2496a095c790acd255ad509");
+        assert_eq!(crc32, "aiGsZQ==");
+        assert_eq!(crc32c, "Jx/Rww==");
+        assert_eq!(crc64nvme, "nGZY6jIbrwQ=")
     }
 }
