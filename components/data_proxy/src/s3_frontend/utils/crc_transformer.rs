@@ -212,6 +212,7 @@ mod test {
     use crate::s3_frontend::utils::crc_transformer::CrcTransformer;
     use crc_fast::{CrcAlgorithm, Digest as CrcDigest};
     use digest::Digest;
+    use md5::Md5;
     use pithos_lib::helpers::notifications::Message;
     use pithos_lib::helpers::structs::{EncryptionKey, FileContext};
     use pithos_lib::readwrite::GenericReadWriter;
@@ -235,7 +236,7 @@ mod test {
         asr.process().await.unwrap();
 
         let crc32 = crc32_recv.try_recv().unwrap();
-        assert_eq!(crc32, "6a21ac65")
+        assert_eq!(crc32, "aiGsZQ==")
     }
 
     #[tokio::test]
@@ -252,7 +253,7 @@ mod test {
 
         let crc32c = crc32c_recv.try_recv().unwrap();
 
-        assert_eq!(crc32c, "271fd1c3")
+        assert_eq!(crc32c, "Jx/Rww==")
     }
 
     #[tokio::test]
@@ -269,7 +270,7 @@ mod test {
 
         let crc64nvme = crc64nvme_recv.try_recv().unwrap();
 
-        assert_eq!(crc64nvme, "9c6658ea321baf04")
+        assert_eq!(crc64nvme, "nGZY6jIbrwQ=")
     }
 
     #[tokio::test]
@@ -293,9 +294,9 @@ mod test {
         let crc32c = crc32c_recv.try_recv().unwrap();
         let crc64nvme = crc64nvme_recv.try_recv().unwrap();
 
-        assert_eq!(crc32, "3746087e");
-        assert_eq!(crc32c, "871b47d3");
-        assert_eq!(crc64nvme, "b6275d2fb6d88d11")
+        assert_eq!(crc32, "aiGsZQ==");
+        assert_eq!(crc32c, "Jx/Rww==");
+        assert_eq!(crc64nvme, "nGZY6jIbrwQ=")
     }
 
     #[tokio::test]
@@ -338,8 +339,8 @@ mod test {
         let crc32_file1 = crc32_recv.try_recv().unwrap();
         let crc32_file2 = crc32_recv.try_recv().unwrap();
 
-        assert_eq!(crc32_file1, "11382a6b");
-        assert_eq!(crc32_file2, "bb283921");
+        assert_eq!(crc32_file1, "ETgqaw==");
+        assert_eq!(crc32_file2, "uyg5IQ==");
     }
 
     #[tokio::test]
@@ -347,6 +348,9 @@ mod test {
         let file1 = b"abcdefg".repeat(1024 * 1024).to_vec();
         let file2 = b"zyxwvu".repeat(1024 * 1024).to_vec();
         let combined = Vec::from_iter(file1.clone().into_iter().chain(file2.clone()));
+
+        std::fs::write("/tmp/file1.txt", &file1).unwrap();
+        std::fs::write("/tmp/file2.txt", &file2).unwrap();
 
         let (sx, rx) = async_channel::bounded(10);
         sx.send(Message::FileContext(FileContext {
