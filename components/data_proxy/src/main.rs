@@ -77,11 +77,6 @@ async fn main() -> Result<()> {
 
     dotenvy::from_filename(".env").ok();
 
-    let tokio_env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or("none".into())
-        .add_directive("tokio=trace".parse().unwrap())
-        .add_directive("runtime=trace".parse().unwrap());
-
     let logging_env_filter = EnvFilter::try_from_default_env()
         .unwrap_or("none".into())
         .add_directive("data_proxy=trace".parse()?);
@@ -92,12 +87,7 @@ async fn main() -> Result<()> {
         .with_target(false)
         .with_filter(logging_env_filter);
 
-    let console_layer = console_subscriber::spawn().with_filter(tokio_env_filter);
-
-    tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(console_layer)
-        .init();
+    tracing_subscriber::registry().with(fmt_layer).init();
 
     trace!("init storage backend");
 
