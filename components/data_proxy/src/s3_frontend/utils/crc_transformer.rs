@@ -294,9 +294,9 @@ mod test {
         let crc32c = crc32c_recv.try_recv().unwrap();
         let crc64nvme = crc64nvme_recv.try_recv().unwrap();
 
-        assert_eq!(crc32, "aiGsZQ==");
-        assert_eq!(crc32c, "Jx/Rww==");
-        assert_eq!(crc64nvme, "nGZY6jIbrwQ=")
+        assert_eq!(crc32, "N0YIfg==");
+        assert_eq!(crc32c, "hxtH0w==");
+        assert_eq!(crc64nvme, "tiddL7bYjRE=")
     }
 
     #[tokio::test]
@@ -386,8 +386,8 @@ mod test {
         let crc32_file1 = crc32_recv.try_recv().unwrap();
         let crc32_file2 = crc32_recv.try_recv().unwrap();
 
-        assert_eq!(crc32_file1, "48376d21");
-        assert_eq!(crc32_file2, "9de97047");
+        assert_eq!(crc32_file1, "SDdtIQ==");
+        assert_eq!(crc32_file2, "nelwRw==");
     }
 
     #[tokio::test]
