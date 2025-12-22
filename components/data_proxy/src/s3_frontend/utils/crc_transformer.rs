@@ -1,5 +1,6 @@
 use anyhow::anyhow;
 use anyhow::Result;
+use base64::prelude::*;
 use async_channel::{Receiver, Sender, TryRecvError};
 use digest::DynDigest;
 use pithos_lib::helpers::notifications::{Message, Notifier};
@@ -109,7 +110,7 @@ where
         // Finish and reset digest. Send final checksum into backchannel if available.
         let finished_hash = self.hasher.finalize_reset().to_vec();
         if let Some(sx) = &self.back_channel {
-            sx.try_send(hex::encode(finished_hash))?;
+            sx.try_send(BASE64_STANDARD.encode(&finished_hash))?;
         }
         Ok(())
     }
