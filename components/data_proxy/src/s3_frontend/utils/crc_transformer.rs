@@ -306,25 +306,16 @@ mod test {
         let combined = Vec::from_iter(file1.clone().into_iter().chain(file2.clone()));
 
         let (sx, rx) = async_channel::bounded(10);
-        sx.send(Message::FileContext(FileContext {
-            file_path: "file1.txt".to_string(),
-            compressed_size: file1.len() as u64,
-            decompressed_size: file1.len() as u64,
-            compression: true,
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
-
-        sx.send(Message::FileContext(FileContext {
-            file_path: "file2.txt".to_string(),
-            compressed_size: file2.len() as u64,
-            decompressed_size: file2.len() as u64,
-            compression: false,
-            ..Default::default()
-        }))
-        .await
-        .unwrap();
+        for (idx, file) in vec![file1, file2].into_iter().enumerate() {
+            sx.send(Message::FileContext(FileContext {
+                file_path: format!("file_{idx}.txt"),
+                compressed_size: file.len() as u64,
+                decompressed_size: file.len() as u64,
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        }
 
         // Create a new GenericReadWriter
         let mut output: Vec<u8> = Vec::new();
@@ -341,6 +332,58 @@ mod test {
 
         assert_eq!(crc32_file1, "ETgqaw==");
         assert_eq!(crc32_file2, "uyg5IQ==");
+    }
+
+    #[tokio::test]
+    async fn test_transformer_multifile_mini() {
+        let file1 = b"Lorem".to_vec(); // RJibOQ==
+        let file2 = b"laudantium".to_vec(); // 37qsjA==
+        let file3 = b"uniform".to_vec(); // 9ix5tw==
+        let file4 = b"sit".to_vec(); // SqFq0A==
+
+        // Create a single vector with bytes instead if chained vectors
+        let mut combined = Vec::new();
+        combined.extend(&file1);
+        combined.extend(&file2);
+        combined.extend(&file3);
+        combined.extend(&file4);
+        assert_eq!(combined.len(), 25);
+        assert_eq!(String::from_utf8_lossy(&combined), "Loremlaudantiumuniformsit");
+
+        // Send file contexts in channel
+        let (sx, rx) = async_channel::bounded(10);
+        for (idx, file) in vec![file1, file2, file3, file4].into_iter().enumerate() {
+            let ctx = FileContext {
+                file_path: format!("file_{idx}.txt"),
+                compressed_size: file.len() as u64,
+                decompressed_size: file.len() as u64,
+                ..Default::default()
+            };
+            //dbg!(&ctx);
+            sx.send(Message::FileContext(ctx))
+            .await
+            .unwrap();
+        }
+
+        // Create a new GenericReadWriter
+        let mut output: Vec<u8> = Vec::new();
+        let mut asr = GenericReadWriter::new_with_writer(combined.as_ref(), &mut output);
+        asr.add_message_receiver(rx).await.unwrap();
+
+        let (crc32_transformer, crc32_recv) =
+            CrcTransformer::new_with_backchannel(CrcDigest::new(CrcAlgorithm::Crc32IsoHdlc), true);
+        asr = asr.add_transformer(crc32_transformer);
+        asr.process().await.unwrap();
+
+        let crc32_file1 = crc32_recv.try_recv().unwrap();
+        let crc32_file2 = crc32_recv.try_recv().unwrap();
+        let crc32_file3 = crc32_recv.try_recv().unwrap();
+        let crc32_file4 = crc32_recv.try_recv().unwrap();
+
+        assert_eq!(crc32_file1, "RJibOQ==");
+        assert_eq!(crc32_file2, "37qsjA==");
+        assert_eq!(crc32_file3, "9ix5tw==");
+        assert_eq!(crc32_file4, "SqFq0A==");
     }
 
     #[tokio::test]
