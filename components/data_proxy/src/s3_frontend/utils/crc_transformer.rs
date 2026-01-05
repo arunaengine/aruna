@@ -163,7 +163,7 @@ where
     #[tracing::instrument(level = "trace", skip(self, buf))]
     async fn process_bytes(&mut self, buf: &mut bytes::BytesMut) -> Result<()> {
         let Ok((finished, should_flush)) = self.process_messages() else {
-            return Err(anyhow!("[HashingTransformer] Error processing messages"));
+            return Err(anyhow!("[CrcTransformer] Error processing messages"));
         };
 
         // Do nothing if already finished
