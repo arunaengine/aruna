@@ -48,8 +48,8 @@ lazy_static = { workspace = true }
 md-5 = "0.10.6"
 mime_guess = "2.0.5"
 nom = "8.0.0"
-pithos_lib = "0.6.3"
-postgres-from-row = { workspace = true }
+pithos_lib = "0.6.4"
+#postgres-from-row = { workspace = true }
 postgres-types = { workspace = true }
 postgres_array = "0.11.1"
 prost-wkt-types = { workspace = true }
