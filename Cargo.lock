@@ -1323,16 +1323,14 @@ checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
 name = "crc-fast"
-version = "1.2.1"
+version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "add8d3a4c789d77eeb0f0e3c1035f73610d017f9047e87db94f89c02a56d8fef"
+checksum = "2c15e7f62c7d6e256e6d0fc3fc1ef395348e4bc395dcf14d6990da0e5aa6e8b0"
 dependencies = [
- "cc",
  "crc",
  "digest",
- "libc",
- "rand 0.9.2",
- "regex",
+ "rustversion",
+ "spin 0.10.0",
 ]
 
 [[package]]
@@ -1549,6 +1547,7 @@ dependencies = [
  "cel-parser",
  "chrono",
  "console-subscriber",
+ "crc-fast",
  "crossbeam-skiplist",
  "curve25519-dalek",
  "dashmap",
@@ -2824,7 +2823,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin",
+ "spin 0.9.8",
 ]
 
 [[package]]
@@ -4863,6 +4862,12 @@ name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+
+[[package]]
+name = "spin"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
 
 [[package]]
 name = "spki"
