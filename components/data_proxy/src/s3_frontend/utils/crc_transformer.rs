@@ -121,7 +121,12 @@ where
             file_queue.pop_front();
             // Try to fetch next file context if available and init digest with carryover bytes
             if let Some((_, size)) = file_queue.front() {
-                self.counter = *size - carryover_bytes.len() as u64; // Already subtract the carryover bytes
+                self.counter = size
+                    .checked_sub(carryover_bytes.len() as u64)
+                    .ok_or_else(|| {
+                        anyhow!("[CrcTransformer] Received more bytes than size of next file")
+                    })?;
+
                 DynDigest::update(&mut self.hasher, carryover_bytes);
             } else {
                 // No more files available -> finished
@@ -348,19 +353,20 @@ mod test {
         combined.extend(&file3);
         combined.extend(&file4);
         assert_eq!(combined.len(), 25);
-        assert_eq!(String::from_utf8_lossy(&combined), "Loremlaudantiumuniformsit");
+        assert_eq!(
+            String::from_utf8_lossy(&combined),
+            "Loremlaudantiumuniformsit"
+        );
 
         // Send file contexts in channel
         let (sx, rx) = async_channel::bounded(10);
         for (idx, file) in vec![file1, file2, file3, file4].into_iter().enumerate() {
-            let ctx = FileContext {
+            sx.send(Message::FileContext(FileContext {
                 file_path: format!("file_{idx}.txt"),
                 compressed_size: file.len() as u64,
                 decompressed_size: file.len() as u64,
                 ..Default::default()
-            };
-            //dbg!(&ctx);
-            sx.send(Message::FileContext(ctx))
+            }))
             .await
             .unwrap();
         }
