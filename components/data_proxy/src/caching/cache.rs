@@ -1386,7 +1386,7 @@ impl Cache {
         upload_id: &str,
         start_at: u64,
         limit: usize,
-    ) -> Option<(Vec<Part>, Option<String>, bool)> {
+    ) -> Option<(Vec<Part>, Option<i32>, bool)> {
         let mut all_parts: Vec<UploadPart> =
             if let Some(parts) = self.multi_parts.get(upload_id).map(|e| e.value().clone()) {
                 parts
@@ -1407,7 +1407,8 @@ impl Cache {
             response_parts.push(p.into());
 
             if response_parts.len() == limit {
-                next_part_marker = Some(next_part_number.to_string());
+                //Note: Cast should be ok as the maximum number of parts per upload is limited to 10.000
+                next_part_marker = Some(next_part_number as i32);
                 is_truncated = true;
                 break;
             }
