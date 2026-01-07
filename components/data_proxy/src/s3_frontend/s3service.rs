@@ -17,8 +17,8 @@ use aruna_rust_api::api::storage::models::v2::Hash;
 use aruna_rust_api::api::storage::models::v2::Hashalgorithm;
 use aruna_rust_api::api::storage::models::v2::Status;
 use base64::engine::general_purpose;
-use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 use bytes::BufMut;
 use bytes::BytesMut;
 use futures_util::TryStreamExt;
@@ -103,7 +103,7 @@ impl ArunaS3Service {
 
         let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(format!("{md5:x}"))),
-            checksum_sha256: Some(format!("{}", BASE64_STANDARD.encode(&sha256))),
+            checksum_sha256: Some(BASE64_STANDARD.encode(sha256).to_string()),
             version_id: Some(object.id.to_string()),
             ..Default::default()
         };
@@ -866,7 +866,7 @@ impl S3 for ArunaS3Service {
 
         let mime = mime_guess::from_path(object.name.as_str())
             .first()
-            .and_then(|mime_guess| ContentType::from_str(&mime_guess.to_string()).ok());
+            .and_then(|mime_guess| ContentType::from_str(mime_guess.as_ref()).ok());
 
         let output = GetObjectOutput {
             body,
@@ -939,7 +939,7 @@ impl S3 for ArunaS3Service {
 
         let mime = mime_guess::from_path(object.name.as_str())
             .first()
-            .and_then(|mime_guess| ContentType::from_str(&mime_guess.to_string()).ok());
+            .and_then(|mime_guess| ContentType::from_str(mime_guess.as_ref()).ok());
 
         let output = HeadObjectOutput {
             content_length: Some(content_len),
@@ -1995,7 +1995,7 @@ impl S3 for ArunaS3Service {
                 s3_error!(InternalError, "Unable to add location with binding")
             })?;
 
-        let mut output = PutObjectOutput {
+        let output = PutObjectOutput {
             e_tag: Some(ETag::Strong(format!("-{}", new_object.id))),
             ..Default::default()
         };
@@ -2143,7 +2143,7 @@ impl S3 for ArunaS3Service {
         };
 
         // Create basic response output
-        let mut output = UploadPartOutput {
+        let output = UploadPartOutput {
             e_tag: Some(ETag::Strong(format!("-{etag}"))),
             ..Default::default()
         };
@@ -2386,7 +2386,7 @@ impl S3 for ArunaS3Service {
 
         let response = CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
-                e_tag: md5hash.map(|h| ETag::Strong(h)),
+                e_tag: md5hash.map(ETag::Strong),
                 checksum_sha256: sha256hash,
                 last_modified: Some(
                     time::OffsetDateTime::from_unix_timestamp(
