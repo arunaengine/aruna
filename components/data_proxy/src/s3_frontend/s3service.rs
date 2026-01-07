@@ -18,6 +18,7 @@ use aruna_rust_api::api::storage::models::v2::Hashalgorithm;
 use aruna_rust_api::api::storage::models::v2::Status;
 use base64::engine::general_purpose;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::BufMut;
 use bytes::BytesMut;
 use futures_util::TryStreamExt;
@@ -51,6 +52,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::pin;
 use tracing::debug;
@@ -100,8 +102,8 @@ impl ArunaS3Service {
         let sha256 = Sha256::new().finalize();
 
         let output = PutObjectOutput {
-            e_tag: Some(format!("{md5:x}")),
-            checksum_sha256: Some(format!("{sha256:x}")),
+            e_tag: Some(ETag::Strong(format!("{md5:x}"))),
+            checksum_sha256: Some(format!("{}", BASE64_STANDARD.encode(&sha256))),
             version_id: Some(object.id.to_string()),
             ..Default::default()
         };
@@ -176,10 +178,14 @@ impl S3 for ArunaS3Service {
                         error!(error = "part_number must be specified");
                         s3_error!(InvalidPart, "part_number must be specified")
                     })?,
-                    etag: a.e_tag.ok_or_else(|| {
-                        error!(error = "etag must be specified");
-                        s3_error!(InvalidPart, "etag must be specified")
-                    })?,
+                    etag: a
+                        .e_tag
+                        .ok_or_else(|| {
+                            error!(error = "etag must be specified");
+                            s3_error!(InvalidPart, "etag must be specified")
+                        })?
+                        .value()
+                        .to_string(),
                 })
             })
             .collect::<Result<Vec<PartETag>, S3Error>>()?;
@@ -226,7 +232,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let response = CompleteMultipartUploadOutput {
-            e_tag: Some(format!("-{}", object.id)),
+            e_tag: Some(ETag::Strong(format!("-{}", object.id))),
             ..Default::default()
         };
 
@@ -544,13 +550,8 @@ impl S3 for ArunaS3Service {
         };
         let start_at: u64 = match &req.input.part_number_marker {
             Some(marker) => {
-                let next_part_number = marker.parse().map_err(|_| {
-                    error!(error = "Invalid part number marker", marker);
-                    s3_error!(InvalidArgument, "Invalid part number marker")
-                })?;
-
-                if next_part_number < 10000 {
-                    next_part_number
+                if *marker < 10000 {
+                    *marker as u64
                 } else {
                     error!(error = "Invalid part number marker", marker);
                     return Err(s3_error!(InvalidArgument, "Invalid part number marker"));
@@ -583,7 +584,7 @@ impl S3 for ArunaS3Service {
             is_truncated,
             key: Some(req.input.key),
             max_parts: req.input.max_parts,
-            next_part_number_marker,
+            next_part_number_marker: next_part_number_marker.map(|marker| marker as i32),
             owner: None, //Todo?
             part_number_marker: req.input.part_number_marker,
             parts,
@@ -653,7 +654,7 @@ impl S3 for ArunaS3Service {
                 body,
                 last_modified: None,
                 content_disposition: Some(format!(r#"attachment;filename="{name}.tar.gz"#)),
-                e_tag: Some(format!("-{name}")),
+                e_tag: Some(ETag::Strong(format!("-{name}"))),
                 ..Default::default()
             });
 
@@ -863,7 +864,9 @@ impl S3 for ArunaS3Service {
             s3_error!(InternalError, "Internal processing error")
         })));
 
-        let mime = mime_guess::from_path(object.name.as_str()).first();
+        let mime = mime_guess::from_path(object.name.as_str())
+            .first()
+            .and_then(|mime_guess| ContentType::from_str(&mime_guess.to_string()).ok());
 
         let output = GetObjectOutput {
             body,
@@ -871,7 +874,7 @@ impl S3 for ArunaS3Service {
             content_range,
             content_length: Some(content_length),
             last_modified: None,
-            e_tag: Some(format!("-{}", object.id)),
+            e_tag: Some(ETag::Strong(format!("-{}", object.id))),
             version_id: None,
             content_type: mime,
             content_disposition: Some(format!(r#"attachment;filename="{}""#, object.name)),
@@ -925,7 +928,7 @@ impl S3 for ArunaS3Service {
                     })?
                     .into(),
                 ),
-                e_tag: Some(format!("-{}", bundle.id)),
+                e_tag: Some(ETag::Strong(format!("-{}", bundle.id))),
                 ..Default::default()
             }));
         }
@@ -934,7 +937,9 @@ impl S3 for ArunaS3Service {
 
         let content_len = location.map(|l| l.raw_content_len).unwrap_or_default();
 
-        let mime = mime_guess::from_path(object.name.as_str()).first();
+        let mime = mime_guess::from_path(object.name.as_str())
+            .first()
+            .and_then(|mime_guess| ContentType::from_str(&mime_guess.to_string()).ok());
 
         let output = HeadObjectOutput {
             content_length: Some(content_len),
@@ -946,7 +951,7 @@ impl S3 for ArunaS3Service {
                     })?
                     .into(),
             ),
-            e_tag: Some(object.id.to_string()),
+            e_tag: Some(ETag::Strong(object.id.to_string())),
             content_disposition: Some(format!(r#"attachment;filename="{}""#, object.name)),
             content_type: mime,
             ..Default::default()
@@ -1037,7 +1042,7 @@ impl S3 for ArunaS3Service {
             keys.into_iter()
                 .map(|e| Object {
                     checksum_algorithm: None,
-                    e_tag: Some(e.etag.to_string()),
+                    e_tag: Some(ETag::Strong(e.etag.to_string())),
                     key: Some(e.key),
                     last_modified: e.created_at.map(|t| {
                         s3s::dto::Timestamp::from(
@@ -1178,7 +1183,7 @@ impl S3 for ArunaS3Service {
             keys.into_iter()
                 .map(|e| Object {
                     checksum_algorithm: None,
-                    e_tag: Some(e.etag.to_string()),
+                    e_tag: Some(ETag::Strong(e.etag.to_string())),
                     key: Some(e.key),
                     last_modified: e.created_at.map(|t| {
                         s3s::dto::Timestamp::from(
@@ -1990,9 +1995,8 @@ impl S3 for ArunaS3Service {
                 s3_error!(InternalError, "Unable to add location with binding")
             })?;
 
-        let output = PutObjectOutput {
-            e_tag: Some(format!("-{}", new_object.id)),
-            checksum_sha256: sha_initial,
+        let mut output = PutObjectOutput {
+            e_tag: Some(ETag::Strong(format!("-{}", new_object.id))),
             ..Default::default()
         };
         debug!(?output);
@@ -2138,8 +2142,9 @@ impl S3 for ArunaS3Service {
             }
         };
 
-        let output = UploadPartOutput {
-            e_tag: Some(format!("-{etag}")),
+        // Create basic response output
+        let mut output = UploadPartOutput {
+            e_tag: Some(ETag::Strong(format!("-{etag}"))),
             ..Default::default()
         };
         debug!(?output);
@@ -2381,7 +2386,7 @@ impl S3 for ArunaS3Service {
 
         let response = CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
-                e_tag: md5hash,
+                e_tag: md5hash.map(|h| ETag::Strong(h)),
                 checksum_sha256: sha256hash,
                 last_modified: Some(
                     time::OffsetDateTime::from_unix_timestamp(
