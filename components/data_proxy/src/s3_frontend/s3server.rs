@@ -201,32 +201,6 @@ impl AsRef<S3Service> for WrappingService {
     }
 }
 
-/*
-impl WrappingService {
-    #[tracing::instrument(level = "trace", skip(self))]
-    #[must_use]
-    pub fn into_make_service(self) -> MakeService<Self> {
-        MakeService(self)
-    }
-}
-
-#[derive(Clone)]
-pub struct MakeService<S>(S);
-
-impl<T, S: Clone> Service<T> for MakeService<S> {
-    type Response = S;
-
-    type Error = Infallible;
-
-    type Future = Ready<Result<Self::Response, Self::Error>>;
-
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn call(&self, _: T) -> Self::Future {
-        ready(Ok(self.0.clone()))
-    }
-}
-*/
-
 impl WrappingService {
     async fn get_cors_headers(
         &self,
