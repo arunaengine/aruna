@@ -6,23 +6,22 @@ use crate::CONFIG;
 use crate::CORS_REGEX;
 use anyhow::Result;
 use futures_core::future::BoxFuture;
-use futures_util::FutureExt;
+use futures_util::{FutureExt, TryFutureExt};
 use http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
     ORIGIN, VARY,
 };
-use http::{HeaderValue, Method, StatusCode};
+use http::{HeaderValue, Method, Request, StatusCode};
+use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::header::HOST;
 use s3s::host::SingleDomain;
-use s3s::s3_error;
-use s3s::service::{S3Service, S3ServiceBuilder, SharedS3Service};
+use s3s::service::{S3Service, S3ServiceBuilder};
 use s3s::Body;
 use s3s::S3Error;
-use std::convert::Infallible;
-use std::future::{ready, Ready};
+use s3s::{s3_error, HttpError, HttpResponse};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -30,12 +29,12 @@ use tracing::{error, info};
 pub struct S3Server {
     s3service: S3Service,
     address: String,
-    inner_raw: ArunaS3Service,
+    aruna_s3: ArunaS3Service,
 }
 
 #[derive(Clone)]
 pub struct WrappingService {
-    shared: SharedS3Service,
+    shared: S3Service,
     inner: ArunaS3Service,
 }
 
@@ -63,11 +62,12 @@ impl S3Server {
         };
 
         Ok(Self {
-            s3service: service,
             address: address.into(),
-            inner_raw: s3service,
+            s3service: service,
+            aruna_s3: s3service,
         })
     }
+
     #[tracing::instrument(level = "trace", skip(self))]
     pub async fn run(self) -> Result<()> {
         // Run server
@@ -79,8 +79,8 @@ impl S3Server {
         let local_addr = listener.local_addr()?;
 
         let service = WrappingService {
-            shared: self.s3service.into_shared(),
-            inner: self.inner_raw.clone(),
+            shared: self.s3service,
+            inner: self.aruna_s3.clone(),
         };
 
         let connection = ConnBuilder::new(TokioExecutor::new());
@@ -90,7 +90,7 @@ impl S3Server {
                 let (socket, _) = match listener.accept().await {
                     Ok(ok) => ok,
                     Err(err) => {
-                        tracing::error!("error accepting connection: {err}");
+                        error!("error accepting connection: {err}");
                         continue;
                     }
                 };
@@ -109,15 +109,15 @@ impl S3Server {
     }
 }
 
-impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
-    type Response = hyper::Response<Body>;
+impl Service<Request<Incoming>> for WrappingService {
+    type Response = HttpResponse; //hyper::Response<Body>;
 
     type Error = S3Error;
 
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     #[tracing::instrument(level = "trace", skip(self, req))]
-    fn call(&self, req: hyper::Request<hyper::body::Incoming>) -> Self::Future {
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
         // Check if response gets CORS header pass
         let mut origin_exception = false;
         if let Some(origin) = req.headers().get("Origin") {
@@ -137,7 +137,7 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
         if req.method() == Method::OPTIONS {
             let clone = self.clone();
             return Box::pin(async move {
-                let mut response = hyper::Response::builder();
+                let mut response = HttpResponse::builder();
                 match clone.get_cors_headers(origin_exception, &req).await {
                     Ok(cors_header) => {
                         for (k, v) in cors_header.iter() {
@@ -157,6 +157,7 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
         // https://github.com/s3s-project/s3s/blob/85f3842d03175537753584ad9d4f25e819aa9025/crates/s3s/src/ops/generated.rs#L613-L650
         if req.method() == Method::POST && req.uri().to_string().contains("uploadId") {
             let clone = self.clone();
+            let self_clone = self.shared.clone();
             return Box::pin(async move {
                 let headers = match clone.get_cors_headers(origin_exception, &req).await {
                     Ok(map) => Some(map),
@@ -166,29 +167,41 @@ impl Service<hyper::Request<hyper::body::Incoming>> for WrappingService {
                     }
                 };
 
-                let resp = clone.shared.call(req);
-                let res =
-                    resp.map(move |r| clone.modify_response_headers(r, origin_exception, headers));
-
+                let (parts, body) = req.into_parts();
+                let s3s_request = s3s::HttpRequest::from_parts(parts, body.into());
+                let resp = self_clone.call(s3s_request);
+                let res = resp
+                    .map(move |r| clone.modify_response_headers(r, origin_exception, headers))
+                    .map_err(|_| s3_error!(InternalError, "Failed to add CORS header"));
                 res.await
             });
         };
 
+        // Default S3 operation call
         let clone = self.clone();
-        let resp = clone.shared.call(req);
+        let shared_clone = self.shared.clone();
+        Box::pin(async move {
+            let (parts, body) = req.into_parts();
+            let s3s_request = s3s::HttpRequest::from_parts(parts, body.into());
+            let s3s_response = shared_clone.call(s3s_request);
 
-        let res = resp.map(move |r| clone.modify_response_headers(r, origin_exception, None));
-        res.boxed()
+            let final_response = s3s_response
+                .map(move |r| clone.modify_response_headers(r, origin_exception, None))
+                .map_err(|_| s3_error!(InternalError, "Failed to add CORS header"));
+            final_response.await
+        })
+        //final_response.boxed()
     }
 }
 
 impl AsRef<S3Service> for WrappingService {
     #[tracing::instrument(level = "trace", skip(self))]
     fn as_ref(&self) -> &S3Service {
-        self.shared.as_ref()
+        &self.shared
     }
 }
 
+/*
 impl WrappingService {
     #[tracing::instrument(level = "trace", skip(self))]
     #[must_use]
@@ -212,6 +225,7 @@ impl<T, S: Clone> Service<T> for MakeService<S> {
         ready(Ok(self.0.clone()))
     }
 }
+*/
 
 impl WrappingService {
     async fn get_cors_headers(
@@ -354,10 +368,11 @@ impl WrappingService {
 
     fn modify_response_headers(
         &self,
-        resp: Result<hyper::Response<Body>, S3Error>,
+        //resp: Result<hyper::Response<Body>, S3Error>,
+        resp: Result<HttpResponse, HttpError>,
         origin_exception: bool,
         headers: Option<hyper::HeaderMap>,
-    ) -> Result<hyper::Response<Body>, S3Error> {
+    ) -> Result<HttpResponse, HttpError> {
         let res = resp.map(|mut r| {
             if r.headers().contains_key("Transfer-Encoding") {
                 r.headers_mut().remove("Content-Length");
