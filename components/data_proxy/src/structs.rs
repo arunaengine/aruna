@@ -2,7 +2,6 @@ use anyhow::Result;
 use anyhow::{anyhow, bail};
 use aruna_rust_api::api::storage::models::v2::generic_resource::Resource;
 use aruna_rust_api::api::storage::models::v2::permission::ResourceId;
-use aruna_rust_api::api::storage::models::v2::Pubkey;
 use aruna_rust_api::api::storage::models::v2::{
     relation::Relation, DataClass, InternalRelationVariant, KeyValue, Object as GrpcObject,
     PermissionLevel, Project, RelationDirection, Status, User as GrpcUser,
@@ -10,6 +9,7 @@ use aruna_rust_api::api::storage::models::v2::{
 use aruna_rust_api::api::storage::models::v2::{Collection, DataEndpoint};
 use aruna_rust_api::api::storage::models::v2::{Dataset, ResourceVariant};
 use aruna_rust_api::api::storage::models::v2::{Hash, Permission};
+use aruna_rust_api::api::storage::models::v2::{Hashalgorithm, Pubkey};
 use aruna_rust_api::api::storage::services::v2::create_collection_request;
 use aruna_rust_api::api::storage::services::v2::create_dataset_request;
 use aruna_rust_api::api::storage::services::v2::create_object_request;
@@ -999,6 +999,22 @@ impl TryFrom<GrpcObject> for Object {
         let outbounds = outbound.into_option();
         let versions = version.into_option();
 
+        // Convert hashes to proxy internal format
+        let mut hashes = HashMap::new();
+        for h in value.hashes.iter() {
+            match Hashalgorithm::try_from(h.alg)? {
+                Hashalgorithm::Md5 => {
+                    hashes.insert("md5".to_string(), h.hash.to_string());
+                }
+                Hashalgorithm::Sha256 => {
+                    hashes.insert("sha256".to_string(), h.hash.to_string());
+                }
+                _ => {
+                    // Ignore unspecified hashes
+                }
+            }
+        }
+
         Ok(Object {
             id: DieselUlid::from_str(&value.id)?,
             name: value.name.to_string(),
@@ -1007,7 +1023,7 @@ impl TryFrom<GrpcObject> for Object {
             object_status: value.status(),
             data_class: value.data_class(),
             object_type: ObjectType::Object,
-            hashes: HashMap::default(),
+            hashes,
             metadata_license: value.metadata_license_tag,
             data_license: value.data_license_tag,
             dynamic: value.dynamic,
