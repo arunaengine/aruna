@@ -1166,12 +1166,12 @@ impl Object {
         self.hashes
             .iter()
             .map(|(k, v)| {
-                let alg = if k == "MD5" {
-                    2
-                } else if k == "SHA256" {
-                    1
+                let alg = if k == "md5" {
+                    Hashalgorithm::Md5 as i32
+                } else if k == "sha256" {
+                    Hashalgorithm::Sha256 as i32
                 } else {
-                    0
+                    Hashalgorithm::Unspecified as i32
                 };
 
                 Hash {
