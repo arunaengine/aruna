@@ -100,22 +100,36 @@ impl ArunaS3Service {
         &self,
         object: ProxyObject,
         headers: Option<HashMap<String, String>>,
+        checksum_handler: ChecksumHandler,
     ) -> S3Result<S3Response<PutObjectOutput>> {
-        let md5 = Md5::new().finalize();
-        let sha256 = Sha256::new().finalize();
-
-        let output = PutObjectOutput {
-            e_tag: Some(ETag::Strong(format!("{md5:x}"))),
-            checksum_sha256: Some(BASE64_STANDARD.encode(sha256).to_string()),
+        // Base output
+        let mut output = PutObjectOutput {
+            e_tag: Some(ETag::Strong(format!("{:x}", Md5::new().finalize()))),
             version_id: Some(object.id.to_string()),
+            size: Some(0),
             ..Default::default()
         };
 
+        // Add demanded checksum
+        if let Some(required) = checksum_handler.required_checksum {
+            let empty_checksum = required.get_empty_checksum();
+            match required {
+                IntegrityChecksum::CRC32(_) => output.checksum_crc32 = Some(empty_checksum),
+                IntegrityChecksum::CRC32C(_) => output.checksum_crc32c = Some(empty_checksum),
+                IntegrityChecksum::CRC64NVME(_) => output.checksum_crc64nvme = Some(empty_checksum),
+                IntegrityChecksum::SHA1(_) => output.checksum_sha1 = Some(empty_checksum),
+                IntegrityChecksum::SHA256(_) => output.checksum_sha256 = Some(empty_checksum),
+            }
+            output.checksum_type = Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
+        }
+
+        // Insert temp resource into cache
         self.cache.insert_temp_resource(object).await.map_err(|_| {
             error!(error = "Unable to temporarily cache empty object");
             s3_error!(InternalError, "Unable to temporarily cache empty object")
         })?;
 
+        // Add other provided headers to response
         let mut resp = S3Response::new(output);
         if let Some(headers) = headers {
             for (k, v) in headers {
@@ -127,6 +141,7 @@ impl ArunaS3Service {
                 );
             }
         }
+        debug!(?resp);
 
         Ok(resp)
     }
@@ -1753,7 +1768,17 @@ impl S3 for ArunaS3Service {
         trace!(?new_object);
         match req.input.content_length {
             Some(0) => {
-                return self.put_empty_object(new_object, headers).await;
+                // Create temp object with full key as name (as normal S3 would do) and project (bucket) as parent
+                new_object.name = req.input.key;
+                new_object.parents = Some(HashSet::from_iter([TypedRelation::Project(
+                    states
+                        .get_project()
+                        .ok_or_else(|| s3_error!(NoSuchBucket, "Bucket does not exist"))?
+                        .id,
+                )]));
+                return self
+                    .put_empty_object(new_object, headers, checksum_handler)
+                    .await;
             }
             None => {
                 error!("Missing content-length");
