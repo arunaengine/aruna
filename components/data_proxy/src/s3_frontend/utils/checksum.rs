@@ -9,6 +9,12 @@ pub const CRC64NVME_HEADER: &str = "x-amz-checksum-crc64nvme";
 pub const SHA1_HEADER: &str = "x-amz-checksum-sha1";
 pub const SHA256_HEADER: &str = "x-amz-checksum-sha256";
 
+pub const CRC32_EMPTY: &str = "AAAAAA==";
+pub const CRC32C_EMPTY: &str = "AAAAAA==";
+pub const CRC64NVME_EMPTY: &str = "AAAAAAAAAAA=";
+pub const SHA1_EMPTY: &str = "2jmj7l5rSw0yVb/vlWAYkK/YBwk=";
+pub const SHA256_EMPTY: &str = "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=";
+
 #[derive(Clone, Debug)]
 pub enum IntegrityChecksum {
     CRC32(Option<String>),
@@ -99,6 +105,17 @@ impl IntegrityChecksum {
             IntegrityChecksum::SHA1(ref mut val) => *val = Some(checksum),
             IntegrityChecksum::SHA256(ref mut val) => *val = Some(checksum),
         }
+    }
+
+    pub fn get_empty_checksum(&self) -> String {
+        match self {
+            IntegrityChecksum::CRC32(_) => CRC32_EMPTY,
+            IntegrityChecksum::CRC32C(_) => CRC32C_EMPTY,
+            IntegrityChecksum::CRC64NVME(_) => CRC64NVME_EMPTY,
+            IntegrityChecksum::SHA1(_) => SHA1_EMPTY,
+            IntegrityChecksum::SHA256(_) => SHA256_EMPTY,
+        }
+        .to_string()
     }
 }
 
