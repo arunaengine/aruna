@@ -1,6 +1,9 @@
 use crate::caching::cache::Cache;
 use crate::data_backends::storage_backend::StorageBackend;
-use crate::s3_frontend::utils::buffered_s3_sink::BufferedS3Sink;
+use crate::s3_frontend::utils::checksum::{ChecksumHandler, IntegrityChecksum};
+use crate::s3_frontend::utils::{
+    buffered_s3_sink::BufferedS3Sink, crc_transformer::CrcTransformer,
+};
 use crate::structs::Object;
 use crate::structs::ObjectLocation;
 use crate::structs::VersionVariant;
@@ -9,6 +12,8 @@ use anyhow::Result;
 use aruna_rust_api::api::storage::models::v2::Hash;
 use aruna_rust_api::api::storage::models::v2::Hashalgorithm;
 use aruna_rust_api::api::storage::models::v2::Status;
+use crc_fast::CrcAlgorithm;
+use crc_fast::Digest as CrcDigest;
 use diesel_ulid::DieselUlid;
 use md5::{Digest, Md5};
 use pithos_lib::streamreadwrite::GenericStreamReadWriter;
@@ -21,7 +26,9 @@ use pithos_lib::transformers::pithos_comp_enc::PithosTransformer;
 use pithos_lib::transformers::size_probe::SizeProbe;
 use pithos_lib::transformers::zstd_comp::ZstdEnc;
 use pithos_lib::transformers::zstd_decomp::ZstdDec;
+use s3s::dto::{CompleteMultipartUploadOutput, ETag};
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::pin;
@@ -45,7 +52,8 @@ impl DataHandler {
         backend: Arc<Box<dyn StorageBackend>>,
         before_location: ObjectLocation,
         path_level: Option<[Option<(DieselUlid, String)>; 4]>,
-    ) -> Result<()> {
+        mut checksum_handler: ChecksumHandler,
+    ) -> Result<CompleteMultipartUploadOutput> {
         let token = if let Some(handler) = cache.auth.read().await.as_ref() {
             let Some(created_by) = object.created_by else {
                 error!("No created_by found");
@@ -157,17 +165,38 @@ impl DataHandler {
                     asr = asr.add_transformer(ZstdDec::new());
                 }
 
-                let (uncompressed_probe, uncompressed_stream) = SizeProbe::new();
+                // [Optional] Checksums
+                let (crc32_t, crc32_rx) = CrcTransformer::new_with_backchannel(
+                    CrcDigest::new(CrcAlgorithm::Crc32IsoHdlc),
+                    false,
+                );
+                let (crc32c_t, crc32c_rx) = CrcTransformer::new_with_backchannel(
+                    CrcDigest::new(CrcAlgorithm::Crc32Iscsi),
+                    false,
+                );
+                let (crc64nvme_t, crc64nvme_rx) = CrcTransformer::new_with_backchannel(
+                    CrcDigest::new(CrcAlgorithm::Crc64Nvme),
+                    false,
+                );
 
-                asr = asr.add_transformer(uncompressed_probe);
+                asr = asr.add_transformer(crc32_t);
+                asr = asr.add_transformer(crc32c_t);
+                asr = asr.add_transformer(crc64nvme_t);
 
-                let (sha_transformer, sha_recv) =
+                // Hashes
+                let (sha_t, sha_rx) =
                     HashingTransformer::new_with_backchannel(Sha256::new(), "sha256".to_string());
-                let (md5_transformer, md5_recv) =
+                let (md5_t, md5_rx) =
                     HashingTransformer::new_with_backchannel(Md5::new(), "md5".to_string());
+                //TODO: HashingTransformer sends hash to Footer which does not support SHA1 ...
+                //let (sha_transformer, sha_recv) = HashingTransformer::new_with_backchannel(Sha1::new(), "sha1".to_string());
 
-                asr = asr.add_transformer(sha_transformer);
-                asr = asr.add_transformer(md5_transformer);
+                asr = asr.add_transformer(sha_t);
+                asr = asr.add_transformer(md5_t);
+
+                // Log uncompressed size
+                let (uncompressed_probe, uncompressed_stream) = SizeProbe::new();
+                asr = asr.add_transformer(uncompressed_probe);
 
                 if new_location_clone.is_pithos() {
                     tx.send(pithos_lib::helpers::notifications::Message::FileContext(
@@ -205,19 +234,31 @@ impl DataHandler {
                     e
                 })?;
 
-                Ok::<(u64, u64, String, String, String), anyhow::Error>((
+                // Fetch hashes
+                let mut hashes = HashMap::new();
+                for (key, rx) in vec![
+                    ("sha256", sha_rx),
+                    ("md5", md5_rx),
+                    ("crc32", crc32_rx),
+                    ("crc32c", crc32c_rx),
+                    ("crc64nvme", crc64nvme_rx),
+                ] {
+                    hashes.insert(
+                        key.into(),
+                        rx.try_recv().inspect_err(|&e| {
+                            error!(error = ?e, msg = e.to_string());
+                        })?,
+                    );
+                }
+
+                Ok::<(u64, u64, HashMap<String, String>, String), anyhow::Error>((
                     disk_size_stream.try_recv().inspect_err(|&e| {
                         error!(error = ?e, msg = e.to_string());
                     })?,
                     uncompressed_stream.try_recv().inspect_err(|&e| {
                         error!(error = ?e, msg = e.to_string());
                     })?,
-                    sha_recv.try_recv().inspect_err(|&e| {
-                        error!(error = ?e, msg = e.to_string());
-                    })?,
-                    md5_recv.try_recv().inspect_err(|&e| {
-                        error!(error = ?e, msg = e.to_string());
-                    })?,
+                    hashes,
                     final_sha_recv.try_recv().inspect_err(|&e| {
                         error!(error = ?e, msg = e.to_string());
                     })?,
@@ -242,7 +283,7 @@ impl DataHandler {
             }
         }
 
-        let (before_size, after_size, sha, md5, final_sha) = aswr_handle
+        let (before_size, after_size, hashes, final_sha) = aswr_handle
             .await
             .map_err(|e| {
                 error!(error = ?e, msg = e.to_string());
@@ -259,20 +300,33 @@ impl DataHandler {
 
         debug!(new_location = ?new_location, "Finished finalizing location");
 
-        let hashes = vec![
-            Hash {
-                alg: Hashalgorithm::Sha256.into(),
-                hash: sha,
-            },
-            Hash {
-                alg: Hashalgorithm::Md5.into(),
-                hash: md5,
-            },
-        ];
+        // Already store hashes in cache/database
+        checksum_handler.calculated_checksums = hashes;
+        cache
+            .update_object_hashes(
+                object.id,
+                checksum_handler.get_calculated_checksums().clone(),
+            )
+            .await?;
 
         if let Some(handler) = cache.aruna_client.read().await.as_ref() {
-            // Set id of new location to object id to satisfy FK constraint
-            // TODO: Update hashes etc.
+            // Send SHA256 and MD5 hashes to Aruna server
+            let hashes = vec![
+                Hash {
+                    alg: Hashalgorithm::Sha256.into(),
+                    hash: checksum_handler
+                        .get_checksum_by_key("sha256")
+                        .ok_or_else(|| anyhow!("SHA256 not found."))?
+                        .clone(),
+                },
+                Hash {
+                    alg: Hashalgorithm::Md5.into(),
+                    hash: checksum_handler
+                        .get_checksum_by_key("md5")
+                        .ok_or_else(|| anyhow!("MD5 not found."))?
+                        .clone(),
+                },
+            ];
 
             handler
                 .set_object_hashes(&object.id, hashes, &token)
@@ -287,10 +341,38 @@ impl DataHandler {
                 .to_string();
             backend.delete_object(before_location).await?;
 
+            // Remove parts from database
             cache.delete_parts_by_upload_id(upload_id).await?;
         }
 
-        Ok(())
+        // Create basic response with Etag
+        let mut output = CompleteMultipartUploadOutput {
+            e_tag: Some(ETag::Strong(format!("-{}", object.id))),
+            ..Default::default()
+        };
+
+        // Add required checksum to response
+        if let Some(required) = &checksum_handler.required_checksum {
+            match required {
+                IntegrityChecksum::CRC32(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("crc32");
+                }
+                IntegrityChecksum::CRC32C(_) => {
+                    output.checksum_crc32c = checksum_handler.get_checksum_by_key("crc32c");
+                }
+                IntegrityChecksum::CRC64NVME(_) => {
+                    output.checksum_crc64nvme = checksum_handler.get_checksum_by_key("crc64nvme");
+                }
+                IntegrityChecksum::SHA1(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha1");
+                }
+                IntegrityChecksum::SHA256(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha256");
+                }
+            }
+        }
+
+        Ok(output)
     }
 }
 

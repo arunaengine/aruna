@@ -5,6 +5,7 @@ use crate::data_backends::storage_backend::StorageBackend;
 use crate::database::persistence::{delete_parts_by_object_id, delete_parts_by_upload_id};
 use crate::replication::replication_handler::ReplicationMessage;
 use crate::s3_frontend::data_handler::DataHandler;
+use crate::s3_frontend::utils::checksum::ChecksumHandler;
 use crate::structs::{
     AccessKeyPermissions, Bundle, DbPermissionLevel, LocationBinding, ObjectType, TypedId,
     UploadPart, User,
@@ -385,6 +386,7 @@ impl Cache {
                             backend,
                             temp_location,
                             None,
+                            ChecksumHandler::new(None),
                         )
                         .await
                         {
@@ -923,6 +925,32 @@ impl Cache {
                 self.paths.insert(new, *old_entry.value());
             }
         }
+        Ok(())
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, object_id, hashes))]
+    pub async fn update_object_hashes(
+        &self,
+        object_id: DieselUlid,
+        hashes: HashMap<String, String>,
+    ) -> Result<()> {
+        if let Ok((rwlock_object, _)) = self.get_resource(&object_id) {
+            // Update hashes in cache object
+            let mut cache_object = rwlock_object.write().await;
+            cache_object.hashes.extend(hashes);
+
+            // Write update to persistence if available
+            if let Some(persistence) = self.persistence.read().await.as_ref() {
+                let mut client = persistence.get_client().await?;
+                let transaction = client.transaction().await?;
+                let transaction_client = transaction.client();
+                cache_object.upsert(transaction_client).await?;
+                transaction.commit().await?;
+            }
+        } else {
+            bail!("Object with id {} not found", object_id);
+        }
+
         Ok(())
     }
 

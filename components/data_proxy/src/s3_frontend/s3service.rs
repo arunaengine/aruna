@@ -167,6 +167,9 @@ impl S3 for ArunaS3Service {
                 s3_error!(UnexpectedContent, "Missing data context")
             })?;
 
+        // Init checksum handler
+        let checksum_handler = ChecksumHandler::from_headers(&req.headers)?;
+
         let impersonating_token =
             user_state.sign_impersonating_token(self.cache.auth.read().await.as_ref());
 
@@ -248,11 +251,6 @@ impl S3 for ArunaS3Service {
                 s3_error!(InternalError, "Unable to finish upload")
             })?;
 
-        let response = CompleteMultipartUploadOutput {
-            e_tag: Some(ETag::Strong(format!("-{}", object.id))),
-            ..Default::default()
-        };
-
         old_location.disk_content_len = disk_size as i64;
         old_location.raw_content_len = cumulative_size as i64;
 
@@ -277,13 +275,31 @@ impl S3 for ArunaS3Service {
             }
         }
 
-        tokio::spawn(DataHandler::finalize_location(
-            object,
-            self.cache.clone(),
-            self.backend.clone(),
-            old_location,
-            Some(objects_state.try_slice()?),
-        ));
+        let object_clone = object.clone();
+        let cache_clone = self.cache.clone();
+        let backend_clone = self.backend.clone();
+        let path_level = objects_state.try_slice()?;
+        let future = async move {
+            let response = DataHandler::finalize_location(
+                object_clone,
+                cache_clone,
+                backend_clone,
+                old_location,
+                Some(path_level),
+                checksum_handler,
+            )
+            .await
+            .map_err(|e| s3_error!(InternalError, "{e}"))?;
+
+            Ok::<CompleteMultipartUploadOutput, S3Error>(response)
+        }
+        .boxed();
+
+        let response = CompleteMultipartUploadOutput {
+            e_tag: Some(ETag::Strong(format!("-{}", object.id))),
+            future: Some(future),
+            ..Default::default()
+        };
         debug!(?response);
 
         let mut resp = S3Response::new(response);
