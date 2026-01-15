@@ -27,9 +27,7 @@ use futures_util::{FutureExt, TryStreamExt};
 use http::HeaderName;
 use http::HeaderValue;
 use md5::{Digest, Md5};
-use pithos_lib::helpers::footer_parser::Footer;
-use pithos_lib::helpers::footer_parser::FooterParser;
-use pithos_lib::helpers::footer_parser::FooterParserState;
+use pithos_lib::helpers::footer_parser::{Footer, FooterParser, FooterParserState};
 use pithos_lib::helpers::notifications::Message as PithosMessage;
 use pithos_lib::streamreadwrite::GenericStreamReadWriter;
 use pithos_lib::transformer::ReadWriter;
@@ -45,24 +43,14 @@ use pithos_lib::transformers::zstd_comp::ZstdEnc;
 use pithos_lib::transformers::zstd_decomp::ZstdDec;
 use s3s::dto::*;
 use s3s::s3_error;
-use s3s::S3Error;
-use s3s::S3Request;
-use s3s::S3Response;
-use s3s::S3Result;
-use s3s::S3;
+use s3s::{S3Error, S3Request, S3Response, S3Result, S3};
 use sha2::Sha256;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::pin;
-use tracing::debug;
-use tracing::error;
-use tracing::info_span;
-use tracing::trace;
-use tracing::warn;
-use tracing::Instrument;
+use tracing::{debug, error, info_span, trace, warn, Instrument};
 
 pub struct ArunaS3Service {
     pub backend: Arc<Box<dyn StorageBackend>>,
@@ -1952,7 +1940,7 @@ impl S3 for ArunaS3Service {
 
         // Fetch calculated hashes
         trace!("fetching hashes");
-        for (key, rx) in vec![
+        for (key, rx) in [
             ("sha256", initial_sha_rx),
             ("md5", md5_rx),
             ("crc32", crc32_rx),
@@ -2206,7 +2194,7 @@ impl S3 for ArunaS3Service {
                 })?;
 
                 // Fetch hashes
-                for (key, rx) in vec![
+                for (key, rx) in [
                     ("md5", md5_rx),
                     ("sha256", sha_rx),
                     ("crc32", crc32_rx),

@@ -236,7 +236,7 @@ impl DataHandler {
 
                 // Fetch hashes
                 let mut hashes = HashMap::new();
-                for (key, rx) in vec![
+                for (key, rx) in [
                     ("sha256", sha_rx),
                     ("md5", md5_rx),
                     ("crc32", crc32_rx),

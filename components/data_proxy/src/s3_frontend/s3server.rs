@@ -190,7 +190,6 @@ impl Service<Request<Incoming>> for WrappingService {
                 .map_err(|_| s3_error!(InternalError, "Failed to add CORS header"));
             final_response.await
         })
-        //final_response.boxed()
     }
 }
 
@@ -205,7 +204,7 @@ impl WrappingService {
     async fn get_cors_headers(
         &self,
         origin_exception: bool,
-        req: &hyper::Request<hyper::body::Incoming>,
+        req: &Request<Incoming>,
     ) -> Result<hyper::HeaderMap, S3Error> {
         // Return all * if origin exception matches
         if origin_exception {
