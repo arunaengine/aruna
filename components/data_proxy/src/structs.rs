@@ -1992,7 +1992,7 @@ impl From<&Object> for TypedId {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct UploadPart {
     pub id: DieselUlid,
     pub object_id: DieselUlid,
@@ -2000,6 +2000,7 @@ pub struct UploadPart {
     pub part_number: u64,
     pub raw_size: u64,
     pub size: u64,
+    pub checksums: Option<HashMap<String, String>>,
 }
 
 impl From<UploadPart> for Part {
@@ -2016,6 +2017,94 @@ impl From<UploadPart> for Part {
 
 #[cfg(test)]
 mod tests {
+    use crate::database::database::Database;
+    use crate::database::persistence::WithGenericBytes;
+    use crate::structs::UploadPart;
+    use diesel_ulid::DieselUlid;
+    use std::collections::HashMap;
+
     #[test]
     fn test_resource_strings_cmp() {}
+
+    #[test]
+    fn upload_part_marshalling() {
+        // Create a test instance of UploadPart with checksums
+        let mut checksums = HashMap::new();
+        checksums.insert("md5".to_string(), "abc123".to_string());
+        checksums.insert("sha256".to_string(), "def456".to_string());
+        checksums.insert("crc32".to_string(), "hC5Uvw==".to_string());
+        checksums.insert("crc32c".to_string(), "p+pydw====".to_string());
+        checksums.insert("crc64nvme".to_string(), "N4vzZ9TJUr8=".to_string());
+
+        let mut original = UploadPart {
+            id: DieselUlid::generate(),
+            object_id: DieselUlid::generate(),
+            upload_id: "upload-123".to_string(),
+            part_number: 1,
+            raw_size: 1024,
+            size: 512,
+            checksums: Some(checksums),
+        };
+
+        // Serialize / Deserialize
+        let json = serde_json::to_string(&original).expect("Failed to serialize");
+        dbg!(&json);
+        let deserialized: UploadPart = serde_json::from_str(&json).expect("Failed to deserialize");
+
+        assert_eq!(original, deserialized);
+
+        // Set checksums to None and try again
+        original.checksums = None;
+
+        // Serialize / Deserialize
+        let json = serde_json::to_string(&original).expect("Failed to serialize");
+        dbg!(&json);
+        let deserialized: UploadPart = serde_json::from_str(&json).expect("Failed to deserialize");
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[tokio::test]
+    async fn upload_part_persistence() {
+        // Create a test instance of UploadPart with checksums
+        let mut checksums = HashMap::new();
+        checksums.insert("md5".to_string(), "abc123".to_string());
+        checksums.insert("sha256".to_string(), "def456".to_string());
+        checksums.insert("crc32".to_string(), "hC5Uvw==".to_string());
+        checksums.insert("crc32c".to_string(), "p+pydw====".to_string());
+        checksums.insert("crc64nvme".to_string(), "N4vzZ9TJUr8=".to_string());
+
+        let mut original = UploadPart {
+            id: DieselUlid::generate(),
+            object_id: DieselUlid::generate(),
+            upload_id: "upload-123".to_string(),
+            part_number: 1,
+            raw_size: 1024,
+            size: 512,
+            checksums: Some(checksums),
+        };
+
+        let db = Database::new().await.unwrap();
+        let client = db.get_client().await.unwrap();
+
+        original.upsert(&client).await.unwrap();
+
+        let fetched = UploadPart::get_opt(&original.id, &client)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(original, fetched);
+
+        // Remove checksums, upsert in database and re-fetch
+        original.checksums = None;
+        original.upsert(&client).await.unwrap();
+
+        let fetched = UploadPart::get_opt(&original.id, &client)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(original, fetched);
+    }
 }
