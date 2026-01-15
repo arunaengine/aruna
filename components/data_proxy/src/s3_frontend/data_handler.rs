@@ -26,7 +26,7 @@ use pithos_lib::transformers::pithos_comp_enc::PithosTransformer;
 use pithos_lib::transformers::size_probe::SizeProbe;
 use pithos_lib::transformers::zstd_comp::ZstdEnc;
 use pithos_lib::transformers::zstd_decomp::ZstdDec;
-use s3s::dto::{CompleteMultipartUploadOutput, ETag};
+use s3s::dto::{ChecksumType, CompleteMultipartUploadOutput, ETag};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -370,6 +370,7 @@ impl DataHandler {
                     output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha256");
                 }
             }
+            output.checksum_type = Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
         }
 
         Ok(output)

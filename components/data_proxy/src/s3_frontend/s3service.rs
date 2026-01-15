@@ -2063,6 +2063,7 @@ impl S3 for ArunaS3Service {
                     output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha256");
                 }
             }
+            output.checksum_type = Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
         }
         debug!(?output);
 
