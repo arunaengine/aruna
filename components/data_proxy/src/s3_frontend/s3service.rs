@@ -19,7 +19,6 @@ use aruna_rust_api::api::storage::models::v2::Hash;
 use aruna_rust_api::api::storage::models::v2::Hashalgorithm;
 use aruna_rust_api::api::storage::models::v2::Status;
 use base64::engine::general_purpose;
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use bytes::BufMut;
 use bytes::BytesMut;
@@ -2111,6 +2110,10 @@ impl S3 for ArunaS3Service {
             s3_error!(NoSuchKey, "Object not found")
         })?;
 
+        // Init checksum handler
+        let mut checksum_handler = ChecksumHandler::from_headers(&req.headers)?;
+
+        // Upload part
         let etag = match req.input.body {
             Some(data) => {
                 trace!("streaming data to backend");
@@ -2127,11 +2130,35 @@ impl S3 for ArunaS3Service {
 
                 let mut awr = GenericStreamReadWriter::new_with_sink(data, sink);
 
+                // [Optional] Checksums
+                let (sha_t, sha_rx) =
+                    HashingTransformer::new_with_backchannel(Sha256::new(), "sha256".to_string());
+                let (md5_t, md5_rx) =
+                    HashingTransformer::new_with_backchannel(Md5::new(), "md5".to_string());
+                let (crc32_t, crc32_rx) = CrcTransformer::new_with_backchannel(
+                    CrcDigest::new(CrcAlgorithm::Crc32IsoHdlc),
+                    false,
+                );
+                let (crc32c_t, crc32c_rx) = CrcTransformer::new_with_backchannel(
+                    CrcDigest::new(CrcAlgorithm::Crc32Iscsi),
+                    false,
+                );
+                let (crc64nvme_t, crc64nvme_rx) = CrcTransformer::new_with_backchannel(
+                    CrcDigest::new(CrcAlgorithm::Crc64Nvme),
+                    false,
+                );
+
+                awr = awr.add_transformer(crc32_t);
+                awr = awr.add_transformer(crc32c_t);
+                awr = awr.add_transformer(crc64nvme_t);
+                awr = awr.add_transformer(sha_t);
+                awr = awr.add_transformer(md5_t);
+
+                // Size probe before encryption
                 let (before_probe, before_receiver) = SizeProbe::new();
                 awr = awr.add_transformer(before_probe);
 
-                let (after_probe, after_receiver) = SizeProbe::new();
-
+                // Encrypt if encryption key is available
                 if let Some(enc_key) = &location.get_encryption_key() {
                     trace!("adding chacha20 encryption");
                     awr = awr.add_transformer(ChaCha20Enc::new_with_fixed(*enc_key).map_err(
@@ -2142,6 +2169,8 @@ impl S3 for ArunaS3Service {
                     )?);
                 }
 
+                // Size probe after encryption
+                let (after_probe, after_receiver) = SizeProbe::new();
                 awr = awr.add_transformer(after_probe);
 
                 awr.process().await.map_err(|_| {
@@ -2159,6 +2188,23 @@ impl S3 for ArunaS3Service {
                     s3_error!(InternalError, "Unable to get size")
                 })?;
 
+                // Fetch hashes
+                for (key, rx) in vec![
+                    ("md5", md5_rx),
+                    ("sha256", sha_rx),
+                    ("crc32", crc32_rx),
+                    ("crc32c", crc32c_rx),
+                    ("crc64nvme", crc64nvme_rx),
+                ] {
+                    checksum_handler.add_calculated_checksum(
+                        key,
+                        rx.try_recv().map_err(|_| {
+                            error!("Unable to fetch {key} from channel");
+                            s3_error!(InternalError, "Unable to {key} hash initial data")
+                        })?,
+                    );
+                }
+
                 self.cache
                     .create_multipart_upload(
                         location.upload_id.ok_or_else(|| {
@@ -2169,6 +2215,7 @@ impl S3 for ArunaS3Service {
                         req.input.part_number as u64,
                         before_size,
                         after_size,
+                        checksum_handler.get_calculated_checksums().clone(),
                     )
                     .await
                     .map_err(|_| {
@@ -2193,10 +2240,30 @@ impl S3 for ArunaS3Service {
         };
 
         // Create basic response output
-        let output = UploadPartOutput {
+        let mut output = UploadPartOutput {
             e_tag: Some(ETag::Strong(format!("-{etag}"))),
             ..Default::default()
         };
+        // Add required checksum to response
+        if let Some(required) = &checksum_handler.required_checksum {
+            match required {
+                IntegrityChecksum::CRC32(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("crc32");
+                }
+                IntegrityChecksum::CRC32C(_) => {
+                    output.checksum_crc32c = checksum_handler.get_checksum_by_key("crc32c");
+                }
+                IntegrityChecksum::CRC64NVME(_) => {
+                    output.checksum_crc64nvme = checksum_handler.get_checksum_by_key("crc64nvme");
+                }
+                IntegrityChecksum::SHA1(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha1");
+                }
+                IntegrityChecksum::SHA256(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha256");
+                }
+            }
+        }
         debug!(?output);
 
         let mut resp = S3Response::new(output);

@@ -191,6 +191,10 @@ impl ChecksumHandler {
         }
     }
 
+    pub fn from_headers(headers: &HeaderMap<HeaderValue>) -> Result<Self, S3Error> {
+        Ok(Self::new(eval_required_checksum(headers)?))
+    }
+
     pub fn get_validation_checksum(&self) -> &Option<String> {
         if let Some(checksum) = &self.required_checksum {
             match checksum {

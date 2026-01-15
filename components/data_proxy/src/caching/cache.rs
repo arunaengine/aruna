@@ -1320,6 +1320,7 @@ impl Cache {
         part_number: u64,
         raw_size: u64,
         final_size: u64,
+        checksums: HashMap<String, String>,
     ) -> Result<()> {
         let part = UploadPart {
             id: DieselUlid::generate(),
@@ -1328,6 +1329,7 @@ impl Cache {
             object_id,
             upload_id: upload_id.clone(),
             raw_size,
+            checksums: Some(checksums),
         };
         if let Some(persistence) = self.persistence.read().await.as_ref() {
             part.upsert(persistence.get_client().await?.client())
