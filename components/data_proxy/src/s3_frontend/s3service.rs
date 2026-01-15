@@ -4,6 +4,8 @@ use super::utils::ranges::calculate_ranges;
 use crate::bundler::bundle_helper::get_bundle;
 use crate::caching::cache::Cache;
 use crate::data_backends::storage_backend::StorageBackend;
+use crate::s3_frontend::utils::checksum::{ChecksumHandler, IntegrityChecksum};
+use crate::s3_frontend::utils::crc_transformer::CrcTransformer;
 use crate::s3_frontend::utils::list_objects::list_response;
 use crate::structs::CheckAccessResult;
 use crate::structs::NewOrExistingObject;
@@ -21,7 +23,8 @@ use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use bytes::BufMut;
 use bytes::BytesMut;
-use futures_util::TryStreamExt;
+use crc_fast::{CrcAlgorithm, Digest as CrcDigest};
+use futures_util::{FutureExt, TryStreamExt};
 use http::HeaderName;
 use http::HeaderValue;
 use md5::{Digest, Md5};
@@ -1696,6 +1699,9 @@ impl S3 for ArunaS3Service {
                 s3_error!(UnexpectedContent, "Missing data context")
             })?;
 
+        // Init checksum handler
+        let mut checksum_handler = ChecksumHandler::from_headers(&req.headers)?;
+
         let impersonating_token =
             user_state.sign_impersonating_token(self.cache.auth.read().await.as_ref());
 
@@ -1769,11 +1775,17 @@ impl S3 for ArunaS3Service {
         trace!("Initialized data location");
 
         // Initialize hashing transformers
-        let (initial_sha_trans, initial_sha_recv) =
+        let (initial_size_trans, initial_size_rx) = SizeProbe::new();
+        let (initial_sha_trans, initial_sha_rx) =
             HashingTransformer::new_with_backchannel(Sha256::new(), "sha256".to_string());
-        let (initial_md5_trans, initial_md5_recv) =
+        let (md5_trans, md5_rx) =
             HashingTransformer::new_with_backchannel(Md5::new(), "md5".to_string());
-        let (initial_size_trans, initial_size_recv) = SizeProbe::new();
+        let (crc32_t, crc32_rx) =
+            CrcTransformer::new_with_backchannel(CrcDigest::new(CrcAlgorithm::Crc32IsoHdlc), false);
+        let (crc32c_t, crc32c_rx) =
+            CrcTransformer::new_with_backchannel(CrcDigest::new(CrcAlgorithm::Crc32Iscsi), false);
+        let (crc64nvme_t, crc64nvme_rx) =
+            CrcTransformer::new_with_backchannel(CrcDigest::new(CrcAlgorithm::Crc64Nvme), false);
         let (final_sha_trans, final_sha_recv) =
             HashingTransformer::new_with_backchannel(Sha256::new(), "sha256".to_string());
         let (final_size_trans, final_size_recv) = SizeProbe::new();
@@ -1781,7 +1793,6 @@ impl S3 for ArunaS3Service {
         match req.input.body {
             Some(data) => {
                 let (tx, rx) = async_channel::bounded(10);
-
                 let mut awr = GenericStreamReadWriter::new_with_sink(
                     data,
                     BufferedS3Sink::new(
@@ -1801,8 +1812,11 @@ impl S3 for ArunaS3Service {
                     s3_error!(InternalError, "Internal notifier error")
                 })?;
 
+                awr = awr.add_transformer(crc32_t);
+                awr = awr.add_transformer(crc32c_t);
+                awr = awr.add_transformer(crc64nvme_t);
                 awr = awr.add_transformer(initial_sha_trans);
-                awr = awr.add_transformer(initial_md5_trans);
+                awr = awr.add_transformer(md5_trans);
                 awr = awr.add_transformer(initial_size_trans);
 
                 if location.is_compressed() && !location.is_pithos() {
@@ -1898,19 +1912,27 @@ impl S3 for ArunaS3Service {
 
         // Fetch calculated hashes
         trace!("fetching hashes");
-        let md5_initial = Some(initial_md5_recv.try_recv().map_err(|_| {
-            error!(error = "Unable to md5 hash initial data");
-            s3_error!(InternalError, "Unable to md5 hash initial data")
-        })?);
-        let sha_initial = Some(initial_sha_recv.try_recv().map_err(|_| {
-            error!(error = "Unable to sha hash initial data");
-            s3_error!(InternalError, "Unable to sha hash initial data")
-        })?);
+        for (key, rx) in vec![
+            ("sha256", initial_sha_rx),
+            ("md5", md5_rx),
+            ("crc32", crc32_rx),
+            ("crc32c", crc32c_rx),
+            ("crc64nvme", crc64nvme_rx),
+        ] {
+            checksum_handler.add_calculated_checksum(
+                key,
+                rx.try_recv().map_err(|_| {
+                    error!("Unable to fetch {key} from channel");
+                    s3_error!(InternalError, "Unable to {key} hash initial data")
+                })?,
+            );
+        }
+
         let sha_final: String = final_sha_recv.try_recv().map_err(|_| {
             error!(error = "Unable to sha hash final data");
             s3_error!(InternalError, "Unable to sha hash final data")
         })?;
-        let initial_size: u64 = initial_size_recv.try_recv().map_err(|_| {
+        let initial_size: u64 = initial_size_rx.try_recv().map_err(|_| {
             error!(error = "Unable to get size");
             s3_error!(InternalError, "Unable to get size")
         })?;
@@ -1919,47 +1941,31 @@ impl S3 for ArunaS3Service {
             s3_error!(InternalError, "Unable to get size")
         })?;
 
-        new_object.hashes = vec![
-            (
-                "MD5".to_string(),
-                md5_initial.clone().ok_or_else(|| {
-                    error!(error = "Unable to get md5 hash initial data");
-                    s3_error!(InternalError, "Unable to get md5 hash initial data")
-                })?,
-            ),
-            (
-                "SHA256".to_string(),
-                sha_initial.clone().ok_or_else(|| {
-                    error!(error = "Unable to get sha hash initial data");
-                    s3_error!(InternalError, "Unable to get sha hash initial data")
-                })?,
-            ),
-        ]
-        .into_iter()
-        .collect::<HashMap<String, String>>();
-
-        let hashes = vec![
-            Hash {
-                alg: Hashalgorithm::Sha256.into(),
-                hash: sha_initial.clone().ok_or_else(|| {
-                    error!(error = "Unable to get sha hash initial data");
-                    s3_error!(InternalError, "Unable to get sha hash initial data")
-                })?,
-            },
-            Hash {
-                alg: Hashalgorithm::Md5.into(),
-                hash: md5_initial.clone().ok_or_else(|| {
-                    error!(error = "Unable to get md5 hash initial data");
-                    s3_error!(InternalError, "Unable to get md5 hash initial data")
-                })?,
-            },
-        ];
-
         location.raw_content_len = initial_size as i64;
         location.disk_content_len = final_size as i64;
         location.disk_hash = Some(sha_final.clone());
 
+        let proto_hashes = vec![
+            Hash {
+                alg: Hashalgorithm::Md5.into(),
+                hash: checksum_handler.get_checksum_by_key("md5").ok_or_else(|| {
+                    error!(error = "Unable to get md5 hash initial data");
+                    s3_error!(InternalError, "Unable to get md5 hash initial data")
+                })?,
+            },
+            Hash {
+                alg: Hashalgorithm::Sha256.into(),
+                hash: checksum_handler
+                    .get_checksum_by_key("sha256")
+                    .ok_or_else(|| {
+                        error!(error = "Unable to get sha hash initial data");
+                        s3_error!(InternalError, "Unable to get sha hash initial data")
+                    })?,
+            },
+        ];
+
         trace!("finishing object");
+        new_object.hashes = checksum_handler.get_calculated_checksums().clone();
         if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
             if let Some(token) = &impersonating_token {
                 if was_init {
@@ -1967,7 +1973,7 @@ impl S3 for ArunaS3Service {
                         .finish_object(
                             new_object.id,
                             location.raw_content_len,
-                            hashes.clone(),
+                            proto_hashes.clone(),
                             token,
                         )
                         .await
@@ -1995,10 +2001,29 @@ impl S3 for ArunaS3Service {
                 s3_error!(InternalError, "Unable to add location with binding")
             })?;
 
-        let output = PutObjectOutput {
+        let mut output = PutObjectOutput {
             e_tag: Some(ETag::Strong(format!("-{}", new_object.id))),
             ..Default::default()
         };
+        if let Some(required) = &checksum_handler.required_checksum {
+            match required {
+                IntegrityChecksum::CRC32(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("crc32");
+                }
+                IntegrityChecksum::CRC32C(_) => {
+                    output.checksum_crc32c = checksum_handler.get_checksum_by_key("crc32c");
+                }
+                IntegrityChecksum::CRC64NVME(_) => {
+                    output.checksum_crc64nvme = checksum_handler.get_checksum_by_key("crc64nvme");
+                }
+                IntegrityChecksum::SHA1(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha1");
+                }
+                IntegrityChecksum::SHA256(_) => {
+                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha256");
+                }
+            }
+        }
         debug!(?output);
 
         let mut resp = S3Response::new(output);
