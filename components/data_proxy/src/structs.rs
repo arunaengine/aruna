@@ -1182,6 +1182,27 @@ impl Object {
             .collect()
     }
 
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub fn get_api_safe_hashes(&self) -> Vec<Hash> {
+        self.hashes
+            .iter()
+            .filter_map(|(k, v)| {
+                let alg = if k == "md5" {
+                    Hashalgorithm::Md5 as i32
+                } else if k == "sha256" {
+                    Hashalgorithm::Sha256 as i32
+                } else {
+                    return None;
+                };
+
+                Some(Hash {
+                    alg,
+                    hash: v.to_string(),
+                })
+            })
+            .collect()
+    }
+
     #[tracing::instrument(level = "trace", skip(self, ep_id))]
     pub fn is_partial_sync(&self, ep_id: &DieselUlid) -> bool {
         self.endpoints
