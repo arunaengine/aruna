@@ -831,7 +831,7 @@ impl Cache {
     }
 
     #[tracing::instrument(level = "trace", skip(self, object))]
-    pub async fn upsert_object(&self, object: Object) -> Result<()> {
+    pub async fn upsert_object(&self, mut object: Object) -> Result<()> {
         trace!(?object, "upserting object");
 
         if let Ok((rwlock_object, _)) = self.get_resource(&object.id) {
@@ -839,6 +839,11 @@ impl Cache {
             if *cache_object == object {
                 return Ok(());
             }
+
+            // Add/Update existing checksums to object hashes
+            let mut proxy_hashes = cache_object.hashes.clone();
+            proxy_hashes.extend(object.hashes.clone());
+            object.hashes = proxy_hashes;
         }
 
         if let Some(persistence) = self.persistence.read().await.as_ref() {
