@@ -605,7 +605,7 @@ impl S3 for ArunaS3Service {
             is_truncated,
             key: Some(req.input.key),
             max_parts: req.input.max_parts,
-            next_part_number_marker: next_part_number_marker.map(|marker| marker),
+            next_part_number_marker,
             owner: None, //Todo?
             part_number_marker: req.input.part_number_marker,
             parts,

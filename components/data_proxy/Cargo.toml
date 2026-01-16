@@ -55,7 +55,7 @@ postgres_array = "0.11.1"
 prost-wkt-types = { workspace = true }
 rand = { workspace = true }
 regex = "1.11.1"
-reqsign = "0.16.5"
+reqsign = { workspace = true }
 reqwest = { workspace = true }
 s3s = "0.12.0"
 serde = { workspace = true }

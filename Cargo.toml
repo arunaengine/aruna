@@ -1,12 +1,14 @@
 [workspace]
-members = [
-    "components/*",
-]
+members = ["components/*"]
 resolver = "2"
 
 [workspace.package]
 version = "2.0.4"
-authors = ["Sebastian Beyvers <sb@pus.de>", "Jannis Hochmuth <jannis.hochmuth@cb.jlug.de>", "Lukas Brehm <lukas.brehm@cb.jlug.de>"]
+authors = [
+    "Sebastian Beyvers <sb@pus.de>",
+    "Jannis Hochmuth <jannis.hochmuth@cb.jlug.de>",
+    "Lukas Brehm <lukas.brehm@cb.jlug.de>",
+]
 edition = "2021"
 repository = "https://github.com/ArunaStorage/aruna"
 license = "MIT OR Apache-2.0"
@@ -17,34 +19,38 @@ anyhow = "1.0.98"
 aruna-rust-api = "2.0.2"
 async-channel = "2.3.1"
 async-trait = "0.1.88"
-aws-config = "1.6.2"
-aws-sdk-s3 = "1.83.0"
+aws-config = "1.8.12"
+aws-sdk-s3 = "1.120.0"
 base64 = "0.22.1"
-cel-interpreter = "0.9.1"
-cel-parser = "0.8.1"
-chrono = "0.4.38"
-dashmap = {version = "6.1.0", features = ["serde"]}
+cel-interpreter = "0.10.0"
+cel-parser = "0.10.1"
+chrono = "0.4.43"
+dashmap = { version = "6.1.0", features = ["serde"] }
 deadpool-postgres = "0.14.1"
 diesel-ulid = "0.3.2"
 dotenvy = "0.15.7"
 futures = "0.3.31"
 hex = "0.4.3"
 hmac = "0.12.1"
-jsonwebtoken = { version = "9.3.1", features = ["use_pem"] }
+jsonwebtoken = { version = "10.2.0", features = ["use_pem", "rust_crypto"] }
 lazy_static = "1.5.0"
 postgres-from-row = "=0.5.2"
-postgres-types = { version = "0.2.9", features = ["derive"] }
-prost-wkt-types = "0.5.1"
+postgres-types = { version = "0.2.12", features = ["derive"] }
+prost-wkt-types = "0.7.1"
 rand = "0.9.2"
-reqsign = { version = "0.16.3"}
-reqwest = { version = "0.12.15", features = ["stream", "json"] }
+reqsign = { version = "0.18.1" }
+reqwest = { version = "0.13.1", features = ["stream", "json"] }
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = { version = "1.0.140", features = ["raw_value"] }
-sha2 = {version = "0.10.8", features = ["std", "asm", "sha2-asm"]}
-time = "0.3.41"
-tokio = { version = "1.44.2", features = ["full", "tracing"] }
-tokio-postgres = { version = "0.7.13", features = ["with-uuid-1", "with-serde_json-1", "with-chrono-0_4"] }
-tokio-stream = { version = "0.1.17", features = ["net"] }
-tonic = { version = "0.11.0", features = ["tls", "tls-roots"] }
-tower = { version = "0.5.2", features = ["retry"] }
-url = "2.5.4"
+serde_json = { version = "1.0.149", features = ["raw_value"] }
+sha2 = { version = "0.10.8", features = ["std", "asm", "sha2-asm"] }
+time = "0.3.45"
+tokio = { version = "1.49.0", features = ["full", "tracing"] }
+tokio-postgres = { version = "0.7.16", features = [
+    "with-uuid-1",
+    "with-serde_json-1",
+    "with-chrono-0_4",
+] }
+tokio-stream = { version = "0.1.18", features = ["net"] }
+tonic = { version = "0.14.2" }
+tower = { version = "0.5.3", features = ["retry"] }
+url = "2.5.8"

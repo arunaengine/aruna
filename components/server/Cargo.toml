@@ -10,55 +10,62 @@ license.workspace = true
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ahash = {workspace = true}
-anyhow = {workspace = true}
-aruna-rust-api = {workspace = true}
-async-channel = {workspace = true}
-async-nats = "0.42.0"
-async-trait = {workspace = true}
-aws-config =  {workspace = true}
-aws-sdk-s3 =  {workspace = true}
+ahash = { workspace = true }
+anyhow = { workspace = true }
+aruna-rust-api = { workspace = true }
+async-channel = { workspace = true }
+async-nats = "0.45.0"
+async-trait = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 aws-types = "1.3.8"
-base64 = {workspace = true}
-bincode = {version = "2.0.1", features = ["serde"] }
-cel-interpreter = {workspace = true}
-cel-parser = {workspace = true}
-chrono = {workspace = true}
-dashmap = {workspace = true}
-deadpool-postgres = {workspace = true}
-diesel-ulid = {workspace = true}
-dotenvy = {workspace = true}
-evmap = "10.0.2"
+base64 = { workspace = true }
+bincode = { version = "2.0.1", features = [
+    "serde",
+] } # The last maintained version
+cel-interpreter = { workspace = true }
+cel-parser = { workspace = true }
+chrono = { workspace = true }
+dashmap = { workspace = true }
+deadpool-postgres = { workspace = true }
+diesel-ulid = { workspace = true }
+dotenvy = { workspace = true }
+evmap = "11.0.0"
 evmap-derive = "0.2.0"
-futures = {workspace = true}
-hex = {workspace = true}
-hmac = {workspace = true}
+futures = { workspace = true }
+hex = { workspace = true }
+hmac = { workspace = true }
 itertools = "0.14.0"
-jsonwebtoken = {workspace = true}
-lazy_static = {workspace = true}
+jsonwebtoken = { workspace = true }
+lazy_static = { workspace = true }
 lettre = "0.11.18"
 log = "0.4.27"
-meilisearch-sdk = "0.29.1"
-postgres-from-row = {workspace = true}
-postgres-types = {workspace = true}
+meilisearch-sdk = "0.32.0"
+postgres-from-row = { workspace = true }
+postgres-types = { workspace = true }
 prost = "0.14.1"
-prost-wkt-types = {workspace = true}
-rand = {workspace = true}
+prost-wkt-types = { workspace = true }
+rand = { workspace = true }
 rand_core = "0.9.3"
 regex = "1.11.1"
 reqsign = { workspace = true }
 reqwest = { workspace = true }
 rusty_ulid = "2.0.0"
-serde = {workspace = true}
-serde_json = {workspace = true}
-sha2 = {workspace = true}
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 simple_logger = "5.0.0"
-time = {workspace = true}
-tokio = {workspace = true}
-tokio-postgres = {workspace = true}
-tokio-stream = {workspace = true}
-tonic = {workspace = true}
-tower = {workspace = true}
-url = {workspace = true}
-uuid = {version = "1.18.0", features = ["v4", "fast-rng", "macro-diagnostics", "serde"]}
-xxhash-rust = {version="0.8.15", features=["xxh3"]}
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tower = { workspace = true }
+url = { workspace = true }
+uuid = { version = "1.18.0", features = [
+    "v4",
+    "fast-rng",
+    "macro-diagnostics",
+    "serde",
+] }
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
