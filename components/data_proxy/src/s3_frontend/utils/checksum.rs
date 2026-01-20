@@ -1,4 +1,6 @@
 use aws_sdk_s3::types::ChecksumType;
+use base64::prelude::BASE64_STANDARD;
+use base64::Engine;
 use http::{HeaderMap, HeaderValue};
 use s3s::{s3_error, S3Error};
 use std::collections::HashMap;
@@ -284,6 +286,19 @@ pub fn header_value_to_str(value: &HeaderValue) -> Result<&str, S3Error> {
     value
         .to_str()
         .map_err(|_| s3_error!(InvalidArgument, "invalid header value"))
+}
+
+pub fn hex_to_base64(value: &str) -> Result<String, S3Error> {
+    Ok(BASE64_STANDARD.encode(
+        hex::decode(value)
+            .map_err(|_| s3_error!(InternalError, "Hex to base64 conversion failed"))?,
+    ))
+}
+
+pub fn base64_to_hex(value: &str) -> Result<String, S3Error> {
+    Ok(hex::encode(BASE64_STANDARD.decode(value).map_err(
+        |_| s3_error!(InternalError, "Base64 to hex conversion failed"),
+    )?))
 }
 
 #[cfg(test)]
