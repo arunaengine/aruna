@@ -529,4 +529,27 @@ mod tests {
         let res = header_value_to_str(&invalid_hv);
         assert!(res.is_err());
     }
+
+    #[test]
+    fn test_hex_and_base64_conversion_success_and_roundtrip() {
+        // Use hex "abcd" => bytes [0xAB, 0xCD] => base64 "q80="
+        let hex = "abcd";
+        let b64 = hex_to_base64(hex).expect("should convert hex to base64");
+        assert_eq!(b64, "q80=");
+
+        // Convert back
+        let hex_back = base64_to_hex(&b64).expect("should convert base64 to hex");
+        assert_eq!(hex_back, "abcd");
+    }
+
+    #[test]
+    fn test_hex_and_base64_conversion_errors() {
+        // Invalid hex should return an error
+        let bad_hex = "zzzz";
+        assert!(hex_to_base64(bad_hex).is_err());
+
+        // Invalid base64 should return an error
+        let bad_b64 = "!!!notbase64";
+        assert!(base64_to_hex(bad_b64).is_err());
+    }
 }
