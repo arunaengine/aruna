@@ -1,3 +1,4 @@
+use aws_sdk_s3::types::ChecksumType;
 use http::{HeaderMap, HeaderValue};
 use s3s::{s3_error, S3Error};
 use std::collections::HashMap;
@@ -82,6 +83,29 @@ impl TryFrom<(&str, Option<&HeaderValue>)> for IntegrityChecksum {
             )),
             _ => Err(s3_error!(InvalidArgument, "invalid checksum algorithm")),
         }
+    }
+}
+
+impl TryFrom<&HeaderMap> for ChecksumHandler {
+    type Error = S3Error;
+
+    #[tracing::instrument(level = "trace", skip(value))]
+    fn try_from(value: &HeaderMap<HeaderValue>) -> Result<Self, Self::Error> {
+        let mut handler = Self::default();
+
+        // Set checksum type
+        if let Some(header_value) = value.get("x-amz-checksum-type") {
+            let checksum_type = header_value_to_str(header_value)?;
+            handler.checksum_type = Some(ChecksumType::from(checksum_type));
+        }
+
+        // Set checksum mode
+        handler.checksum_mode = value.contains_key("x-amz-checksum-mode");
+
+        // Eval required checksum
+        handler.required_checksum = eval_required_checksum(&value)?;
+
+        Ok(handler)
     }
 }
 
@@ -180,6 +204,8 @@ fn detect_algorithm_from_headers(
 #[derive(Clone, Debug, Default)]
 pub struct ChecksumHandler {
     pub required_checksum: Option<IntegrityChecksum>,
+    pub checksum_type: Option<ChecksumType>,
+    pub checksum_mode: bool,
     pub calculated_checksums: HashMap<String, String>,
 }
 
@@ -187,6 +213,8 @@ impl ChecksumHandler {
     pub fn new(required_checksum: Option<IntegrityChecksum>) -> Self {
         ChecksumHandler {
             required_checksum,
+            checksum_type: None,
+            checksum_mode: false,
             calculated_checksums: HashMap::new(),
         }
     }
