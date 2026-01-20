@@ -647,6 +647,9 @@ impl S3 for ArunaS3Service {
                 s3_error!(InternalError, "No context found")
             })?;
 
+        // Init checksum handler
+        let checksum_handler = ChecksumHandler::from_headers(&req.headers)?;
+
         let ObjectsState::Regular { states, location } = objects_state else {
             let (levels, name) = match objects_state {
                 ObjectsState::Bundle { bundle, .. } => (
@@ -889,7 +892,7 @@ impl S3 for ArunaS3Service {
             .first()
             .and_then(|mime_guess| ContentType::from_str(mime_guess.as_ref()).ok());
 
-        let output = GetObjectOutput {
+        let mut output = GetObjectOutput {
             body,
             accept_ranges,
             content_range,
@@ -901,6 +904,19 @@ impl S3 for ArunaS3Service {
             content_disposition: Some(format!(r#"attachment;filename="{}""#, object.name)),
             ..Default::default()
         };
+        // Optionally add checksums (if available) to output
+        if checksum_handler.checksum_mode {
+            for (alg, hash) in object.hashes.iter() {
+                match alg.as_str() {
+                    "crc32" => output.checksum_crc32 = Some(hash.clone()),
+                    "crc32c" => output.checksum_crc32c = Some(hash.clone()),
+                    "crc64nvme" => output.checksum_crc64nvme = Some(hash.clone()),
+                    "sha1" => output.checksum_sha1 = Some(hash.clone()),
+                    "sha256" => output.checksum_sha256 = Some(hash.clone()),
+                    _ => {}
+                }
+            }
+        }
         debug!(?output);
 
         let mut resp = S3Response::new(output);
@@ -936,6 +952,9 @@ impl S3 for ArunaS3Service {
                 s3_error!(InternalError, "No context found")
             })?;
 
+        // Init checksum handler
+        let checksum_handler = ChecksumHandler::from_headers(&req.headers)?;
+
         if let ObjectsState::Bundle { bundle, .. } = objects_state {
             return Ok(S3Response::new(HeadObjectOutput {
                 content_length: None,
@@ -962,7 +981,7 @@ impl S3 for ArunaS3Service {
             .first()
             .and_then(|mime_guess| ContentType::from_str(mime_guess.as_ref()).ok());
 
-        let output = HeadObjectOutput {
+        let mut output = HeadObjectOutput {
             content_length: Some(content_len),
             last_modified: Some(
                 time::OffsetDateTime::from_unix_timestamp((object.id.timestamp() / 1000) as i64)
@@ -977,9 +996,22 @@ impl S3 for ArunaS3Service {
             content_type: mime,
             ..Default::default()
         };
-
         debug!(?output);
         debug!(?headers);
+
+        // Optionally add checksums (if available) to output
+        if checksum_handler.checksum_mode {
+            for (alg, hash) in object.hashes {
+                match alg.as_str() {
+                    "crc32" => output.checksum_crc32 = Some(hash),
+                    "crc32c" => output.checksum_crc32c = Some(hash),
+                    "crc64nvme" => output.checksum_crc64nvme = Some(hash),
+                    "sha1" => output.checksum_sha1 = Some(hash),
+                    "sha256" => output.checksum_sha256 = Some(hash),
+                    _ => {}
+                }
+            }
+        }
 
         let mut resp = S3Response::new(output);
         if let Some(headers) = headers {
