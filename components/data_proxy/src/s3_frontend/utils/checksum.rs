@@ -23,7 +23,7 @@ pub enum IntegrityChecksum {
     CRC32(Option<String>),
     CRC32C(Option<String>),
     CRC64NVME(Option<String>),
-    SHA1(Option<String>), // For the sake of completeness. Not supported.
+    _SHA1(Option<String>), // For the sake of completeness. Not supported.
     SHA256(Option<String>),
 }
 
@@ -33,7 +33,7 @@ impl std::fmt::Display for IntegrityChecksum {
             IntegrityChecksum::CRC32(_) => write!(f, "crc32"),
             IntegrityChecksum::CRC32C(_) => write!(f, "crc32c"),
             IntegrityChecksum::CRC64NVME(_) => write!(f, "crc64nvme"),
-            IntegrityChecksum::SHA1(_) => write!(f, "sha1"),
+            IntegrityChecksum::_SHA1(_) => write!(f, "sha1"),
             IntegrityChecksum::SHA256(_) => write!(f, "sha256"),
         }
     }
@@ -44,10 +44,7 @@ impl TryFrom<&HeaderValue> for IntegrityChecksum {
 
     #[tracing::instrument(level = "trace", skip(value))]
     fn try_from(value: &HeaderValue) -> Result<Self, Self::Error> {
-        let header_value_str = value
-            .to_str()
-            .map_err(|_| s3_error!(InvalidArgument, "header contains invalid value"))?;
-        match header_value_str {
+        match header_value_to_str(value)? {
             "CRC32" => Ok(IntegrityChecksum::CRC32(None)),
             "CRC32C" => Ok(IntegrityChecksum::CRC32C(None)),
             "CRC64NVME" => Ok(IntegrityChecksum::CRC64NVME(None)),
@@ -67,11 +64,7 @@ impl TryFrom<(&str, Option<&HeaderValue>)> for IntegrityChecksum {
     fn try_from(value: (&str, Option<&HeaderValue>)) -> Result<Self, Self::Error> {
         let provided_checksum = match value.1 {
             None => None,
-            Some(val) => Some(
-                val.to_str()
-                    .map_err(|_| s3_error!(InvalidArgument, "header contains invalid characters"))?
-                    .to_string(),
-            ),
+            Some(val) => Some(header_value_to_str(val)?.to_string()),
         };
 
         match value.0 {
@@ -93,6 +86,7 @@ impl TryFrom<&HeaderMap> for ChecksumHandler {
 
     #[tracing::instrument(level = "trace", skip(value))]
     fn try_from(value: &HeaderMap<HeaderValue>) -> Result<Self, Self::Error> {
+        // Init default ChecksumHandler
         let mut handler = Self::default();
 
         // Set checksum type
@@ -105,7 +99,7 @@ impl TryFrom<&HeaderMap> for ChecksumHandler {
         handler.checksum_mode = value.contains_key("x-amz-checksum-mode");
 
         // Eval required checksum
-        handler.required_checksum = eval_required_checksum(&value)?;
+        handler.required_checksum = eval_required_checksum(value)?;
 
         Ok(handler)
     }
@@ -118,7 +112,7 @@ impl IntegrityChecksum {
             Self::CRC32(_) => CRC32_HEADER,
             Self::CRC32C(_) => CRC32C_HEADER,
             Self::CRC64NVME(_) => CRC64NVME_HEADER,
-            Self::SHA1(_) => SHA1_HEADER,
+            Self::_SHA1(_) => SHA1_HEADER,
             Self::SHA256(_) => SHA256_HEADER,
         }
     }
@@ -128,7 +122,7 @@ impl IntegrityChecksum {
             IntegrityChecksum::CRC32(ref mut val) => *val = Some(checksum),
             IntegrityChecksum::CRC32C(ref mut val) => *val = Some(checksum),
             IntegrityChecksum::CRC64NVME(ref mut val) => *val = Some(checksum),
-            IntegrityChecksum::SHA1(ref mut val) => *val = Some(checksum),
+            IntegrityChecksum::_SHA1(ref mut val) => *val = Some(checksum),
             IntegrityChecksum::SHA256(ref mut val) => *val = Some(checksum),
         }
     }
@@ -138,7 +132,7 @@ impl IntegrityChecksum {
             IntegrityChecksum::CRC32(_) => CRC32_EMPTY,
             IntegrityChecksum::CRC32C(_) => CRC32C_EMPTY,
             IntegrityChecksum::CRC64NVME(_) => CRC64NVME_EMPTY,
-            IntegrityChecksum::SHA1(_) => SHA1_EMPTY,
+            IntegrityChecksum::_SHA1(_) => SHA1_EMPTY,
             IntegrityChecksum::SHA256(_) => SHA256_EMPTY,
         }
         .to_string()
@@ -226,16 +220,16 @@ impl ChecksumHandler {
     }
 
     pub fn from_headers(headers: &HeaderMap<HeaderValue>) -> Result<Self, S3Error> {
-        Ok(Self::try_from(headers)?)
+        Self::try_from(headers)
     }
 
-    pub fn get_validation_checksum(&self) -> &Option<String> {
+    fn get_validation_checksum(&self) -> &Option<String> {
         if let Some(checksum) = &self.required_checksum {
             match checksum {
                 IntegrityChecksum::CRC32(val)
                 | IntegrityChecksum::CRC32C(val)
                 | IntegrityChecksum::CRC64NVME(val)
-                | IntegrityChecksum::SHA1(val)
+                | IntegrityChecksum::_SHA1(val)
                 | IntegrityChecksum::SHA256(val) => val,
             }
         } else {
@@ -283,11 +277,6 @@ impl ChecksumHandler {
                 }
             })
             .transpose()
-    }
-
-    pub fn upsert_checksum(&mut self, key: &str, checksum: &str) -> Option<String> {
-        self.calculated_checksums
-            .insert(key.to_string(), checksum.to_string())
     }
 
     pub fn validate_checksum(&self) -> bool {
@@ -340,7 +329,7 @@ mod tests {
         assert_eq!(IntegrityChecksum::CRC32(None).to_string(), "crc32");
         assert_eq!(IntegrityChecksum::CRC32C(None).to_string(), "crc32c");
         assert_eq!(IntegrityChecksum::CRC64NVME(None).to_string(), "crc64nvme");
-        assert_eq!(IntegrityChecksum::SHA1(None).to_string(), "sha1");
+        assert_eq!(IntegrityChecksum::_SHA1(None).to_string(), "sha1");
         assert_eq!(IntegrityChecksum::SHA256(None).to_string(), "sha256");
 
         assert_eq!(
@@ -356,7 +345,7 @@ mod tests {
             "crc64nvme"
         );
         assert_eq!(
-            IntegrityChecksum::SHA1(Some("lorem".into())).to_string(),
+            IntegrityChecksum::_SHA1(Some("lorem".into())).to_string(),
             "sha1"
         );
         assert_eq!(
@@ -491,14 +480,14 @@ mod tests {
     #[test]
     fn test_checksum_handler_operations() {
         // No required checksum
-        let handler = ChecksumHandler::new(None);
+        let handler = ChecksumHandler::new();
         assert!(handler.get_validation_checksum().is_none());
         assert!(handler.get_calculated_checksum().is_none());
         assert!(handler.validate_checksum()); // no required checksum => true
 
         // With required checksum
         let required = IntegrityChecksum::CRC32(None);
-        let mut handler = ChecksumHandler::new(Some(required));
+        let mut handler = ChecksumHandler::_new_with_checksum(Some(required));
         // set validation checksum inside the handler
         if let Some(ic) = &mut handler.required_checksum {
             ic.set_validation_checksum("expected".to_string());

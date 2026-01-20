@@ -97,14 +97,14 @@ impl ArunaS3Service {
             ..Default::default()
         };
 
-        // Add demanded checksum
+        // Add optionally required checksum
         if let Some(required) = checksum_handler.required_checksum {
             let empty_checksum = required.get_empty_checksum();
             match required {
                 IntegrityChecksum::CRC32(_) => output.checksum_crc32 = Some(empty_checksum),
                 IntegrityChecksum::CRC32C(_) => output.checksum_crc32c = Some(empty_checksum),
                 IntegrityChecksum::CRC64NVME(_) => output.checksum_crc64nvme = Some(empty_checksum),
-                IntegrityChecksum::SHA1(_) => output.checksum_sha1 = Some(empty_checksum),
+                IntegrityChecksum::_SHA1(_) => output.checksum_sha1 = Some(empty_checksum),
                 IntegrityChecksum::SHA256(_) => output.checksum_sha256 = Some(empty_checksum),
             }
             output.checksum_type = Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
@@ -2038,12 +2038,7 @@ impl S3 for ArunaS3Service {
             if let Some(token) = &impersonating_token {
                 if was_init {
                     new_object = handler
-                        .finish_object(
-                            new_object.id,
-                            location.raw_content_len,
-                            proto_hashes.clone(),
-                            token,
-                        )
+                        .finish_object(new_object.id, location.raw_content_len, proto_hashes, token)
                         .await
                         .map_err(|_| {
                             error!(error = "Unable to finish object");
