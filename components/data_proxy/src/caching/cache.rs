@@ -386,7 +386,7 @@ impl Cache {
                             backend,
                             temp_location,
                             None,
-                            ChecksumHandler::new(None),
+                            ChecksumHandler::new(),
                         )
                         .await
                         {

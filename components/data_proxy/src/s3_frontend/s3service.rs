@@ -156,7 +156,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         // Init checksum handler
-        let checksum_handler = ChecksumHandler::from_headers(&req.headers)?;
+        let checksum_handler = ChecksumHandler::try_from(&req.headers)?;
 
         let impersonating_token =
             user_state.sign_impersonating_token(self.cache.auth.read().await.as_ref());

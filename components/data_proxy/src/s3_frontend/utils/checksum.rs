@@ -210,7 +210,11 @@ pub struct ChecksumHandler {
 }
 
 impl ChecksumHandler {
-    pub fn new(required_checksum: Option<IntegrityChecksum>) -> Self {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn _new_with_checksum(required_checksum: Option<IntegrityChecksum>) -> Self {
         ChecksumHandler {
             required_checksum,
             checksum_type: None,
@@ -220,7 +224,7 @@ impl ChecksumHandler {
     }
 
     pub fn from_headers(headers: &HeaderMap<HeaderValue>) -> Result<Self, S3Error> {
-        Ok(Self::new(eval_required_checksum(headers)?))
+        Ok(Self::try_from(headers)?)
     }
 
     pub fn get_validation_checksum(&self) -> &Option<String> {
