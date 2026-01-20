@@ -36,6 +36,7 @@ use tracing::{debug, error};
 
 use crate::auth::auth::AuthHandler;
 use crate::helpers::IntoOption;
+use crate::s3_frontend::utils::checksum::{base64_to_hex, hex_to_base64};
 use crate::CONFIG;
 
 /* ----- Constants ----- */
@@ -1002,12 +1003,13 @@ impl TryFrom<GrpcObject> for Object {
         // Convert hashes to proxy internal format
         let mut hashes = HashMap::new();
         for h in value.hashes.iter() {
+            let b64_hash = hex_to_base64(&h.hash)?;
             match Hashalgorithm::try_from(h.alg)? {
                 Hashalgorithm::Md5 => {
-                    hashes.insert("md5".to_string(), h.hash.to_string());
+                    hashes.insert("md5".to_string(), b64_hash);
                 }
                 Hashalgorithm::Sha256 => {
-                    hashes.insert("sha256".to_string(), h.hash.to_string());
+                    hashes.insert("sha256".to_string(), b64_hash);
                 }
                 _ => {
                     // Ignore unspecified hashes
@@ -1183,21 +1185,20 @@ impl Object {
     }
 
     #[tracing::instrument(level = "trace", skip(self))]
-    pub fn get_api_safe_hashes(&self) -> Vec<Hash> {
+    pub fn get_api_safe_hashes(&self) -> Result<Vec<Hash>> {
         self.hashes
             .iter()
-            .filter_map(|(k, v)| {
+            .filter(|(k, _)| *k == "md5" || *k == "sha256")
+            .map(|(k, v)| {
                 let alg = if k == "md5" {
-                    Hashalgorithm::Md5 as i32
-                } else if k == "sha256" {
-                    Hashalgorithm::Sha256 as i32
+                    Hashalgorithm::Md5
                 } else {
-                    return None;
+                    Hashalgorithm::Sha256
                 };
 
-                Some(Hash {
-                    alg,
-                    hash: v.to_string(),
+                Ok(Hash {
+                    alg: alg as i32,
+                    hash: base64_to_hex(v)?,
                 })
             })
             .collect()

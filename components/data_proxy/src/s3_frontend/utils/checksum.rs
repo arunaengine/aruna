@@ -243,24 +243,46 @@ impl ChecksumHandler {
         }
     }
 
-    pub fn add_calculated_checksum(&mut self, key: impl Into<String>, checksum: String) {
-        self.calculated_checksums.insert(key.into(), checksum);
+    pub fn add_calculated_checksum(
+        &mut self,
+        key: impl Into<String>,
+        checksum: String,
+        to_b64: bool,
+    ) -> Result<(), S3Error> {
+        self.calculated_checksums.insert(
+            key.into(),
+            if to_b64 {
+                hex_to_base64(&checksum)?
+            } else {
+                checksum
+            },
+        );
+        Ok(())
     }
 
     pub fn get_calculated_checksum(&self) -> Option<String> {
-        if let Some(algo) = &self.required_checksum {
-            self.calculated_checksums.get(&algo.to_string()).cloned()
-        } else {
-            None
-        }
+        self.required_checksum.as_ref().and_then(|required| {
+            self.calculated_checksums
+                .get(&required.to_string())
+                .cloned()
+        })
     }
 
     pub fn get_calculated_checksums(&self) -> &HashMap<String, String> {
         &self.calculated_checksums
     }
 
-    pub fn get_checksum_by_key(&self, key: &str) -> Option<String> {
-        self.calculated_checksums.get(key).cloned()
+    pub fn get_checksum_by_key(&self, key: &str, to_hex: bool) -> Result<Option<String>, S3Error> {
+        self.calculated_checksums
+            .get(key)
+            .map(|hash| {
+                if to_hex {
+                    base64_to_hex(hash)
+                } else {
+                    Ok(hash.clone())
+                }
+            })
+            .transpose()
     }
 
     pub fn upsert_checksum(&mut self, key: &str, checksum: &str) -> Option<String> {
@@ -480,13 +502,15 @@ mod tests {
         );
 
         // add calculated checksum and retrieve
-        handler.add_calculated_checksum("crc32", "expected".to_string());
+        handler
+            .add_calculated_checksum("crc32", "expected".to_string(), false)
+            .unwrap();
         assert_eq!(
             handler.get_calculated_checksum(),
             Some("expected".to_string())
         );
         assert_eq!(
-            handler.get_checksum_by_key("crc32"),
+            handler.get_checksum_by_key("crc32", false).unwrap(),
             Some("expected".to_string())
         );
 

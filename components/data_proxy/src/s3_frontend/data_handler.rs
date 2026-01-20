@@ -28,7 +28,6 @@ use pithos_lib::transformers::zstd_comp::ZstdEnc;
 use pithos_lib::transformers::zstd_decomp::ZstdDec;
 use s3s::dto::{ChecksumType, CompleteMultipartUploadOutput, ETag};
 use sha2::Sha256;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use tokio::pin;
@@ -235,30 +234,33 @@ impl DataHandler {
                 })?;
 
                 // Fetch hashes
-                let mut hashes = HashMap::new();
-                for (key, rx) in [
-                    ("sha256", sha_rx),
-                    ("md5", md5_rx),
-                    ("crc32", crc32_rx),
-                    ("crc32c", crc32c_rx),
-                    ("crc64nvme", crc64nvme_rx),
+                for (key, rx, hex_to_b64) in [
+                    ("sha256", sha_rx, true),
+                    ("md5", md5_rx, true),
+                    ("crc32", crc32_rx, false),
+                    ("crc32c", crc32c_rx, false),
+                    ("crc64nvme", crc64nvme_rx, false),
                 ] {
-                    hashes.insert(
-                        key.into(),
+                    //hashes.insert(
+                    checksum_handler.add_calculated_checksum(
+                        //key.into(),
+                        key,
                         rx.try_recv().inspect_err(|&e| {
                             error!(error = ?e, msg = e.to_string());
                         })?,
-                    );
+                        hex_to_b64,
+                    )?;
                 }
 
-                Ok::<(u64, u64, HashMap<String, String>, String), anyhow::Error>((
+                //Ok::<(u64, u64, HashMap<String, String>, String), anyhow::Error>((
+                Ok::<(u64, u64, ChecksumHandler, String), anyhow::Error>((
                     disk_size_stream.try_recv().inspect_err(|&e| {
                         error!(error = ?e, msg = e.to_string());
                     })?,
                     uncompressed_stream.try_recv().inspect_err(|&e| {
                         error!(error = ?e, msg = e.to_string());
                     })?,
-                    hashes,
+                    checksum_handler,
                     final_sha_recv.try_recv().inspect_err(|&e| {
                         error!(error = ?e, msg = e.to_string());
                     })?,
@@ -283,7 +285,7 @@ impl DataHandler {
             }
         }
 
-        let (before_size, after_size, hashes, final_sha) = aswr_handle
+        let (before_size, after_size, checksum_handler, final_sha) = aswr_handle
             .await
             .map_err(|e| {
                 error!(error = ?e, msg = e.to_string());
@@ -301,7 +303,6 @@ impl DataHandler {
         debug!(new_location = ?new_location, "Finished finalizing location");
 
         // Already store hashes in cache/database
-        checksum_handler.calculated_checksums = hashes;
         cache
             .update_object_hashes(
                 object.id,
@@ -315,14 +316,14 @@ impl DataHandler {
                 Hash {
                     alg: Hashalgorithm::Sha256.into(),
                     hash: checksum_handler
-                        .get_checksum_by_key("sha256")
+                        .get_checksum_by_key("sha256", true)?
                         .ok_or_else(|| anyhow!("SHA256 not found."))?
                         .clone(),
                 },
                 Hash {
                     alg: Hashalgorithm::Md5.into(),
                     hash: checksum_handler
-                        .get_checksum_by_key("md5")
+                        .get_checksum_by_key("md5", true)?
                         .ok_or_else(|| anyhow!("MD5 not found."))?
                         .clone(),
                 },
@@ -353,22 +354,13 @@ impl DataHandler {
 
         // Add required checksum to response
         if let Some(required) = &checksum_handler.required_checksum {
+            let checksum = checksum_handler.get_calculated_checksum();
             match required {
-                IntegrityChecksum::CRC32(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("crc32");
-                }
-                IntegrityChecksum::CRC32C(_) => {
-                    output.checksum_crc32c = checksum_handler.get_checksum_by_key("crc32c");
-                }
-                IntegrityChecksum::CRC64NVME(_) => {
-                    output.checksum_crc64nvme = checksum_handler.get_checksum_by_key("crc64nvme");
-                }
-                IntegrityChecksum::SHA1(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha1");
-                }
-                IntegrityChecksum::SHA256(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha256");
-                }
+                IntegrityChecksum::CRC32(_) => output.checksum_crc32 = checksum,
+                IntegrityChecksum::CRC32C(_) => output.checksum_crc32c = checksum,
+                IntegrityChecksum::CRC64NVME(_) => output.checksum_crc64nvme = checksum,
+                IntegrityChecksum::_SHA1(_) => output.checksum_sha1 = checksum,
+                IntegrityChecksum::SHA256(_) => output.checksum_sha256 = checksum,
             }
             output.checksum_type = Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
         }

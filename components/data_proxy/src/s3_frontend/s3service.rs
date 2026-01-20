@@ -1972,12 +1972,12 @@ impl S3 for ArunaS3Service {
 
         // Fetch calculated hashes
         trace!("fetching hashes");
-        for (key, rx) in [
-            ("sha256", initial_sha_rx),
-            ("md5", md5_rx),
-            ("crc32", crc32_rx),
-            ("crc32c", crc32c_rx),
-            ("crc64nvme", crc64nvme_rx),
+        for (key, rx, hex_to_b64) in [
+            ("sha256", initial_sha_rx, true),
+            ("md5", md5_rx, true),
+            ("crc32", crc32_rx, false),
+            ("crc32c", crc32c_rx, false),
+            ("crc64nvme", crc64nvme_rx, false),
         ] {
             checksum_handler.add_calculated_checksum(
                 key,
@@ -1985,7 +1985,8 @@ impl S3 for ArunaS3Service {
                     error!("Unable to fetch {key} from channel");
                     s3_error!(InternalError, "Unable to {key} hash initial data")
                 })?,
-            );
+                hex_to_b64,
+            )?;
         }
 
         let sha_final: String = final_sha_recv.try_recv().map_err(|_| {
@@ -2008,15 +2009,17 @@ impl S3 for ArunaS3Service {
         let proto_hashes = vec![
             Hash {
                 alg: Hashalgorithm::Md5.into(),
-                hash: checksum_handler.get_checksum_by_key("md5").ok_or_else(|| {
-                    error!(error = "Unable to get md5 hash initial data");
-                    s3_error!(InternalError, "Unable to get md5 hash initial data")
-                })?,
+                hash: checksum_handler
+                    .get_checksum_by_key("md5", true)?
+                    .ok_or_else(|| {
+                        error!(error = "Unable to get md5 hash initial data");
+                        s3_error!(InternalError, "Unable to get md5 hash initial data")
+                    })?,
             },
             Hash {
                 alg: Hashalgorithm::Sha256.into(),
                 hash: checksum_handler
-                    .get_checksum_by_key("sha256")
+                    .get_checksum_by_key("sha256", true)?
                     .ok_or_else(|| {
                         error!(error = "Unable to get sha hash initial data");
                         s3_error!(InternalError, "Unable to get sha hash initial data")
@@ -2066,22 +2069,13 @@ impl S3 for ArunaS3Service {
             ..Default::default()
         };
         if let Some(required) = &checksum_handler.required_checksum {
+            let checksum = checksum_handler.get_calculated_checksum();
             match required {
-                IntegrityChecksum::CRC32(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("crc32");
-                }
-                IntegrityChecksum::CRC32C(_) => {
-                    output.checksum_crc32c = checksum_handler.get_checksum_by_key("crc32c");
-                }
-                IntegrityChecksum::CRC64NVME(_) => {
-                    output.checksum_crc64nvme = checksum_handler.get_checksum_by_key("crc64nvme");
-                }
-                IntegrityChecksum::SHA1(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha1");
-                }
-                IntegrityChecksum::SHA256(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha256");
-                }
+                IntegrityChecksum::CRC32(_) => output.checksum_crc32 = checksum,
+                IntegrityChecksum::CRC32C(_) => output.checksum_crc32c = checksum,
+                IntegrityChecksum::CRC64NVME(_) => output.checksum_crc64nvme = checksum,
+                IntegrityChecksum::_SHA1(_) => output.checksum_sha1 = checksum,
+                IntegrityChecksum::SHA256(_) => output.checksum_sha256 = checksum,
             }
             output.checksum_type = Some(ChecksumType::from_static(ChecksumType::FULL_OBJECT));
         }
@@ -2226,12 +2220,12 @@ impl S3 for ArunaS3Service {
                 })?;
 
                 // Fetch hashes
-                for (key, rx) in [
-                    ("md5", md5_rx),
-                    ("sha256", sha_rx),
-                    ("crc32", crc32_rx),
-                    ("crc32c", crc32c_rx),
-                    ("crc64nvme", crc64nvme_rx),
+                for (key, rx, hex_to_b64) in [
+                    ("md5", md5_rx, true),
+                    ("sha256", sha_rx, true),
+                    ("crc32", crc32_rx, false),
+                    ("crc32c", crc32c_rx, false),
+                    ("crc64nvme", crc64nvme_rx, false),
                 ] {
                     checksum_handler.add_calculated_checksum(
                         key,
@@ -2239,7 +2233,8 @@ impl S3 for ArunaS3Service {
                             error!("Unable to fetch {key} from channel");
                             s3_error!(InternalError, "Unable to {key} hash initial data")
                         })?,
-                    );
+                        hex_to_b64,
+                    )?;
                 }
 
                 self.cache
@@ -2283,22 +2278,13 @@ impl S3 for ArunaS3Service {
         };
         // Add required checksum to response
         if let Some(required) = &checksum_handler.required_checksum {
+            let checksum = checksum_handler.get_calculated_checksum();
             match required {
-                IntegrityChecksum::CRC32(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("crc32");
-                }
-                IntegrityChecksum::CRC32C(_) => {
-                    output.checksum_crc32c = checksum_handler.get_checksum_by_key("crc32c");
-                }
-                IntegrityChecksum::CRC64NVME(_) => {
-                    output.checksum_crc64nvme = checksum_handler.get_checksum_by_key("crc64nvme");
-                }
-                IntegrityChecksum::SHA1(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha1");
-                }
-                IntegrityChecksum::SHA256(_) => {
-                    output.checksum_crc32 = checksum_handler.get_checksum_by_key("sha256");
-                }
+                IntegrityChecksum::CRC32(_) => output.checksum_crc32 = checksum,
+                IntegrityChecksum::CRC32C(_) => output.checksum_crc32c = checksum,
+                IntegrityChecksum::CRC64NVME(_) => output.checksum_crc64nvme = checksum,
+                IntegrityChecksum::_SHA1(_) => output.checksum_sha1 = checksum,
+                IntegrityChecksum::SHA256(_) => output.checksum_sha256 = checksum,
             }
         }
         debug!(?output);
