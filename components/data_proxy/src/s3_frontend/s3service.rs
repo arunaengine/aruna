@@ -1989,6 +1989,11 @@ impl S3 for ArunaS3Service {
             )?;
         }
 
+        // Validate optionally provided checksum
+        if !checksum_handler.validate_checksum() {
+            return Err(s3_error!(BadDigest, "Checksum validation failed"));
+        }
+
         let sha_final: String = final_sha_recv.try_recv().map_err(|_| {
             error!(error = "Unable to sha hash final data");
             s3_error!(InternalError, "Unable to sha hash final data")
@@ -2235,6 +2240,11 @@ impl S3 for ArunaS3Service {
                         })?,
                         hex_to_b64,
                     )?;
+                }
+
+                // Validate optionally provided checksum
+                if !checksum_handler.validate_checksum() {
+                    return Err(s3_error!(BadDigest, "Checksum validation failed"));
                 }
 
                 self.cache

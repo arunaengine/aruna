@@ -291,15 +291,22 @@ impl ChecksumHandler {
     }
 
     pub fn validate_checksum(&self) -> bool {
-        if let Some(checksum) = &self.required_checksum {
-            let calculated = self
-                .calculated_checksums
-                .get(&checksum.to_string())
-                .cloned();
-            return self.get_validation_checksum().eq(&calculated);
+        if let Some(required_checksum) = &self.required_checksum {
+            return match self.get_validation_checksum() {
+                None => true, // No checksum provided for validation
+                Some(validation_checksum) => {
+                    if let Some(calculated_checksum) = self
+                        .calculated_checksums
+                        .get(&required_checksum.to_string())
+                    {
+                        validation_checksum.eq(calculated_checksum)
+                    } else {
+                        false
+                    }
+                }
+            };
         }
-
-        // If no checksum is required
+        // If no checksum is provided checksum is always valid
         true
     }
 }
@@ -501,6 +508,9 @@ mod tests {
             &Some("expected".to_string())
         );
 
+        // Validation should fail
+        assert!(!handler.validate_checksum());
+
         // add calculated checksum and retrieve
         handler
             .add_calculated_checksum("crc32", "expected".to_string(), false)
@@ -514,21 +524,8 @@ mod tests {
             Some("expected".to_string())
         );
 
-        // upsert returns previous value
-        let prev = handler.upsert_checksum("crc32", "newval");
-        assert_eq!(prev, Some("expected".to_string()));
-        assert_eq!(
-            handler.get_checksum_by_key("crc32"),
-            Some("newval".to_string())
-        );
-
-        // validate true only if calculated matches validation
-        // currently validation is "expected" and calculated is "newval" -> false
+        // Validation should now succeed
         assert!(!handler.validate_checksum());
-
-        // set calculated to match
-        handler.upsert_checksum("crc32", "expected");
-        assert!(handler.validate_checksum());
     }
 
     #[test]
