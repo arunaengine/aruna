@@ -514,7 +514,7 @@ mod tests {
         );
 
         // Validation should now succeed
-        assert!(!handler.validate_checksum());
+        assert!(handler.validate_checksum());
     }
 
     #[test]
