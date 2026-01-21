@@ -14,7 +14,7 @@ aws-sdk-s3 = { workspace = true }
 data_proxy = { path = "../components/data_proxy" }
 aruna-rust-api = { workspace = true }
 async-channel = { workspace = true }
-async-nats = "0.45.0"
+async-nats = "0.46.0"
 chrono = {workspace = true}
 dashmap = {workspace = true}
 deadpool-postgres = { workspace = true }
