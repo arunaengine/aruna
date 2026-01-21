@@ -2,7 +2,7 @@ use anyhow::Result;
 use anyhow::{anyhow, bail};
 use aruna_rust_api::api::storage::models::v2::generic_resource::Resource;
 use aruna_rust_api::api::storage::models::v2::permission::ResourceId;
-use aruna_rust_api::api::storage::models::v2::Pubkey;
+use aruna_rust_api::api::storage::models::v2::{Hashalgorithm, Pubkey};
 use aruna_rust_api::api::storage::models::v2::{
     relation::Relation, DataClass, InternalRelationVariant, KeyValue, Object as GrpcObject,
     PermissionLevel, Project, RelationDirection, Status, User as GrpcUser,
@@ -1151,9 +1151,9 @@ impl Object {
             .iter()
             .map(|(k, v)| {
                 let alg = if k == "MD5" {
-                    2
+                    Hashalgorithm::Md5 as i32
                 } else if k == "SHA256" {
-                    1
+                    Hashalgorithm::Sha256 as i32
                 } else {
                     0
                 };
