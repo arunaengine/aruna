@@ -28,7 +28,7 @@ postgres-types = {workspace = true}
 prost = "0.14.1"
 prost-wkt-types = {workspace = true}
 rand = { workspace = true }
-testcontainers = "0.25.2"
+testcontainers = "0.26.3"
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 tonic = { workspace = true }
