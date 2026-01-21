@@ -23,4 +23,4 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --package e2e_tests -- --include-ignored
+          args: --release --package e2e_tests -- --include-ignored
