@@ -14,13 +14,12 @@ use aws_sdk_s3::config::{Credentials, RequestChecksumCalculation, ResponseChecks
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use diesel_ulid::DieselUlid;
-use std::path::Path;
 use std::str::FromStr;
 
 #[tokio::test]
-async fn test() {
+async fn upload_download() {
     // Init
-    let infra = init_test_environment(false).await;
+    let infra = init_test_environment(true).await;
     let (_server_handle, server_port) = init_server(&infra).await.unwrap();
 
     // Check if server is correctly initiated
@@ -95,12 +94,12 @@ async fn test() {
     }
 
     // Upload single part file via S3
-    let body = ByteStream::from_path(Path::new("/tmp/SRR33138449.7mb.fastq")).await;
+    let body = ByteStream::from_static("This is some pretty important content.".as_bytes());
     let object_ulid = s3_client
         .put_object()
         .bucket(project.name)
         .key("SRR33138449.7mb.fastq")
-        .body(body.unwrap())
+        .body(body)
         .send()
         .await
         .unwrap()
@@ -117,10 +116,10 @@ async fn test() {
     assert_eq!(object.id, object_ulid);
     for hash in object.hashes {
         match hash.alg {
-            1 => assert_eq!(hash.hash, "04a1c23c19601e9badbd85870dd4f3cd"), //MD5
+            1 => assert_eq!(hash.hash, "fa8449a915bdf6d71e1140442ad93fbe"), //MD5
             2 => assert_eq!(
                 hash.hash,
-                "6262ce9e09e117cc7954f9dee32e0b6c4262f088e1ed20eca230e751b8673cf5"
+                "7521e2b83fa99c5351a29289902e0da82224c319dfc0c06573b0464717fb6579"
             ), //SHA256
             _ => panic!("Unexpected hash alg: {}", hash.alg),
         }
