@@ -43,7 +43,6 @@ async fn upload_download() {
     let api_token = create_api_token(server_port, USER1_OIDC_TOKEN)
         .await
         .token_secret;
-    dbg!(&api_token);
 
     let user = get_user(server_port, &api_token).await.user.unwrap();
     assert_eq!(user.display_name, "test-user");
@@ -63,7 +62,7 @@ async fn upload_download() {
         None,
         "ARUNA_SERVER", // Endpoint name?
     );
-    let base_config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+    let base_config = aws_config::defaults(BehaviorVersion::v2026_01_12())
         .credentials_provider(creds)
         .load()
         .await;

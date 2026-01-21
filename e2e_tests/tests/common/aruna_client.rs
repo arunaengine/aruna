@@ -151,7 +151,6 @@ pub async fn get_object_client(server_port: u16) -> ObjectServiceClient<Channel>
 
 pub async fn get_object(server_port: u16, token: &str, object_ulid: &str) -> GetObjectResponse {
     // Create request
-    dbg!(object_ulid);
     let request = add_token(
         Request::new(GetObjectRequest {
             object_id: object_ulid.to_string(),
