@@ -190,7 +190,6 @@ impl Service<Request<Incoming>> for WrappingService {
                 .map_err(|_| s3_error!(InternalError, "Failed to add CORS header"));
             final_response.await
         })
-        //final_response.boxed()
     }
 }
 
@@ -201,37 +200,11 @@ impl AsRef<S3Service> for WrappingService {
     }
 }
 
-/*
-impl WrappingService {
-    #[tracing::instrument(level = "trace", skip(self))]
-    #[must_use]
-    pub fn into_make_service(self) -> MakeService<Self> {
-        MakeService(self)
-    }
-}
-
-#[derive(Clone)]
-pub struct MakeService<S>(S);
-
-impl<T, S: Clone> Service<T> for MakeService<S> {
-    type Response = S;
-
-    type Error = Infallible;
-
-    type Future = Ready<Result<Self::Response, Self::Error>>;
-
-    #[tracing::instrument(level = "trace", skip(self))]
-    fn call(&self, _: T) -> Self::Future {
-        ready(Ok(self.0.clone()))
-    }
-}
-*/
-
 impl WrappingService {
     async fn get_cors_headers(
         &self,
         origin_exception: bool,
-        req: &hyper::Request<hyper::body::Incoming>,
+        req: &Request<Incoming>,
     ) -> Result<hyper::HeaderMap, S3Error> {
         // Return all * if origin exception matches
         if origin_exception {

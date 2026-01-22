@@ -688,7 +688,7 @@ impl GrpcQueryHandler {
         let mut req = Request::new(FinishObjectStagingRequest {
             object_id: server_object.id.to_string(),
             content_len,
-            hashes: proxy_object.get_hashes(), // Hashes stay the same
+            hashes: proxy_object.get_api_safe_hashes()?, // Hashes stay the same
             completed_parts: vec![],
             upload_id: "".to_string(), // Upload id only needed in requests from users
         });
@@ -711,8 +711,9 @@ impl GrpcQueryHandler {
                 anyhow!("Object missing in FinishObjectResponse")
             })?;
 
-        // Id of location record should be set to Dataproxy Object id but is set to Server Object id... the fuck?
-        let object = DPObject::try_from(response)?;
+        // Convert Object from response to Dataproxy internal representation and merge hashes
+        let mut object = DPObject::try_from(response)?;
+        object.hashes.extend(proxy_object.hashes);
 
         // Persist Object and Location in cache/database
         self.cache.upsert_object(object.clone()).await?;

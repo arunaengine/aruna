@@ -2,7 +2,6 @@ use anyhow::Result;
 use anyhow::{anyhow, bail};
 use aruna_rust_api::api::storage::models::v2::generic_resource::Resource;
 use aruna_rust_api::api::storage::models::v2::permission::ResourceId;
-use aruna_rust_api::api::storage::models::v2::Pubkey;
 use aruna_rust_api::api::storage::models::v2::{
     relation::Relation, DataClass, InternalRelationVariant, KeyValue, Object as GrpcObject,
     PermissionLevel, Project, RelationDirection, Status, User as GrpcUser,
@@ -10,6 +9,7 @@ use aruna_rust_api::api::storage::models::v2::{
 use aruna_rust_api::api::storage::models::v2::{Collection, DataEndpoint};
 use aruna_rust_api::api::storage::models::v2::{Dataset, ResourceVariant};
 use aruna_rust_api::api::storage::models::v2::{Hash, Permission};
+use aruna_rust_api::api::storage::models::v2::{Hashalgorithm, Pubkey};
 use aruna_rust_api::api::storage::services::v2::create_collection_request;
 use aruna_rust_api::api::storage::services::v2::create_dataset_request;
 use aruna_rust_api::api::storage::services::v2::create_object_request;
@@ -36,6 +36,7 @@ use tracing::{debug, error};
 
 use crate::auth::auth::AuthHandler;
 use crate::helpers::IntoOption;
+use crate::s3_frontend::utils::checksum::{base64_to_hex, hex_to_base64};
 use crate::CONFIG;
 
 /* ----- Constants ----- */
@@ -999,6 +1000,23 @@ impl TryFrom<GrpcObject> for Object {
         let outbounds = outbound.into_option();
         let versions = version.into_option();
 
+        // Convert hashes to proxy internal format
+        let mut hashes = HashMap::new();
+        for h in value.hashes.iter() {
+            let b64_hash = hex_to_base64(&h.hash)?;
+            match Hashalgorithm::try_from(h.alg)? {
+                Hashalgorithm::Md5 => {
+                    hashes.insert("md5".to_string(), b64_hash);
+                }
+                Hashalgorithm::Sha256 => {
+                    hashes.insert("sha256".to_string(), b64_hash);
+                }
+                _ => {
+                    // Ignore unspecified hashes
+                }
+            }
+        }
+
         Ok(Object {
             id: DieselUlid::from_str(&value.id)?,
             name: value.name.to_string(),
@@ -1007,7 +1025,7 @@ impl TryFrom<GrpcObject> for Object {
             object_status: value.status(),
             data_class: value.data_class(),
             object_type: ObjectType::Object,
-            hashes: HashMap::default(),
+            hashes,
             metadata_license: value.metadata_license_tag,
             data_license: value.data_license_tag,
             dynamic: value.dynamic,
@@ -1150,18 +1168,38 @@ impl Object {
         self.hashes
             .iter()
             .map(|(k, v)| {
-                let alg = if k == "MD5" {
-                    2
-                } else if k == "SHA256" {
-                    1
+                let alg = if k == "md5" {
+                    Hashalgorithm::Md5 as i32
+                } else if k == "sha256" {
+                    Hashalgorithm::Sha256 as i32
                 } else {
-                    0
+                    Hashalgorithm::Unspecified as i32
                 };
 
                 Hash {
                     alg,
                     hash: v.to_string(),
                 }
+            })
+            .collect()
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub fn get_api_safe_hashes(&self) -> Result<Vec<Hash>> {
+        self.hashes
+            .iter()
+            .filter(|(k, _)| *k == "md5" || *k == "sha256")
+            .map(|(k, v)| {
+                let alg = if k == "md5" {
+                    Hashalgorithm::Md5
+                } else {
+                    Hashalgorithm::Sha256
+                };
+
+                Ok(Hash {
+                    alg: alg as i32,
+                    hash: base64_to_hex(v)?,
+                })
             })
             .collect()
     }
@@ -1955,7 +1993,7 @@ impl From<&Object> for TypedId {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct UploadPart {
     pub id: DieselUlid,
     pub object_id: DieselUlid,
@@ -1963,6 +2001,7 @@ pub struct UploadPart {
     pub part_number: u64,
     pub raw_size: u64,
     pub size: u64,
+    pub checksums: Option<HashMap<String, String>>,
 }
 
 impl From<UploadPart> for Part {
@@ -1979,6 +2018,94 @@ impl From<UploadPart> for Part {
 
 #[cfg(test)]
 mod tests {
+    use crate::database::database::Database;
+    use crate::database::persistence::WithGenericBytes;
+    use crate::structs::UploadPart;
+    use diesel_ulid::DieselUlid;
+    use std::collections::HashMap;
+
     #[test]
     fn test_resource_strings_cmp() {}
+
+    #[test]
+    fn upload_part_marshalling() {
+        // Create a test instance of UploadPart with checksums
+        let mut checksums = HashMap::new();
+        checksums.insert("md5".to_string(), "abc123".to_string());
+        checksums.insert("sha256".to_string(), "def456".to_string());
+        checksums.insert("crc32".to_string(), "hC5Uvw==".to_string());
+        checksums.insert("crc32c".to_string(), "p+pydw====".to_string());
+        checksums.insert("crc64nvme".to_string(), "N4vzZ9TJUr8=".to_string());
+
+        let mut original = UploadPart {
+            id: DieselUlid::generate(),
+            object_id: DieselUlid::generate(),
+            upload_id: "upload-123".to_string(),
+            part_number: 1,
+            raw_size: 1024,
+            size: 512,
+            checksums: Some(checksums),
+        };
+
+        // Serialize / Deserialize
+        let json = serde_json::to_string(&original).expect("Failed to serialize");
+        dbg!(&json);
+        let deserialized: UploadPart = serde_json::from_str(&json).expect("Failed to deserialize");
+
+        assert_eq!(original, deserialized);
+
+        // Set checksums to None and try again
+        original.checksums = None;
+
+        // Serialize / Deserialize
+        let json = serde_json::to_string(&original).expect("Failed to serialize");
+        dbg!(&json);
+        let deserialized: UploadPart = serde_json::from_str(&json).expect("Failed to deserialize");
+
+        assert_eq!(original, deserialized);
+    }
+
+    #[tokio::test]
+    async fn upload_part_persistence() {
+        // Create a test instance of UploadPart with checksums
+        let mut checksums = HashMap::new();
+        checksums.insert("md5".to_string(), "abc123".to_string());
+        checksums.insert("sha256".to_string(), "def456".to_string());
+        checksums.insert("crc32".to_string(), "hC5Uvw==".to_string());
+        checksums.insert("crc32c".to_string(), "p+pydw====".to_string());
+        checksums.insert("crc64nvme".to_string(), "N4vzZ9TJUr8=".to_string());
+
+        let mut original = UploadPart {
+            id: DieselUlid::generate(),
+            object_id: DieselUlid::generate(),
+            upload_id: "upload-123".to_string(),
+            part_number: 1,
+            raw_size: 1024,
+            size: 512,
+            checksums: Some(checksums),
+        };
+
+        let db = Database::new().await.unwrap();
+        let client = db.get_client().await.unwrap();
+
+        original.upsert(&client).await.unwrap();
+
+        let fetched = UploadPart::get_opt(&original.id, &client)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(original, fetched);
+
+        // Remove checksums, upsert in database and re-fetch
+        original.checksums = None;
+        original.upsert(&client).await.unwrap();
+
+        let fetched = UploadPart::get_opt(&original.id, &client)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(original, fetched);
+    }
 }
