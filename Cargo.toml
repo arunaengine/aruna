@@ -20,14 +20,11 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.93.0"
 
 [workspace.dependencies]
-async-channel = "2.5.0"
-ahash = "0.8.12"
-anyhow = "1.0.99"
+fjall = "3.0.1"
 async-trait = "0.1.89"
 axum = "0.8.8"
 axum-extra = { version = "0.10.1", features = ["query"] }
 blake3 = { version = "1.8.2", features = ["serde"] }
-casbin = { version = "2.10.1", features = ["explain", "logging"] }
 chrono = { version = "0.4.42", features = ["serde"] }
 data-encoding = "2.9.0"
 dotenvy = "0.15.7"
@@ -64,6 +61,7 @@ utoipa = { version = "5.4.0", features = [
 ] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
-
+smallvec = "1.15.1"
+byteview = "0.10.0"
 [profile.release]
 panic = "abort"

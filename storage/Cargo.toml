@@ -6,3 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fjall = { workspace = true }
+thiserror = { workspace = true }
+crossfire = "3.0.2"
+aruna-core = { path = "../core" }
+ulid = { workspace = true }
+byteview = "0.10.0"
+tracing = { workspace = true }

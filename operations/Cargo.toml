@@ -6,3 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aruna-core = { path = "../core" }
+aruna-storage = { path = "../storage" }
+tokio = { workspace = true }
+smallvec = { workspace = true }
+tracing = { workspace = true }
+byteview = { workspace = true }
+ulid = { workspace = true }

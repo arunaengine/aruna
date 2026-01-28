@@ -6,3 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+smallvec = { workspace = true }
+ulid = { workspace = true }
+thiserror = { workspace = true }
+byteview = "0.10.0"
