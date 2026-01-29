@@ -9,7 +9,9 @@ use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, R
 use ulid::Ulid;
 
 use crate::errors::StorageLibError;
-pub type Channel = crossfire::MTx<mpsc::Array<(StorageEffect, oneshot::TxOneshot<StorageEvent>)>>;
+pub type EffectHandle = (StorageEffect, oneshot::TxOneshot<StorageEvent>);
+pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
+pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 
 pub struct FjallStorage {
     db: OptimisticTxDatabase,
@@ -20,14 +22,11 @@ pub struct FjallStorage {
 
 #[derive(Clone)]
 pub struct StorageHandle {
-    write_channel: Channel,
+    write_channel: EffectSender,
 }
 
 impl StorageHandle {
-    pub fn new() -> (
-        Self,
-        crossfire::Rx<mpsc::Array<(StorageEffect, oneshot::TxOneshot<StorageEvent>)>>,
-    ) {
+    pub fn new() -> (Self, EffectReceiver) {
         let (sender, receiver) = mpsc::bounded_blocking(2048);
         (
             StorageHandle {
@@ -40,7 +39,7 @@ impl StorageHandle {
     pub async fn send_effect(&self, effect: StorageEffect) -> Event {
         let storage_event = {
             let (response_tx, response_rx) = crossfire::oneshot::oneshot();
-            if let Err(_) = self.write_channel.send((effect, response_tx)) {
+            if self.write_channel.send((effect, response_tx)).is_err() {
                 return Event::Storage(StorageEvent::Error {
                     error: StorageError::ChannelClosed,
                 });
@@ -57,7 +56,7 @@ impl StorageHandle {
 }
 
 impl FjallStorage {
-    pub fn new(path: &str) -> Result<StorageHandle, StorageLibError> {
+    pub fn open(path: &str) -> Result<StorageHandle, StorageLibError> {
         let db = OptimisticTxDatabase::builder(path).open()?;
 
         let (sender, receiver) = StorageHandle::new();
@@ -75,10 +74,7 @@ impl FjallStorage {
         Ok(sender)
     }
 
-    pub fn receive_loop(
-        &mut self,
-        receiver: crossfire::Rx<mpsc::Array<(StorageEffect, oneshot::TxOneshot<StorageEvent>)>>,
-    ) -> ! {
+    pub fn receive_loop(&mut self, receiver: EffectReceiver) -> ! {
         loop {
             match receiver.recv() {
                 Ok((effect, response_tx)) => {
@@ -107,7 +103,7 @@ impl FjallStorage {
                             txn_id,
                         } => self.delete(key_space, key, txn_id),
                     };
-                    let _ = response_tx.send(event);
+                    response_tx.send(event);
                 }
                 Err(_) => {
                     tracing::warn!(

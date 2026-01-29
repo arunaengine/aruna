@@ -5,7 +5,6 @@ use ulid::Ulid;
 use crate::effects::Effect;
 
 /// Event(s)->Operation->Effect(s)
-
 pub type Effects = SmallVec<[Effect; 4]>;
 pub type TxnId = Ulid;
 pub type Key = ByteView;

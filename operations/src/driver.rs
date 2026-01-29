@@ -127,7 +127,7 @@ mod test {
 
     #[tokio::test]
     pub async fn test_driver() {
-        let storage_handle = storage::FjallStorage::new("/tmp/aruna_test_db").unwrap();
+        let storage_handle = storage::FjallStorage::open("/tmp/aruna_test_db").unwrap();
 
         let context = DriverContext { storage_handle };
 
