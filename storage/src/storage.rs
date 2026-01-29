@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::thread;
 
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::types::{Key, Value};
-use aruna_core::{effects::StorageEffect, errors::StorageError};
+use aruna_core::handle::Handle;
+use async_trait::async_trait;
 use byteview::ByteView;
 use crossfire::{mpsc, oneshot};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
@@ -37,7 +39,7 @@ impl StorageHandle {
         )
     }
 
-    pub async fn send_effect(&self, effect: StorageEffect) -> Event {
+    pub async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
         let storage_event = {
             let (response_tx, response_rx) = crossfire::oneshot::oneshot();
             if self.write_channel.send((effect, response_tx)).is_err() {
@@ -53,6 +55,35 @@ impl StorageHandle {
             }
         };
         Event::Storage(storage_event)
+    }
+}
+
+#[async_trait]
+impl Handle for StorageHandle {
+    async fn send_effect(&self, effect: Effect) -> Event {
+        match effect {
+            Effect::Storage(storage_effect) => {
+                let (response_tx, response_rx) = crossfire::oneshot::oneshot();
+                if self
+                    .write_channel
+                    .send((storage_effect, response_tx))
+                    .is_err()
+                {
+                    return Event::Storage(StorageEvent::Error {
+                        error: StorageError::ChannelClosed,
+                    });
+                }
+                match response_rx.await {
+                    Ok(event) => Event::Storage(event),
+                    Err(_) => Event::Storage(StorageEvent::Error {
+                        error: StorageError::ChannelClosed,
+                    }),
+                }
+            }
+            _ => Event::Storage(StorageEvent::Error {
+                error: StorageError::InvalidEffect,
+            }),
+        }
     }
 }
 
