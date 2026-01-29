@@ -5,7 +5,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::{effects::StorageEffect, errors::StorageError};
 use byteview::ByteView;
 use crossfire::{mpsc, oneshot};
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
+use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use ulid::Ulid;
 
 use crate::errors::StorageLibError;
@@ -13,10 +13,12 @@ pub type Channel = crossfire::MTx<mpsc::Array<(StorageEffect, oneshot::TxOneshot
 
 pub struct FjallStorage {
     db: OptimisticTxDatabase,
+    keyspaces: HashMap<String, OptimisticTxKeyspace>,
     read_txns: HashMap<Ulid, fjall::Snapshot>,
     write_txns: HashMap<Ulid, fjall::OptimisticWriteTx>,
 }
 
+#[derive(Clone)]
 pub struct StorageHandle {
     write_channel: Channel,
 }
@@ -39,14 +41,14 @@ impl StorageHandle {
         let storage_event = {
             let (response_tx, response_rx) = crossfire::oneshot::oneshot();
             if let Err(_) = self.write_channel.send((effect, response_tx)) {
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::Unknown,
+                return Event::Storage(StorageEvent::Error {
+                    error: StorageError::ChannelClosed,
                 });
             }
             match response_rx.await {
                 Ok(event) => event,
                 Err(_) => StorageEvent::Error {
-                    error: StorageError::Unknown,
+                    error: StorageError::ChannelClosed,
                 },
             }
         };
@@ -63,6 +65,7 @@ impl FjallStorage {
         thread::spawn(move || {
             let mut storage = FjallStorage {
                 db,
+                keyspaces: HashMap::new(),
                 read_txns: HashMap::new(),
                 write_txns: HashMap::new(),
             };
@@ -128,7 +131,7 @@ impl FjallStorage {
                 }
                 Err(_e) => {
                     return StorageEvent::Error {
-                        error: aruna_core::errors::StorageError::TransactionConflict,
+                        error: StorageError::TransactionConflict,
                     };
                 }
             };
@@ -150,19 +153,29 @@ impl FjallStorage {
             StorageEvent::TransactionAborted { txn_id }
         } else {
             StorageEvent::Error {
-                error: aruna_core::errors::StorageError::TransactionNotFound,
+                error: StorageError::TransactionNotFound,
             }
         }
     }
 
+    fn get_or_create_keyspace(&mut self, name: &str) -> Result<OptimisticTxKeyspace, StorageError> {
+        if let Some(ks) = self.keyspaces.get(name) {
+            return Ok(ks.clone());
+        }
+
+        match self.db.keyspace(name, KeyspaceCreateOptions::default) {
+            Ok(ks) => {
+                self.keyspaces.insert(name.to_string(), ks.clone());
+                Ok(ks)
+            }
+            Err(_) => Err(StorageError::KeyspaceError),
+        }
+    }
+
     fn read(&mut self, key_space: String, key: ByteView, txn_id: Option<Ulid>) -> StorageEvent {
-        let Ok(keyspace) = self
-            .db
-            .keyspace(&key_space, || KeyspaceCreateOptions::default())
-        else {
-            return StorageEvent::Error {
-                error: aruna_core::errors::StorageError::Unknown,
-            };
+        let keyspace = match self.get_or_create_keyspace(&key_space) {
+            Ok(ks) => ks,
+            Err(e) => return StorageEvent::Error { error: e },
         };
 
         if let Some(txn_id) = txn_id {
@@ -173,12 +186,12 @@ impl FjallStorage {
                         value: value_opt.map(|v| v.into()),
                     },
                     Err(_e) => StorageEvent::Error {
-                        error: aruna_core::errors::StorageError::Unknown,
+                        error: StorageError::ReadError,
                     },
                 }
             } else {
                 StorageEvent::Error {
-                    error: aruna_core::errors::StorageError::TransactionNotFound,
+                    error: StorageError::TransactionNotFound,
                 }
             }
         } else {
@@ -190,7 +203,7 @@ impl FjallStorage {
                     value: value_opt.map(|v| v.into()),
                 },
                 Err(_e) => StorageEvent::Error {
-                    error: aruna_core::errors::StorageError::Unknown,
+                    error: StorageError::ReadError,
                 },
             }
         }
@@ -203,13 +216,9 @@ impl FjallStorage {
         value: ByteView,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
-        let Ok(keyspace) = self
-            .db
-            .keyspace(&key_space, || KeyspaceCreateOptions::default())
-        else {
-            return StorageEvent::Error {
-                error: aruna_core::errors::StorageError::Unknown,
-            };
+        let keyspace = match self.get_or_create_keyspace(&key_space) {
+            Ok(ks) => ks,
+            Err(e) => return StorageEvent::Error { error: e },
         };
 
         if let Some(txn_id) = txn_id {
@@ -218,14 +227,14 @@ impl FjallStorage {
                 StorageEvent::WriteResult { key }
             } else {
                 StorageEvent::Error {
-                    error: aruna_core::errors::StorageError::TransactionNotFound,
+                    error: StorageError::TransactionNotFound,
                 }
             }
         } else {
             match keyspace.insert(key.clone(), value) {
                 Ok(_) => StorageEvent::WriteResult { key },
                 Err(_e) => StorageEvent::Error {
-                    error: aruna_core::errors::StorageError::Unknown,
+                    error: StorageError::WriteError,
                 },
             }
         }
@@ -241,24 +250,20 @@ impl FjallStorage {
             match txn.commit() {
                 Ok(_) => StorageEvent::TransactionCommitted { txn_id },
                 Err(_e) => StorageEvent::Error {
-                    error: aruna_core::errors::StorageError::TransactionConflict,
+                    error: StorageError::TransactionConflict,
                 },
             }
         } else {
             StorageEvent::Error {
-                error: aruna_core::errors::StorageError::TransactionNotFound,
+                error: StorageError::TransactionNotFound,
             }
         }
     }
 
     fn delete(&mut self, key_space: String, key: ByteView, txn_id: Option<Ulid>) -> StorageEvent {
-        let Ok(keyspace) = self
-            .db
-            .keyspace(&key_space, || KeyspaceCreateOptions::default())
-        else {
-            return StorageEvent::Error {
-                error: aruna_core::errors::StorageError::Unknown,
-            };
+        let keyspace = match self.get_or_create_keyspace(&key_space) {
+            Ok(ks) => ks,
+            Err(e) => return StorageEvent::Error { error: e },
         };
 
         if let Some(txn_id) = txn_id {
@@ -267,14 +272,14 @@ impl FjallStorage {
                 StorageEvent::DeleteResult { key }
             } else {
                 StorageEvent::Error {
-                    error: aruna_core::errors::StorageError::TransactionNotFound,
+                    error: StorageError::TransactionNotFound,
                 }
             }
         } else {
             match keyspace.remove(key.clone()) {
                 Ok(_) => StorageEvent::DeleteResult { key },
                 Err(_e) => StorageEvent::Error {
-                    error: aruna_core::errors::StorageError::Unknown,
+                    error: StorageError::DeleteError,
                 },
             }
         }

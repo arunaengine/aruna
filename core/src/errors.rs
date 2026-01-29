@@ -8,6 +8,14 @@ pub enum StorageError {
     TransactionConflict,
     #[error("Transaction not found")]
     TransactionNotFound,
-    #[error("Unknown error")]
-    Unknown,
+    #[error("Keyspace error")]
+    KeyspaceError,
+    #[error("Read error")]
+    ReadError,
+    #[error("Write error")]
+    WriteError,
+    #[error("Delete error")]
+    DeleteError,
+    #[error("Channel closed")]
+    ChannelClosed,
 }
