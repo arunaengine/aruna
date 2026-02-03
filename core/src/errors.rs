@@ -19,3 +19,15 @@ pub enum StorageError {
     #[error("Channel closed")]
     ChannelClosed,
 }
+
+#[derive(Debug, Error)]
+pub enum ConversionError {
+    #[error(transparent)]
+    PostcardError(#[from] postcard::Error)
+}
+
+#[derive(Debug, Error)]
+pub enum ParseRealmIdError {
+    #[error("Parsing error {0}")]
+    ParsingError(String),
+}
