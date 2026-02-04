@@ -20,7 +20,7 @@ pub struct FjallStorage {
     write_txns: HashMap<Ulid, fjall::OptimisticWriteTx>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct StorageHandle {
     write_channel: EffectSender,
 }

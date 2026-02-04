@@ -6,3 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aruna-core = { path = "../core" }
+aruna-operations = { path = "../operations" }
+utoipa = { version = "5.4.0", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+axum = "0.8.8"
+serde = { workspace = true }
+thiserror = { workspace = true }

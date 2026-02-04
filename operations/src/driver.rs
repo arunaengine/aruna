@@ -1,6 +1,7 @@
 use aruna_core::operation::Operation;
 use aruna_storage::storage;
 
+#[derive(Debug)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
 }

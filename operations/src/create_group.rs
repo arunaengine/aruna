@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-// TODO: Placeholder, create real Request later
 #[derive(Clone, Debug)]
 pub struct CreateGroupConfig {
     pub user_id: UserId,
@@ -266,6 +265,12 @@ mod test {
                     .assigned_users
                     .iter()
                     .any(|user| user == &group_config.user_id)
+        }));
+        assert!(result.1.roles.iter().any(|(_id, role)| {
+            role.name == "user"
+        }));
+        assert!(result.1.roles.iter().any(|(_id, role)| {
+            role.name == "viewer"
         }));
     }
 }

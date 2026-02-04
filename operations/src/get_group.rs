@@ -8,7 +8,6 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-// TODO: Placeholder, create real Request later
 #[derive(Clone, Debug)]
 pub struct GetGroupConfig {
     pub group_id: GroupId,
