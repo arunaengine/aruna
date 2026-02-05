@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::thread;
 
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::types::{Key, Value};
 use aruna_core::{effects::StorageEffect, errors::StorageError};
 use byteview::ByteView;
 use crossfire::{mpsc, oneshot};
@@ -94,6 +95,9 @@ impl FjallStorage {
                             value,
                             txn_id,
                         } => self.write(key_space, key, value, txn_id),
+                        StorageEffect::Iter { key_space, txn_id } => {
+                            self.iterate(key_space, txn_id)
+                        }
                         StorageEffect::CommitTransaction { txn_id } => {
                             self.commit_transaction(txn_id)
                         }
@@ -202,6 +206,43 @@ impl FjallStorage {
                     error: StorageError::ReadError,
                 },
             }
+        }
+    }
+
+    // FIXME: Improve this to stream keyspace entries without loading the whole keyspace into one
+    // vector
+    fn iterate(&mut self, key_space: String, txn_id: Option<Ulid>) -> StorageEvent {
+        let mut inner = |key_space: String,
+                         txn_id: Option<Ulid>|
+         -> Result<Vec<(Key, Value)>, StorageError> {
+            let keyspace = self.get_or_create_keyspace(&key_space)?;
+
+            if let Some(txn_id) = txn_id {
+                if let Some(txn) = self.read_txns.get(&txn_id) {
+                    txn.iter(keyspace)
+                        .map(|guard| -> Result<(Key, Value), StorageError> {
+                            let (k, v) = guard.into_inner().map_err(|_| StorageError::ReadError)?;
+                            Ok((k.into(), v.into()))
+                        })
+                        .collect()
+                } else {
+                    Err(StorageError::TransactionNotFound)
+                }
+            } else {
+                // Non-transactional read
+                let snapshot = self.db.read_tx();
+                snapshot
+                    .iter(keyspace)
+                    .map(|guard| -> Result<(Key, Value), StorageError> {
+                        let (k, v) = guard.into_inner().map_err(|_| StorageError::ReadError)?;
+                        Ok((k.into(), v.into()))
+                    })
+                    .collect()
+            }
+        };
+        match inner(key_space, txn_id) {
+            Ok(vec) => StorageEvent::IterResult { values: vec },
+            Err(error) => StorageEvent::Error { error },
         }
     }
 

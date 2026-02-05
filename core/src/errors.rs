@@ -23,7 +23,7 @@ pub enum StorageError {
 #[derive(Debug, Error)]
 pub enum ConversionError {
     #[error(transparent)]
-    PostcardError(#[from] postcard::Error)
+    PostcardError(#[from] postcard::Error),
 }
 
 #[derive(Debug, Error)]

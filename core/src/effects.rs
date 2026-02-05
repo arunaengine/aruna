@@ -20,6 +20,10 @@ pub enum StorageEffect {
         key: Key,
         txn_id: Option<TxnId>,
     },
+    Iter {
+        key_space: KeySpace,
+        txn_id: Option<TxnId>,
+    },
     Write {
         key_space: KeySpace,
         key: Key,

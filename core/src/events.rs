@@ -18,6 +18,7 @@ pub enum StorageEvent {
     TransactionCommitted { txn_id: TxnId },
     TransactionAborted { txn_id: TxnId },
     ReadResult { key: Key, value: Option<Value> },
+    IterResult { values: Vec<(Key, Value)> },
     WriteResult { key: Key },
     DeleteResult { key: Key },
     Error { error: StorageError },

@@ -14,3 +14,4 @@ serde = { workspace = true }
 postcard = { workspace = true }
 globset = { workspace = true }
 base64 = { workspace = true }
+fjall = { workspace = true }
