@@ -112,7 +112,7 @@ mod test {
 
         // Header setup
         let mut headers = HeaderMap::new();
-        headers.insert("Bearer", token)
+        headers.insert("Bearer", token);
 
         let ctx = extract_auth_context(&state, &headers).await;
 
