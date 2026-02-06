@@ -8,7 +8,13 @@ use utoipa::ToSchema;
 #[derive(Debug, Error)]
 pub enum ServerError {
     #[error("Unimplemented")]
-    Unimplemented
+    Unimplemented,
+    #[error("Unauthorized")]
+    Unauthorized,
+    #[error("{0}")]
+    InternalError(String),
+    #[error("Bad request")]
+    BadRequest,
 }
 
 /// Standard error response for API endpoints.
@@ -55,7 +61,6 @@ impl ErrorResponse {
     }
 }
 
-
 impl<E: std::fmt::Display> From<E> for ErrorResponse {
     fn from(e: E) -> Self {
         Self::new(e.to_string())
@@ -80,14 +85,19 @@ impl IntoResponse for ServerError {
 impl ServerError {
     fn status_code(&self) -> StatusCode {
         match self {
-            ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED
+            ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+            ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            ServerError::BadRequest => StatusCode::BAD_REQUEST,
         }
     }
 
-    fn error_code(&self) -> &'static str {
+    fn error_code(&self) -> String {
         match self {
-            ServerError::Unimplemented => "Not implemented"
+            ServerError::Unimplemented => "Not implemented".to_string(),
+            ServerError::Unauthorized => "Not authorized".to_string(),
+            ServerError::InternalError(msg) => msg.clone(),
+            ServerError::BadRequest => "Bad request".to_string(),
         }
     }
-
 }

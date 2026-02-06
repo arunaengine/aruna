@@ -38,6 +38,7 @@ mod test {
     };
     use aruna_storage::storage;
     use byteview::ByteView;
+    use ulid::Ulid;
 
     use crate::driver::{DriverContext, drive};
 
@@ -128,7 +129,8 @@ mod test {
 
     #[tokio::test]
     pub async fn test_driver() {
-        let storage_handle = storage::FjallStorage::open("/tmp/aruna_test_db").unwrap();
+        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
 
         let context = DriverContext { storage_handle };
 

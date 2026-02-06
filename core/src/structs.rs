@@ -77,6 +77,20 @@ pub enum Permission {
     DENY,
 }
 
+impl fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Permission::READ => "Read",
+                Permission::WRITE => "Write",
+                Permission::DENY => "Deny",
+            }
+        )
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct AuthorizationDocument {
     pub group_id: GroupId,

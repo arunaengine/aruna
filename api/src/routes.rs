@@ -1,12 +1,21 @@
-use std::sync::Arc;
-use axum::extract::{Path, Query, State};
-use axum::{Extension, Json, Router};
-use axum::http::StatusCode;
-use axum::routing::{get, post};
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use crate::auth::{AuthContext, auth_middleware};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::server::{AuthContext, ServerState};
+use crate::server::ServerState;
+use aruna_core::structs::{AuthorizationDocument, Group};
+use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::driver::drive;
+use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::list_groups::ListGroupOperation;
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::middleware::from_fn_with_state;
+use axum::routing::{get, post};
+use axum::{Extension, Json, Router};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use ulid::Ulid;
+use utoipa::ToSchema;
 
 /// Build the group routes.
 pub fn router(state: Arc<ServerState>) -> Router {
@@ -14,7 +23,7 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/groups/{id}", get(get_group))
         .route("/groups", post(create_group))
         .route("/groups", get(list_groups))
-        .layer(Extension(Some(AuthContext{})))
+        .layer(from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
 }
 
@@ -26,8 +35,46 @@ pub struct CreateGroupRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateGroupResponse {}
+pub struct CreateGroupResponse {
+    pub display_name: String,
+    pub group_id: String,
+    pub realm_id: String,
+    pub roles: Vec<RoleResponse>,
+}
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RoleResponse {
+    pub role_id: String,
+    pub name: String,
+    pub permissions: HashMap<String, String>,
+    pub assigned_users: Vec<String>,
+}
+
+impl From<(Group, AuthorizationDocument)> for CreateGroupResponse {
+    fn from((group, auth): (Group, AuthorizationDocument)) -> Self {
+        let mut roles = Vec::new();
+        for (role_id, role) in auth.roles {
+            let role = RoleResponse {
+                role_id: role_id.to_string(),
+                name: role.name,
+                permissions: role
+                    .permissions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_string()))
+                    .collect(),
+                assigned_users: role.assigned_users.iter().map(|u| u.to_string()).collect(),
+            };
+            roles.push(role);
+        }
+
+        CreateGroupResponse {
+            display_name: group.display_name,
+            group_id: group.group_id.to_string(),
+            realm_id: group.realm_id.to_string(),
+            roles,
+        }
+    }
+}
 
 /// Create a new group.
 ///
@@ -53,12 +100,26 @@ pub async fn create_group(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<CreateGroupRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
-    todo!()
+    let auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
+
+    let config = CreateGroupConfig {
+        user_id: auth.user_id,
+        realm_id: auth.realm_id,
+        display_name: request.name,
+    };
+    let result = drive(CreateGroupOperation::new(config), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let response: CreateGroupResponse = result.into();
+
+    Ok((StatusCode::OK, response.into()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiGroup {
-
+    pub display_name: String,
+    pub group_id: String,
+    pub realm_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -113,14 +174,59 @@ impl PaginationParams {
 pub async fn list_groups(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Query(pagination): Query<PaginationParams>,
+    Query(_pagination): Query<PaginationParams>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
-    todo!()
+    let _auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
+
+    let result = drive(ListGroupOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let response = ListGroupsResponse {
+        groups: result
+            .iter()
+            .map(|g| ApiGroup {
+                display_name: g.display_name.clone(),
+                group_id: g.group_id.to_string(),
+                realm_id: g.realm_id.to_string(),
+            })
+            .collect(),
+    };
+
+    Ok((StatusCode::OK, response.into()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct GroupInfoResponse {
-    group: ApiGroup
+    pub display_name: String,
+    pub group_id: String,
+    pub realm_id: String,
+    pub roles: Vec<RoleResponse>,
+}
+
+impl From<(Group, AuthorizationDocument)> for GroupInfoResponse {
+    fn from((group, auth): (Group, AuthorizationDocument)) -> Self {
+        let mut roles = Vec::new();
+        for (role_id, role) in auth.roles {
+            let role = RoleResponse {
+                role_id: role_id.to_string(),
+                name: role.name,
+                permissions: role
+                    .permissions
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.to_string()))
+                    .collect(),
+                assigned_users: role.assigned_users.iter().map(|u| u.to_string()).collect(),
+            };
+            roles.push(role);
+        }
+
+        GroupInfoResponse {
+            display_name: group.display_name,
+            group_id: group.group_id.to_string(),
+            realm_id: group.realm_id.to_string(),
+            roles,
+        }
+    }
 }
 
 /// Get group information.
@@ -143,6 +249,13 @@ pub struct GroupInfoResponse {
 pub async fn get_group(
     State(state): State<Arc<ServerState>>,
     Path(group_id): Path<String>,
-) -> ServerResult<Json<GroupInfoResponse>> {
-    todo!()
+) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
+    let group_id = Ulid::from_string(&group_id).map_err(|_e| ServerError::BadRequest)?;
+    let config = GetGroupConfig { group_id };
+    let result = drive(GetGroupOperation::new(config), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let response: GroupInfoResponse = result.into();
+
+    Ok((StatusCode::OK, response.into()))
 }
