@@ -1,14 +1,19 @@
 use aruna_core::operation::Operation;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{RealmId, TokenClaims};
 use aruna_core::types::UserId;
+use chrono::Months;
+use jsonwebtoken::{EncodingKey, Header, encode};
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
 #[derive(Clone, Debug)]
 pub struct CreateTokenConfig {
+    pub time: u64,
+    pub expiry: Option<u64>,
     pub user_id: UserId,
     pub realm_id: RealmId,
-    pub display_name: String,
+    pub keypair: [u8; 64],
 }
 
 #[derive(Debug)]
@@ -30,6 +35,10 @@ pub enum CreateTokenState {
 pub enum CreateTokenError {
     #[error("Creating Group did not finish")]
     NotFinished,
+    #[error("Invalid timestamp")]
+    InvalidTimestamp,
+    #[error("Invalid timestamp")]
+    EncodingError(#[from] jsonwebtoken::errors::Error),
 }
 
 impl CreateTokenOperation {
@@ -41,7 +50,48 @@ impl CreateTokenOperation {
         }
     }
     pub fn emit_token(&mut self) -> Result<(), CreateTokenError> {
-        todo!()
+        println!("Start");
+        let iat = self.config.time;
+        let exp = match self.config.expiry {
+            Some(exp) => {
+                if exp > iat {
+                    exp
+                } else {
+                    return Err(CreateTokenError::InvalidTimestamp);
+                }
+            }
+            None => {
+                let time = chrono::DateTime::from_timestamp_secs(iat as i64)
+                    .ok_or_else(|| CreateTokenError::InvalidTimestamp)?;
+                let new = time
+                    .checked_add_months(Months::new(12))
+                    .ok_or_else(|| CreateTokenError::InvalidTimestamp)?;
+                new.timestamp() as u64
+            }
+        };
+
+        println!("Claims");
+        let claims = TokenClaims {
+            sub: format!(
+                "{}@{}",
+                self.config.user_id.to_string(),
+                self.config.realm_id.to_string()
+            ),
+            iss: self.config.realm_id.to_string(),
+            iat,
+            exp,
+            jti: Ulid::new().to_string(), // TODO: Save tokens somewhere
+        };
+        println!("Token");
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(&self.config.keypair),
+        )?;
+        self.output = Some(Ok(token));
+
+        println!("Finish");
+        Ok(())
     }
 }
 impl Operation for CreateTokenOperation {
@@ -50,14 +100,23 @@ impl Operation for CreateTokenOperation {
     type Error = CreateTokenError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = CreateTokenState::CreateToken;
-        self.emit_token();
+        println!("{:?}", self.state);
+        if let Err(err) = self.emit_token() {
+            self.state = CreateTokenState::Error;
+            self.output = Some(Err(err));
+        };
+        self.state = CreateTokenState::Finish;
         smallvec![]
     }
 
     fn step(&mut self, events: aruna_core::events::Event) -> aruna_core::types::Effects {
+        println!("{:?}", self.state);
         match (events, &self.state) {
+            (_, CreateTokenState::CreateToken) => {
+                smallvec![]
+            }
             (_, CreateTokenState::Error) => {
+                self.abort();
                 smallvec![]
             }
             (_, CreateTokenState::Finish) => {
@@ -87,8 +146,27 @@ impl Operation for CreateTokenOperation {
 
 #[cfg(test)]
 mod test {
+    use crate::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use crate::driver::{DriverContext, drive};
+    use aruna_core::structs::RealmId;
+    use aruna_storage::storage;
+    use ulid::Ulid;
+
     #[tokio::test]
     pub async fn test_token_creation() {
-        todo!()
+        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
+
+        let context = DriverContext { storage_handle };
+
+        let token_config = CreateTokenConfig {
+            time: chrono::Utc::now().timestamp() as u64,
+            expiry: None,
+            user_id: Ulid::new(),
+            realm_id: RealmId([0u8; 32]),
+            keypair: [0u8; 64],
+        };
+        let token_operation = CreateTokenOperation::new(token_config.clone());
+        drive(token_operation, &context).await.unwrap();
     }
 }

@@ -8,10 +8,12 @@ rust-version.workspace = true
 [dependencies]
 aruna-core = { path = "../core" }
 aruna-storage = { path = "../storage" }
+byteview = { workspace = true }
+chrono = { workspace = true }
+globset = { workspace = true }
+jsonwebtoken = { workspace = true }
+smallvec = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
-smallvec = { workspace = true }
 tracing = { workspace = true }
-byteview = { workspace = true }
 ulid = { workspace = true }
-globset = { workspace = true }

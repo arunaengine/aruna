@@ -1,5 +1,5 @@
 use aruna_core::errors::ParseRealmIdError;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{RealmId, TokenClaims};
 use aruna_core::types::UserId;
 use axum::extract::Request;
 use axum::http::{HeaderMap, header};
@@ -11,20 +11,6 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::server::ServerState;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TokenClaims {
-    /// Subject: user identity in format `{user_ulid}@{realm_pubkey_base64}`.
-    pub sub: String,
-    /// Issuer: realm public key (base64-encoded).
-    pub iss: String,
-    /// Issued at: Unix timestamp in seconds.
-    pub iat: u64,
-    /// Expiration: Unix timestamp in seconds.
-    pub exp: u64,
-    /// JWT ID: unique token identifier (ULID string).
-    pub jti: String,
-}
 
 #[derive(Debug)]
 pub struct OidcValidator {}
@@ -93,29 +79,48 @@ mod test {
     use crate::auth::extract_auth_context;
     use crate::server::ServerState;
     use aruna_core::structs::RealmId;
-    use aruna_operations::driver::DriverContext;
+    use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
-    use axum::http::HeaderMap;
+    use axum::http::{HeaderMap, header};
     use std::sync::Arc;
+    use ulid::Ulid;
 
     #[tokio::test]
     pub async fn test_middleware() {
         // Test setup
+        println!("Server setup");
         let storage_handle = storage::FjallStorage::open("/tmp/aruna_test_db").unwrap();
         let driver_ctx = Arc::new(DriverContext { storage_handle });
         let realm_id = Some(RealmId([0u8; 32]));
         let realm_keypair = Some([0u8; 64]);
-        let state = ServerState::new(driver_ctx, realm_keypair, realm_id, None);
+        let state = ServerState::new(driver_ctx.clone(), realm_keypair, realm_id.clone(), None);
 
         // Token setup
-        let token = todo!("Create Token");
+        println!("Token setup");
+        let token_config = CreateTokenConfig {
+            time: chrono::Utc::now().timestamp() as u64,
+            expiry: None,
+            user_id: Ulid::new(),
+            realm_id: realm_id.clone().unwrap(),
+            keypair: realm_keypair.unwrap(),
+        };
+        let token_operation = CreateTokenOperation::new(token_config.clone());
+        let token = drive(token_operation, &driver_ctx).await.unwrap();
 
         // Header setup
+        println!("Header setup");
         let mut headers = HeaderMap::new();
-        headers.insert("Bearer", token);
+        headers
+            .insert(
+                header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer: {}", token)).unwrap(),
+            )
+            .unwrap();
 
-        let ctx = extract_auth_context(&state, &headers).await;
-
-        ctx.unwrap();
+        println!("Test");
+        let ctx = extract_auth_context(&state, &headers).await.unwrap();
+        assert_eq!(ctx.realm_id, realm_id.unwrap());
+        assert_eq!(ctx.user_id, token_config.user_id);
     }
 }

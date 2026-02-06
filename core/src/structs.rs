@@ -176,3 +176,18 @@ impl AuthorizationDocument {
         Ok(postcard::from_bytes(bytes)?)
     }
 }
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenClaims {
+    /// Subject: user identity in format `{user_ulid}@{realm_pubkey_base64}`.
+    pub sub: String,
+    /// Issuer: realm public key (base64-encoded).
+    pub iss: String,
+    /// Issued at: Unix timestamp in seconds.
+    pub iat: u64,
+    /// Expiration: Unix timestamp in seconds.
+    pub exp: u64,
+    /// JWT ID: unique token identifier (ULID string).
+    pub jti: String,
+}
