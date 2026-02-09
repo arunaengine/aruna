@@ -13,3 +13,9 @@ pub type KeySpace = String;
 pub type GroupId = Ulid;
 pub type UserId = Ulid;
 pub type RoleId = Ulid;
+
+// Re-export the new type-safe identifiers
+pub use crate::id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
+
+// Backward compatibility alias - will be removed in future tasks
+pub type DhtKey = [u8; 32];

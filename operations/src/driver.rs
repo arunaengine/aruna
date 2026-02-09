@@ -16,10 +16,13 @@ pub async fn drive<O: Operation>(
         while let Some(effect) = queue.pop() {
             match effect {
                 aruna_core::effects::Effect::Storage(storage_effect) => {
-                    let event = context.storage_handle.send_effect(storage_effect).await;
+                    let event = context
+                        .storage_handle
+                        .send_storage_effect(storage_effect)
+                        .await;
                     queue.extend(operation.step(event));
                 }
-                aruna_core::effects::Effect::Network() => todo!(),
+                aruna_core::effects::Effect::Net(_) => todo!(),
                 aruna_core::effects::Effect::Task() => todo!(),
                 aruna_core::effects::Effect::Search() => todo!(),
                 aruna_core::effects::Effect::Stream() => todo!(),

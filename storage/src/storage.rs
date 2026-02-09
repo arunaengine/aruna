@@ -137,6 +137,9 @@ impl FjallStorage {
                             key,
                             txn_id,
                         } => self.delete(key_space, key, txn_id),
+                        StorageEffect::Scan { key_space, prefix } => {
+                            self.scan(key_space, prefix)
+                        }
                     };
                     response_tx.send(event);
                 }
@@ -351,5 +354,29 @@ impl FjallStorage {
                 },
             }
         }
+    }
+
+    fn scan(&mut self, key_space: String, prefix: Option<ByteView>) -> StorageEvent {
+        let keyspace = match self.get_or_create_keyspace(&key_space) {
+            Ok(ks) => ks,
+            Err(e) => return StorageEvent::Error { error: e },
+        };
+
+        let snapshot = self.db.read_tx();
+        let entries: Vec<(ByteView, ByteView)> = if let Some(prefix) = prefix {
+            snapshot
+                .prefix(keyspace, prefix)
+                .filter_map(|guard| guard.into_inner().ok())
+                .map(|(k, v)| (ByteView::from(k.as_ref()), ByteView::from(v.as_ref())))
+                .collect()
+        } else {
+            snapshot
+                .iter(keyspace)
+                .filter_map(|guard| guard.into_inner().ok())
+                .map(|(k, v)| (ByteView::from(k.as_ref()), ByteView::from(v.as_ref())))
+                .collect()
+        };
+
+        StorageEvent::ScanResult { entries }
     }
 }
