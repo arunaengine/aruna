@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::thread;
 
 use aruna_core::effects::{Effect, StorageEffect};
@@ -126,9 +127,6 @@ impl FjallStorage {
                             value,
                             txn_id,
                         } => self.write(key_space, key, value, txn_id),
-                        StorageEffect::Iter { key_space, txn_id } => {
-                            self.iterate(key_space, txn_id)
-                        }
                         StorageEffect::CommitTransaction { txn_id } => {
                             self.commit_transaction(txn_id)
                         }
@@ -137,9 +135,13 @@ impl FjallStorage {
                             key,
                             txn_id,
                         } => self.delete(key_space, key, txn_id),
-                        StorageEffect::Scan { key_space, prefix } => {
-                            self.scan(key_space, prefix)
-                        }
+                        StorageEffect::Iter {
+                            key_space,
+                            prefix,
+                            start_after,
+                            limit,
+                            txn_id,
+                        } => self.iterate(key_space, prefix, start_after, limit, txn_id),
                     };
                     response_tx.send(event);
                 }
@@ -243,43 +245,6 @@ impl FjallStorage {
         }
     }
 
-    // FIXME: Improve this to stream keyspace entries without loading the whole keyspace into one
-    // vector
-    fn iterate(&mut self, key_space: String, txn_id: Option<Ulid>) -> StorageEvent {
-        let mut inner = |key_space: String,
-                         txn_id: Option<Ulid>|
-         -> Result<Vec<(Key, Value)>, StorageError> {
-            let keyspace = self.get_or_create_keyspace(&key_space)?;
-
-            if let Some(txn_id) = txn_id {
-                if let Some(txn) = self.read_txns.get(&txn_id) {
-                    txn.iter(keyspace)
-                        .map(|guard| -> Result<(Key, Value), StorageError> {
-                            let (k, v) = guard.into_inner().map_err(|_| StorageError::ReadError)?;
-                            Ok((k.into(), v.into()))
-                        })
-                        .collect()
-                } else {
-                    Err(StorageError::TransactionNotFound)
-                }
-            } else {
-                // Non-transactional read
-                let snapshot = self.db.read_tx();
-                snapshot
-                    .iter(keyspace)
-                    .map(|guard| -> Result<(Key, Value), StorageError> {
-                        let (k, v) = guard.into_inner().map_err(|_| StorageError::ReadError)?;
-                        Ok((k.into(), v.into()))
-                    })
-                    .collect()
-            }
-        };
-        match inner(key_space, txn_id) {
-            Ok(vec) => StorageEvent::IterResult { values: vec },
-            Err(error) => StorageEvent::Error { error },
-        }
-    }
-
     fn write(
         &mut self,
         key_space: String,
@@ -356,27 +321,123 @@ impl FjallStorage {
         }
     }
 
-    fn scan(&mut self, key_space: String, prefix: Option<ByteView>) -> StorageEvent {
+    fn iterate(
+        &mut self,
+        key_space: String,
+        prefix: Option<ByteView>,
+        start_after: Option<ByteView>,
+        limit: usize,
+        txn_id: Option<Ulid>,
+    ) -> StorageEvent {
         let keyspace = match self.get_or_create_keyspace(&key_space) {
             Ok(ks) => ks,
             Err(e) => return StorageEvent::Error { error: e },
         };
 
-        let snapshot = self.db.read_tx();
-        let entries: Vec<(ByteView, ByteView)> = if let Some(prefix) = prefix {
-            snapshot
-                .prefix(keyspace, prefix)
-                .filter_map(|guard| guard.into_inner().ok())
-                .map(|(k, v)| (ByteView::from(k.as_ref()), ByteView::from(v.as_ref())))
-                .collect()
+        if limit == 0 {
+            return StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            };
+        }
+
+        let result = if let Some(txn_id) = txn_id {
+            match self.read_txns.get(&txn_id) {
+                Some(txn) => {
+                    iterate_page(txn, &keyspace, prefix.as_ref(), start_after.as_ref(), limit)
+                }
+                None => {
+                    return StorageEvent::Error {
+                        error: StorageError::TransactionNotFound,
+                    };
+                }
+            }
         } else {
-            snapshot
-                .iter(keyspace)
-                .filter_map(|guard| guard.into_inner().ok())
-                .map(|(k, v)| (ByteView::from(k.as_ref()), ByteView::from(v.as_ref())))
-                .collect()
+            let snapshot = self.db.read_tx();
+            iterate_page(
+                &snapshot,
+                &keyspace,
+                prefix.as_ref(),
+                start_after.as_ref(),
+                limit,
+            )
         };
 
-        StorageEvent::ScanResult { entries }
+        match result {
+            Ok((values, next_start_after)) => StorageEvent::IterResult {
+                values,
+                next_start_after,
+            },
+            Err(error) => StorageEvent::Error { error },
+        }
     }
+}
+
+fn iterate_page<R: Readable>(
+    reader: &R,
+    keyspace: &OptimisticTxKeyspace,
+    prefix: Option<&ByteView>,
+    start_after: Option<&ByteView>,
+    limit: usize,
+) -> Result<(Vec<(ByteView, ByteView)>, Option<ByteView>), StorageError> {
+    let prefix_bytes = prefix.map(|p| p.as_ref().to_vec());
+    let start_after_bytes = start_after.map(|s| s.as_ref().to_vec());
+
+    let iter = match (prefix_bytes.as_ref(), start_after_bytes.as_ref()) {
+        (Some(prefix), Some(start_after)) => {
+            let start_bound = if start_after < prefix {
+                Included(prefix.clone())
+            } else {
+                Excluded(start_after.clone())
+            };
+
+            match prefix_upper_bound(prefix) {
+                Some(end) => reader.range(keyspace, (start_bound, Excluded(end))),
+                None => reader.range(keyspace, (start_bound, Unbounded::<Vec<u8>>)),
+            }
+        }
+        (Some(prefix), None) => match prefix_upper_bound(prefix) {
+            Some(end) => reader.range(keyspace, (Included(prefix.clone()), Excluded(end))),
+            None => reader.range(keyspace, (Included(prefix.clone()), Unbounded::<Vec<u8>>)),
+        },
+        (None, Some(start_after)) => reader.range(
+            keyspace,
+            (Excluded(start_after.clone()), Unbounded::<Vec<u8>>),
+        ),
+        (None, None) => reader.iter(keyspace),
+    };
+
+    collect_page(iter, limit)
+}
+
+fn collect_page(
+    iter: fjall::Iter,
+    limit: usize,
+) -> Result<(Vec<(ByteView, ByteView)>, Option<ByteView>), StorageError> {
+    let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit);
+
+    for guard in iter {
+        let (key, value) = guard.into_inner().map_err(|_| StorageError::ReadError)?;
+        if values.len() == limit {
+            let next_start_after = values.last().map(|(k, _)| k.clone());
+            return Ok((values, next_start_after));
+        }
+
+        values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
+    }
+
+    Ok((values, None))
+}
+
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for idx in (0..upper.len()).rev() {
+        if upper[idx] != u8::MAX {
+            upper[idx] = upper[idx].saturating_add(1);
+            upper.truncate(idx + 1);
+            return Some(upper);
+        }
+    }
+
+    None
 }

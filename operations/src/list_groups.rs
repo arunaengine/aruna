@@ -26,7 +26,10 @@ impl ListGroupOperation {
     fn emit_list_groups(&mut self) -> aruna_core::types::Effects {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: "groups".to_string(),
-            txn_id: self.txn_id
+            prefix: None,
+            start_after: None,
+            limit: 10_000,
+            txn_id: self.txn_id,
         })]
     }
 
@@ -101,7 +104,7 @@ impl Operation for ListGroupOperation {
                 self.emit_list_groups()
             }
             (
-                aruna_core::events::Event::Storage(StorageEvent::IterResult { values }),
+                aruna_core::events::Event::Storage(StorageEvent::IterResult { values, .. }),
                 ListGroupState::ListGroups,
             ) => match self.emit_parse_groups(values) {
                 Ok(effects) => {
@@ -161,7 +164,10 @@ mod test {
         let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
         let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
 
-        let context = DriverContext { storage_handle };
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
 
         let mut groups = Vec::new();
         for i in 0..100 {
