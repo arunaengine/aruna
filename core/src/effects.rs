@@ -24,10 +24,6 @@ pub enum StorageEffect {
         key: Key,
         txn_id: Option<TxnId>,
     },
-    Iter {
-        key_space: KeySpace,
-        txn_id: Option<TxnId>,
-    },
     Write {
         key_space: KeySpace,
         key: Key,
@@ -42,10 +38,18 @@ pub enum StorageEffect {
     AbortTransaction {
         txn_id: TxnId,
     },
-    /// Scan all keys in a keyspace (optionally with a prefix)
-    Scan {
+    /// Iterate over keys in a keyspace with optional prefix and pagination.
+    ///
+    /// Iteration order is lexicographic by key bytes.
+    /// - `prefix`: restricts results to keys with this prefix
+    /// - `start_after`: exclusive cursor key
+    /// - `limit`: maximum number of entries to return
+    Iter {
         key_space: KeySpace,
         prefix: Option<Key>,
+        start_after: Option<Key>,
+        limit: usize,
+        txn_id: Option<TxnId>,
     },
 }
 
@@ -79,6 +83,7 @@ pub enum GossipEffect {
 pub enum StreamEffect {
     Open { node_id: NodeId, alpn: Alpn },
     Send { stream_id: u64, data: Vec<u8> },
+    Recv { stream_id: u64, max_bytes: usize },
     Close { stream_id: u64 },
     RequestOwned { stream_id: u64 },
 }

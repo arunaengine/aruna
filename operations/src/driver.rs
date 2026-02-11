@@ -1,9 +1,13 @@
+use aruna_core::events::{Event, NetEvent};
+use aruna_core::handle::Handle;
 use aruna_core::operation::Operation;
+use aruna_net::NetHandle;
 use aruna_storage::storage;
 
 #[derive(Debug)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
+    pub net_handle: Option<NetHandle>,
 }
 
 pub async fn drive<O: Operation>(
@@ -22,10 +26,28 @@ pub async fn drive<O: Operation>(
                         .await;
                     queue.extend(operation.step(event));
                 }
-                aruna_core::effects::Effect::Net(_) => todo!(),
-                aruna_core::effects::Effect::Task() => todo!(),
-                aruna_core::effects::Effect::Search() => todo!(),
-                aruna_core::effects::Effect::Stream() => todo!(),
+                aruna_core::effects::Effect::Net(net_effect) => {
+                    let event = if let Some(net_handle) = &context.net_handle {
+                        net_handle
+                            .send_effect(aruna_core::effects::Effect::Net(net_effect))
+                            .await
+                    } else {
+                        Event::Net(NetEvent::Error(aruna_core::events::NetError::ChannelClosed))
+                    };
+                    queue.extend(operation.step(event));
+                }
+                aruna_core::effects::Effect::Task() => {
+                    tracing::warn!("Task effect is not handled by driver yet");
+                    queue.extend(operation.step(Event::Task()));
+                }
+                aruna_core::effects::Effect::Search() => {
+                    tracing::warn!("Search effect is not handled by driver yet");
+                    queue.extend(operation.step(Event::Search()));
+                }
+                aruna_core::effects::Effect::Stream() => {
+                    tracing::warn!("Top-level stream effect is not handled by driver yet");
+                    queue.extend(operation.step(Event::Stream()));
+                }
             }
         }
     }
@@ -135,7 +157,10 @@ mod test {
         let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
         let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
 
-        let context = DriverContext { storage_handle };
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
 
         let operation = TestOperation::new();
         let result = drive(operation, &context).await;

@@ -1,111 +1,338 @@
 use std::time::Duration;
 
 use aruna_core::TopicId;
-use aruna_core::effects::{DhtEffect, Effect, GossipEffect, NetEffect};
-use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent};
+use aruna_core::alpn::Alpn;
+use aruna_core::effects::{
+    DhtEffect, Effect, GossipEffect, NetEffect, StorageEffect, StreamEffect,
+};
+use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent, StreamEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::DhtKeyId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::FjallStorage;
+use byteview::ByteView;
 use tempfile::tempdir;
 use ulid::Ulid;
 
 #[tokio::test]
-async fn test_dht_put_get() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().unwrap())?;
-    let handle = NetHandle::new(NetConfig::default(), storage).await?;
+    let storage = FjallStorage::open(temp_dir.path().to_str().ok_or("invalid temp path")?)?;
 
-    let key = [42u8; 32];
-    let value = b"test-value".to_vec();
+    for (k, v) in [
+        (b"a1", b"v1"),
+        (b"a2", b"v2"),
+        (b"a3", b"v3"),
+        (b"b1", b"v4"),
+    ] {
+        let _ = storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: "iter_test".to_string(),
+                key: ByteView::from(*k),
+                value: ByteView::from(*v),
+                txn_id: None,
+            }))
+            .await;
+    }
 
-    // Put
-    let effect = Effect::Net(NetEffect::Dht(DhtEffect::Put {
-        key,
-        value: value.clone(),
-        ttl: Duration::from_secs(3600),
-    }));
+    let first = storage
+        .send_effect(Effect::Storage(StorageEffect::Iter {
+            key_space: "iter_test".to_string(),
+            prefix: Some(ByteView::from(*b"a")),
+            start_after: None,
+            limit: 2,
+            txn_id: None,
+        }))
+        .await;
 
-    let event = handle.send_effect(effect).await;
-    assert!(matches!(
-        event,
-        Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
-    ));
+    let (values, next_start_after) = match first {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => (values, next_start_after),
+        other => panic!("unexpected first iter result: {other:?}"),
+    };
 
-    // Get
-    let effect = Effect::Net(NetEffect::Dht(DhtEffect::Get { key }));
-    let event = handle.send_effect(effect).await;
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].0, ByteView::from(*b"a1"));
+    assert_eq!(values[1].0, ByteView::from(*b"a2"));
+    assert_eq!(next_start_after, Some(ByteView::from(*b"a2")));
 
-    if let Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) = event {
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0].value, value);
-    } else {
-        panic!("Expected GetResult, got {:?}", event);
+    let second = storage
+        .send_effect(Effect::Storage(StorageEffect::Iter {
+            key_space: "iter_test".to_string(),
+            prefix: Some(ByteView::from(*b"a")),
+            start_after: next_start_after,
+            limit: 2,
+            txn_id: None,
+        }))
+        .await;
+
+    match second {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => {
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].0, ByteView::from(*b"a3"));
+            assert!(next_start_after.is_none());
+        }
+        other => panic!("unexpected second iter result: {other:?}"),
     }
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_gossip_subscribe_unsubscribe() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().unwrap())?;
-    let handle = NetHandle::new(NetConfig::default(), storage).await?;
+async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
 
-    let topic = TopicId::realm(Ulid::new());
+    let cfg = || NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        use_dns_discovery: false,
+        ..NetConfig::default()
+    };
 
-    // Subscribe
-    let effect = Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-        topic: topic.clone(),
-    }));
-    let event = handle.send_effect(effect).await;
-    assert!(matches!(
-        event,
-        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
-    ));
+    let handle_a = NetHandle::new(cfg(), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(), storage_b).await?;
 
-    // Unsubscribe
-    let effect = Effect::Net(NetEffect::Gossip(GossipEffect::Unsubscribe { topic }));
-    let event = handle.send_effect(effect).await;
-    assert!(matches!(
-        event,
-        Event::Net(NetEvent::Gossip(GossipEvent::Unsubscribed { .. }))
-    ));
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+
+    let open = handle_a
+        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Open {
+            node_id: handle_b.node_id(),
+            alpn: Alpn::Bao,
+        })))
+        .await;
+    let stream_id_a = match open {
+        Event::Net(NetEvent::Stream(StreamEvent::Opened { stream_id, .. })) => stream_id,
+        other => panic!("unexpected stream open event: {other:?}"),
+    };
+
+    let key = [42u8; 32];
+    let value = b"replicated-value".to_vec();
+
+    let put = handle_a
+        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+            key,
+            value: value.clone(),
+            ttl: Duration::from_secs(3600),
+        })))
+        .await;
+    assert!(
+        matches!(put, Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))),
+        "unexpected put event: {put:?}"
+    );
+
+    let mut found = false;
+    for _ in 0..10 {
+        let get = handle_b
+            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get { key })))
+            .await;
+
+        if let Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) = get
+            && values.iter().any(|entry| entry.value == value)
+        {
+            found = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(found, "expected replicated DHT value on second node");
+
+    let _ = handle_a
+        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Close {
+            stream_id: stream_id_a,
+        })))
+        .await;
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
 
     Ok(())
 }
 
 #[tokio::test]
-async fn test_node_id() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = tempdir()?;
-    let storage = FjallStorage::open(temp_dir.path().to_str().unwrap())?;
-    let handle = NetHandle::new(NetConfig::default(), storage).await?;
+async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
 
-    let node_id = handle.node_id();
-    // Node ID should be non-zero (it's derived from the secret key)
-    assert!(node_id.as_bytes().iter().any(|&b| b != 0));
+    let cfg = || NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        use_dns_discovery: false,
+        ..NetConfig::default()
+    };
 
+    let handle_a = NetHandle::new(cfg(), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(), storage_b).await?;
+
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+
+    let topic = TopicId::realm(Ulid::new());
+
+    let subscribe_a = handle_a
+        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
+            topic: topic.clone(),
+        })))
+        .await;
+    let subscribe_b = handle_b
+        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
+            topic: topic.clone(),
+        })))
+        .await;
+
+    assert!(matches!(
+        subscribe_a,
+        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
+    ));
+    assert!(matches!(
+        subscribe_b,
+        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
+    ));
+
+    let payload = b"hello gossip".to_vec();
+    let mut got_message = false;
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for _ in 0..8 {
+        let broadcast = handle_a
+            .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Broadcast {
+                topic: topic.clone(),
+                message: payload.clone(),
+            })))
+            .await;
+        assert!(matches!(
+            broadcast,
+            Event::Net(NetEvent::Gossip(GossipEvent::BroadcastComplete { .. }))
+        ));
+
+        let maybe = tokio::time::timeout(Duration::from_millis(1200), handle_b.recv_event()).await;
+        if let Ok(Some(NetEvent::Gossip(GossipEvent::Message {
+            topic: recv_topic,
+            data,
+            ..
+        }))) = maybe
+            && recv_topic == topic
+            && data == payload
+        {
+            got_message = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    assert!(got_message, "expected gossip message on second node");
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+
+    let cfg = || NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        use_dns_discovery: false,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(), storage_b).await?;
+
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+
+    let open = handle_a
+        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Open {
+            node_id: handle_b.node_id(),
+            alpn: Alpn::Bao,
+        })))
+        .await;
+
+    let stream_id_a = match open {
+        Event::Net(NetEvent::Stream(StreamEvent::Opened { stream_id, .. })) => stream_id,
+        other => panic!("unexpected open event: {other:?}"),
+    };
+
+    let send = handle_a
+        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Send {
+            stream_id: stream_id_a,
+            data: b"hello stream".to_vec(),
+        })))
+        .await;
+    assert!(matches!(
+        send,
+        Event::Net(NetEvent::Stream(StreamEvent::Sent { .. }))
+    ));
+
+    let incoming = tokio::time::timeout(Duration::from_secs(5), handle_b.recv_event()).await?;
+    let stream_id_b = match incoming {
+        Some(NetEvent::Stream(StreamEvent::Opened { stream_id, .. })) => stream_id,
+        other => panic!("unexpected incoming stream event: {other:?}"),
+    };
+
+    let recv = handle_b
+        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Recv {
+            stream_id: stream_id_b,
+            max_bytes: 1024,
+        })))
+        .await;
+
+    match recv {
+        Event::Net(NetEvent::Stream(StreamEvent::Received { data, .. })) => {
+            assert_eq!(data, b"hello stream".to_vec());
+        }
+        other => panic!("unexpected recv event: {other:?}"),
+    }
+
+    let own = handle_b
+        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::RequestOwned {
+            stream_id: stream_id_b,
+        })))
+        .await;
+    assert!(matches!(
+        own,
+        Event::Net(NetEvent::Stream(StreamEvent::OwnershipReady { .. }))
+    ));
+    assert!(handle_b.take_owned_stream(stream_id_b).is_some());
+
+    let _ = handle_a
+        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Close {
+            stream_id: stream_id_a,
+        })))
+        .await;
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
     Ok(())
 }
 
 #[test]
 fn test_dht_key_id_hashing() {
-    // Test that DhtKeyId::from_data produces consistent hashes
     let key1 = DhtKeyId::from_data(b"test-key");
     let key2 = DhtKeyId::from_data(b"test-key");
     let key3 = DhtKeyId::from_data(b"different-key");
 
-    // Same input produces same hash
     assert_eq!(key1, key2);
     assert_eq!(key1.as_bytes(), key2.as_bytes());
-
-    // Different input produces different hash
     assert_ne!(key1, key3);
-
-    // Hash is non-zero
     assert!(key1.as_bytes().iter().any(|&b| b != 0));
 
-    // Test from_bytes round-trip
     let bytes = *key1.as_bytes();
     let key4 = DhtKeyId::from_bytes(bytes);
     assert_eq!(key1, key4);
@@ -113,27 +340,20 @@ fn test_dht_key_id_hashing() {
 
 #[test]
 fn test_topic_id_creation() {
-    // Test TopicId creation via enum variants
     let realm_id = Ulid::new();
     let topic1 = TopicId::realm(realm_id);
 
-    // Test roundtrip via to_bytes/from_bytes
     let bytes = topic1.to_bytes();
-    let topic2 = TopicId::from_bytes(&bytes).unwrap();
+    let topic2 = TopicId::from_bytes(&bytes).expect("topic roundtrip");
     assert_eq!(topic1, topic2);
 
-    // Test custom topics
     let topic3 = TopicId::custom(b"my-topic".to_vec());
     let topic4 = TopicId::custom(b"my-topic".to_vec());
     let topic5 = TopicId::custom(b"other-topic".to_vec());
 
-    // Same input produces same topic
     assert_eq!(topic3, topic4);
-
-    // Different input produces different topic
     assert_ne!(topic3, topic5);
 
-    // Test conversion to iroh topic (hashes to 32 bytes)
     let iroh_topic = topic1.to_iroh_topic();
     assert!(iroh_topic.as_bytes().iter().any(|&b| b != 0));
 }

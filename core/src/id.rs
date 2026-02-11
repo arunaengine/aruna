@@ -215,7 +215,11 @@ impl fmt::Debug for TopicId {
             Self::Realm(id) => write!(f, "TopicId::Realm({})", id),
             Self::Node(id) => write!(f, "TopicId::Node({})", id),
             Self::Block(id) => write!(f, "TopicId::Block({})", id),
-            Self::Custom(data) => write!(f, "TopicId::Custom({})", hex::encode(&data[..data.len().min(8)])),
+            Self::Custom(data) => write!(
+                f,
+                "TopicId::Custom({})",
+                hex::encode(&data[..data.len().min(8)])
+            ),
         }
     }
 }

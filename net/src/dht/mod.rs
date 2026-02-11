@@ -27,6 +27,7 @@ use aruna_core::id::NodeIdExt;
 
 pub struct DhtService {
     local_id: NodeId,
+    secret_key: iroh::SecretKey,
     client: DhtClient,
     server: Arc<DhtServer>,
     storage: Arc<DhtStorage>,
@@ -43,6 +44,7 @@ impl DhtService {
     ) -> Result<Self> {
         // NodeId is now iroh::PublicKey directly
         let local_id = endpoint.id();
+        let secret_key = endpoint.secret_key().clone();
         let storage = Arc::new(DhtStorage::new(storage_handle));
         let routing_table = Arc::new(RwLock::new(RoutingTable::new(local_id)));
 
@@ -70,6 +72,7 @@ impl DhtService {
 
         Ok(Self {
             local_id,
+            secret_key,
             client,
             server,
             storage,
@@ -94,14 +97,21 @@ impl DhtService {
 
     /// Store a value in the DHT
     pub async fn put(&self, key: &DhtKeyId, value: Vec<u8>, ttl: Duration) -> Result<()> {
-        let expires_at = unix_timestamp_secs().saturating_add(ttl.as_secs());
+        let ttl_secs = ttl.as_secs();
+        let expires_at = unix_timestamp_secs().saturating_add(ttl_secs);
 
-        // Store locally first (no signature for local storage)
+        let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
+        signed_data.extend_from_slice(key.as_bytes());
+        signed_data.extend_from_slice(&value);
+        signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+        let signature = self.secret_key.sign(&signed_data).to_bytes();
+
+        // Store locally first
         let entry = StoredEntry {
             publisher: self.local_id,
             value: value.clone(),
             expires_at,
-            signature: None,
+            signature: Some(signature),
         };
         self.storage.put(key, entry).await;
 
@@ -117,18 +127,38 @@ impl DhtService {
         }
 
         let closest = find_node(&self.client, initial, key.as_bytes()).await;
+        let attempted = closest.len().min(K);
 
-        // Store on closest nodes (no signature for now)
-        put_value(
+        if attempted == 0 {
+            tracing::warn!(?key, "DHT put: lookup produced no replication targets");
+            return Ok(());
+        }
+
+        let stored = put_value(
             &self.client,
             closest,
             key,
             value,
-            ttl.as_secs(),
+            ttl_secs,
             &self.local_id,
-            None, // No signature for now
+            Some(signature),
         )
         .await;
+
+        if stored == 0 {
+            tracing::warn!(
+                ?key,
+                attempted,
+                "DHT put stored value locally but failed remote replication"
+            );
+        } else if stored < attempted {
+            tracing::warn!(
+                ?key,
+                stored,
+                attempted,
+                "DHT put only partially replicated value"
+            );
+        }
 
         Ok(())
     }

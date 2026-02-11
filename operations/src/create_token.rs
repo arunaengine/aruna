@@ -157,7 +157,10 @@ mod test {
         let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
         let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
 
-        let context = DriverContext { storage_handle };
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
 
         let token_config = CreateTokenConfig {
             time: chrono::Utc::now().timestamp() as u64,

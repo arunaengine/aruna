@@ -1,7 +1,7 @@
 // net/src/dht/lookup.rs
 use aruna_core::id::{DhtKeyId, NodeId};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use super::client::DhtClient;
 use super::kbucket::{K, PeerInfo};
@@ -59,14 +59,15 @@ pub async fn find_node(
 ) -> Vec<NodeId> {
     let mut queried: HashSet<[u8; 32]> = HashSet::new();
     let mut heap: BinaryHeap<NodeWithDistance> = BinaryHeap::new();
+    let mut candidates: HashMap<[u8; 32], NodeWithDistance> = HashMap::new();
 
     // Initialize with closest known nodes
     for peer in initial_nodes {
-        let distance = xor_distance(target, peer.node_id.as_bytes());
-        heap.push(NodeWithDistance {
+        let node = NodeWithDistance {
             node_id: peer.node_id,
-            distance,
-        });
+            distance: xor_distance(target, peer.node_id.as_bytes()),
+        };
+        upsert_candidate(&mut candidates, &mut heap, node);
     }
 
     for _ in 0..MAX_ITERATIONS {
@@ -111,18 +112,19 @@ pub async fn find_node(
         for handle in handles {
             if let Ok(Ok(nodes)) = handle.await {
                 for node_id in nodes {
-                    if !queried.contains(node_id.as_bytes()) {
-                        let distance = xor_distance(target, node_id.as_bytes());
-                        heap.push(NodeWithDistance { node_id, distance });
-                    }
+                    let node = NodeWithDistance {
+                        node_id,
+                        distance: xor_distance(target, node_id.as_bytes()),
+                    };
+                    upsert_candidate(&mut candidates, &mut heap, node);
                 }
             }
         }
     }
 
     // Return k closest
-    let mut result: Vec<NodeWithDistance> = heap.into_iter().collect();
-    result.sort();
+    let mut result: Vec<NodeWithDistance> = candidates.into_values().collect();
+    sort_by_closest(&mut result);
     result.truncate(K);
     result.into_iter().map(|nwd| nwd.node_id).collect()
 }
@@ -135,6 +137,7 @@ pub async fn get_value(
 ) -> (Vec<StoredValue>, Vec<NodeId>) {
     let mut queried: HashSet<[u8; 32]> = HashSet::new();
     let mut heap: BinaryHeap<NodeWithDistance> = BinaryHeap::new();
+    let mut candidates: HashMap<[u8; 32], NodeWithDistance> = HashMap::new();
     let mut all_values: Vec<StoredValue> = Vec::new();
 
     // Target is key bytes for distance calculation
@@ -142,11 +145,11 @@ pub async fn get_value(
 
     // Initialize
     for peer in initial_nodes {
-        let distance = xor_distance(target, peer.node_id.as_bytes());
-        heap.push(NodeWithDistance {
+        let node = NodeWithDistance {
             node_id: peer.node_id,
-            distance,
-        });
+            distance: xor_distance(target, peer.node_id.as_bytes()),
+        };
+        upsert_candidate(&mut candidates, &mut heap, node);
     }
 
     for _ in 0..MAX_ITERATIONS {
@@ -190,10 +193,11 @@ pub async fn get_value(
                 all_values.extend(values);
 
                 for node_id in closer_nodes {
-                    if !queried.contains(node_id.as_bytes()) {
-                        let distance = xor_distance(target, node_id.as_bytes());
-                        heap.push(NodeWithDistance { node_id, distance });
-                    }
+                    let node = NodeWithDistance {
+                        node_id,
+                        distance: xor_distance(target, node_id.as_bytes()),
+                    };
+                    upsert_candidate(&mut candidates, &mut heap, node);
                 }
             }
         }
@@ -204,14 +208,31 @@ pub async fn get_value(
         }
     }
 
-    let mut closest: Vec<NodeWithDistance> = heap.into_iter().collect();
-    closest.sort();
+    let mut closest: Vec<NodeWithDistance> = candidates.into_values().collect();
+    sort_by_closest(&mut closest);
     closest.truncate(K);
 
     (
         all_values,
         closest.into_iter().map(|nwd| nwd.node_id).collect(),
     )
+}
+
+fn upsert_candidate(
+    candidates: &mut HashMap<[u8; 32], NodeWithDistance>,
+    heap: &mut BinaryHeap<NodeWithDistance>,
+    node: NodeWithDistance,
+) {
+    let key = *node.node_id.as_bytes();
+    if let std::collections::hash_map::Entry::Vacant(entry) = candidates.entry(key) {
+        entry.insert(node.clone());
+        heap.push(node);
+    }
+}
+
+#[inline]
+fn sort_by_closest(nodes: &mut [NodeWithDistance]) {
+    nodes.sort_by(|a, b| a.distance.cmp(&b.distance));
 }
 
 /// Store value on k closest nodes
@@ -247,4 +268,60 @@ pub async fn put_value(
     }
 
     success_count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_node(seed: u8) -> NodeId {
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    #[test]
+    fn test_binary_heap_pops_closest_first() {
+        let target = [0u8; 32];
+        let mut heap = BinaryHeap::new();
+        let near = make_node(1);
+        let far = make_node(200);
+
+        heap.push(NodeWithDistance {
+            node_id: far,
+            distance: xor_distance(&target, far.as_bytes()),
+        });
+        heap.push(NodeWithDistance {
+            node_id: near,
+            distance: xor_distance(&target, near.as_bytes()),
+        });
+
+        let first = heap.pop().expect("heap has first");
+        let second = heap.pop().expect("heap has second");
+        assert!(first.distance <= second.distance);
+    }
+
+    #[test]
+    fn test_sort_by_closest_uses_ascending_distance() {
+        let mut nodes = vec![
+            NodeWithDistance {
+                node_id: make_node(1),
+                distance: [3u8; 32],
+            },
+            NodeWithDistance {
+                node_id: make_node(2),
+                distance: [1u8; 32],
+            },
+            NodeWithDistance {
+                node_id: make_node(3),
+                distance: [2u8; 32],
+            },
+        ];
+
+        sort_by_closest(&mut nodes);
+
+        assert_eq!(nodes[0].distance, [1u8; 32]);
+        assert_eq!(nodes[1].distance, [2u8; 32]);
+        assert_eq!(nodes[2].distance, [3u8; 32]);
+    }
 }

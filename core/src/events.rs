@@ -15,16 +15,33 @@ pub enum Event {
 
 #[derive(Debug)]
 pub enum StorageEvent {
-    TransactionStarted { txn_id: TxnId },
-    TransactionCommitted { txn_id: TxnId },
-    TransactionAborted { txn_id: TxnId },
-    ReadResult { key: Key, value: Option<Value> },
-    IterResult { values: Vec<(Key, Value)> },
-    WriteResult { key: Key },
-    DeleteResult { key: Key },
-    /// Result of a scan operation, returns all key-value pairs
-    ScanResult { entries: Vec<(Key, Value)> },
-    Error { error: StorageError },
+    TransactionStarted {
+        txn_id: TxnId,
+    },
+    TransactionCommitted {
+        txn_id: TxnId,
+    },
+    TransactionAborted {
+        txn_id: TxnId,
+    },
+    ReadResult {
+        key: Key,
+        value: Option<Value>,
+    },
+    WriteResult {
+        key: Key,
+    },
+    DeleteResult {
+        key: Key,
+    },
+    /// Result of an iteration request with optional pagination cursor.
+    IterResult {
+        values: Vec<(Key, Value)>,
+        next_start_after: Option<Key>,
+    },
+    Error {
+        error: StorageError,
+    },
 }
 
 #[derive(Debug)]

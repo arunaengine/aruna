@@ -241,7 +241,10 @@ mod test {
         let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
         let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
 
-        let context = DriverContext { storage_handle };
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
 
         let group_config = CreateGroupConfig {
             user_id: Ulid::new(),
@@ -266,11 +269,19 @@ mod test {
                     .iter()
                     .any(|user| user == &group_config.user_id)
         }));
-        assert!(result.1.roles.iter().any(|(_id, role)| {
-            role.name == "user"
-        }));
-        assert!(result.1.roles.iter().any(|(_id, role)| {
-            role.name == "viewer"
-        }));
+        assert!(
+            result
+                .1
+                .roles
+                .iter()
+                .any(|(_id, role)| { role.name == "user" })
+        );
+        assert!(
+            result
+                .1
+                .roles
+                .iter()
+                .any(|(_id, role)| { role.name == "viewer" })
+        );
     }
 }

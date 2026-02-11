@@ -91,7 +91,10 @@ mod test {
         // Test setup
         println!("Server setup");
         let storage_handle = storage::FjallStorage::open("/tmp/aruna_test_db").unwrap();
-        let driver_ctx = Arc::new(DriverContext { storage_handle });
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+        });
         let realm_id = Some(RealmId([0u8; 32]));
         let realm_keypair = Some([0u8; 64]);
         let state = ServerState::new(driver_ctx.clone(), realm_keypair, realm_id.clone(), None);
@@ -111,12 +114,10 @@ mod test {
         // Header setup
         println!("Header setup");
         let mut headers = HeaderMap::new();
-        headers
-            .insert(
-                header::AUTHORIZATION,
-                axum::http::HeaderValue::from_str(&format!("Bearer: {}", token)).unwrap(),
-            )
-            .unwrap();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+        );
 
         println!("Test");
         let ctx = extract_auth_context(&state, &headers).await.unwrap();

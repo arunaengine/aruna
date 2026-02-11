@@ -5,7 +5,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::GossipError;
 use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::TopicId;
+use aruna_core::id::{NodeId, TopicId};
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -25,6 +25,7 @@ pub struct GossipService {
     gossip: Gossip,
     storage: StorageHandle,
     subscriptions: Arc<RwLock<HashMap<TopicId, (CancellationToken, GossipSender)>>>,
+    bootstrap_nodes: Arc<RwLock<Vec<NodeId>>>,
     shutdown: CancellationToken,
     /// Channel to forward incoming gossip messages as events to the core event stream
     event_tx: mpsc::Sender<NetEvent>,
@@ -34,6 +35,7 @@ impl GossipService {
     pub async fn new(
         endpoint: Endpoint,
         storage: StorageHandle,
+        bootstrap_nodes: Vec<NodeId>,
         shutdown: CancellationToken,
         event_tx: mpsc::Sender<NetEvent>,
     ) -> Result<Self> {
@@ -43,6 +45,7 @@ impl GossipService {
             gossip,
             storage,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            bootstrap_nodes: Arc::new(RwLock::new(bootstrap_nodes)),
             shutdown,
             event_tx,
         })
@@ -79,9 +82,10 @@ impl GossipService {
 
         let cancel = self.shutdown.child_token();
 
+        let bootstrap_nodes = self.bootstrap_nodes.read().clone();
         let gossip_topic = self
             .gossip
-            .subscribe(topic.to_iroh_topic(), vec![])
+            .subscribe(topic.to_iroh_topic(), bootstrap_nodes)
             .await
             .map_err(|e| NetError::Gossip(e.to_string()))?;
 
@@ -157,6 +161,13 @@ impl GossipService {
         });
 
         Ok(())
+    }
+
+    pub fn add_bootstrap_node(&self, node_id: NodeId) {
+        let mut nodes = self.bootstrap_nodes.write();
+        if !nodes.contains(&node_id) {
+            nodes.push(node_id);
+        }
     }
 
     pub async fn broadcast(&self, topic: TopicId, message: Vec<u8>) -> Result<()> {

@@ -6,7 +6,9 @@ use parking_lot::RwLock;
 use std::sync::Arc;
 
 use super::kbucket::{K, PeerInfo, RoutingTable};
-use super::rpc::{DhtRequest, DhtResponse, ErrorCode, StoredValue, decode_request, encode_response};
+use super::rpc::{
+    DhtRequest, DhtResponse, ErrorCode, StoredValue, decode_request, encode_response,
+};
 use super::storage::{DhtStorage, StoredEntry};
 use crate::error::Result;
 
@@ -120,21 +122,25 @@ impl DhtServer {
                 publisher,
                 signature,
             } => {
-                // Verify signature if present
-                if let Some(sig_bytes) = signature {
-                    // Build signed data: key || value || ttl_secs
-                    let mut signed_data = Vec::new();
-                    signed_data.extend_from_slice(key.as_bytes());
-                    signed_data.extend_from_slice(&value);
-                    signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+                let Some(sig_bytes) = signature else {
+                    return DhtResponse::Error {
+                        code: ErrorCode::InvalidSignature,
+                        message: "Missing publisher signature".to_string(),
+                    };
+                };
 
-                    let sig = iroh::Signature::from_bytes(&sig_bytes);
-                    if publisher.verify(&signed_data, &sig).is_err() {
-                        return DhtResponse::Error {
-                            code: ErrorCode::InvalidSignature,
-                            message: "Invalid publisher signature".to_string(),
-                        };
-                    }
+                // Build signed data: key || value || ttl_secs
+                let mut signed_data = Vec::new();
+                signed_data.extend_from_slice(key.as_bytes());
+                signed_data.extend_from_slice(&value);
+                signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+
+                let sig = iroh::Signature::from_bytes(&sig_bytes);
+                if publisher.verify(&signed_data, &sig).is_err() {
+                    return DhtResponse::Error {
+                        code: ErrorCode::InvalidSignature,
+                        message: "Invalid publisher signature".to_string(),
+                    };
                 }
 
                 let expires_at = unix_timestamp_secs().saturating_add(ttl_secs);
@@ -142,7 +148,7 @@ impl DhtServer {
                     publisher,
                     value,
                     expires_at,
-                    signature,
+                    signature: Some(sig_bytes),
                 };
                 self.storage.put(&key, entry).await;
                 DhtResponse::Stored
@@ -163,6 +169,7 @@ impl std::fmt::Debug for DhtServer {
 mod tests {
     use super::super::kbucket::RoutingTable;
     use super::*;
+    use tempfile::tempdir;
 
     fn make_node(seed: u8) -> NodeId {
         // Generate deterministic keys from seed
@@ -198,5 +205,40 @@ mod tests {
         assert!(!closest.is_empty());
         // Closest to node 2 should be node 2 itself (XOR distance 0)
         assert_eq!(closest[0].node_id, node2);
+    }
+
+    #[tokio::test]
+    async fn test_put_requires_signature() {
+        let local_id = make_node(0);
+        let routing_table = Arc::new(RwLock::new(RoutingTable::new(local_id)));
+
+        let dir = tempdir().expect("create tempdir");
+        let storage_handle = aruna_storage::FjallStorage::open(
+            dir.path()
+                .to_str()
+                .expect("tempdir path should be valid utf8"),
+        )
+        .expect("open test storage");
+
+        let storage = Arc::new(DhtStorage::new(storage_handle));
+        let server = DhtServer::new(local_id, routing_table, storage);
+
+        let response = server
+            .handle_request(DhtRequest::PutValue {
+                key: aruna_core::id::DhtKeyId::from_data(b"unsigned"),
+                value: b"value".to_vec(),
+                ttl_secs: 30,
+                publisher: make_node(1),
+                signature: None,
+            })
+            .await;
+
+        assert!(matches!(
+            response,
+            DhtResponse::Error {
+                code: ErrorCode::InvalidSignature,
+                ..
+            }
+        ));
     }
 }

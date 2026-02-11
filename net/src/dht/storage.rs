@@ -8,6 +8,7 @@ use byteview::ByteView;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const DHT_KEYSPACE: &str = "dht";
+const CLEANUP_PAGE_SIZE: usize = 256;
 
 /// Serde helper for NodeId (iroh::PublicKey)
 mod node_id_serde {
@@ -67,6 +68,7 @@ pub struct StoredEntry {
 
 pub struct DhtStorage {
     storage: StorageHandle,
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for DhtStorage {
@@ -77,7 +79,10 @@ impl std::fmt::Debug for DhtStorage {
 
 impl DhtStorage {
     pub fn new(storage: StorageHandle) -> Self {
-        Self { storage }
+        Self {
+            storage,
+            write_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Get all non-expired entries for a key
@@ -102,6 +107,7 @@ impl DhtStorage {
 
     /// Store a value, deduplicating by publisher
     pub async fn put(&self, key: &DhtKeyId, entry: StoredEntry) {
+        let _guard = self.write_lock.lock().await;
         let mut entries = self.get(key).await;
         let now = unix_timestamp_secs();
 
@@ -125,6 +131,7 @@ impl DhtStorage {
 
     /// Remove expired entries for a key
     pub async fn cleanup(&self, key: &DhtKeyId) {
+        let _guard = self.write_lock.lock().await;
         let entries = self.get(key).await; // Already filters expired
         if entries.is_empty() {
             // Delete the key entirely
@@ -151,56 +158,123 @@ impl DhtStorage {
 
     /// Remove expired entries from all DHT keys
     pub async fn cleanup_all(&self) {
-        // Scan all keys in the DHT keyspace
-        let effect = Effect::Storage(StorageEffect::Scan {
-            key_space: DHT_KEYSPACE.to_string(),
-            prefix: None,
-        });
-
-        let Event::Storage(StorageEvent::ScanResult { entries }) =
-            self.storage.send_effect(effect).await
-        else {
-            return;
-        };
-
+        let _guard = self.write_lock.lock().await;
         let now = unix_timestamp_secs();
+        let mut start_after = None;
 
-        for (key, value) in entries {
-            // Deserialize the stored entries
-            let stored_entries: Vec<StoredEntry> =
-                postcard::from_bytes(&value).unwrap_or_default();
+        loop {
+            let effect = Effect::Storage(StorageEffect::Iter {
+                key_space: DHT_KEYSPACE.to_string(),
+                prefix: None,
+                start_after: start_after.clone(),
+                limit: CLEANUP_PAGE_SIZE,
+                txn_id: None,
+            });
 
-            // Filter out expired entries
-            let valid_entries: Vec<StoredEntry> = stored_entries
-                .into_iter()
-                .filter(|e| e.expires_at > now)
-                .collect();
+            let Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) = self.storage.send_effect(effect).await
+            else {
+                return;
+            };
 
-            if valid_entries.is_empty() {
-                // Delete the key entirely
-                let delete_effect = Effect::Storage(StorageEffect::Delete {
-                    key_space: DHT_KEYSPACE.to_string(),
-                    key,
-                    txn_id: None,
-                });
-                let _ = self.storage.send_effect(delete_effect).await;
-            } else if valid_entries.len()
-                < postcard::from_bytes::<Vec<StoredEntry>>(&value)
-                    .map(|v| v.len())
-                    .unwrap_or(0)
-            {
-                // Some entries were removed, re-store the cleaned list
-                let Ok(data) = postcard::to_allocvec(&valid_entries) else {
-                    continue;
-                };
-                let write_effect = Effect::Storage(StorageEffect::Write {
-                    key_space: DHT_KEYSPACE.to_string(),
-                    key,
-                    value: ByteView::from(data),
-                    txn_id: None,
-                });
-                let _ = self.storage.send_effect(write_effect).await;
+            for (key, value) in values {
+                let stored_entries: Vec<StoredEntry> =
+                    postcard::from_bytes(&value).unwrap_or_default();
+                let original_len = stored_entries.len();
+
+                let valid_entries: Vec<StoredEntry> = stored_entries
+                    .into_iter()
+                    .filter(|e| e.expires_at > now)
+                    .collect();
+
+                if valid_entries.is_empty() {
+                    let delete_effect = Effect::Storage(StorageEffect::Delete {
+                        key_space: DHT_KEYSPACE.to_string(),
+                        key,
+                        txn_id: None,
+                    });
+                    let _ = self.storage.send_effect(delete_effect).await;
+                } else if valid_entries.len() < original_len {
+                    let Ok(data) = postcard::to_allocvec(&valid_entries) else {
+                        continue;
+                    };
+                    let write_effect = Effect::Storage(StorageEffect::Write {
+                        key_space: DHT_KEYSPACE.to_string(),
+                        key,
+                        value: ByteView::from(data),
+                        txn_id: None,
+                    });
+                    let _ = self.storage.send_effect(write_effect).await;
+                }
             }
+
+            if let Some(next) = next_start_after {
+                start_after = Some(next);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn make_node(seed: u8) -> NodeId {
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_puts_preserve_publishers() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let storage = aruna_storage::FjallStorage::open(
+            temp_dir
+                .path()
+                .to_str()
+                .expect("temp path must be valid utf8"),
+        )
+        .expect("open storage");
+
+        let dht_storage = Arc::new(DhtStorage::new(storage));
+        let key = DhtKeyId::from_data(b"concurrent-put");
+        let task_count = 16usize;
+        let barrier = Arc::new(tokio::sync::Barrier::new(task_count));
+
+        let mut tasks = Vec::with_capacity(task_count);
+        for i in 0..task_count {
+            let dht_storage = dht_storage.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut signature = [0u8; 64];
+                signature[0] = i as u8;
+                let entry = StoredEntry {
+                    publisher: make_node((i + 1) as u8),
+                    value: vec![i as u8],
+                    expires_at: unix_timestamp_secs() + 120,
+                    signature: Some(signature),
+                };
+
+                barrier.wait().await;
+                dht_storage.put(&key, entry).await;
+            }));
+        }
+
+        for task in tasks {
+            task.await.expect("task join");
+        }
+
+        let mut entries = dht_storage.get(&key).await;
+        entries.sort_by_key(|entry| entry.value[0]);
+
+        assert_eq!(entries.len(), task_count);
+        for (idx, entry) in entries.iter().enumerate() {
+            assert_eq!(entry.value, vec![idx as u8]);
         }
     }
 }
