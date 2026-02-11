@@ -8,7 +8,7 @@ use aruna_core::effects::{
 use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent, StreamEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::DhtKeyId;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::{InboundNetEvent, NetConfig, NetHandle};
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
 use tempfile::tempdir;
@@ -215,12 +215,13 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
             Event::Net(NetEvent::Gossip(GossipEvent::BroadcastComplete { .. }))
         ));
 
-        let maybe = tokio::time::timeout(Duration::from_millis(1200), handle_b.recv_event()).await;
-        if let Ok(Some(NetEvent::Gossip(GossipEvent::Message {
+        let maybe =
+            tokio::time::timeout(Duration::from_millis(1200), handle_b.recv_inbound_event()).await;
+        if let Ok(Some(InboundNetEvent::GossipMessage {
             topic: recv_topic,
             data,
             ..
-        }))) = maybe
+        })) = maybe
             && recv_topic == topic
             && data == payload
         {
@@ -280,9 +281,10 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
         Event::Net(NetEvent::Stream(StreamEvent::Sent { .. }))
     ));
 
-    let incoming = tokio::time::timeout(Duration::from_secs(5), handle_b.recv_event()).await?;
+    let incoming =
+        tokio::time::timeout(Duration::from_secs(5), handle_b.recv_inbound_event()).await?;
     let stream_id_b = match incoming {
-        Some(NetEvent::Stream(StreamEvent::Opened { stream_id, .. })) => stream_id,
+        Some(InboundNetEvent::StreamOpened { stream_id, .. }) => stream_id,
         other => panic!("unexpected incoming stream event: {other:?}"),
     };
 

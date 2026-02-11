@@ -140,6 +140,7 @@ dependencies = [
  "aruna-core",
  "aruna-net",
  "aruna-storage",
+ "async-trait",
  "byteview",
  "chrono",
  "globset",

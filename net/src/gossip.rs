@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::GossipError;
-use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_storage::StorageHandle;
@@ -18,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::error::{NetError, Result};
+use crate::inbound::InboundNetEvent;
 
 const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
 
@@ -27,8 +27,8 @@ pub struct GossipService {
     subscriptions: Arc<RwLock<HashMap<TopicId, (CancellationToken, GossipSender)>>>,
     bootstrap_nodes: Arc<RwLock<Vec<NodeId>>>,
     shutdown: CancellationToken,
-    /// Channel to forward incoming gossip messages as events to the core event stream
-    event_tx: mpsc::Sender<NetEvent>,
+    /// Channel to forward incoming gossip messages as unsolicited inbound events.
+    event_tx: mpsc::Sender<InboundNetEvent>,
 }
 
 impl GossipService {
@@ -37,7 +37,7 @@ impl GossipService {
         storage: StorageHandle,
         bootstrap_nodes: Vec<NodeId>,
         shutdown: CancellationToken,
-        event_tx: mpsc::Sender<NetEvent>,
+        event_tx: mpsc::Sender<InboundNetEvent>,
     ) -> Result<Self> {
         let gossip = Gossip::builder().spawn(endpoint);
 
@@ -108,14 +108,12 @@ impl GossipService {
                         match event {
                             Some(Ok(event)) => {
                                 if let iroh_gossip::api::Event::Received(msg) = event {
-                                    // Forward incoming message as a GossipEvent::Message
-                                    let gossip_event = GossipEvent::Message {
+                                    let gossip_event = InboundNetEvent::GossipMessage {
                                         topic: topic.clone(),
                                         sender: msg.delivered_from,
                                         data: msg.content.to_vec(),
                                     };
-                                    // Use try_send to avoid blocking on backpressure
-                                    match event_tx.try_send(NetEvent::Gossip(gossip_event)) {
+                                    match event_tx.try_send(gossip_event) {
                                         Ok(()) => {}
                                         Err(mpsc::error::TrySendError::Full(_)) => {
                                             warn!(
@@ -131,13 +129,11 @@ impl GossipService {
                                 }
                             }
                             Some(Err(e)) => {
-                                // Stream error - emit error event and terminate
                                 warn!(topic = %topic, error = %e, "Gossip subscription stream error");
                                 unexpected_termination = true;
                                 break;
                             }
                             None => {
-                                // Stream closed unexpectedly
                                 warn!(topic = %topic, "Gossip subscription stream closed unexpectedly");
                                 unexpected_termination = true;
                                 break;
@@ -146,16 +142,8 @@ impl GossipService {
                     }
                 }
             }
-            // Emit error event if subscription terminated unexpectedly
             if unexpected_termination {
-                let error_event = GossipEvent::Error {
-                    error: GossipError::Other(format!(
-                        "Subscription for topic {} terminated unexpectedly",
-                        topic
-                    )),
-                };
-                // Best-effort send - if channel is full or closed, we can't do much
-                let _ = event_tx.try_send(NetEvent::Gossip(error_event));
+                warn!(topic = %topic, "Subscription terminated unexpectedly");
             }
             subscriptions.write().remove(&topic);
         });

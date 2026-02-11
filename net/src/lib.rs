@@ -2,15 +2,17 @@
 #![deny(unsafe_code)]
 
 pub mod dht;
+mod effect_handlers;
 pub mod error;
 pub mod gossip;
+pub mod inbound;
 pub mod streams;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use aruna_core::effects::{DhtEffect, Effect, GossipEffect, NetEffect, StreamEffect};
-use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StreamEvent};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_storage::StorageHandle;
@@ -18,6 +20,7 @@ use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
+use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +29,7 @@ use tracing::warn;
 pub use dht::DhtService;
 pub use error::{NetError, Result};
 pub use gossip::GossipService;
+pub use inbound::InboundNetEvent;
 pub use streams::StreamsService;
 
 pub struct NetConfig {
@@ -59,6 +63,11 @@ impl std::fmt::Debug for NetConfig {
 
 type EffectHandle = (NetEffect, oneshot::Sender<NetEvent>);
 
+#[async_trait]
+pub trait InboundEventHandler: Send + Sync {
+    async fn handle_inbound(&self, event: InboundNetEvent);
+}
+
 #[derive(Clone)]
 pub struct NetHandle {
     inner: Arc<NetInner>,
@@ -72,7 +81,8 @@ struct NetInner {
     dht: Arc<DhtService>,
     gossip: Arc<GossipService>,
     streams: Arc<StreamsService>,
-    incoming_event_rx: Mutex<mpsc::Receiver<NetEvent>>,
+    inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
+    inbound_event_rx: Mutex<mpsc::Receiver<InboundNetEvent>>,
     shutdown: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -121,7 +131,10 @@ impl NetHandle {
         let node_id = endpoint.id();
         let shutdown = CancellationToken::new();
 
-        let (incoming_event_tx, incoming_event_rx) = mpsc::channel::<NetEvent>(1024);
+        let (raw_inbound_tx, mut raw_inbound_rx) = mpsc::channel::<InboundNetEvent>(1024);
+        let (inbound_event_tx, inbound_event_rx) = mpsc::channel::<InboundNetEvent>(1024);
+        let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
+            Arc::new(RwLock::new(None));
 
         let dht = Arc::new(
             DhtService::new(endpoint.clone(), storage.clone(), shutdown.child_token()).await?,
@@ -139,7 +152,7 @@ impl NetHandle {
                 storage.clone(),
                 config.bootstrap_nodes.clone(),
                 shutdown.child_token(),
-                incoming_event_tx.clone(),
+                raw_inbound_tx.clone(),
             )
             .await?,
         );
@@ -166,21 +179,13 @@ impl NetHandle {
                         let gossip = gossip_for_effects.clone();
                         let streams = streams_for_effects.clone();
                         tokio::spawn(async move {
-                            let event = match effect {
-                                NetEffect::Dht(dht_effect) => handle_dht_effect(&dht, dht_effect).await,
-                                NetEffect::Gossip(gossip_effect) => {
-                                    handle_gossip_effect(&gossip, gossip_effect).await
-                                }
-                                NetEffect::Stream(stream_effect) => {
-                                    handle_stream_effect(
-                                        &streams,
-                                        &dht,
-                                        &gossip,
-                                        stream_effect,
-                                    )
-                                    .await
-                                }
-                            };
+                            let event = effect_handlers::handle_net_effect(
+                                &dht,
+                                &gossip,
+                                &streams,
+                                effect,
+                            )
+                            .await;
                             let _ = response_tx.send(event);
                         });
                     }
@@ -221,7 +226,7 @@ impl NetHandle {
         });
 
         let streams_registry = streams.registry();
-        let event_tx = incoming_event_tx.clone();
+        let event_tx = raw_inbound_tx.clone();
         let dht_for_streams = dht.clone();
         let gossip_for_streams = gossip.clone();
         let stream_task = tokio::spawn(async move {
@@ -230,12 +235,33 @@ impl NetHandle {
                 gossip_for_streams.add_bootstrap_node(peer_id);
 
                 let stream_id = streams_registry.register(send, recv);
-                let opened = NetEvent::Stream(StreamEvent::Opened {
+                let opened = InboundNetEvent::StreamOpened {
                     stream_id,
                     node_id: peer_id,
-                });
+                };
                 if event_tx.try_send(opened).is_err() {
                     warn!("Incoming event channel full; dropping inbound stream event");
+                }
+            }
+        });
+
+        let inbound_handler_for_dispatch = inbound_handler.clone();
+        let shutdown_for_dispatch = shutdown.clone();
+        let inbound_dispatch_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_for_dispatch.cancelled() => break,
+                    maybe_event = raw_inbound_rx.recv() => {
+                        let Some(event) = maybe_event else { break };
+                        let handler = inbound_handler_for_dispatch.read().clone();
+                        if let Some(handler) = handler {
+                            tokio::spawn(async move {
+                                handler.handle_inbound(event).await;
+                            });
+                        } else if inbound_event_tx.try_send(event).is_err() {
+                            warn!("Inbound event channel full; dropping inbound event");
+                        }
+                    }
                 }
             }
         });
@@ -261,13 +287,15 @@ impl NetHandle {
             dht,
             gossip,
             streams,
-            incoming_event_rx: Mutex::new(incoming_event_rx),
+            inbound_handler,
+            inbound_event_rx: Mutex::new(inbound_event_rx),
             shutdown,
             tasks: Mutex::new(vec![
                 effect_task,
                 dht_task,
                 gossip_task,
                 stream_task,
+                inbound_dispatch_task,
                 accept_task,
             ]),
         });
@@ -299,8 +327,16 @@ impl NetHandle {
         self.inner.streams.take_owned_stream(stream_id)
     }
 
-    pub async fn recv_event(&self) -> Option<NetEvent> {
-        let mut rx = self.inner.incoming_event_rx.lock().await;
+    pub fn set_inbound_handler(&self, handler: Arc<dyn InboundEventHandler>) {
+        *self.inner.inbound_handler.write() = Some(handler);
+    }
+
+    pub fn clear_inbound_handler(&self) {
+        self.inner.inbound_handler.write().take();
+    }
+
+    pub async fn recv_inbound_event(&self) -> Option<InboundNetEvent> {
+        let mut rx = self.inner.inbound_event_rx.lock().await;
         rx.recv().await
     }
 
@@ -354,112 +390,6 @@ impl Handle for NetHandle {
                 }
             }
             _ => Event::Net(NetEvent::Error(aruna_core::events::NetError::InvalidEffect)),
-        }
-    }
-}
-
-async fn handle_dht_effect(dht: &DhtService, effect: DhtEffect) -> NetEvent {
-    match effect {
-        DhtEffect::Put { key, value, ttl } => {
-            let key_id = aruna_core::id::DhtKeyId::from_bytes(key);
-            match dht.put(&key_id, value, ttl).await {
-                Ok(()) => NetEvent::Dht(DhtEvent::PutComplete { key }),
-                Err(e) => NetEvent::Dht(DhtEvent::Error {
-                    error: aruna_core::errors::DhtError::StoreFailed(e.to_string()),
-                }),
-            }
-        }
-        DhtEffect::Get { key } => {
-            let key_id = aruna_core::id::DhtKeyId::from_bytes(key);
-            match dht.get(&key_id).await {
-                Ok(values) => NetEvent::Dht(DhtEvent::GetResult { key, values }),
-                Err(e) => NetEvent::Dht(DhtEvent::Error {
-                    error: aruna_core::errors::DhtError::Other(e.to_string()),
-                }),
-            }
-        }
-    }
-}
-
-async fn handle_gossip_effect(gossip: &GossipService, effect: GossipEffect) -> NetEvent {
-    match effect {
-        GossipEffect::Subscribe { topic } => match gossip.subscribe(topic.clone()).await {
-            Ok(()) => NetEvent::Gossip(GossipEvent::Subscribed { topic }),
-            Err(e) => NetEvent::Gossip(GossipEvent::Error {
-                error: aruna_core::errors::GossipError::Other(e.to_string()),
-            }),
-        },
-        GossipEffect::Broadcast { topic, message } => {
-            match gossip.broadcast(topic.clone(), message).await {
-                Ok(()) => NetEvent::Gossip(GossipEvent::BroadcastComplete { topic }),
-                Err(e) => NetEvent::Gossip(GossipEvent::Error {
-                    error: aruna_core::errors::GossipError::BroadcastFailed(e.to_string()),
-                }),
-            }
-        }
-        GossipEffect::Unsubscribe { topic } => match gossip.unsubscribe(topic.clone()).await {
-            Ok(()) => NetEvent::Gossip(GossipEvent::Unsubscribed { topic }),
-            Err(e) => NetEvent::Gossip(GossipEvent::Error {
-                error: aruna_core::errors::GossipError::Other(e.to_string()),
-            }),
-        },
-    }
-}
-
-async fn handle_stream_effect(
-    streams: &StreamsService,
-    dht: &DhtService,
-    gossip: &GossipService,
-    effect: StreamEffect,
-) -> NetEvent {
-    match effect {
-        StreamEffect::Open { node_id, alpn } => {
-            dht.add_peer(node_id).await;
-            gossip.add_bootstrap_node(node_id);
-
-            match streams.open(node_id, alpn).await {
-                Ok(stream_id) => NetEvent::Stream(StreamEvent::Opened { stream_id, node_id }),
-                Err(e) => NetEvent::Stream(StreamEvent::Error {
-                    stream_id: 0,
-                    error: aruna_core::errors::StreamError::ConnectionFailed(e.to_string()),
-                }),
-            }
-        }
-        StreamEffect::Send { stream_id, data } => match streams.send(stream_id, data).await {
-            Ok(bytes_sent) => NetEvent::Stream(StreamEvent::Sent {
-                stream_id,
-                bytes_sent,
-            }),
-            Err(e) => NetEvent::Stream(StreamEvent::Error {
-                stream_id,
-                error: aruna_core::errors::StreamError::Other(e.to_string()),
-            }),
-        },
-        StreamEffect::Recv {
-            stream_id,
-            max_bytes,
-        } => match streams.recv(stream_id, max_bytes).await {
-            Ok(data) => NetEvent::Stream(StreamEvent::Received { stream_id, data }),
-            Err(e) => NetEvent::Stream(StreamEvent::Error {
-                stream_id,
-                error: aruna_core::errors::StreamError::Other(e.to_string()),
-            }),
-        },
-        StreamEffect::Close { stream_id } => {
-            streams.close(stream_id);
-            NetEvent::Stream(StreamEvent::Closed { stream_id })
-        }
-        StreamEffect::RequestOwned { stream_id } => {
-            if streams.request_owned(stream_id) {
-                NetEvent::Stream(StreamEvent::OwnershipReady { stream_id })
-            } else {
-                NetEvent::Stream(StreamEvent::Error {
-                    stream_id,
-                    error: aruna_core::errors::StreamError::Other(
-                        "Stream not found or busy".to_string(),
-                    ),
-                })
-            }
         }
     }
 }
