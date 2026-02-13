@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crate::alpn::Alpn;
 use crate::id::NodeId;
+use crate::state_machine::StateMachineConfig;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 
 pub enum Effect {
@@ -74,16 +75,21 @@ pub enum DhtEffect {
 
 #[derive(Debug, Clone)]
 pub enum GossipEffect {
-    Subscribe { topic: TopicId },
-    Broadcast { topic: TopicId, message: Vec<u8> },
-    Unsubscribe { topic: TopicId },
+    Subscribe {
+        topic: TopicId,
+        state_machine: StateMachineConfig,
+    },
+    Broadcast {
+        topic: TopicId,
+        message: Vec<u8>,
+    },
+    Unsubscribe {
+        topic: TopicId,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub enum StreamEffect {
     Open { node_id: NodeId, alpn: Alpn },
-    Send { stream_id: u64, data: Vec<u8> },
-    Recv { stream_id: u64, max_bytes: usize },
     Close { stream_id: u64 },
-    RequestOwned { stream_id: u64 },
 }

@@ -106,8 +106,8 @@ impl NetHandle {
             .secret_key(secret_key)
             .address_lookup(address_lookup.clone())
             .alpns(vec![
-                dht::rpc::DHT_ALPN.to_vec(),
-                iroh_gossip::net::GOSSIP_ALPN.to_vec(),
+                aruna_core::alpn::Alpn::Dht.as_bytes().to_vec(),
+                aruna_core::alpn::Alpn::Gossip.as_bytes().to_vec(),
                 aruna_core::alpn::Alpn::Bao.as_bytes().to_vec(),
                 aruna_core::alpn::Alpn::Automerge.as_bytes().to_vec(),
             ]);
@@ -150,6 +150,7 @@ impl NetHandle {
             GossipService::new(
                 endpoint.clone(),
                 storage.clone(),
+                dht.clone(),
                 config.bootstrap_nodes.clone(),
                 shutdown.child_token(),
                 raw_inbound_tx.clone(),
@@ -225,8 +226,8 @@ impl NetHandle {
             }
         });
 
-        let streams_registry = streams.registry();
         let event_tx = raw_inbound_tx.clone();
+        let streams_for_streams = streams.clone();
         let dht_for_streams = dht.clone();
         let gossip_for_streams = gossip.clone();
         let stream_task = tokio::spawn(async move {
@@ -234,7 +235,13 @@ impl NetHandle {
                 dht_for_streams.add_peer(peer_id).await;
                 gossip_for_streams.add_bootstrap_node(peer_id);
 
-                let stream_id = streams_registry.register(send, recv);
+                let stream_id = match streams_for_streams.register_incoming(send, recv) {
+                    Ok(stream_id) => stream_id,
+                    Err(err) => {
+                        warn!(error = %err, "Failed to register inbound stream");
+                        continue;
+                    }
+                };
                 let opened = InboundNetEvent::StreamOpened {
                     stream_id,
                     node_id: peer_id,

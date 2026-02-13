@@ -43,7 +43,10 @@ async fn handle_dht_effect(dht: &DhtService, effect: DhtEffect) -> NetEvent {
 
 async fn handle_gossip_effect(gossip: &GossipService, effect: GossipEffect) -> NetEvent {
     match effect {
-        GossipEffect::Subscribe { topic } => match gossip.subscribe(topic.clone()).await {
+        GossipEffect::Subscribe {
+            topic,
+            state_machine,
+        } => match gossip.subscribe(topic.clone(), state_machine).await {
             Ok(()) => NetEvent::Gossip(GossipEvent::Subscribed { topic }),
             Err(e) => NetEvent::Gossip(GossipEvent::Error {
                 error: aruna_core::errors::GossipError::Other(e.to_string()),
@@ -85,41 +88,9 @@ async fn handle_stream_effect(
                 }),
             }
         }
-        StreamEffect::Send { stream_id, data } => match streams.send(stream_id, data).await {
-            Ok(bytes_sent) => NetEvent::Stream(StreamEvent::Sent {
-                stream_id,
-                bytes_sent,
-            }),
-            Err(e) => NetEvent::Stream(StreamEvent::Error {
-                stream_id,
-                error: aruna_core::errors::StreamError::Other(e.to_string()),
-            }),
-        },
-        StreamEffect::Recv {
-            stream_id,
-            max_bytes,
-        } => match streams.recv(stream_id, max_bytes).await {
-            Ok(data) => NetEvent::Stream(StreamEvent::Received { stream_id, data }),
-            Err(e) => NetEvent::Stream(StreamEvent::Error {
-                stream_id,
-                error: aruna_core::errors::StreamError::Other(e.to_string()),
-            }),
-        },
         StreamEffect::Close { stream_id } => {
             streams.close(stream_id);
             NetEvent::Stream(StreamEvent::Closed { stream_id })
-        }
-        StreamEffect::RequestOwned { stream_id } => {
-            if streams.request_owned(stream_id) {
-                NetEvent::Stream(StreamEvent::OwnershipReady { stream_id })
-            } else {
-                NetEvent::Stream(StreamEvent::Error {
-                    stream_id,
-                    error: aruna_core::errors::StreamError::Other(
-                        "Stream not found or busy".to_string(),
-                    ),
-                })
-            }
         }
     }
 }

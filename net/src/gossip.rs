@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
+use aruna_core::state_machine::StateMachineConfig;
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -16,15 +18,32 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::DhtService;
 use crate::error::{NetError, Result};
 use crate::inbound::InboundNetEvent;
 
 const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
+const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Debug)]
+struct TopicSubscription {
+    cancel: CancellationToken,
+    sender: GossipSender,
+    state_machine: StateMachineConfig,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedSubscription {
+    topic: TopicId,
+    state_machine: StateMachineConfig,
+}
 
 pub struct GossipService {
     gossip: Gossip,
     storage: StorageHandle,
-    subscriptions: Arc<RwLock<HashMap<TopicId, (CancellationToken, GossipSender)>>>,
+    dht: Arc<DhtService>,
+    local_node_id: NodeId,
+    subscriptions: Arc<RwLock<HashMap<TopicId, TopicSubscription>>>,
     bootstrap_nodes: Arc<RwLock<Vec<NodeId>>>,
     shutdown: CancellationToken,
     /// Channel to forward incoming gossip messages as unsolicited inbound events.
@@ -35,15 +54,19 @@ impl GossipService {
     pub async fn new(
         endpoint: Endpoint,
         storage: StorageHandle,
+        dht: Arc<DhtService>,
         bootstrap_nodes: Vec<NodeId>,
         shutdown: CancellationToken,
         event_tx: mpsc::Sender<InboundNetEvent>,
     ) -> Result<Self> {
         let gossip = Gossip::builder().spawn(endpoint);
+        let local_node_id = dht.local_id();
 
         Ok(Self {
             gossip,
             storage,
+            dht,
+            local_node_id,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             bootstrap_nodes: Arc::new(RwLock::new(bootstrap_nodes)),
             shutdown,
@@ -66,23 +89,26 @@ impl GossipService {
             value: Some(data), ..
         }) = self.storage.send_effect(effect).await
         {
-            let topics: Vec<TopicId> = postcard::from_bytes(&data).unwrap_or_default();
-            for topic in topics {
-                let _ = self.subscribe(topic).await;
+            for persisted in decode_persisted_subscriptions(&data) {
+                let _ = self
+                    .subscribe(persisted.topic, persisted.state_machine)
+                    .await;
             }
         }
 
         Ok(())
     }
 
-    pub async fn subscribe(&self, topic: TopicId) -> Result<()> {
+    pub async fn subscribe(&self, topic: TopicId, state_machine: StateMachineConfig) -> Result<()> {
         if self.subscriptions.read().contains_key(&topic) {
             return Err(NetError::Gossip("Already subscribed".to_string()));
         }
 
+        self.announce_topic_subscription(&topic).await?;
+        let bootstrap_nodes = self.lookup_topic_bootstrap_nodes(&topic).await?;
+
         let cancel = self.shutdown.child_token();
 
-        let bootstrap_nodes = self.bootstrap_nodes.read().clone();
         let gossip_topic = self
             .gossip
             .subscribe(topic.to_iroh_topic(), bootstrap_nodes)
@@ -91,13 +117,19 @@ impl GossipService {
 
         let (sender, mut stream) = gossip_topic.split();
 
-        self.subscriptions
-            .write()
-            .insert(topic.clone(), (cancel.clone(), sender));
+        self.subscriptions.write().insert(
+            topic.clone(),
+            TopicSubscription {
+                cancel: cancel.clone(),
+                sender,
+                state_machine: state_machine.clone(),
+            },
+        );
         self.persist_subscriptions().await;
 
         let subscriptions = self.subscriptions.clone();
         let event_tx = self.event_tx.clone();
+        let configured_state_machine = state_machine;
         tokio::spawn(async move {
             use futures::stream::StreamExt;
             let mut unexpected_termination = false;
@@ -112,6 +144,7 @@ impl GossipService {
                                         topic: topic.clone(),
                                         sender: msg.delivered_from,
                                         data: msg.content.to_vec(),
+                                        state_machine: configured_state_machine.clone(),
                                     };
                                     match event_tx.try_send(gossip_event) {
                                         Ok(()) => {}
@@ -158,11 +191,51 @@ impl GossipService {
         }
     }
 
+    async fn announce_topic_subscription(&self, topic: &TopicId) -> Result<()> {
+        let dht_key = aruna_core::keys::gossip_peer_key(topic);
+        self.dht
+            .put(
+                &dht_key,
+                self.local_node_id.as_bytes().to_vec(),
+                GOSSIP_TOPIC_ANNOUNCE_TTL,
+            )
+            .await
+            .map_err(|e| NetError::Gossip(format!("Failed to announce gossip topic in DHT: {e}")))
+    }
+
+    async fn lookup_topic_bootstrap_nodes(&self, topic: &TopicId) -> Result<Vec<NodeId>> {
+        let dht_key = aruna_core::keys::gossip_peer_key(topic);
+        let entries = self.dht.get(&dht_key).await.map_err(|e| {
+            NetError::Gossip(format!(
+                "Failed to lookup gossip topic bootstrap nodes: {e}"
+            ))
+        })?;
+
+        let configured_nodes = self.bootstrap_nodes.read().clone();
+        let mut seen = HashSet::new();
+        let mut bootstrap_nodes = Vec::new();
+
+        for node_id in entries
+            .into_iter()
+            .map(|entry| entry.node_id)
+            .chain(configured_nodes.into_iter())
+        {
+            if node_id == self.local_node_id {
+                continue;
+            }
+            if seen.insert(node_id) {
+                bootstrap_nodes.push(node_id);
+            }
+        }
+
+        Ok(bootstrap_nodes)
+    }
+
     pub async fn broadcast(&self, topic: TopicId, message: Vec<u8>) -> Result<()> {
         let sender = {
             let guard = self.subscriptions.read();
             match guard.get(&topic) {
-                Some((_, sender)) => sender.clone(),
+                Some(subscription) => subscription.sender.clone(),
                 None => return Err(NetError::Gossip("Not subscribed".to_string())),
             }
         };
@@ -177,8 +250,8 @@ impl GossipService {
 
     pub async fn unsubscribe(&self, topic: TopicId) -> Result<()> {
         let removed = self.subscriptions.write().remove(&topic);
-        if let Some((cancel, _sender)) = removed {
-            cancel.cancel();
+        if let Some(subscription) = removed {
+            subscription.cancel.cancel();
             self.persist_subscriptions().await;
             Ok(())
         } else {
@@ -187,8 +260,17 @@ impl GossipService {
     }
 
     async fn persist_subscriptions(&self) {
-        let topics: Vec<TopicId> = self.subscriptions.read().keys().cloned().collect();
-        let Ok(data) = postcard::to_allocvec(&topics) else {
+        let persisted: Vec<PersistedSubscription> = self
+            .subscriptions
+            .read()
+            .iter()
+            .map(|(topic, subscription)| PersistedSubscription {
+                topic: topic.clone(),
+                state_machine: subscription.state_machine.clone(),
+            })
+            .collect();
+
+        let Ok(data) = postcard::to_allocvec(&persisted) else {
             // Serialization failed - skip persisting
             return;
         };
@@ -202,6 +284,21 @@ impl GossipService {
 
         let _ = self.storage.send_effect(effect).await;
     }
+}
+
+fn decode_persisted_subscriptions(bytes: &[u8]) -> Vec<PersistedSubscription> {
+    if let Ok(subscriptions) = postcard::from_bytes::<Vec<PersistedSubscription>>(bytes) {
+        return subscriptions;
+    }
+
+    postcard::from_bytes::<Vec<TopicId>>(bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|topic| PersistedSubscription {
+            topic,
+            state_machine: StateMachineConfig::default(),
+        })
+        .collect()
 }
 
 impl std::fmt::Debug for GossipService {

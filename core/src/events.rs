@@ -68,32 +68,16 @@ pub struct DhtEntry {
 
 #[derive(Debug)]
 pub enum GossipEvent {
-    Subscribed {
-        topic: TopicId,
-    },
-    BroadcastComplete {
-        topic: TopicId,
-    },
-    Message {
-        topic: TopicId,
-        sender: NodeId,
-        data: Vec<u8>,
-    },
-    Unsubscribed {
-        topic: TopicId,
-    },
-    Error {
-        error: GossipError,
-    },
+    Subscribed { topic: TopicId },
+    BroadcastComplete { topic: TopicId },
+    Unsubscribed { topic: TopicId },
+    Error { error: GossipError },
 }
 
 #[derive(Debug)]
 pub enum StreamEvent {
     Opened { stream_id: u64, node_id: NodeId },
-    Sent { stream_id: u64, bytes_sent: usize },
-    Received { stream_id: u64, data: Vec<u8> },
     Closed { stream_id: u64 },
-    OwnershipReady { stream_id: u64 },
     Error { stream_id: u64, error: StreamError },
 }
 

@@ -8,6 +8,7 @@ use aruna_core::effects::{
 use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent, StreamEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::DhtKeyId;
+use aruna_core::state_machine::StateMachineConfig;
 use aruna_net::{InboundNetEvent, NetConfig, NetHandle};
 use aruna_storage::FjallStorage;
 use byteview::ByteView;
@@ -182,11 +183,13 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
     let subscribe_a = handle_a
         .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
             topic: topic.clone(),
+            state_machine: StateMachineConfig::incoming_gossip_message(),
         })))
         .await;
     let subscribe_b = handle_b
         .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
             topic: topic.clone(),
+            state_machine: StateMachineConfig::incoming_gossip_message(),
         })))
         .await;
 
@@ -270,16 +273,13 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
         other => panic!("unexpected open event: {other:?}"),
     };
 
-    let send = handle_a
-        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Send {
-            stream_id: stream_id_a,
-            data: b"hello stream".to_vec(),
-        })))
-        .await;
-    assert!(matches!(
-        send,
-        Event::Net(NetEvent::Stream(StreamEvent::Sent { .. }))
-    ));
+    let (mut send_a, _recv_a) = handle_a
+        .take_owned_stream(stream_id_a)
+        .expect("outbound stream should be available as owned handle");
+    send_a
+        .write_all(b"hello stream")
+        .await
+        .map_err(|e| std::io::Error::other(format!("failed to write outbound stream data: {e}")))?;
 
     let incoming =
         tokio::time::timeout(Duration::from_secs(5), handle_b.recv_inbound_event()).await?;
@@ -288,30 +288,20 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
         other => panic!("unexpected incoming stream event: {other:?}"),
     };
 
-    let recv = handle_b
-        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Recv {
-            stream_id: stream_id_b,
-            max_bytes: 1024,
-        })))
-        .await;
-
-    match recv {
-        Event::Net(NetEvent::Stream(StreamEvent::Received { data, .. })) => {
-            assert_eq!(data, b"hello stream".to_vec());
-        }
-        other => panic!("unexpected recv event: {other:?}"),
-    }
-
-    let own = handle_b
-        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::RequestOwned {
-            stream_id: stream_id_b,
-        })))
-        .await;
-    assert!(matches!(
-        own,
-        Event::Net(NetEvent::Stream(StreamEvent::OwnershipReady { .. }))
-    ));
-    assert!(handle_b.take_owned_stream(stream_id_b).is_some());
+    let (_send_b, mut recv_b) = handle_b
+        .take_owned_stream(stream_id_b)
+        .expect("inbound stream should be available as owned handle");
+    let chunk = recv_b
+        .read_chunk(1024)
+        .await
+        .map_err(|e| std::io::Error::other(format!("failed to read inbound stream data: {e}")))?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "inbound stream closed without data",
+            )
+        })?;
+    assert_eq!(chunk.bytes.to_vec(), b"hello stream".to_vec());
 
     let _ = handle_a
         .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Close {
@@ -349,9 +339,9 @@ fn test_topic_id_creation() {
     let topic2 = TopicId::from_bytes(&bytes).expect("topic roundtrip");
     assert_eq!(topic1, topic2);
 
-    let topic3 = TopicId::custom(b"my-topic".to_vec());
-    let topic4 = TopicId::custom(b"my-topic".to_vec());
-    let topic5 = TopicId::custom(b"other-topic".to_vec());
+    let topic3 = TopicId::content_hash([0x11; 32]);
+    let topic4 = TopicId::content_hash([0x11; 32]);
+    let topic5 = TopicId::content_hash([0x22; 32]);
 
     assert_eq!(topic3, topic4);
     assert_ne!(topic3, topic5);

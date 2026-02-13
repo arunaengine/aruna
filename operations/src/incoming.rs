@@ -3,6 +3,7 @@ use std::sync::Arc;
 use aruna_core::events::Event;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_core::operation::Operation;
+use aruna_core::state_machine::StateMachineId;
 use aruna_net::{InboundEventHandler, InboundNetEvent};
 use async_trait::async_trait;
 use smallvec::smallvec;
@@ -45,12 +46,21 @@ impl InboundEventHandler for OperationsInboundHandler {
                 topic,
                 sender,
                 data,
-            } => {
-                let op = IncomingGossipMessageOperation::new(topic, sender, data);
-                if let Err(err) = drive(op, self.context.as_ref()).await {
-                    error!(error = ?err, "Failed to process inbound gossip event");
+                state_machine,
+            } => match &state_machine.id {
+                StateMachineId::IncomingGossipMessage => {
+                    let op = IncomingGossipMessageOperation::new(topic, sender, data);
+                    if let Err(err) = drive(op, self.context.as_ref()).await {
+                        error!(error = ?err, "Failed to process inbound gossip event");
+                    }
                 }
-            }
+                StateMachineId::Named(name) => {
+                    warn!(
+                        state_machine = %name,
+                        "No inbound handler registered for configured state machine"
+                    );
+                }
+            },
             InboundNetEvent::StreamOpened { stream_id, node_id } => {
                 let op = IncomingStreamOpenedOperation::new(stream_id, node_id);
                 if let Err(err) = drive(op, self.context.as_ref()).await {

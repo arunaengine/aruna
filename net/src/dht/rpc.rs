@@ -1,7 +1,7 @@
 use aruna_core::id::{DhtKeyId, NodeId};
 use serde::{Deserialize, Serialize};
 
-pub const DHT_ALPN: &[u8] = b"aruna/dht/1";
+pub const DHT_ALPN: &[u8] = aruna_core::alpn::Alpn::Dht.as_bytes();
 
 /// Serde helper for NodeId (iroh::PublicKey)
 mod node_id_serde {

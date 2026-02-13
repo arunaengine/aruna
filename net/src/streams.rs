@@ -6,13 +6,11 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use iroh::Endpoint;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
-use iroh_gossip::net::GOSSIP_ALPN;
 use parking_lot::{Mutex as ParkingMutex, RwLock};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::dht::rpc::DHT_ALPN;
 use crate::error::{NetError, Result};
 
 pub type BiStream = (SendStream, RecvStream);
@@ -79,54 +77,6 @@ impl StreamRegistry {
     pub fn close(&self, id: u64) {
         self.streams.write().insert(id, StreamState::Closed);
     }
-
-    pub async fn send(&self, id: u64, data: &[u8]) -> Result<usize> {
-        let send_stream = {
-            let streams = self.streams.read();
-            match streams.get(&id) {
-                Some(StreamState::Active { send, .. }) => send.clone(),
-                Some(StreamState::Owned) => {
-                    return Err(NetError::Stream("Stream is owned".to_string()));
-                }
-                Some(StreamState::Closed) | None => {
-                    return Err(NetError::Stream("Stream not found or closed".to_string()));
-                }
-            }
-        };
-
-        let mut stream = send_stream.lock().await;
-        stream
-            .write_all(data)
-            .await
-            .map_err(|e| NetError::Stream(e.to_string()))?;
-
-        Ok(data.len())
-    }
-
-    pub async fn recv(&self, id: u64, max_bytes: usize) -> Result<Vec<u8>> {
-        let recv_stream = {
-            let streams = self.streams.read();
-            match streams.get(&id) {
-                Some(StreamState::Active { recv, .. }) => recv.clone(),
-                Some(StreamState::Owned) => {
-                    return Err(NetError::Stream("Stream is owned".to_string()));
-                }
-                Some(StreamState::Closed) | None => {
-                    return Err(NetError::Stream("Stream not found or closed".to_string()));
-                }
-            }
-        };
-
-        let mut stream = recv_stream.lock().await;
-        match stream
-            .read_chunk(max_bytes.max(1))
-            .await
-            .map_err(|e| NetError::Stream(e.to_string()))?
-        {
-            Some(chunk) => Ok(chunk.bytes.to_vec()),
-            None => Err(NetError::Stream("Stream closed".to_string())),
-        }
-    }
 }
 
 impl Default for StreamRegistry {
@@ -161,8 +111,17 @@ impl StreamsService {
         }
     }
 
-    pub fn registry(&self) -> Arc<StreamRegistry> {
-        self.registry.clone()
+    fn register_owned(&self, send: SendStream, recv: RecvStream) -> Result<u64> {
+        let stream_id = self.registry.register(send, recv);
+        let Some(streams) = self.registry.take_owned(stream_id) else {
+            self.registry.close(stream_id);
+            return Err(NetError::Stream(
+                "Failed to acquire ownership of newly opened stream".to_string(),
+            ));
+        };
+
+        self.owned_streams.lock().insert(stream_id, streams);
+        Ok(stream_id)
     }
 
     pub async fn open(&self, node_id: NodeId, alpn: Alpn) -> Result<u64> {
@@ -177,20 +136,11 @@ impl StreamsService {
             .await
             .map_err(|e| NetError::Stream(e.to_string()))?;
 
-        Ok(self.registry.register(send, recv))
+        self.register_owned(send, recv)
     }
 
-    pub fn request_owned(&self, stream_id: u64) -> bool {
-        if self.owned_streams.lock().contains_key(&stream_id) {
-            return true;
-        }
-
-        if let Some(streams) = self.registry.take_owned(stream_id) {
-            self.owned_streams.lock().insert(stream_id, streams);
-            true
-        } else {
-            false
-        }
+    pub fn register_incoming(&self, send: SendStream, recv: RecvStream) -> Result<u64> {
+        self.register_owned(send, recv)
     }
 
     pub fn take_owned_stream(&self, stream_id: u64) -> Option<BiStream> {
@@ -200,14 +150,6 @@ impl StreamsService {
     pub fn close(&self, stream_id: u64) {
         self.registry.close(stream_id);
         self.owned_streams.lock().remove(&stream_id);
-    }
-
-    pub async fn send(&self, stream_id: u64, data: Vec<u8>) -> Result<usize> {
-        self.registry.send(stream_id, &data).await
-    }
-
-    pub async fn recv(&self, stream_id: u64, max_bytes: usize) -> Result<Vec<u8>> {
-        self.registry.recv(stream_id, max_bytes).await
     }
 }
 
@@ -250,25 +192,30 @@ pub async fn run_accept_loop(
                     let alpn_bytes = conn.alpn().to_vec();
                     let peer_id = conn.remote_id();
 
-                    if alpn_bytes == DHT_ALPN {
-                        let (send, recv) = match conn.accept_bi().await {
-                            Ok(streams) => streams,
-                            Err(_) => return,
-                        };
-                        let _ = dht_handler.send((send, recv, peer_id)).await;
-                    } else if alpn_bytes == GOSSIP_ALPN {
-                        let _ = gossip_handler.send((conn, peer_id)).await;
-                    } else if let Some(alpn) = Alpn::from_bytes(&alpn_bytes) {
-                        let (send, recv) = match conn.accept_bi().await {
-                            Ok(streams) => streams,
-                            Err(_) => return,
-                        };
-                        let _ = stream_handler.send((alpn, send, recv, peer_id)).await;
-                    } else {
-                        warn!(
-                            "Dropping incoming connection with unknown ALPN: {:?}",
-                            alpn_bytes
-                        );
+                    match Alpn::from_bytes(&alpn_bytes) {
+                        Some(Alpn::Dht) => {
+                            let (send, recv) = match conn.accept_bi().await {
+                                Ok(streams) => streams,
+                                Err(_) => return,
+                            };
+                            let _ = dht_handler.send((send, recv, peer_id)).await;
+                        }
+                        Some(Alpn::Gossip) => {
+                            let _ = gossip_handler.send((conn, peer_id)).await;
+                        }
+                        Some(alpn @ (Alpn::Bao | Alpn::Automerge)) => {
+                            let (send, recv) = match conn.accept_bi().await {
+                                Ok(streams) => streams,
+                                Err(_) => return,
+                            };
+                            let _ = stream_handler.send((alpn, send, recv, peer_id)).await;
+                        }
+                        None => {
+                            warn!(
+                                "Dropping incoming connection with unknown ALPN: {:?}",
+                                alpn_bytes
+                            );
+                        }
                     }
                 });
             }

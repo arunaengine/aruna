@@ -98,17 +98,20 @@ pub enum TopicId {
     Realm(Ulid),
     /// Node-specific topic (prefix 'n')
     Node(#[serde(with = "pubkey_serde")] NodeId),
-    /// Block sync topic (prefix 'b')
-    Block(Ulid),
-    /// Custom topic from arbitrary bytes (prefix 'c')
-    Custom(Vec<u8>),
+    /// Group-scoped topic (prefix 'g')
+    Group(Ulid),
+    /// Metadata document topic (prefix 'm')
+    MetadataDocument(Ulid),
+    /// Content hash topic (prefix 'h')
+    ContentHash([u8; 32]),
 }
 
 /// Prefix bytes for TopicId variants
 const PREFIX_REALM: u8 = b'r';
 const PREFIX_NODE: u8 = b'n';
-const PREFIX_BLOCK: u8 = b'b';
-const PREFIX_CUSTOM: u8 = b'c';
+const PREFIX_GROUP: u8 = b'g';
+const PREFIX_METADATA_DOCUMENT: u8 = b'm';
+const PREFIX_CONTENT_HASH: u8 = b'h';
 
 impl TopicId {
     /// Create a realm-scoped topic
@@ -123,16 +126,22 @@ impl TopicId {
         Self::Node(id)
     }
 
-    /// Create a block sync topic
+    /// Create a group-scoped topic
     #[inline]
-    pub fn block(id: Ulid) -> Self {
-        Self::Block(id)
+    pub fn group(id: Ulid) -> Self {
+        Self::Group(id)
     }
 
-    /// Create a custom topic from arbitrary bytes
+    /// Create a metadata document topic
     #[inline]
-    pub fn custom(data: impl Into<Vec<u8>>) -> Self {
-        Self::Custom(data.into())
+    pub fn metadata_document(id: Ulid) -> Self {
+        Self::MetadataDocument(id)
+    }
+
+    /// Create a content hash topic
+    #[inline]
+    pub fn content_hash(hash: [u8; 32]) -> Self {
+        Self::ContentHash(hash)
     }
 
     /// Serialize to bytes (prefix + payload)
@@ -150,16 +159,22 @@ impl TopicId {
                 buf.extend_from_slice(pubkey.as_bytes());
                 buf
             }
-            Self::Block(ulid) => {
+            Self::Group(ulid) => {
                 let mut buf = Vec::with_capacity(17);
-                buf.push(PREFIX_BLOCK);
+                buf.push(PREFIX_GROUP);
                 buf.extend_from_slice(&ulid.to_bytes());
                 buf
             }
-            Self::Custom(data) => {
-                let mut buf = Vec::with_capacity(1 + data.len());
-                buf.push(PREFIX_CUSTOM);
-                buf.extend_from_slice(data);
+            Self::MetadataDocument(ulid) => {
+                let mut buf = Vec::with_capacity(17);
+                buf.push(PREFIX_METADATA_DOCUMENT);
+                buf.extend_from_slice(&ulid.to_bytes());
+                buf
+            }
+            Self::ContentHash(hash) => {
+                let mut buf = Vec::with_capacity(33);
+                buf.push(PREFIX_CONTENT_HASH);
+                buf.extend_from_slice(hash);
                 buf
             }
         }
@@ -188,14 +203,27 @@ impl TopicId {
                 let bytes: [u8; 32] = payload.try_into().ok()?;
                 Some(Self::Node(NodeId::from_bytes(&bytes).ok()?))
             }
-            PREFIX_BLOCK => {
+            PREFIX_GROUP => {
                 if payload.len() != 16 {
                     return None;
                 }
                 let bytes: [u8; 16] = payload.try_into().ok()?;
-                Some(Self::Block(Ulid::from_bytes(bytes)))
+                Some(Self::Group(Ulid::from_bytes(bytes)))
             }
-            PREFIX_CUSTOM => Some(Self::Custom(payload.to_vec())),
+            PREFIX_METADATA_DOCUMENT => {
+                if payload.len() != 16 {
+                    return None;
+                }
+                let bytes: [u8; 16] = payload.try_into().ok()?;
+                Some(Self::MetadataDocument(Ulid::from_bytes(bytes)))
+            }
+            PREFIX_CONTENT_HASH => {
+                if payload.len() != 32 {
+                    return None;
+                }
+                let bytes: [u8; 32] = payload.try_into().ok()?;
+                Some(Self::ContentHash(bytes))
+            }
             _ => None,
         }
     }
@@ -214,12 +242,9 @@ impl fmt::Debug for TopicId {
         match self {
             Self::Realm(id) => write!(f, "TopicId::Realm({})", id),
             Self::Node(id) => write!(f, "TopicId::Node({})", id),
-            Self::Block(id) => write!(f, "TopicId::Block({})", id),
-            Self::Custom(data) => write!(
-                f,
-                "TopicId::Custom({})",
-                hex::encode(&data[..data.len().min(8)])
-            ),
+            Self::Group(id) => write!(f, "TopicId::Group({})", id),
+            Self::MetadataDocument(id) => write!(f, "TopicId::MetadataDocument({})", id),
+            Self::ContentHash(hash) => write!(f, "TopicId::ContentHash({})", hex::encode(hash)),
         }
     }
 }
@@ -229,8 +254,9 @@ impl fmt::Display for TopicId {
         match self {
             Self::Realm(id) => write!(f, "r:{}", id),
             Self::Node(id) => write!(f, "n:{}", id),
-            Self::Block(id) => write!(f, "b:{}", id),
-            Self::Custom(data) => write!(f, "c:{}", hex::encode(data)),
+            Self::Group(id) => write!(f, "g:{}", id),
+            Self::MetadataDocument(id) => write!(f, "m:{}", id),
+            Self::ContentHash(hash) => write!(f, "h:{}", hex::encode(hash)),
         }
     }
 }
@@ -308,10 +334,10 @@ mod tests {
     }
 
     #[test]
-    fn test_topic_id_custom() {
-        let topic = TopicId::custom(b"my-channel".to_vec());
+    fn test_topic_id_content_hash() {
+        let topic = TopicId::content_hash([0xAB; 32]);
         let bytes = topic.to_bytes();
-        assert_eq!(bytes[0], PREFIX_CUSTOM);
+        assert_eq!(bytes[0], PREFIX_CONTENT_HASH);
         let parsed = TopicId::from_bytes(&bytes).unwrap();
         assert_eq!(topic, parsed);
     }

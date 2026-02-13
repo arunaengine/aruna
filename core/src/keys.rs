@@ -1,11 +1,11 @@
 // core/src/keys.rs
 use crate::id::{DhtKeyId, TopicId};
 
-/// Create a custom topic from arbitrary bytes.
+/// Create a content-hash topic from arbitrary bytes.
 #[must_use]
 #[inline]
 pub fn topic_from_bytes(input: &[u8]) -> TopicId {
-    TopicId::custom(input.to_vec())
+    TopicId::content_hash(*blake3::hash(input).as_bytes())
 }
 
 /// Derive a DHT key from arbitrary bytes using BLAKE3.
@@ -50,7 +50,7 @@ mod tests {
 
     #[test]
     fn test_gossip_peer_key() {
-        let topic = TopicId::custom(b"my-topic".to_vec());
+        let topic = TopicId::content_hash(*blake3::hash(b"my-topic").as_bytes());
         let key1 = gossip_peer_key(&topic);
         let key2 = gossip_peer_key(&topic);
         assert_eq!(key1, key2);
