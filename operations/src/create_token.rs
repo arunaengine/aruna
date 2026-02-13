@@ -26,7 +26,6 @@ pub struct CreateTokenOperation {
 #[derive(Debug)]
 pub enum CreateTokenState {
     Init,
-    CreateToken,
     Finish,
     Error,
 }
@@ -50,7 +49,6 @@ impl CreateTokenOperation {
         }
     }
     pub fn emit_token(&mut self) -> Result<(), CreateTokenError> {
-        println!("Start");
         let iat = self.config.time;
         let exp = match self.config.expiry {
             Some(exp) => {
@@ -70,7 +68,6 @@ impl CreateTokenOperation {
             }
         };
 
-        println!("Claims");
         let claims = TokenClaims {
             sub: format!(
                 "{}@{}",
@@ -82,7 +79,6 @@ impl CreateTokenOperation {
             exp,
             jti: Ulid::new().to_string(), // TODO: Save tokens somewhere
         };
-        println!("Token");
         let token = encode(
             &Header::default(),
             &claims,
@@ -90,7 +86,6 @@ impl CreateTokenOperation {
         )?;
         self.output = Some(Ok(token));
 
-        println!("Finish");
         Ok(())
     }
 }
@@ -100,32 +95,17 @@ impl Operation for CreateTokenOperation {
     type Error = CreateTokenError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        println!("{:?}", self.state);
         if let Err(err) = self.emit_token() {
             self.state = CreateTokenState::Error;
             self.output = Some(Err(err));
-        };
-        self.state = CreateTokenState::Finish;
+        } else {
+            self.state = CreateTokenState::Finish;
+        }
         smallvec![]
     }
 
-    fn step(&mut self, events: aruna_core::events::Event) -> aruna_core::types::Effects {
-        println!("{:?}", self.state);
-        match (events, &self.state) {
-            (_, CreateTokenState::CreateToken) => {
-                smallvec![]
-            }
-            (_, CreateTokenState::Error) => {
-                self.abort();
-                smallvec![]
-            }
-            (_, CreateTokenState::Finish) => {
-                smallvec![]
-            }
-            _ => {
-                smallvec![]
-            }
-        }
+    fn step(&mut self, _events: aruna_core::events::Event) -> aruna_core::types::Effects {
+        smallvec![]
     }
 
     fn is_complete(&self) -> bool {

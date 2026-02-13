@@ -1,17 +1,7 @@
 // net/src/dht/kbucket.rs
 use aruna_core::id::{NodeId, NodeIdExt};
-use aruna_core::util::unix_timestamp_secs;
+use aruna_core::util::{unix_timestamp_secs, xor_distance_32};
 use std::collections::VecDeque;
-
-/// XOR distance between two 32-byte values
-#[inline]
-fn xor_distance(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut result = [0u8; 32];
-    for (i, byte) in result.iter_mut().enumerate() {
-        *byte = a[i] ^ b[i];
-    }
-    result
-}
 
 /// Maximum entries per bucket (standard Kademlia k value)
 pub const K: usize = 20;
@@ -195,8 +185,8 @@ impl RoutingTable {
 
         // Sort by XOR distance to target
         all_peers.sort_by(|a, b| {
-            let dist_a = xor_distance(target, a.node_id.as_bytes());
-            let dist_b = xor_distance(target, b.node_id.as_bytes());
+            let dist_a = xor_distance_32(target, a.node_id.as_bytes());
+            let dist_b = xor_distance_32(target, b.node_id.as_bytes());
             dist_a.cmp(&dist_b)
         });
 

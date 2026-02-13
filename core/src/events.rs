@@ -8,9 +8,15 @@ use crate::{
 pub enum Event {
     Storage(StorageEvent),
     Net(NetEvent),
+    SubOperation(SubOperationEvent),
     Task(),
     Search(),
     Stream(),
+}
+
+#[derive(Debug)]
+pub enum SubOperationEvent {
+    DepthLimitExceeded { max_depth: usize },
 }
 
 #[derive(Debug)]

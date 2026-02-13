@@ -122,7 +122,7 @@ impl DhtServer {
                 publisher,
                 signature,
             } => {
-                let Some(sig_bytes) = signature else {
+                let Some(signature) = signature else {
                     return DhtResponse::Error {
                         code: ErrorCode::InvalidSignature,
                         message: "Missing publisher signature".to_string(),
@@ -135,8 +135,7 @@ impl DhtServer {
                 signed_data.extend_from_slice(&value);
                 signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
 
-                let sig = iroh::Signature::from_bytes(&sig_bytes);
-                if publisher.verify(&signed_data, &sig).is_err() {
+                if publisher.verify(&signed_data, &signature).is_err() {
                     return DhtResponse::Error {
                         code: ErrorCode::InvalidSignature,
                         message: "Invalid publisher signature".to_string(),
@@ -148,7 +147,7 @@ impl DhtServer {
                     publisher,
                     value,
                     expires_at,
-                    signature: Some(sig_bytes),
+                    signature: Some(signature),
                 };
                 self.storage.put(&key, entry).await;
                 DhtResponse::Stored

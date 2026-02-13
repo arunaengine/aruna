@@ -6,7 +6,6 @@ use axum::http::{HeaderMap, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use jsonwebtoken::{DecodingKey, Validation, decode};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -88,8 +87,6 @@ mod test {
 
     #[tokio::test]
     pub async fn test_middleware() {
-        // Test setup
-        println!("Server setup");
         let storage_handle = storage::FjallStorage::open("/tmp/aruna_test_db").unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
@@ -99,8 +96,6 @@ mod test {
         let realm_keypair = Some([0u8; 64]);
         let state = ServerState::new(driver_ctx.clone(), realm_keypair, realm_id.clone(), None);
 
-        // Token setup
-        println!("Token setup");
         let token_config = CreateTokenConfig {
             time: chrono::Utc::now().timestamp() as u64,
             expiry: None,
@@ -111,15 +106,12 @@ mod test {
         let token_operation = CreateTokenOperation::new(token_config.clone());
         let token = drive(token_operation, &driver_ctx).await.unwrap();
 
-        // Header setup
-        println!("Header setup");
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
             axum::http::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
         );
 
-        println!("Test");
         let ctx = extract_auth_context(&state, &headers).await.unwrap();
         assert_eq!(ctx.realm_id, realm_id.unwrap());
         assert_eq!(ctx.user_id, token_config.user_id);

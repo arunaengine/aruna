@@ -5,65 +5,19 @@ use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 const DHT_KEYSPACE: &str = "dht";
 const CLEANUP_PAGE_SIZE: usize = 256;
 
-/// Serde helper for NodeId (iroh::PublicKey)
-mod node_id_serde {
-    use super::*;
-
-    pub fn serialize<S: Serializer>(key: &NodeId, s: S) -> Result<S::Ok, S::Error> {
-        key.as_bytes().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<NodeId, D::Error> {
-        let bytes: [u8; 32] = Deserialize::deserialize(d)?;
-        NodeId::from_bytes(&bytes).map_err(serde::de::Error::custom)
-    }
-}
-
-/// Serde helper for Option<[u8; 64]> (Ed25519 signature)
-mod opt_signature_serde {
-    use super::*;
-
-    pub fn serialize<S: Serializer>(sig: &Option<[u8; 64]>, s: S) -> Result<S::Ok, S::Error> {
-        match sig {
-            Some(bytes) => {
-                let vec: Vec<u8> = bytes.to_vec();
-                Some(vec).serialize(s)
-            }
-            None => None::<Vec<u8>>.serialize(s),
-        }
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[u8; 64]>, D::Error> {
-        let opt: Option<Vec<u8>> = Deserialize::deserialize(d)?;
-        match opt {
-            Some(vec) => {
-                if vec.len() != 64 {
-                    return Err(serde::de::Error::custom("signature must be 64 bytes"));
-                }
-                let mut arr = [0u8; 64];
-                arr.copy_from_slice(&vec);
-                Ok(Some(arr))
-            }
-            None => Ok(None),
-        }
-    }
-}
-
 /// A value stored in the DHT
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEntry {
-    #[serde(with = "node_id_serde")]
     pub publisher: NodeId,
     pub value: Vec<u8>,
     pub expires_at: u64,
     /// Optional Ed25519 signature for publisher verification
-    #[serde(with = "opt_signature_serde")]
-    pub signature: Option<[u8; 64]>,
+    pub signature: Option<iroh::Signature>,
 }
 
 pub struct DhtStorage {
@@ -251,13 +205,11 @@ mod tests {
             let dht_storage = dht_storage.clone();
             let barrier = barrier.clone();
             tasks.push(tokio::spawn(async move {
-                let mut signature = [0u8; 64];
-                signature[0] = i as u8;
                 let entry = StoredEntry {
                     publisher: make_node((i + 1) as u8),
                     value: vec![i as u8],
                     expires_at: unix_timestamp_secs() + 120,
-                    signature: Some(signature),
+                    signature: None,
                 };
 
                 barrier.wait().await;

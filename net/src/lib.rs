@@ -5,16 +5,16 @@ pub mod dht;
 mod effect_handlers;
 pub mod error;
 pub mod gossip;
-pub mod inbound;
 pub mod streams;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use aruna_core::alpn::Alpn;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::NodeId;
+use aruna_core::id::{NodeId, TopicId};
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;
@@ -29,7 +29,6 @@ use tracing::warn;
 pub use dht::DhtService;
 pub use error::{NetError, Result};
 pub use gossip::GossipService;
-pub use inbound::InboundNetEvent;
 pub use streams::StreamsService;
 
 pub struct NetConfig {
@@ -65,7 +64,13 @@ type EffectHandle = (NetEffect, oneshot::Sender<NetEvent>);
 
 #[async_trait]
 pub trait InboundEventHandler: Send + Sync {
-    async fn handle_inbound(&self, event: InboundNetEvent);
+    async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>);
+    async fn handle_incoming_stream(
+        &self,
+        alpn: Alpn,
+        stream: streams::BiStream,
+        node_id: NodeId,
+    );
 }
 
 #[derive(Clone)]
@@ -82,7 +87,6 @@ struct NetInner {
     gossip: Arc<GossipService>,
     streams: Arc<StreamsService>,
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
-    inbound_event_rx: Mutex<mpsc::Receiver<InboundNetEvent>>,
     shutdown: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -131,8 +135,7 @@ impl NetHandle {
         let node_id = endpoint.id();
         let shutdown = CancellationToken::new();
 
-        let (raw_inbound_tx, mut raw_inbound_rx) = mpsc::channel::<InboundNetEvent>(1024);
-        let (inbound_event_tx, inbound_event_rx) = mpsc::channel::<InboundNetEvent>(1024);
+        let (gossip_msg_tx, mut gossip_msg_rx) = mpsc::channel::<(TopicId, NodeId, Vec<u8>)>(1024);
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
 
@@ -153,7 +156,7 @@ impl NetHandle {
                 dht.clone(),
                 config.bootstrap_nodes.clone(),
                 shutdown.child_token(),
-                raw_inbound_tx.clone(),
+                gossip_msg_tx.clone(),
             )
             .await?,
         );
@@ -169,7 +172,6 @@ impl NetHandle {
         let shutdown_for_effects = shutdown.clone();
         let dht_for_effects = dht.clone();
         let gossip_for_effects = gossip.clone();
-        let streams_for_effects = streams.clone();
         let effect_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -178,12 +180,10 @@ impl NetHandle {
                         let Some((effect, response_tx)) = maybe_effect else { break };
                         let dht = dht_for_effects.clone();
                         let gossip = gossip_for_effects.clone();
-                        let streams = streams_for_effects.clone();
                         tokio::spawn(async move {
                             let event = effect_handlers::handle_net_effect(
                                 &dht,
                                 &gossip,
-                                &streams,
                                 effect,
                             )
                             .await;
@@ -226,49 +226,44 @@ impl NetHandle {
             }
         });
 
-        let event_tx = raw_inbound_tx.clone();
-        let streams_for_streams = streams.clone();
-        let dht_for_streams = dht.clone();
-        let gossip_for_streams = gossip.clone();
-        let stream_task = tokio::spawn(async move {
-            while let Some((_alpn, send, recv, peer_id)) = stream_rx.recv().await {
-                dht_for_streams.add_peer(peer_id).await;
-                gossip_for_streams.add_bootstrap_node(peer_id);
-
-                let stream_id = match streams_for_streams.register_incoming(send, recv) {
-                    Ok(stream_id) => stream_id,
-                    Err(err) => {
-                        warn!(error = %err, "Failed to register inbound stream");
-                        continue;
+        let inbound_handler_for_gossip = inbound_handler.clone();
+        let shutdown_for_gossip_events = shutdown.clone();
+        let gossip_event_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown_for_gossip_events.cancelled() => break,
+                    maybe_msg = gossip_msg_rx.recv() => {
+                        let Some((topic, sender, data)) = maybe_msg else { break };
+                        let handler = inbound_handler_for_gossip.read().clone();
+                        if let Some(handler) = handler {
+                            tokio::spawn(async move {
+                                handler.handle_gossip_message(topic, sender, data).await;
+                            });
+                        } else {
+                            warn!(topic = %topic, sender = %sender, "Dropping inbound gossip message without registered handler");
+                        }
                     }
-                };
-                let opened = InboundNetEvent::StreamOpened {
-                    stream_id,
-                    node_id: peer_id,
-                };
-                if event_tx.try_send(opened).is_err() {
-                    warn!("Incoming event channel full; dropping inbound stream event");
                 }
             }
         });
 
-        let inbound_handler_for_dispatch = inbound_handler.clone();
-        let shutdown_for_dispatch = shutdown.clone();
-        let inbound_dispatch_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown_for_dispatch.cancelled() => break,
-                    maybe_event = raw_inbound_rx.recv() => {
-                        let Some(event) = maybe_event else { break };
-                        let handler = inbound_handler_for_dispatch.read().clone();
-                        if let Some(handler) = handler {
-                            tokio::spawn(async move {
-                                handler.handle_inbound(event).await;
-                            });
-                        } else if inbound_event_tx.try_send(event).is_err() {
-                            warn!("Inbound event channel full; dropping inbound event");
-                        }
-                    }
+        let dht_for_streams = dht.clone();
+        let gossip_for_streams = gossip.clone();
+        let inbound_handler_for_streams = inbound_handler.clone();
+        let stream_task = tokio::spawn(async move {
+            while let Some((alpn, send, recv, peer_id)) = stream_rx.recv().await {
+                dht_for_streams.add_peer(peer_id).await;
+                gossip_for_streams.add_bootstrap_node(peer_id);
+
+                let handler = inbound_handler_for_streams.read().clone();
+                if let Some(handler) = handler {
+                    tokio::spawn(async move {
+                        handler
+                            .handle_incoming_stream(alpn, (send, recv), peer_id)
+                            .await;
+                    });
+                } else {
+                    warn!(node_id = %peer_id, "Dropping inbound stream without registered handler");
                 }
             }
         });
@@ -295,14 +290,13 @@ impl NetHandle {
             gossip,
             streams,
             inbound_handler,
-            inbound_event_rx: Mutex::new(inbound_event_rx),
             shutdown,
             tasks: Mutex::new(vec![
                 effect_task,
                 dht_task,
                 gossip_task,
+                gossip_event_task,
                 stream_task,
-                inbound_dispatch_task,
                 accept_task,
             ]),
         });
@@ -330,8 +324,13 @@ impl NetHandle {
         self.inner.dht.add_peer(endpoint_addr.id).await;
     }
 
-    pub fn take_owned_stream(&self, stream_id: u64) -> Option<streams::BiStream> {
-        self.inner.streams.take_owned_stream(stream_id)
+    pub async fn open_stream(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
+        if node_id != self.inner.node_id {
+            self.inner.dht.add_peer(node_id).await;
+            self.inner.gossip.add_bootstrap_node(node_id);
+        }
+
+        self.inner.streams.open(node_id, alpn).await
     }
 
     pub fn set_inbound_handler(&self, handler: Arc<dyn InboundEventHandler>) {
@@ -340,11 +339,6 @@ impl NetHandle {
 
     pub fn clear_inbound_handler(&self) {
         self.inner.inbound_handler.write().take();
-    }
-
-    pub async fn recv_inbound_event(&self) -> Option<InboundNetEvent> {
-        let mut rx = self.inner.inbound_event_rx.lock().await;
-        rx.recv().await
     }
 
     pub async fn shutdown(&self) {

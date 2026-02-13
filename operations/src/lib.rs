@@ -3,4 +3,7 @@ pub mod create_token;
 pub mod driver;
 pub mod get_group;
 pub mod incoming;
+pub mod incoming_automerge;
+pub mod incoming_bao;
+pub mod incoming_gossip;
 pub mod list_groups;

@@ -114,7 +114,7 @@ impl DhtClient {
         value: Vec<u8>,
         ttl_secs: u64,
         publisher: &NodeId,
-        signature: Option<[u8; 64]>,
+        signature: Option<iroh::Signature>,
     ) -> Result<()> {
         let response = self
             .rpc(

@@ -13,22 +13,34 @@ pub struct ListGroupOperation {
     txn_id: Option<Ulid>,
     output: Option<Result<Vec<Group>, ListGroupError>>,
     state: ListGroupState,
+    limit: usize,
+    offset: usize,
 }
 
 impl ListGroupOperation {
+    const DEFAULT_LIMIT: usize = 10_000;
+
     pub fn new() -> Self {
+        Self::with_pagination(Self::DEFAULT_LIMIT, 0)
+    }
+
+    pub fn with_pagination(limit: usize, offset: usize) -> Self {
         ListGroupOperation {
             txn_id: None,
             output: None,
             state: ListGroupState::Init,
+            limit,
+            offset,
         }
     }
+
     fn emit_list_groups(&mut self) -> aruna_core::types::Effects {
+        let scan_limit = self.offset.saturating_add(self.limit).max(1);
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: "groups".to_string(),
             prefix: None,
             start_after: None,
-            limit: 10_000,
+            limit: scan_limit,
             txn_id: self.txn_id,
         })]
     }
@@ -39,7 +51,9 @@ impl ListGroupOperation {
     ) -> Result<aruna_core::types::Effects, ListGroupError> {
         self.output = Some(
             values
-                .iter()
+                .into_iter()
+                .skip(self.offset)
+                .take(self.limit)
                 .map(|(_, value)| -> Result<Group, ListGroupError> {
                     Group::from_bytes(&value).map_err(|err| err.into())
                 })

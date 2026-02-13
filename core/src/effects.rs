@@ -2,12 +2,13 @@ use std::time::Duration;
 
 use crate::alpn::Alpn;
 use crate::id::NodeId;
-use crate::state_machine::StateMachineConfig;
+use crate::operation::SubOperation;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 
 pub enum Effect {
     Storage(StorageEffect),
     Net(NetEffect),
+    SubOperation(Box<dyn SubOperation>),
     Task(),
     Search(),
     Stream(),
@@ -75,17 +76,9 @@ pub enum DhtEffect {
 
 #[derive(Debug, Clone)]
 pub enum GossipEffect {
-    Subscribe {
-        topic: TopicId,
-        state_machine: StateMachineConfig,
-    },
-    Broadcast {
-        topic: TopicId,
-        message: Vec<u8>,
-    },
-    Unsubscribe {
-        topic: TopicId,
-    },
+    Subscribe { topic: TopicId },
+    Broadcast { topic: TopicId, message: Vec<u8> },
+    Unsubscribe { topic: TopicId },
 }
 
 #[derive(Debug, Clone)]

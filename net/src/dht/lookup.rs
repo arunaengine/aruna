@@ -1,5 +1,6 @@
 // net/src/dht/lookup.rs
 use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::util::xor_distance_32;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -12,16 +13,6 @@ const ALPHA: usize = 3;
 
 /// Maximum lookup iterations
 const MAX_ITERATIONS: usize = 20;
-
-/// XOR distance between two 32-byte values
-#[inline]
-fn xor_distance(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut result = [0u8; 32];
-    for (i, byte) in result.iter_mut().enumerate() {
-        *byte = a[i] ^ b[i];
-    }
-    result
-}
 
 /// A node with its distance to target for priority queue
 #[derive(Clone)]
@@ -65,7 +56,7 @@ pub async fn find_node(
     for peer in initial_nodes {
         let node = NodeWithDistance {
             node_id: peer.node_id,
-            distance: xor_distance(target, peer.node_id.as_bytes()),
+            distance: xor_distance_32(target, peer.node_id.as_bytes()),
         };
         upsert_candidate(&mut candidates, &mut heap, node);
     }
@@ -114,7 +105,7 @@ pub async fn find_node(
                 for node_id in nodes {
                     let node = NodeWithDistance {
                         node_id,
-                        distance: xor_distance(target, node_id.as_bytes()),
+                        distance: xor_distance_32(target, node_id.as_bytes()),
                     };
                     upsert_candidate(&mut candidates, &mut heap, node);
                 }
@@ -147,7 +138,7 @@ pub async fn get_value(
     for peer in initial_nodes {
         let node = NodeWithDistance {
             node_id: peer.node_id,
-            distance: xor_distance(target, peer.node_id.as_bytes()),
+            distance: xor_distance_32(target, peer.node_id.as_bytes()),
         };
         upsert_candidate(&mut candidates, &mut heap, node);
     }
@@ -195,7 +186,7 @@ pub async fn get_value(
                 for node_id in closer_nodes {
                     let node = NodeWithDistance {
                         node_id,
-                        distance: xor_distance(target, node_id.as_bytes()),
+                        distance: xor_distance_32(target, node_id.as_bytes()),
                     };
                     upsert_candidate(&mut candidates, &mut heap, node);
                 }
@@ -243,7 +234,7 @@ pub async fn put_value(
     value: Vec<u8>,
     ttl_secs: u64,
     publisher: &NodeId,
-    signature: Option<[u8; 64]>,
+    signature: Option<iroh::Signature>,
 ) -> usize {
     let mut handles = Vec::new();
 
@@ -289,11 +280,11 @@ mod tests {
 
         heap.push(NodeWithDistance {
             node_id: far,
-            distance: xor_distance(&target, far.as_bytes()),
+            distance: xor_distance_32(&target, far.as_bytes()),
         });
         heap.push(NodeWithDistance {
             node_id: near,
-            distance: xor_distance(&target, near.as_bytes()),
+            distance: xor_distance_32(&target, near.as_bytes()),
         });
 
         let first = heap.pop().expect("heap has first");

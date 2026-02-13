@@ -1,19 +1,43 @@
 use std::time::Duration;
+use std::sync::Arc;
 
 use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{
-    DhtEffect, Effect, GossipEffect, NetEffect, StorageEffect, StreamEffect,
+    DhtEffect, Effect, GossipEffect, NetEffect, StorageEffect,
 };
-use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent, StreamEvent};
+use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::DhtKeyId;
-use aruna_core::state_machine::StateMachineConfig;
-use aruna_net::{InboundNetEvent, NetConfig, NetHandle};
+use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_net::streams::BiStream;
+use aruna_net::{InboundEventHandler, NetConfig, NetHandle};
 use aruna_storage::FjallStorage;
+use async_trait::async_trait;
 use byteview::ByteView;
+use tokio::sync::mpsc;
 use tempfile::tempdir;
 use ulid::Ulid;
+
+#[derive(Clone, Default)]
+struct TestInboundHandler {
+    gossip_tx: Option<mpsc::UnboundedSender<(TopicId, NodeId, Vec<u8>)>>,
+    stream_tx: Option<mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>>,
+}
+
+#[async_trait]
+impl InboundEventHandler for TestInboundHandler {
+    async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>) {
+        if let Some(tx) = &self.gossip_tx {
+            let _ = tx.send((topic, sender, data));
+        }
+    }
+
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
+        if let Some(tx) = &self.stream_tx {
+            let _ = tx.send((alpn, stream, node_id));
+        }
+    }
+}
 
 #[tokio::test]
 async fn test_storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>> {
@@ -103,17 +127,6 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
-    let open = handle_a
-        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Open {
-            node_id: handle_b.node_id(),
-            alpn: Alpn::Bao,
-        })))
-        .await;
-    let stream_id_a = match open {
-        Event::Net(NetEvent::Stream(StreamEvent::Opened { stream_id, .. })) => stream_id,
-        other => panic!("unexpected stream open event: {other:?}"),
-    };
-
     let key = [42u8; 32];
     let value = b"replicated-value".to_vec();
 
@@ -147,12 +160,6 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
 
     assert!(found, "expected replicated DHT value on second node");
 
-    let _ = handle_a
-        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Close {
-            stream_id: stream_id_a,
-        })))
-        .await;
-
     handle_a.shutdown().await;
     handle_b.shutdown().await;
 
@@ -175,6 +182,12 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
     let handle_a = NetHandle::new(cfg(), storage_a).await?;
     let handle_b = NetHandle::new(cfg(), storage_b).await?;
 
+    let (gossip_tx, mut gossip_rx) = mpsc::unbounded_channel();
+    handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
+        gossip_tx: Some(gossip_tx),
+        stream_tx: None,
+    }));
+
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
@@ -183,13 +196,11 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
     let subscribe_a = handle_a
         .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
             topic: topic.clone(),
-            state_machine: StateMachineConfig::incoming_gossip_message(),
         })))
         .await;
     let subscribe_b = handle_b
         .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
             topic: topic.clone(),
-            state_machine: StateMachineConfig::incoming_gossip_message(),
         })))
         .await;
 
@@ -218,13 +229,8 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
             Event::Net(NetEvent::Gossip(GossipEvent::BroadcastComplete { .. }))
         ));
 
-        let maybe =
-            tokio::time::timeout(Duration::from_millis(1200), handle_b.recv_inbound_event()).await;
-        if let Ok(Some(InboundNetEvent::GossipMessage {
-            topic: recv_topic,
-            data,
-            ..
-        })) = maybe
+        let maybe = tokio::time::timeout(Duration::from_millis(1200), gossip_rx.recv()).await;
+        if let Ok(Some((recv_topic, _, data))) = maybe
             && recv_topic == topic
             && data == payload
         {
@@ -258,39 +264,27 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
     let handle_a = NetHandle::new(cfg(), storage_a).await?;
     let handle_b = NetHandle::new(cfg(), storage_b).await?;
 
+    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+    handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
+        gossip_tx: None,
+        stream_tx: Some(stream_tx),
+    }));
+
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
-    let open = handle_a
-        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Open {
-            node_id: handle_b.node_id(),
-            alpn: Alpn::Bao,
-        })))
-        .await;
-
-    let stream_id_a = match open {
-        Event::Net(NetEvent::Stream(StreamEvent::Opened { stream_id, .. })) => stream_id,
-        other => panic!("unexpected open event: {other:?}"),
-    };
-
-    let (mut send_a, _recv_a) = handle_a
-        .take_owned_stream(stream_id_a)
-        .expect("outbound stream should be available as owned handle");
+    let (mut send_a, _recv_a) = handle_a.open_stream(handle_b.node_id(), Alpn::Bao).await?;
     send_a
         .write_all(b"hello stream")
         .await
         .map_err(|e| std::io::Error::other(format!("failed to write outbound stream data: {e}")))?;
 
-    let incoming =
-        tokio::time::timeout(Duration::from_secs(5), handle_b.recv_inbound_event()).await?;
-    let stream_id_b = match incoming {
-        Some(InboundNetEvent::StreamOpened { stream_id, .. }) => stream_id,
-        other => panic!("unexpected incoming stream event: {other:?}"),
-    };
+    let (incoming_alpn, (_send_b, mut recv_b), _node_id) =
+        tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+            .await?
+            .ok_or("expected inbound stream")?;
+    assert_eq!(incoming_alpn, Alpn::Bao);
 
-    let (_send_b, mut recv_b) = handle_b
-        .take_owned_stream(stream_id_b)
-        .expect("inbound stream should be available as owned handle");
     let chunk = recv_b
         .read_chunk(1024)
         .await
@@ -302,12 +296,6 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
             )
         })?;
     assert_eq!(chunk.bytes.to_vec(), b"hello stream".to_vec());
-
-    let _ = handle_a
-        .send_effect(Effect::Net(NetEffect::Stream(StreamEffect::Close {
-            stream_id: stream_id_a,
-        })))
-        .await;
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;
@@ -339,9 +327,10 @@ fn test_topic_id_creation() {
     let topic2 = TopicId::from_bytes(&bytes).expect("topic roundtrip");
     assert_eq!(topic1, topic2);
 
-    let topic3 = TopicId::content_hash([0x11; 32]);
-    let topic4 = TopicId::content_hash([0x11; 32]);
-    let topic5 = TopicId::content_hash([0x22; 32]);
+    let group_id = Ulid::new();
+    let topic3 = TopicId::group(group_id);
+    let topic4 = TopicId::group(group_id);
+    let topic5 = TopicId::group(Ulid::new());
 
     assert_eq!(topic3, topic4);
     assert_ne!(topic3, topic5);

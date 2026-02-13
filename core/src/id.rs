@@ -1,4 +1,5 @@
 // core/src/id.rs
+use crate::util::xor_distance_32;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use ulid::Ulid;
@@ -19,13 +20,7 @@ pub trait NodeIdExt {
 impl NodeIdExt for NodeId {
     #[inline]
     fn xor_distance(&self, other: &NodeId) -> [u8; 32] {
-        let a = self.as_bytes();
-        let b = other.as_bytes();
-        let mut result = [0u8; 32];
-        for (i, byte) in result.iter_mut().enumerate() {
-            *byte = a[i] ^ b[i];
-        }
-        result
+        xor_distance_32(self.as_bytes(), other.as_bytes())
     }
 
     #[inline]
@@ -64,11 +59,7 @@ impl DhtKeyId {
     /// XOR distance to a NodeId (for finding closest nodes)
     #[inline]
     pub fn xor_distance_to_node(&self, node: &NodeId) -> [u8; 32] {
-        let mut result = [0u8; 32];
-        for (i, byte) in result.iter_mut().enumerate() {
-            *byte = self.0[i] ^ node.as_bytes()[i];
-        }
-        result
+        xor_distance_32(self.as_bytes(), node.as_bytes())
     }
 }
 
@@ -97,13 +88,11 @@ pub enum TopicId {
     /// Realm-scoped topic (prefix 'r')
     Realm(Ulid),
     /// Node-specific topic (prefix 'n')
-    Node(#[serde(with = "pubkey_serde")] NodeId),
+    Node(NodeId),
     /// Group-scoped topic (prefix 'g')
     Group(Ulid),
     /// Metadata document topic (prefix 'm')
     MetadataDocument(Ulid),
-    /// Content hash topic (prefix 'h')
-    ContentHash([u8; 32]),
 }
 
 /// Prefix bytes for TopicId variants
@@ -111,7 +100,6 @@ const PREFIX_REALM: u8 = b'r';
 const PREFIX_NODE: u8 = b'n';
 const PREFIX_GROUP: u8 = b'g';
 const PREFIX_METADATA_DOCUMENT: u8 = b'm';
-const PREFIX_CONTENT_HASH: u8 = b'h';
 
 impl TopicId {
     /// Create a realm-scoped topic
@@ -136,12 +124,6 @@ impl TopicId {
     #[inline]
     pub fn metadata_document(id: Ulid) -> Self {
         Self::MetadataDocument(id)
-    }
-
-    /// Create a content hash topic
-    #[inline]
-    pub fn content_hash(hash: [u8; 32]) -> Self {
-        Self::ContentHash(hash)
     }
 
     /// Serialize to bytes (prefix + payload)
@@ -169,12 +151,6 @@ impl TopicId {
                 let mut buf = Vec::with_capacity(17);
                 buf.push(PREFIX_METADATA_DOCUMENT);
                 buf.extend_from_slice(&ulid.to_bytes());
-                buf
-            }
-            Self::ContentHash(hash) => {
-                let mut buf = Vec::with_capacity(33);
-                buf.push(PREFIX_CONTENT_HASH);
-                buf.extend_from_slice(hash);
                 buf
             }
         }
@@ -217,13 +193,6 @@ impl TopicId {
                 let bytes: [u8; 16] = payload.try_into().ok()?;
                 Some(Self::MetadataDocument(Ulid::from_bytes(bytes)))
             }
-            PREFIX_CONTENT_HASH => {
-                if payload.len() != 32 {
-                    return None;
-                }
-                let bytes: [u8; 32] = payload.try_into().ok()?;
-                Some(Self::ContentHash(bytes))
-            }
             _ => None,
         }
     }
@@ -244,7 +213,6 @@ impl fmt::Debug for TopicId {
             Self::Node(id) => write!(f, "TopicId::Node({})", id),
             Self::Group(id) => write!(f, "TopicId::Group({})", id),
             Self::MetadataDocument(id) => write!(f, "TopicId::MetadataDocument({})", id),
-            Self::ContentHash(hash) => write!(f, "TopicId::ContentHash({})", hex::encode(hash)),
         }
     }
 }
@@ -256,23 +224,7 @@ impl fmt::Display for TopicId {
             Self::Node(id) => write!(f, "n:{}", id),
             Self::Group(id) => write!(f, "g:{}", id),
             Self::MetadataDocument(id) => write!(f, "m:{}", id),
-            Self::ContentHash(hash) => write!(f, "h:{}", hex::encode(hash)),
         }
-    }
-}
-
-/// Serde helper for NodeId (iroh::PublicKey)
-mod pubkey_serde {
-    use super::NodeId;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(key: &NodeId, s: S) -> Result<S::Ok, S::Error> {
-        key.as_bytes().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<NodeId, D::Error> {
-        let bytes: [u8; 32] = Deserialize::deserialize(d)?;
-        NodeId::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
 
@@ -334,10 +286,10 @@ mod tests {
     }
 
     #[test]
-    fn test_topic_id_content_hash() {
-        let topic = TopicId::content_hash([0xAB; 32]);
+    fn test_topic_id_group() {
+        let topic = TopicId::group(Ulid::new());
         let bytes = topic.to_bytes();
-        assert_eq!(bytes[0], PREFIX_CONTENT_HASH);
+        assert_eq!(bytes[0], PREFIX_GROUP);
         let parsed = TopicId::from_bytes(&bytes).unwrap();
         assert_eq!(topic, parsed);
     }

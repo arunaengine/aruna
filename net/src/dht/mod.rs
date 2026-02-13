@@ -104,7 +104,7 @@ impl DhtService {
         signed_data.extend_from_slice(key.as_bytes());
         signed_data.extend_from_slice(&value);
         signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
-        let signature = self.secret_key.sign(&signed_data).to_bytes();
+        let signature = self.secret_key.sign(&signed_data);
 
         // Store locally first
         let entry = StoredEntry {

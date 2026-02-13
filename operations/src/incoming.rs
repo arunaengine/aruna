@@ -1,22 +1,16 @@
 use std::sync::Arc;
 
-use aruna_core::events::Event;
+use aruna_core::alpn::Alpn;
 use aruna_core::id::{NodeId, TopicId};
-use aruna_core::operation::Operation;
-use aruna_core::state_machine::StateMachineId;
-use aruna_net::{InboundEventHandler, InboundNetEvent};
+use aruna_net::InboundEventHandler;
+use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use smallvec::smallvec;
-use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use crate::driver::{DriverContext, drive};
-
-#[derive(Debug, Error)]
-pub enum IncomingOperationError {
-    #[error("Incoming operation did not finish")]
-    NotFinished,
-}
+use crate::incoming_automerge::IncomingAutomergeOperation;
+use crate::incoming_bao::IncomingBaoOperation;
+use crate::incoming_gossip::IncomingGossipOperation;
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -40,143 +34,38 @@ pub fn initialize_net_incoming(context: Arc<DriverContext>) {
 
 #[async_trait]
 impl InboundEventHandler for OperationsInboundHandler {
-    async fn handle_inbound(&self, event: InboundNetEvent) {
-        match event {
-            InboundNetEvent::GossipMessage {
-                topic,
-                sender,
-                data,
-                state_machine,
-            } => match &state_machine.id {
-                StateMachineId::IncomingGossipMessage => {
-                    let op = IncomingGossipMessageOperation::new(topic, sender, data);
-                    if let Err(err) = drive(op, self.context.as_ref()).await {
-                        error!(error = ?err, "Failed to process inbound gossip event");
-                    }
-                }
-                StateMachineId::Named(name) => {
-                    warn!(
-                        state_machine = %name,
-                        "No inbound handler registered for configured state machine"
-                    );
-                }
-            },
-            InboundNetEvent::StreamOpened { stream_id, node_id } => {
-                let op = IncomingStreamOpenedOperation::new(stream_id, node_id);
+    async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>) {
+        let op = IncomingGossipOperation::new(topic, sender, data);
+        if let Err(err) = drive(op, self.context.as_ref()).await {
+            error!(error = ?err, "Failed to process inbound gossip event");
+        }
+    }
+
+    async fn handle_incoming_stream(
+        &self,
+        alpn: Alpn,
+        stream: BiStream,
+        node_id: NodeId,
+    ) {
+        match alpn {
+            Alpn::Bao => {
+                let op = IncomingBaoOperation::new(stream, node_id);
                 if let Err(err) = drive(op, self.context.as_ref()).await {
-                    error!(error = ?err, "Failed to process inbound stream-open event");
+                    error!(error = ?err, "Failed to process inbound bao stream event");
                 }
             }
+            Alpn::Automerge => {
+                let op = IncomingAutomergeOperation::new(stream, node_id);
+                if let Err(err) = drive(op, self.context.as_ref()).await {
+                    error!(error = ?err, "Failed to process inbound automerge stream event");
+                }
+            }
+            Alpn::Dht | Alpn::Gossip => {
+                warn!(
+                    node_id = %node_id,
+                    "Ignoring inbound stream for non-stream ALPN"
+                );
+            }
         }
-    }
-}
-
-#[derive(Debug)]
-pub struct IncomingGossipMessageOperation {
-    topic: TopicId,
-    sender: NodeId,
-    data: Vec<u8>,
-    complete: bool,
-}
-
-impl IncomingGossipMessageOperation {
-    pub fn new(topic: TopicId, sender: NodeId, data: Vec<u8>) -> Self {
-        Self {
-            topic,
-            sender,
-            data,
-            complete: false,
-        }
-    }
-}
-
-impl Operation for IncomingGossipMessageOperation {
-    type Output = ();
-    type Error = IncomingOperationError;
-
-    fn start(&mut self) -> aruna_core::types::Effects {
-        info!(
-            topic = %self.topic,
-            sender = %self.sender,
-            bytes = self.data.len(),
-            data = ?self.data,
-            "Received inbound gossip message"
-        );
-        self.complete = true;
-        smallvec![]
-    }
-
-    fn step(&mut self, _event: Event) -> aruna_core::types::Effects {
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.complete
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.complete {
-            Ok(())
-        } else {
-            Err(IncomingOperationError::NotFinished)
-        }
-    }
-
-    fn abort(&mut self) -> aruna_core::types::Effects {
-        self.complete = true;
-        smallvec![]
-    }
-}
-
-#[derive(Debug)]
-pub struct IncomingStreamOpenedOperation {
-    stream_id: u64,
-    node_id: NodeId,
-    complete: bool,
-}
-
-impl IncomingStreamOpenedOperation {
-    pub fn new(stream_id: u64, node_id: NodeId) -> Self {
-        Self {
-            stream_id,
-            node_id,
-            complete: false,
-        }
-    }
-}
-
-impl Operation for IncomingStreamOpenedOperation {
-    type Output = ();
-    type Error = IncomingOperationError;
-
-    fn start(&mut self) -> aruna_core::types::Effects {
-        info!(
-            stream_id = self.stream_id,
-            node_id = %self.node_id,
-            "Received inbound stream opened event"
-        );
-        self.complete = true;
-        smallvec![]
-    }
-
-    fn step(&mut self, _event: Event) -> aruna_core::types::Effects {
-        smallvec![]
-    }
-
-    fn is_complete(&self) -> bool {
-        self.complete
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.complete {
-            Ok(())
-        } else {
-            Err(IncomingOperationError::NotFinished)
-        }
-    }
-
-    fn abort(&mut self) -> aruna_core::types::Effects {
-        self.complete = true;
-        smallvec![]
     }
 }

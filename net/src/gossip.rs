@@ -6,7 +6,6 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
-use aruna_core::state_machine::StateMachineConfig;
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -20,7 +19,6 @@ use tracing::warn;
 
 use crate::DhtService;
 use crate::error::{NetError, Result};
-use crate::inbound::InboundNetEvent;
 
 const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
 const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
@@ -29,13 +27,6 @@ const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
 struct TopicSubscription {
     cancel: CancellationToken,
     sender: GossipSender,
-    state_machine: StateMachineConfig,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct PersistedSubscription {
-    topic: TopicId,
-    state_machine: StateMachineConfig,
 }
 
 pub struct GossipService {
@@ -46,8 +37,8 @@ pub struct GossipService {
     subscriptions: Arc<RwLock<HashMap<TopicId, TopicSubscription>>>,
     bootstrap_nodes: Arc<RwLock<Vec<NodeId>>>,
     shutdown: CancellationToken,
-    /// Channel to forward incoming gossip messages as unsolicited inbound events.
-    event_tx: mpsc::Sender<InboundNetEvent>,
+    /// Channel to forward incoming gossip messages.
+    event_tx: mpsc::Sender<(TopicId, NodeId, Vec<u8>)>,
 }
 
 impl GossipService {
@@ -57,7 +48,7 @@ impl GossipService {
         dht: Arc<DhtService>,
         bootstrap_nodes: Vec<NodeId>,
         shutdown: CancellationToken,
-        event_tx: mpsc::Sender<InboundNetEvent>,
+        event_tx: mpsc::Sender<(TopicId, NodeId, Vec<u8>)>,
     ) -> Result<Self> {
         let gossip = Gossip::builder().spawn(endpoint);
         let local_node_id = dht.local_id();
@@ -89,17 +80,15 @@ impl GossipService {
             value: Some(data), ..
         }) = self.storage.send_effect(effect).await
         {
-            for persisted in decode_persisted_subscriptions(&data) {
-                let _ = self
-                    .subscribe(persisted.topic, persisted.state_machine)
-                    .await;
+            for topic in decode_persisted_subscriptions(&data) {
+                let _ = self.subscribe(topic).await;
             }
         }
 
         Ok(())
     }
 
-    pub async fn subscribe(&self, topic: TopicId, state_machine: StateMachineConfig) -> Result<()> {
+    pub async fn subscribe(&self, topic: TopicId) -> Result<()> {
         if self.subscriptions.read().contains_key(&topic) {
             return Err(NetError::Gossip("Already subscribed".to_string()));
         }
@@ -122,14 +111,12 @@ impl GossipService {
             TopicSubscription {
                 cancel: cancel.clone(),
                 sender,
-                state_machine: state_machine.clone(),
             },
         );
         self.persist_subscriptions().await;
 
         let subscriptions = self.subscriptions.clone();
         let event_tx = self.event_tx.clone();
-        let configured_state_machine = state_machine;
         tokio::spawn(async move {
             use futures::stream::StreamExt;
             let mut unexpected_termination = false;
@@ -140,13 +127,11 @@ impl GossipService {
                         match event {
                             Some(Ok(event)) => {
                                 if let iroh_gossip::api::Event::Received(msg) = event {
-                                    let gossip_event = InboundNetEvent::GossipMessage {
-                                        topic: topic.clone(),
-                                        sender: msg.delivered_from,
-                                        data: msg.content.to_vec(),
-                                        state_machine: configured_state_machine.clone(),
-                                    };
-                                    match event_tx.try_send(gossip_event) {
+                                    match event_tx.try_send((
+                                        topic.clone(),
+                                        msg.delivered_from,
+                                        msg.content.to_vec(),
+                                    )) {
                                         Ok(()) => {}
                                         Err(mpsc::error::TrySendError::Full(_)) => {
                                             warn!(
@@ -260,14 +245,11 @@ impl GossipService {
     }
 
     async fn persist_subscriptions(&self) {
-        let persisted: Vec<PersistedSubscription> = self
+        let persisted: Vec<TopicId> = self
             .subscriptions
             .read()
             .iter()
-            .map(|(topic, subscription)| PersistedSubscription {
-                topic: topic.clone(),
-                state_machine: subscription.state_machine.clone(),
-            })
+            .map(|(topic, _)| topic.clone())
             .collect();
 
         let Ok(data) = postcard::to_allocvec(&persisted) else {
@@ -286,19 +268,8 @@ impl GossipService {
     }
 }
 
-fn decode_persisted_subscriptions(bytes: &[u8]) -> Vec<PersistedSubscription> {
-    if let Ok(subscriptions) = postcard::from_bytes::<Vec<PersistedSubscription>>(bytes) {
-        return subscriptions;
-    }
-
-    postcard::from_bytes::<Vec<TopicId>>(bytes)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|topic| PersistedSubscription {
-            topic,
-            state_machine: StateMachineConfig::default(),
-        })
-        .collect()
+fn decode_persisted_subscriptions(bytes: &[u8]) -> Vec<TopicId> {
+    postcard::from_bytes::<Vec<TopicId>>(bytes).unwrap_or_default()
 }
 
 impl std::fmt::Debug for GossipService {
