@@ -186,8 +186,8 @@ pub async fn list_groups(
         ListGroupOperation::with_pagination(limit as usize, offset as usize),
         &state.get_ctx(),
     )
-        .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
     let response = ListGroupsResponse {
         groups: result
             .iter()

@@ -41,12 +41,7 @@ impl InboundEventHandler for OperationsInboundHandler {
         }
     }
 
-    async fn handle_incoming_stream(
-        &self,
-        alpn: Alpn,
-        stream: BiStream,
-        node_id: NodeId,
-    ) {
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
         match alpn {
             Alpn::Bao => {
                 let op = IncomingBaoOperation::new(stream, node_id);

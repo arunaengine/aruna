@@ -65,12 +65,7 @@ type EffectHandle = (NetEffect, oneshot::Sender<NetEvent>);
 #[async_trait]
 pub trait InboundEventHandler: Send + Sync {
     async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>);
-    async fn handle_incoming_stream(
-        &self,
-        alpn: Alpn,
-        stream: streams::BiStream,
-        node_id: NodeId,
-    );
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: streams::BiStream, node_id: NodeId);
 }
 
 #[derive(Clone)]

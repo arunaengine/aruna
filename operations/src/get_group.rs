@@ -272,12 +272,14 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use crate::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_storage::storage;
+    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[tokio::test]
     pub async fn test_get_group() {
-        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
-        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
 
         let context = DriverContext {
             storage_handle,

@@ -1,5 +1,5 @@
-pub mod routes;
-pub mod openapi;
-pub mod server;
-pub mod error;
 pub mod auth;
+pub mod error;
+pub mod openapi;
+pub mod routes;
+pub mod server;

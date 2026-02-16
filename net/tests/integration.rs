@@ -1,11 +1,9 @@
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{
-    DhtEffect, Effect, GossipEffect, NetEffect, StorageEffect,
-};
+use aruna_core::effects::{DhtEffect, Effect, GossipEffect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
@@ -14,8 +12,8 @@ use aruna_net::{InboundEventHandler, NetConfig, NetHandle};
 use aruna_storage::FjallStorage;
 use async_trait::async_trait;
 use byteview::ByteView;
-use tokio::sync::mpsc;
 use tempfile::tempdir;
+use tokio::sync::mpsc;
 use ulid::Ulid;
 
 #[derive(Clone, Default)]

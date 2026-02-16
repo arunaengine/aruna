@@ -18,7 +18,12 @@ const MAX_SUBOP_DEPTH: usize = 32;
 
 async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
     match effect {
-        Effect::Storage(storage_effect) => context.storage_handle.send_storage_effect(storage_effect).await,
+        Effect::Storage(storage_effect) => {
+            context
+                .storage_handle
+                .send_storage_effect(storage_effect)
+                .await
+        }
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {
                 net_handle.send_effect(Effect::Net(net_effect)).await
@@ -100,6 +105,7 @@ pub async fn drive<O: Operation>(
 
 #[cfg(test)]
 mod test {
+    use crate::driver::{DriverContext, drive};
     use aruna_core::{
         effects::{Effect, StorageEffect},
         events::{Event, StorageEvent, SubOperationEvent},
@@ -108,9 +114,7 @@ mod test {
     use aruna_storage::storage;
     use byteview::ByteView;
     use std::convert::Infallible;
-    use ulid::Ulid;
-
-    use crate::driver::{DriverContext, drive};
+    use tempfile::tempdir;
 
     pub struct TestOperation {
         pub state: u8,
@@ -199,8 +203,9 @@ mod test {
 
     #[tokio::test]
     pub async fn test_driver() {
-        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
-        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
 
         let context = DriverContext {
             storage_handle,
@@ -256,15 +261,18 @@ mod test {
 
     #[tokio::test]
     async fn test_driver_preserves_effect_order_fifo() {
-        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
-        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
         };
 
         let operation = EffectOrderOperation::new();
-        let observed = drive(operation, &context).await.expect("drive should succeed");
+        let observed = drive(operation, &context)
+            .await
+            .expect("drive should succeed");
         assert_eq!(observed, vec!["task", "search"]);
     }
 
@@ -314,8 +322,9 @@ mod test {
 
     #[tokio::test]
     async fn test_suboperation_depth_limit_is_enforced() {
-        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
-        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

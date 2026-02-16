@@ -83,11 +83,13 @@ mod test {
     use aruna_storage::storage;
     use axum::http::{HeaderMap, header};
     use std::sync::Arc;
+    use tempfile::env::temp_dir;
     use ulid::Ulid;
 
     #[tokio::test]
     pub async fn test_middleware() {
-        let storage_handle = storage::FjallStorage::open("/tmp/aruna_test_db").unwrap();
+        let tempdir = temp_dir();
+        let storage_handle = storage::FjallStorage::open(&tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,

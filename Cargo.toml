@@ -70,7 +70,7 @@ utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 smallvec = "1.15.1"
 byteview = "0.10.0"
-tempfile = "3.14"
+tempfile = "3.25.0"
 
 [profile.release]
 panic = "abort"
