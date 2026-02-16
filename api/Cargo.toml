@@ -18,3 +18,6 @@ tokio = { workspace = true }
 ulid = { workspace = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }

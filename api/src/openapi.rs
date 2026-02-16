@@ -21,6 +21,7 @@ use utoipa::{Modify, OpenApi};
         // REST API endpoints - Groups
         crate::routes::create_group,
         crate::routes::list_groups,
+        crate::routes::get_group,
     ),
     modifiers(&SecurityAddon)
 )]

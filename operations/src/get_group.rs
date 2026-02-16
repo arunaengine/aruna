@@ -1,6 +1,6 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::StorageEvent;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{AuthorizationDocument, Group};
 use aruna_core::types::{Effects, GroupId};
@@ -76,9 +76,120 @@ impl GetGroupOperation {
             StorageEffect::CommitTransaction { txn_id }
         )])
     }
+
+    fn fail(&mut self, err: GetGroupError) -> Effects {
+        self.state = GetGroupState::Error;
+        self.output = Some(Err(err));
+        smallvec![]
+    }
+
+    fn fail_with_cleanup(&mut self, err: GetGroupError, cleanup_effects: Effects) -> Effects {
+        self.state = GetGroupState::Error;
+        self.output = Some(Err(err));
+        cleanup_effects
+    }
+
+    fn unexpected_event(
+        &mut self,
+        state: GetGroupState,
+        expected: &'static str,
+        got: String,
+    ) -> Effects {
+        let cleanup_effects = self.abort();
+        self.fail_with_cleanup(
+            GetGroupError::UnexpectedEvent {
+                state,
+                expected,
+                got,
+            },
+            cleanup_effects,
+        )
+    }
+
+    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+        if let Event::Storage(StorageEvent::Error { error }) = event {
+            return Err(self.fail(error.into()));
+        }
+
+        Ok(event)
+    }
+
+    fn handle_start_transaction(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return self.unexpected_event(
+                GetGroupState::StartTransaction,
+                "Event::Storage(StorageEvent::TransactionStarted)",
+                got,
+            );
+        };
+
+        self.state = GetGroupState::GetGroup;
+        self.txn_id = Some(txn_id);
+        self.emit_get_group()
+    }
+
+    fn handle_get_group(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected_event(
+                GetGroupState::GetGroup,
+                "Event::Storage(StorageEvent::ReadResult)",
+                got,
+            );
+        };
+
+        match self.emit_parse_group(value) {
+            Ok(_) => {
+                self.state = GetGroupState::GetAuthDoc;
+                self.emit_get_auth_doc()
+            }
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn handle_get_auth_doc(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected_event(
+                GetGroupState::GetAuthDoc,
+                "Event::Storage(StorageEvent::ReadResult)",
+                got,
+            );
+        };
+
+        match self.emit_parse_auth_doc(value) {
+            Ok(effects) => {
+                self.state = GetGroupState::CommitTransaction;
+                effects
+            }
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn handle_commit_transaction(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+            return self.unexpected_event(
+                GetGroupState::CommitTransaction,
+                "Event::Storage(StorageEvent::TransactionCommitted)",
+                got,
+            );
+        };
+
+        if let Some(group) = &self.group
+            && let Some(auth) = &self.auth_doc
+        {
+            self.state = GetGroupState::Finish;
+            self.output = Some(Ok((group.clone(), auth.clone())));
+            smallvec![]
+        } else {
+            self.fail(GetGroupError::GroupNotFound)
+        }
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum GetGroupState {
     Init,
     StartTransaction,
@@ -103,6 +214,12 @@ pub enum GetGroupError {
     AuthDocNotFound,
     #[error("Creating Group did not finish")]
     NotFinished,
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: GetGroupState,
+        expected: &'static str,
+        got: String,
+    },
 }
 
 impl Operation for GetGroupOperation {
@@ -118,67 +235,18 @@ impl Operation for GetGroupOperation {
         })]
     }
 
-    fn step(&mut self, events: aruna_core::events::Event) -> aruna_core::types::Effects {
-        match (events, &self.state) {
-            (
-                aruna_core::events::Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-                GetGroupState::StartTransaction,
-            ) => {
-                self.state = GetGroupState::GetGroup;
-                self.txn_id = Some(txn_id);
-                self.emit_get_group()
-            }
-            (
-                aruna_core::events::Event::Storage(StorageEvent::ReadResult { value, .. }),
-                GetGroupState::GetGroup,
-            ) => match self.emit_parse_group(value) {
-                Ok(_) => {
-                    self.state = GetGroupState::GetAuthDoc;
-                    self.emit_get_auth_doc()
-                }
-                Err(err) => {
-                    self.state = GetGroupState::Error;
-                    self.output = Some(Err(err));
-                    smallvec![]
-                }
-            },
-            (
-                aruna_core::events::Event::Storage(StorageEvent::ReadResult { value, .. }),
-                GetGroupState::GetAuthDoc,
-            ) => match self.emit_parse_auth_doc(value) {
-                Ok(effects) => {
-                    self.state = GetGroupState::CommitTransaction;
-                    effects
-                }
-                Err(err) => {
-                    self.state = GetGroupState::Error;
-                    self.output = Some(Err(err));
-                    smallvec![]
-                }
-            },
-            (
-                aruna_core::events::Event::Storage(StorageEvent::TransactionCommitted { .. }),
-                GetGroupState::CommitTransaction,
-            ) => {
-                if let Some(group) = &self.group
-                    && let Some(auth) = &self.auth_doc
-                {
-                    self.state = GetGroupState::Finish;
-                    self.output = Some(Ok((group.clone(), auth.clone())));
-                } else {
-                    self.state = GetGroupState::Error;
-                    self.output = Some(Err(GetGroupError::GroupNotFound));
-                }
-                smallvec![]
-            }
-            (aruna_core::events::Event::Storage(StorageEvent::Error { error }), _) => {
-                self.state = GetGroupState::Error;
-                self.output = Some(Err(error.into()));
-                smallvec![]
-            }
-            _ => {
-                smallvec![]
-            }
+    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+        let event = match self.fail_on_storage_error(event) {
+            Ok(event) => event,
+            Err(effects) => return effects,
+        };
+
+        match self.state {
+            GetGroupState::StartTransaction => self.handle_start_transaction(event),
+            GetGroupState::GetGroup => self.handle_get_group(event),
+            GetGroupState::GetAuthDoc => self.handle_get_auth_doc(event),
+            GetGroupState::CommitTransaction => self.handle_commit_transaction(event),
+            GetGroupState::Init | GetGroupState::Finish | GetGroupState::Error => smallvec![],
         }
     }
 
@@ -204,14 +272,19 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use crate::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_storage::storage;
+    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[tokio::test]
     pub async fn test_get_group() {
-        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
-        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
 
-        let context = DriverContext { storage_handle };
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
 
         let group_config = CreateGroupConfig {
             user_id: Ulid::new(),

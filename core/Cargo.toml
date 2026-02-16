@@ -10,8 +10,11 @@ smallvec = { workspace = true }
 ulid = { workspace = true }
 thiserror = { workspace = true }
 byteview = "0.10.0"
+async-trait = { workspace = true }
+blake3 = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
-globset = { workspace = true }
 base64 = { workspace = true }
-fjall = { workspace = true }
+hex = { workspace = true }
+iroh = { workspace = true }
+iroh-gossip = { workspace = true }

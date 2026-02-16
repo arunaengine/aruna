@@ -1,8 +1,14 @@
-use crate::types::{Key, KeySpace, TxnId, Value};
+use std::time::Duration;
+
+use crate::alpn::Alpn;
+use crate::id::NodeId;
+use crate::operation::SubOperation;
+use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 
 pub enum Effect {
     Storage(StorageEffect),
-    Network(),
+    Net(NetEffect),
+    SubOperation(Box<dyn SubOperation>),
     Task(),
     Search(),
     Stream(),
@@ -20,10 +26,6 @@ pub enum StorageEffect {
         key: Key,
         txn_id: Option<TxnId>,
     },
-    Iter {
-        key_space: KeySpace,
-        txn_id: Option<TxnId>,
-    },
     Write {
         key_space: KeySpace,
         key: Key,
@@ -38,4 +40,49 @@ pub enum StorageEffect {
     AbortTransaction {
         txn_id: TxnId,
     },
+    /// Iterate over keys in a keyspace with optional prefix and pagination.
+    ///
+    /// Iteration order is lexicographic by key bytes.
+    /// - `prefix`: restricts results to keys with this prefix
+    /// - `start_after`: exclusive cursor key
+    /// - `limit`: maximum number of entries to return
+    Iter {
+        key_space: KeySpace,
+        prefix: Option<Key>,
+        start_after: Option<Key>,
+        limit: usize,
+        txn_id: Option<TxnId>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum NetEffect {
+    Dht(DhtEffect),
+    Gossip(GossipEffect),
+    Stream(StreamEffect),
+}
+
+#[derive(Debug, Clone)]
+pub enum DhtEffect {
+    Put {
+        key: DhtKey,
+        value: Vec<u8>,
+        ttl: Duration,
+    },
+    Get {
+        key: DhtKey,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum GossipEffect {
+    Subscribe { topic: TopicId },
+    Broadcast { topic: TopicId, message: Vec<u8> },
+    Unsubscribe { topic: TopicId },
+}
+
+#[derive(Debug, Clone)]
+pub enum StreamEffect {
+    Open { node_id: NodeId, alpn: Alpn },
+    Close { stream_id: u64 },
 }

@@ -1,28 +1,102 @@
-use aruna_core::operation::Operation;
+use aruna_core::effects::Effect;
+use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::handle::Handle;
+use aruna_core::operation::{Operation, SubOperation};
+use aruna_net::NetHandle;
 use aruna_storage::storage;
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 
 #[derive(Debug)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
+    pub net_handle: Option<NetHandle>,
+}
+
+const MAX_SUBOP_DEPTH: usize = 32;
+
+async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
+    match effect {
+        Effect::Storage(storage_effect) => {
+            context
+                .storage_handle
+                .send_storage_effect(storage_effect)
+                .await
+        }
+        Effect::Net(net_effect) => {
+            if let Some(net_handle) = &context.net_handle {
+                net_handle.send_effect(Effect::Net(net_effect)).await
+            } else {
+                Event::Net(NetEvent::Error(aruna_core::events::NetError::ChannelClosed))
+            }
+        }
+        Effect::SubOperation(sub_operation) => {
+            if depth >= MAX_SUBOP_DEPTH {
+                Event::SubOperation(SubOperationEvent::DepthLimitExceeded {
+                    max_depth: MAX_SUBOP_DEPTH,
+                })
+            } else {
+                drive_suboperation(sub_operation, context, depth + 1).await
+            }
+        }
+        Effect::Task() => {
+            tracing::warn!("Task effect is not handled by driver yet");
+            Event::Task()
+        }
+        Effect::Search() => {
+            tracing::warn!("Search effect is not handled by driver yet");
+            Event::Search()
+        }
+        Effect::Stream() => {
+            tracing::warn!("Top-level stream effect is not handled by driver yet");
+            Event::Stream()
+        }
+    }
+}
+
+fn drive_suboperation<'a>(
+    mut operation: Box<dyn SubOperation>,
+    context: &'a DriverContext,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Event> + Send + 'a>> {
+    Box::pin(async move {
+        let mut queue: VecDeque<_> = operation.start().into_iter().collect();
+
+        while !operation.is_complete() {
+            while let Some(effect) = queue.pop_front() {
+                let event = dispatch_effect(effect, context, depth).await;
+                queue.extend(operation.step(event));
+            }
+
+            if queue.is_empty() && !operation.is_complete() {
+                queue.extend(operation.abort());
+                if queue.is_empty() {
+                    break;
+                }
+            }
+        }
+
+        operation.finalize()
+    })
 }
 
 pub async fn drive<O: Operation>(
     mut operation: O,
     context: &DriverContext,
 ) -> Result<O::Output, O::Error> {
-    let mut queue = operation.start();
+    let mut queue: VecDeque<_> = operation.start().into_iter().collect();
 
     while !operation.is_complete() {
-        while let Some(effect) = queue.pop() {
-            match effect {
-                aruna_core::effects::Effect::Storage(storage_effect) => {
-                    let event = context.storage_handle.send_effect(storage_effect).await;
-                    queue.extend(operation.step(event));
-                }
-                aruna_core::effects::Effect::Network() => todo!(),
-                aruna_core::effects::Effect::Task() => todo!(),
-                aruna_core::effects::Effect::Search() => todo!(),
-                aruna_core::effects::Effect::Stream() => todo!(),
+        while let Some(effect) = queue.pop_front() {
+            let event = dispatch_effect(effect, context, 0).await;
+            queue.extend(operation.step(event));
+        }
+
+        if queue.is_empty() && !operation.is_complete() {
+            queue.extend(operation.abort());
+            if queue.is_empty() {
+                break;
             }
         }
     }
@@ -31,16 +105,16 @@ pub async fn drive<O: Operation>(
 
 #[cfg(test)]
 mod test {
+    use crate::driver::{DriverContext, drive};
     use aruna_core::{
         effects::{Effect, StorageEffect},
-        events::{Event, StorageEvent},
-        operation::Operation,
+        events::{Event, StorageEvent, SubOperationEvent},
+        operation::{Operation, boxed_suboperation},
     };
     use aruna_storage::storage;
     use byteview::ByteView;
-    use ulid::Ulid;
-
-    use crate::driver::{DriverContext, drive};
+    use std::convert::Infallible;
+    use tempfile::tempdir;
 
     pub struct TestOperation {
         pub state: u8,
@@ -129,13 +203,141 @@ mod test {
 
     #[tokio::test]
     pub async fn test_driver() {
-        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
-        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
 
-        let context = DriverContext { storage_handle };
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
 
         let operation = TestOperation::new();
         let result = drive(operation, &context).await;
         assert!(result.is_ok());
+    }
+
+    struct EffectOrderOperation {
+        observed: Vec<&'static str>,
+    }
+
+    impl EffectOrderOperation {
+        fn new() -> Self {
+            Self {
+                observed: Vec::new(),
+            }
+        }
+    }
+
+    impl Operation for EffectOrderOperation {
+        type Output = Vec<&'static str>;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::Task(), Effect::Search()]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            match event {
+                Event::Task() => self.observed.push("task"),
+                Event::Search() => self.observed.push("search"),
+                _ => {}
+            }
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.observed.len() == 2
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self.observed)
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_driver_preserves_effect_order_fifo() {
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
+
+        let operation = EffectOrderOperation::new();
+        let observed = drive(operation, &context)
+            .await
+            .expect("drive should succeed");
+        assert_eq!(observed, vec!["task", "search"]);
+    }
+
+    struct RecursiveSubOperation {
+        observed: Option<Event>,
+    }
+
+    impl RecursiveSubOperation {
+        fn new() -> Self {
+            Self { observed: None }
+        }
+    }
+
+    impl Operation for RecursiveSubOperation {
+        type Output = Event;
+        type Error = Infallible;
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::SubOperation(boxed_suboperation(
+                RecursiveSubOperation::new(),
+                |result| match result {
+                    Ok(event) => event,
+                    Err(never) => match never {},
+                },
+            ))]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            self.observed = Some(event);
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.observed.is_some()
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self
+                .observed
+                .expect("recursive suboperation should produce an event"))
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_suboperation_depth_limit_is_enforced() {
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
+
+        let event = drive(RecursiveSubOperation::new(), &context)
+            .await
+            .expect("recursive suboperation should resolve to depth-limit event");
+
+        assert!(matches!(
+            event,
+            Event::SubOperation(SubOperationEvent::DepthLimitExceeded { max_depth })
+                if max_depth == super::MAX_SUBOP_DEPTH
+        ));
     }
 }

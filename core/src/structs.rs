@@ -177,7 +177,6 @@ impl AuthorizationDocument {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
     /// Subject: user identity in format `{user_ulid}@{realm_pubkey_base64}`.

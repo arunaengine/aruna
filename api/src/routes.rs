@@ -50,28 +50,29 @@ pub struct RoleResponse {
     pub assigned_users: Vec<String>,
 }
 
+fn map_roles(auth: AuthorizationDocument) -> Vec<RoleResponse> {
+    auth.roles
+        .into_iter()
+        .map(|(role_id, role)| RoleResponse {
+            role_id: role_id.to_string(),
+            name: role.name,
+            permissions: role
+                .permissions
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect(),
+            assigned_users: role.assigned_users.iter().map(|u| u.to_string()).collect(),
+        })
+        .collect()
+}
+
 impl From<(Group, AuthorizationDocument)> for CreateGroupResponse {
     fn from((group, auth): (Group, AuthorizationDocument)) -> Self {
-        let mut roles = Vec::new();
-        for (role_id, role) in auth.roles {
-            let role = RoleResponse {
-                role_id: role_id.to_string(),
-                name: role.name,
-                permissions: role
-                    .permissions
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.to_string()))
-                    .collect(),
-                assigned_users: role.assigned_users.iter().map(|u| u.to_string()).collect(),
-            };
-            roles.push(role);
-        }
-
         CreateGroupResponse {
             display_name: group.display_name,
             group_id: group.group_id.to_string(),
             realm_id: group.realm_id.to_string(),
-            roles,
+            roles: map_roles(auth),
         }
     }
 }
@@ -112,7 +113,7 @@ pub async fn create_group(
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
     let response: CreateGroupResponse = result.into();
 
-    Ok((StatusCode::OK, response.into()))
+    Ok((StatusCode::CREATED, response.into()))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -174,13 +175,19 @@ impl PaginationParams {
 pub async fn list_groups(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
-    Query(_pagination): Query<PaginationParams>,
+    Query(pagination): Query<PaginationParams>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
     let _auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
 
-    let result = drive(ListGroupOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let limit = pagination.limit_or(100).clamp(1, 1_000);
+    let offset = pagination.offset_or(0);
+
+    let result = drive(
+        ListGroupOperation::with_pagination(limit as usize, offset as usize),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
     let response = ListGroupsResponse {
         groups: result
             .iter()
@@ -205,26 +212,11 @@ pub struct GroupInfoResponse {
 
 impl From<(Group, AuthorizationDocument)> for GroupInfoResponse {
     fn from((group, auth): (Group, AuthorizationDocument)) -> Self {
-        let mut roles = Vec::new();
-        for (role_id, role) in auth.roles {
-            let role = RoleResponse {
-                role_id: role_id.to_string(),
-                name: role.name,
-                permissions: role
-                    .permissions
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.to_string()))
-                    .collect(),
-                assigned_users: role.assigned_users.iter().map(|u| u.to_string()).collect(),
-            };
-            roles.push(role);
-        }
-
         GroupInfoResponse {
             display_name: group.display_name,
             group_id: group.group_id.to_string(),
             realm_id: group.realm_id.to_string(),
-            roles,
+            roles: map_roles(auth),
         }
     }
 }
@@ -241,6 +233,7 @@ impl From<(Group, AuthorizationDocument)> for GroupInfoResponse {
     ),
     responses(
         (status = 200, description = "Group information", body = GroupInfoResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 400, description = "Invalid group ID", body = ErrorResponse),
         (status = 404, description = "Group not found", body = ErrorResponse)
     ),
@@ -248,8 +241,11 @@ impl From<(Group, AuthorizationDocument)> for GroupInfoResponse {
 )]
 pub async fn get_group(
     State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
+    let _auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
+
     let group_id = Ulid::from_string(&group_id).map_err(|_e| ServerError::BadRequest)?;
     let config = GetGroupConfig { group_id };
     let result = drive(GetGroupOperation::new(config), &state.get_ctx())

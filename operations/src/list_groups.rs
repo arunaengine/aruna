@@ -1,6 +1,6 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::StorageEvent;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::Group;
 use aruna_core::types::{Key, Value};
@@ -13,20 +13,35 @@ pub struct ListGroupOperation {
     txn_id: Option<Ulid>,
     output: Option<Result<Vec<Group>, ListGroupError>>,
     state: ListGroupState,
+    limit: usize,
+    offset: usize,
 }
 
 impl ListGroupOperation {
+    const DEFAULT_LIMIT: usize = 10_000;
+
     pub fn new() -> Self {
+        Self::with_pagination(Self::DEFAULT_LIMIT, 0)
+    }
+
+    pub fn with_pagination(limit: usize, offset: usize) -> Self {
         ListGroupOperation {
             txn_id: None,
             output: None,
             state: ListGroupState::Init,
+            limit,
+            offset,
         }
     }
+
     fn emit_list_groups(&mut self) -> aruna_core::types::Effects {
+        let scan_limit = self.offset.saturating_add(self.limit).max(1);
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: "groups".to_string(),
-            txn_id: self.txn_id
+            prefix: None,
+            start_after: None,
+            limit: scan_limit,
+            txn_id: self.txn_id,
         })]
     }
 
@@ -36,7 +51,9 @@ impl ListGroupOperation {
     ) -> Result<aruna_core::types::Effects, ListGroupError> {
         self.output = Some(
             values
-                .iter()
+                .into_iter()
+                .skip(self.offset)
+                .take(self.limit)
                 .map(|(_, value)| -> Result<Group, ListGroupError> {
                     Group::from_bytes(&value).map_err(|err| err.into())
                 })
@@ -49,9 +66,98 @@ impl ListGroupOperation {
             None => Err(ListGroupError::NoTransactionFound),
         }
     }
+
+    fn fail(&mut self, err: ListGroupError) -> aruna_core::types::Effects {
+        self.state = ListGroupState::Error;
+        self.output = Some(Err(err));
+        smallvec![]
+    }
+
+    fn fail_with_cleanup(
+        &mut self,
+        err: ListGroupError,
+        cleanup_effects: aruna_core::types::Effects,
+    ) -> aruna_core::types::Effects {
+        self.state = ListGroupState::Error;
+        self.output = Some(Err(err));
+        cleanup_effects
+    }
+
+    fn unexpected_event(
+        &mut self,
+        state: ListGroupState,
+        expected: &'static str,
+        got: String,
+    ) -> aruna_core::types::Effects {
+        let cleanup_effects = self.abort();
+        self.fail_with_cleanup(
+            ListGroupError::UnexpectedEvent {
+                state,
+                expected,
+                got,
+            },
+            cleanup_effects,
+        )
+    }
+
+    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, aruna_core::types::Effects> {
+        if let Event::Storage(StorageEvent::Error { error }) = event {
+            return Err(self.fail(error.into()));
+        }
+
+        Ok(event)
+    }
+
+    fn handle_start_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return self.unexpected_event(
+                ListGroupState::StartTransaction,
+                "Event::Storage(StorageEvent::TransactionStarted)",
+                got,
+            );
+        };
+
+        self.state = ListGroupState::ListGroups;
+        self.txn_id = Some(txn_id);
+        self.emit_list_groups()
+    }
+
+    fn handle_list_groups(&mut self, event: Event) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return self.unexpected_event(
+                ListGroupState::ListGroups,
+                "Event::Storage(StorageEvent::IterResult)",
+                got,
+            );
+        };
+
+        match self.emit_parse_groups(values) {
+            Ok(effects) => {
+                self.state = ListGroupState::CommitTransaction;
+                effects
+            }
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn handle_commit_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+            return self.unexpected_event(
+                ListGroupState::CommitTransaction,
+                "Event::Storage(StorageEvent::TransactionCommitted)",
+                got,
+            );
+        };
+
+        self.state = ListGroupState::Finish;
+        smallvec![]
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ListGroupState {
     Init,
     StartTransaction,
@@ -75,6 +181,12 @@ pub enum ListGroupError {
     AuthDocNotFound,
     #[error("Creating Group did not finish")]
     NotFinished,
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: ListGroupState,
+        expected: &'static str,
+        got: String,
+    },
 }
 
 impl Operation for ListGroupOperation {
@@ -90,43 +202,17 @@ impl Operation for ListGroupOperation {
         })]
     }
 
-    fn step(&mut self, events: aruna_core::events::Event) -> aruna_core::types::Effects {
-        match (events, &self.state) {
-            (
-                aruna_core::events::Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-                ListGroupState::StartTransaction,
-            ) => {
-                self.state = ListGroupState::ListGroups;
-                self.txn_id = Some(txn_id);
-                self.emit_list_groups()
-            }
-            (
-                aruna_core::events::Event::Storage(StorageEvent::IterResult { values }),
-                ListGroupState::ListGroups,
-            ) => match self.emit_parse_groups(values) {
-                Ok(effects) => {
-                    self.state = ListGroupState::CommitTransaction;
-                    effects
-                }
-                Err(err) => {
-                    self.state = ListGroupState::Error;
-                    self.output = Some(Err(err));
-                    smallvec![]
-                }
-            },
-            (
-                aruna_core::events::Event::Storage(StorageEvent::TransactionCommitted { .. }),
-                ListGroupState::CommitTransaction,
-            ) => {
-                self.state = ListGroupState::Finish;
-                smallvec![]
-            }
-            (aruna_core::events::Event::Storage(StorageEvent::Error { error }), _) => {
-                self.state = ListGroupState::Error;
-                self.output = Some(Err(error.into()));
-                smallvec![]
-            }
-            _ => {
+    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+        let event = match self.fail_on_storage_error(event) {
+            Ok(event) => event,
+            Err(effects) => return effects,
+        };
+
+        match self.state {
+            ListGroupState::StartTransaction => self.handle_start_transaction(event),
+            ListGroupState::ListGroups => self.handle_list_groups(event),
+            ListGroupState::CommitTransaction => self.handle_commit_transaction(event),
+            ListGroupState::Init | ListGroupState::Finish | ListGroupState::Error => {
                 smallvec![]
             }
         }
@@ -154,14 +240,19 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use crate::list_groups::ListGroupOperation;
     use aruna_storage::storage;
+    use tempfile::tempdir;
     use ulid::Ulid;
 
     #[tokio::test]
     pub async fn test_list_group() {
-        let random_path = format!("/dev/shm/{}", Ulid::new().to_string());
-        let storage_handle = storage::FjallStorage::open(&random_path).unwrap();
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
 
-        let context = DriverContext { storage_handle };
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+        };
 
         let mut groups = Vec::new();
         for i in 0..100 {

@@ -1,25 +1,94 @@
 use crate::{
-    errors::StorageError,
-    types::{Key, TxnId, Value},
+    errors::{DhtError, GossipError, StorageError, StreamError},
+    id::NodeId,
+    types::{DhtKey, Key, TopicId, TxnId, Value},
 };
 
 #[derive(Debug)]
 pub enum Event {
     Storage(StorageEvent),
-    Network(),
+    Net(NetEvent),
+    SubOperation(SubOperationEvent),
     Task(),
     Search(),
     Stream(),
 }
 
 #[derive(Debug)]
+pub enum SubOperationEvent {
+    DepthLimitExceeded { max_depth: usize },
+}
+
+#[derive(Debug)]
 pub enum StorageEvent {
-    TransactionStarted { txn_id: TxnId },
-    TransactionCommitted { txn_id: TxnId },
-    TransactionAborted { txn_id: TxnId },
-    ReadResult { key: Key, value: Option<Value> },
-    IterResult { values: Vec<(Key, Value)> },
-    WriteResult { key: Key },
-    DeleteResult { key: Key },
-    Error { error: StorageError },
+    TransactionStarted {
+        txn_id: TxnId,
+    },
+    TransactionCommitted {
+        txn_id: TxnId,
+    },
+    TransactionAborted {
+        txn_id: TxnId,
+    },
+    ReadResult {
+        key: Key,
+        value: Option<Value>,
+    },
+    WriteResult {
+        key: Key,
+    },
+    DeleteResult {
+        key: Key,
+    },
+    /// Result of an iteration request with optional pagination cursor.
+    IterResult {
+        values: Vec<(Key, Value)>,
+        next_start_after: Option<Key>,
+    },
+    Error {
+        error: StorageError,
+    },
+}
+
+#[derive(Debug)]
+pub enum NetEvent {
+    Dht(DhtEvent),
+    Gossip(GossipEvent),
+    Stream(StreamEvent),
+    Error(NetError),
+}
+
+#[derive(Debug)]
+pub enum DhtEvent {
+    PutComplete { key: DhtKey },
+    GetResult { key: DhtKey, values: Vec<DhtEntry> },
+    Error { error: DhtError },
+}
+
+#[derive(Debug, Clone)]
+pub struct DhtEntry {
+    pub node_id: NodeId,
+    pub value: Vec<u8>,
+    pub expires_at: u64,
+}
+
+#[derive(Debug)]
+pub enum GossipEvent {
+    Subscribed { topic: TopicId },
+    BroadcastComplete { topic: TopicId },
+    Unsubscribed { topic: TopicId },
+    Error { error: GossipError },
+}
+
+#[derive(Debug)]
+pub enum StreamEvent {
+    Opened { stream_id: u64, node_id: NodeId },
+    Closed { stream_id: u64 },
+    Error { stream_id: u64, error: StreamError },
+}
+
+#[derive(Debug)]
+pub enum NetError {
+    InvalidEffect,
+    ChannelClosed,
 }

@@ -13,3 +13,4 @@ aruna-core = { path = "../core" }
 ulid = { workspace = true }
 byteview = "0.10.0"
 tracing = { workspace = true }
+async-trait = { workspace = true }
