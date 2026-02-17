@@ -196,6 +196,20 @@ version = "3.0.0"
 [[package]]
 name = "aruna-tools"
 version = "3.0.0"
+dependencies = [
+ "aruna",
+ "aruna-api",
+ "aruna-core",
+ "aruna-net",
+ "aruna-operations",
+ "aruna-storage",
+ "chrono",
+ "ed25519-dalek 2.2.0",
+ "jsonwebtoken",
+ "tempfile",
+ "tokio",
+ "ulid",
+]
 
 [[package]]
 name = "async-compat"
