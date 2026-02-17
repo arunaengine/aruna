@@ -23,6 +23,7 @@ rand = { workspace = true }
 byteview = "0.10.0"
 futures = { workspace = true }
 tracing = { workspace = true }
+smallvec = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

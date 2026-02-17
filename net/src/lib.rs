@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-pub use dht::DhtService;
+pub use dht::DhtHandle;
 pub use error::{NetError, Result};
 pub use gossip::GossipService;
 pub use streams::StreamsService;
@@ -78,7 +78,7 @@ struct NetInner {
     node_id: NodeId,
     endpoint: Endpoint,
     address_lookup: MemoryLookup,
-    dht: Arc<DhtService>,
+    dht: Arc<DhtHandle>,
     gossip: Arc<GossipService>,
     streams: Arc<StreamsService>,
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
@@ -134,9 +134,9 @@ impl NetHandle {
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
 
-        let dht = Arc::new(
-            DhtService::new(endpoint.clone(), storage.clone(), shutdown.child_token()).await?,
-        );
+        let (dht_handle, dht_runtime) =
+            DhtHandle::spawn(endpoint.clone(), storage.clone(), shutdown.child_token())?;
+        let dht = Arc::new(dht_handle);
 
         if !config.bootstrap_nodes.is_empty()
             && let Err(err) = dht.bootstrap_nodes(&config.bootstrap_nodes).await
@@ -193,19 +193,16 @@ impl NetHandle {
         let (gossip_conn_tx, mut gossip_conn_rx) = mpsc::channel(64);
         let (stream_tx, mut stream_rx) = mpsc::channel(64);
 
-        let dht_server = dht.server();
+        let dht_inbound_tx = dht_runtime.inbound_stream_tx.clone();
         let dht_for_inbound = dht.clone();
         let gossip_for_inbound = gossip.clone();
         let dht_task = tokio::spawn(async move {
             while let Some((send, recv, peer_id)) = dht_rx.recv().await {
-                let server = dht_server.clone();
-                let dht = dht_for_inbound.clone();
-                let gossip = gossip_for_inbound.clone();
-                tokio::spawn(async move {
-                    dht.add_peer(peer_id).await;
-                    gossip.add_bootstrap_node(peer_id);
-                    let _ = server.handle_stream(send, recv, peer_id).await;
-                });
+                let _ = dht_for_inbound.add_peer(peer_id);
+                gossip_for_inbound.add_bootstrap_node(peer_id);
+                if dht_inbound_tx.send((send, recv, peer_id)).await.is_err() {
+                    break;
+                }
             }
         });
 
@@ -213,7 +210,7 @@ impl NetHandle {
         let gossip_for_gossip = gossip.clone();
         let gossip_task = tokio::spawn(async move {
             while let Some((conn, peer_id)) = gossip_conn_rx.recv().await {
-                dht_for_gossip.add_peer(peer_id).await;
+                let _ = dht_for_gossip.add_peer(peer_id);
                 gossip_for_gossip.add_bootstrap_node(peer_id);
                 if let Err(err) = gossip_for_gossip.gossip().handle_connection(conn).await {
                     warn!(error = %err, "Failed to hand connection to gossip service");
@@ -247,7 +244,7 @@ impl NetHandle {
         let inbound_handler_for_streams = inbound_handler.clone();
         let stream_task = tokio::spawn(async move {
             while let Some((alpn, send, recv, peer_id)) = stream_rx.recv().await {
-                dht_for_streams.add_peer(peer_id).await;
+                let _ = dht_for_streams.add_peer(peer_id);
                 gossip_for_streams.add_bootstrap_node(peer_id);
 
                 let handler = inbound_handler_for_streams.read().clone();
@@ -276,6 +273,16 @@ impl NetHandle {
             .await;
         });
 
+        let mut tasks = dht_runtime.tasks;
+        tasks.extend(vec![
+            effect_task,
+            dht_task,
+            gossip_task,
+            gossip_event_task,
+            stream_task,
+            accept_task,
+        ]);
+
         let inner = Arc::new(NetInner {
             effect_tx,
             node_id,
@@ -286,14 +293,7 @@ impl NetHandle {
             streams,
             inbound_handler,
             shutdown,
-            tasks: Mutex::new(vec![
-                effect_task,
-                dht_task,
-                gossip_task,
-                gossip_event_task,
-                stream_task,
-                accept_task,
-            ]),
+            tasks: Mutex::new(tasks),
         });
 
         Ok(Self { inner })
@@ -316,12 +316,12 @@ impl NetHandle {
             .address_lookup
             .add_endpoint_info(endpoint_addr.clone());
         self.inner.gossip.add_bootstrap_node(endpoint_addr.id);
-        self.inner.dht.add_peer(endpoint_addr.id).await;
+        let _ = self.inner.dht.add_peer(endpoint_addr.id);
     }
 
     pub async fn open_stream(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
         if node_id != self.inner.node_id {
-            self.inner.dht.add_peer(node_id).await;
+            let _ = self.inner.dht.add_peer(node_id);
             self.inner.gossip.add_bootstrap_node(node_id);
         }
 
@@ -341,6 +341,7 @@ impl NetHandle {
             return;
         }
 
+        let _ = self.inner.dht.shutdown().await;
         self.inner.shutdown.cancel();
         let _ = self.inner.gossip.gossip().shutdown().await;
         self.inner.endpoint.close().await;
