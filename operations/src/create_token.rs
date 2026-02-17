@@ -2,7 +2,10 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{RealmId, TokenClaims};
 use aruna_core::types::UserId;
 use chrono::Months;
-use jsonwebtoken::{EncodingKey, Header, encode};
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -36,8 +39,12 @@ pub enum CreateTokenError {
     NotFinished,
     #[error("Invalid timestamp")]
     InvalidTimestamp,
-    #[error("Invalid timestamp")]
+    #[error(transparent)]
     EncodingError(#[from] jsonwebtoken::errors::Error),
+    #[error(transparent)]
+    KeySerializationError(#[from] ed25519_dalek::ed25519::Error),
+    #[error(transparent)]
+    PKCSError(#[from] ed25519_dalek::pkcs8::Error),
 }
 
 impl CreateTokenOperation {
@@ -79,10 +86,14 @@ impl CreateTokenOperation {
             exp,
             jti: Ulid::new().to_string(), // TODO: Save tokens somewhere
         };
+
+        let signing_key = SigningKey::from_keypair_bytes(&self.config.keypair)?;
+        let encoding_key = signing_key.to_pkcs8_pem(LineEnding::default())?;
+
         let token = encode(
-            &Header::default(),
+            &Header::new(Algorithm::EdDSA),
             &claims,
-            &EncodingKey::from_secret(&self.config.keypair),
+            &EncodingKey::from_ed_pem(encoding_key.as_bytes())?,
         )?;
         self.output = Some(Ok(token));
 
@@ -130,6 +141,7 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::structs::RealmId;
     use aruna_storage::storage;
+    use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -144,12 +156,18 @@ mod test {
             net_handle: None,
         };
 
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let realm_id = RealmId::from_bytes(pubkey);
+        let keypair = signing_key.to_keypair_bytes();
+
         let token_config = CreateTokenConfig {
             time: chrono::Utc::now().timestamp() as u64,
             expiry: None,
             user_id: Ulid::new(),
-            realm_id: RealmId([0u8; 32]),
-            keypair: [0u8; 64],
+            realm_id,
+            keypair,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone());
         drive(token_operation, &context).await.unwrap();

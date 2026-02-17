@@ -5,11 +5,13 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, header};
 use axum::middleware::Next;
 use axum::response::Response;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePublicKey;
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::server::ServerState;
+use crate::server_state::ServerState;
 
 #[derive(Debug)]
 pub struct OidcValidator {}
@@ -51,8 +53,19 @@ async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Optio
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))?;
     let keypair = state.get_keypair()?;
-    let decoding_key = DecodingKey::from_secret(&keypair);
-    let claims = decode::<TokenClaims>(token, &decoding_key, &Validation::default()).ok()?;
+    let signing_key = SigningKey::from_keypair_bytes(&keypair).ok()?;
+    let verifying_key = signing_key
+        .verifying_key()
+        .to_public_key_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::default())
+        .ok()?;
+
+    let decoding_key = DecodingKey::from_ed_pem(verifying_key.as_bytes()).ok()?;
+    let claims = decode::<TokenClaims>(
+        token,
+        &decoding_key,
+        &Validation::new(jsonwebtoken::Algorithm::EdDSA),
+    )
+    .ok()?;
     claims.claims.try_into().ok()
 }
 
@@ -76,12 +89,13 @@ pub async fn auth_middleware(
 #[cfg(test)]
 mod test {
     use crate::auth::extract_auth_context;
-    use crate::server::ServerState;
+    use crate::server_state::ServerState;
     use aruna_core::structs::RealmId;
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use axum::http::{HeaderMap, header};
+    use ed25519_dalek::SigningKey;
     use std::sync::Arc;
     use tempfile::env::temp_dir;
     use ulid::Ulid;
@@ -94,8 +108,13 @@ mod test {
             storage_handle,
             net_handle: None,
         });
-        let realm_id = Some(RealmId([0u8; 32]));
-        let realm_keypair = Some([0u8; 64]);
+
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let realm_id = Some(RealmId::from_bytes(pubkey));
+        let realm_keypair = Some(signing_key.to_keypair_bytes());
+
         let state = ServerState::new(driver_ctx.clone(), realm_keypair, realm_id.clone(), None);
 
         let token_config = CreateTokenConfig {

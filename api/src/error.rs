@@ -101,3 +101,11 @@ impl ServerError {
         }
     }
 }
+
+#[derive(Debug, Error)]
+pub enum ServerSetupError {
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    #[error("Runtime error: `{0}`")]
+    Runtime(String),
+}

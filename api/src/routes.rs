@@ -1,6 +1,6 @@
 use crate::auth::{AuthContext, auth_middleware};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::server::ServerState;
+use crate::server_state::ServerState;
 use aruna_core::structs::{AuthorizationDocument, Group};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
@@ -18,7 +18,7 @@ use ulid::Ulid;
 use utoipa::ToSchema;
 
 /// Build the group routes.
-pub fn router(state: Arc<ServerState>) -> Router {
+pub fn rest_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/groups/{id}", get(get_group))
         .route("/groups", post(create_group))

@@ -11,6 +11,7 @@ aruna-operations = { path = "../operations" }
 aruna-storage = { path = "../storage" }
 axum = "0.8.8"
 chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -21,3 +22,4 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rand = { workspace = true }
