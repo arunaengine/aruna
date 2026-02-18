@@ -1,6 +1,16 @@
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+pub enum BlobError {
+    #[error("Channel closed")]
+    ChannelClosed,
+    #[error(transparent)]
+    OpenDalError(#[from] opendal::Error),
+    #[error("Operator creation failed")]
+    OperatorCreationFailed,
+}
+
+#[derive(Debug, Error)]
 pub enum StorageError {
     #[error("Key not found")]
     KeyNotFound,
