@@ -6,6 +6,7 @@ pub mod handle;
 pub mod id;
 pub mod keys;
 pub mod operation;
+pub mod stream;
 pub mod structs;
 pub mod types;
 pub mod util;

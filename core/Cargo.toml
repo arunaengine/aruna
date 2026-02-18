@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytes.workspace = true
 smallvec = { workspace = true }
 ulid = { workspace = true }
 thiserror = { workspace = true }
@@ -18,3 +19,4 @@ base64 = { workspace = true }
 hex = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
+futures.workspace = true
