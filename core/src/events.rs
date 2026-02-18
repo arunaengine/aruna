@@ -1,11 +1,20 @@
+use crate::errors::BlobError;
+use crate::stream::BackendStream;
+use crate::stream::BoxError;
 use crate::{
     errors::{DhtError, GossipError, StorageError, StreamError},
     id::NodeId,
     types::{DhtKey, Key, TopicId, TxnId, Value},
 };
+use bytes::Bytes;
+use opendal::Operator;
+use std::collections::HashMap;
+use std::fmt::Debug;
 
 #[derive(Debug)]
 pub enum Event {
+    Blob(BlobEvent),
+    Network(),
     Storage(StorageEvent),
     Net(NetEvent),
     SubOperation(SubOperationEvent),
@@ -17,6 +26,28 @@ pub enum Event {
 #[derive(Debug)]
 pub enum SubOperationEvent {
     DepthLimitExceeded { max_depth: usize },
+}
+
+#[derive(Debug)]
+pub enum BlobEvent {
+    //TicketReceived { ticket: String, },
+    OperatorCreated {
+        operator: Operator,
+    },
+    WriteFinished {
+        backend_path: String,
+        bytes_written: u64,
+        hashes: HashMap<String, Vec<u8>>,
+        //checksums: HashMap<String, String>,
+    },
+    ReadFinished {
+        blob: BackendStream<Result<Bytes, BoxError>>,
+        stream_size: u64,
+    },
+    DeleteFinished,
+    Error {
+        error: BlobError,
+    },
 }
 
 #[derive(Debug)]
