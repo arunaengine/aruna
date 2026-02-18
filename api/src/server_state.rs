@@ -1,7 +1,6 @@
 use crate::auth::OidcValidator;
 use crate::error::TokenError;
 use crate::openapi::ApiDoc;
-use aruna_core::errors::ConversionError;
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_operations::driver::DriverContext;
 use base64::Engine;

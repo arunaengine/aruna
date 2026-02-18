@@ -5,7 +5,6 @@ use aruna_operations::driver::DriverContext;
 use aruna_storage::storage;
 use std::sync::Arc;
 
-
 #[tokio::main]
 async fn main() {
     let config = read_config().unwrap();
@@ -15,19 +14,19 @@ async fn main() {
         storage_handle,
         net_handle: None,
     });
-    todo!()
-    // let state = Arc::new(ServerState::new(
-    //     driver_ctx,
-    //     Some(config.realm_keypair),
-    //     Some(config.realm_id),
-    //     None,
-    // ));
 
-    // let config = ServerConfig {
-    //     http_addr: config.socket_addr,
-    // };
-    // let server = Server::new(state, config);
-    // if let Err(err) = server.run().await {
-    //     eprintln!("{}", err);
-    // }
+    let state = Arc::new(ServerState::new(
+        driver_ctx,
+        config.realm_id,
+        config.node_capabilities,
+        None,
+    ));
+
+    let config = ServerConfig {
+        http_addr: config.socket_addr,
+    };
+    let server = Server::new(state, config);
+    if let Err(err) = server.run().await {
+        eprintln!("{}", err);
+    }
 }
