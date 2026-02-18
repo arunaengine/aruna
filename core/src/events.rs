@@ -14,7 +14,6 @@ use std::fmt::Debug;
 #[derive(Debug)]
 pub enum Event {
     Blob(BlobEvent),
-    Network(),
     Storage(StorageEvent),
     Net(NetEvent),
     SubOperation(SubOperationEvent),

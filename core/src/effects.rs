@@ -11,7 +11,6 @@ use std::ops::Range;
 
 pub enum Effect {
     Blob(BlobEffect),
-    Network(),
     Storage(StorageEffect),
     Net(NetEffect),
     SubOperation(Box<dyn SubOperation>),
