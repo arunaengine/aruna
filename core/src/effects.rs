@@ -3,15 +3,45 @@ use std::time::Duration;
 use crate::alpn::Alpn;
 use crate::id::NodeId;
 use crate::operation::SubOperation;
+use crate::stream::{BackendStream, BoxError};
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
+use bytes::Bytes;
+use opendal::Operator;
+use std::ops::Range;
 
 pub enum Effect {
+    Blob(BlobEffect),
+    Network(),
     Storage(StorageEffect),
     Net(NetEffect),
     SubOperation(Box<dyn SubOperation>),
     Task(),
     Search(),
     Stream(),
+}
+
+pub enum BlobEffect {
+    GetOperator {
+        bucket: Option<String>,
+    },
+    Write {
+        operator: Operator,
+        path: String,
+        blob: BackendStream<Result<Bytes, BoxError>>,
+    },
+    Read {
+        operator: Operator,
+        path: String,
+    },
+    ReadRange {
+        operator: Operator,
+        path: String,
+        range: Range<u64>,
+    },
+    Delete {
+        operator: Operator,
+        path: String,
+    },
 }
 
 pub enum StorageEffect {
