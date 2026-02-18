@@ -17,6 +17,7 @@ use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
+use crossfire::TrySendError;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
@@ -134,7 +135,7 @@ impl NetHandle {
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
 
-        let (dht_handle, dht_runtime) =
+        let (dht_handle, dht_resources) =
             DhtHandle::spawn(endpoint.clone(), storage.clone(), shutdown.child_token())?;
         let dht = Arc::new(dht_handle);
 
@@ -193,15 +194,19 @@ impl NetHandle {
         let (gossip_conn_tx, mut gossip_conn_rx) = mpsc::channel(64);
         let (stream_tx, mut stream_rx) = mpsc::channel(64);
 
-        let dht_inbound_tx = dht_runtime.inbound_stream_tx.clone();
+        let dht_inbound_tx = dht_resources.inbound_stream_tx.clone();
         let dht_for_inbound = dht.clone();
         let gossip_for_inbound = gossip.clone();
         let dht_task = tokio::spawn(async move {
             while let Some((send, recv, peer_id)) = dht_rx.recv().await {
                 let _ = dht_for_inbound.add_peer(peer_id);
                 gossip_for_inbound.add_bootstrap_node(peer_id);
-                if dht_inbound_tx.send((send, recv, peer_id)).await.is_err() {
-                    break;
+                match dht_inbound_tx.try_send((send, recv, peer_id)) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue full");
+                    }
+                    Err(TrySendError::Disconnected(_)) => break,
                 }
             }
         });
@@ -273,7 +278,7 @@ impl NetHandle {
             .await;
         });
 
-        let mut tasks = dht_runtime.tasks;
+        let mut tasks = dht_resources.tasks;
         tasks.extend(vec![
             effect_task,
             dht_task,

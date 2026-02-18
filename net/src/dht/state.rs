@@ -1,32 +1,41 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId, NodeIdExt};
+use aruna_core::util::xor_distance_32;
 use smallvec::SmallVec;
 
-use super::constants::{DRIVER_TICK_INTERVAL, RPC_TIMEOUT_TICKS};
+use super::constants::{DRIVER_TICK_INTERVAL, LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, RPC_TIMEOUT_TICKS};
 use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
 use super::protocol::{
-    CallerId, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
-    DhtOutputValue, InboundId, OpId, RequestId, StorageId,
+    CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
+    DhtOutputValue, INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage,
 };
 use super::rpc::{DhtRequest, DhtResponse, ErrorCode, StoredValue};
 use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, live_entries, merge_entry};
+
+type PendingMap = HashMap<PendingKey, PendingMeta>;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingMeta {
+    deadline_tick: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PendingKey {
+    Rpc { phase: RpcPhase, peer: NodeId },
+    Storage { stage: StorageStage },
+}
 
 pub struct DhtStateMachine {
     local_id: NodeId,
     secret_key: iroh::SecretKey,
     routing_table: RoutingTable,
-    next_request_id: u64,
-    next_storage_id: u64,
-    next_op_id: u64,
-    inflight_rpc: HashMap<RequestId, RpcRoute>,
-    inflight_storage: HashMap<StorageId, StorageRoute>,
-    pending_ops: HashMap<OpId, PendingOp>,
-    deadlines: BTreeMap<u64, Vec<RequestId>>,
+    next_internal_op_id: OpId,
+    ops: HashMap<OpId, OpState>,
     cleanup_cursor: Option<Vec<u8>>,
     cleanup_inflight: bool,
-    shutdown_requested: bool,
     current_tick: u64,
     now_secs: u64,
 }
@@ -36,12 +45,9 @@ impl std::fmt::Debug for DhtStateMachine {
         f.debug_struct("DhtStateMachine")
             .field("local_id", &self.local_id)
             .field("routing_table_size", &self.routing_table.len())
-            .field("pending_ops", &self.pending_ops.len())
-            .field("inflight_rpc", &self.inflight_rpc.len())
-            .field("inflight_storage", &self.inflight_storage.len())
+            .field("ops", &self.ops.len())
             .field("cleanup_cursor", &self.cleanup_cursor)
             .field("cleanup_inflight", &self.cleanup_inflight)
-            .field("shutdown_requested", &self.shutdown_requested)
             .field("current_tick", &self.current_tick)
             .field("now_secs", &self.now_secs)
             .finish()
@@ -49,38 +55,66 @@ impl std::fmt::Debug for DhtStateMachine {
 }
 
 #[derive(Debug)]
-enum PendingOp {
+enum OpState {
     Put(PutOp),
     Get(GetOp),
     Bootstrap(BootstrapOp),
     EvictionPing(EvictionPingOp),
     MaintenancePing(MaintenancePingOp),
+    InboundGet(InboundGetOp),
+    InboundPut(InboundPutOp),
+}
+
+impl OpState {
+    fn pending(&self) -> &PendingMap {
+        match self {
+            Self::Put(op) => &op.pending,
+            Self::Get(op) => &op.pending,
+            Self::Bootstrap(op) => &op.pending,
+            Self::EvictionPing(op) => &op.pending,
+            Self::MaintenancePing(op) => &op.pending,
+            Self::InboundGet(op) => &op.pending,
+            Self::InboundPut(op) => &op.pending,
+        }
+    }
+
+    fn pending_mut(&mut self) -> &mut PendingMap {
+        match self {
+            Self::Put(op) => &mut op.pending,
+            Self::Get(op) => &mut op.pending,
+            Self::Bootstrap(op) => &mut op.pending,
+            Self::EvictionPing(op) => &mut op.pending,
+            Self::MaintenancePing(op) => &mut op.pending,
+            Self::InboundGet(op) => &mut op.pending,
+            Self::InboundPut(op) => &mut op.pending,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct PutOp {
-    caller_id: Option<CallerId>,
     key: DhtKeyId,
     value: Vec<u8>,
     ttl_secs: u64,
     signature: iroh::Signature,
-    outstanding_rpc: usize,
+    frontier: LookupFrontier,
+    lookup_finished: bool,
+    pending: PendingMap,
 }
 
 #[derive(Debug)]
 struct GetOp {
-    caller_id: Option<CallerId>,
     key: DhtKeyId,
     values: Vec<DhtEntry>,
     seen_publishers: HashSet<NodeId>,
-    outstanding_rpc: usize,
+    frontier: LookupFrontier,
+    pending: PendingMap,
 }
 
 #[derive(Debug)]
 struct BootstrapOp {
-    caller_id: Option<CallerId>,
-    outstanding_rpc: usize,
     active_nodes: usize,
+    pending: PendingMap,
 }
 
 #[derive(Debug)]
@@ -88,48 +122,81 @@ struct EvictionPingOp {
     oldest_node: NodeId,
     bucket_idx: usize,
     pending_peer: PeerInfo,
-    outstanding_rpc: usize,
+    pending: PendingMap,
 }
 
 #[derive(Debug)]
 struct MaintenancePingOp {
     peer: NodeId,
-    outstanding_rpc: usize,
+    pending: PendingMap,
 }
 
 #[derive(Debug)]
-enum RpcRoute {
-    Op { op_id: OpId },
+struct InboundGetOp {
+    inbound_id: InboundId,
+    key: DhtKeyId,
+    pending: PendingMap,
 }
 
 #[derive(Debug)]
-enum StorageRoute {
-    PutLocalRead {
-        op_id: OpId,
-        key: DhtKeyId,
-        new_entry: StoredEntry,
-    },
-    PutLocalWrite {
-        op_id: OpId,
-    },
-    GetLocalRead {
-        op_id: OpId,
-    },
-    InboundGetValue {
-        inbound_id: InboundId,
-        key: DhtKeyId,
-    },
-    InboundPutRead {
-        inbound_id: InboundId,
-        key: DhtKeyId,
-        new_entry: StoredEntry,
-    },
-    InboundPutWrite {
-        inbound_id: InboundId,
-    },
-    CleanupIter,
-    CleanupWrite,
-    CleanupDelete,
+struct InboundPutOp {
+    inbound_id: InboundId,
+    key: DhtKeyId,
+    new_entry: StoredEntry,
+    pending: PendingMap,
+}
+
+#[derive(Debug, Default)]
+struct LookupFrontier {
+    discovered: HashSet<NodeId>,
+    queried: HashSet<NodeId>,
+    pending: Vec<NodeId>,
+    sent_queries: usize,
+}
+
+impl LookupFrontier {
+    fn add_candidate(&mut self, node_id: NodeId, local_id: NodeId) {
+        if node_id == local_id {
+            return;
+        }
+
+        if !self.discovered.insert(node_id) {
+            return;
+        }
+
+        if !self.queried.contains(&node_id) {
+            self.pending.push(node_id);
+        }
+    }
+
+    fn add_candidates<I: IntoIterator<Item = NodeId>>(&mut self, nodes: I, local_id: NodeId) {
+        for node_id in nodes {
+            self.add_candidate(node_id, local_id);
+        }
+    }
+
+    fn pop_next(&mut self, target: &[u8; 32]) -> Option<NodeId> {
+        if self.pending.is_empty() {
+            return None;
+        }
+
+        self.pending
+            .sort_unstable_by(|a, b| compare_distance(target, a, b));
+        let next = self.pending.remove(0);
+        self.queried.insert(next);
+        Some(next)
+    }
+
+    fn closest_discovered(&self, target: &[u8; 32], count: usize) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = self.discovered.iter().copied().collect();
+        nodes.sort_unstable_by(|a, b| compare_distance(target, a, b));
+        nodes.truncate(count);
+        nodes
+    }
+
+    fn pending_exhausted(&self) -> bool {
+        self.pending.is_empty() || self.sent_queries >= LOOKUP_MAX_QUERIES
+    }
 }
 
 impl DhtStateMachine {
@@ -138,23 +205,13 @@ impl DhtStateMachine {
             local_id,
             secret_key,
             routing_table: RoutingTable::new(local_id),
-            next_request_id: 1,
-            next_storage_id: 1,
-            next_op_id: 1,
-            inflight_rpc: HashMap::new(),
-            inflight_storage: HashMap::new(),
-            pending_ops: HashMap::new(),
-            deadlines: BTreeMap::new(),
+            next_internal_op_id: INTERNAL_OP_START,
+            ops: HashMap::new(),
             cleanup_cursor: None,
             cleanup_inflight: false,
-            shutdown_requested: false,
             current_tick: 0,
             now_secs: start_unix_secs,
         }
-    }
-
-    pub fn local_id(&self) -> NodeId {
-        self.local_id
     }
 
     pub fn step(&mut self, input: DhtInput) -> SmallVec<[DhtEffect; 4]> {
@@ -164,152 +221,101 @@ impl DhtStateMachine {
             DhtInput::Cmd(cmd) => self.handle_cmd(cmd, &mut out),
             DhtInput::Io(io) => self.handle_io(io, &mut out),
             DhtInput::Tick { now_tick } => self.handle_tick(now_tick, &mut out),
-            DhtInput::ShutdownRequested => self.handle_shutdown_requested(&mut out),
-            DhtInput::ContinueOp { op_id } => self.handle_continue(op_id, &mut out),
         }
 
         out
     }
 
     fn handle_cmd(&mut self, cmd: DhtCmd, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if self.shutdown_requested {
-            let caller_id = match cmd {
-                DhtCmd::Put { caller_id, .. }
-                | DhtCmd::Get { caller_id, .. }
-                | DhtCmd::Bootstrap { caller_id, .. }
-                | DhtCmd::RoutingTableSize { caller_id }
-                | DhtCmd::Shutdown { caller_id } => caller_id,
-                DhtCmd::AddPeer { .. } => None,
-            };
-
-            if let Some(caller_id) = caller_id {
-                out.push(DhtEffect::Output(DhtOutput::Failed {
-                    caller_id,
-                    error: DhtIoError::Shutdown,
-                }));
-            }
-            return;
-        }
-
         match cmd {
             DhtCmd::Put {
+                op_id,
                 key,
                 value,
                 ttl,
-                caller_id,
-            } => self.handle_cmd_put(key, value, ttl, caller_id, out),
-            DhtCmd::Get { key, caller_id } => self.handle_cmd_get(key, caller_id, out),
-            DhtCmd::Bootstrap { nodes, caller_id } => {
-                self.handle_cmd_bootstrap(nodes, caller_id, out)
-            }
-            DhtCmd::RoutingTableSize { caller_id } => {
-                if let Some(caller_id) = caller_id {
-                    out.push(DhtEffect::Output(DhtOutput::Completed {
-                        caller_id,
-                        result: DhtOutputValue::RoutingTableSize(self.routing_table.len()),
-                    }));
-                }
+            } => self.handle_cmd_put(op_id, key, value, ttl, out),
+            DhtCmd::Get { op_id, key } => self.handle_cmd_get(op_id, key, out),
+            DhtCmd::Bootstrap { op_id, nodes } => self.handle_cmd_bootstrap(op_id, nodes, out),
+            DhtCmd::RoutingTableSize { op_id } => {
+                out.push(DhtEffect::Output(DhtOutput::Completed {
+                    op_id,
+                    result: DhtOutputValue::RoutingTableSize(self.routing_table.len()),
+                }));
             }
             DhtCmd::AddPeer { node_id } => self.insert_peer(node_id, out),
-            DhtCmd::Shutdown { caller_id } => {
-                self.shutdown_requested = true;
-                self.fail_all_pending(DhtIoError::Shutdown, out);
-                if let Some(caller_id) = caller_id {
-                    out.push(DhtEffect::Output(DhtOutput::Completed {
-                        caller_id,
-                        result: DhtOutputValue::Unit,
-                    }));
-                }
-                out.push(DhtEffect::Output(DhtOutput::ShutdownComplete));
-            }
         }
     }
 
     fn handle_cmd_put(
         &mut self,
+        op_id: OpId,
         key: DhtKeyId,
         value: Vec<u8>,
         ttl: std::time::Duration,
-        caller_id: Option<CallerId>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        let ttl_secs = ttl.as_secs();
-        let expires_at = self.now_secs.saturating_add(ttl_secs);
+        if self.ops.contains_key(&op_id) {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::Network("duplicate op id".to_string()),
+            }));
+            return;
+        }
 
+        let ttl_secs = ttl.as_secs();
         let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
         signed_data.extend_from_slice(key.as_bytes());
         signed_data.extend_from_slice(&value);
         signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
         let signature = self.secret_key.sign(&signed_data);
 
-        let new_entry = StoredEntry {
-            publisher: self.local_id,
-            value: value.clone(),
-            expires_at,
-            signature: Some(signature),
-        };
-
-        let op_id = self.alloc_op_id();
-        self.pending_ops.insert(
-            op_id,
-            PendingOp::Put(PutOp {
-                caller_id,
-                key,
-                value,
-                ttl_secs,
-                signature,
-                outstanding_rpc: 0,
-            }),
-        );
-
-        let storage_id = self.alloc_storage_id();
-        self.inflight_storage.insert(
-            storage_id,
-            StorageRoute::PutLocalRead {
-                op_id,
-                key,
-                new_entry,
-            },
-        );
-        out.push(DhtEffect::IoRequest(DhtIoRequest::StorageRead {
-            storage_id,
+        let mut op = OpState::Put(PutOp {
             key,
-        }));
+            value,
+            ttl_secs,
+            signature,
+            frontier: LookupFrontier::default(),
+            lookup_finished: false,
+            pending: HashMap::new(),
+        });
+        self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, out);
+        self.ops.insert(op_id, op);
     }
 
-    fn handle_cmd_get(
-        &mut self,
-        key: DhtKeyId,
-        caller_id: Option<CallerId>,
-        out: &mut SmallVec<[DhtEffect; 4]>,
-    ) {
-        let op_id = self.alloc_op_id();
-        self.pending_ops.insert(
-            op_id,
-            PendingOp::Get(GetOp {
-                caller_id,
-                key,
-                values: Vec::new(),
-                seen_publishers: HashSet::new(),
-                outstanding_rpc: 0,
-            }),
-        );
+    fn handle_cmd_get(&mut self, op_id: OpId, key: DhtKeyId, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if self.ops.contains_key(&op_id) {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::Network("duplicate op id".to_string()),
+            }));
+            return;
+        }
 
-        let storage_id = self.alloc_storage_id();
-        self.inflight_storage
-            .insert(storage_id, StorageRoute::GetLocalRead { op_id });
-        out.push(DhtEffect::IoRequest(DhtIoRequest::StorageRead {
-            storage_id,
+        let mut op = OpState::Get(GetOp {
             key,
-        }));
+            values: Vec::new(),
+            seen_publishers: HashSet::new(),
+            frontier: LookupFrontier::default(),
+            pending: HashMap::new(),
+        });
+        self.queue_storage_read(op_id, &mut op, StorageStage::GetLocalRead, key, out);
+        self.ops.insert(op_id, op);
     }
 
     fn handle_cmd_bootstrap(
         &mut self,
+        op_id: OpId,
         nodes: Vec<NodeId>,
-        caller_id: Option<CallerId>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
+        if self.ops.contains_key(&op_id) {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::Network("duplicate op id".to_string()),
+            }));
+            return;
+        }
+
         let mut unique: Vec<NodeId> = nodes
             .into_iter()
             .filter(|node| *node != self.local_id)
@@ -318,78 +324,44 @@ impl DhtStateMachine {
         unique.dedup();
 
         if unique.is_empty() {
-            if let Some(caller_id) = caller_id {
-                out.push(DhtEffect::Output(DhtOutput::Completed {
-                    caller_id,
-                    result: DhtOutputValue::Unit,
-                }));
-            }
+            out.push(DhtEffect::Output(DhtOutput::Completed {
+                op_id,
+                result: DhtOutputValue::Unit,
+            }));
             return;
         }
 
-        let op_id = self.alloc_op_id();
-        self.pending_ops.insert(
-            op_id,
-            PendingOp::Bootstrap(BootstrapOp {
-                caller_id,
-                outstanding_rpc: 0,
-                active_nodes: 0,
-            }),
-        );
-
-        let mut sent = 0usize;
+        let mut op = OpState::Bootstrap(BootstrapOp {
+            active_nodes: 0,
+            pending: HashMap::new(),
+        });
         for node in unique {
-            if self
-                .queue_rpc_request(op_id, node, DhtRequest::Ping, out)
-                .is_some()
-            {
-                sent = sent.saturating_add(1);
-            }
+            self.queue_rpc(
+                op_id,
+                &mut op,
+                RpcPhase::Bootstrap,
+                node,
+                DhtRequest::Ping,
+                out,
+            );
         }
-
-        if let Some(PendingOp::Bootstrap(op)) = self.pending_ops.get_mut(&op_id) {
-            op.outstanding_rpc = sent;
-            if sent == 0 {
-                let caller_id = op.caller_id;
-                self.pending_ops.remove(&op_id);
-                if let Some(caller_id) = caller_id {
-                    out.push(DhtEffect::Output(DhtOutput::Failed {
-                        caller_id,
-                        error: DhtIoError::Network("no bootstrap nodes reachable".to_string()),
-                    }));
-                }
-            }
-        }
+        self.ops.insert(op_id, op);
     }
 
     fn handle_io(&mut self, io: DhtIo, out: &mut SmallVec<[DhtEffect; 4]>) {
         match io {
             DhtIo::RpcResponse {
-                request_id,
+                op_id,
+                phase,
                 peer,
                 response,
-            } => {
-                let Some(route) = self.inflight_rpc.remove(&request_id) else {
-                    return;
-                };
-                match route {
-                    RpcRoute::Op { op_id } => {
-                        self.handle_op_rpc_response(op_id, peer, response, out);
-                    }
-                }
-            }
+            } => self.handle_rpc_response(op_id, phase, peer, response, out),
             DhtIo::RpcError {
-                request_id,
+                op_id,
+                phase,
                 peer,
                 error,
-            } => {
-                let Some(route) = self.inflight_rpc.remove(&request_id) else {
-                    return;
-                };
-                match route {
-                    RpcRoute::Op { op_id } => self.handle_op_rpc_error(op_id, peer, error, out),
-                }
-            }
+            } => self.handle_rpc_error(op_id, phase, peer, error, out),
             DhtIo::InboundRequest {
                 inbound_id,
                 peer,
@@ -400,61 +372,28 @@ impl DhtStateMachine {
             }
             DhtIo::InboundDropped { .. } => {}
             DhtIo::StorageReadResult {
-                storage_id,
+                op_id,
+                stage,
                 entries,
-            } => {
-                let Some(route) = self.inflight_storage.remove(&storage_id) else {
-                    return;
-                };
-                self.handle_storage_read(route, entries, out);
+            } => self.handle_storage_read(op_id, stage, entries, out),
+            DhtIo::StorageWriteResult { op_id, stage } => {
+                self.handle_storage_write(op_id, stage, out)
             }
-            DhtIo::StorageWriteResult { storage_id } => {
-                let Some(route) = self.inflight_storage.remove(&storage_id) else {
-                    return;
-                };
-                self.handle_storage_write(route, out);
-            }
-            DhtIo::StorageDeleteResult { storage_id } => {
-                let Some(route) = self.inflight_storage.remove(&storage_id) else {
-                    return;
-                };
-                match route {
-                    StorageRoute::InboundPutWrite { inbound_id } => {
-                        out.push(DhtEffect::IoRequest(DhtIoRequest::DropInbound {
-                            inbound_id,
-                        }));
-                    }
-                    StorageRoute::CleanupDelete => {}
-                    StorageRoute::PutLocalRead { .. }
-                    | StorageRoute::PutLocalWrite { .. }
-                    | StorageRoute::GetLocalRead { .. }
-                    | StorageRoute::InboundGetValue { .. }
-                    | StorageRoute::InboundPutRead { .. }
-                    | StorageRoute::CleanupIter
-                    | StorageRoute::CleanupWrite => {}
-                }
+            DhtIo::StorageDeleteResult { op_id, stage } => {
+                self.handle_storage_delete(op_id, stage, out)
             }
             DhtIo::StorageIterResult {
-                storage_id,
+                op_id,
+                stage,
                 values,
                 next_start_after,
-            } => {
-                let Some(route) = self.inflight_storage.remove(&storage_id) else {
-                    return;
-                };
-                self.handle_storage_iter(route, values, next_start_after, out);
-            }
-            DhtIo::StorageError { storage_id, error } => {
-                let Some(route) = self.inflight_storage.remove(&storage_id) else {
-                    return;
-                };
-                self.handle_storage_error(route, error, out);
-            }
+            } => self.handle_storage_iter(op_id, stage, values, next_start_after, out),
+            DhtIo::StorageError {
+                op_id,
+                stage,
+                error,
+            } => self.handle_storage_error(op_id, stage, error, out),
             DhtIo::PeerSeen { peer } => self.insert_peer(peer, out),
-            DhtIo::DispatcherClosed => {
-                self.fail_all_pending(DhtIoError::DispatcherClosed, out);
-                self.shutdown_requested = true;
-            }
         }
     }
 
@@ -468,80 +407,272 @@ impl DhtStateMachine {
                 .saturating_add(delta.saturating_mul(DRIVER_TICK_INTERVAL.as_secs()));
         }
 
-        let mut expired = Vec::new();
-        while let Some((deadline, _)) = self.deadlines.first_key_value() {
-            if *deadline > now_tick {
-                break;
-            }
-            if let Some((_, request_ids)) = self.deadlines.pop_first() {
-                expired.extend(request_ids);
-            }
-        }
+        let mut timed_out = self.collect_timed_out_rpc();
+        timed_out.sort_unstable_by(|(op_a, phase_a, peer_a), (op_b, phase_b, peer_b)| {
+            op_a.cmp(op_b)
+                .then_with(|| rpc_phase_order(*phase_a).cmp(&rpc_phase_order(*phase_b)))
+                .then_with(|| peer_a.as_bytes().cmp(peer_b.as_bytes()))
+        });
 
-        for request_id in expired {
-            let Some(route) = self.inflight_rpc.remove(&request_id) else {
-                continue;
-            };
-            match route {
-                RpcRoute::Op { op_id } => {
-                    self.handle_op_rpc_error(op_id, self.local_id, DhtIoError::Timeout, out)
-                }
-            }
+        for (op_id, phase, peer) in timed_out {
+            self.handle_rpc_error(op_id, phase, peer, DhtIoError::Timeout, out);
         }
 
         self.schedule_maintenance_ping(now_tick, out);
-
-        if !self.cleanup_inflight {
-            let storage_id = self.alloc_storage_id();
-            self.cleanup_inflight = true;
-            self.inflight_storage
-                .insert(storage_id, StorageRoute::CleanupIter);
-            out.push(DhtEffect::IoRequest(DhtIoRequest::StorageIter {
-                storage_id,
-                start_after: self.cleanup_cursor.clone(),
-                limit: CLEANUP_PAGE_SIZE,
-            }));
-        }
+        self.schedule_cleanup(out);
     }
 
-    fn handle_shutdown_requested(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if self.shutdown_requested {
+    fn handle_rpc_response(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        response: DhtResponse,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_rpc(op_state.pending_mut(), phase, peer) {
+            self.ops.insert(op_id, op_state);
             return;
         }
 
-        self.shutdown_requested = true;
-        self.fail_all_pending(DhtIoError::Shutdown, out);
-        out.push(DhtEffect::Output(DhtOutput::ShutdownComplete));
+        match op_state {
+            OpState::Put(mut op) => {
+                if phase == RpcPhase::PutLookup {
+                    match response {
+                        DhtResponse::Nodes { nodes } => {
+                            op.frontier.add_candidates(nodes, self.local_id);
+                        }
+                        DhtResponse::Value { closer_nodes, .. } => {
+                            op.frontier.add_candidates(closer_nodes, self.local_id);
+                        }
+                        DhtResponse::Pong | DhtResponse::Stored | DhtResponse::Error { .. } => {}
+                    }
+
+                    self.dispatch_put_lookup_requests(op_id, &mut op, out);
+                    if self.put_lookup_exhausted(&op) {
+                        self.begin_put_store(op_id, &mut op, out);
+                    }
+                }
+
+                self.maybe_complete_put(op_id, op, out);
+            }
+            OpState::Get(mut op) => {
+                if phase != RpcPhase::GetLookup {
+                    self.ops.insert(op_id, OpState::Get(op));
+                    return;
+                }
+
+                match response {
+                    DhtResponse::Value {
+                        entries,
+                        closer_nodes,
+                    } => {
+                        let now = self.now_secs;
+                        for entry in entries {
+                            if entry.expires_at <= now {
+                                continue;
+                            }
+                            if op.seen_publishers.insert(entry.publisher) {
+                                op.values.push(DhtEntry {
+                                    node_id: entry.publisher,
+                                    value: entry.value,
+                                    expires_at: entry.expires_at,
+                                });
+                            }
+                        }
+
+                        for node_id in &closer_nodes {
+                            self.routing_table.insert(PeerInfo::new(*node_id));
+                        }
+                        op.frontier.add_candidates(closer_nodes, self.local_id);
+                    }
+                    DhtResponse::Nodes { nodes } => {
+                        for node_id in &nodes {
+                            self.routing_table.insert(PeerInfo::new(*node_id));
+                        }
+                        op.frontier.add_candidates(nodes, self.local_id);
+                    }
+                    DhtResponse::Pong | DhtResponse::Stored | DhtResponse::Error { .. } => {}
+                }
+
+                self.dispatch_get_requests(op_id, &mut op, out);
+                self.maybe_complete_get(op_id, op, out);
+            }
+            OpState::Bootstrap(mut op) => {
+                if phase != RpcPhase::Bootstrap {
+                    self.ops.insert(op_id, OpState::Bootstrap(op));
+                    return;
+                }
+                if matches!(response, DhtResponse::Pong) {
+                    self.routing_table.insert(PeerInfo::new(peer));
+                    op.active_nodes = op.active_nodes.saturating_add(1);
+                }
+                self.finish_bootstrap(
+                    op_id,
+                    op,
+                    DhtIoError::Network("no bootstrap nodes reachable".to_string()),
+                    out,
+                );
+            }
+            OpState::EvictionPing(op) => {
+                if phase != RpcPhase::EvictionPing {
+                    self.ops.insert(op_id, OpState::EvictionPing(op));
+                    return;
+                }
+
+                let peer_alive = matches!(response, DhtResponse::Pong);
+                if !peer_alive {
+                    let _ = self.routing_table.remove(&op.oldest_node);
+                    self.routing_table.insert(op.pending_peer.clone());
+                }
+
+                if pending_rpc_count(&op.pending, RpcPhase::EvictionPing) > 0 {
+                    self.ops.insert(op_id, OpState::EvictionPing(op));
+                }
+            }
+            OpState::MaintenancePing(op) => {
+                if phase != RpcPhase::MaintenancePing {
+                    self.ops.insert(op_id, OpState::MaintenancePing(op));
+                    return;
+                }
+
+                if matches!(response, DhtResponse::Pong) {
+                    self.routing_table.insert(PeerInfo::new(peer));
+                }
+
+                if pending_rpc_count(&op.pending, RpcPhase::MaintenancePing) > 0 {
+                    self.ops.insert(op_id, OpState::MaintenancePing(op));
+                }
+            }
+            OpState::InboundGet(op) => {
+                self.ops.insert(op_id, OpState::InboundGet(op));
+            }
+            OpState::InboundPut(op) => {
+                self.ops.insert(op_id, OpState::InboundPut(op));
+            }
+        }
     }
 
-    fn handle_continue(&mut self, _op_id: OpId, _out: &mut SmallVec<[DhtEffect; 4]>) {}
+    fn handle_rpc_error(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        error: DhtIoError,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_rpc(op_state.pending_mut(), phase, peer) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        match op_state {
+            OpState::Put(mut op) => {
+                if phase == RpcPhase::PutLookup {
+                    self.dispatch_put_lookup_requests(op_id, &mut op, out);
+                    if self.put_lookup_exhausted(&op) {
+                        self.begin_put_store(op_id, &mut op, out);
+                    }
+                }
+
+                self.maybe_complete_put(op_id, op, out);
+            }
+            OpState::Get(mut op) => {
+                if phase != RpcPhase::GetLookup {
+                    self.ops.insert(op_id, OpState::Get(op));
+                    return;
+                }
+
+                self.dispatch_get_requests(op_id, &mut op, out);
+                self.maybe_complete_get(op_id, op, out);
+            }
+            OpState::Bootstrap(op) => {
+                if phase != RpcPhase::Bootstrap {
+                    self.ops.insert(op_id, OpState::Bootstrap(op));
+                    return;
+                }
+                self.finish_bootstrap(op_id, op, error, out);
+            }
+            OpState::EvictionPing(op) => {
+                if phase != RpcPhase::EvictionPing {
+                    self.ops.insert(op_id, OpState::EvictionPing(op));
+                    return;
+                }
+
+                let _ = self.routing_table.evict_oldest(op.bucket_idx);
+                self.routing_table.insert(op.pending_peer.clone());
+            }
+            OpState::MaintenancePing(op) => {
+                if phase != RpcPhase::MaintenancePing {
+                    self.ops.insert(op_id, OpState::MaintenancePing(op));
+                    return;
+                }
+
+                let _ = self.routing_table.remove(&op.peer);
+            }
+            OpState::InboundGet(op) => {
+                self.ops.insert(op_id, OpState::InboundGet(op));
+            }
+            OpState::InboundPut(op) => {
+                self.ops.insert(op_id, OpState::InboundPut(op));
+            }
+        }
+    }
 
     fn handle_storage_read(
         &mut self,
-        route: StorageRoute,
+        op_id: OpId,
+        stage: StorageStage,
         entries: Vec<StoredEntry>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        match route {
-            StorageRoute::PutLocalRead {
-                op_id,
-                key,
-                new_entry,
-            } => {
-                let merged = merge_entry(entries, new_entry, self.now_secs);
-                let storage_id = self.alloc_storage_id();
-                self.inflight_storage
-                    .insert(storage_id, StorageRoute::PutLocalWrite { op_id });
-                out.push(DhtEffect::IoRequest(DhtIoRequest::StorageWrite {
-                    storage_id,
-                    key,
-                    entries: merged,
-                }));
-            }
-            StorageRoute::GetLocalRead { op_id } => {
-                let Some(PendingOp::Get(mut op)) = self.pending_ops.remove(&op_id) else {
+        if op_id == CLEANUP_OP_ID {
+            return;
+        }
+
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_storage(op_state.pending_mut(), stage) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        match op_state {
+            OpState::Put(mut op) => {
+                if stage != StorageStage::PutLocalRead {
+                    self.ops.insert(op_id, OpState::Put(op));
                     return;
+                }
+
+                let new_entry = StoredEntry {
+                    publisher: self.local_id,
+                    value: op.value.clone(),
+                    expires_at: self.now_secs.saturating_add(op.ttl_secs),
+                    signature: Some(op.signature),
                 };
+                let merged = merge_entry(entries, new_entry, self.now_secs);
+                self.queue_storage_write_pending(
+                    op_id,
+                    &mut op.pending,
+                    StorageStage::PutLocalWrite,
+                    op.key,
+                    merged,
+                    out,
+                );
+                self.ops.insert(op_id, OpState::Put(op));
+            }
+            OpState::Get(mut op) => {
+                if stage != StorageStage::GetLocalRead {
+                    self.ops.insert(op_id, OpState::Get(op));
+                    return;
+                }
 
                 let now = self.now_secs;
                 for entry in live_entries(entries, now) {
@@ -554,35 +685,23 @@ impl DhtStateMachine {
                     }
                 }
 
-                let peers = self.routing_table.closest(op.key.as_bytes(), K);
-                let mut sent = 0usize;
-                for peer in peers {
-                    if self
-                        .queue_rpc_request(
-                            op_id,
-                            peer.node_id,
-                            DhtRequest::GetValue { key: op.key },
-                            out,
-                        )
-                        .is_some()
-                    {
-                        sent = sent.saturating_add(1);
-                    }
+                op.frontier.add_candidates(
+                    self.routing_table
+                        .closest(op.key.as_bytes(), K)
+                        .into_iter()
+                        .map(|peer| peer.node_id),
+                    self.local_id,
+                );
+
+                self.dispatch_get_requests(op_id, &mut op, out);
+                self.maybe_complete_get(op_id, op, out);
+            }
+            OpState::InboundGet(op) => {
+                if stage != StorageStage::InboundGetRead {
+                    self.ops.insert(op_id, OpState::InboundGet(op));
+                    return;
                 }
 
-                op.outstanding_rpc = sent;
-                if op.outstanding_rpc == 0 {
-                    if let Some(caller_id) = op.caller_id {
-                        out.push(DhtEffect::Output(DhtOutput::Completed {
-                            caller_id,
-                            result: DhtOutputValue::GetValues(op.values),
-                        }));
-                    }
-                } else {
-                    self.pending_ops.insert(op_id, PendingOp::Get(op));
-                }
-            }
-            StorageRoute::InboundGetValue { inbound_id, key } => {
                 let now = self.now_secs;
                 let values: Vec<StoredValue> = live_entries(entries, now)
                     .into_iter()
@@ -595,56 +714,144 @@ impl DhtStateMachine {
                     .collect();
                 let closer_nodes = self
                     .routing_table
-                    .closest(key.as_bytes(), K)
+                    .closest(op.key.as_bytes(), K)
                     .into_iter()
                     .map(|peer| peer.node_id)
                     .collect();
 
                 out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
-                    inbound_id,
+                    inbound_id: op.inbound_id,
                     response: DhtResponse::Value {
                         entries: values,
                         closer_nodes,
                     },
                 }));
             }
-            StorageRoute::InboundPutRead {
-                inbound_id,
-                key,
-                new_entry,
-            } => {
-                let merged = merge_entry(entries, new_entry, self.now_secs);
-                let storage_id = self.alloc_storage_id();
-                self.inflight_storage
-                    .insert(storage_id, StorageRoute::InboundPutWrite { inbound_id });
-                out.push(DhtEffect::IoRequest(DhtIoRequest::StorageWrite {
-                    storage_id,
-                    key,
-                    entries: merged,
-                }));
+            OpState::InboundPut(mut op) => {
+                if stage != StorageStage::InboundPutRead {
+                    self.ops.insert(op_id, OpState::InboundPut(op));
+                    return;
+                }
+
+                let merged = merge_entry(entries, op.new_entry.clone(), self.now_secs);
+                self.queue_storage_write_pending(
+                    op_id,
+                    &mut op.pending,
+                    StorageStage::InboundPutWrite,
+                    op.key,
+                    merged,
+                    out,
+                );
+                self.ops.insert(op_id, OpState::InboundPut(op));
             }
-            StorageRoute::PutLocalWrite { .. } => {}
-            StorageRoute::InboundPutWrite { inbound_id } => {
-                out.push(DhtEffect::IoRequest(DhtIoRequest::DropInbound {
-                    inbound_id,
-                }));
+            OpState::Bootstrap(op) => {
+                self.ops.insert(op_id, OpState::Bootstrap(op));
             }
-            StorageRoute::CleanupIter
-            | StorageRoute::CleanupWrite
-            | StorageRoute::CleanupDelete => {}
+            OpState::EvictionPing(op) => {
+                self.ops.insert(op_id, OpState::EvictionPing(op));
+            }
+            OpState::MaintenancePing(op) => {
+                self.ops.insert(op_id, OpState::MaintenancePing(op));
+            }
         }
+    }
+
+    fn handle_storage_write(
+        &mut self,
+        op_id: OpId,
+        stage: StorageStage,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if op_id == CLEANUP_OP_ID {
+            return;
+        }
+
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_storage(op_state.pending_mut(), stage) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        match op_state {
+            OpState::Put(mut op) => {
+                if stage != StorageStage::PutLocalWrite {
+                    self.ops.insert(op_id, OpState::Put(op));
+                    return;
+                }
+
+                op.frontier.add_candidates(
+                    self.routing_table
+                        .closest(op.key.as_bytes(), K)
+                        .into_iter()
+                        .map(|peer| peer.node_id),
+                    self.local_id,
+                );
+
+                self.dispatch_put_lookup_requests(op_id, &mut op, out);
+                if self.put_lookup_exhausted(&op) {
+                    self.begin_put_store(op_id, &mut op, out);
+                }
+                self.maybe_complete_put(op_id, op, out);
+            }
+            OpState::InboundPut(op) => {
+                if stage != StorageStage::InboundPutWrite {
+                    self.ops.insert(op_id, OpState::InboundPut(op));
+                    return;
+                }
+
+                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                    inbound_id: op.inbound_id,
+                    response: DhtResponse::Stored,
+                }));
+            }
+            OpState::Get(op) => {
+                self.ops.insert(op_id, OpState::Get(op));
+            }
+            OpState::Bootstrap(op) => {
+                self.ops.insert(op_id, OpState::Bootstrap(op));
+            }
+            OpState::EvictionPing(op) => {
+                self.ops.insert(op_id, OpState::EvictionPing(op));
+            }
+            OpState::MaintenancePing(op) => {
+                self.ops.insert(op_id, OpState::MaintenancePing(op));
+            }
+            OpState::InboundGet(op) => {
+                self.ops.insert(op_id, OpState::InboundGet(op));
+            }
+        }
+    }
+
+    fn handle_storage_delete(
+        &mut self,
+        op_id: OpId,
+        stage: StorageStage,
+        _out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if op_id == CLEANUP_OP_ID {
+            return;
+        }
+
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        let _ = take_pending_storage(op_state.pending_mut(), stage);
+        self.ops.insert(op_id, op_state);
     }
 
     fn handle_storage_iter(
         &mut self,
-        route: StorageRoute,
+        op_id: OpId,
+        stage: StorageStage,
         values: Vec<(Vec<u8>, Vec<StoredEntry>)>,
         next_start_after: Option<Vec<u8>>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        let StorageRoute::CleanupIter = route else {
+        if op_id != CLEANUP_OP_ID || stage != StorageStage::CleanupIter {
             return;
-        };
+        }
 
         for (raw_key, entries) in values {
             let Ok(key_bytes): Result<[u8; 32], _> = raw_key.as_slice().try_into() else {
@@ -655,19 +862,15 @@ impl DhtStateMachine {
             let original_len = entries.len();
             let live = live_entries(entries, self.now_secs);
             if live.is_empty() {
-                let storage_id = self.alloc_storage_id();
-                self.inflight_storage
-                    .insert(storage_id, StorageRoute::CleanupDelete);
                 out.push(DhtEffect::IoRequest(DhtIoRequest::StorageDelete {
-                    storage_id,
+                    op_id: CLEANUP_OP_ID,
+                    stage: StorageStage::CleanupDelete,
                     key,
                 }));
             } else if live.len() < original_len {
-                let storage_id = self.alloc_storage_id();
-                self.inflight_storage
-                    .insert(storage_id, StorageRoute::CleanupWrite);
                 out.push(DhtEffect::IoRequest(DhtIoRequest::StorageWrite {
-                    storage_id,
+                    op_id: CLEANUP_OP_ID,
+                    stage: StorageStage::CleanupWrite,
                     key,
                     entries: live,
                 }));
@@ -678,90 +881,51 @@ impl DhtStateMachine {
         self.cleanup_inflight = false;
     }
 
-    fn handle_storage_write(&mut self, route: StorageRoute, out: &mut SmallVec<[DhtEffect; 4]>) {
-        match route {
-            StorageRoute::PutLocalWrite { op_id } => {
-                let Some(PendingOp::Put(mut op)) = self.pending_ops.remove(&op_id) else {
-                    return;
-                };
-
-                let peers = self.routing_table.closest(op.key.as_bytes(), K);
-                let mut sent = 0usize;
-                for peer in peers {
-                    if self
-                        .queue_rpc_request(
-                            op_id,
-                            peer.node_id,
-                            DhtRequest::PutValue {
-                                key: op.key,
-                                value: op.value.clone(),
-                                ttl_secs: op.ttl_secs,
-                                publisher: self.local_id,
-                                signature: Some(op.signature),
-                            },
-                            out,
-                        )
-                        .is_some()
-                    {
-                        sent = sent.saturating_add(1);
-                    }
-                }
-
-                op.outstanding_rpc = sent;
-                if op.outstanding_rpc == 0 {
-                    if let Some(caller_id) = op.caller_id {
-                        out.push(DhtEffect::Output(DhtOutput::Completed {
-                            caller_id,
-                            result: DhtOutputValue::Unit,
-                        }));
-                    }
-                } else {
-                    self.pending_ops.insert(op_id, PendingOp::Put(op));
-                }
-            }
-            StorageRoute::InboundPutWrite { inbound_id } => {
-                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
-                    inbound_id,
-                    response: DhtResponse::Stored,
-                }));
-            }
-            StorageRoute::CleanupWrite => {}
-            StorageRoute::PutLocalRead { .. }
-            | StorageRoute::GetLocalRead { .. }
-            | StorageRoute::InboundGetValue { .. }
-            | StorageRoute::InboundPutRead { .. }
-            | StorageRoute::CleanupIter
-            | StorageRoute::CleanupDelete => {}
-        }
-    }
-
     fn handle_storage_error(
         &mut self,
-        route: StorageRoute,
+        op_id: OpId,
+        stage: StorageStage,
         error: DhtIoError,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        match route {
-            StorageRoute::PutLocalRead { op_id, .. }
-            | StorageRoute::PutLocalWrite { op_id }
-            | StorageRoute::GetLocalRead { op_id } => {
-                self.fail_op(op_id, error, out);
-            }
-            StorageRoute::CleanupIter => {
+        if op_id == CLEANUP_OP_ID {
+            if stage == StorageStage::CleanupIter {
                 self.cleanup_inflight = false;
             }
-            StorageRoute::CleanupWrite | StorageRoute::CleanupDelete => {}
-            StorageRoute::InboundGetValue { inbound_id, .. }
-            | StorageRoute::InboundPutRead { inbound_id, .. }
-            | StorageRoute::InboundPutWrite { inbound_id } => {
+            return;
+        }
+
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_storage(op_state.pending_mut(), stage) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        match op_state {
+            OpState::Put(_) | OpState::Get(_) | OpState::Bootstrap(_) => {
+                out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
+            }
+            OpState::InboundGet(op) => {
                 out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
-                    inbound_id,
+                    inbound_id: op.inbound_id,
                     response: DhtResponse::Error {
                         code: ErrorCode::Internal,
                         message: "storage error".to_string(),
                     },
                 }));
             }
+            OpState::InboundPut(op) => {
+                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                    inbound_id: op.inbound_id,
+                    response: DhtResponse::Error {
+                        code: ErrorCode::Internal,
+                        message: "storage error".to_string(),
+                    },
+                }));
+            }
+            OpState::EvictionPing(_) | OpState::MaintenancePing(_) => {}
         }
     }
 
@@ -792,15 +956,14 @@ impl DhtStateMachine {
                 }));
             }
             DhtRequest::GetValue { key } => {
-                let storage_id = self.alloc_storage_id();
-                self.inflight_storage.insert(
-                    storage_id,
-                    StorageRoute::InboundGetValue { inbound_id, key },
-                );
-                out.push(DhtEffect::IoRequest(DhtIoRequest::StorageRead {
-                    storage_id,
+                let op_id = self.alloc_internal_op_id();
+                let mut op = OpState::InboundGet(InboundGetOp {
+                    inbound_id,
                     key,
-                }));
+                    pending: HashMap::new(),
+                });
+                self.queue_storage_read(op_id, &mut op, StorageStage::InboundGetRead, key, out);
+                self.ops.insert(op_id, op);
             }
             DhtRequest::PutValue {
                 key,
@@ -843,270 +1006,183 @@ impl DhtStateMachine {
                     signature: Some(signature),
                 };
 
-                let storage_id = self.alloc_storage_id();
-                self.inflight_storage.insert(
-                    storage_id,
-                    StorageRoute::InboundPutRead {
-                        inbound_id,
-                        key,
-                        new_entry,
-                    },
-                );
-                out.push(DhtEffect::IoRequest(DhtIoRequest::StorageRead {
-                    storage_id,
+                let op_id = self.alloc_internal_op_id();
+                let mut op = OpState::InboundPut(InboundPutOp {
+                    inbound_id,
                     key,
-                }));
+                    new_entry,
+                    pending: HashMap::new(),
+                });
+                self.queue_storage_read(op_id, &mut op, StorageStage::InboundPutRead, key, out);
+                self.ops.insert(op_id, op);
             }
         }
     }
 
-    fn handle_op_rpc_response(
+    fn dispatch_get_requests(
         &mut self,
         op_id: OpId,
-        peer: NodeId,
-        response: DhtResponse,
+        op: &mut GetOp,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        let Some(op) = self.pending_ops.remove(&op_id) else {
-            return;
-        };
-
-        match op {
-            PendingOp::Put(mut put_op) => {
-                put_op.outstanding_rpc = put_op.outstanding_rpc.saturating_sub(1);
-                if put_op.outstanding_rpc == 0 {
-                    if let Some(caller_id) = put_op.caller_id {
-                        out.push(DhtEffect::Output(DhtOutput::Completed {
-                            caller_id,
-                            result: DhtOutputValue::Unit,
-                        }));
-                    }
-                } else {
-                    self.pending_ops.insert(op_id, PendingOp::Put(put_op));
-                }
-            }
-            PendingOp::Get(mut get_op) => {
-                if let DhtResponse::Value {
-                    entries,
-                    closer_nodes,
-                } = response
-                {
-                    let now = self.now_secs;
-                    for entry in entries {
-                        if entry.expires_at <= now {
-                            continue;
-                        }
-                        if get_op.seen_publishers.insert(entry.publisher) {
-                            get_op.values.push(DhtEntry {
-                                node_id: entry.publisher,
-                                value: entry.value,
-                                expires_at: entry.expires_at,
-                            });
-                        }
-                    }
-
-                    for node_id in closer_nodes {
-                        self.routing_table.insert(PeerInfo::new(node_id));
-                    }
-                }
-
-                get_op.outstanding_rpc = get_op.outstanding_rpc.saturating_sub(1);
-                if get_op.outstanding_rpc == 0 {
-                    if let Some(caller_id) = get_op.caller_id {
-                        out.push(DhtEffect::Output(DhtOutput::Completed {
-                            caller_id,
-                            result: DhtOutputValue::GetValues(get_op.values),
-                        }));
-                    }
-                } else {
-                    self.pending_ops.insert(op_id, PendingOp::Get(get_op));
-                }
-            }
-            PendingOp::Bootstrap(mut bootstrap_op) => {
-                if matches!(response, DhtResponse::Pong) {
-                    self.routing_table.insert(PeerInfo::new(peer));
-                    bootstrap_op.active_nodes = bootstrap_op.active_nodes.saturating_add(1);
-                }
-
-                bootstrap_op.outstanding_rpc = bootstrap_op.outstanding_rpc.saturating_sub(1);
-                if bootstrap_op.outstanding_rpc == 0 {
-                    if let Some(caller_id) = bootstrap_op.caller_id {
-                        if bootstrap_op.active_nodes == 0 {
-                            out.push(DhtEffect::Output(DhtOutput::Failed {
-                                caller_id,
-                                error: DhtIoError::Network(
-                                    "no bootstrap nodes reachable".to_string(),
-                                ),
-                            }));
-                        } else {
-                            out.push(DhtEffect::Output(DhtOutput::Completed {
-                                caller_id,
-                                result: DhtOutputValue::Unit,
-                            }));
-                        }
-                    }
-                } else {
-                    self.pending_ops
-                        .insert(op_id, PendingOp::Bootstrap(bootstrap_op));
-                }
-            }
-            PendingOp::EvictionPing(mut eviction_op) => {
-                let peer_alive = matches!(response, DhtResponse::Pong);
-                eviction_op.outstanding_rpc = eviction_op.outstanding_rpc.saturating_sub(1);
-                if !peer_alive {
-                    let _ = self.routing_table.remove(&eviction_op.oldest_node);
-                    self.routing_table.insert(eviction_op.pending_peer.clone());
-                }
-
-                if eviction_op.outstanding_rpc > 0 {
-                    self.pending_ops
-                        .insert(op_id, PendingOp::EvictionPing(eviction_op));
-                }
-            }
-            PendingOp::MaintenancePing(mut ping_op) => {
-                if matches!(response, DhtResponse::Pong) {
-                    self.routing_table.insert(PeerInfo::new(peer));
-                }
-                ping_op.outstanding_rpc = ping_op.outstanding_rpc.saturating_sub(1);
-                if ping_op.outstanding_rpc > 0 {
-                    self.pending_ops
-                        .insert(op_id, PendingOp::MaintenancePing(ping_op));
-                }
-            }
+        while pending_rpc_count(&op.pending, RpcPhase::GetLookup) < LOOKUP_ALPHA
+            && op.frontier.sent_queries < LOOKUP_MAX_QUERIES
+        {
+            let Some(peer) = op.frontier.pop_next(op.key.as_bytes()) else {
+                break;
+            };
+            self.queue_rpc_pending(
+                op_id,
+                &mut op.pending,
+                RpcPhase::GetLookup,
+                peer,
+                DhtRequest::GetValue { key: op.key },
+                out,
+            );
+            op.frontier.sent_queries = op.frontier.sent_queries.saturating_add(1);
         }
     }
 
-    fn handle_op_rpc_error(
+    fn dispatch_put_lookup_requests(
         &mut self,
         op_id: OpId,
-        _peer: NodeId,
+        op: &mut PutOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        while pending_rpc_count(&op.pending, RpcPhase::PutLookup) < LOOKUP_ALPHA
+            && op.frontier.sent_queries < LOOKUP_MAX_QUERIES
+        {
+            let Some(peer) = op.frontier.pop_next(op.key.as_bytes()) else {
+                break;
+            };
+            self.queue_rpc_pending(
+                op_id,
+                &mut op.pending,
+                RpcPhase::PutLookup,
+                peer,
+                DhtRequest::FindNode {
+                    target: *op.key.as_bytes(),
+                },
+                out,
+            );
+            op.frontier.sent_queries = op.frontier.sent_queries.saturating_add(1);
+        }
+    }
+
+    fn put_lookup_exhausted(&self, op: &PutOp) -> bool {
+        !op.lookup_finished
+            && pending_rpc_count(&op.pending, RpcPhase::PutLookup) == 0
+            && op.frontier.pending_exhausted()
+    }
+
+    fn begin_put_store(&mut self, op_id: OpId, op: &mut PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if op.lookup_finished {
+            return;
+        }
+        op.lookup_finished = true;
+
+        let targets = op.frontier.closest_discovered(op.key.as_bytes(), K);
+        for peer in targets {
+            self.queue_rpc_pending(
+                op_id,
+                &mut op.pending,
+                RpcPhase::PutStore,
+                peer,
+                DhtRequest::PutValue {
+                    key: op.key,
+                    value: op.value.clone(),
+                    ttl_secs: op.ttl_secs,
+                    publisher: self.local_id,
+                    signature: Some(op.signature),
+                },
+                out,
+            );
+        }
+    }
+
+    fn maybe_complete_get(&mut self, op_id: OpId, op: GetOp, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if pending_rpc_count(&op.pending, RpcPhase::GetLookup) == 0
+            && op.frontier.pending_exhausted()
+        {
+            out.push(DhtEffect::Output(DhtOutput::Completed {
+                op_id,
+                result: DhtOutputValue::GetValues(op.values),
+            }));
+        } else {
+            self.ops.insert(op_id, OpState::Get(op));
+        }
+    }
+
+    fn maybe_complete_put(&mut self, op_id: OpId, op: PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if op.lookup_finished && pending_rpc_count(&op.pending, RpcPhase::PutStore) == 0 {
+            out.push(DhtEffect::Output(DhtOutput::Completed {
+                op_id,
+                result: DhtOutputValue::Unit,
+            }));
+        } else {
+            self.ops.insert(op_id, OpState::Put(op));
+        }
+    }
+
+    fn finish_bootstrap(
+        &mut self,
+        op_id: OpId,
+        op: BootstrapOp,
         error: DhtIoError,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        let Some(op) = self.pending_ops.remove(&op_id) else {
-            return;
-        };
-
-        match op {
-            PendingOp::Put(mut put_op) => {
-                put_op.outstanding_rpc = put_op.outstanding_rpc.saturating_sub(1);
-                if put_op.outstanding_rpc == 0 {
-                    if let Some(caller_id) = put_op.caller_id {
-                        out.push(DhtEffect::Output(DhtOutput::Completed {
-                            caller_id,
-                            result: DhtOutputValue::Unit,
-                        }));
-                    }
-                } else {
-                    self.pending_ops.insert(op_id, PendingOp::Put(put_op));
-                }
+        if pending_rpc_count(&op.pending, RpcPhase::Bootstrap) == 0 {
+            if op.active_nodes == 0 {
+                out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
+            } else {
+                out.push(DhtEffect::Output(DhtOutput::Completed {
+                    op_id,
+                    result: DhtOutputValue::Unit,
+                }));
             }
-            PendingOp::Get(mut get_op) => {
-                get_op.outstanding_rpc = get_op.outstanding_rpc.saturating_sub(1);
-                if get_op.outstanding_rpc == 0 {
-                    if let Some(caller_id) = get_op.caller_id {
-                        out.push(DhtEffect::Output(DhtOutput::Completed {
-                            caller_id,
-                            result: DhtOutputValue::GetValues(get_op.values),
-                        }));
-                    }
-                } else {
-                    self.pending_ops.insert(op_id, PendingOp::Get(get_op));
-                }
-            }
-            PendingOp::Bootstrap(mut bootstrap_op) => {
-                bootstrap_op.outstanding_rpc = bootstrap_op.outstanding_rpc.saturating_sub(1);
-                if bootstrap_op.outstanding_rpc == 0 {
-                    if let Some(caller_id) = bootstrap_op.caller_id {
-                        if bootstrap_op.active_nodes == 0 {
-                            out.push(DhtEffect::Output(DhtOutput::Failed { caller_id, error }));
-                        } else {
-                            out.push(DhtEffect::Output(DhtOutput::Completed {
-                                caller_id,
-                                result: DhtOutputValue::Unit,
-                            }));
-                        }
-                    }
-                } else {
-                    self.pending_ops
-                        .insert(op_id, PendingOp::Bootstrap(bootstrap_op));
-                }
-            }
-            PendingOp::EvictionPing(mut eviction_op) => {
-                eviction_op.outstanding_rpc = eviction_op.outstanding_rpc.saturating_sub(1);
-                let _ = self.routing_table.evict_oldest(eviction_op.bucket_idx);
-                self.routing_table.insert(eviction_op.pending_peer.clone());
-                if eviction_op.outstanding_rpc > 0 {
-                    self.pending_ops
-                        .insert(op_id, PendingOp::EvictionPing(eviction_op));
-                }
-            }
-            PendingOp::MaintenancePing(mut ping_op) => {
-                ping_op.outstanding_rpc = ping_op.outstanding_rpc.saturating_sub(1);
-                let _ = self.routing_table.remove(&ping_op.peer);
-                if ping_op.outstanding_rpc > 0 {
-                    self.pending_ops
-                        .insert(op_id, PendingOp::MaintenancePing(ping_op));
-                }
-            }
+        } else {
+            self.ops.insert(op_id, OpState::Bootstrap(op));
         }
-    }
-
-    fn queue_rpc_request(
-        &mut self,
-        op_id: OpId,
-        peer: NodeId,
-        request: DhtRequest,
-        out: &mut SmallVec<[DhtEffect; 4]>,
-    ) -> Option<RequestId> {
-        if self.shutdown_requested {
-            return None;
-        }
-
-        let request_id = self.alloc_request_id();
-        self.inflight_rpc.insert(request_id, RpcRoute::Op { op_id });
-        let deadline_tick = self.current_tick.saturating_add(RPC_TIMEOUT_TICKS);
-        self.deadlines
-            .entry(deadline_tick)
-            .or_default()
-            .push(request_id);
-        out.push(DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-            request_id,
-            peer,
-            request,
-            deadline_tick,
-        }));
-        Some(request_id)
     }
 
     fn schedule_maintenance_ping(&mut self, now_tick: u64, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if self.shutdown_requested {
-            return;
-        }
-
         let mut peers = self.routing_table.all_peers();
         if peers.is_empty() {
             return;
         }
+
         peers.sort_unstable_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
         let idx = (now_tick as usize) % peers.len();
         let peer = peers[idx].node_id;
 
-        let op_id = self.alloc_op_id();
-        self.pending_ops.insert(
+        let op_id = self.alloc_internal_op_id();
+        let mut op = OpState::MaintenancePing(MaintenancePingOp {
+            peer,
+            pending: HashMap::new(),
+        });
+        self.queue_rpc(
             op_id,
-            PendingOp::MaintenancePing(MaintenancePingOp {
-                peer,
-                outstanding_rpc: 1,
-            }),
+            &mut op,
+            RpcPhase::MaintenancePing,
+            peer,
+            DhtRequest::Ping,
+            out,
         );
+        self.ops.insert(op_id, op);
+    }
 
-        if self
-            .queue_rpc_request(op_id, peer, DhtRequest::Ping, out)
-            .is_none()
-        {
-            let _ = self.pending_ops.remove(&op_id);
+    fn schedule_cleanup(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if self.cleanup_inflight {
+            return;
         }
+
+        self.cleanup_inflight = true;
+        out.push(DhtEffect::IoRequest(DhtIoRequest::StorageIter {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupIter,
+            start_after: self.cleanup_cursor.clone(),
+            limit: CLEANUP_PAGE_SIZE,
+        }));
     }
 
     fn insert_peer(&mut self, node_id: NodeId, out: &mut SmallVec<[DhtEffect; 4]>) {
@@ -1128,81 +1204,164 @@ impl DhtStateMachine {
             return;
         }
 
-        let op_id = self.alloc_op_id();
-        self.pending_ops.insert(
+        let op_id = self.alloc_internal_op_id();
+        let mut op = OpState::EvictionPing(EvictionPingOp {
+            oldest_node: oldest_peer.node_id,
+            bucket_idx,
+            pending_peer: pending,
+            pending: HashMap::new(),
+        });
+        self.queue_rpc(
             op_id,
-            PendingOp::EvictionPing(EvictionPingOp {
-                oldest_node: oldest_peer.node_id,
-                bucket_idx,
-                pending_peer: pending,
-                outstanding_rpc: 1,
-            }),
+            &mut op,
+            RpcPhase::EvictionPing,
+            oldest_peer.node_id,
+            DhtRequest::Ping,
+            out,
+        );
+        self.ops.insert(op_id, op);
+    }
+
+    fn queue_rpc(
+        &self,
+        op_id: OpId,
+        op: &mut OpState,
+        phase: RpcPhase,
+        peer: NodeId,
+        request: DhtRequest,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        self.queue_rpc_pending(op_id, op.pending_mut(), phase, peer, request, out);
+    }
+
+    fn queue_rpc_pending(
+        &self,
+        op_id: OpId,
+        pending: &mut PendingMap,
+        phase: RpcPhase,
+        peer: NodeId,
+        request: DhtRequest,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let deadline_tick = self.current_tick.saturating_add(RPC_TIMEOUT_TICKS);
+        pending.insert(
+            PendingKey::Rpc { phase, peer },
+            PendingMeta {
+                deadline_tick: Some(deadline_tick),
+            },
         );
 
-        let _ = self.queue_rpc_request(op_id, oldest_peer.node_id, DhtRequest::Ping, out);
+        out.push(DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+            op_id,
+            phase,
+            peer,
+            request,
+        }));
     }
 
-    fn fail_op(&mut self, op_id: OpId, error: DhtIoError, out: &mut SmallVec<[DhtEffect; 4]>) {
-        let Some(op) = self.pending_ops.remove(&op_id) else {
-            return;
-        };
-        self.drop_routes_for_op(op_id);
+    fn queue_storage_read(
+        &self,
+        op_id: OpId,
+        op: &mut OpState,
+        stage: StorageStage,
+        key: DhtKeyId,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        op.pending_mut().insert(
+            PendingKey::Storage { stage },
+            PendingMeta {
+                deadline_tick: None,
+            },
+        );
 
-        let caller_id = match op {
-            PendingOp::Put(op) => op.caller_id,
-            PendingOp::Get(op) => op.caller_id,
-            PendingOp::Bootstrap(op) => op.caller_id,
-            PendingOp::EvictionPing(_) => None,
-            PendingOp::MaintenancePing(_) => None,
-        };
-
-        if let Some(caller_id) = caller_id {
-            out.push(DhtEffect::Output(DhtOutput::Failed { caller_id, error }));
-        }
+        out.push(DhtEffect::IoRequest(DhtIoRequest::StorageRead {
+            op_id,
+            stage,
+            key,
+        }));
     }
 
-    fn fail_all_pending(&mut self, error: DhtIoError, out: &mut SmallVec<[DhtEffect; 4]>) {
-        let op_ids: Vec<OpId> = self.pending_ops.keys().copied().collect();
-        for op_id in op_ids {
-            self.fail_op(op_id, error.clone(), out);
-        }
+    fn queue_storage_write_pending(
+        &self,
+        op_id: OpId,
+        pending: &mut PendingMap,
+        stage: StorageStage,
+        key: DhtKeyId,
+        entries: Vec<StoredEntry>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        pending.insert(
+            PendingKey::Storage { stage },
+            PendingMeta {
+                deadline_tick: None,
+            },
+        );
+
+        out.push(DhtEffect::IoRequest(DhtIoRequest::StorageWrite {
+            op_id,
+            stage,
+            key,
+            entries,
+        }));
     }
 
-    fn drop_routes_for_op(&mut self, op_id: OpId) {
-        self.inflight_rpc.retain(|_, route| match route {
-            RpcRoute::Op { op_id: route_op } => *route_op != op_id,
-        });
-        self.inflight_storage.retain(|_, route| match route {
-            StorageRoute::PutLocalRead {
-                op_id: route_op, ..
+    fn collect_timed_out_rpc(&self) -> Vec<(OpId, RpcPhase, NodeId)> {
+        let mut timed_out = Vec::new();
+
+        for (op_id, op) in &self.ops {
+            for (key, meta) in op.pending() {
+                let PendingKey::Rpc { phase, peer } = key else {
+                    continue;
+                };
+                if let Some(deadline_tick) = meta.deadline_tick {
+                    if deadline_tick <= self.current_tick {
+                        timed_out.push((*op_id, *phase, *peer));
+                    }
+                }
             }
-            | StorageRoute::PutLocalWrite { op_id: route_op }
-            | StorageRoute::GetLocalRead { op_id: route_op } => *route_op != op_id,
-            StorageRoute::InboundGetValue { .. }
-            | StorageRoute::InboundPutRead { .. }
-            | StorageRoute::InboundPutWrite { .. }
-            | StorageRoute::CleanupIter
-            | StorageRoute::CleanupWrite
-            | StorageRoute::CleanupDelete => true,
-        });
+        }
+
+        timed_out
     }
 
-    fn alloc_request_id(&mut self) -> RequestId {
-        let id = self.next_request_id;
-        self.next_request_id = self.next_request_id.saturating_add(1);
-        id
+    fn alloc_internal_op_id(&mut self) -> OpId {
+        let op_id = self.next_internal_op_id;
+        self.next_internal_op_id = self.next_internal_op_id.saturating_add(1);
+        op_id
     }
+}
 
-    fn alloc_storage_id(&mut self) -> StorageId {
-        let id = self.next_storage_id;
-        self.next_storage_id = self.next_storage_id.saturating_add(1);
-        id
-    }
+fn pending_rpc_count(pending: &PendingMap, phase: RpcPhase) -> usize {
+    pending
+        .keys()
+        .filter(|key| matches!(key, PendingKey::Rpc { phase: p, .. } if *p == phase))
+        .count()
+}
 
-    fn alloc_op_id(&mut self) -> OpId {
-        let id = self.next_op_id;
-        self.next_op_id = self.next_op_id.saturating_add(1);
-        id
+fn take_pending_rpc(pending: &mut PendingMap, phase: RpcPhase, peer: NodeId) -> bool {
+    pending.remove(&PendingKey::Rpc { phase, peer }).is_some()
+}
+
+fn take_pending_storage(pending: &mut PendingMap, stage: StorageStage) -> bool {
+    pending.remove(&PendingKey::Storage { stage }).is_some()
+}
+
+fn compare_distance(target: &[u8; 32], a: &NodeId, b: &NodeId) -> Ordering {
+    let dist_a = xor_distance_32(target, a.as_bytes());
+    let dist_b = xor_distance_32(target, b.as_bytes());
+    dist_a
+        .cmp(&dist_b)
+        .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+}
+
+fn rpc_phase_order(phase: RpcPhase) -> u8 {
+    match phase {
+        RpcPhase::PutLookup => 0,
+        RpcPhase::PutStore => 1,
+        RpcPhase::GetLookup => 2,
+        RpcPhase::Bootstrap => 3,
+        RpcPhase::EvictionPing => 4,
+        RpcPhase::MaintenancePing => 5,
     }
 }
 
@@ -1222,21 +1381,19 @@ mod tests {
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
 
-        let effects = state.step(DhtInput::Cmd(DhtCmd::RoutingTableSize {
-            caller_id: Some(1),
-        }));
+        let effects = state.step(DhtInput::Cmd(DhtCmd::RoutingTableSize { op_id: 1 }));
 
         assert!(matches!(
             effects.as_slice(),
             [DhtEffect::Output(DhtOutput::Completed {
-                caller_id: 1,
+                op_id: 1,
                 result: DhtOutputValue::RoutingTableSize(0)
             })]
         ));
     }
 
     #[test]
-    fn add_peer_is_sync_and_emits_eviction_ping_when_full() {
+    fn add_peer_is_sync_and_emits_no_effect_when_not_full() {
         let local_secret = iroh::SecretKey::from_bytes(&[11u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
@@ -1244,27 +1401,6 @@ mod tests {
         let peer = make_node(1);
         let effects = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
         assert!(effects.is_empty());
-    }
-
-    #[test]
-    fn shutdown_fails_new_commands() {
-        let local_secret = iroh::SecretKey::from_bytes(&[19u8; 32]);
-        let local_id = local_secret.public();
-        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
-
-        let _ = state.step(DhtInput::ShutdownRequested);
-        let effects = state.step(DhtInput::Cmd(DhtCmd::Get {
-            key: DhtKeyId::from_data(b"k"),
-            caller_id: Some(9),
-        }));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [DhtEffect::Output(DhtOutput::Failed {
-                caller_id: 9,
-                error: DhtIoError::Shutdown
-            })]
-        ));
     }
 
     #[test]
@@ -1280,16 +1416,20 @@ mod tests {
         let key = DhtKeyId::from_data(b"deterministic-key");
         let trace = vec![
             DhtInput::Cmd(DhtCmd::Put {
+                op_id: 1,
                 key,
                 value: b"hello".to_vec(),
                 ttl: std::time::Duration::from_secs(30),
-                caller_id: Some(1),
             }),
             DhtInput::Io(DhtIo::StorageReadResult {
-                storage_id: 1,
+                op_id: 1,
+                stage: StorageStage::PutLocalRead,
                 entries: Vec::new(),
             }),
-            DhtInput::Io(DhtIo::StorageWriteResult { storage_id: 2 }),
+            DhtInput::Io(DhtIo::StorageWriteResult {
+                op_id: 1,
+                stage: StorageStage::PutLocalWrite,
+            }),
         ];
 
         let outputs_a: Vec<String> = trace
@@ -1312,19 +1452,21 @@ mod tests {
 
         let peer = make_node(42);
         let effects = state.step(DhtInput::Cmd(DhtCmd::Bootstrap {
+            op_id: 5,
             nodes: vec![peer],
-            caller_id: Some(5),
         }));
 
-        let request_id = effects
-            .iter()
-            .find_map(|effect| match effect {
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest { request_id, .. }) => {
-                    Some(*request_id)
-                }
-                _ => None,
-            })
-            .expect("bootstrap should emit rpc request");
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    op_id,
+                    phase: RpcPhase::Bootstrap,
+                    peer: req_peer,
+                    ..
+                }) if *op_id == 5 && *req_peer == peer
+            )
+        }));
 
         let timeout_effects = state.step(DhtInput::Tick {
             now_tick: RPC_TIMEOUT_TICKS,
@@ -1333,17 +1475,74 @@ mod tests {
             matches!(
                 effect,
                 DhtEffect::Output(DhtOutput::Failed {
-                    caller_id: 5,
+                    op_id: 5,
                     error: DhtIoError::Timeout
                 })
             )
         }));
 
         let late_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
-            request_id,
+            op_id: 5,
+            phase: RpcPhase::Bootstrap,
             peer,
             response: DhtResponse::Pong,
         }));
         assert!(late_effects.is_empty());
+    }
+
+    #[test]
+    fn get_lookup_continues_with_closer_nodes() {
+        let local_secret = iroh::SecretKey::from_bytes(&[31u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let first_peer = make_node(1);
+        let second_peer = make_node(2);
+        let key = DhtKeyId::from_data(b"iterative-get");
+
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
+            node_id: first_peer,
+        }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get { op_id: 9, key }));
+
+        let local_read_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 9,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        assert!(local_read_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    op_id,
+                    phase: RpcPhase::GetLookup,
+                    peer,
+                    request: DhtRequest::GetValue { .. },
+                }) if *op_id == 9 && *peer == first_peer
+            )
+        }));
+
+        let follow_up = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 9,
+            phase: RpcPhase::GetLookup,
+            peer: first_peer,
+            response: DhtResponse::Value {
+                entries: Vec::new(),
+                closer_nodes: vec![second_peer],
+            },
+        }));
+
+        assert!(follow_up.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    op_id,
+                    phase: RpcPhase::GetLookup,
+                    peer,
+                    request: DhtRequest::GetValue { .. },
+                }) if *op_id == 9 && *peer == second_peer
+            )
+        }));
     }
 }

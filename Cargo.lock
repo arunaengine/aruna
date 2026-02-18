@@ -118,6 +118,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "byteview",
+ "crossfire",
  "futures",
  "hex",
  "iroh",

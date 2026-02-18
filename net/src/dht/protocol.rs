@@ -7,45 +7,40 @@ use thiserror::Error;
 use super::rpc::{DhtRequest, DhtResponse};
 use super::storage::StoredEntry;
 
-pub type CallerId = u64;
 pub type OpId = u64;
-pub type RequestId = u64;
-pub type StorageId = u64;
 pub type InboundId = u64;
+
+pub const INTERNAL_OP_START: OpId = 1 << 63;
+pub const CLEANUP_OP_ID: OpId = 0;
 
 #[derive(Debug, Clone)]
 pub enum DhtInput {
     Cmd(DhtCmd),
     Io(DhtIo),
     Tick { now_tick: u64 },
-    ShutdownRequested,
-    ContinueOp { op_id: OpId },
 }
 
 #[derive(Debug, Clone)]
 pub enum DhtCmd {
     Put {
+        op_id: OpId,
         key: DhtKeyId,
         value: Vec<u8>,
         ttl: Duration,
-        caller_id: Option<CallerId>,
     },
     Get {
+        op_id: OpId,
         key: DhtKeyId,
-        caller_id: Option<CallerId>,
     },
     Bootstrap {
+        op_id: OpId,
         nodes: Vec<NodeId>,
-        caller_id: Option<CallerId>,
     },
     RoutingTableSize {
-        caller_id: Option<CallerId>,
+        op_id: OpId,
     },
     AddPeer {
         node_id: NodeId,
-    },
-    Shutdown {
-        caller_id: Option<CallerId>,
     },
 }
 
@@ -57,15 +52,8 @@ pub enum DhtEffect {
 
 #[derive(Debug, Clone)]
 pub enum DhtOutput {
-    Completed {
-        caller_id: CallerId,
-        result: DhtOutputValue,
-    },
-    Failed {
-        caller_id: CallerId,
-        error: DhtIoError,
-    },
-    ShutdownComplete,
+    Completed { op_id: OpId, result: DhtOutputValue },
+    Failed { op_id: OpId, error: DhtIoError },
 }
 
 #[derive(Debug, Clone)]
@@ -75,13 +63,36 @@ pub enum DhtOutputValue {
     RoutingTableSize(usize),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RpcPhase {
+    PutLookup,
+    PutStore,
+    GetLookup,
+    Bootstrap,
+    EvictionPing,
+    MaintenancePing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StorageStage {
+    PutLocalRead,
+    PutLocalWrite,
+    GetLocalRead,
+    InboundGetRead,
+    InboundPutRead,
+    InboundPutWrite,
+    CleanupIter,
+    CleanupWrite,
+    CleanupDelete,
+}
+
 #[derive(Debug, Clone)]
 pub enum DhtIoRequest {
     RpcRequest {
-        request_id: RequestId,
+        op_id: OpId,
+        phase: RpcPhase,
         peer: NodeId,
         request: DhtRequest,
-        deadline_tick: u64,
     },
     RpcResponse {
         inbound_id: InboundId,
@@ -91,20 +102,24 @@ pub enum DhtIoRequest {
         inbound_id: InboundId,
     },
     StorageRead {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
         key: DhtKeyId,
     },
     StorageWrite {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
         key: DhtKeyId,
         entries: Vec<StoredEntry>,
     },
     StorageDelete {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
         key: DhtKeyId,
     },
     StorageIter {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
         start_after: Option<Vec<u8>>,
         limit: usize,
     },
@@ -113,12 +128,14 @@ pub enum DhtIoRequest {
 #[derive(Debug, Clone)]
 pub enum DhtIo {
     RpcResponse {
-        request_id: RequestId,
+        op_id: OpId,
+        phase: RpcPhase,
         peer: NodeId,
         response: DhtResponse,
     },
     RpcError {
-        request_id: RequestId,
+        op_id: OpId,
+        phase: RpcPhase,
         peer: NodeId,
         error: DhtIoError,
     },
@@ -131,28 +148,32 @@ pub enum DhtIo {
         inbound_id: InboundId,
     },
     StorageReadResult {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
         entries: Vec<StoredEntry>,
     },
     StorageWriteResult {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
     },
     StorageDeleteResult {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
     },
     StorageIterResult {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
         values: Vec<(Vec<u8>, Vec<StoredEntry>)>,
         next_start_after: Option<Vec<u8>>,
     },
     StorageError {
-        storage_id: StorageId,
+        op_id: OpId,
+        stage: StorageStage,
         error: DhtIoError,
     },
     PeerSeen {
         peer: NodeId,
     },
-    DispatcherClosed,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -163,14 +184,10 @@ pub enum DhtIoError {
     Shutdown,
     #[error("timeout")]
     Timeout,
-    #[error("dispatcher closed")]
-    DispatcherClosed,
     #[error("network error: {0}")]
     Network(String),
     #[error("storage error: {0}")]
     Storage(String),
     #[error("invalid response: {0}")]
     InvalidResponse(String),
-    #[error("internal error: {0}")]
-    Internal(String),
 }
