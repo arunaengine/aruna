@@ -1,0 +1,24 @@
+[package]
+name = "aruna-blob"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-core = { path = "../core" }
+aruna-storage = { path = "../storage" }
+blake3 = "1.8.3"
+bytes.workspace = true
+#crc-fast = "1.10.0"
+crossfire.workspace = true 
+opendal.workspace = true 
+tracing.workspace = true 
+thiserror.workspace = true
+ulid.workspace = true
+
+#s3s.workspace = true
+#sha2.workspace = true
+sha2 = "0.10.7"
+md5 = "0.8.0"
+futures.workspace = true

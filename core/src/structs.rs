@@ -3,6 +3,7 @@ use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::time::SystemTime;
 use ulid::Ulid;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -189,4 +190,56 @@ pub struct TokenClaims {
     pub exp: u64,
     /// JWT ID: unique token identifier (ULID string).
     pub jti: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BackendConfig {
+    pub backend_type: String,
+    pub bucket_prefix: Option<String>,
+    pub max_bucket_size: Option<u64>,
+    pub root: String,
+    pub service_config: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BackendBucket {
+    pub bucket: String,
+    pub size: u64,
+}
+
+impl From<(String, u64)> for BackendBucket {
+    fn from((bucket, size): (String, u64)) -> Self {
+        Self { bucket, size }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BlobInfo {
+    pub bucket: String,
+    pub key: String,
+    pub created_by: UserId,
+    pub created_at: SystemTime,
+    pub staging: bool,
+    pub compressed: bool,
+    pub encrypted: bool,
+    // Indicates whether object is partially synced or not. Ingested resources that exist
+    // at the root level of the storage backend have empty storage root.
+    pub partial: bool,
+    //pub storage_root: String,
+    pub storage_path: String,
+    pub blob_size: u64,
+    pub hashes: HashMap<String, Vec<u8>>, // Raw bytes that can be encoded as needed
+}
+
+impl BlobInfo {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn get_blake3(&self) -> Option<&Vec<u8>> {
+        self.hashes.get("blake3")
+    }
 }
