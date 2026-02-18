@@ -7,3 +7,4 @@ pub mod incoming_automerge;
 pub mod incoming_bao;
 pub mod incoming_gossip;
 pub mod list_groups;
+pub mod s3;

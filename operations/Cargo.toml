@@ -6,10 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aruna-blob = { path = "../blob" }
 aruna-core = { path = "../core" }
 aruna-storage = { path = "../storage" }
 aruna-net = { path = "../net" }
 async-trait = { workspace = true }
+bytes.workspace = true
 byteview = { workspace = true }
 chrono = { workspace = true }
 globset = { workspace = true }
@@ -19,6 +21,7 @@ tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
+opendal.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
