@@ -10,7 +10,7 @@ members = [
     "operations",
     "tools",
 ]
-default-members = ["aruna"]
+# default-members = ["aruna"]
 resolver = "3"
 
 [workspace.package]
@@ -22,6 +22,7 @@ rust-version = "1.93.0"
 
 [workspace.dependencies]
 fjall = "3.0.1"
+ahash = "0.8.12"
 async-trait = "0.1.89"
 axum = "0.8.8"
 axum-extra = { version = "0.12.5", features = ["query"] }

@@ -1,3 +1,5 @@
+use std::array::TryFromSliceError;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -60,6 +62,14 @@ pub enum StreamError {
 pub enum ConversionError {
     #[error(transparent)]
     PostcardError(#[from] postcard::Error),
+    #[error(transparent)]
+    PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
+    #[error(transparent)]
+    FromSliceError(#[from] TryFromSliceError),
+    #[error(transparent)]
+    PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    #[error(transparent)]
+    PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
 }
 
 #[derive(Debug, Error)]

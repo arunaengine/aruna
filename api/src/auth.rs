@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use aruna_core::errors::ParseRealmIdError;
 use aruna_core::structs::{RealmId, TokenClaims};
 use aruna_core::types::UserId;
@@ -5,12 +7,13 @@ use axum::extract::Request;
 use axum::http::{HeaderMap, header};
 use axum::middleware::Next;
 use axum::response::Response;
-use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::EncodePublicKey;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{DecodingKey, Validation, decode};
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::error::TokenError;
 use crate::server_state::ServerState;
 
 #[derive(Debug)]
@@ -52,21 +55,64 @@ async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Optio
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))?;
-    let keypair = state.get_keypair()?;
-    let signing_key = SigningKey::from_keypair_bytes(&keypair).ok()?;
-    let verifying_key = signing_key
-        .verifying_key()
-        .to_public_key_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::default())
-        .ok()?;
 
-    let decoding_key = DecodingKey::from_ed_pem(verifying_key.as_bytes()).ok()?;
-    let claims = decode::<TokenClaims>(
-        token,
-        &decoding_key,
-        &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-    )
-    .ok()?;
-    claims.claims.try_into().ok()
+    let token = handle_token(state, token).await.ok()?;
+    token.try_into().ok()
+}
+
+pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaims, TokenError> {
+    let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
+    let claims = match (
+        unvalidated_claims.claims.issuer_pubkey,
+        unvalidated_claims.claims.delegation_signature.is_some(),
+    ) {
+        (Some(issuer), true) => {
+            let decoding_key = state.get_issuer_key(issuer).await?;
+            let claims = decode::<TokenClaims>(
+                token,
+                &decoding_key,
+                &Validation::new(jsonwebtoken::Algorithm::EdDSA),
+            )?;
+            claims
+        }
+        (_, _) => {
+            let pubkey = state.get_pubkey();
+            let decoding_key = DecodingKey::from_ed_pem(&pubkey)?;
+            let claims = decode::<TokenClaims>(
+                token,
+                &decoding_key,
+                &Validation::new(jsonwebtoken::Algorithm::EdDSA),
+            )?;
+            claims
+        }
+    };
+    validate_claims(state, &claims.claims)?;
+    Ok(claims.claims)
+}
+
+pub fn validate_claims(state: &ServerState, claims: &TokenClaims) -> Result<(), TokenError> {
+    let now = chrono::Utc::now().timestamp() as u64;
+    if now > claims.exp {
+        return Err(TokenError::Expired);
+    }
+
+    // TODO:
+    // - Check token hash against revocation list
+    // - Check permission restrictions
+
+    // Check server token claims
+    match (&claims.delegation_signature, &claims.issuer_pubkey) {
+        (Some(delegation_token), Some(issuer_pubkey)) => {
+            // Check delegation signature
+            let realm_key = state.get_realm_id();
+            let realm_verifying_key = VerifyingKey::from_bytes(realm_key.as_bytes())?;
+            let signature = Signature::from_str(delegation_token)?;
+            realm_verifying_key.verify(issuer_pubkey.as_bytes(), &signature)?;
+            Ok(())
+        }
+        (None, None) => Ok(()),
+        (_, _) => Err(TokenError::InvalidServerToken),
+    }
 }
 
 pub async fn auth_middleware(
@@ -90,18 +136,20 @@ pub async fn auth_middleware(
 mod test {
     use crate::auth::extract_auth_context;
     use crate::server_state::ServerState;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use axum::http::{HeaderMap, header};
+    use base64::Engine;
     use ed25519_dalek::SigningKey;
+    use jsonwebtoken::signature::SignerMut;
     use std::sync::Arc;
     use tempfile::env::temp_dir;
     use ulid::Ulid;
 
     #[tokio::test]
-    pub async fn test_middleware() {
+    pub async fn test_tokens() {
         let tempdir = temp_dir();
         let storage_handle = storage::FjallStorage::open(&tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
@@ -110,31 +158,113 @@ mod test {
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let signing_key: SigningKey = SigningKey::generate(&mut csprng);
-        let pubkey = signing_key.verifying_key().to_bytes();
-        let realm_id = Some(RealmId::from_bytes(pubkey));
-        let realm_keypair = Some(signing_key.to_keypair_bytes());
+        let mut realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let pubkey = realm_signing_key.verifying_key().to_bytes();
+        let realm_id = RealmId::from_bytes(pubkey);
 
-        let state = ServerState::new(driver_ctx.clone(), realm_keypair, realm_id.clone(), None);
+        let time = chrono::Utc::now().timestamp() as u64;
+        let expiry = None;
+        let user_id = Ulid::new();
+
+        //
+        // Test Management Nodes
+        //
+        let capabilities = NodeCapabilities::management_node(realm_signing_key.clone()).unwrap();
+        let state = ServerState::new(
+            driver_ctx.clone(),
+            realm_id.clone(),
+            capabilities.clone(),
+            None,
+        );
 
         let token_config = CreateTokenConfig {
-            time: chrono::Utc::now().timestamp() as u64,
-            expiry: None,
-            user_id: Ulid::new(),
-            realm_id: realm_id.clone().unwrap(),
-            keypair: realm_keypair.unwrap(),
+            time,
+            expiry,
+            user_id,
+            realm_id: realm_id.clone(),
+            node_capabilities: capabilities,
         };
-        let token_operation = CreateTokenOperation::new(token_config.clone());
-        let token = drive(token_operation, &driver_ctx).await.unwrap();
+        let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
+        let management_token = drive(token_operation, &driver_ctx).await.unwrap();
 
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            axum::http::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", management_token)).unwrap(),
         );
 
         let ctx = extract_auth_context(&state, &headers).await.unwrap();
-        assert_eq!(ctx.realm_id, realm_id.unwrap());
+        assert_eq!(ctx.realm_id, realm_id);
+        assert_eq!(ctx.user_id, token_config.user_id);
+
+        //
+        // Test Server Nodes
+        //
+        let issuer_key = SigningKey::generate(&mut csprng);
+
+        let message = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(issuer_key.verifying_key().to_bytes());
+        let delegation_signature = realm_signing_key.sign(message.as_bytes()).to_string();
+
+        let capabilities =
+            NodeCapabilities::server_node(issuer_key, realm_id.clone(), delegation_signature)
+                .unwrap();
+        let state = ServerState::new(
+            driver_ctx.clone(),
+            realm_id.clone(),
+            capabilities.clone(),
+            None,
+        );
+
+        let token_config = CreateTokenConfig {
+            time,
+            expiry,
+            user_id,
+            realm_id: realm_id.clone(),
+            node_capabilities: capabilities,
+        };
+        let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
+        let server_token = drive(token_operation, &driver_ctx).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", server_token)).unwrap(),
+        );
+
+        let ctx = extract_auth_context(&state, &headers).await.unwrap();
+        assert_eq!(ctx.realm_id, realm_id);
+        assert_eq!(ctx.user_id, token_config.user_id);
+
+        //
+        // Test Local Nodes
+        //
+        let capabilities = NodeCapabilities::local_node(realm_id.clone()).unwrap();
+        let state = ServerState::new(
+            driver_ctx.clone(),
+            realm_id.clone(),
+            capabilities.clone(),
+            None,
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", management_token)).unwrap(),
+        );
+
+        let ctx = extract_auth_context(&state, &headers).await.unwrap();
+        assert_eq!(ctx.realm_id, realm_id);
+        assert_eq!(ctx.user_id, token_config.user_id);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", server_token)).unwrap(),
+        );
+
+        let ctx = extract_auth_context(&state, &headers).await.unwrap();
+        assert_eq!(ctx.realm_id, realm_id);
         assert_eq!(ctx.user_id, token_config.user_id);
     }
 }

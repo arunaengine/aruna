@@ -1,9 +1,14 @@
 use crate::errors::{ConversionError, ParseRealmIdError};
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
+use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::pkcs8::EncodePublicKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RealmId(pub [u8; 32]);
@@ -38,6 +43,12 @@ impl RealmId {
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
         Ok(Self(arr))
+    }
+
+    pub fn to_pkcs8_pem_bytes(&self) -> Result<[u8; 113], ConversionError> {
+        let verifiying_key = VerifyingKey::from_bytes(&self.0)?;
+        let pkcs8 = verifiying_key.to_public_key_pem(LineEnding::default())?;
+        Ok(pkcs8.as_bytes().try_into()?)
     }
 }
 
@@ -189,4 +200,93 @@ pub struct TokenClaims {
     pub exp: u64,
     /// JWT ID: unique token identifier (ULID string).
     pub jti: String,
+    /// Path restrictions: List of (path_pattern, permission) pairs acting as a whitelist
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restrictions: Option<Vec<PathRestriction>>,
+    /// Issuer public key (base64-encoded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_pubkey: Option<String>,
+    /// Delegation signature: Realm signature over issuer_pubkey
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_signature: Option<String>,
+}
+
+/// Path restriction for token scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathRestriction {
+    /// Path pattern (supports * and ** wildcards).
+    pub pattern: String,
+    /// Permission level for this pattern.
+    pub permission: Permission,
+}
+
+#[derive(Clone, Debug)]
+pub enum NodeCapabilities {
+    // This may seem redundant, but because we need both representations both
+    // and need both on (nearly) every request, this mitigates unneeded conversions
+    Management {
+        /// ed25519-dalek representation
+        realm_signing_key: SigningKey,
+        /// pkcs8_pem bytes representation
+        realm_verifying_key: [u8; 113],
+        realm_encoding_key: [u8; 168],
+    },
+    Server {
+        /// ed25519-dalek representation
+        issuer_signing_key: SigningKey,
+        /// pkcs8_pem bytes representation
+        issuer_verifying_key: [u8; 113],
+        issuer_encoding_key: [u8; 168],
+
+        /// pkcs8_pem bytes representation
+        realm_verifying_key: [u8; 113],
+        /// Realm signature over issuer_pubkey
+        delegation_signature: String,
+    },
+    Local {
+        //realm_pubkey: [u8; 32],
+        realm_verifying_key: [u8; 113],
+    },
+}
+
+impl NodeCapabilities {
+    pub fn management_node(realm_signing_key: SigningKey) -> Result<Self, ConversionError> {
+        let privkey = realm_signing_key.to_pkcs8_pem(LineEnding::default())?;
+        let pubkey = realm_signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::default())?;
+        let realm_verifying_key = pubkey.as_bytes().try_into()?;
+        let realm_encoding_key = privkey.as_bytes().try_into()?;
+        Ok(NodeCapabilities::Management {
+            realm_signing_key,
+            realm_verifying_key,
+            realm_encoding_key,
+        })
+    }
+    pub fn server_node(
+        issuer_signing_key: SigningKey,
+        realm_id: RealmId,
+        delegation_signature: String,
+    ) -> Result<Self, ConversionError> {
+        let privkey = issuer_signing_key.to_pkcs8_pem(LineEnding::default())?;
+        let pubkey = issuer_signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::default())?;
+        let issuer_verifying_key = pubkey.as_bytes().try_into()?;
+        let issuer_encoding_key = privkey.as_bytes().try_into()?;
+        let realm_verifying_key = realm_id.to_pkcs8_pem_bytes()?;
+        Ok(NodeCapabilities::Server {
+            issuer_signing_key,
+            issuer_verifying_key,
+            issuer_encoding_key,
+            delegation_signature,
+            realm_verifying_key,
+        })
+    }
+    pub fn local_node(realm_id: RealmId) -> Result<Self, ConversionError> {
+        let realm_verifying_key = realm_id.to_pkcs8_pem_bytes()?;
+        Ok(NodeCapabilities::Local {
+            realm_verifying_key,
+        })
+    }
 }

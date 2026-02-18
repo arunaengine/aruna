@@ -15,18 +15,19 @@ async fn main() {
         storage_handle,
         net_handle: None,
     });
-    let state = Arc::new(ServerState::new(
-        driver_ctx,
-        Some(config.realm_keypair),
-        Some(config.realm_id),
-        None,
-    ));
+    todo!()
+    // let state = Arc::new(ServerState::new(
+    //     driver_ctx,
+    //     Some(config.realm_keypair),
+    //     Some(config.realm_id),
+    //     None,
+    // ));
 
-    let config = ServerConfig {
-        http_addr: config.socket_addr,
-    };
-    let server = Server::new(state, config);
-    if let Err(err) = server.run().await {
-        eprintln!("{}", err);
-    }
+    // let config = ServerConfig {
+    //     http_addr: config.socket_addr,
+    // };
+    // let server = Server::new(state, config);
+    // if let Err(err) = server.run().await {
+    //     eprintln!("{}", err);
+    // }
 }

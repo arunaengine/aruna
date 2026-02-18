@@ -18,6 +18,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "ahash"
+version = "0.8.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
+dependencies = [
+ "cfg-if",
+ "getrandom 0.3.4",
+ "once_cell",
+ "version_check",
+ "zerocopy",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -89,10 +102,12 @@ dependencies = [
 name = "aruna-api"
 version = "3.0.0"
 dependencies = [
+ "ahash",
  "aruna-core",
  "aruna-operations",
  "aruna-storage",
  "axum",
+ "base64",
  "chrono",
  "ed25519-dalek 2.2.0",
  "jsonwebtoken",
@@ -114,6 +129,7 @@ dependencies = [
  "base64",
  "blake3",
  "byteview",
+ "ed25519-dalek 2.2.0",
  "hex",
  "iroh",
  "iroh-gossip",
@@ -157,6 +173,7 @@ dependencies = [
  "aruna-net",
  "aruna-storage",
  "async-trait",
+ "base64",
  "byteview",
  "chrono",
  "ed25519-dalek 2.2.0",

@@ -1,3 +1,6 @@
+use std::array::TryFromSliceError;
+
+use aruna_core::errors::ConversionError;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -15,6 +18,29 @@ pub enum ServerError {
     InternalError(String),
     #[error("Bad request")]
     BadRequest,
+}
+
+#[derive(Debug, Error)]
+pub enum TokenError {
+    #[error("Invalid issuer key")]
+    InvalidIssuerKey,
+    #[error(transparent)]
+    PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
+    #[error("Token expired")]
+    Expired,
+    #[error("Invalid server token")]
+    InvalidServerToken,
+    #[error(transparent)]
+    FromSliceError(#[from] TryFromSliceError),
+    #[error(transparent)]
+    PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    #[error(transparent)]
+    PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
+    #[error(transparent)]
+    JWTError(#[from] jsonwebtoken::errors::Error),
+    #[error(transparent)]
+    Base64Error(#[from] base64::DecodeError),
+
 }
 
 /// Standard error response for API endpoints.
@@ -108,4 +134,6 @@ pub enum ServerSetupError {
     IoError(#[from] std::io::Error),
     #[error("Runtime error: `{0}`")]
     Runtime(String),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
 }

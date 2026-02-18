@@ -20,6 +20,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

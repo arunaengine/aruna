@@ -6,10 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
 aruna-core = { path = "../core" }
 aruna-operations = { path = "../operations" }
 aruna-storage = { path = "../storage" }
 axum = "0.8.8"
+base64 = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 jsonwebtoken = { workspace = true }
