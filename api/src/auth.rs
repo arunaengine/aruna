@@ -93,6 +93,7 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         });
         let realm_id = Some(RealmId([0u8; 32]));
         let realm_keypair = Some([0u8; 64]);

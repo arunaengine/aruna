@@ -1,5 +1,7 @@
+use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::Effect;
-use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_net::NetHandle;
@@ -12,12 +14,20 @@ use std::pin::Pin;
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
+    pub blob_handle: Option<BlobHandle>,
 }
 
 const MAX_SUBOP_DEPTH: usize = 32;
 
 async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
     match effect {
+        Effect::Blob(blob_effect) => {
+            if let Some(blob_handle) = &context.blob_handle {
+                blob_handle.send_effect(blob_effect).await
+            } else {
+                Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
+            }
+        }
         Effect::Storage(storage_effect) => {
             context
                 .storage_handle
@@ -210,6 +220,7 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let operation = TestOperation::new();
@@ -267,6 +278,7 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let operation = EffectOrderOperation::new();
@@ -328,6 +340,7 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let event = drive(RecursiveSubOperation::new(), &context)

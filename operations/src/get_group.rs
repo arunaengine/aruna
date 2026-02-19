@@ -284,6 +284,7 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let group_config = CreateGroupConfig {
