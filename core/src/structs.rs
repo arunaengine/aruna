@@ -1,8 +1,11 @@
-use crate::errors::{ConversionError, ParseRealmIdError};
+use crate::errors::{BlobError, ConversionError, ParseRealmIdError};
 use crate::types::{GroupId, RoleId, UserId};
+use byteview::ByteView;
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Display;
+use std::path::PathBuf;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -195,38 +198,82 @@ pub struct TokenClaims {
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
     pub backend_type: String,
-    pub bucket_prefix: Option<String>,
-    pub max_bucket_size: Option<u64>,
     pub root: String,
     pub service_config: HashMap<String, String>,
+    pub bucket_prefix: Option<String>,
+    pub max_bucket_size: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct BackendBucket {
-    pub bucket: String,
-    pub size: u64,
+    pub name: String,
+    pub load: u64,
+}
+
+impl TryFrom<(ByteView, ByteView)> for BackendBucket {
+    type Error = ConversionError;
+
+    fn try_from(value: (ByteView, ByteView)) -> Result<Self, Self::Error> {
+        let (bucket, load) = value;
+
+        Ok(BackendBucket {
+            name: String::from_utf8(bucket.to_vec())?,
+            load: u64::from_le_bytes(load.as_ref().try_into()?),
+        })
+    }
 }
 
 impl From<(String, u64)> for BackendBucket {
-    fn from((bucket, size): (String, u64)) -> Self {
-        Self { bucket, size }
+    fn from((name, size): (String, u64)) -> Self {
+        Self { name, load: size }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BackendLocation {
+    pub root: String,
+    pub storage_bucket: String,
+    pub object_bucket: String, // S3 bucket from request
+    pub object_key: String,    // S3 key from request
+    pub ulid: Ulid,
+    pub compressed: bool,
+    pub encrypted: bool,
+}
+
+impl Display for BackendLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let path = PathBuf::from(&self.root)
+            .join(&self.storage_bucket)
+            .join(&self.object_bucket)
+            .join(format!("{}_{}", self.object_key, self.ulid));
+        write!(
+            f,
+            "{}",
+            path.into_os_string()
+                .into_string()
+                .map_err(|_| fmt::Error)?
+        )
+    }
+}
+
+impl BackendLocation {
+    pub fn get_storage_path(&self) -> Result<String, BlobError> {
+        Ok(PathBuf::from(&self.storage_bucket)
+            .join(&self.object_bucket)
+            .join(format!("{}_{}", self.object_key, self.ulid))
+            .into_os_string()
+            .into_string()
+            .map_err(|_| ConversionError::OsStringError)?)
     }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlobInfo {
-    pub bucket: String,
-    pub key: String,
+    pub location: BackendLocation,
     pub created_by: UserId,
     pub created_at: SystemTime,
     pub staging: bool,
-    pub compressed: bool,
-    pub encrypted: bool,
-    // Indicates whether object is partially synced or not. Ingested resources that exist
-    // at the root level of the storage backend have empty storage root.
     pub partial: bool,
-    //pub storage_root: String,
-    pub storage_path: String,
     pub blob_size: u64,
     pub hashes: HashMap<String, Vec<u8>>, // Raw bytes that can be encoded as needed
 }
@@ -237,6 +284,10 @@ impl BlobInfo {
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn get_location(&self) -> &BackendLocation {
+        &self.location
     }
 
     pub fn get_blake3(&self) -> Option<&Vec<u8>> {

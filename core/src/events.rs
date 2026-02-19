@@ -1,13 +1,13 @@
 use crate::errors::BlobError;
 use crate::stream::BackendStream;
 use crate::stream::BoxError;
+use crate::structs::BackendLocation;
 use crate::{
     errors::{DhtError, GossipError, StorageError, StreamError},
     id::NodeId,
     types::{DhtKey, Key, TopicId, TxnId, Value},
 };
 use bytes::Bytes;
-use opendal::Operator;
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -30,11 +30,9 @@ pub enum SubOperationEvent {
 #[derive(Debug)]
 pub enum BlobEvent {
     //TicketReceived { ticket: String, },
-    OperatorCreated {
-        operator: Operator,
-    },
+    //OperatorCreated { operator: Operator, },
     WriteFinished {
-        backend_path: String,
+        location: BackendLocation,
         bytes_written: u64,
         hashes: HashMap<String, Vec<u8>>,
         //checksums: HashMap<String, String>,
@@ -44,9 +42,7 @@ pub enum BlobEvent {
         stream_size: u64,
     },
     DeleteFinished,
-    Error {
-        error: BlobError,
-    },
+    Error(BlobError),
 }
 
 #[derive(Debug)]

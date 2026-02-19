@@ -4,10 +4,20 @@ use thiserror::Error;
 pub enum BlobError {
     #[error("Channel closed")]
     ChannelClosed,
+    #[error("Blob handle missing")]
+    HandleMissing,
     #[error(transparent)]
-    OpenDalError(#[from] opendal::Error),
-    #[error("Operator creation failed")]
-    OperatorCreationFailed,
+    ConversionError(#[from] ConversionError),
+    #[error("failed to create bucket: {0}")]
+    MakeBucketError(String),
+    #[error("Operator creation failed: {0}")]
+    OperatorCreationFailed(String),
+    #[error("Write error: {0}")]
+    WriteError(String),
+    #[error("Read error: {0}")]
+    ReadError(String),
+    #[error("Delete error: {0}")]
+    DeleteError(String),
 }
 
 #[derive(Debug, Error)]
@@ -70,6 +80,16 @@ pub enum StreamError {
 pub enum ConversionError {
     #[error(transparent)]
     PostcardError(#[from] postcard::Error),
+    #[error(transparent)]
+    FromUtf8Error(#[from] std::string::FromUtf8Error),
+    #[error("Failed to convert from str: {0}")]
+    FromStrError(String),
+    #[error("Failed to convert OsString to String")]
+    OsStringError,
+    #[error(transparent)]
+    ParseIntError(#[from] std::num::ParseIntError),
+    #[error(transparent)]
+    TryFromSliceError(#[from] std::array::TryFromSliceError),
 }
 
 #[derive(Debug, Error)]

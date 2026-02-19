@@ -4,9 +4,9 @@ use crate::alpn::Alpn;
 use crate::id::NodeId;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, BoxError};
+use crate::structs::BackendLocation;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 use bytes::Bytes;
-use opendal::Operator;
 use std::ops::Range;
 
 pub enum Effect {
@@ -20,26 +20,21 @@ pub enum Effect {
 }
 
 pub enum BlobEffect {
-    GetOperator {
-        bucket: Option<String>,
-    },
+    //GetOperator { bucket: Option<String>, },
     Write {
-        operator: Operator,
-        path: String,
+        bucket: String,
+        key: String,
         blob: BackendStream<Result<Bytes, BoxError>>,
     },
     Read {
-        operator: Operator,
-        path: String,
+        location: BackendLocation,
     },
     ReadRange {
-        operator: Operator,
-        path: String,
+        location: BackendLocation,
         range: Range<u64>,
     },
     Delete {
-        operator: Operator,
-        path: String,
+        location: BackendLocation,
     },
 }
 

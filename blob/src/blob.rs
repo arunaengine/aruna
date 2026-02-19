@@ -1,20 +1,19 @@
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
-use crate::opendal::{emit_backend_operator, get_backend_operator};
+use crate::opendal::{init_backend_operator, init_service};
 use crate::s3::make_bucket;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::BlobError;
+use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::BoxError;
-use aruna_core::structs::{BackendBucket, BackendConfig};
+use aruna_core::structs::{BackendBucket, BackendConfig, BackendLocation};
 use aruna_storage::storage::StorageHandle;
 use bytes::Bytes;
 use crossfire::{mpsc, oneshot};
 use futures::StreamExt;
-use opendal::Operator;
-use std::collections::HashMap;
+use opendal::{Operator, services};
 use std::fmt::Display;
 use std::ops::RangeBounds;
 use std::str::FromStr;
@@ -23,13 +22,13 @@ use ulid::Ulid;
 
 pub const BLOB_LOCATION_DB: &str = "locations";
 pub const BLOB_PATH_DB: &str = "path_locations_mapping";
+pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub type EffectHandle = (BlobEffect, oneshot::TxOneshot<BlobEvent>);
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 
 //TODO: BaoTree replication (immer getrieben vom Initiator)
-//TODO: Hold StorageHandle to manage backend "buckets"?
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Backend {
@@ -41,7 +40,7 @@ pub enum Backend {
 }
 
 impl FromStr for Backend {
-    type Err = BlobLibError;
+    type Err = ConversionError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -49,7 +48,7 @@ impl FromStr for Backend {
             "http" => Ok(Backend::HTTP),
             "postgres" => Ok(Backend::Postgres),
             "filesystem" => Ok(Backend::FileSystem),
-            _ => Err(BlobLibError::ConversionError(format!(
+            _ => Err(ConversionError::FromStrError(format!(
                 "unknown backend {}",
                 s
             ))),
@@ -70,6 +69,7 @@ impl Display for Backend {
 
 pub struct BlobHandler {
     backend_config: BackendConfig,
+    //backend_operators: HashMap<String, Operator>, // Store operator for each bucket !?
     storage: StorageHandle, // For storage backend bucket evaluation
 }
 
@@ -93,13 +93,11 @@ impl BlobHandle {
         let blob_event = {
             let (response_tx, response_rx) = oneshot::oneshot();
             if self.write_channel.send((effect, response_tx)).is_err() {
-                return Event::Blob(BlobEvent::Error {
-                    error: BlobError::ChannelClosed,
-                });
+                return Event::Blob(BlobEvent::Error(BlobError::ChannelClosed));
             }
-            response_rx.await.unwrap_or_else(|_| BlobEvent::Error {
-                error: BlobError::ChannelClosed,
-            })
+            response_rx
+                .await
+                .unwrap_or_else(|_| BlobEvent::Error(BlobError::ChannelClosed))
         };
         Event::Blob(blob_event)
     }
@@ -125,25 +123,14 @@ impl BlobHandler {
             match receiver.recv() {
                 Ok((effect, response_tx)) => {
                     let event = match effect {
-                        BlobEffect::GetOperator { bucket } => {
-                            emit_backend_operator(bucket, self.backend_config.clone())
+                        BlobEffect::Write { bucket, key, blob } => {
+                            self.write_blob(&bucket, &key, blob).await
                         }
-                        BlobEffect::Write {
-                            operator,
-                            path,
-                            blob,
-                        } => self.write_blob(operator, &path, blob).await,
-                        BlobEffect::Read { operator, path } => {
-                            self.read_blob(operator, &path).await
+                        BlobEffect::Read { location } => self.read_blob(location).await,
+                        BlobEffect::ReadRange { location, range } => {
+                            self.read_blob_range(location, range).await
                         }
-                        BlobEffect::ReadRange {
-                            operator,
-                            path,
-                            range,
-                        } => self.read_blob_range(operator, &path, range).await,
-                        BlobEffect::Delete { operator, path } => {
-                            self.delete_blob(operator, &path).await
-                        }
+                        BlobEffect::Delete { location } => self.delete_blob(location).await,
                     };
                     response_tx.send(event);
                 }
@@ -156,115 +143,209 @@ impl BlobHandler {
 
     pub async fn write_blob(
         &self,
-        operator: Operator,
-        path: &str,
+        request_bucket: &str,
+        request_key: &str,
         mut blob: BackendStream<Result<Bytes, BoxError>>,
     ) -> BlobEvent {
-        // Just write the StreamingBlob to the backend
+        // Init stuff
         let mut hasher = Hasher::new();
         let mut bytes_written: u64 = 0;
 
+        // Evaluate backend bucket and init location
+        let backend_bucket = match self.eval_backend_bucket().await {
+            Ok(bucket) => bucket,
+            Err(err) => return BlobEvent::Error(err),
+        };
+        let location = BackendLocation {
+            root: self.backend_config.root.clone(),
+            storage_bucket: backend_bucket.clone(),
+            object_bucket: request_bucket.to_string(),
+            object_key: request_key.to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+        };
+        let storage_path = match location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
+        };
+
+        // Init operator for backend bucket
+        let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
+            Ok(op) => op,
+            Err(err) => return BlobEvent::Error(err),
+        };
+
+        // Write blob to backend storage
         while let Some(Ok(bytes)) = blob.next().await {
             hasher.update(&bytes);
-            if let Err(e) = operator.write(path, bytes.to_vec()).await {
-                return BlobEvent::Error { error: e.into() };
+            if let Err(e) = operator.write(&storage_path, bytes.to_vec()).await {
+                return BlobEvent::Error(BlobError::WriteError(e.to_string()));
             }
             bytes_written += bytes.len() as u64;
         }
 
+        // Return write result
         BlobEvent::WriteFinished {
-            backend_path: path.to_string(),
+            location,
             bytes_written,
             hashes: hasher.to_map(),
             //checksums: Default::default(),
         }
     }
 
-    pub async fn read_blob(&self, operator: Operator, path: &str) -> BlobEvent {
-        let reader = match operator.reader(path).await {
+    //pub async fn read_blob(&self, operator: Operator, path: &str) -> BlobEvent {
+    pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
+        // Get operator for provided location
+        let operator = match self.operator_from_location(&location) {
+            Ok(op) => op,
+            Err(err) => {
+                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
+            }
+        };
+
+        // Create reader stream
+        let storage_path = match location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
+        };
+        let reader = match operator.reader(&storage_path).await {
             Ok(r) => match r.into_bytes_stream(..).await {
                 Ok(stream) => stream,
-                Err(e) => return BlobEvent::Error { error: e.into() },
+                Err(e) => return BlobEvent::Error(BlobError::ReadError(e.to_string())),
             },
-            Err(e) => return BlobEvent::Error { error: e.into() },
+            Err(e) => return BlobEvent::Error(BlobError::ReadError(e.to_string())),
         };
 
         BlobEvent::ReadFinished {
             blob: BackendStream::new(reader),
-            stream_size: 0, //TODO
+            stream_size: 0, //TODO: Should this be queried in the state machine?
         }
     }
 
     pub async fn read_blob_range(
         &self,
-        operator: Operator,
-        path: &str,
+        location: BackendLocation,
         range: impl RangeBounds<u64>,
     ) -> BlobEvent {
-        let reader = match operator.reader(path).await {
+        // Get operator for provided location
+        let operator = match self.operator_from_location(&location) {
+            Ok(op) => op,
+            Err(err) => {
+                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
+            }
+        };
+
+        // Create reader stream
+        let storage_path = match location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
+        };
+        let reader = match operator.reader(&storage_path).await {
             Ok(r) => match r.into_bytes_stream(range).await {
                 Ok(stream) => stream,
-                Err(e) => return BlobEvent::Error { error: e.into() },
+                Err(e) => return BlobEvent::Error(BlobError::ReadError(e.to_string())),
             },
-            Err(e) => return BlobEvent::Error { error: e.into() },
+            Err(e) => return BlobEvent::Error(BlobError::ReadError(e.to_string())),
         };
 
         BlobEvent::ReadFinished {
             blob: BackendStream::new(reader),
-            stream_size: 0, //TODO
+            stream_size: 0, //TODO: Should this be queried in the state machine?
         }
     }
 
-    pub async fn delete_blob(&self, operator: Operator, path: &str) -> BlobEvent {
-        match operator.delete(path).await {
-            Ok(_) => {}
-            Err(e) => return BlobEvent::Error { error: e.into() },
+    pub async fn delete_blob(&self, location: BackendLocation) -> BlobEvent {
+        // Get operator for provided location
+        let operator = match self.operator_from_location(&location) {
+            Ok(op) => op,
+            Err(err) => {
+                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
+            }
+        };
+
+        // Create reader stream
+        let storage_path = match location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
+        };
+
+        if let Err(e) = operator.delete(&storage_path).await {
+            return BlobEvent::Error(BlobError::DeleteError(e.to_string()));
         }
         BlobEvent::DeleteFinished
     }
 
-    async fn evaluate_backend_bucket(&self) -> Result<String, BlobLibError> {
-        let buckets: HashMap<String, u64> =
-            if let Event::Storage(StorageEvent::IterResult { values, .. }) = self
-                .storage
-                .send_effect(Effect::Storage(StorageEffect::Iter {
-                    key_space: "buckets".to_string(),
-                    prefix: self
-                        .backend_config
-                        .bucket_prefix
-                        .map(|prefix| prefix.into()),
-                    start_after: None,
-                    limit: 0,
-                    txn_id: None,
-                }))
-                .await
-            {
-                values
-                    .into_iter()
-                    .filter_map(|(k, v)| {
-                        let key = String::from_utf8(k.to_vec()).ok()?;
-                        let value = String::from_utf8(v.to_vec()).ok()?.parse::<u64>().ok()?;
-                        Some((key, value))
-                    })
-                    .collect()
-            } else {
-                HashMap::new()
-            };
-
-        if let Some(bucket_max_size) = self.backend_config.max_bucket_size {
-            // Find bucket with fewer objects than max bucket size
-            for (bucket, load) in buckets {
-                if load < bucket_max_size {
-                    return Ok(bucket.to_string());
-                }
-            }
-        } else if let Some((bucket, _)) = buckets.into_iter().next() {
-            // Take first bucket if no size limit
-            return Ok(bucket);
+    async fn eval_backend_bucket(&self) -> Result<String, BlobError> {
+        // Short circuit if static bucket is set in config
+        if let Some(bucket) = self.backend_config.service_config.get("bucket") {
+            return Ok(bucket.clone());
         }
 
-        // No suitable bucket found, create new one
-        Ok(generate_bucket_name())
+        // Fetch bucket stats from database
+        let buckets = self.fetch_bucket_stats().await?;
+
+        // Check if a suitable bucket exists
+        if let Some(bucket_max_size) = self.backend_config.max_bucket_size {
+            // Find bucket with fewer objects than max bucket size
+            for bucket in buckets {
+                if bucket.load < bucket_max_size {
+                    return Ok(bucket.name);
+                }
+            }
+        } else if let Some(bucket) = buckets.into_iter().next() {
+            // Take the first existing bucket if no size limit
+            return Ok(bucket.name);
+        }
+
+        // No suitable bucket found -> make bucket
+        let bucket_name = generate_bucket_name();
+        make_bucket(&bucket_name, &self.backend_config.service_config).await?;
+
+        Ok(bucket_name)
+    }
+
+    async fn fetch_bucket_stats(&self) -> Result<Vec<BackendBucket>, ConversionError> {
+        if let Event::Storage(StorageEvent::IterResult { values, .. }) = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: BUCKET_STATS_DB.to_string(),
+                prefix: self
+                    .backend_config
+                    .bucket_prefix
+                    .clone()
+                    .map(|prefix| prefix.into()),
+                start_after: None,
+                limit: 0,
+                txn_id: None,
+            }))
+            .await
+        {
+            values
+                .into_iter()
+                .map(|kv| BackendBucket::try_from(kv))
+                .collect::<Result<Vec<BackendBucket>, ConversionError>>()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn operator_from_location(&self, location: &BackendLocation) -> Result<Operator, BlobError> {
+        let mut config = self.backend_config.service_config.clone();
+        config.insert("root".to_string(), location.root.clone());
+
+        let backend_type = Backend::from_str(&self.backend_config.backend_type)
+            .map_err(|e| ConversionError::FromStrError(e.to_string()))?;
+        if Backend::S3 == backend_type {
+            config.insert("bucket".to_string(), location.storage_bucket.clone());
+        }
+
+        Ok(match backend_type {
+            Backend::S3 => init_service::<services::S3>(config)?,
+            Backend::HTTP => init_service::<services::Http>(config)?,
+            Backend::Postgres => init_service::<services::Postgresql>(config)?,
+            Backend::FileSystem => init_service::<services::Fs>(config)?,
+        })
     }
 }
 
