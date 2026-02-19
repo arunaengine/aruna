@@ -46,7 +46,7 @@ impl GetGroupOperation {
     }
 
     fn emit_parse_group(&mut self, value: Option<byteview::ByteView>) -> Result<(), GetGroupError> {
-        let value = value.ok_or_else(|| GetGroupError::GroupNotFound)?;
+        let value = value.ok_or(GetGroupError::GroupNotFound)?;
         let group = Group::from_bytes(&value)?;
         self.group = Some(group);
         Ok(())
@@ -66,12 +66,10 @@ impl GetGroupOperation {
         &mut self,
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, GetGroupError> {
-        let value = value.ok_or_else(|| GetGroupError::AuthDocNotFound)?;
+        let value = value.ok_or(GetGroupError::AuthDocNotFound)?;
         let auth_doc = AuthorizationDocument::from_bytes(&value)?;
         self.auth_doc = Some(auth_doc);
-        let txn_id = self
-            .txn_id
-            .ok_or_else(|| GetGroupError::NoTransactionFound)?;
+        let txn_id = self.txn_id.ok_or(GetGroupError::NoTransactionFound)?;
         Ok(smallvec![Effect::Storage(
             StorageEffect::CommitTransaction { txn_id }
         )])
@@ -255,7 +253,7 @@ impl Operation for GetGroupOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| GetGroupError::NotFinished)?
+        self.output.ok_or(GetGroupError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {

@@ -110,14 +110,14 @@ impl PutObjectOperation {
         }) = event
         {
             // Check if the body was fully written
-            if bytes_written != self.config.request.content_length.unwrap_or(0) as u64 {
+            if bytes_written != self.config.request.content_length.unwrap_or(0) {
                 return self.emit_error(PutObjectError::IncompleteBody);
             }
 
             // Update output
             self.output = Some(Ok(BlobInfo {
                 location,
-                created_by: self.config.user_id.clone(),
+                created_by: self.config.user_id,
                 created_at: SystemTime::now(),
                 staging: false,
                 partial: false,
@@ -277,7 +277,7 @@ impl Operation for PutObjectOperation {
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         if PutObjectState::Error == self.state {
             if let Some(Err(error)) = self.output {
-                return Err(error)
+                return Err(error);
             }
             return Err(PutObjectError::PutObjectFailed);
         }

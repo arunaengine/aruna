@@ -248,8 +248,8 @@ impl GossipService {
         let persisted: Vec<TopicId> = self
             .subscriptions
             .read()
-            .iter()
-            .map(|(topic, _)| topic.clone())
+            .keys()
+            .map(|topic| topic.clone())
             .collect();
 
         let Ok(data) = postcard::to_allocvec(&persisted) else {

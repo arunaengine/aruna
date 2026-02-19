@@ -14,6 +14,12 @@ pub struct Hasher {
     md5: md5::Context,
 }
 
+impl Default for Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Hasher {
     pub fn new() -> Self {
         Hasher {

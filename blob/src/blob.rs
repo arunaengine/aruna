@@ -323,7 +323,7 @@ impl BlobHandler {
         {
             values
                 .into_iter()
-                .map(|kv| BackendBucket::try_from(kv))
+                .map(BackendBucket::try_from)
                 .collect::<Result<Vec<BackendBucket>, ConversionError>>()
         } else {
             Ok(Vec::new())

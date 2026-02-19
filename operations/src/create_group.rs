@@ -54,7 +54,7 @@ impl CreateGroupOperation {
         let group = Group {
             roles: HashSet::new(),
             display_name: self.config.display_name.clone(),
-            group_id: group_id.clone(),
+            group_id: group_id,
             realm_id: self.config.realm_id.clone(),
         };
 
@@ -73,13 +73,12 @@ impl CreateGroupOperation {
     }
 
     fn emit_create_auth_doc(&mut self) -> Result<aruna_core::types::Effects, CreateGroupError> {
-        self.txn_id
-            .ok_or_else(|| CreateGroupError::NoTransactionFound)?;
+        self.txn_id.ok_or(CreateGroupError::NoTransactionFound)?;
 
         let group_id = self
             .group
             .as_ref()
-            .ok_or_else(|| CreateGroupError::GroupNotFound)?
+            .ok_or(CreateGroupError::GroupNotFound)?
             .group_id;
 
         let auth_doc = AuthorizationDocument::new_with_default(
@@ -285,7 +284,7 @@ impl Operation for CreateGroupOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| CreateGroupError::NotFinished)?
+        self.output.ok_or(CreateGroupError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {

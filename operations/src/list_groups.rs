@@ -17,6 +17,12 @@ pub struct ListGroupOperation {
     offset: usize,
 }
 
+impl Default for ListGroupOperation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ListGroupOperation {
     const DEFAULT_LIMIT: usize = 10_000;
 
@@ -223,7 +229,7 @@ impl Operation for ListGroupOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| ListGroupError::NotFinished)?
+        self.output.ok_or(ListGroupError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {

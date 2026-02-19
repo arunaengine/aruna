@@ -60,10 +60,10 @@ impl CreateTokenOperation {
             }
             None => {
                 let time = chrono::DateTime::from_timestamp_secs(iat as i64)
-                    .ok_or_else(|| CreateTokenError::InvalidTimestamp)?;
+                    .ok_or(CreateTokenError::InvalidTimestamp)?;
                 let new = time
                     .checked_add_months(Months::new(12))
-                    .ok_or_else(|| CreateTokenError::InvalidTimestamp)?;
+                    .ok_or(CreateTokenError::InvalidTimestamp)?;
                 new.timestamp() as u64
             }
         };
@@ -72,7 +72,7 @@ impl CreateTokenOperation {
             sub: format!(
                 "{}@{}",
                 self.config.user_id.to_string(),
-                self.config.realm_id.to_string()
+                self.config.realm_id
             ),
             iss: self.config.realm_id.to_string(),
             iat,
@@ -116,7 +116,7 @@ impl Operation for CreateTokenOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| CreateTokenError::NotFinished)?
+        self.output.ok_or(CreateTokenError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {

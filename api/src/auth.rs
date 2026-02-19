@@ -37,8 +37,8 @@ impl TryFrom<TokenClaims> for AuthContext {
         let (user, realm) = value
             .sub
             .split_once('@')
-            .ok_or_else(|| AuthorizationError::DecodingError)?;
-        let user_id = Ulid::from_string(&user)?;
+            .ok_or(AuthorizationError::DecodingError)?;
+        let user_id = Ulid::from_string(user)?;
         let realm_id = RealmId::from_base64(realm)?;
 
         Ok(Self { user_id, realm_id })

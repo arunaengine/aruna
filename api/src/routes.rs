@@ -101,7 +101,7 @@ pub async fn create_group(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<CreateGroupRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
-    let auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
 
     let config = CreateGroupConfig {
         user_id: auth.user_id,
@@ -177,7 +177,7 @@ pub async fn list_groups(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(pagination): Query<PaginationParams>,
 ) -> ServerResult<(StatusCode, Json<ListGroupsResponse>)> {
-    let _auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
+    let _auth = auth.ok_or(ServerError::Unauthorized)?;
 
     let limit = pagination.limit_or(100).clamp(1, 1_000);
     let offset = pagination.offset_or(0);
@@ -244,7 +244,7 @@ pub async fn get_group(
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
-    let _auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
+    let _auth = auth.ok_or(ServerError::Unauthorized)?;
 
     let group_id = Ulid::from_string(&group_id).map_err(|_e| ServerError::BadRequest)?;
     let config = GetGroupConfig { group_id };
