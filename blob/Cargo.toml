@@ -8,6 +8,8 @@ rust-version.workspace = true
 [dependencies]
 aruna-core = { path = "../core" }
 aruna-storage = { path = "../storage" }
+aws-config = "1.8.14"
+aws-sdk-s3 = "1.124.0"
 blake3 = "1.8.3"
 bytes.workspace = true
 #crc-fast = "1.10.0"

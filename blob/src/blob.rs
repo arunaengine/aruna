@@ -1,6 +1,7 @@
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
 use crate::opendal::{emit_backend_operator, get_backend_operator};
+use crate::s3::make_bucket;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};

@@ -19,5 +19,4 @@ base64 = { workspace = true }
 hex = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
-opendal.workspace = true
 futures.workspace = true
