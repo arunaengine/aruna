@@ -22,6 +22,10 @@ pub enum ServerError {
 
 #[derive(Debug, Error)]
 pub enum TokenError {
+    #[error("Realm is not trusted")]
+    RealmNotTrusted,
+    #[error("TokenBlacklisted")]
+    TokenBlacklisted,
     #[error("Invalid issuer key")]
     InvalidIssuerKey,
     #[error(transparent)]

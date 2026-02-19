@@ -12,6 +12,7 @@ aruna-operations = { path = "../operations" }
 aruna-storage = { path = "../storage" }
 axum = "0.8.8"
 base64 = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 jsonwebtoken = { workspace = true }

@@ -108,6 +108,7 @@ dependencies = [
  "aruna-storage",
  "axum",
  "base64",
+ "blake3",
  "chrono",
  "ed25519-dalek 2.2.0",
  "jsonwebtoken",

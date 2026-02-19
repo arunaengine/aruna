@@ -8,7 +8,7 @@ use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::DecodingKey;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use utoipa::OpenApi;
@@ -16,11 +16,19 @@ use utoipa_swagger_ui::SwaggerUi;
 
 #[derive(Clone, Debug)]
 pub struct ServerState {
+    // Contains neccessary drivers for request handling
     driver_ctx: Arc<DriverContext>,
+    // Capabilities defined as in spec: Membership, Server and Local node capabilities
     node_capabilities: NodeCapabilities,
     // Base64 encoded issuer pubkeys and jsonwebtoken serialized DecodingKeys
     issuer_keys: Arc<RwLock<HashMap<String, DecodingKey, ahash::RandomState>>>,
+    // Contains token id as a string, so also invalid ids get banned
+    token_revocation_list: Arc<RwLock<HashSet<String, ahash::RandomState>>>,
+    // Contains trusted realms
+    trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
+    // Realm membership
     realm_id: RealmId,
+    // TODO: OIDC handling
     oidc_validator: Option<Arc<OidcValidator>>,
 }
 
@@ -31,11 +39,15 @@ impl ServerState {
         node_capabilities: NodeCapabilities,
         oidc_validator: Option<Arc<OidcValidator>>,
     ) -> Self {
+        let mut trusted_realms = HashSet::default();
+        trusted_realms.insert(realm_id.clone());
         Self {
             driver_ctx,
             realm_id,
             oidc_validator,
             node_capabilities,
+            token_revocation_list: Arc::new(RwLock::new(HashSet::default())),
+            trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
             issuer_keys: Arc::new(RwLock::new(HashMap::default())),
         }
     }
@@ -62,7 +74,7 @@ impl ServerState {
         self.realm_id.clone()
     }
 
-    pub async fn get_issuer_key(&self, pubkey: String) -> Result<DecodingKey, TokenError> {
+    pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {
         // Just to be double sure this is not producing deadlocks
         let read_lock = self.issuer_keys.read().await;
         let key = read_lock.get(&pubkey).cloned();
@@ -83,6 +95,31 @@ impl ServerState {
             .await
             .insert(pubkey, decoding_key.clone());
         Ok(decoding_key)
+    }
+
+    pub async fn add_token_to_blacklist(&self, token: &str) {
+        let hash = blake3::hash(token.as_bytes()).to_string();
+        self.token_revocation_list.write().await.insert(hash);
+    }
+    pub async fn add_trusted_realm(&self, realm_id: RealmId) {
+        self.trusted_realms_list.write().await.insert(realm_id);
+    }
+
+    pub async fn is_token_blacklisted(&self, token: &str) -> bool {
+        let hash = blake3::hash(token.as_bytes()).to_string();
+        self.token_revocation_list
+            .read()
+            .await
+            .get(&hash)
+            .is_some()
+    }
+
+    pub async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
+        self.trusted_realms_list
+            .read()
+            .await
+            .get(realm_id)
+            .is_some()
     }
 }
 
