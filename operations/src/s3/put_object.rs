@@ -333,6 +333,7 @@ mod test {
             },
             storage_handle.clone(),
         )
+        .await
         .unwrap();
 
         let data = b"hello, world!";

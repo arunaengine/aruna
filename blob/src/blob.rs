@@ -15,7 +15,6 @@ use crossfire::{mpsc, oneshot};
 use futures::StreamExt;
 use opendal::{Operator, services};
 use std::ops::RangeBounds;
-use std::thread;
 use ulid::Ulid;
 
 pub const BLOB_LOCATION_DB: &str = "locations";
@@ -23,8 +22,8 @@ pub const BLOB_PATH_DB: &str = "path_locations_mapping";
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub type EffectHandle = (BlobEffect, oneshot::TxOneshot<BlobEvent>);
-pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
-pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
+pub type EffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle>>;
+pub type EffectReceiver = crossfire::AsyncRx<mpsc::Array<EffectHandle>>;
 
 //TODO: BaoTree replication (immer getrieben vom Initiator)
 
@@ -41,7 +40,7 @@ pub struct BlobHandle {
 
 impl BlobHandle {
     pub fn new() -> (Self, EffectReceiver) {
-        let (sender, receiver) = mpsc::bounded_blocking(2048);
+        let (sender, receiver) = mpsc::bounded_async(2048);
         (
             BlobHandle {
                 write_channel: sender,
@@ -53,7 +52,12 @@ impl BlobHandle {
     pub async fn send_effect(&self, effect: BlobEffect) -> Event {
         let blob_event = {
             let (response_tx, response_rx) = oneshot::oneshot();
-            if self.write_channel.send((effect, response_tx)).is_err() {
+            if self
+                .write_channel
+                .send((effect, response_tx))
+                .await
+                .is_err()
+            {
                 return Event::Blob(BlobEvent::Error(BlobError::ChannelClosed));
             }
             response_rx
@@ -65,10 +69,13 @@ impl BlobHandle {
 }
 
 impl BlobHandler {
-    pub fn new(config: BackendConfig, handle: StorageHandle) -> Result<BlobHandle, BlobLibError> {
+    pub async fn new(
+        config: BackendConfig,
+        handle: StorageHandle,
+    ) -> Result<BlobHandle, BlobLibError> {
         let (blob_handle, rx) = BlobHandle::new();
 
-        thread::spawn(async move || {
+        tokio::spawn(async {
             let mut blob_handler = BlobHandler {
                 backend_config: config,
                 storage: handle,
@@ -81,7 +88,7 @@ impl BlobHandler {
 
     pub async fn receive_loop(&mut self, receiver: EffectReceiver) -> ! {
         loop {
-            match receiver.recv() {
+            match receiver.recv().await {
                 Ok((effect, response_tx)) => {
                     let event = match effect {
                         BlobEffect::Write { bucket, key, blob } => {

@@ -21,3 +21,4 @@ sha2 = "0.10.7"
 tracing.workspace = true 
 thiserror.workspace = true
 ulid.workspace = true
+tokio.workspace = true
