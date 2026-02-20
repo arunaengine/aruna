@@ -61,6 +61,14 @@ pub enum StreamError {
 #[derive(Debug, Error)]
 pub enum ConversionError {
     #[error(transparent)]
+    UlidDecodeError(#[from] ulid::DecodeError),
+    #[error(transparent)]
+    Base64DecodeError(#[from] base64::DecodeError),
+    #[error("`{0}`")]
+    InvalidLength(String),
+    #[error("Invalid UserId")]
+    InvalidUserId,
+    #[error(transparent)]
     PostcardError(#[from] postcard::Error),
     #[error(transparent)]
     PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
@@ -70,10 +78,4 @@ pub enum ConversionError {
     PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
     #[error(transparent)]
     PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
-}
-
-#[derive(Debug, Error)]
-pub enum ParseRealmIdError {
-    #[error("Parsing error {0}")]
-    ParsingError(String),
 }

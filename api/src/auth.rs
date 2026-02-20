@@ -1,8 +1,6 @@
 use std::str::FromStr;
-
-use aruna_core::errors::ParseRealmIdError;
-use aruna_core::structs::{RealmId, TokenClaims};
-use aruna_core::types::UserId;
+use aruna_core::errors::ConversionError;
+use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
 use axum::extract::Request;
 use axum::http::{HeaderMap, header};
 use axum::middleware::Next;
@@ -12,7 +10,6 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Validation, decode};
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::error::TokenError;
 use crate::server_state::ServerState;
@@ -20,11 +17,6 @@ use crate::server_state::ServerState;
 #[derive(Debug)]
 pub struct OidcValidator {}
 
-#[derive(Debug, Clone)]
-pub struct AuthContext {
-    pub user_id: UserId,
-    pub realm_id: RealmId,
-}
 
 #[derive(Debug, Error)]
 pub enum AuthorizationError {
@@ -33,22 +25,7 @@ pub enum AuthorizationError {
     #[error(transparent)]
     IntoUlid(#[from] ulid::DecodeError),
     #[error(transparent)]
-    IntoRealmId(#[from] ParseRealmIdError),
-}
-
-impl TryFrom<TokenClaims> for AuthContext {
-    type Error = AuthorizationError;
-
-    fn try_from(value: TokenClaims) -> Result<Self, Self::Error> {
-        let (user, realm) = value
-            .sub
-            .split_once('@')
-            .ok_or_else(|| AuthorizationError::DecodingError)?;
-        let user_id = Ulid::from_string(&user)?;
-        let realm_id = RealmId::from_base64(realm)?;
-
-        Ok(Self { user_id, realm_id })
-    }
+    IntoRealmId(#[from] ConversionError),
 }
 
 async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Option<AuthContext> {

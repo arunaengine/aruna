@@ -1,4 +1,4 @@
-use aruna_core::errors::ParseRealmIdError;
+use aruna_core::errors::ConversionError;
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey};
@@ -23,7 +23,7 @@ pub enum SetupError {
     #[error(transparent)]
     SocketParsingError(#[from] std::net::AddrParseError),
     #[error(transparent)]
-    KeyPairParsingError(#[from] ParseRealmIdError),
+    KeyPairParsingError(#[from] ConversionError),
     #[error(transparent)]
     FromSliceError(#[from] TryFromSliceError),
     #[error(transparent)]

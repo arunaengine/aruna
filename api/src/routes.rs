@@ -1,7 +1,7 @@
-use crate::auth::{AuthContext, auth_middleware};
+use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthorizationDocument, Group};
+use aruna_core::structs::{AuthContext, AuthorizationDocument, Group};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};

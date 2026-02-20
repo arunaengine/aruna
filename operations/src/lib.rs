@@ -1,5 +1,7 @@
+pub mod check_permissions;
 pub mod create_group;
 pub mod create_token;
+pub mod create_realm;
 pub mod driver;
 pub mod get_group;
 pub mod incoming;

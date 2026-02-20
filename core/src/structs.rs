@@ -1,14 +1,14 @@
-use crate::errors::{ConversionError, ParseRealmIdError};
+use crate::errors::ConversionError;
 use crate::types::{GroupId, RoleId, UserId};
 use core::fmt;
+use ed25519_dalek::SigningKey;
 use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
-use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RealmId(pub [u8; 32]);
@@ -29,13 +29,12 @@ impl RealmId {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(self.0)
     }
 
-    pub fn from_base64(base64_str: &str) -> Result<Self, ParseRealmIdError> {
+    pub fn from_base64(base64_str: &str) -> Result<Self, ConversionError> {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(base64_str)
-            .map_err(|e| ParseRealmIdError::ParsingError(format!("invalid base64: {}", e)))?;
+            .decode(base64_str)?;
         if bytes.len() != 32 {
-            return Err(ParseRealmIdError::ParsingError(format!(
+            return Err(ConversionError::InvalidLength(format!(
                 "expected 32 bytes, got {}",
                 bytes.len()
             )));
@@ -287,6 +286,33 @@ impl NodeCapabilities {
         let realm_verifying_key = realm_id.to_pkcs8_pem_bytes()?;
         Ok(NodeCapabilities::Local {
             realm_verifying_key,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthContext {
+    pub user_id: UserId,
+    pub realm_id: RealmId,
+    pub path_restrictions: Option<Vec<PathRestriction>>,
+}
+
+impl TryFrom<TokenClaims> for AuthContext {
+    type Error = ConversionError;
+
+    fn try_from(value: TokenClaims) -> Result<Self, Self::Error> {
+        let (user, realm) = value
+            .sub
+            .split_once('@')
+            .ok_or_else(|| ConversionError::InvalidUserId)?;
+        let user_id = Ulid::from_string(&user)?;
+        let realm_id = RealmId::from_base64(realm)?;
+        let path_restrictions = value.restrictions;
+
+        Ok(Self {
+            user_id,
+            realm_id,
+            path_restrictions,
         })
     }
 }
