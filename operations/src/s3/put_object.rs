@@ -12,16 +12,9 @@ use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
 
-//TODO:
-//  - Backend bucket management
-//    - Stats db
-//    - Create bucket on demand (No bucket available or all full)
-//    - bucket: <prefix>_<uuid> | key: <key>.<ulid>
-//  - Path creation/handling
-
 #[derive(Debug, Eq, PartialEq)]
 pub enum PutObjectState {
-    Init, //TODO: Do we need this as it is skipped with the start() function?
+    Init,
     WriteBlob,
     StartTransaction,
     CreateBlob,
@@ -170,7 +163,7 @@ impl PutObjectOperation {
                 "{}/{}/{}",
                 self.config.group_id, self.config.request.bucket, self.config.request.key
             );
-            self.state = PutObjectState::CreatePathMapping;
+            self.state = PutObjectState::CreatePermissions;
 
             match self.get_blake3() {
                 None => self.emit_error(PutObjectError::MissingHash("blake3".to_string())),
@@ -351,22 +344,21 @@ mod test {
         };
         let put_operation = PutObjectOperation::new(put_config);
 
-        // Jesus, Take the Wheel!
         let context = DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: Some(blob_handle),
         };
+        // Jesus, Take the Wheel!
         let result = drive(put_operation, &context)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        println!("{:#?}", result);
 
-        assert!(exists(result.location.get_storage_path().unwrap()).unwrap());
+        assert!(exists(result.location.get_full_path().unwrap()).unwrap());
         assert_eq!(
-            read_to_string(result.location.get_storage_path().unwrap()).unwrap(),
+            read_to_string(result.location.get_full_path().unwrap()).unwrap(),
             String::from_utf8_lossy(&data[..]).to_string()
         );
     }

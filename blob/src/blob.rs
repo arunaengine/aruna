@@ -1,6 +1,6 @@
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
-use crate::opendal::{init_backend_operator, init_operator, init_service};
+use crate::opendal::{init_backend_operator, init_operator};
 use crate::s3::make_bucket;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -13,7 +13,7 @@ use aruna_storage::storage::StorageHandle;
 use bytes::Bytes;
 use crossfire::{mpsc, oneshot};
 use futures::StreamExt;
-use opendal::{Operator, services};
+use opendal::Operator;
 use std::ops::RangeBounds;
 use ulid::Ulid;
 

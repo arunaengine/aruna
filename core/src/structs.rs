@@ -295,6 +295,16 @@ impl Display for BackendLocation {
 }
 
 impl BackendLocation {
+    pub fn get_full_path(&self) -> Result<String, ConversionError> {
+        PathBuf::from(&self.root)
+            .join(&self.storage_bucket)
+            .join(&self.object_bucket)
+            .join(format!("{}_{}", self.object_key, self.ulid))
+            .into_os_string()
+            .into_string()
+            .map_err(|_| ConversionError::OsStringError)
+    }
+
     pub fn get_storage_path(&self) -> Result<String, BlobError> {
         Ok(PathBuf::from(&self.storage_bucket)
             .join(&self.object_bucket)
