@@ -1,6 +1,6 @@
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
-use crate::opendal::{init_backend_operator, init_service};
+use crate::opendal::{init_backend_operator, init_operator, init_service};
 use crate::s3::make_bucket;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -8,15 +8,13 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::BoxError;
-use aruna_core::structs::{BackendBucket, BackendConfig, BackendLocation};
+use aruna_core::structs::{Backend, BackendBucket, BackendConfig, BackendLocation};
 use aruna_storage::storage::StorageHandle;
 use bytes::Bytes;
 use crossfire::{mpsc, oneshot};
 use futures::StreamExt;
 use opendal::{Operator, services};
-use std::fmt::Display;
 use std::ops::RangeBounds;
-use std::str::FromStr;
 use std::thread;
 use ulid::Ulid;
 
@@ -29,43 +27,6 @@ pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 
 //TODO: BaoTree replication (immer getrieben vom Initiator)
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub enum Backend {
-    #[default]
-    S3,
-    HTTP,
-    Postgres,
-    FileSystem,
-}
-
-impl FromStr for Backend {
-    type Err = ConversionError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "s3" => Ok(Backend::S3),
-            "http" => Ok(Backend::HTTP),
-            "postgres" => Ok(Backend::Postgres),
-            "filesystem" => Ok(Backend::FileSystem),
-            _ => Err(ConversionError::FromStrError(format!(
-                "unknown backend {}",
-                s
-            ))),
-        }
-    }
-}
-
-impl Display for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Backend::S3 => write!(f, "s3"),
-            Backend::HTTP => write!(f, "http"),
-            Backend::Postgres => write!(f, "postgres"),
-            Backend::FileSystem => write!(f, "filesystem"),
-        }
-    }
-}
 
 pub struct BlobHandler {
     backend_config: BackendConfig,
@@ -300,7 +261,11 @@ impl BlobHandler {
 
         // No suitable bucket found -> make bucket
         let bucket_name = generate_bucket_name();
-        make_bucket(&bucket_name, &self.backend_config.service_config).await?;
+
+        if Backend::S3 == self.backend_config.backend_type {
+            // Bucket only needs to be actively created with a S3 storage backend
+            make_bucket(&bucket_name, &self.backend_config.service_config).await?;
+        }
 
         Ok(bucket_name)
     }
@@ -331,21 +296,17 @@ impl BlobHandler {
     }
 
     fn operator_from_location(&self, location: &BackendLocation) -> Result<Operator, BlobError> {
+        // Clone config for temporary only manipulation
         let mut config = self.backend_config.service_config.clone();
-        config.insert("root".to_string(), location.root.clone());
 
-        let backend_type = Backend::from_str(&self.backend_config.backend_type)
-            .map_err(|e| ConversionError::FromStrError(e.to_string()))?;
-        if Backend::S3 == backend_type {
+        // Insert root and bucket (in case of S3 storage) into service config
+        config.insert("root".to_string(), location.root.clone());
+        if Backend::S3 == self.backend_config.backend_type {
             config.insert("bucket".to_string(), location.storage_bucket.clone());
         }
 
-        Ok(match backend_type {
-            Backend::S3 => init_service::<services::S3>(config)?,
-            Backend::HTTP => init_service::<services::Http>(config)?,
-            Backend::Postgres => init_service::<services::Postgresql>(config)?,
-            Backend::FileSystem => init_service::<services::Fs>(config)?,
-        })
+        // Init operator
+        init_operator(self.backend_config.backend_type.clone(), config)
     }
 }
 

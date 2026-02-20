@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -195,9 +196,46 @@ pub struct TokenClaims {
     pub jti: String,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum Backend {
+    #[default]
+    S3,
+    HTTP,
+    Postgres,
+    FileSystem,
+}
+
+impl FromStr for Backend {
+    type Err = ConversionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "s3" => Ok(Backend::S3),
+            "http" => Ok(Backend::HTTP),
+            "postgres" => Ok(Backend::Postgres),
+            "filesystem" => Ok(Backend::FileSystem),
+            _ => Err(ConversionError::FromStrError(format!(
+                "unknown backend {}",
+                s
+            ))),
+        }
+    }
+}
+
+impl Display for Backend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Backend::S3 => write!(f, "s3"),
+            Backend::HTTP => write!(f, "http"),
+            Backend::Postgres => write!(f, "postgres"),
+            Backend::FileSystem => write!(f, "filesystem"),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
-    pub backend_type: String,
+    pub backend_type: Backend,
     pub root: String,
     pub service_config: HashMap<String, String>,
     pub bucket_prefix: Option<String>,

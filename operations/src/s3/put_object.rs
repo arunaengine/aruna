@@ -311,7 +311,7 @@ mod test {
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::BackendConfig;
+    use aruna_core::structs::{Backend, BackendConfig};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::fs::{exists, read_to_string};
@@ -325,7 +325,7 @@ mod test {
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
         let blob_handle = BlobHandler::new(
             BackendConfig {
-                backend_type: "filesystem".to_string(),
+                backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
                 max_bucket_size: Some(100000),
                 root: temp_root.to_string(),

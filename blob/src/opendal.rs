@@ -1,11 +1,9 @@
-use crate::blob::Backend;
 use crate::error::BlobLibError;
 use aruna_core::errors::BlobError;
-use aruna_core::structs::BackendConfig;
+use aruna_core::structs::{Backend, BackendConfig};
 use opendal::layers::{LoggingLayer, RetryLayer};
 use opendal::{Builder, Operator, services};
 use std::collections::HashMap;
-use std::str::FromStr;
 use ulid::Ulid;
 
 pub fn init_backend_operator(
@@ -13,24 +11,36 @@ pub fn init_backend_operator(
     bucket: String,
 ) -> Result<Operator, BlobError> {
     // Insert root and bucket (in case of S3 storage) into service config
-    let backend_type = Backend::from_str(&config.backend_type)?;
     config
         .service_config
         .insert("root".to_string(), config.root);
-    if Backend::S3 == backend_type {
-        config.service_config.insert("bucket".to_string(), bucket);
-    }
 
     // Create and check backend
-    let operator = match backend_type {
-        Backend::S3 => init_service::<services::S3>(config.service_config)?,
+    let operator = match config.backend_type {
+        Backend::S3 => {
+            config.service_config.insert("bucket".to_string(), bucket);
+            init_service::<services::S3>(config.service_config)?
+        }
         Backend::HTTP => init_service::<services::Http>(config.service_config)?,
         Backend::Postgres => init_service::<services::Postgresql>(config.service_config)?,
         Backend::FileSystem => init_service::<services::Fs>(config.service_config)?,
     };
+    //_check_operator(&operator).await?;
 
     // Return operator
     Ok(operator)
+}
+
+pub fn init_operator(
+    backend_type: Backend,
+    config: HashMap<String, String>,
+) -> Result<Operator, BlobError> {
+    Ok(match backend_type {
+        Backend::S3 => init_service::<services::S3>(config)?,
+        Backend::HTTP => init_service::<services::Http>(config)?,
+        Backend::Postgres => init_service::<services::Postgresql>(config)?,
+        Backend::FileSystem => init_service::<services::Fs>(config)?,
+    })
 }
 
 pub fn init_service<B: Builder>(cfg: HashMap<String, String>) -> Result<Operator, BlobError> {
