@@ -49,10 +49,10 @@ pub enum PutObjectError {
 
 #[derive(Debug)]
 pub struct PutObjectInput {
-    bucket: String,
-    key: String,
-    content_length: Option<u64>,
-    body: Option<BackendStream<Result<Bytes, BoxError>>>,
+    pub bucket: String,
+    pub key: String,
+    pub content_length: Option<u64>,
+    pub body: Option<BackendStream<Result<Bytes, BoxError>>>,
     //TODO: tbc
 }
 
@@ -300,7 +300,7 @@ impl Operation for PutObjectOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;
