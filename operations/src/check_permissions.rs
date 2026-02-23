@@ -2,7 +2,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{AuthContext, AuthorizationDocument, Permission, RealmId, Role};
+use aruna_core::structs::{AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId, Role};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use globset::Glob;
 use smallvec::smallvec;
@@ -22,8 +22,8 @@ pub struct CheckPermissionsOperation {
     config: CheckPermissionsConfig,
     txn_id: Option<TxnId>,
     group_id: Option<Ulid>,
-    realm_auth_doc: Option<AuthorizationDocument>,
-    group_auth_doc: Option<AuthorizationDocument>,
+    realm_auth_doc: Option<RealmAuthorizationDocument>,
+    group_auth_doc: Option<GroupAuthorizationDocument>,
     output: Option<Result<bool, CheckPermissionsError>>,
     state: CheckPermissionsState,
 }
@@ -181,7 +181,7 @@ impl CheckPermissionsOperation {
         let (realm, group) = CheckPermissionsOperation::parse_path(&self.config.path)?;
         self.group_id = group;
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: "realm".to_string(),
+            key_space: "auth".to_string(),
             key: (*realm.as_bytes()).into(),
             txn_id: self.txn_id
         })])
@@ -191,7 +191,7 @@ impl CheckPermissionsOperation {
         &mut self,
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, CheckPermissionsError> {
-        self.realm_auth_doc = Some(AuthorizationDocument::from_bytes(
+        self.realm_auth_doc = Some(RealmAuthorizationDocument::from_bytes(
             &value.ok_or_else(|| CheckPermissionsError::AuthDocNotFound)?,
         )?);
 
@@ -222,7 +222,7 @@ impl CheckPermissionsOperation {
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, CheckPermissionsError> {
         self.state = CheckPermissionsState::CheckPermissions;
-        self.group_auth_doc = Some(AuthorizationDocument::from_bytes(
+        self.group_auth_doc = Some(GroupAuthorizationDocument::from_bytes(
             &value.ok_or_else(|| CheckPermissionsError::AuthDocNotFound)?,
         )?);
 
@@ -383,6 +383,7 @@ mod test {
 
     use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
 
     #[tokio::test]
@@ -423,6 +424,16 @@ mod test {
 
         let user_id = Ulid::new();
         let realm_id = RealmId([0u8; 32]);
+
+        let realm_config = CreateRealmConfig {
+            user_id,
+            realm_id: realm_id.clone(),
+            realm_description: "A description".to_string(),
+        };
+
+        let realm_operation = CreateRealmOperation::new(realm_config.clone());
+        let _result = drive(realm_operation, &context).await.unwrap();
+
         let group_config = CreateGroupConfig {
             user_id,
             realm_id: realm_id.clone(),

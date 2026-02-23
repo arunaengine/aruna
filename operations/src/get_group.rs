@@ -2,7 +2,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{AuthorizationDocument, Group};
+use aruna_core::structs::{GroupAuthorizationDocument, Group};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -18,8 +18,8 @@ pub struct GetGroupOperation {
     config: GetGroupConfig,
     txn_id: Option<Ulid>,
     group: Option<Group>,
-    auth_doc: Option<AuthorizationDocument>,
-    output: Option<Result<(Group, AuthorizationDocument), GetGroupError>>,
+    auth_doc: Option<GroupAuthorizationDocument>,
+    output: Option<Result<(Group, GroupAuthorizationDocument), GetGroupError>>,
     state: GetGroupState,
 }
 
@@ -67,7 +67,7 @@ impl GetGroupOperation {
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, GetGroupError> {
         let value = value.ok_or_else(|| GetGroupError::AuthDocNotFound)?;
-        let auth_doc = AuthorizationDocument::from_bytes(&value)?;
+        let auth_doc = GroupAuthorizationDocument::from_bytes(&value)?;
         self.auth_doc = Some(auth_doc);
         let txn_id = self
             .txn_id
@@ -223,7 +223,7 @@ pub enum GetGroupError {
 }
 
 impl Operation for GetGroupOperation {
-    type Output = (Group, AuthorizationDocument);
+    type Output = (Group, GroupAuthorizationDocument);
 
     type Error = GetGroupError;
 

@@ -31,8 +31,7 @@ impl RealmId {
 
     pub fn from_base64(base64_str: &str) -> Result<Self, ConversionError> {
         use base64::Engine;
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(base64_str)?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(base64_str)?;
         if bytes.len() != 32 {
             return Err(ConversionError::InvalidLength(format!(
                 "expected 32 bytes, got {}",
@@ -102,7 +101,7 @@ impl fmt::Display for Permission {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
-pub struct AuthorizationDocument {
+pub struct GroupAuthorizationDocument {
     pub group_id: GroupId,
     pub roles: HashMap<RoleId, Role>,
 }
@@ -115,8 +114,8 @@ pub struct Role {
     pub assigned_users: HashSet<UserId>,
 }
 
-impl AuthorizationDocument {
-    pub fn new_with_default(user_id: UserId, realm_id: RealmId, group_id: GroupId) -> Self {
+impl GroupAuthorizationDocument {
+    pub fn new_default_group_doc(user_id: UserId, realm_id: RealmId, group_id: GroupId) -> Self {
         let mut roles = HashMap::new();
         let admin = Ulid::new();
         roles.insert(
@@ -175,7 +174,7 @@ impl AuthorizationDocument {
                 ]),
             },
         );
-        AuthorizationDocument { group_id, roles }
+        GroupAuthorizationDocument { group_id, roles }
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -314,5 +313,64 @@ impl TryFrom<TokenClaims> for AuthContext {
             realm_id,
             path_restrictions,
         })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Realm {
+    pub realm_id: RealmId,
+    pub description: String,
+}
+
+impl Realm {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct RealmAuthorizationDocument {
+    pub realm_id: RealmId,
+    pub roles: HashMap<RoleId, Role>,
+    pub operation_restrictions: HashMap<Operation, HashSet<Ulid>>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
+pub enum Operation {
+    CreateGroup,
+    ListGroups,
+    ManageRealmRoles,
+    ManageRealmConfig,
+}
+
+impl RealmAuthorizationDocument {
+    pub fn new_default_realm_doc(user_id: UserId, realm_id: RealmId) -> Self {
+        let mut roles = HashMap::new();
+        let admin = Ulid::new();
+        roles.insert(
+            admin,
+            Role {
+                role_id: admin,
+                name: "admin".to_string(),
+                permissions: HashMap::from([(format!("/{realm_id}/admin/**"), Permission::WRITE)]),
+                assigned_users: HashSet::from([(user_id)]),
+            },
+        );
+        RealmAuthorizationDocument {
+            realm_id,
+            roles,
+            operation_restrictions: HashMap::new(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
     }
 }

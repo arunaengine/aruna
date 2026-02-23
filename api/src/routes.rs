@@ -1,7 +1,7 @@
 use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, AuthorizationDocument, Group};
+use aruna_core::structs::{AuthContext, GroupAuthorizationDocument, Group};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
@@ -50,7 +50,7 @@ pub struct RoleResponse {
     pub assigned_users: Vec<String>,
 }
 
-fn map_roles(auth: AuthorizationDocument) -> Vec<RoleResponse> {
+fn map_roles(auth: GroupAuthorizationDocument) -> Vec<RoleResponse> {
     auth.roles
         .into_iter()
         .map(|(role_id, role)| RoleResponse {
@@ -66,8 +66,8 @@ fn map_roles(auth: AuthorizationDocument) -> Vec<RoleResponse> {
         .collect()
 }
 
-impl From<(Group, AuthorizationDocument)> for CreateGroupResponse {
-    fn from((group, auth): (Group, AuthorizationDocument)) -> Self {
+impl From<(Group, GroupAuthorizationDocument)> for CreateGroupResponse {
+    fn from((group, auth): (Group, GroupAuthorizationDocument)) -> Self {
         CreateGroupResponse {
             display_name: group.display_name,
             group_id: group.group_id.to_string(),
@@ -210,8 +210,8 @@ pub struct GroupInfoResponse {
     pub roles: Vec<RoleResponse>,
 }
 
-impl From<(Group, AuthorizationDocument)> for GroupInfoResponse {
-    fn from((group, auth): (Group, AuthorizationDocument)) -> Self {
+impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
+    fn from((group, auth): (Group, GroupAuthorizationDocument)) -> Self {
         GroupInfoResponse {
             display_name: group.display_name,
             group_id: group.group_id.to_string(),

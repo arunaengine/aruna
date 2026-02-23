@@ -2,7 +2,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{AuthorizationDocument, Group, RealmId};
+use aruna_core::structs::{GroupAuthorizationDocument, Group, RealmId};
 use aruna_core::types::UserId;
 use smallvec::smallvec;
 use std::collections::HashSet;
@@ -19,10 +19,10 @@ pub struct CreateGroupConfig {
 pub struct CreateGroupOperation {
     config: CreateGroupConfig,
     group: Option<Group>,
-    auth_doc: Option<AuthorizationDocument>,
+    auth_doc: Option<GroupAuthorizationDocument>,
     state: CreateGroupState,
     txn_id: Option<Ulid>,
-    output: Option<Result<(Group, AuthorizationDocument), CreateGroupError>>,
+    output: Option<Result<(Group, GroupAuthorizationDocument), CreateGroupError>>,
 }
 
 impl std::fmt::Debug for CreateGroupOperation {
@@ -82,7 +82,7 @@ impl CreateGroupOperation {
             .ok_or_else(|| CreateGroupError::GroupNotFound)?
             .group_id;
 
-        let auth_doc = AuthorizationDocument::new_with_default(
+        let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
             self.config.user_id,
             self.config.realm_id.clone(),
             group_id,
@@ -248,7 +248,7 @@ pub enum CreateGroupError {
 }
 
 impl Operation for CreateGroupOperation {
-    type Output = (Group, AuthorizationDocument);
+    type Output = (Group, GroupAuthorizationDocument);
 
     type Error = CreateGroupError;
 
