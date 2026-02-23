@@ -1,9 +1,17 @@
-use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use utoipa::ToSchema;
+
+#[derive(Debug, Error)]
+pub enum S3ServerError {
+    #[error(transparent)]
+    DomainError(#[from] s3s::host::DomainError),
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+}
 
 #[derive(Debug, Error)]
 pub enum ServerError {

@@ -342,3 +342,27 @@ impl BlobInfo {
         self.hashes.get("blake3")
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserIdentity {
+    pub user_id: UserId,
+    pub realm_key: RealmId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserAccess {
+    pub user_id: UserIdentity,
+    pub group_id: Ulid,
+    pub secret: String,
+    //pub expiry: SystemTime
+    //filter: todo!()
+}
+
+impl UserAccess {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}

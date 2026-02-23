@@ -1,0 +1,88 @@
+use crate::s3::util::{convert_input, to_base64};
+use aruna_core::structs::UserAccess;
+use aruna_operations::driver::{drive, DriverContext};
+use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
+use futures_util::TryStreamExt;
+use s3s::dto::{
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, ETag, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
+    PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput,
+    PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
+    StreamingBlob, UploadPartInput, UploadPartOutput,
+};
+use s3s::S3ErrorCode::InternalError;
+use s3s::{s3_error, S3Error, S3Request, S3Response, S3Result, S3};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap};
+use std::fmt::Debug;
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::SystemTime;
+use tracing::{debug, error, trace, warn};
+use ulid::Ulid;
+
+#[derive(Clone)]
+pub struct ArunaS3Service {
+    state: Arc<DriverContext>,
+}
+
+impl Debug for ArunaS3Service {
+    #[tracing::instrument(level = "trace", skip(self, f))]
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArunaS3Service").finish()
+    }
+}
+
+impl ArunaS3Service {
+    #[tracing::instrument(level = "trace", skip(driver_ctx))]
+    pub async fn new(driver_ctx: Arc<DriverContext>) -> Self {
+        ArunaS3Service { state: driver_ctx }
+    }
+}
+
+#[async_trait::async_trait]
+impl S3 for ArunaS3Service {
+    #[tracing::instrument(err, skip(self, req))]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn put_object(
+        &self,
+        req: S3Request<PutObjectInput>,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        debug!("Received PUT Request: {:#?}", req);
+
+        // Extract access check result
+        let UserAccess {
+            user_id, group_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        let input = convert_input(req.input)?;
+        let config = PutObjectConfig {
+            user_id: user_id.user_id,
+            group_id,
+            request: input,
+            exists: false,
+        };
+        let operation = PutObjectOperation::new(config);
+
+        if let Some(Ok(blob_info)) = drive(operation, &self.state)
+            .await
+            .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
+        {
+            Ok(S3Response::new(PutObjectOutput {
+                e_tag: Some(ETag::Strong(to_base64(
+                    blob_info.hashes.get("md5").expect("Meh."),
+                ))),
+                size: Some(blob_info.blob_size as i64),
+                ..Default::default()
+            }))
+        } else {
+            Err(s3_error!(InternalError, "Failed to process PUT request"))
+        }
+    }
+}
