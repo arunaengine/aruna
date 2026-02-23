@@ -1,3 +1,4 @@
+use aruna_core::consts::GROUP_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -37,7 +38,7 @@ impl ListGroupOperation {
     fn emit_list_groups(&mut self) -> aruna_core::types::Effects {
         let scan_limit = self.offset.saturating_add(self.limit).max(1);
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: "groups".to_string(),
+            key_space: GROUP_KEYSPACE.to_string(),
             prefix: None,
             start_after: None,
             limit: scan_limit,

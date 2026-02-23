@@ -1,3 +1,4 @@
+use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -65,7 +66,7 @@ impl CreateGroupOperation {
         let value = group.to_bytes()?.into();
 
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: "groups".to_string(),
+            key_space: GROUP_KEYSPACE.to_string(),
             key,
             value,
             txn_id: self.txn_id,
@@ -93,7 +94,7 @@ impl CreateGroupOperation {
         let key = group_id.to_bytes().into();
         let value = auth_doc.to_bytes()?.into();
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: "auth".to_string(),
+            key_space: AUTH_KEYSPACE.to_string(),
             key,
             value,
             txn_id: self.txn_id,

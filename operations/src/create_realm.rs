@@ -1,3 +1,4 @@
+use aruna_core::consts::{AUTH_KEYSPACE, REALM_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -60,7 +61,7 @@ impl CreateRealmOperation {
         let value = realm.to_bytes()?.into();
 
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: "realm".to_string(),
+            key_space: REALM_KEYSPACE.to_string(),
             key,
             value,
             txn_id: self.txn_id,
@@ -83,7 +84,7 @@ impl CreateRealmOperation {
         let key = (*realm_id.as_bytes()).into();
         let value = auth_doc.to_bytes()?.into();
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: "auth".to_string(),
+            key_space: AUTH_KEYSPACE.to_string(),
             key,
             value,
             txn_id: self.txn_id,

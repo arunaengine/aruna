@@ -1,3 +1,4 @@
+use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -39,7 +40,7 @@ impl GetGroupOperation {
         let key = self.config.group_id.to_bytes().into();
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: "groups".to_string(),
+            key_space: GROUP_KEYSPACE.to_string(),
             key,
             txn_id: self.txn_id,
         })]
@@ -57,7 +58,7 @@ impl GetGroupOperation {
         let key = self.config.group_id.to_bytes().into();
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: "auth".to_string(),
+            key_space: AUTH_KEYSPACE.to_string(),
             key,
             txn_id: self.txn_id,
         })]

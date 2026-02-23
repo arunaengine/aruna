@@ -1,3 +1,4 @@
+use aruna_core::consts::AUTH_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -181,7 +182,7 @@ impl CheckPermissionsOperation {
         let (realm, group) = CheckPermissionsOperation::parse_path(&self.config.path)?;
         self.group_id = group;
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: "auth".to_string(),
+            key_space: AUTH_KEYSPACE.to_string(),
             key: (*realm.as_bytes()).into(),
             txn_id: self.txn_id
         })])
@@ -200,7 +201,7 @@ impl CheckPermissionsOperation {
                 self.state = CheckPermissionsState::GetGroupAuthDoc;
                 Ok(smallvec![Effect::Storage(StorageEffect::Read {
                     txn_id: self.txn_id,
-                    key_space: "auth".to_string(),
+                    key_space: AUTH_KEYSPACE.to_string(),
                     key: group.to_bytes().into(),
                 })])
             }
