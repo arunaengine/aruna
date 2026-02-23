@@ -42,7 +42,7 @@ impl std::fmt::Debug for StreamsService {
 
 pub async fn run_accept_loop(
     endpoint: Endpoint,
-    dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
+    dht_handler: mpsc::Sender<(Connection, SendStream, RecvStream, NodeId)>,
     gossip_handler: mpsc::Sender<(Connection, NodeId)>,
     stream_handler: mpsc::Sender<(Alpn, SendStream, RecvStream, NodeId)>,
     shutdown: CancellationToken,
@@ -77,7 +77,7 @@ pub async fn run_accept_loop(
                                 Ok(streams) => streams,
                                 Err(_) => return,
                             };
-                            let _ = dht_handler.send((send, recv, peer_id)).await;
+                            let _ = dht_handler.send((conn, send, recv, peer_id)).await;
                         }
                         Some(Alpn::Gossip) => {
                             let _ = gossip_handler.send((conn, peer_id)).await;

@@ -99,6 +99,9 @@ struct PutOp {
     signature: iroh::Signature,
     frontier: LookupFrontier,
     lookup_finished: bool,
+    store_attempted: usize,
+    store_acked: usize,
+    last_store_error: Option<String>,
     pending: PendingMap,
 }
 
@@ -276,6 +279,9 @@ impl DhtStateMachine {
             signature,
             frontier: LookupFrontier::default(),
             lookup_finished: false,
+            store_attempted: 0,
+            store_acked: 0,
+            last_store_error: None,
             pending: HashMap::new(),
         });
         self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, out);
@@ -370,6 +376,7 @@ impl DhtStateMachine {
                 self.insert_peer(peer, out);
                 self.handle_inbound_request(inbound_id, request, out);
             }
+            DhtIo::InboundReadError { .. } => {}
             DhtIo::InboundDropped { .. } => {}
             DhtIo::StorageReadResult {
                 op_id,
@@ -440,20 +447,38 @@ impl DhtStateMachine {
 
         match op_state {
             OpState::Put(mut op) => {
-                if phase == RpcPhase::PutLookup {
-                    match response {
-                        DhtResponse::Nodes { nodes } => {
-                            op.frontier.add_candidates(nodes, self.local_id);
+                match phase {
+                    RpcPhase::PutLookup => {
+                        match response {
+                            DhtResponse::Nodes { nodes } => {
+                                op.frontier.add_candidates(nodes, self.local_id);
+                            }
+                            DhtResponse::Value { closer_nodes, .. } => {
+                                op.frontier.add_candidates(closer_nodes, self.local_id);
+                            }
+                            DhtResponse::Pong | DhtResponse::Stored | DhtResponse::Error { .. } => {
+                            }
                         }
-                        DhtResponse::Value { closer_nodes, .. } => {
-                            op.frontier.add_candidates(closer_nodes, self.local_id);
-                        }
-                        DhtResponse::Pong | DhtResponse::Stored | DhtResponse::Error { .. } => {}
-                    }
 
-                    self.dispatch_put_lookup_requests(op_id, &mut op, out);
-                    if self.put_lookup_exhausted(&op) {
-                        self.begin_put_store(op_id, &mut op, out);
+                        self.dispatch_put_lookup_requests(op_id, &mut op, out);
+                        if self.put_lookup_exhausted(&op) {
+                            self.begin_put_store(op_id, &mut op, out);
+                        }
+                    }
+                    RpcPhase::PutStore => match response {
+                        DhtResponse::Stored => {
+                            op.store_acked = op.store_acked.saturating_add(1);
+                        }
+                        DhtResponse::Error { code, message } => {
+                            op.last_store_error = Some(format!("{code:?}: {message}"));
+                        }
+                        other => {
+                            op.last_store_error = Some(format!("unexpected response: {other:?}"));
+                        }
+                    },
+                    _ => {
+                        self.ops.insert(op_id, OpState::Put(op));
+                        return;
                     }
                 }
 
@@ -496,6 +521,11 @@ impl DhtStateMachine {
                         op.frontier.add_candidates(nodes, self.local_id);
                     }
                     DhtResponse::Pong | DhtResponse::Stored | DhtResponse::Error { .. } => {}
+                }
+
+                if !op.values.is_empty() {
+                    self.maybe_complete_get(op_id, op, out);
+                    return;
                 }
 
                 self.dispatch_get_requests(op_id, &mut op, out);
@@ -574,10 +604,19 @@ impl DhtStateMachine {
 
         match op_state {
             OpState::Put(mut op) => {
-                if phase == RpcPhase::PutLookup {
-                    self.dispatch_put_lookup_requests(op_id, &mut op, out);
-                    if self.put_lookup_exhausted(&op) {
-                        self.begin_put_store(op_id, &mut op, out);
+                match phase {
+                    RpcPhase::PutLookup => {
+                        self.dispatch_put_lookup_requests(op_id, &mut op, out);
+                        if self.put_lookup_exhausted(&op) {
+                            self.begin_put_store(op_id, &mut op, out);
+                        }
+                    }
+                    RpcPhase::PutStore => {
+                        op.last_store_error = Some(error.to_string());
+                    }
+                    _ => {
+                        self.ops.insert(op_id, OpState::Put(op));
+                        return;
                     }
                 }
 
@@ -683,6 +722,11 @@ impl DhtStateMachine {
                             expires_at: entry.expires_at,
                         });
                     }
+                }
+
+                if !op.values.is_empty() {
+                    self.maybe_complete_get(op_id, op, out);
+                    return;
                 }
 
                 op.frontier.add_candidates(
@@ -1082,6 +1126,7 @@ impl DhtStateMachine {
         op.lookup_finished = true;
 
         let targets = op.frontier.closest_discovered(op.key.as_bytes(), K);
+        op.store_attempted = targets.len();
         for peer in targets {
             self.queue_rpc_pending(
                 op_id,
@@ -1101,8 +1146,9 @@ impl DhtStateMachine {
     }
 
     fn maybe_complete_get(&mut self, op_id: OpId, op: GetOp, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if pending_rpc_count(&op.pending, RpcPhase::GetLookup) == 0
-            && op.frontier.pending_exhausted()
+        if !op.values.is_empty()
+            || (pending_rpc_count(&op.pending, RpcPhase::GetLookup) == 0
+                && op.frontier.pending_exhausted())
         {
             out.push(DhtEffect::Output(DhtOutput::Completed {
                 op_id,
@@ -1114,10 +1160,22 @@ impl DhtStateMachine {
     }
 
     fn maybe_complete_put(&mut self, op_id: OpId, op: PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if op.lookup_finished && pending_rpc_count(&op.pending, RpcPhase::PutStore) == 0 {
+        if op.store_acked > 0 {
             out.push(DhtEffect::Output(DhtOutput::Completed {
                 op_id,
                 result: DhtOutputValue::Unit,
+            }));
+        } else if op.lookup_finished && pending_rpc_count(&op.pending, RpcPhase::PutStore) == 0 {
+            let message = if let Some(last_error) = op.last_store_error {
+                format!("put failed: remote store rejected ({last_error})")
+            } else if op.store_attempted == 0 {
+                "put failed: no remote store targets".to_string()
+            } else {
+                "put failed: no remote store acknowledgement".to_string()
+            };
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::Network(message),
             }));
         } else {
             self.ops.insert(op_id, OpState::Put(op));
@@ -1544,5 +1602,690 @@ mod tests {
                 }) if *op_id == 9 && *peer == second_peer
             )
         }));
+    }
+
+    #[test]
+    fn put_fails_without_remote_store_targets() {
+        let local_secret = iroh::SecretKey::from_bytes(&[41u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let key = DhtKeyId::from_data(b"strict-put-no-targets");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id: 11,
+            key,
+            value: b"value".to_vec(),
+            ttl: std::time::Duration::from_secs(60),
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 11,
+            stage: StorageStage::PutLocalRead,
+            entries: Vec::new(),
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+            op_id: 11,
+            stage: StorageStage::PutLocalWrite,
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Failed {
+                    op_id: 11,
+                    error: DhtIoError::Network(message)
+                }) if message.contains("no remote store targets")
+            )
+        }));
+    }
+
+    #[test]
+    fn put_fails_when_store_rpc_times_out() {
+        let local_secret = iroh::SecretKey::from_bytes(&[42u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 100);
+
+        let peer = make_node(4);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+
+        let key = DhtKeyId::from_data(b"strict-put-timeout");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id: 12,
+            key,
+            value: b"value".to_vec(),
+            ttl: std::time::Duration::from_secs(60),
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 12,
+            stage: StorageStage::PutLocalRead,
+            entries: Vec::new(),
+        }));
+        let write_effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+            op_id: 12,
+            stage: StorageStage::PutLocalWrite,
+        }));
+
+        assert!(write_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    op_id: 12,
+                    phase: RpcPhase::PutLookup,
+                    peer: req_peer,
+                    ..
+                }) if *req_peer == peer
+            )
+        }));
+
+        let store_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 12,
+            phase: RpcPhase::PutLookup,
+            peer,
+            response: DhtResponse::Nodes { nodes: Vec::new() },
+        }));
+
+        assert!(store_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    op_id: 12,
+                    phase: RpcPhase::PutStore,
+                    peer: req_peer,
+                    ..
+                }) if *req_peer == peer
+            )
+        }));
+
+        let fail_effects = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id: 12,
+            phase: RpcPhase::PutStore,
+            peer,
+            error: DhtIoError::Timeout,
+        }));
+
+        assert!(fail_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Failed {
+                    op_id: 12,
+                    error: DhtIoError::Network(message)
+                }) if message.contains("remote store rejected")
+            )
+        }));
+    }
+
+    #[test]
+    fn put_fails_on_non_stored_response() {
+        let local_secret = iroh::SecretKey::from_bytes(&[43u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 100);
+
+        let peer = make_node(5);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+
+        let key = DhtKeyId::from_data(b"strict-put-non-stored");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id: 13,
+            key,
+            value: b"value".to_vec(),
+            ttl: std::time::Duration::from_secs(60),
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 13,
+            stage: StorageStage::PutLocalRead,
+            entries: Vec::new(),
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+            op_id: 13,
+            stage: StorageStage::PutLocalWrite,
+        }));
+
+        let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 13,
+            phase: RpcPhase::PutLookup,
+            peer,
+            response: DhtResponse::Nodes { nodes: Vec::new() },
+        }));
+
+        let fail_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 13,
+            phase: RpcPhase::PutStore,
+            peer,
+            response: DhtResponse::Error {
+                code: ErrorCode::Internal,
+                message: "store failed".to_string(),
+            },
+        }));
+
+        assert!(fail_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Failed {
+                    op_id: 13,
+                    error: DhtIoError::Network(message)
+                }) if message.contains("remote store rejected")
+            )
+        }));
+    }
+
+    #[test]
+    fn put_succeeds_after_first_store_ack_even_with_other_pending() {
+        let local_secret = iroh::SecretKey::from_bytes(&[44u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 100);
+
+        let peer_a = make_node(6);
+        let peer_b = make_node(7);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer_a }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer_b }));
+
+        let key = DhtKeyId::from_data(b"strict-put-first-ack");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
+            op_id: 14,
+            key,
+            value: b"value".to_vec(),
+            ttl: std::time::Duration::from_secs(60),
+        }));
+        let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 14,
+            stage: StorageStage::PutLocalRead,
+            entries: Vec::new(),
+        }));
+        let write_effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+            op_id: 14,
+            stage: StorageStage::PutLocalWrite,
+        }));
+
+        let mut lookup_peers = Vec::new();
+        for effect in &write_effects {
+            if let DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                op_id: 14,
+                phase: RpcPhase::PutLookup,
+                peer,
+                ..
+            }) = effect
+            {
+                lookup_peers.push(*peer);
+            }
+        }
+        assert!(
+            lookup_peers.len() >= 2,
+            "expected lookup fanout to both peers"
+        );
+
+        let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 14,
+            phase: RpcPhase::PutLookup,
+            peer: lookup_peers[0],
+            response: DhtResponse::Nodes { nodes: Vec::new() },
+        }));
+        let store_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 14,
+            phase: RpcPhase::PutLookup,
+            peer: lookup_peers[1],
+            response: DhtResponse::Nodes { nodes: Vec::new() },
+        }));
+
+        let mut store_peers = Vec::new();
+        for effect in &store_effects {
+            if let DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                op_id: 14,
+                phase: RpcPhase::PutStore,
+                peer,
+                ..
+            }) = effect
+            {
+                store_peers.push(*peer);
+            }
+        }
+        assert!(
+            store_peers.len() >= 2,
+            "expected store fanout to both peers"
+        );
+
+        let ack_peer = store_peers[0];
+        let late_peer = *store_peers
+            .iter()
+            .find(|peer| **peer != ack_peer)
+            .expect("expected second pending store peer");
+
+        let complete_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 14,
+            phase: RpcPhase::PutStore,
+            peer: ack_peer,
+            response: DhtResponse::Stored,
+        }));
+        assert!(complete_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 14,
+                    result: DhtOutputValue::Unit
+                })
+            )
+        }));
+
+        let late_effects = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id: 14,
+            phase: RpcPhase::PutStore,
+            peer: late_peer,
+            error: DhtIoError::Timeout,
+        }));
+        assert!(late_effects.is_empty());
+    }
+
+    #[test]
+    fn get_short_circuits_on_local_value_without_lookup() {
+        let local_secret = iroh::SecretKey::from_bytes(&[45u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let peer = make_node(8);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+
+        let key = DhtKeyId::from_data(b"get-short-circuit-local");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get { op_id: 15, key }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 15,
+            stage: StorageStage::GetLocalRead,
+            entries: vec![StoredEntry {
+                publisher: make_node(9),
+                value: b"cached".to_vec(),
+                expires_at: 2_000,
+                signature: None,
+            }],
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 15,
+                    result: DhtOutputValue::GetValues(values)
+                }) if values.iter().any(|entry| entry.value == b"cached".to_vec())
+            )
+        }));
+        assert!(!effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    phase: RpcPhase::GetLookup,
+                    ..
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn get_short_circuits_on_first_remote_value() {
+        let local_secret = iroh::SecretKey::from_bytes(&[46u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let peer_a = make_node(10);
+        let peer_b = make_node(11);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer_a }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer_b }));
+
+        let key = DhtKeyId::from_data(b"get-short-circuit-remote");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get { op_id: 16, key }));
+
+        let local_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 16,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        let mut lookup_peers = Vec::new();
+        for effect in &local_effects {
+            if let DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                op_id: 16,
+                phase: RpcPhase::GetLookup,
+                peer,
+                ..
+            }) = effect
+            {
+                lookup_peers.push(*peer);
+            }
+        }
+        assert!(
+            lookup_peers.len() >= 2,
+            "expected lookup fanout to both peers"
+        );
+
+        let response_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 16,
+            phase: RpcPhase::GetLookup,
+            peer: lookup_peers[0],
+            response: DhtResponse::Value {
+                entries: vec![StoredValue {
+                    publisher: make_node(12),
+                    value: b"first".to_vec(),
+                    expires_at: 2_000,
+                    signature: None,
+                }],
+                closer_nodes: vec![make_node(13)],
+            },
+        }));
+
+        assert!(response_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 16,
+                    result: DhtOutputValue::GetValues(values)
+                }) if values.iter().any(|entry| entry.value == b"first".to_vec())
+            )
+        }));
+        assert!(!response_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    phase: RpcPhase::GetLookup,
+                    ..
+                })
+            )
+        }));
+
+        let late_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 16,
+            phase: RpcPhase::GetLookup,
+            peer: lookup_peers[1],
+            response: DhtResponse::Value {
+                entries: Vec::new(),
+                closer_nodes: Vec::new(),
+            },
+        }));
+        assert!(late_effects.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_partial_success_completes_when_other_peer_times_out() {
+        let local_secret = iroh::SecretKey::from_bytes(&[47u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let peer_a = make_node(14);
+        let peer_b = make_node(15);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Bootstrap {
+            op_id: 17,
+            nodes: vec![peer_a, peer_b],
+        }));
+
+        let first = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 17,
+            phase: RpcPhase::Bootstrap,
+            peer: peer_a,
+            response: DhtResponse::Pong,
+        }));
+        assert!(
+            first
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
+
+        let second = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id: 17,
+            phase: RpcPhase::Bootstrap,
+            peer: peer_b,
+            error: DhtIoError::Timeout,
+        }));
+        assert!(second.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 17,
+                    result: DhtOutputValue::Unit
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn wrong_rpc_phase_is_ignored_and_operation_continues() {
+        let local_secret = iroh::SecretKey::from_bytes(&[48u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let peer = make_node(16);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Bootstrap {
+            op_id: 18,
+            nodes: vec![peer],
+        }));
+
+        let wrong_phase = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 18,
+            phase: RpcPhase::GetLookup,
+            peer,
+            response: DhtResponse::Pong,
+        }));
+        assert!(wrong_phase.is_empty());
+
+        let complete = state.step(DhtInput::Io(DhtIo::RpcResponse {
+            op_id: 18,
+            phase: RpcPhase::Bootstrap,
+            peer,
+            response: DhtResponse::Pong,
+        }));
+        assert!(complete.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 18,
+                    result: DhtOutputValue::Unit
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn wrong_storage_stage_is_ignored_and_get_still_completes() {
+        let local_secret = iroh::SecretKey::from_bytes(&[49u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let key = DhtKeyId::from_data(b"wrong-stage");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get { op_id: 19, key }));
+
+        let wrong_stage = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 19,
+            stage: StorageStage::PutLocalRead,
+            entries: Vec::new(),
+        }));
+        assert!(wrong_stage.is_empty());
+
+        let complete = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 19,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+        assert!(complete.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 19,
+                    result: DhtOutputValue::GetValues(values)
+                }) if values.is_empty()
+            )
+        }));
+    }
+
+    #[test]
+    fn inbound_put_missing_signature_returns_invalid_signature_error() {
+        let local_secret = iroh::SecretKey::from_bytes(&[50u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let publisher = make_node(17);
+        let key = DhtKeyId::from_data(b"missing-signature");
+        let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 7,
+            peer: make_node(18),
+            request: DhtRequest::PutValue {
+                key,
+                value: b"value".to_vec(),
+                ttl_secs: 30,
+                publisher,
+                signature: None,
+            },
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                    inbound_id: 7,
+                    response: DhtResponse::Error {
+                        code: ErrorCode::InvalidSignature,
+                        ..
+                    }
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn inbound_put_invalid_signature_returns_invalid_signature_error() {
+        let local_secret = iroh::SecretKey::from_bytes(&[51u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let publisher_secret = iroh::SecretKey::from_bytes(&[52u8; 32]);
+        let attacker_secret = iroh::SecretKey::from_bytes(&[53u8; 32]);
+
+        let key = DhtKeyId::from_data(b"invalid-signature");
+        let value = b"value".to_vec();
+        let ttl_secs: u64 = 45;
+        let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
+        signed_data.extend_from_slice(key.as_bytes());
+        signed_data.extend_from_slice(&value);
+        signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+        let invalid_signature = attacker_secret.sign(&signed_data);
+
+        let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 8,
+            peer: make_node(19),
+            request: DhtRequest::PutValue {
+                key,
+                value,
+                ttl_secs,
+                publisher: publisher_secret.public(),
+                signature: Some(invalid_signature),
+            },
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                    inbound_id: 8,
+                    response: DhtResponse::Error {
+                        code: ErrorCode::InvalidSignature,
+                        ..
+                    }
+                })
+            )
+        }));
+    }
+
+    #[test]
+    fn inbound_put_valid_signature_enqueues_storage_read() {
+        let local_secret = iroh::SecretKey::from_bytes(&[56u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let publisher_secret = iroh::SecretKey::from_bytes(&[57u8; 32]);
+        let key = DhtKeyId::from_data(b"valid-signature");
+        let value = b"value".to_vec();
+        let ttl_secs: u64 = 45;
+
+        let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
+        signed_data.extend_from_slice(key.as_bytes());
+        signed_data.extend_from_slice(&value);
+        signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+        let signature = publisher_secret.sign(&signed_data);
+
+        let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 9,
+            peer: make_node(22),
+            request: DhtRequest::PutValue {
+                key,
+                value,
+                ttl_secs,
+                publisher: publisher_secret.public(),
+                signature: Some(signature),
+            },
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::StorageRead {
+                    stage: StorageStage::InboundPutRead,
+                    key: req_key,
+                    ..
+                }) if *req_key == key
+            )
+        }));
+    }
+
+    #[test]
+    fn maintenance_ping_timeout_removes_peer_from_routing_table() {
+        let local_secret = iroh::SecretKey::from_bytes(&[54u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let peer = make_node(20);
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+
+        let before = state.step(DhtInput::Cmd(DhtCmd::RoutingTableSize { op_id: 20 }));
+        assert!(matches!(
+            before.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                op_id: 20,
+                result: DhtOutputValue::RoutingTableSize(1)
+            })]
+        ));
+
+        let tick_effects = state.step(DhtInput::Tick { now_tick: 1 });
+        assert!(tick_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    phase: RpcPhase::MaintenancePing,
+                    peer: req_peer,
+                    ..
+                }) if *req_peer == peer
+            )
+        }));
+
+        let _ = state.step(DhtInput::Tick {
+            now_tick: 1 + RPC_TIMEOUT_TICKS,
+        });
+
+        let after = state.step(DhtInput::Cmd(DhtCmd::RoutingTableSize { op_id: 21 }));
+        assert!(matches!(
+            after.as_slice(),
+            [DhtEffect::Output(DhtOutput::Completed {
+                op_id: 21,
+                result: DhtOutputValue::RoutingTableSize(0)
+            })]
+        ));
+    }
+
+    #[test]
+    fn unknown_operation_io_is_ignored() {
+        let local_secret = iroh::SecretKey::from_bytes(&[55u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let effects = state.step(DhtInput::Io(DhtIo::RpcError {
+            op_id: 999,
+            phase: RpcPhase::Bootstrap,
+            peer: make_node(21),
+            error: DhtIoError::Timeout,
+        }));
+        assert!(effects.is_empty());
     }
 }

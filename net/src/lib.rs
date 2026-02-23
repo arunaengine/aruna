@@ -198,10 +198,10 @@ impl NetHandle {
         let dht_for_inbound = dht.clone();
         let gossip_for_inbound = gossip.clone();
         let dht_task = tokio::spawn(async move {
-            while let Some((send, recv, peer_id)) = dht_rx.recv().await {
+            while let Some((conn, send, recv, peer_id)) = dht_rx.recv().await {
                 let _ = dht_for_inbound.add_peer(peer_id);
                 gossip_for_inbound.add_bootstrap_node(peer_id);
-                match dht_inbound_tx.try_send((send, recv, peer_id)) {
+                match dht_inbound_tx.try_send((conn, send, recv, peer_id)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
                         warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue full");

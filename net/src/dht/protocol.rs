@@ -144,6 +144,10 @@ pub enum DhtIo {
         peer: NodeId,
         request: DhtRequest,
     },
+    InboundReadError {
+        inbound_id: InboundId,
+        error: DhtIoError,
+    },
     InboundDropped {
         inbound_id: InboundId,
     },
