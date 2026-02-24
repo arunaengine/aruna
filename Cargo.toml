@@ -38,7 +38,7 @@ globset = "0.4.18"
 iroh = "0.96.0"
 iroh-base = "0.96.0"
 iroh-gossip = "0.96.0"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"]}
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 opendal = { version = "0.55", features = ["services-postgresql", "services-fs", "services-s3", "services-http"] }
 tokio-util = "0.7"
 bytes = "1"
@@ -74,6 +74,11 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 smallvec = "1.15.1"
 byteview = "0.10.1"
 tempfile = "3.25.0"
+sha2 = "0.11.0-rc.2"
+
+[patch.crates-io]
+# Temporarily fixes the dependency conflict of digest 0.10.x and 0.11.x until dependencies are updated
+curve25519-dalek = { git = "https://github.com/das-Abroxas/curve25519-dalek", branch = "fix/digest-import" }
 
 [profile.release]
 panic = "abort"

@@ -8,7 +8,6 @@ rust-version.workspace = true
 [dependencies]
 # Aruna modules
 aruna-core = { path = "../core" }
-aruna-blob = { path = "../blob" }
 aruna-operations = { path = "../operations" }
 
 # General
