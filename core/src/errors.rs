@@ -78,4 +78,6 @@ pub enum ConversionError {
     PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
     #[error(transparent)]
     PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
+    #[error("Invalid string `{0}` for Operation")]
+    InvalidOperationConversion(String),
 }

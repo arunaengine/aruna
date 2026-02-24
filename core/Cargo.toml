@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+automerge = { workspace = true }
+autosurgeon = { workspace = true }
 smallvec = { workspace = true }
 ulid = { workspace = true }
 thiserror = { workspace = true }
