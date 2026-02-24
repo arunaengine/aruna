@@ -2,7 +2,7 @@ use crate::errors::ConversionError;
 use crate::structs::group::autosurgeon_role_map;
 use crate::structs::structs::{Permission, Role};
 use crate::types::{RoleId, UserId};
-use autosurgeon::{Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -63,19 +63,22 @@ impl fmt::Display for RealmId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hydrate, Reconcile)]
 pub struct Realm {
+    #[autosurgeon(with = "autosurgeon_realm_id")]
     pub realm_id: RealmId,
     pub description: String,
 }
 
 impl Realm {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
+        let mut doc = automerge::AutoCommit::new();
+        reconcile(&mut doc, self)?;
+        Ok(doc.save())
     }
-
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let doc = automerge::AutoCommit::load(&bytes)?;
+        Ok(hydrate(&doc)?)
     }
 }
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
@@ -146,11 +149,13 @@ impl RealmAuthorizationDocument {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
+        let mut doc = automerge::AutoCommit::new();
+        reconcile(&mut doc, self)?;
+        Ok(doc.save())
     }
-
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let doc = automerge::AutoCommit::load(&bytes)?;
+        Ok(hydrate(&doc)?)
     }
 }
 

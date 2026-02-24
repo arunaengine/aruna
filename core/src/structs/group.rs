@@ -3,7 +3,7 @@ use crate::structs::realm::{RealmId, autosurgeon_realm_id};
 use crate::structs::structs::{Permission, Role};
 use crate::types::autosurgeon_ulid;
 use crate::types::{GroupId, RoleId, UserId};
-use autosurgeon::{Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
@@ -21,10 +21,13 @@ pub struct Group {
 
 impl Group {
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&self)?)
+        let mut doc = automerge::AutoCommit::new();
+        reconcile(&mut doc, self)?;
+        Ok(doc.save())
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let doc = automerge::AutoCommit::load(&bytes)?;
+        Ok(hydrate(&doc)?)
     }
 }
 
@@ -100,11 +103,13 @@ impl GroupAuthorizationDocument {
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
+        let mut doc = automerge::AutoCommit::new();
+        reconcile(&mut doc, self)?;
+        Ok(doc.save())
     }
-
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let doc = automerge::AutoCommit::load(&bytes)?;
+        Ok(hydrate(&doc)?)
     }
 }
 
@@ -187,9 +192,30 @@ pub mod autosurgeon_role_set {
 
 #[cfg(test)]
 mod test {
-    use crate::structs::{GroupAuthorizationDocument, RealmId};
+    use std::collections::HashSet;
+
+    use crate::structs::{Group, GroupAuthorizationDocument, RealmId};
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
+
+    #[test]
+    pub fn test_group_conversion() {
+        let group = Group {
+            display_name: "A group".to_string(),
+            group_id: Ulid::new(),
+            realm_id: RealmId([0u8; 32]),
+            roles: HashSet::from([Ulid::new(), Ulid::new()]),
+        };
+        let mut automerge_doc = automerge::AutoCommit::new();
+        reconcile(&mut automerge_doc, &group).unwrap();
+
+        let bytes = automerge_doc.save();
+
+        let stored_automerge_doc = automerge::AutoCommit::load(&bytes).unwrap();
+        let hydrated_group: Group = hydrate(&stored_automerge_doc).unwrap();
+
+        assert_eq!(group, hydrated_group);
+    }
 
     #[test]
     pub fn test_group_auth_doc_conversion() {

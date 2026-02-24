@@ -1,5 +1,6 @@
 use std::array::TryFromSliceError;
 
+use automerge::AutomergeError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -80,4 +81,10 @@ pub enum ConversionError {
     PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
     #[error("Invalid string `{0}` for Operation")]
     InvalidOperationConversion(String),
+    #[error(transparent)]
+    ReconcileError(#[from] autosurgeon::ReconcileError),
+    #[error(transparent)]
+    HydrateError(#[from] autosurgeon::HydrateError),
+    #[error(transparent)]
+    AutomergeError(#[from] AutomergeError),
 }
