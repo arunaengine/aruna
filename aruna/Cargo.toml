@@ -6,3 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Aruna modules
+aruna-api = { path = "../api" }
+aruna-blob = { path = "../blob" }
+aruna-core = { path = "../core" }
+aruna-operations = { path = "../operations" }
+aruna-storage = { path = "../storage" }
+
+# The rest
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ulid.workspace = true
