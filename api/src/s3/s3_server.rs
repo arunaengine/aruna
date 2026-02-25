@@ -66,7 +66,7 @@ impl S3Server {
         })
     }
     #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn run(self) -> Result<(), S3ServerError> {
+    pub async fn run(self) -> Result<JoinHandle<()>, S3ServerError> {
         // Run server
         let listener = TcpListener::bind(&self.address).await?;
         let local_addr = listener.local_addr()?;
@@ -93,10 +93,10 @@ impl S3Server {
             }
         };
 
-        let _task = tokio::spawn(server);
+        let task = tokio::spawn(server);
         info!("server is running at http://{local_addr}");
 
-        Ok(())
+        Ok(task)
     }
 }
 
