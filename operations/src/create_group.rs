@@ -3,8 +3,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{GroupAuthorizationDocument, Group, RealmId};
-use aruna_core::types::UserId;
+use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument};
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -12,8 +11,7 @@ use ulid::Ulid;
 
 #[derive(Clone, Debug)]
 pub struct CreateGroupConfig {
-    pub user_id: UserId,
-    pub realm_id: RealmId,
+    pub actor: Actor,
     pub display_name: String,
 }
 
@@ -56,14 +54,14 @@ impl CreateGroupOperation {
             roles: HashSet::new(),
             display_name: self.config.display_name.clone(),
             group_id: group_id.clone(),
-            realm_id: self.config.realm_id.clone(),
+            realm_id: self.config.actor.realm_id.clone(),
         };
 
         self.group = Some(group.clone());
 
         let key = group_id.to_bytes().into();
 
-        let value = group.to_bytes()?.into();
+        let value = group.to_bytes(&self.config.actor)?.into();
 
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: GROUP_KEYSPACE.to_string(),
@@ -84,15 +82,15 @@ impl CreateGroupOperation {
             .group_id;
 
         let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
-            self.config.user_id,
-            self.config.realm_id.clone(),
+            self.config.actor.user_id,
+            self.config.actor.realm_id.clone(),
             group_id,
         );
 
         self.auth_doc = Some(auth_doc.clone());
 
         let key = group_id.to_bytes().into();
-        let value = auth_doc.to_bytes()?.into();
+        let value = auth_doc.to_bytes(&self.config.actor)?.into();
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: AUTH_KEYSPACE.to_string(),
             key,
@@ -301,7 +299,9 @@ impl Operation for CreateGroupOperation {
 mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
+    use aruna_core::structs::Actor;
     use aruna_storage::storage;
+    use iroh::PublicKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -316,15 +316,21 @@ mod test {
             net_handle: None,
         };
 
+        let user_id = Ulid::new();
+        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let node_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
         let group_config = CreateGroupConfig {
-            user_id: Ulid::new(),
-            realm_id: aruna_core::structs::RealmId([0u8; 32]),
+            actor: Actor {
+                node_id,
+                user_id,
+                realm_id,
+            },
             display_name: "Test group".to_string(),
         };
         let group_operation = CreateGroupOperation::new(group_config.clone());
         let result = drive(group_operation, &context).await.unwrap();
         assert_eq!(result.0.display_name, group_config.display_name);
-        assert_eq!(result.0.realm_id, group_config.realm_id);
+        assert_eq!(result.0.realm_id, group_config.actor.realm_id);
         assert!(
             result
                 .0
@@ -337,7 +343,7 @@ mod test {
                 && role
                     .assigned_users
                     .iter()
-                    .any(|user| user == &group_config.user_id)
+                    .any(|user| user == &group_config.actor.user_id)
         }));
         assert!(
             result

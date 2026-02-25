@@ -14,6 +14,7 @@ aruna-net = { path = "../net" }
 base64 = { workspace = true }
 dotenvy = "0.15.7"
 ed25519-dalek = { workspace = true }
+iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

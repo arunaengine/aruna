@@ -15,6 +15,7 @@ base64 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
+iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

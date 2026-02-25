@@ -1,4 +1,3 @@
-use std::str::FromStr;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
 use axum::extract::Request;
@@ -9,6 +8,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Validation, decode};
+use std::str::FromStr;
 use thiserror::Error;
 
 use crate::error::TokenError;
@@ -16,7 +16,6 @@ use crate::server_state::ServerState;
 
 #[derive(Debug)]
 pub struct OidcValidator {}
-
 
 #[derive(Debug, Error)]
 pub enum AuthorizationError {
@@ -154,6 +153,10 @@ mod test {
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
 
+        let node_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let node_id =
+            iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes()).unwrap();
+
         let time = chrono::Utc::now().timestamp() as u64;
         let expiry = None;
         let user_id = Ulid::new();
@@ -165,6 +168,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
+            node_id.clone(),
             capabilities.clone(),
             None,
         );
@@ -204,6 +208,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
+            node_id.clone(),
             capabilities.clone(),
             None,
         );
@@ -235,6 +240,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
+            node_id.clone(),
             capabilities.clone(),
             None,
         );
@@ -275,6 +281,10 @@ mod test {
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
 
+        let node_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let node_id =
+            iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes()).unwrap();
+
         let time = chrono::Utc::now().timestamp() as u64;
         let expiry = Some(
             chrono::Utc::now()
@@ -288,6 +298,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
+            node_id.clone(),
             capabilities.clone(),
             None,
         );
@@ -359,6 +370,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
+            node_id.clone(),
             capabilities.clone(),
             None,
         );
@@ -397,6 +409,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
+            node_id.clone(),
             capabilities.clone(),
             None,
         );
@@ -430,6 +443,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
+            node_id.clone(),
             capabilities.clone(),
             None,
         );

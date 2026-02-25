@@ -18,6 +18,7 @@ async fn main() {
     let state = Arc::new(ServerState::new(
         driver_ctx,
         config.realm_id,
+        config.node_id,
         config.node_capabilities,
         None,
     ));

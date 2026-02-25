@@ -1,3 +1,4 @@
+use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::realm::RealmId;
 use crate::types::autosurgeon_ulid;
@@ -170,6 +171,29 @@ impl TryFrom<TokenClaims> for AuthContext {
             realm_id,
             path_restrictions,
         })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Actor {
+    pub node_id: NodeId,
+    pub user_id: UserId,
+    pub realm_id: RealmId,
+}
+
+impl TryFrom<&[u8]> for Actor {
+    type Error = ConversionError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Ok(postcard::from_bytes(value)?)
+    }
+}
+
+impl TryFrom<&Actor> for Vec<u8> {
+    type Error = ConversionError;
+
+    fn try_from(value: &Actor) -> Result<Self, Self::Error> {
+        Ok(postcard::to_allocvec(value)?)
     }
 }
 

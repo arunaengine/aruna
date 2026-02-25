@@ -3,7 +3,9 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId, Role};
+use aruna_core::structs::{
+    AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId, Role,
+};
 use aruna_core::types::{Effects, GroupId, TxnId};
 use globset::Glob;
 use smallvec::smallvec;
@@ -379,6 +381,7 @@ mod test {
     use aruna_core::structs::{Permission, RealmId};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
+    use iroh::PublicKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -425,10 +428,14 @@ mod test {
 
         let user_id = Ulid::new();
         let realm_id = RealmId([0u8; 32]);
+        let node_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
 
         let realm_config = CreateRealmConfig {
-            user_id,
-            realm_id: realm_id.clone(),
+            actor: aruna_core::structs::Actor {
+                node_id,
+                user_id,
+                realm_id: realm_id.clone(),
+            },
             realm_description: "A description".to_string(),
         };
 
@@ -436,8 +443,11 @@ mod test {
         let _result = drive(realm_operation, &context).await.unwrap();
 
         let group_config = CreateGroupConfig {
-            user_id,
-            realm_id: realm_id.clone(),
+            actor: aruna_core::structs::Actor {
+                node_id,
+                user_id,
+                realm_id: realm_id.clone(),
+            },
             display_name: "Test group".to_string(),
         };
 

@@ -3,7 +3,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{GroupAuthorizationDocument, Group};
+use aruna_core::structs::{Group, GroupAuthorizationDocument};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -272,6 +272,7 @@ mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::get_group::{GetGroupConfig, GetGroupOperation};
+    use aruna_core::structs::Actor;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -287,9 +288,14 @@ mod test {
             net_handle: None,
         };
 
-        let group_config = CreateGroupConfig {
+        let actor = Actor {
             user_id: Ulid::new(),
             realm_id: aruna_core::structs::RealmId([0u8; 32]),
+            node_id: iroh::PublicKey::from_bytes(&[0u8; 32]).unwrap(),
+        };
+
+        let group_config = CreateGroupConfig {
+            actor,
             display_name: "Test group".to_string(),
         };
         let group_operation = CreateGroupOperation::new(group_config.clone());

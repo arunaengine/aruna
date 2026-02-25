@@ -1,6 +1,7 @@
 use crate::auth::OidcValidator;
 use crate::error::TokenError;
 use crate::openapi::ApiDoc;
+use aruna_core::NodeId;
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_operations::driver::DriverContext;
 use base64::Engine;
@@ -28,6 +29,8 @@ pub struct ServerState {
     trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
     // Realm membership
     realm_id: RealmId,
+    // Realm membership
+    node_id: NodeId,
     // TODO: OIDC handling
     oidc_validator: Option<Arc<OidcValidator>>,
 }
@@ -36,6 +39,7 @@ impl ServerState {
     pub fn new(
         driver_ctx: Arc<DriverContext>,
         realm_id: RealmId,
+        node_id: NodeId,
         node_capabilities: NodeCapabilities,
         oidc_validator: Option<Arc<OidcValidator>>,
     ) -> Self {
@@ -44,6 +48,7 @@ impl ServerState {
         Self {
             driver_ctx,
             realm_id,
+            node_id,
             oidc_validator,
             node_capabilities,
             token_revocation_list: Arc::new(RwLock::new(HashSet::default())),
@@ -72,6 +77,10 @@ impl ServerState {
 
     pub fn get_realm_id(&self) -> RealmId {
         self.realm_id.clone()
+    }
+
+    pub fn get_node_id(&self) -> NodeId {
+        self.node_id.clone()
     }
 
     pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {

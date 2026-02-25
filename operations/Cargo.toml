@@ -15,6 +15,7 @@ async-trait = { workspace = true }
 byteview = { workspace = true }
 chrono = { workspace = true }
 globset = { workspace = true }
+iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 smallvec = { workspace = true }
 tokio = { workspace = true }

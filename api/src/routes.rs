@@ -1,7 +1,7 @@
 use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, GroupAuthorizationDocument, Group};
+use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
@@ -103,9 +103,14 @@ pub async fn create_group(
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
     let auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
 
-    let config = CreateGroupConfig {
+    let actor = Actor {
+        node_id: state.get_node_id(),
         user_id: auth.user_id,
-        realm_id: auth.realm_id,
+        realm_id: state.get_realm_id(),
+    };
+
+    let config = CreateGroupConfig {
+        actor,
         display_name: request.name,
     };
     let result = drive(CreateGroupOperation::new(config), &state.get_ctx())

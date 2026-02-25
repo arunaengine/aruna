@@ -1,4 +1,3 @@
-use autosurgeon::{Hydrate, HydrateError};
 use byteview::ByteView;
 use smallvec::SmallVec;
 use ulid::Ulid;

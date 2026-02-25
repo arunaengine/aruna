@@ -1,4 +1,5 @@
 use crate::errors::ConversionError;
+use crate::structs::Actor;
 use crate::structs::realm::{RealmId, autosurgeon_realm_id};
 use crate::structs::structs::{Permission, Role};
 use crate::types::autosurgeon_ulid;
@@ -20,8 +21,9 @@ pub struct Group {
 }
 
 impl Group {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        let mut doc = automerge::AutoCommit::new();
+    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        let actor = postcard::to_allocvec(actor)?;
+        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
         reconcile(&mut doc, self)?;
         Ok(doc.save())
     }
@@ -102,8 +104,9 @@ impl GroupAuthorizationDocument {
         GroupAuthorizationDocument { group_id, roles }
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        let mut doc = automerge::AutoCommit::new();
+    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        let actor = postcard::to_allocvec(actor)?;
+        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
         reconcile(&mut doc, self)?;
         Ok(doc.save())
     }

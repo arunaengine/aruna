@@ -240,6 +240,7 @@ mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::list_groups::ListGroupOperation;
+    use aruna_core::structs::Actor;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -258,8 +259,11 @@ mod test {
         let mut groups = Vec::new();
         for i in 0..100 {
             let group_config = CreateGroupConfig {
-                user_id: Ulid::new(),
-                realm_id: aruna_core::structs::RealmId([0u8; 32]),
+                actor: Actor {
+                    user_id: Ulid::new(),
+                    realm_id: aruna_core::structs::RealmId([0u8; 32]),
+                    node_id: iroh::PublicKey::from_bytes(&[0u8; 32]).unwrap(),
+                },
                 display_name: format!("Test group {i}"),
             };
             let group_operation = CreateGroupOperation::new(group_config.clone());

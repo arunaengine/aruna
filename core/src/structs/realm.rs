@@ -1,4 +1,5 @@
 use crate::errors::ConversionError;
+use crate::structs::Actor;
 use crate::structs::group::autosurgeon_role_map;
 use crate::structs::structs::{Permission, Role};
 use crate::types::{RoleId, UserId};
@@ -71,8 +72,9 @@ pub struct Realm {
 }
 
 impl Realm {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        let mut doc = automerge::AutoCommit::new();
+    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        let actor = postcard::to_allocvec(actor)?;
+        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
         reconcile(&mut doc, self)?;
         Ok(doc.save())
     }
@@ -148,8 +150,9 @@ impl RealmAuthorizationDocument {
         }
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        let mut doc = automerge::AutoCommit::new();
+    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        let actor = postcard::to_allocvec(actor)?;
+        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
         reconcile(&mut doc, self)?;
         Ok(doc.save())
     }

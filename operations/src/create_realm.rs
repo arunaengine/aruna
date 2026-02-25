@@ -3,16 +3,14 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{Realm, RealmAuthorizationDocument, RealmId};
-use aruna_core::types::UserId;
+use aruna_core::structs::{Actor, Realm, RealmAuthorizationDocument};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 #[derive(Clone, Debug)]
 pub struct CreateRealmConfig {
-    pub user_id: UserId,
-    pub realm_id: RealmId,
+    pub actor: Actor,
     pub realm_description: String,
 }
 
@@ -50,15 +48,15 @@ impl CreateRealmOperation {
     }
     fn emit_create_realm(&mut self) -> Result<aruna_core::types::Effects, CreateRealmError> {
         let realm = Realm {
-            realm_id: self.config.realm_id.clone(),
+            realm_id: self.config.actor.realm_id.clone(),
             description: self.config.realm_description.clone(),
         };
 
         self.realm = Some(realm.clone());
 
-        let key = (*self.config.realm_id.as_bytes()).into();
+        let key = (*self.config.actor.realm_id.as_bytes()).into();
 
-        let value = realm.to_bytes()?.into();
+        let value = realm.to_bytes(&self.config.actor)?.into();
 
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: REALM_KEYSPACE.to_string(),
@@ -72,17 +70,17 @@ impl CreateRealmOperation {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
-        let realm_id = self.config.realm_id.clone();
+        let realm_id = self.config.actor.realm_id.clone();
 
         let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(
-            self.config.user_id,
-            self.config.realm_id.clone(),
+            self.config.actor.user_id,
+            self.config.actor.realm_id.clone(),
         );
 
         self.auth_doc = Some(auth_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
-        let value = auth_doc.to_bytes()?.into();
+        let value = auth_doc.to_bytes(&self.config.actor)?.into();
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: AUTH_KEYSPACE.to_string(),
             key,
@@ -289,7 +287,7 @@ impl Operation for CreateRealmOperation {
 
 #[cfg(test)]
 mod test {
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{Actor, RealmId};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
@@ -313,23 +311,27 @@ mod test {
         let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
+        let node_id = iroh::PublicKey::from_bytes(&[0u8; 32]).unwrap();
         let realm_admin = Ulid::new();
 
         let realm_config = CreateRealmConfig {
-            user_id: realm_admin,
-            realm_id,
+            actor: Actor {
+                node_id,
+                user_id: realm_admin,
+                realm_id,
+            },
             realm_description: format!("A realm description"),
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let result = drive(realm_operation, &context).await.unwrap();
         assert_eq!(result.0.description, realm_config.realm_description);
-        assert_eq!(result.0.realm_id, realm_config.realm_id);
+        assert_eq!(result.0.realm_id, realm_config.actor.realm_id);
         assert!(result.1.roles.iter().any(|(_id, role)| {
             role.name == "admin"
                 && role
                     .assigned_users
                     .iter()
-                    .any(|user| user == &realm_config.user_id)
+                    .any(|user| user == &realm_config.actor.user_id)
         }));
         assert!(result.1.operation_restrictions.is_empty())
     }
