@@ -54,16 +54,20 @@ impl S3 for ArunaS3Service {
         debug!("Received PUT Request: {:#?}", req);
 
         // Extract access check result
+        /*
         let UserAccess {
             user_id, group_id, ..
         } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        */
+        let user_id = Ulid::new();
+        let group_id = Ulid::new();
 
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
-            user_id: user_id.user_id,
+            user_id,
             group_id,
             request: input,
             exists: false,

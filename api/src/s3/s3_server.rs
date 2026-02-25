@@ -48,7 +48,7 @@ impl S3Server {
         let s3service = ArunaS3Service::new(driver_ctx.clone()).await;
 
         let auth = AuthProvider {
-            driver_ctx: driver_ctx.clone(),
+            _driver_ctx: driver_ctx.clone(),
         };
 
         let service = {
