@@ -1,12 +1,9 @@
 use super::auth::AuthProvider;
 use super::s3_service::ArunaS3Service;
-use crate::error::{S3ServerError, ServerError};
+use crate::error::S3ServerError;
 use aruna_operations::driver::DriverContext;
 use futures_core::future::BoxFuture;
-use futures_util::FutureExt;
-use http::Method;
-use http::StatusCode;
-use http::{HeaderValue, Request};
+use http::Request;
 use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper_util::rt::TokioExecutor;
@@ -15,31 +12,26 @@ use hyper_util::server::conn::auto::Builder as ConnBuilder;
 use s3s::host::SingleDomain;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
-use s3s::Body;
-use s3s::S3Error;
-use s3s::{s3_error, HttpResponse};
-use std::convert::Infallible;
-use std::future::ready;
-use std::future::Ready;
+use s3s::HttpError;
+use s3s::HttpResponse;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 use tracing::error;
 use tracing::info;
 
 pub struct S3Server {
-    s3service: S3Service,
-    aruna_s3: ArunaS3Service,
     address: String,
+    s3service: S3Service,
 }
 
 #[derive(Clone)]
 pub struct WrappingService {
-    shared: S3Service,
-    inner: ArunaS3Service,
+    shared: S3Service, // Aruna specific implementation of S3 trait
 }
 
 impl S3Server {
-    #[tracing::instrument(level = "trace", skip(frontend, controller))]
+    #[tracing::instrument(level = "trace", skip(address, hostname, driver_ctx))]
     pub async fn new(
         address: impl Into<String> + Copy,
         hostname: impl Into<String>,
@@ -62,7 +54,6 @@ impl S3Server {
         Ok(Self {
             address: address.into(),
             s3service: service,
-            aruna_s3: s3service,
         })
     }
     #[tracing::instrument(level = "trace", skip(self))]
@@ -72,7 +63,6 @@ impl S3Server {
         let local_addr = listener.local_addr()?;
         let service = WrappingService {
             shared: self.s3service,
-            inner: self.aruna_s3.clone(),
         };
         let connection = ConnBuilder::new(TokioExecutor::new());
 
@@ -103,17 +93,17 @@ impl S3Server {
 impl Service<Request<Incoming>> for WrappingService {
     type Response = HttpResponse;
 
-    type Error = S3Error;
+    type Error = HttpError;
 
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    #[tracing::instrument(level = "trace", skip(self, req))]
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         //TODO: CORS
 
         // Default S3 operation call
         let (parts, body) = req.into_parts();
         let s3s_request = s3s::HttpRequest::from_parts(parts, body.into());
-        self.shared.call(s3s_request)
+        let shared = self.shared.clone();
+        Box::pin(async move { shared.call(s3s_request).await.map_err(Into::into) })
     }
 }

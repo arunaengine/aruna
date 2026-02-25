@@ -1,27 +1,11 @@
 use crate::s3::util::{convert_input, to_base64};
-use aruna_core::structs::UserAccess;
 use aruna_operations::driver::{drive, DriverContext};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
-use futures_util::TryStreamExt;
-use s3s::dto::{
-    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
-    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput,
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, ETag, GetBucketReplicationInput,
-    GetBucketReplicationOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput,
-    PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
-    StreamingBlob, UploadPartInput, UploadPartOutput,
-};
-use s3s::S3ErrorCode::InternalError;
-use s3s::{s3_error, S3Error, S3Request, S3Response, S3Result, S3};
-use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap};
+use s3s::dto::{ETag, PutObjectInput, PutObjectOutput};
+use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
 use std::fmt::Debug;
-use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, warn};
 use ulid::Ulid;
 
 #[derive(Clone)]
@@ -80,7 +64,10 @@ impl S3 for ArunaS3Service {
         {
             Ok(S3Response::new(PutObjectOutput {
                 e_tag: Some(ETag::Strong(to_base64(
-                    blob_info.hashes.get("md5").expect("Meh."),
+                    blob_info.hashes.get("md5").ok_or_else(|| {
+                        error!(error = "Missing MD5 hash");
+                        s3_error!(InternalError, "Missing MD5 hash")
+                    })?,
                 ))),
                 size: Some(blob_info.blob_size as i64),
                 ..Default::default()
