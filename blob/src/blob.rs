@@ -143,15 +143,17 @@ impl BlobHandler {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
         };
+        let mut writer = operator.writer(&storage_path).await.unwrap();
 
         // Write blob to backend storage
         while let Some(Ok(bytes)) = blob.next().await {
             hasher.update(&bytes);
-            if let Err(e) = operator.write(&storage_path, bytes.to_vec()).await {
+            if let Err(e) = writer.write(bytes.to_vec()).await {
                 return BlobEvent::Error(BlobError::WriteError(e.to_string()));
             }
             bytes_written += bytes.len() as u64;
         }
+        writer.close().await.unwrap();
 
         // Return write result
         BlobEvent::WriteFinished {
