@@ -3,7 +3,7 @@ use aruna_core::stream::BackendStream;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
 use s3s::dto::PutObjectInput;
-use s3s::{s3_error, S3Error, S3Result};
+use s3s::{S3Error, S3Result, s3_error};
 
 pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
     match operation_name {

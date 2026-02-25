@@ -9,11 +9,11 @@ use hyper::service::Service;
 use hyper_util::rt::TokioExecutor;
 use hyper_util::rt::TokioIo;
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
+use s3s::HttpError;
+use s3s::HttpResponse;
 use s3s::host::SingleDomain;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
-use s3s::HttpError;
-use s3s::HttpResponse;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -104,6 +104,6 @@ impl Service<Request<Incoming>> for WrappingService {
         let (parts, body) = req.into_parts();
         let s3s_request = s3s::HttpRequest::from_parts(parts, body.into());
         let shared = self.shared.clone();
-        Box::pin(async move { shared.call(s3s_request).await.map_err(Into::into) })
+        Box::pin(async move { shared.call(s3s_request).await })
     }
 }

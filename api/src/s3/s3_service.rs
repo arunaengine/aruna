@@ -1,8 +1,8 @@
 use crate::s3::util::{convert_input, to_base64};
-use aruna_operations::driver::{drive, DriverContext};
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
 use s3s::dto::{ETag, PutObjectInput, PutObjectOutput};
-use s3s::{s3_error, S3Request, S3Response, S3Result, S3};
+use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
