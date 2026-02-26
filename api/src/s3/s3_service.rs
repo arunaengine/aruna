@@ -1,7 +1,11 @@
 use crate::s3::util::{convert_input, to_base64};
+use aruna_core::structs::{RealmId, UserIdentity};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::s3::get_object::{GetObjectInput as GOI, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
-use s3s::dto::{ETag, PutObjectInput, PutObjectOutput};
+use s3s::dto::{
+    ETag, GetObjectInput, GetObjectOutput, PutObjectInput, PutObjectOutput, StreamingBlob,
+};
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -62,6 +66,7 @@ impl S3 for ArunaS3Service {
             .await
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
         {
+            debug!(?blob_info);
             Ok(S3Response::new(PutObjectOutput {
                 e_tag: Some(ETag::Strong(to_base64(
                     blob_info.hashes.get("md5").ok_or_else(|| {
@@ -74,6 +79,50 @@ impl S3 for ArunaS3Service {
             }))
         } else {
             Err(s3_error!(InternalError, "Failed to process PUT request"))
+        }
+    }
+
+    #[tracing::instrument(err)]
+    #[allow(clippy::blocks_in_conditions)]
+    async fn get_object(
+        &self,
+        req: S3Request<GetObjectInput>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        debug!("Received GET Request: {:#?}", req);
+
+        // Extract access check result
+        /*
+        let UserAccess {
+            user_id, group_id, ..
+        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        */
+        let user_id = Ulid::new();
+        let _group_id = Ulid::new();
+
+        let operation = GetObjectOperation::new(GOI {
+            bucket: req.input.bucket,
+            key: req.input.key,
+            range: None,
+            group_id: Default::default(),
+            user_identity: UserIdentity {
+                user_id,
+                realm_key: RealmId([0u8; 32]),
+            }, //TODO
+        });
+
+        if let Ok(Some(Ok(blob_stream))) = drive(operation, &self.state).await {
+            let wut = StreamingBlob::wrap(blob_stream);
+
+            Ok(S3Response::new(GetObjectOutput {
+                body: Some(wut),
+                ..Default::default()
+            }))
+        } else {
+            //TODO: Better error handling
+            Err(s3_error!(InternalError, "Failed to process GET request"))
         }
     }
 }

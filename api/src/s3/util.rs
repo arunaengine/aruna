@@ -119,7 +119,7 @@ pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObject
             bucket: input.bucket,
             key: input.key,
             content_length: input.content_length.map(|l| l as u64),
-            body: Some(BackendStream::new(stream)),
+            body: Some(BackendStream::new_from_boxed(stream)),
         }),
     }
 }
