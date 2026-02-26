@@ -7,7 +7,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{BlobInfo, UserIdentity};
 use aruna_core::types::Effects;
 use bytes::Bytes;
-use smallvec::{smallvec, SmallVec};
+use smallvec::{SmallVec, smallvec};
 use std::ops::Range;
 use thiserror::Error;
 use ulid::Ulid;
@@ -121,7 +121,7 @@ impl GetObjectOperation {
     }
 
     pub fn handle_received_path_mapping(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { key, value }) = event else {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
                 expected: "Event::Storage(StorageEvent::TransactionStarted)",
@@ -245,9 +245,9 @@ impl Operation for GetObjectOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation, GetObjectState};
-    use aruna_blob::blob::{BlobHandler, BLOB_LOCATION_DB, BLOB_PATH_DB};
+    use aruna_blob::blob::{BLOB_LOCATION_DB, BLOB_PATH_DB, BlobHandler};
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -316,7 +316,7 @@ mod test {
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
         {
-            let event = storage_handle
+            let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATION_DB.to_string(),
                     key: hashes.blake3.as_slice().into(),

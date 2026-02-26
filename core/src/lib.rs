@@ -12,3 +12,5 @@ pub mod types;
 pub mod util;
 
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
+
+pub const USER_ACCESS_KEYSPACE: &str = "user_access";

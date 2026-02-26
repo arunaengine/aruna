@@ -343,13 +343,13 @@ impl BlobInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub user_id: UserId,
     pub realm_key: RealmId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserAccess {
     pub user_id: UserIdentity,
     pub group_id: Ulid,
