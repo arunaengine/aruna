@@ -1,6 +1,5 @@
 use crate::errors::BlobError;
-use crate::stream::BackendStream;
-use crate::stream::BoxError;
+use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::BackendLocation;
 use crate::{
     errors::{DhtError, GossipError, StorageError, StreamError},
@@ -38,7 +37,7 @@ pub enum BlobEvent {
         //checksums: HashMap<String, String>,
     },
     ReadFinished {
-        blob: BackendStream<Result<Bytes, BoxError>>,
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
         stream_size: u64,
     },
     DeleteFinished,

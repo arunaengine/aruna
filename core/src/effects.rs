@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::alpn::Alpn;
 use crate::id::NodeId;
 use crate::operation::SubOperation;
-use crate::stream::{BackendStream, BoxError};
+use crate::stream::{BackendStream, StreamError};
 use crate::structs::BackendLocation;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 use bytes::Bytes;
@@ -24,7 +24,7 @@ pub enum BlobEffect {
     Write {
         bucket: String,
         key: String,
-        blob: BackendStream<Result<Bytes, BoxError>>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
     },
     Read {
         location: BackendLocation,

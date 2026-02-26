@@ -1,36 +1,58 @@
 use futures::Stream;
-use futures::stream::BoxStream;
 use std::error::Error;
+use std::fmt;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-pub type BoxError = Box<dyn Error + Send + Sync>;
+pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'a>>;
+pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
-pub struct BackendStream<T>(pub BoxStream<'static, T>);
+#[derive(Debug)]
+pub struct StreamError(pub BoxError);
 
-impl<T> BackendStream<Result<T, BoxError>> {
-    pub fn new<S, E>(stream: S) -> Self
-    where
-        S: Stream<Item = Result<T, E>> + Unpin + Send + Sync + 'static,
-        E: Into<BoxError>,
-    {
-        use futures::StreamExt;
-
-        let boxed = stream.map(|result| result.map_err(Into::into)).boxed();
-
-        BackendStream(boxed)
+impl fmt::Display for StreamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
-impl<T> std::fmt::Debug for BackendStream<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Error for StreamError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.0.source()
+    }
+}
+
+pub struct BackendStream<T>(pub BoxStream<'static, T>);
+
+impl<T> BackendStream<Result<T, StreamError>> {
+    pub fn new<S, E>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
+        E: Error + Send + Sync + 'static,
+    {
+        use futures::StreamExt;
+        let mapped = stream.map(|result| result.map_err(|e| StreamError(Box::new(e))));
+        BackendStream(Box::pin(mapped))
+    }
+
+    pub fn new_from_boxed<S>(stream: S) -> Self
+    where
+        S: Stream<Item = Result<T, BoxError>> + Send + Sync + 'static,
+    {
+        use futures::StreamExt;
+        let mapped = stream.map(|result| result.map_err(StreamError));
+        BackendStream(Box::pin(mapped))
+    }
+}
+
+impl<T> fmt::Debug for BackendStream<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BackendStream")
             .field("stream", &"<opaque>")
             .finish()
     }
 }
 
-// Implement Deref to use it like a BoxStream
 impl<T> std::ops::Deref for BackendStream<T> {
     type Target = BoxStream<'static, T>;
 

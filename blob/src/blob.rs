@@ -6,8 +6,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::stream::BackendStream;
-use aruna_core::stream::BoxError;
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{Backend, BackendBucket, BackendConfig, BackendLocation};
 use aruna_storage::storage::StorageHandle;
 use bytes::Bytes;
@@ -113,7 +112,7 @@ impl BlobHandler {
         &self,
         request_bucket: &str,
         request_key: &str,
-        mut blob: BackendStream<Result<Bytes, BoxError>>,
+        mut blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
         // Init stuff
         let mut hasher = Hasher::new();

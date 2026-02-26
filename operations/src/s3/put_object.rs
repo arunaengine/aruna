@@ -3,7 +3,7 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::stream::{BackendStream, BoxError};
+use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::BlobInfo;
 use aruna_core::types::{Effects, GroupId, UserId};
 use bytes::Bytes;
@@ -52,7 +52,7 @@ pub struct PutObjectInput {
     pub bucket: String,
     pub key: String,
     pub content_length: Option<u64>,
-    pub body: Option<BackendStream<Result<Bytes, BoxError>>>,
+    pub body: Option<BackendStream<Result<Bytes, StreamError>>>,
     //TODO: tbc
 }
 
