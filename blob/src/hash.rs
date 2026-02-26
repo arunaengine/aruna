@@ -29,6 +29,12 @@ impl Hasher {
         }
     }
 
+    pub fn new_with_bytes(bytes: &[u8]) -> Self {
+        let mut hasher = Self::new();
+        hasher.update(bytes);
+        hasher
+    }
+
     pub fn update(&mut self, bytes: &[u8]) {
         self.blake3.update(bytes);
         self.sha256.update(bytes);

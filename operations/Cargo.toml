@@ -23,5 +23,6 @@ tracing = { workspace = true }
 ulid = { workspace = true }
 
 [dev-dependencies]
+futures-util.workspace = true
 tempfile = { workspace = true }
 tokio-util = "0.7.18"
