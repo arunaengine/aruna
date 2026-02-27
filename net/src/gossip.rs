@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::DhtService;
+use crate::DhtHandle;
 use crate::error::{NetError, Result};
 
 const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
@@ -32,7 +32,7 @@ struct TopicSubscription {
 pub struct GossipService {
     gossip: Gossip,
     storage: StorageHandle,
-    dht: Arc<DhtService>,
+    dht: Arc<DhtHandle>,
     local_node_id: NodeId,
     subscriptions: Arc<RwLock<HashMap<TopicId, TopicSubscription>>>,
     bootstrap_nodes: Arc<RwLock<Vec<NodeId>>>,
@@ -45,7 +45,7 @@ impl GossipService {
     pub async fn new(
         endpoint: Endpoint,
         storage: StorageHandle,
-        dht: Arc<DhtService>,
+        dht: Arc<DhtHandle>,
         bootstrap_nodes: Vec<NodeId>,
         shutdown: CancellationToken,
         event_tx: mpsc::Sender<(TopicId, NodeId, Vec<u8>)>,

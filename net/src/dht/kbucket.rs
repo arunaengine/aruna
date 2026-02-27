@@ -1,6 +1,6 @@
 // net/src/dht/kbucket.rs
 use aruna_core::id::{NodeId, NodeIdExt};
-use aruna_core::util::{unix_timestamp_secs, xor_distance_32};
+use aruna_core::util::xor_distance_32;
 use std::collections::VecDeque;
 
 /// Maximum entries per bucket (standard Kademlia k value)
@@ -21,12 +21,12 @@ impl PeerInfo {
     pub fn new(node_id: NodeId) -> Self {
         Self {
             node_id,
-            last_seen: unix_timestamp_secs(),
+            last_seen: 0,
         }
     }
 
     pub fn touch(&mut self) {
-        self.last_seen = unix_timestamp_secs();
+        self.last_seen = self.last_seen.saturating_add(1);
     }
 }
 
