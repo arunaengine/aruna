@@ -77,17 +77,35 @@ pub async fn run_accept_loop(
                                 Ok(streams) => streams,
                                 Err(_) => return,
                             };
-                            let _ = dht_handler.send((conn, send, recv, peer_id)).await;
+                            if let Err(err) = dht_handler.send((conn, send, recv, peer_id)).await {
+                                warn!(
+                                    node_id = %peer_id,
+                                    error = %err,
+                                    "Failed to forward inbound DHT stream"
+                                );
+                            }
                         }
                         Some(Alpn::Gossip) => {
-                            let _ = gossip_handler.send((conn, peer_id)).await;
+                            if let Err(err) = gossip_handler.send((conn, peer_id)).await {
+                                warn!(
+                                    node_id = %peer_id,
+                                    error = %err,
+                                    "Failed to forward inbound gossip connection"
+                                );
+                            }
                         }
                         Some(alpn @ (Alpn::Bao | Alpn::Automerge)) => {
                             let (send, recv) = match conn.accept_bi().await {
                                 Ok(streams) => streams,
                                 Err(_) => return,
                             };
-                            let _ = stream_handler.send((alpn, send, recv, peer_id)).await;
+                            if let Err(err) = stream_handler.send((alpn, send, recv, peer_id)).await {
+                                warn!(
+                                    node_id = %peer_id,
+                                    error = %err,
+                                    "Failed to forward inbound app stream"
+                                );
+                            }
                         }
                         None => {
                             warn!(

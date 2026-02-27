@@ -199,7 +199,13 @@ impl NetHandle {
         let gossip_for_inbound = gossip.clone();
         let dht_task = tokio::spawn(async move {
             while let Some((conn, send, recv, peer_id)) = dht_rx.recv().await {
-                let _ = dht_for_inbound.add_peer(peer_id);
+                if let Err(err) = dht_for_inbound.add_peer(peer_id) {
+                    warn!(
+                        node_id = %peer_id,
+                        error = %err,
+                        "Failed to add inbound DHT peer to routing queue"
+                    );
+                }
                 gossip_for_inbound.add_bootstrap_node(peer_id);
                 match dht_inbound_tx.try_send((conn, send, recv, peer_id)) {
                     Ok(()) => {}
@@ -215,7 +221,13 @@ impl NetHandle {
         let gossip_for_gossip = gossip.clone();
         let gossip_task = tokio::spawn(async move {
             while let Some((conn, peer_id)) = gossip_conn_rx.recv().await {
-                let _ = dht_for_gossip.add_peer(peer_id);
+                if let Err(err) = dht_for_gossip.add_peer(peer_id) {
+                    warn!(
+                        node_id = %peer_id,
+                        error = %err,
+                        "Failed to add gossip peer to routing queue"
+                    );
+                }
                 gossip_for_gossip.add_bootstrap_node(peer_id);
                 if let Err(err) = gossip_for_gossip.gossip().handle_connection(conn).await {
                     warn!(error = %err, "Failed to hand connection to gossip service");
@@ -249,7 +261,13 @@ impl NetHandle {
         let inbound_handler_for_streams = inbound_handler.clone();
         let stream_task = tokio::spawn(async move {
             while let Some((alpn, send, recv, peer_id)) = stream_rx.recv().await {
-                let _ = dht_for_streams.add_peer(peer_id);
+                if let Err(err) = dht_for_streams.add_peer(peer_id) {
+                    warn!(
+                        node_id = %peer_id,
+                        error = %err,
+                        "Failed to add inbound stream peer to routing queue"
+                    );
+                }
                 gossip_for_streams.add_bootstrap_node(peer_id);
 
                 let handler = inbound_handler_for_streams.read().clone();
@@ -321,12 +339,24 @@ impl NetHandle {
             .address_lookup
             .add_endpoint_info(endpoint_addr.clone());
         self.inner.gossip.add_bootstrap_node(endpoint_addr.id);
-        let _ = self.inner.dht.add_peer(endpoint_addr.id);
+        if let Err(err) = self.inner.dht.add_peer(endpoint_addr.id) {
+            warn!(
+                node_id = %endpoint_addr.id,
+                error = %err,
+                "Failed to add endpoint address peer to DHT"
+            );
+        }
     }
 
     pub async fn open_stream(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
         if node_id != self.inner.node_id {
-            let _ = self.inner.dht.add_peer(node_id);
+            if let Err(err) = self.inner.dht.add_peer(node_id) {
+                warn!(
+                    node_id = %node_id,
+                    error = %err,
+                    "Failed to add stream target peer to DHT"
+                );
+            }
             self.inner.gossip.add_bootstrap_node(node_id);
         }
 
@@ -346,9 +376,13 @@ impl NetHandle {
             return;
         }
 
-        let _ = self.inner.dht.shutdown().await;
+        if let Err(err) = self.inner.dht.shutdown().await {
+            warn!(error = %err, "DHT shutdown returned error");
+        }
         self.inner.shutdown.cancel();
-        let _ = self.inner.gossip.gossip().shutdown().await;
+        if let Err(err) = self.inner.gossip.gossip().shutdown().await {
+            warn!(error = %err, "Gossip shutdown returned error");
+        }
         self.inner.endpoint.close().await;
 
         let mut tasks = self.inner.tasks.lock().await;

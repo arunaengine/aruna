@@ -19,14 +19,16 @@ use super::constants::{
 };
 use super::protocol::{
     DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput, DhtOutputValue,
-    InboundId, OpId,
+    InboundId, OpId, RpcPhase, StorageStage,
 };
 use super::rpc::{
     DHT_ALPN, DhtRequest, DhtResponse, ErrorCode, decode_request, decode_response, encode_request,
     encode_response,
 };
 use super::state::DhtStateMachine;
-use super::storage::{CLEANUP_PAGE_SIZE, DHT_KEYSPACE, decode_entries, encode_entries};
+use super::storage::{
+    CLEANUP_PAGE_SIZE, DHT_KEYSPACE, StoredEntry, decode_entries, encode_entries,
+};
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
 pub type InboundDhtStream = (Connection, SendStream, RecvStream, NodeId);
@@ -324,260 +326,281 @@ impl DhtDriver {
                 phase,
                 peer,
                 request,
-            } => {
-                let endpoint = self.endpoint.clone();
-                let io_tx = self.io_tx.clone();
-                tokio::spawn(async move {
-                    match rpc_request(endpoint, peer, request).await {
-                        Ok(response) => {
-                            let _ = io_tx
-                                .send(DhtIo::RpcResponse {
-                                    op_id,
-                                    phase,
-                                    peer,
-                                    response,
-                                })
-                                .await;
-                        }
-                        Err(error) => {
-                            let _ = io_tx
-                                .send(DhtIo::RpcError {
-                                    op_id,
-                                    phase,
-                                    peer,
-                                    error,
-                                })
-                                .await;
-                        }
-                    }
-                });
-            }
+            } => self.dispatch_rpc_request(op_id, phase, peer, request),
             DhtIoRequest::RpcResponse {
                 inbound_id,
                 response,
-            } => {
-                let maybe_send = self.inbound_contexts.remove(&inbound_id);
-                let io_tx = self.io_tx.clone();
-                tokio::spawn(async move {
-                    if let Some((_conn, mut send)) = maybe_send {
-                        let _ = write_response_to_stream(&mut send, &response).await;
-                    }
-                    let _ = io_tx.send(DhtIo::InboundDropped { inbound_id }).await;
-                });
-            }
-            DhtIoRequest::DropInbound { inbound_id } => {
-                self.inbound_contexts.remove(&inbound_id);
-                self.process_input(DhtInput::Io(DhtIo::InboundDropped { inbound_id }));
-            }
+            } => self.dispatch_rpc_response(inbound_id, response),
+            DhtIoRequest::DropInbound { inbound_id } => self.dispatch_drop_inbound(inbound_id),
             DhtIoRequest::StorageRead { op_id, stage, key } => {
-                let storage = self.storage.clone();
-                let io_tx = self.io_tx.clone();
-                tokio::spawn(async move {
-                    let effect = Effect::Storage(StorageEffect::Read {
-                        key_space: DHT_KEYSPACE.to_string(),
-                        key: ByteView::from(key.as_bytes().as_slice()),
-                        txn_id: None,
-                    });
-
-                    match storage.send_effect(effect).await {
-                        Event::Storage(StorageEvent::ReadResult {
-                            value: Some(data), ..
-                        }) => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageReadResult {
-                                    op_id,
-                                    stage,
-                                    entries: decode_entries(&data),
-                                })
-                                .await;
-                        }
-                        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageReadResult {
-                                    op_id,
-                                    stage,
-                                    entries: Vec::new(),
-                                })
-                                .await;
-                        }
-                        Event::Storage(StorageEvent::Error { error }) => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageError {
-                                    op_id,
-                                    stage,
-                                    error: DhtIoError::Storage(error.to_string()),
-                                })
-                                .await;
-                        }
-                        other => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageError {
-                                    op_id,
-                                    stage,
-                                    error: DhtIoError::Storage(format!(
-                                        "unexpected storage read event: {other:?}"
-                                    )),
-                                })
-                                .await;
-                        }
-                    }
-                });
+                self.dispatch_storage_read(op_id, stage, key)
             }
             DhtIoRequest::StorageWrite {
                 op_id,
                 stage,
                 key,
                 entries,
-            } => {
-                let storage = self.storage.clone();
-                let io_tx = self.io_tx.clone();
-                tokio::spawn(async move {
-                    let Some(bytes) = encode_entries(&entries) else {
-                        let _ = io_tx
-                            .send(DhtIo::StorageError {
-                                op_id,
-                                stage,
-                                error: DhtIoError::Storage(
-                                    "serialize dht entries failed".to_string(),
-                                ),
-                            })
-                            .await;
-                        return;
-                    };
-
-                    let effect = Effect::Storage(StorageEffect::Write {
-                        key_space: DHT_KEYSPACE.to_string(),
-                        key: ByteView::from(key.as_bytes().as_slice()),
-                        value: ByteView::from(bytes),
-                        txn_id: None,
-                    });
-
-                    match storage.send_effect(effect).await {
-                        Event::Storage(StorageEvent::WriteResult { .. }) => {
-                            let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
-                        }
-                        Event::Storage(StorageEvent::Error { error }) => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageError {
-                                    op_id,
-                                    stage,
-                                    error: DhtIoError::Storage(error.to_string()),
-                                })
-                                .await;
-                        }
-                        other => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageError {
-                                    op_id,
-                                    stage,
-                                    error: DhtIoError::Storage(format!(
-                                        "unexpected storage write event: {other:?}"
-                                    )),
-                                })
-                                .await;
-                        }
-                    }
-                });
-            }
+            } => self.dispatch_storage_write(op_id, stage, key, entries),
             DhtIoRequest::StorageDelete { op_id, stage, key } => {
-                let storage = self.storage.clone();
-                let io_tx = self.io_tx.clone();
-                tokio::spawn(async move {
-                    let effect = Effect::Storage(StorageEffect::Delete {
-                        key_space: DHT_KEYSPACE.to_string(),
-                        key: ByteView::from(key.as_bytes().as_slice()),
-                        txn_id: None,
-                    });
-
-                    match storage.send_effect(effect).await {
-                        Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageDeleteResult { op_id, stage })
-                                .await;
-                        }
-                        Event::Storage(StorageEvent::Error { error }) => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageError {
-                                    op_id,
-                                    stage,
-                                    error: DhtIoError::Storage(error.to_string()),
-                                })
-                                .await;
-                        }
-                        other => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageError {
-                                    op_id,
-                                    stage,
-                                    error: DhtIoError::Storage(format!(
-                                        "unexpected storage delete event: {other:?}"
-                                    )),
-                                })
-                                .await;
-                        }
-                    }
-                });
+                self.dispatch_storage_delete(op_id, stage, key)
             }
             DhtIoRequest::StorageIter {
                 op_id,
                 stage,
                 start_after,
                 limit,
-            } => {
-                let storage = self.storage.clone();
-                let io_tx = self.io_tx.clone();
-                tokio::spawn(async move {
-                    let effect = Effect::Storage(StorageEffect::Iter {
-                        key_space: DHT_KEYSPACE.to_string(),
-                        prefix: None,
-                        start_after: start_after.map(ByteView::from),
-                        limit: if limit == 0 { CLEANUP_PAGE_SIZE } else { limit },
-                        txn_id: None,
-                    });
-
-                    match storage.send_effect(effect).await {
-                        Event::Storage(StorageEvent::IterResult {
-                            values,
-                            next_start_after,
-                        }) => {
-                            let decoded_values = values
-                                .into_iter()
-                                .map(|(key, value)| (key.as_ref().to_vec(), decode_entries(&value)))
-                                .collect();
-
-                            let _ = io_tx
-                                .send(DhtIo::StorageIterResult {
-                                    op_id,
-                                    stage,
-                                    values: decoded_values,
-                                    next_start_after: next_start_after.map(|k| k.as_ref().to_vec()),
-                                })
-                                .await;
-                        }
-                        Event::Storage(StorageEvent::Error { error }) => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageError {
-                                    op_id,
-                                    stage,
-                                    error: DhtIoError::Storage(error.to_string()),
-                                })
-                                .await;
-                        }
-                        other => {
-                            let _ = io_tx
-                                .send(DhtIo::StorageError {
-                                    op_id,
-                                    stage,
-                                    error: DhtIoError::Storage(format!(
-                                        "unexpected storage iter event: {other:?}"
-                                    )),
-                                })
-                                .await;
-                        }
-                    }
-                });
-            }
+            } => self.dispatch_storage_iter(op_id, stage, start_after, limit),
         }
+    }
+
+    fn dispatch_rpc_request(
+        &self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        request: DhtRequest,
+    ) {
+        let endpoint = self.endpoint.clone();
+        let io_tx = self.io_tx.clone();
+        tokio::spawn(async move {
+            match rpc_request(endpoint, peer, request).await {
+                Ok(response) => {
+                    let _ = io_tx
+                        .send(DhtIo::RpcResponse {
+                            op_id,
+                            phase,
+                            peer,
+                            response,
+                        })
+                        .await;
+                }
+                Err(error) => {
+                    let _ = io_tx
+                        .send(DhtIo::RpcError {
+                            op_id,
+                            phase,
+                            peer,
+                            error,
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn dispatch_rpc_response(&mut self, inbound_id: InboundId, response: DhtResponse) {
+        let maybe_send = self.inbound_contexts.remove(&inbound_id);
+        let io_tx = self.io_tx.clone();
+        tokio::spawn(async move {
+            if let Some((_conn, mut send)) = maybe_send {
+                let _ = write_response_to_stream(&mut send, &response).await;
+            }
+            let _ = io_tx.send(DhtIo::InboundDropped { inbound_id }).await;
+        });
+    }
+
+    fn dispatch_drop_inbound(&mut self, inbound_id: InboundId) {
+        self.inbound_contexts.remove(&inbound_id);
+        self.process_input(DhtInput::Io(DhtIo::InboundDropped { inbound_id }));
+    }
+
+    fn dispatch_storage_read(&self, op_id: OpId, stage: StorageStage, key: DhtKeyId) {
+        let storage = self.storage.clone();
+        let io_tx = self.io_tx.clone();
+        tokio::spawn(async move {
+            let effect = Effect::Storage(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            });
+
+            match storage.send_effect(effect).await {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageReadResult {
+                            op_id,
+                            stage,
+                            entries: value.map(|data| decode_entries(&data)).unwrap_or_default(),
+                        })
+                        .await;
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageError {
+                            op_id,
+                            stage,
+                            error: DhtIoError::storage(error),
+                        })
+                        .await;
+                }
+                other => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageError {
+                            op_id,
+                            stage,
+                            error: DhtIoError::storage(format!(
+                                "unexpected storage read event: {other:?}"
+                            )),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn dispatch_storage_write(
+        &self,
+        op_id: OpId,
+        stage: StorageStage,
+        key: DhtKeyId,
+        entries: Vec<StoredEntry>,
+    ) {
+        let storage = self.storage.clone();
+        let io_tx = self.io_tx.clone();
+        tokio::spawn(async move {
+            let Some(bytes) = encode_entries(&entries) else {
+                let _ = io_tx
+                    .send(DhtIo::StorageError {
+                        op_id,
+                        stage,
+                        error: DhtIoError::storage("serialize dht entries failed"),
+                    })
+                    .await;
+                return;
+            };
+
+            let effect = Effect::Storage(StorageEffect::Write {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            });
+
+            match storage.send_effect(effect).await {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageError {
+                            op_id,
+                            stage,
+                            error: DhtIoError::storage(error),
+                        })
+                        .await;
+                }
+                other => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageError {
+                            op_id,
+                            stage,
+                            error: DhtIoError::storage(format!(
+                                "unexpected storage write event: {other:?}"
+                            )),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn dispatch_storage_delete(&self, op_id: OpId, stage: StorageStage, key: DhtKeyId) {
+        let storage = self.storage.clone();
+        let io_tx = self.io_tx.clone();
+        tokio::spawn(async move {
+            let effect = Effect::Storage(StorageEffect::Delete {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: ByteView::from(key.as_bytes().as_slice()),
+                txn_id: None,
+            });
+
+            match storage.send_effect(effect).await {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    let _ = io_tx.send(DhtIo::StorageDeleteResult { op_id, stage }).await;
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageError {
+                            op_id,
+                            stage,
+                            error: DhtIoError::storage(error),
+                        })
+                        .await;
+                }
+                other => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageError {
+                            op_id,
+                            stage,
+                            error: DhtIoError::storage(format!(
+                                "unexpected storage delete event: {other:?}"
+                            )),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn dispatch_storage_iter(
+        &self,
+        op_id: OpId,
+        stage: StorageStage,
+        start_after: Option<Vec<u8>>,
+        limit: usize,
+    ) {
+        let storage = self.storage.clone();
+        let io_tx = self.io_tx.clone();
+        tokio::spawn(async move {
+            let effect = Effect::Storage(StorageEffect::Iter {
+                key_space: DHT_KEYSPACE.to_string(),
+                prefix: None,
+                start_after: start_after.map(ByteView::from),
+                limit: if limit == 0 { CLEANUP_PAGE_SIZE } else { limit },
+                txn_id: None,
+            });
+
+            match storage.send_effect(effect).await {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    let decoded_values = values
+                        .into_iter()
+                        .map(|(key, value)| (key.as_ref().to_vec(), decode_entries(&value)))
+                        .collect();
+
+                    let _ = io_tx
+                        .send(DhtIo::StorageIterResult {
+                            op_id,
+                            stage,
+                            values: decoded_values,
+                            next_start_after: next_start_after.map(|k| k.as_ref().to_vec()),
+                        })
+                        .await;
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageError {
+                            op_id,
+                            stage,
+                            error: DhtIoError::storage(error),
+                        })
+                        .await;
+                }
+                other => {
+                    let _ = io_tx
+                        .send(DhtIo::StorageError {
+                            op_id,
+                            stage,
+                            error: DhtIoError::storage(format!(
+                                "unexpected storage iter event: {other:?}"
+                            )),
+                        })
+                        .await;
+                }
+            }
+        });
     }
 }
 
@@ -587,102 +610,87 @@ async fn rpc_request(
     request: DhtRequest,
 ) -> Result<DhtResponse, DhtIoError> {
     let conn = tokio::time::timeout(RPC_TIMEOUT, endpoint.connect(peer, DHT_ALPN))
-        .await
-        .map_err(|_| DhtIoError::Timeout)?
-        .map_err(|err| DhtIoError::Network(format!("connect failed: {err}")))?;
+        .await?
+        .map_err(DhtIoError::network)?;
 
     let (mut send, mut recv) = conn
         .open_bi()
         .await
-        .map_err(|err| DhtIoError::Network(format!("open_bi failed: {err}")))?;
+        .map_err(DhtIoError::network)?;
 
-    let request_bytes = encode_request(&request)
-        .map_err(|err| DhtIoError::InvalidResponse(format!("encode request failed: {err}")))?;
+    let request_bytes = encode_request(&request)?;
     let len = (request_bytes.len() as u32).to_be_bytes();
     send.write_all(&len)
         .await
-        .map_err(|err| DhtIoError::Network(format!("write request length failed: {err}")))?;
+        .map_err(DhtIoError::network)?;
     send.write_all(&request_bytes)
         .await
-        .map_err(|err| DhtIoError::Network(format!("write request body failed: {err}")))?;
-    send.finish()
-        .map_err(|err| DhtIoError::Network(format!("finish request stream failed: {err}")))?;
+        .map_err(DhtIoError::network)?;
+    send.finish().map_err(DhtIoError::network)?;
 
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(RPC_TIMEOUT, recv.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| DhtIoError::Timeout)?
-        .map_err(|err| DhtIoError::Network(format!("read response length failed: {err}")))?;
+        .await?
+        .map_err(DhtIoError::network)?;
 
     let response_len = u32::from_be_bytes(len_buf) as usize;
     if response_len > MAX_MESSAGE_SIZE {
-        return Err(DhtIoError::InvalidResponse(
-            "response too large".to_string(),
-        ));
+        return Err(DhtIoError::invalid_response("response too large"));
     }
 
     let mut response_bytes = vec![0u8; response_len];
     tokio::time::timeout(RPC_TIMEOUT, recv.read_exact(&mut response_bytes))
-        .await
-        .map_err(|_| DhtIoError::Timeout)?
-        .map_err(|err| DhtIoError::Network(format!("read response body failed: {err}")))?;
+        .await?
+        .map_err(DhtIoError::network)?;
 
-    decode_response(&response_bytes)
-        .map_err(|err| DhtIoError::InvalidResponse(format!("decode response failed: {err}")))
+    Ok(decode_response(&response_bytes)?)
 }
 
 async fn read_request_from_stream(recv: &mut RecvStream) -> Result<DhtRequest, DhtIoError> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
-        .map_err(|err| DhtIoError::Network(err.to_string()))?;
+        .map_err(DhtIoError::network)?;
 
     let len = u32::from_be_bytes(len_buf) as usize;
     if len > MAX_MESSAGE_SIZE {
-        return Err(DhtIoError::InvalidResponse("request too large".to_string()));
+        return Err(DhtIoError::invalid_response("request too large"));
     }
 
     let mut req_bytes = vec![0u8; len];
     recv.read_exact(&mut req_bytes)
         .await
-        .map_err(|err| DhtIoError::Network(err.to_string()))?;
+        .map_err(DhtIoError::network)?;
 
     match recv.read_chunk(1).await {
         Ok(None) => {}
         Ok(Some(_)) => {
-            return Err(DhtIoError::InvalidResponse(
-                "request framing mismatch".to_string(),
-            ));
+            return Err(DhtIoError::invalid_response("request framing mismatch"));
         }
-        Err(err) => return Err(DhtIoError::Network(err.to_string())),
+        Err(err) => return Err(DhtIoError::network(err)),
     }
 
-    decode_request(&req_bytes)
-        .map_err(|err| DhtIoError::InvalidResponse(format!("decode request failed: {err}")))
+    Ok(decode_request(&req_bytes)?)
 }
 
 async fn write_response_to_stream(
     send: &mut SendStream,
     response: &DhtResponse,
 ) -> Result<(), DhtIoError> {
-    let response_bytes = encode_response(response)
-        .map_err(|err| DhtIoError::InvalidResponse(format!("encode response failed: {err}")))?;
+    let response_bytes = encode_response(response)?;
 
     if response_bytes.len() > MAX_MESSAGE_SIZE {
-        return Err(DhtIoError::InvalidResponse(
-            "response too large".to_string(),
-        ));
+        return Err(DhtIoError::invalid_response("response too large"));
     }
 
     let len = (response_bytes.len() as u32).to_be_bytes();
     send.write_all(&len)
         .await
-        .map_err(|err| DhtIoError::Network(err.to_string()))?;
+        .map_err(DhtIoError::network)?;
     send.write_all(&response_bytes)
         .await
-        .map_err(|err| DhtIoError::Network(err.to_string()))?;
-    send.finish()
-        .map_err(|err| DhtIoError::Network(err.to_string()))?;
+        .map_err(DhtIoError::network)?;
+    send.finish().map_err(DhtIoError::network)?;
 
     let _ = tokio::time::timeout(Duration::from_millis(100), send.stopped()).await;
 
