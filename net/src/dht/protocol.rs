@@ -195,3 +195,35 @@ pub enum DhtIoError {
     #[error("invalid response: {0}")]
     InvalidResponse(String),
 }
+
+impl DhtIoError {
+    pub fn network(error: impl std::fmt::Display) -> Self {
+        Self::Network(error.to_string())
+    }
+
+    pub fn storage(error: impl std::fmt::Display) -> Self {
+        Self::Storage(error.to_string())
+    }
+
+    pub fn invalid_response(error: impl std::fmt::Display) -> Self {
+        Self::InvalidResponse(error.to_string())
+    }
+}
+
+impl From<tokio::time::error::Elapsed> for DhtIoError {
+    fn from(_: tokio::time::error::Elapsed) -> Self {
+        Self::Timeout
+    }
+}
+
+impl From<std::io::Error> for DhtIoError {
+    fn from(error: std::io::Error) -> Self {
+        Self::network(error)
+    }
+}
+
+impl From<postcard::Error> for DhtIoError {
+    fn from(error: postcard::Error) -> Self {
+        Self::invalid_response(error)
+    }
+}
