@@ -255,6 +255,10 @@ impl CheckPermissionsOperation {
         if let Some(group) = &self.group_auth_doc {
             roles.extend(group.roles.clone());
         }
+        roles.retain(|_id, role| {
+            role.assigned_users
+                .contains(&self.config.auth_context.user_id)
+        });
         Ok(roles)
     }
 
