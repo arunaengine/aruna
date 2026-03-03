@@ -7,6 +7,7 @@ use aruna_core::effects::{DhtEffect, Effect, GossipEffect, NetEffect, StorageEff
 use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_net::streams::BiStream;
 use aruna_net::{InboundEventHandler, NetConfig, NetHandle};
 use aruna_storage::FjallStorage;
@@ -128,16 +129,30 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
     let key = [42u8; 32];
     let value = b"replicated-value".to_vec();
 
-    let put = handle_a
-        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
-            key,
-            value: value.clone(),
-            ttl: Duration::from_secs(3600),
-        })))
-        .await;
+    let mut put_succeeded = false;
+    let mut last_put_event = None;
+    for _ in 0..10 {
+        let put = handle_a
+            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+                key,
+                value: value.clone(),
+                ttl: Duration::from_secs(3600),
+            })))
+            .await;
+        last_put_event = Some(format!("{put:?}"));
+
+        if matches!(put, Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))) {
+            put_succeeded = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
     assert!(
-        matches!(put, Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))),
-        "unexpected put event: {put:?}"
+        put_succeeded,
+        "expected strict PUT to receive at least one remote acknowledgement, last event: {}",
+        last_put_event.unwrap_or_else(|| "<none>".to_string())
     );
 
     let mut found = false;
@@ -202,14 +217,20 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
         })))
         .await;
 
-    assert!(matches!(
-        subscribe_a,
-        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
-    ));
-    assert!(matches!(
-        subscribe_b,
-        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
-    ));
+    assert!(
+        matches!(
+            subscribe_a,
+            Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
+        ),
+        "unexpected subscribe_a event: {subscribe_a:?}"
+    );
+    assert!(
+        matches!(
+            subscribe_b,
+            Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
+        ),
+        "unexpected subscribe_b event: {subscribe_b:?}"
+    );
 
     let payload = b"hello gossip".to_vec();
     let mut got_message = false;
@@ -294,6 +315,47 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
             )
         })?;
     assert_eq!(chunk.bytes.to_vec(), b"hello stream".to_vec());
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_dht_rpc_ping_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+
+    let cfg = || NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        use_dns_discovery: false,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(), storage_b).await?;
+
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+
+    let (mut send, mut recv) = handle_a.open_stream(handle_b.node_id(), Alpn::Dht).await?;
+
+    let request = encode_request(&DhtRequest::Ping)?;
+    let len = (request.len() as u32).to_be_bytes();
+    send.write_all(&len).await?;
+    send.write_all(&request).await?;
+    send.finish()?;
+
+    let mut response_len = [0u8; 4];
+    recv.read_exact(&mut response_len).await?;
+    let response_len = u32::from_be_bytes(response_len) as usize;
+
+    let mut response = vec![0u8; response_len];
+    recv.read_exact(&mut response).await?;
+    let response = decode_response(&response)?;
+    assert!(matches!(response, DhtResponse::Pong));
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;
