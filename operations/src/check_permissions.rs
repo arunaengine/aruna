@@ -398,7 +398,7 @@ mod test {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::add_group_role::{AddRoleConfig, AddRoleOperation};
+    use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
     use crate::add_user_to_group::{AddUserInput, AddUserOperation};
     use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
@@ -441,14 +441,14 @@ mod test {
             net_handle: None,
         };
 
-        let user_id = Ulid::new();
+        let admin_id = Ulid::new();
         let realm_id = RealmId([0u8; 32]);
         let node_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
 
         let realm_config = CreateRealmConfig {
             actor: aruna_core::structs::Actor {
                 node_id,
-                user_id,
+                user_id: admin_id,
                 realm_id: realm_id.clone(),
             },
             realm_description: "A description".to_string(),
@@ -456,6 +456,8 @@ mod test {
 
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let _result = drive(realm_operation, &context).await.unwrap();
+
+        let user_id = Ulid::new();
 
         let group_config = CreateGroupConfig {
             actor: aruna_core::structs::Actor {
@@ -470,7 +472,9 @@ mod test {
         let (group, group_auth_doc) = drive(group_operation, &context).await.unwrap();
         let group_id = group.group_id;
 
+        //
         // User is in group and has permissions
+        //
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
@@ -490,7 +494,9 @@ mod test {
         let check_result = drive(perm_operation, &context).await.unwrap();
         assert!(check_result);
 
+        //
         // User is not in group and has no permissions
+        //
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: Ulid::new(),
@@ -510,7 +516,9 @@ mod test {
         let check_result = drive(perm_operation, &context).await.unwrap();
         assert!(!check_result);
 
+        //
         // Group does not exist
+        //
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
@@ -529,7 +537,9 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(drive(perm_operation, &context).await.is_err());
 
+        //
         // User is in group and has not sufficient permissions
+        //
         let reader = Ulid::new();
         let add_user_input = AddUserInput {
             actor: Actor {
@@ -567,14 +577,18 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
 
+        //
         // User is in group and has viewer role
+        //
         perm_config.required_permission = Permission::READ;
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(drive(perm_operation, &context).await.unwrap());
 
+        //
         // Test DENY roles
+        //
         let denied_user = Ulid::new();
-        let add_role_input = AddRoleConfig {
+        let add_role_input = AddGroupRoleConfig {
             actor: Actor {
                 node_id,
                 user_id,
@@ -592,7 +606,7 @@ mod test {
             },
         };
 
-        let add_role_operation = AddRoleOperation::new(add_role_input.clone());
+        let add_role_operation = AddGroupRoleOperation::new(add_role_input.clone());
         let _result = drive(add_role_operation, &context).await.unwrap();
 
         let perm_config = CheckPermissionsConfig {
@@ -613,7 +627,9 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
 
-        // - User tries realm operation without realm role
+        //
+        // User tries realm operation without realm role
+        //
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: denied_user,
@@ -631,9 +647,27 @@ mod test {
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
 
+        //
+        // Admin tries realm operations
+        //
+        let perm_config = CheckPermissionsConfig {
+            auth_context: aruna_core::structs::AuthContext {
+                user_id: admin_id,
+                realm_id: realm_id.clone(),
+                path_restrictions: None,
+            },
+            path: format!(
+                "/{}/admin/roles/{}",
+                realm_id.to_string(),
+                Ulid::new().to_string()
+            ),
+            required_permission: Permission::WRITE,
+            realm_level_operation: None,
+        };
+        let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
+        assert!(drive(perm_operation, &context).await.unwrap());
+
         // TODO:
         // - User tries realm operation and has role
-        // - Admin tries realm operations
-        // - Blacklisted user tries realm operations
     }
 }

@@ -10,19 +10,19 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
-pub struct AddRoleConfig {
+pub struct AddGroupRoleConfig {
     pub actor: Actor,
     pub group_id: GroupId,
     pub role: Role,
 }
 
-pub struct AddRoleOperation {
-    input: AddRoleConfig,
-    state: AddRoleState,
-    output: Option<Result<(Group, GroupAuthorizationDocument), AddRoleError>>,
+pub struct AddGroupRoleOperation {
+    input: AddGroupRoleConfig,
+    state: AddGroupRoleState,
+    output: Option<Result<(Group, GroupAuthorizationDocument), AddGroupRoleError>>,
 }
 
-impl std::fmt::Debug for AddRoleOperation {
+impl std::fmt::Debug for AddGroupRoleOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AddRoleOperation")
             .field("input", &self.input)
@@ -33,7 +33,7 @@ impl std::fmt::Debug for AddRoleOperation {
 }
 
 #[derive(Debug, Clone)]
-pub enum AddRoleState {
+pub enum AddGroupRoleState {
     Init,
     StartTransaction,
     GetGroup {
@@ -62,7 +62,7 @@ pub enum AddRoleState {
 }
 
 #[derive(Debug, Error)]
-pub enum AddRoleError {
+pub enum AddGroupRoleError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -75,17 +75,17 @@ pub enum AddRoleError {
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: AddRoleState,
+        state: AddGroupRoleState,
         expected: &'static str,
         got: String,
     },
 }
 
-impl AddRoleOperation {
-    pub fn new(input: AddRoleConfig) -> Self {
-        AddRoleOperation {
+impl AddGroupRoleOperation {
+    pub fn new(input: AddGroupRoleConfig) -> Self {
+        AddGroupRoleOperation {
             input,
-            state: AddRoleState::Init,
+            state: AddGroupRoleState::Init,
             output: None,
         }
     }
@@ -94,7 +94,7 @@ impl AddRoleOperation {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
-                AddRoleState::StartTransaction,
+                AddGroupRoleState::StartTransaction,
                 "Event::Storage(StorageEvent::TransactionStarted)",
                 got,
             );
@@ -108,8 +108,8 @@ impl AddRoleOperation {
     fn emit_get_group(
         &mut self,
         txn_id: TxnId,
-    ) -> Result<aruna_core::types::Effects, AddRoleError> {
-        self.state = AddRoleState::GetGroup { txn_id };
+    ) -> Result<aruna_core::types::Effects, AddGroupRoleError> {
+        self.state = AddGroupRoleState::GetGroup { txn_id };
         let key = self.input.group_id.to_bytes().into();
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: GROUP_KEYSPACE.to_string(),
@@ -138,10 +138,10 @@ impl AddRoleOperation {
         &mut self,
         group: Option<ByteView>,
         txn_id: TxnId,
-    ) -> Result<aruna_core::types::Effects, AddRoleError> {
-        let group = Group::from_bytes(&group.ok_or_else(|| AddRoleError::GroupNotFound)?)?;
+    ) -> Result<aruna_core::types::Effects, AddGroupRoleError> {
+        let group = Group::from_bytes(&group.ok_or_else(|| AddGroupRoleError::GroupNotFound)?)?;
 
-        self.state = AddRoleState::GetAuthDoc { txn_id, group };
+        self.state = AddGroupRoleState::GetAuthDoc { txn_id, group };
 
         let key = self.input.group_id.to_bytes().into();
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
@@ -177,9 +177,9 @@ impl AddRoleOperation {
         txn_id: TxnId,
         mut group: Group,
         auth_doc: Option<ByteView>,
-    ) -> Result<aruna_core::types::Effects, AddRoleError> {
+    ) -> Result<aruna_core::types::Effects, AddGroupRoleError> {
         let mut auth_doc = GroupAuthorizationDocument::from_bytes(
-            &auth_doc.ok_or_else(|| AddRoleError::GroupNotFound)?,
+            &auth_doc.ok_or_else(|| AddGroupRoleError::GroupNotFound)?,
         )?;
         auth_doc
             .roles
@@ -190,7 +190,7 @@ impl AddRoleOperation {
         let key = group.group_id.to_bytes().into();
         let value = auth_doc.to_bytes(&self.input.actor)?.into();
 
-        self.state = AddRoleState::CreateRole {
+        self.state = AddGroupRoleState::CreateRole {
             txn_id,
             group,
             auth_doc,
@@ -231,11 +231,11 @@ impl AddRoleOperation {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
-    ) -> Result<aruna_core::types::Effects, AddRoleError> {
+    ) -> Result<aruna_core::types::Effects, AddGroupRoleError> {
         let key = group.group_id.to_bytes().into();
         let value = group.to_bytes(&self.input.actor)?.into();
 
-        self.state = AddRoleState::UpdateGroup {
+        self.state = AddGroupRoleState::UpdateGroup {
             txn_id,
             group,
             auth_doc,
@@ -264,7 +264,7 @@ impl AddRoleOperation {
                 got,
             );
         };
-        self.state = AddRoleState::CommitTransaction { group, auth_doc };
+        self.state = AddGroupRoleState::CommitTransaction { group, auth_doc };
 
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -283,37 +283,37 @@ impl AddRoleOperation {
                 got,
             );
         };
-        self.state = AddRoleState::Finish;
+        self.state = AddGroupRoleState::Finish;
         self.output = Some(Ok((group, auth_doc)));
 
         smallvec![]
     }
 
-    fn fail(&mut self, err: AddRoleError) -> aruna_core::types::Effects {
-        self.state = AddRoleState::Error;
+    fn fail(&mut self, err: AddGroupRoleError) -> aruna_core::types::Effects {
+        self.state = AddGroupRoleState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
     fn fail_with_cleanup(
         &mut self,
-        err: AddRoleError,
+        err: AddGroupRoleError,
         cleanup_effects: aruna_core::types::Effects,
     ) -> aruna_core::types::Effects {
-        self.state = AddRoleState::Error;
+        self.state = AddGroupRoleState::Error;
         self.output = Some(Err(err));
         cleanup_effects
     }
 
     fn unexpected_event(
         &mut self,
-        state: AddRoleState,
+        state: AddGroupRoleState,
         expected: &'static str,
         got: String,
     ) -> aruna_core::types::Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
-            AddRoleError::UnexpectedEvent {
+            AddGroupRoleError::UnexpectedEvent {
                 state,
                 expected,
                 got,
@@ -331,13 +331,13 @@ impl AddRoleOperation {
     }
 }
 
-impl Operation for AddRoleOperation {
+impl Operation for AddGroupRoleOperation {
     type Output = (Group, GroupAuthorizationDocument);
 
-    type Error = AddRoleError;
+    type Error = AddGroupRoleError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = AddRoleState::StartTransaction;
+        self.state = AddGroupRoleState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -351,44 +351,44 @@ impl Operation for AddRoleOperation {
         };
 
         match self.state.clone() {
-            AddRoleState::StartTransaction => self.handle_start_transaction(event),
-            AddRoleState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
-            AddRoleState::GetAuthDoc { txn_id, group } => {
+            AddGroupRoleState::StartTransaction => self.handle_start_transaction(event),
+            AddGroupRoleState::GetGroup { txn_id } => self.handle_get_group(event, txn_id),
+            AddGroupRoleState::GetAuthDoc { txn_id, group } => {
                 self.handle_get_auth_doc(event, txn_id, group)
             }
-            AddRoleState::CreateRole {
+            AddGroupRoleState::CreateRole {
                 txn_id,
                 group,
                 auth_doc,
             } => self.handle_create_role(event, txn_id, group, auth_doc),
-            AddRoleState::UpdateGroup {
+            AddGroupRoleState::UpdateGroup {
                 txn_id,
                 group,
                 auth_doc,
             } => self.handle_update_group(event, txn_id, group, auth_doc),
-            AddRoleState::CommitTransaction { group, auth_doc } => {
+            AddGroupRoleState::CommitTransaction { group, auth_doc } => {
                 self.handle_commit_transaction(event, group, auth_doc)
             }
-            AddRoleState::Init | AddRoleState::Finish | AddRoleState::Error => {
+            AddGroupRoleState::Init | AddGroupRoleState::Finish | AddGroupRoleState::Error => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(self.state, AddRoleState::Finish | AddRoleState::Error)
+        matches!(self.state, AddGroupRoleState::Finish | AddGroupRoleState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| AddRoleError::NotFinished)?
+        self.output.ok_or_else(|| AddGroupRoleError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
         match self.state {
-            AddRoleState::GetGroup { txn_id }
-            | AddRoleState::GetAuthDoc { txn_id, .. }
-            | AddRoleState::CreateRole { txn_id, .. }
-            | AddRoleState::UpdateGroup { txn_id, .. } => {
+            AddGroupRoleState::GetGroup { txn_id }
+            | AddGroupRoleState::GetAuthDoc { txn_id, .. }
+            | AddGroupRoleState::CreateRole { txn_id, .. }
+            | AddGroupRoleState::UpdateGroup { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
 
@@ -407,7 +407,7 @@ pub mod test {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::add_group_role::{AddRoleConfig, AddRoleOperation};
+    use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
 
@@ -436,7 +436,7 @@ pub mod test {
         let group_operation = CreateGroupOperation::new(group_config.clone());
         let result = drive(group_operation, &context).await.unwrap();
 
-        let add_role_input = AddRoleConfig {
+        let add_role_input = AddGroupRoleConfig {
             actor: Actor {
                 node_id,
                 user_id,
@@ -460,7 +460,7 @@ pub mod test {
             },
         };
 
-        let add_role_operation = AddRoleOperation::new(add_role_input.clone());
+        let add_role_operation = AddGroupRoleOperation::new(add_role_input.clone());
         let (group, auth_doc) = drive(add_role_operation, &context).await.unwrap();
 
         assert!(group.roles.contains(&add_role_input.role.role_id));
