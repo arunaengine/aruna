@@ -5,7 +5,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId,
-    RealmLevelOperation, Role,
+    Role,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use globset::Glob;
@@ -19,7 +19,6 @@ pub struct CheckPermissionsConfig {
     pub auth_context: AuthContext,
     pub path: String,
     pub required_permission: Permission,
-    pub realm_level_operation: Option<RealmLevelOperation>,
 }
 
 #[derive(Debug)]
@@ -400,6 +399,7 @@ mod test {
 
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
     use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
+    use crate::add_user_to_realm_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
     use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -455,7 +455,7 @@ mod test {
         };
 
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
-        let _result = drive(realm_operation, &context).await.unwrap();
+        let (_result, realm_auth_doc) = drive(realm_operation, &context).await.unwrap();
 
         let user_id = Ulid::new();
 
@@ -488,7 +488,6 @@ mod test {
                 Ulid::new().to_string()
             ),
             required_permission: Permission::WRITE,
-            realm_level_operation: None,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         let check_result = drive(perm_operation, &context).await.unwrap();
@@ -510,7 +509,6 @@ mod test {
                 Ulid::new().to_string()
             ),
             required_permission: Permission::WRITE,
-            realm_level_operation: None,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         let check_result = drive(perm_operation, &context).await.unwrap();
@@ -531,7 +529,6 @@ mod test {
                 Ulid::new(),
                 Ulid::new().to_string()
             ),
-            realm_level_operation: None,
             required_permission: Permission::WRITE,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
@@ -572,7 +569,6 @@ mod test {
                 Ulid::new().to_string()
             ),
             required_permission: Permission::WRITE,
-            realm_level_operation: None,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
@@ -622,7 +618,6 @@ mod test {
                 Ulid::new().to_string()
             ),
             required_permission: Permission::READ,
-            realm_level_operation: None,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
@@ -642,7 +637,6 @@ mod test {
                 Ulid::new().to_string()
             ),
             required_permission: Permission::READ,
-            realm_level_operation: None,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(!drive(perm_operation, &context).await.unwrap());
@@ -662,12 +656,48 @@ mod test {
                 Ulid::new().to_string()
             ),
             required_permission: Permission::WRITE,
-            realm_level_operation: None,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(drive(perm_operation, &context).await.unwrap());
 
-        // TODO:
-        // - User tries realm operation and has role
+        //
+        // User tries realm operation and has role
+        //
+        let admin_role = realm_auth_doc
+            .roles
+            .iter()
+            .filter_map(|(id, r)| if r.name == "admin" { Some(*id) } else { None })
+            .collect();
+        let new_admin = Ulid::new();
+
+        let add_user_input = AddUserToRealmRolesInput {
+            actor: Actor {
+                node_id,
+                user_id: admin_id,
+                realm_id: realm_id.clone(),
+            },
+            realm_id: realm_id.clone(),
+            user_id: new_admin,
+            role_ids: admin_role,
+        };
+
+        let add_user_operation = AddUserToRealmRolesOperation::new(add_user_input.clone());
+        let _auth_doc = drive(add_user_operation, &context).await.unwrap();
+
+        let perm_config = CheckPermissionsConfig {
+            auth_context: aruna_core::structs::AuthContext {
+                user_id: new_admin,
+                realm_id: realm_id.clone(),
+                path_restrictions: None,
+            },
+            path: format!(
+                "/{}/admin/roles/{}",
+                realm_id.to_string(),
+                Ulid::new().to_string()
+            ),
+            required_permission: Permission::WRITE,
+        };
+        let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
+        assert!(drive(perm_operation, &context).await.unwrap());
     }
 }
