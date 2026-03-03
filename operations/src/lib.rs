@@ -9,3 +9,5 @@ pub mod incoming_automerge;
 pub mod incoming_bao;
 pub mod incoming_gossip;
 pub mod list_groups;
+pub mod add_user_to_group;
+pub mod add_group_role;

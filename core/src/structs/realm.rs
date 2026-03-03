@@ -90,41 +90,41 @@ pub struct RealmAuthorizationDocument {
     #[autosurgeon(with = "autosurgeon_role_map")]
     pub roles: HashMap<RoleId, Role>,
     #[autosurgeon(with = "autosurgeon_operation_map")]
-    pub operation_restrictions: HashMap<Operation, HashSet<Ulid>>,
+    pub operation_restrictions: HashMap<RealmLevelOperation, HashSet<Ulid>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
-pub enum Operation {
+pub enum RealmLevelOperation {
     CreateGroup,
     ListGroups,
     ManageRealmRoles,
     ManageRealmConfig,
 }
 
-impl TryFrom<String> for Operation {
+impl TryFrom<String> for RealmLevelOperation {
     type Error = ConversionError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
         match value.as_str() {
-            "CreateGroup" => Ok(Operation::CreateGroup),
-            "ListGroups" => Ok(Operation::ListGroups),
-            "ManageRealmRoles" => Ok(Operation::ManageRealmRoles),
-            "ManageRealmConfig" => Ok(Operation::ManageRealmConfig),
+            "CreateGroup" => Ok(RealmLevelOperation::CreateGroup),
+            "ListGroups" => Ok(RealmLevelOperation::ListGroups),
+            "ManageRealmRoles" => Ok(RealmLevelOperation::ManageRealmRoles),
+            "ManageRealmConfig" => Ok(RealmLevelOperation::ManageRealmConfig),
             a => Err(ConversionError::InvalidOperationConversion(a.to_string())),
         }
     }
 }
 
-impl std::fmt::Display for Operation {
+impl std::fmt::Display for RealmLevelOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "{}",
             match self {
-                Operation::CreateGroup => "CreateGroup",
-                Operation::ListGroups => "ListGroups",
-                Operation::ManageRealmRoles => "ManageRealmRoles",
-                Operation::ManageRealmConfig => "ManageRealmConfig",
+                RealmLevelOperation::CreateGroup => "CreateGroup",
+                RealmLevelOperation::ListGroups => "ListGroups",
+                RealmLevelOperation::ManageRealmRoles => "ManageRealmRoles",
+                RealmLevelOperation::ManageRealmConfig => "ManageRealmConfig",
             }
         )
     }
@@ -190,18 +190,18 @@ pub mod autosurgeon_operation_map {
     use ulid::Ulid;
 
     use crate::errors::ConversionError;
-    use crate::structs::Operation;
+    use crate::structs::RealmLevelOperation;
     pub fn hydrate<'a, D: ReadDoc>(
         doc: &D,
         obj: &automerge::ObjId,
         prop: Prop<'a>,
-    ) -> Result<HashMap<Operation, HashSet<Ulid>>, HydrateError> {
+    ) -> Result<HashMap<RealmLevelOperation, HashSet<Ulid>>, HydrateError> {
         let inner: HashMap<String, HashMap<String, String>> = HashMap::hydrate(doc, obj, prop)?;
         let role_set = inner
             .into_iter()
             .map(
-                |(operation, users)| -> Result<(Operation, HashSet<Ulid>), ConversionError> {
-                    let operation: Operation = operation.try_into()?;
+                |(operation, users)| -> Result<(RealmLevelOperation, HashSet<Ulid>), ConversionError> {
+                    let operation: RealmLevelOperation = operation.try_into()?;
                     let user_map: Result<HashSet<Ulid>, ConversionError> = users
                         .iter()
                         .map(|(u, _)| {
@@ -212,14 +212,14 @@ pub mod autosurgeon_operation_map {
                     Ok((operation, user_map?))
                 },
             )
-            .collect::<Result<HashMap<Operation, HashSet<Ulid>>, ConversionError>>()
+            .collect::<Result<HashMap<RealmLevelOperation, HashSet<Ulid>>, ConversionError>>()
             .map_err(|e| {
                 HydrateError::unexpected("valid Ulid string", format!("Invalid Ulid {}", e))
             })?;
         Ok(role_set)
     }
     pub fn reconcile<R: Reconciler>(
-        operation_map: &HashMap<Operation, HashSet<Ulid>>,
+        operation_map: &HashMap<RealmLevelOperation, HashSet<Ulid>>,
         mut reconciler: R,
     ) -> Result<(), R::Error> {
         let mut map = reconciler.map()?;
