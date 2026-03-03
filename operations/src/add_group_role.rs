@@ -71,7 +71,7 @@ pub enum AddGroupRoleError {
     NoTransactionFound,
     #[error("No group found")]
     GroupNotFound,
-    #[error("Creating Group did not finish")]
+    #[error("Adding role to group did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {

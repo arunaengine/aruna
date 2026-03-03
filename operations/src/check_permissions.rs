@@ -399,7 +399,7 @@ mod test {
     use ulid::Ulid;
 
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
-    use crate::add_user_to_group::{AddUserInput, AddUserOperation};
+    use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
     use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -541,7 +541,7 @@ mod test {
         // User is in group and has not sufficient permissions
         //
         let reader = Ulid::new();
-        let add_user_input = AddUserInput {
+        let add_user_input = AddUserToGroupInput {
             actor: Actor {
                 node_id,
                 user_id,
@@ -556,7 +556,7 @@ mod test {
                 .collect(),
         };
 
-        let add_user_operation = AddUserOperation::new(add_user_input.clone());
+        let add_user_operation = AddUserToGroupOperation::new(add_user_input.clone());
         let _auth_doc = drive(add_user_operation, &context).await.unwrap();
 
         let mut perm_config = CheckPermissionsConfig {

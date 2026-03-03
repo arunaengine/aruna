@@ -60,7 +60,7 @@ pub enum AddRealmRoleError {
     NoTransactionFound,
     #[error("No realm authorization document found")]
     RealmAuthDocNotFound,
-    #[error("Creating Group did not finish")]
+    #[error("Adding role to realm did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {

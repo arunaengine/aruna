@@ -11,20 +11,20 @@ use std::collections::HashSet;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
-pub struct AddUserInput {
+pub struct AddUserToGroupInput {
     pub actor: Actor,
     pub group_id: GroupId,
     pub user_id: UserId,
     pub role_ids: HashSet<RoleId>,
 }
 
-pub struct AddUserOperation {
-    input: AddUserInput,
-    state: AddUserState,
-    output: Option<Result<GroupAuthorizationDocument, AddUserError>>,
+pub struct AddUserToGroupOperation {
+    input: AddUserToGroupInput,
+    state: AddUserToGroupState,
+    output: Option<Result<GroupAuthorizationDocument, AddUserToGroupError>>,
 }
 
-impl std::fmt::Debug for AddUserOperation {
+impl std::fmt::Debug for AddUserToGroupOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AddRoleOperation")
             .field("input", &self.input)
@@ -35,7 +35,7 @@ impl std::fmt::Debug for AddUserOperation {
 }
 
 #[derive(Debug, Clone)]
-pub enum AddUserState {
+pub enum AddUserToGroupState {
     Init,
     StartTransaction,
     GetAuthDoc {
@@ -53,7 +53,7 @@ pub enum AddUserState {
 }
 
 #[derive(Debug, Error)]
-pub enum AddUserError {
+pub enum AddUserToGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -64,21 +64,21 @@ pub enum AddUserError {
     RoleNotFound,
     #[error("Authorization document not found")]
     AuthDocNotFound,
-    #[error("Creating Group did not finish")]
+    #[error("Adding user to group did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: AddUserState,
+        state: AddUserToGroupState,
         expected: &'static str,
         got: String,
     },
 }
 
-impl AddUserOperation {
-    pub fn new(input: AddUserInput) -> Self {
-        AddUserOperation {
+impl AddUserToGroupOperation {
+    pub fn new(input: AddUserToGroupInput) -> Self {
+        AddUserToGroupOperation {
             input,
-            state: AddUserState::Init,
+            state: AddUserToGroupState::Init,
             output: None,
         }
     }
@@ -87,7 +87,7 @@ impl AddUserOperation {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
-                AddUserState::StartTransaction,
+                AddUserToGroupState::StartTransaction,
                 "Event::Storage(StorageEvent::TransactionStarted)",
                 got,
             );
@@ -101,8 +101,8 @@ impl AddUserOperation {
     fn emit_get_auth_doc(
         &mut self,
         txn_id: TxnId,
-    ) -> Result<aruna_core::types::Effects, AddUserError> {
-        self.state = AddUserState::GetAuthDoc { txn_id };
+    ) -> Result<aruna_core::types::Effects, AddUserToGroupError> {
+        self.state = AddUserToGroupState::GetAuthDoc { txn_id };
         let key = self.input.group_id.to_bytes().into();
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
             key_space: AUTH_KEYSPACE.to_string(),
@@ -131,22 +131,22 @@ impl AddUserOperation {
         &mut self,
         txn_id: TxnId,
         auth_doc: Option<ByteView>,
-    ) -> Result<aruna_core::types::Effects, AddUserError> {
+    ) -> Result<aruna_core::types::Effects, AddUserToGroupError> {
         let mut auth_doc = GroupAuthorizationDocument::from_bytes(
-            &auth_doc.ok_or_else(|| AddUserError::AuthDocNotFound)?,
+            &auth_doc.ok_or_else(|| AddUserToGroupError::AuthDocNotFound)?,
         )?;
         for role in &self.input.role_ids {
             let role = auth_doc
                 .roles
                 .get_mut(role)
-                .ok_or_else(|| AddUserError::RoleNotFound)?;
+                .ok_or_else(|| AddUserToGroupError::RoleNotFound)?;
             role.assigned_users.insert(self.input.user_id);
         }
 
         let key = auth_doc.group_id.to_bytes().into();
         let value = auth_doc.to_bytes(&self.input.actor)?.into();
 
-        self.state = AddUserState::UpdateAuthDoc { txn_id, auth_doc };
+        self.state = AddUserToGroupState::UpdateAuthDoc { txn_id, auth_doc };
 
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: AUTH_KEYSPACE.to_string(),
@@ -171,7 +171,7 @@ impl AddUserOperation {
             );
         };
 
-        self.state = AddUserState::CommitTransaction { auth_doc };
+        self.state = AddUserToGroupState::CommitTransaction { auth_doc };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
 
@@ -188,37 +188,37 @@ impl AddUserOperation {
                 got,
             );
         };
-        self.state = AddUserState::Finish;
+        self.state = AddUserToGroupState::Finish;
         self.output = Some(Ok(auth_doc));
 
         smallvec![]
     }
 
-    fn fail(&mut self, err: AddUserError) -> aruna_core::types::Effects {
-        self.state = AddUserState::Error;
+    fn fail(&mut self, err: AddUserToGroupError) -> aruna_core::types::Effects {
+        self.state = AddUserToGroupState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
     fn fail_with_cleanup(
         &mut self,
-        err: AddUserError,
+        err: AddUserToGroupError,
         cleanup_effects: aruna_core::types::Effects,
     ) -> aruna_core::types::Effects {
-        self.state = AddUserState::Error;
+        self.state = AddUserToGroupState::Error;
         self.output = Some(Err(err));
         cleanup_effects
     }
 
     fn unexpected_event(
         &mut self,
-        state: AddUserState,
+        state: AddUserToGroupState,
         expected: &'static str,
         got: String,
     ) -> aruna_core::types::Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
-            AddUserError::UnexpectedEvent {
+            AddUserToGroupError::UnexpectedEvent {
                 state,
                 expected,
                 got,
@@ -236,13 +236,13 @@ impl AddUserOperation {
     }
 }
 
-impl Operation for AddUserOperation {
+impl Operation for AddUserToGroupOperation {
     type Output = GroupAuthorizationDocument;
 
-    type Error = AddUserError;
+    type Error = AddUserToGroupError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = AddUserState::StartTransaction;
+        self.state = AddUserToGroupState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
@@ -256,31 +256,31 @@ impl Operation for AddUserOperation {
         };
 
         match self.state.clone() {
-            AddUserState::StartTransaction => self.handle_start_transaction(event),
-            AddUserState::GetAuthDoc { txn_id } => self.handle_get_auth_doc(event, txn_id),
-            AddUserState::UpdateAuthDoc { txn_id, auth_doc } => {
+            AddUserToGroupState::StartTransaction => self.handle_start_transaction(event),
+            AddUserToGroupState::GetAuthDoc { txn_id } => self.handle_get_auth_doc(event, txn_id),
+            AddUserToGroupState::UpdateAuthDoc { txn_id, auth_doc } => {
                 self.handle_update_auth_doc(event, txn_id, auth_doc)
             }
-            AddUserState::CommitTransaction { auth_doc } => {
+            AddUserToGroupState::CommitTransaction { auth_doc } => {
                 self.handle_commit_transaction(event, auth_doc)
             }
-            AddUserState::Init | AddUserState::Finish | AddUserState::Error => {
+            AddUserToGroupState::Init | AddUserToGroupState::Finish | AddUserToGroupState::Error => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(self.state, AddUserState::Finish | AddUserState::Error)
+        matches!(self.state, AddUserToGroupState::Finish | AddUserToGroupState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| AddUserError::NotFinished)?
+        self.output.ok_or_else(|| AddUserToGroupError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
         match self.state {
-            AddUserState::GetAuthDoc { txn_id } | AddUserState::UpdateAuthDoc { txn_id, .. } => {
+            AddUserToGroupState::GetAuthDoc { txn_id } | AddUserToGroupState::UpdateAuthDoc { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
 
@@ -297,7 +297,7 @@ pub mod test {
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::add_user_to_group::{AddUserInput, AddUserOperation};
+    use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
 
@@ -332,7 +332,7 @@ pub mod test {
             .filter_map(|(k, v)| if v.name == "user" { Some(*k) } else { None })
             .collect();
 
-        let add_user_input = AddUserInput {
+        let add_user_input = AddUserToGroupInput {
             actor: Actor {
                 node_id,
                 user_id,
@@ -343,7 +343,7 @@ pub mod test {
             role_ids: reader_writer_roles,
         };
 
-        let add_user_operation = AddUserOperation::new(add_user_input.clone());
+        let add_user_operation = AddUserToGroupOperation::new(add_user_input.clone());
         let auth_doc = drive(add_user_operation, &context).await.unwrap();
 
         assert!(
