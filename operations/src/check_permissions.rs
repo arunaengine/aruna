@@ -297,7 +297,7 @@ impl CheckPermissionsOperation {
     fn fail(&mut self, err: CheckPermissionsError) -> Effects {
         self.state = CheckPermissionsState::Error;
         self.output = Some(Err(err));
-        smallvec![]
+        self.abort()
     }
 
     fn fail_with_cleanup(

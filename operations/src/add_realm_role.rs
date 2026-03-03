@@ -189,7 +189,7 @@ impl AddRealmRoleOperation {
     fn fail(&mut self, err: AddRealmRoleError) -> aruna_core::types::Effects {
         self.state = AddRealmRoleState::Error;
         self.output = Some(Err(err));
-        smallvec![]
+        self.abort()
     }
 
     fn fail_with_cleanup(

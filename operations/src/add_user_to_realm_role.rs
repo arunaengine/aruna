@@ -197,7 +197,7 @@ impl AddUserToRealmRolesOperation {
     fn fail(&mut self, err: AddUserToRealmRolesError) -> aruna_core::types::Effects {
         self.state = AddUserToRealmRolesState::Error;
         self.output = Some(Err(err));
-        smallvec![]
+        self.abort()
     }
 
     fn fail_with_cleanup(

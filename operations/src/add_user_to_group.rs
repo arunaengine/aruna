@@ -197,7 +197,7 @@ impl AddUserToGroupOperation {
     fn fail(&mut self, err: AddUserToGroupError) -> aruna_core::types::Effects {
         self.state = AddUserToGroupState::Error;
         self.output = Some(Err(err));
-        smallvec![]
+        self.abort()
     }
 
     fn fail_with_cleanup(
@@ -264,23 +264,30 @@ impl Operation for AddUserToGroupOperation {
             AddUserToGroupState::CommitTransaction { auth_doc } => {
                 self.handle_commit_transaction(event, auth_doc)
             }
-            AddUserToGroupState::Init | AddUserToGroupState::Finish | AddUserToGroupState::Error => {
+            AddUserToGroupState::Init
+            | AddUserToGroupState::Finish
+            | AddUserToGroupState::Error => {
                 smallvec![]
             }
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(self.state, AddUserToGroupState::Finish | AddUserToGroupState::Error)
+        matches!(
+            self.state,
+            AddUserToGroupState::Finish | AddUserToGroupState::Error
+        )
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| AddUserToGroupError::NotFinished)?
+        self.output
+            .ok_or_else(|| AddUserToGroupError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
         match self.state {
-            AddUserToGroupState::GetAuthDoc { txn_id } | AddUserToGroupState::UpdateAuthDoc { txn_id, .. } => {
+            AddUserToGroupState::GetAuthDoc { txn_id }
+            | AddUserToGroupState::UpdateAuthDoc { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
 
