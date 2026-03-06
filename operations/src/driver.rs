@@ -116,6 +116,7 @@ mod test {
     use std::convert::Infallible;
     use tempfile::tempdir;
 
+    #[derive(Debug, PartialEq)]
     pub struct TestOperation {
         pub state: u8,
         pub txn_id: Option<aruna_core::types::TxnId>,
@@ -217,6 +218,7 @@ mod test {
         assert!(result.is_ok());
     }
 
+    #[derive(Debug, PartialEq)]
     struct EffectOrderOperation {
         observed: Vec<&'static str>,
     }
@@ -276,6 +278,7 @@ mod test {
         assert_eq!(observed, vec!["task", "search"]);
     }
 
+    #[derive(Debug, PartialEq)]
     struct RecursiveSubOperation {
         observed: Option<Event>,
     }

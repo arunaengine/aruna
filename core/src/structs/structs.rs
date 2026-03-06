@@ -76,7 +76,7 @@ pub struct PathRestriction {
     pub permission: Permission,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum NodeCapabilities {
     // This may seem redundant, but because we need both representations both
     // and need both on (nearly) every request, this mitigates unneeded conversions
@@ -147,7 +147,7 @@ impl NodeCapabilities {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AuthContext {
     pub user_id: UserId,
     pub realm_id: RealmId,
@@ -174,7 +174,7 @@ impl TryFrom<TokenClaims> for AuthContext {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct Actor {
     pub node_id: NodeId,
     pub user_id: UserId,

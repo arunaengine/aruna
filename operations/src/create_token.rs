@@ -8,7 +8,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateTokenConfig {
     pub time: u64,
     pub expiry: Option<u64>,
@@ -17,21 +17,21 @@ pub struct CreateTokenConfig {
     pub node_capabilities: NodeCapabilities,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct CreateTokenOperation {
     config: CreateTokenConfig,
     state: CreateTokenState,
     output: Option<Result<String, CreateTokenError>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum CreateTokenState {
     Init,
     Finish,
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum CreateTokenError {
     #[error("Node has no capability to create tokens")]
     NotEnoughCapabilities,
@@ -79,7 +79,6 @@ impl CreateTokenOperation {
             NodeCapabilities::Management {
                 realm_encoding_key, ..
             } => {
-
                 let claims = TokenClaims {
                     sub: format!(
                         "{}@{}",

@@ -3,7 +3,35 @@ use std::array::TryFromSliceError;
 use automerge::AutomergeError;
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
+pub enum AuthorizationError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    GlobError(#[from] globset::Error),
+    #[error("No transaction found")]
+    NoTransactionFound,
+    #[error("Invalid realm id")]
+    InvalidRealmId,
+    #[error("Invalid group id")]
+    InvalidGroupId,
+    #[error("No group found")]
+    GroupNotFound,
+    #[error("No group found")]
+    AuthDocNotFound,
+    #[error("Creating Group did not finish")]
+    NotFinished,
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: String,
+    },
+}
+
+#[derive(Debug, Error, PartialEq)]
 pub enum StorageError {
     #[error("Key not found")]
     KeyNotFound,
@@ -25,7 +53,7 @@ pub enum StorageError {
     InvalidEffect,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum DhtError {
     #[error("Key not found")]
     KeyNotFound,
@@ -37,7 +65,7 @@ pub enum DhtError {
     Other(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum GossipError {
     #[error("Already subscribed")]
     AlreadySubscribed,
@@ -49,7 +77,7 @@ pub enum GossipError {
     Other(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum StreamError {
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
@@ -87,4 +115,10 @@ pub enum ConversionError {
     HydrateError(#[from] autosurgeon::HydrateError),
     #[error(transparent)]
     AutomergeError(#[from] AutomergeError),
+}
+
+impl PartialEq for ConversionError {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
+    }
 }

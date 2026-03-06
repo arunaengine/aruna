@@ -9,12 +9,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GetGroupConfig {
     pub group_id: GroupId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct GetGroupOperation {
     config: GetGroupConfig,
     txn_id: Option<Ulid>,
@@ -190,7 +190,7 @@ impl GetGroupOperation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GetGroupState {
     Init,
     StartTransaction,
@@ -201,7 +201,7 @@ pub enum GetGroupState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum GetGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),

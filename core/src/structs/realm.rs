@@ -64,7 +64,7 @@ impl fmt::Display for RealmId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Hydrate, Reconcile)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hydrate, Reconcile, PartialEq)]
 pub struct Realm {
     #[autosurgeon(with = "autosurgeon_realm_id")]
     pub realm_id: RealmId,

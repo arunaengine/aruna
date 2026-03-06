@@ -10,7 +10,7 @@ use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AddUserToGroupInput {
     pub actor: Actor,
     pub group_id: GroupId,
@@ -18,6 +18,7 @@ pub struct AddUserToGroupInput {
     pub role_ids: HashSet<RoleId>,
 }
 
+#[derive(PartialEq)]
 pub struct AddUserToGroupOperation {
     input: AddUserToGroupInput,
     state: AddUserToGroupState,
@@ -34,7 +35,7 @@ impl std::fmt::Debug for AddUserToGroupOperation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AddUserToGroupState {
     Init,
     StartTransaction,
@@ -52,7 +53,7 @@ pub enum AddUserToGroupState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum AddUserToGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),

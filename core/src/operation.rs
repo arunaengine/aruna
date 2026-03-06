@@ -1,8 +1,10 @@
+use std::any::Any;
+
 use crate::{events::Event, types::Effects};
 
-pub trait Operation: Send {
-    type Output: Send;
-    type Error: Send;
+pub trait Operation: Send + std::fmt::Debug + PartialEq {
+    type Output: Send + std::fmt::Debug;
+    type Error: Send + std::fmt::Debug;
 
     fn start(&mut self) -> Effects;
     fn step(&mut self, events: Event) -> Effects;
@@ -11,12 +13,20 @@ pub trait Operation: Send {
     fn abort(&mut self) -> Effects;
 }
 
-pub trait SubOperation: Send {
+pub trait SubOperation: Send + std::fmt::Debug {
     fn start(&mut self) -> Effects;
     fn step(&mut self, event: Event) -> Effects;
     fn is_complete(&self) -> bool;
     fn finalize(self: Box<Self>) -> Event;
     fn abort(&mut self) -> Effects;
+    fn as_any(&self) -> &dyn Any;
+    fn eq_dyn(&self, other: &dyn SubOperation) -> bool;
+}
+
+impl PartialEq for dyn SubOperation {
+    fn eq(&self, other: &Self) -> bool {
+        self.eq_dyn(other)
+    }
 }
 
 struct MappedSubOperation<O, F>
@@ -26,6 +36,28 @@ where
 {
     operation: Option<O>,
     map_result: Option<F>,
+}
+
+impl<O, F> PartialEq for MappedSubOperation<O, F>
+where
+    O: Operation,
+    F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
+{
+    fn eq(&self, other: &Self) -> bool {
+        self.operation == other.operation
+    }
+}
+
+impl<O, F> std::fmt::Debug for MappedSubOperation<O, F>
+where
+    O: Operation,
+    F: FnOnce(Result<O::Output, O::Error>) -> Event + Send,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MappedSubOperation")
+            .field("operation", &self.operation)
+            .finish()
+    }
 }
 
 impl<O, F> MappedSubOperation<O, F>
@@ -87,6 +119,16 @@ where
             .as_mut()
             .expect("suboperation must be present in abort")
             .abort()
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    fn eq_dyn(&self, other: &dyn SubOperation) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<MappedSubOperation<O, F>>()
+            .is_some_and(|o| self == o)
     }
 }
 

@@ -21,3 +21,4 @@ hex = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 ed25519-dalek = { workspace = true }
+globset = { workspace = true }

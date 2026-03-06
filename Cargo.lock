@@ -135,6 +135,7 @@ dependencies = [
  "blake3",
  "byteview",
  "ed25519-dalek 2.2.0",
+ "globset",
  "hex",
  "iroh",
  "iroh-gossip",

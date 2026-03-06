@@ -9,12 +9,13 @@ use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
     pub actor: Actor,
     pub display_name: String,
 }
 
+#[derive(PartialEq)]
 pub struct CreateGroupOperation {
     config: CreateGroupConfig,
     group: Option<Group>,
@@ -215,7 +216,7 @@ impl CreateGroupOperation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CreateGroupState {
     Init,
     StartTransaction,
@@ -226,7 +227,7 @@ pub enum CreateGroupState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum CreateGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),

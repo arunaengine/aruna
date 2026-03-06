@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ListGroupOperation {
     txn_id: Option<Ulid>,
     output: Option<Result<Vec<Group>, ListGroupError>>,
@@ -158,7 +158,7 @@ impl ListGroupOperation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ListGroupState {
     Init,
     StartTransaction,
@@ -168,7 +168,7 @@ pub enum ListGroupState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum ListGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),

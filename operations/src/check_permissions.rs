@@ -1,38 +1,36 @@
 use aruna_core::consts::AUTH_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId,
-    Role,
+    AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId, Role,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
 use globset::Glob;
 use smallvec::smallvec;
 use std::collections::HashMap;
-use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CheckPermissionsConfig {
     pub auth_context: AuthContext,
     pub path: String,
     pub required_permission: Permission,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct CheckPermissionsOperation {
     config: CheckPermissionsConfig,
     txn_id: Option<TxnId>,
     group_id: Option<Ulid>,
     realm_auth_doc: Option<RealmAuthorizationDocument>,
     group_auth_doc: Option<GroupAuthorizationDocument>,
-    output: Option<Result<bool, CheckPermissionsError>>,
+    output: Option<Result<bool, AuthorizationError>>,
     state: CheckPermissionsState,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CheckPermissionsState {
     Init,
     StartTransaction,
@@ -43,32 +41,24 @@ pub enum CheckPermissionsState {
     Error,
 }
 
-#[derive(Debug, Error)]
-pub enum CheckPermissionsError {
-    #[error(transparent)]
-    StorageError(#[from] StorageError),
-    #[error(transparent)]
-    ConversionError(#[from] ConversionError),
-    #[error(transparent)]
-    GlobError(#[from] globset::Error),
-    #[error("No transaction found")]
-    NoTransactionFound,
-    #[error("Invalid realm id")]
-    InvalidRealmId,
-    #[error("Invalid group id")]
-    InvalidGroupId,
-    #[error("No group found")]
-    GroupNotFound,
-    #[error("No group found")]
-    AuthDocNotFound,
-    #[error("Creating Group did not finish")]
-    NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: CheckPermissionsState,
-        expected: &'static str,
-        got: String,
-    },
+impl std::fmt::Display for CheckPermissionsState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                CheckPermissionsState::Init => "CheckPermissionsState::Init",
+                CheckPermissionsState::StartTransaction =>
+                    "CheckPermissionsState::StartTransaction",
+                CheckPermissionsState::GetRealmAuthDoc => "CheckPermissionsState::GetRealmAuthDoc",
+                CheckPermissionsState::GetGroupAuthDoc => "CheckPermissionsState::GetGroupAuthDoc",
+                CheckPermissionsState::CheckPermissions =>
+                    "CheckPermissionsState::CheckPermissions",
+                CheckPermissionsState::Finish => "CheckPermissionsState::Finish",
+                CheckPermissionsState::Error => "CheckPermissionsState::Error",
+            }
+        )
+    }
 }
 
 impl CheckPermissionsOperation {
@@ -166,13 +156,13 @@ impl CheckPermissionsOperation {
         }
     }
 
-    fn parse_path(path: &str) -> Result<(RealmId, Option<GroupId>), CheckPermissionsError> {
+    fn parse_path(path: &str) -> Result<(RealmId, Option<GroupId>), AuthorizationError> {
         let mut levels = path.split("/");
         levels.next();
         let realm = levels
             .next()
             .and_then(|rid| RealmId::from_base64(rid).ok())
-            .ok_or_else(|| CheckPermissionsError::InvalidRealmId)?;
+            .ok_or_else(|| AuthorizationError::InvalidRealmId)?;
 
         let separator = levels.next();
 
@@ -185,7 +175,7 @@ impl CheckPermissionsOperation {
         Ok((realm, group))
     }
 
-    fn get_realm_auth_doc(&mut self) -> Result<Effects, CheckPermissionsError> {
+    fn get_realm_auth_doc(&mut self) -> Result<Effects, AuthorizationError> {
         self.state = CheckPermissionsState::GetRealmAuthDoc;
         let (realm, group) = CheckPermissionsOperation::parse_path(&self.config.path)?;
         self.group_id = group;
@@ -199,9 +189,9 @@ impl CheckPermissionsOperation {
     fn emit_realm_auth_doc(
         &mut self,
         value: Option<byteview::ByteView>,
-    ) -> Result<Effects, CheckPermissionsError> {
+    ) -> Result<Effects, AuthorizationError> {
         self.realm_auth_doc = Some(RealmAuthorizationDocument::from_bytes(
-            &value.ok_or_else(|| CheckPermissionsError::AuthDocNotFound)?,
+            &value.ok_or_else(|| AuthorizationError::AuthDocNotFound)?,
         )?);
 
         match self.group_id {
@@ -219,7 +209,7 @@ impl CheckPermissionsOperation {
                     StorageEffect::CommitTransaction {
                         txn_id: self
                             .txn_id
-                            .ok_or_else(|| CheckPermissionsError::NoTransactionFound)?
+                            .ok_or_else(|| AuthorizationError::NoTransactionFound)?
                     }
                 )])
             }
@@ -229,33 +219,33 @@ impl CheckPermissionsOperation {
     fn emit_group_auth_doc(
         &mut self,
         value: Option<byteview::ByteView>,
-    ) -> Result<Effects, CheckPermissionsError> {
+    ) -> Result<Effects, AuthorizationError> {
         self.state = CheckPermissionsState::CheckPermissions;
         self.group_auth_doc = Some(GroupAuthorizationDocument::from_bytes(
-            &value.ok_or_else(|| CheckPermissionsError::AuthDocNotFound)?,
+            &value.ok_or_else(|| AuthorizationError::AuthDocNotFound)?,
         )?);
 
         Ok(smallvec![Effect::Storage(
             StorageEffect::CommitTransaction {
                 txn_id: self
                     .txn_id
-                    .ok_or_else(|| CheckPermissionsError::NoTransactionFound)?
+                    .ok_or_else(|| AuthorizationError::NoTransactionFound)?
             }
         )])
     }
 
-    fn emit_check_permissions(&mut self) -> Result<Effects, CheckPermissionsError> {
+    fn emit_check_permissions(&mut self) -> Result<Effects, AuthorizationError> {
         self.state = CheckPermissionsState::Finish;
         let roles = self.collect_roles()?;
         self.output = Some(self.check_permissions(roles));
         Ok(smallvec![])
     }
 
-    fn collect_roles(&mut self) -> Result<HashMap<Ulid, Role>, CheckPermissionsError> {
+    fn collect_roles(&mut self) -> Result<HashMap<Ulid, Role>, AuthorizationError> {
         let mut roles = self
             .realm_auth_doc
             .as_ref()
-            .ok_or_else(|| CheckPermissionsError::AuthDocNotFound)?
+            .ok_or_else(|| AuthorizationError::AuthDocNotFound)?
             .roles
             .clone();
         if let Some(group) = &self.group_auth_doc {
@@ -271,7 +261,7 @@ impl CheckPermissionsOperation {
     fn check_permissions(
         &mut self,
         roles: HashMap<Ulid, Role>,
-    ) -> Result<bool, CheckPermissionsError> {
+    ) -> Result<bool, AuthorizationError> {
         let mut allowed = false;
         for (_, role) in roles {
             for (path, permission) in role.permissions {
@@ -294,17 +284,13 @@ impl CheckPermissionsOperation {
         Ok(allowed)
     }
 
-    fn fail(&mut self, err: CheckPermissionsError) -> Effects {
+    fn fail(&mut self, err: AuthorizationError) -> Effects {
         self.state = CheckPermissionsState::Error;
         self.output = Some(Err(err));
         self.abort()
     }
 
-    fn fail_with_cleanup(
-        &mut self,
-        err: CheckPermissionsError,
-        cleanup_effects: Effects,
-    ) -> Effects {
+    fn fail_with_cleanup(&mut self, err: AuthorizationError, cleanup_effects: Effects) -> Effects {
         self.state = CheckPermissionsState::Error;
         self.output = Some(Err(err));
         cleanup_effects
@@ -318,8 +304,8 @@ impl CheckPermissionsOperation {
     ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
-            CheckPermissionsError::UnexpectedEvent {
-                state,
+            AuthorizationError::UnexpectedEvent {
+                state: state.to_string(),
                 expected,
                 got,
             },
@@ -339,7 +325,7 @@ impl CheckPermissionsOperation {
 impl Operation for CheckPermissionsOperation {
     type Output = bool;
 
-    type Error = CheckPermissionsError;
+    type Error = AuthorizationError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
         self.state = CheckPermissionsState::StartTransaction;
@@ -374,8 +360,7 @@ impl Operation for CheckPermissionsOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output
-            .ok_or_else(|| CheckPermissionsError::NotFinished)?
+        self.output.ok_or_else(|| AuthorizationError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
@@ -585,6 +570,12 @@ mod test {
         //
         let denied_user = Ulid::new();
         let add_role_input = AddGroupRoleConfig {
+            auth_context: aruna_core::structs::AuthContext {
+                user_id,
+                realm_id: realm_id.clone(),
+                path_restrictions: None,
+            },
+            realm_id: realm_id.clone(),
             actor: Actor {
                 node_id,
                 user_id,

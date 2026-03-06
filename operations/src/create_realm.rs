@@ -8,12 +8,13 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {
     pub actor: Actor,
     pub realm_description: String,
 }
 
+#[derive(PartialEq)]
 pub struct CreateRealmOperation {
     config: CreateRealmConfig,
     txn_id: Option<Ulid>,
@@ -205,7 +206,7 @@ impl CreateRealmOperation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CreateRealmState {
     Init,
     StartTransaction,
@@ -216,7 +217,7 @@ pub enum CreateRealmState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum CreateRealmError {
     #[error(transparent)]
     StorageError(#[from] StorageError),

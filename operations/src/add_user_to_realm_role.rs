@@ -10,7 +10,7 @@ use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AddUserToRealmRolesInput {
     pub actor: Actor,
     pub realm_id: RealmId,
@@ -18,6 +18,7 @@ pub struct AddUserToRealmRolesInput {
     pub role_ids: HashSet<RoleId>,
 }
 
+#[derive(PartialEq)]
 pub struct AddUserToRealmRolesOperation {
     input: AddUserToRealmRolesInput,
     state: AddUserToRealmRolesState,
@@ -34,7 +35,7 @@ impl std::fmt::Debug for AddUserToRealmRolesOperation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AddUserToRealmRolesState {
     Init,
     StartTransaction,
@@ -52,7 +53,7 @@ pub enum AddUserToRealmRolesState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum AddUserToRealmRolesError {
     #[error(transparent)]
     StorageError(#[from] StorageError),

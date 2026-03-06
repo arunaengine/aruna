@@ -9,13 +9,14 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AddRealmRoleConfig {
     pub actor: Actor,
     pub realm_id: RealmId,
     pub role: Role,
 }
 
+#[derive(PartialEq)]
 pub struct AddRealmRoleOperation {
     input: AddRealmRoleConfig,
     state: AddRealmRoleState,
@@ -32,7 +33,7 @@ impl std::fmt::Debug for AddRealmRoleOperation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AddRealmRoleState {
     Init,
     StartTransaction,
@@ -50,7 +51,7 @@ pub enum AddRealmRoleState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum AddRealmRoleError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
@@ -288,14 +289,14 @@ impl Operation for AddRealmRoleOperation {
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
+    use crate::add_realm_role::{AddRealmRoleConfig, AddRealmRoleOperation};
+    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use crate::driver::{DriverContext, drive};
     use aruna_core::structs::{Actor, Permission, Role};
     use aruna_storage::storage;
     use iroh::PublicKey;
     use tempfile::tempdir;
     use ulid::Ulid;
-    use crate::add_realm_role::{AddRealmRoleConfig, AddRealmRoleOperation};
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
 
     #[tokio::test]
     pub async fn test_add_role() {
