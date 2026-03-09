@@ -1,4 +1,34 @@
+use std::array::TryFromSliceError;
+use automerge::AutomergeError;
 use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum AuthorizationError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    GlobError(#[from] globset::Error),
+    #[error("No transaction found")]
+    NoTransactionFound,
+    #[error("Invalid realm id")]
+    InvalidRealmId,
+    #[error("Invalid group id")]
+    InvalidGroupId,
+    #[error("No group found")]
+    GroupNotFound,
+    #[error("No group found")]
+    AuthDocNotFound,
+    #[error("Creating Group did not finish")]
+    NotFinished,
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: String,
+    },
+}
 
 #[derive(Debug, Error)]
 pub enum BlobError {
@@ -20,7 +50,7 @@ pub enum BlobError {
     DeleteError(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum StorageError {
     #[error("Key not found")]
     KeyNotFound,
@@ -42,7 +72,7 @@ pub enum StorageError {
     InvalidEffect,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum DhtError {
     #[error("Key not found")]
     KeyNotFound,
@@ -54,7 +84,7 @@ pub enum DhtError {
     Other(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum GossipError {
     #[error("Already subscribed")]
     AlreadySubscribed,
@@ -66,7 +96,7 @@ pub enum GossipError {
     Other(String),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum StreamError {
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
@@ -79,6 +109,14 @@ pub enum StreamError {
 #[derive(Debug, Error)]
 pub enum ConversionError {
     #[error(transparent)]
+    UlidDecodeError(#[from] ulid::DecodeError),
+    #[error(transparent)]
+    Base64DecodeError(#[from] base64::DecodeError),
+    #[error("`{0}`")]
+    InvalidLength(String),
+    #[error("Invalid UserId")]
+    InvalidUserId,
+    #[error(transparent)]
     PostcardError(#[from] postcard::Error),
     #[error(transparent)]
     FromUtf8Error(#[from] std::string::FromUtf8Error),
@@ -89,11 +127,27 @@ pub enum ConversionError {
     #[error(transparent)]
     ParseIntError(#[from] std::num::ParseIntError),
     #[error(transparent)]
-    TryFromSliceError(#[from] std::array::TryFromSliceError),
+    TryFromSliceError(#[from] TryFromSliceError),
+    #[error(transparent)]
+    PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
+    #[error(transparent)]
+    FromSliceError(#[from] TryFromSliceError),
+    #[error(transparent)]
+    PublicKeyConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    #[error(transparent)]
+    PrivateKeyConversionError(#[from] ed25519_dalek::pkcs8::Error),
+    #[error("Invalid string `{0}` for Operation")]
+    InvalidOperationConversion(String),
+    #[error(transparent)]
+    ReconcileError(#[from] autosurgeon::ReconcileError),
+    #[error(transparent)]
+    HydrateError(#[from] autosurgeon::HydrateError),
+    #[error(transparent)]
+    AutomergeError(#[from] AutomergeError),
 }
 
-#[derive(Debug, Error)]
-pub enum ParseRealmIdError {
-    #[error("Parsing error {0}")]
-    ParsingError(String),
+impl PartialEq for ConversionError {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
+    }
 }

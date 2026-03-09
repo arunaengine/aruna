@@ -6,9 +6,17 @@ use smallvec::smallvec;
 use std::convert::Infallible;
 use tracing::info;
 
+#[derive(Debug)]
 pub struct IncomingBaoOperation {
     stream: Option<BiStream>,
     node_id: NodeId,
+}
+
+impl PartialEq for IncomingBaoOperation {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream.as_ref().map(|_| ()) == other.stream.as_ref().map(|_| ())
+            && self.node_id == other.node_id
+    }
 }
 
 impl IncomingBaoOperation {

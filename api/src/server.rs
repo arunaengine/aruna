@@ -1,46 +1,56 @@
-use crate::auth::OidcValidator;
-use crate::openapi::ApiDoc;
-use aruna_core::structs::RealmId;
-use aruna_operations::driver::DriverContext;
+use crate::error::ServerSetupError;
+use crate::routes::rest_router;
+use crate::server_state::{ServerState, swagger_ui};
+use axum::Router;
+use axum::response::Redirect;
+use std::net::SocketAddr;
 use std::sync::Arc;
-use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
+use tokio::net::TcpListener;
 
 #[derive(Clone, Debug)]
-pub struct ServerState {
-    driver_ctx: Arc<DriverContext>,
-    realm_keypair: Option<[u8; 64]>,
-    realm_id: Option<RealmId>,
-    oidc_validator: Option<Arc<OidcValidator>>,
+pub struct Server {
+    state: Arc<ServerState>,
+    config: ServerConfig,
 }
 
-impl ServerState {
-    pub fn new(
-        driver_ctx: Arc<DriverContext>,
-        realm_keypair: Option<[u8; 64]>,
-        realm_id: Option<RealmId>,
-        oidc_validator: Option<Arc<OidcValidator>>,
-    ) -> Self {
-        Self {
-            driver_ctx,
-            realm_keypair,
-            realm_id,
-            oidc_validator,
-        }
-    }
-    pub fn get_ctx(&self) -> Arc<DriverContext> {
-        self.driver_ctx.clone()
-    }
-    pub fn get_keypair(&self) -> Option<[u8; 64]> {
-        self.realm_keypair
-    }
+#[derive(Clone, Debug)]
+pub struct ServerConfig {
+    pub http_addr: SocketAddr,
 }
 
-/// Create the SwaggerUI router for API documentation.
-///
-/// Provides two separate OpenAPI specs:
-/// - `/api-docs/openapi.json` - REST & Admin API
-/// - `/api-docs/s3-openapi.json` - S3-compatible API
-pub fn swagger_ui() -> SwaggerUi {
-    SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi())
+impl Server {
+    pub fn new(state: Arc<ServerState>, config: ServerConfig) -> Self {
+        Self { state, config }
+    }
+    pub fn build_router(&self) -> Router {
+        // Build the main API router
+        let api_v1 = Router::new().merge(rest_router(self.state.clone()));
+
+        // Build the root router with body size limit for REST API
+        let router = Router::new()
+            .route(
+                "/",
+                axum::routing::get(|| async { Redirect::permanent("/swagger-ui") }),
+            )
+            .nest("/api/v1", api_v1)
+            .merge(swagger_ui());
+
+        router
+    }
+
+    pub async fn run(self) -> Result<(), ServerSetupError> {
+        let router = self.build_router();
+
+        // Create TCP listener for main HTTP server
+        let listener = TcpListener::bind(self.config.http_addr).await?;
+
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .map_err(|e| ServerSetupError::Runtime(e.to_string()))?;
+
+        Ok(())
+    }
 }

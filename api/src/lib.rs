@@ -4,3 +4,4 @@ pub mod openapi;
 pub mod routes;
 pub mod s3;
 pub mod server;
+pub mod server_state;

@@ -1,7 +1,7 @@
-use crate::auth::{AuthContext, auth_middleware};
+use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::server::ServerState;
-use aruna_core::structs::{AuthorizationDocument, Group};
+use crate::server_state::ServerState;
+use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
@@ -18,7 +18,7 @@ use ulid::Ulid;
 use utoipa::ToSchema;
 
 /// Build the group routes.
-pub fn router(state: Arc<ServerState>) -> Router {
+pub fn rest_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .route("/groups/{id}", get(get_group))
         .route("/groups", post(create_group))
@@ -50,7 +50,7 @@ pub struct RoleResponse {
     pub assigned_users: Vec<String>,
 }
 
-fn map_roles(auth: AuthorizationDocument) -> Vec<RoleResponse> {
+fn map_roles(auth: GroupAuthorizationDocument) -> Vec<RoleResponse> {
     auth.roles
         .into_iter()
         .map(|(role_id, role)| RoleResponse {
@@ -66,8 +66,8 @@ fn map_roles(auth: AuthorizationDocument) -> Vec<RoleResponse> {
         .collect()
 }
 
-impl From<(Group, AuthorizationDocument)> for CreateGroupResponse {
-    fn from((group, auth): (Group, AuthorizationDocument)) -> Self {
+impl From<(Group, GroupAuthorizationDocument)> for CreateGroupResponse {
+    fn from((group, auth): (Group, GroupAuthorizationDocument)) -> Self {
         CreateGroupResponse {
             display_name: group.display_name,
             group_id: group.group_id.to_string(),
@@ -103,9 +103,14 @@ pub async fn create_group(
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
 
-    let config = CreateGroupConfig {
+    let actor = Actor {
+        node_id: state.get_node_id(),
         user_id: auth.user_id,
-        realm_id: auth.realm_id,
+        realm_id: state.get_realm_id(),
+    };
+
+    let config = CreateGroupConfig {
+        actor,
         display_name: request.name,
     };
     let result = drive(CreateGroupOperation::new(config), &state.get_ctx())
@@ -210,8 +215,8 @@ pub struct GroupInfoResponse {
     pub roles: Vec<RoleResponse>,
 }
 
-impl From<(Group, AuthorizationDocument)> for GroupInfoResponse {
-    fn from((group, auth): (Group, AuthorizationDocument)) -> Self {
+impl From<(Group, GroupAuthorizationDocument)> for GroupInfoResponse {
+    fn from((group, auth): (Group, GroupAuthorizationDocument)) -> Self {
         GroupInfoResponse {
             display_name: group.display_name,
             group_id: group.group_id.to_string(),

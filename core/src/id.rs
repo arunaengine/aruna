@@ -83,7 +83,7 @@ impl From<[u8; 32]> for DhtKeyId {
 
 /// Topic identifier for gossip pub/sub with semantic prefixes.
 /// Format: prefix byte + payload, hashed to 32 bytes for network use.
-#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum TopicId {
     /// Realm-scoped topic (prefix 'r')
     Realm(Ulid),

@@ -1,10 +1,10 @@
 use aruna_core::effects::{DhtEffect, GossipEffect, NetEffect, StreamEffect};
 use aruna_core::events::{DhtEvent, GossipEvent, NetEvent, StreamEvent};
 
-use crate::{DhtService, GossipService};
+use crate::{DhtHandle, GossipService};
 
 pub async fn handle_net_effect(
-    dht: &DhtService,
+    dht: &DhtHandle,
     gossip: &GossipService,
     effect: NetEffect,
 ) -> NetEvent {
@@ -15,7 +15,7 @@ pub async fn handle_net_effect(
     }
 }
 
-async fn handle_dht_effect(dht: &DhtService, effect: DhtEffect) -> NetEvent {
+async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
     match effect {
         DhtEffect::Put { key, value, ttl } => {
             let key_id = aruna_core::id::DhtKeyId::from_bytes(key);

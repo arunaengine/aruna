@@ -5,7 +5,7 @@ use smallvec::smallvec;
 use std::convert::Infallible;
 use tracing::info;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct IncomingGossipOperation {
     topic: TopicId,
     sender: NodeId,

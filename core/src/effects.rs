@@ -9,6 +9,7 @@ use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 use bytes::Bytes;
 use std::ops::Range;
 
+#[derive(Debug, PartialEq)]
 pub enum Effect {
     Blob(BlobEffect),
     Storage(StorageEffect),
@@ -38,6 +39,7 @@ pub enum BlobEffect {
     },
 }
 
+#[derive(Debug, PartialEq)]
 pub enum StorageEffect {
     StartTransaction {
         read: bool,
@@ -79,14 +81,14 @@ pub enum StorageEffect {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
     Gossip(GossipEffect),
     Stream(StreamEffect),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DhtEffect {
     Put {
         key: DhtKey,
@@ -98,14 +100,14 @@ pub enum DhtEffect {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GossipEffect {
     Subscribe { topic: TopicId },
     Broadcast { topic: TopicId, message: Vec<u8> },
     Unsubscribe { topic: TopicId },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StreamEffect {
     Open { node_id: NodeId, alpn: Alpn },
     Close { stream_id: u64 },

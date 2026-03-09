@@ -121,4 +121,56 @@ mod tests {
             panic!("wrong variant");
         }
     }
+
+    #[test]
+    fn test_put_value_request_roundtrip_with_signature() {
+        let publisher_secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let publisher = publisher_secret.public();
+
+        let key = DhtKeyId::from_data(b"signed-put");
+        let value = b"payload".to_vec();
+        let ttl_secs: u64 = 42;
+
+        let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
+        signed_data.extend_from_slice(key.as_bytes());
+        signed_data.extend_from_slice(&value);
+        signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+        let signature = publisher_secret.sign(&signed_data);
+
+        let req = DhtRequest::PutValue {
+            key,
+            value: value.clone(),
+            ttl_secs,
+            publisher,
+            signature: Some(signature),
+        };
+        let bytes = encode_request(&req).expect("encode request");
+        let decoded = decode_request(&bytes).expect("decode request");
+
+        match decoded {
+            DhtRequest::PutValue {
+                key: decoded_key,
+                value: decoded_value,
+                ttl_secs: decoded_ttl,
+                publisher: decoded_publisher,
+                signature: Some(decoded_signature),
+            } => {
+                assert_eq!(decoded_key, key);
+                assert_eq!(decoded_value, value);
+                assert_eq!(decoded_ttl, ttl_secs);
+                assert_eq!(decoded_publisher, publisher);
+
+                let mut verify_data = Vec::with_capacity(32 + decoded_value.len() + 8);
+                verify_data.extend_from_slice(decoded_key.as_bytes());
+                verify_data.extend_from_slice(&decoded_value);
+                verify_data.extend_from_slice(&decoded_ttl.to_le_bytes());
+                assert!(
+                    decoded_publisher
+                        .verify(&verify_data, &decoded_signature)
+                        .is_ok()
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
 }
