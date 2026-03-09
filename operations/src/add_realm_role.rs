@@ -291,7 +291,7 @@ pub mod test {
 
     use crate::add_realm_role::{AddRealmRoleConfig, AddRealmRoleOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use aruna_core::structs::{Actor, Permission, Role};
     use aruna_storage::storage;
     use iroh::PublicKey;
@@ -307,6 +307,7 @@ pub mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let user_id = Ulid::new();

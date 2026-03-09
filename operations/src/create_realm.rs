@@ -295,7 +295,7 @@ mod test {
     use ulid::Ulid;
 
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
 
     #[tokio::test]
     pub async fn test_realm_creation() {
@@ -306,6 +306,7 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;

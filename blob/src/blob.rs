@@ -249,7 +249,7 @@ impl BlobHandler {
     pub async fn negotiate_replication(
         &self,
         (_sx, _rx): BiStream,
-        blob_info: BlobInfo,
+        _blob_info: BlobInfo,
     ) -> Result<(), BlobError> {
         //TODO: Handle replication init:
         // - User allowed to write to this node?
@@ -261,7 +261,7 @@ impl BlobHandler {
     pub async fn replicate_blob(
         &self,
         (_sx, _rx): BiStream,
-        blob_location: BackendLocation,
+        _blob_location: BackendLocation,
     ) -> Result<(), BlobError> {
         todo!()
     }

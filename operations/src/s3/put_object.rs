@@ -25,7 +25,7 @@ pub enum PutObjectState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum PutObjectError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
@@ -47,7 +47,7 @@ pub enum PutObjectError {
     PutObjectFailed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PutObjectInput {
     pub bucket: String,
     pub key: String,
@@ -56,7 +56,7 @@ pub struct PutObjectInput {
     //TODO: tbc
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PutObjectConfig {
     pub user_id: UserId,
     pub group_id: GroupId,
@@ -64,7 +64,7 @@ pub struct PutObjectConfig {
     pub exists: bool, //Note: For version shenanigans which will be implemented later
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct PutObjectOperation {
     state: PutObjectState,
     config: PutObjectConfig,
@@ -300,7 +300,7 @@ impl Operation for PutObjectOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;

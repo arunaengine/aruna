@@ -49,7 +49,7 @@ pub enum BlobEvent {
     Error(BlobError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum StorageEvent {
     TransactionStarted {
         txn_id: TxnId,

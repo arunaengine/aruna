@@ -67,6 +67,16 @@ impl<T> std::ops::DerefMut for BackendStream<T> {
     }
 }
 
+//Note: Just to satisfy PartialEq of Effect and Event
+impl<T> PartialEq for BackendStream<T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::addr_eq(
+            self.0.as_ref().get_ref() as *const _,
+            other.0.as_ref().get_ref() as *const _,
+        )
+    }
+}
+
 impl<T> Stream for BackendStream<T> {
     type Item = T;
 

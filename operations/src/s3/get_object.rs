@@ -7,7 +7,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{BlobInfo, UserIdentity};
 use aruna_core::types::Effects;
 use bytes::Bytes;
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 use std::ops::Range;
 use thiserror::Error;
 use ulid::Ulid;
@@ -24,7 +24,7 @@ pub enum GetObjectState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum GetObjectError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
@@ -49,7 +49,7 @@ pub enum GetObjectError {
     GetObjectFailed,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct GetObjectInput {
     pub bucket: String,
     pub key: String,
@@ -59,7 +59,7 @@ pub struct GetObjectInput {
     //TODO: tbc
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct GetObjectOperation {
     input: GetObjectInput,
     state: GetObjectState,
@@ -245,9 +245,9 @@ impl Operation for GetObjectOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation, GetObjectState};
-    use aruna_blob::blob::{BLOB_LOCATION_DB, BLOB_PATH_DB, BlobHandler};
+    use aruna_blob::blob::{BlobHandler, BLOB_LOCATION_DB, BLOB_PATH_DB};
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};

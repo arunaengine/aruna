@@ -3,7 +3,7 @@ use aruna_core::structs::{NodeCapabilities, RealmId, TokenClaims};
 use aruna_core::types::UserId;
 use base64::Engine;
 use chrono::Months;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -177,7 +177,7 @@ impl Operation for CreateTokenOperation {
 #[cfg(test)]
 mod test {
     use crate::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
@@ -193,6 +193,7 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;

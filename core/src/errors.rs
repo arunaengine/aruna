@@ -1,5 +1,5 @@
-use std::array::TryFromSliceError;
 use automerge::AutomergeError;
+use std::array::TryFromSliceError;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -30,7 +30,7 @@ pub enum AuthorizationError {
     },
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum BlobError {
     #[error("Channel closed")]
     ChannelClosed,
@@ -126,8 +126,6 @@ pub enum ConversionError {
     OsStringError,
     #[error(transparent)]
     ParseIntError(#[from] std::num::ParseIntError),
-    #[error(transparent)]
-    TryFromSliceError(#[from] TryFromSliceError),
     #[error(transparent)]
     PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
     #[error(transparent)]

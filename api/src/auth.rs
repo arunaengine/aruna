@@ -1,14 +1,18 @@
-use aruna_core::errors::ConversionError;
-use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
-use ulid::Ulid;
-use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use jsonwebtoken::dangerous::insecure_decode;
-use jsonwebtoken::{Validation, decode};
-use std::str::FromStr;
-
 use crate::error::TokenError;
 use crate::server_state::ServerState;
+use aruna_core::errors::ConversionError;
+use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
+use axum::extract::Request;
+use axum::middleware::Next;
+use axum::response::Response;
+use base64::Engine;
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use http::HeaderMap;
+use jsonwebtoken::dangerous::insecure_decode;
+use jsonwebtoken::{decode, Validation};
+use s3s::header;
+use std::str::FromStr;
+use thiserror::Error;
 
 #[derive(Debug)]
 pub struct OidcValidator {}
@@ -121,20 +125,18 @@ pub async fn auth_middleware(
 mod test {
     use crate::auth::extract_auth_context;
     use crate::server::ServerState;
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::{drive, DriverContext};
     use aruna_storage::storage;
     use axum::http::{header, HeaderMap};
-    use std::sync::Arc;
-    use tempfile::env::temp_dir;
-    use ulid::Ulid;
-    use crate::server_state::ServerState;
-    use aruna_core::structs::{NodeCapabilities, RealmId};
     use base64::Engine;
     use chrono::Days;
     use ed25519_dalek::SigningKey;
     use jsonwebtoken::signature::SignerMut;
+    use std::sync::Arc;
+    use tempfile::env::temp_dir;
+    use ulid::Ulid;
 
     #[tokio::test]
     pub async fn test_token_capabilities() {
@@ -144,6 +146,7 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;

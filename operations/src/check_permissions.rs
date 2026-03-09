@@ -388,7 +388,7 @@ mod test {
     use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
 
     #[tokio::test]
     pub async fn test_path_parsing() {
@@ -424,6 +424,7 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let admin_id = Ulid::new();

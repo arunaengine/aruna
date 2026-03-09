@@ -1,6 +1,6 @@
 use aruna::config::read_config;
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{drive, DriverContext};
 use aruna_storage::storage;
 use std::sync::Arc;
 use tempfile::tempdir;
@@ -15,6 +15,7 @@ pub async fn create_token() -> String {
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
+        blob_handle: None,
     });
 
     let token_config = CreateTokenConfig {

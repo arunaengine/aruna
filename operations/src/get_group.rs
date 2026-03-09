@@ -270,7 +270,7 @@ impl Operation for GetGroupOperation {
 #[cfg(test)]
 mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use crate::get_group::{GetGroupConfig, GetGroupOperation};
     use aruna_core::structs::Actor;
     use aruna_storage::storage;
@@ -286,6 +286,7 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let actor = Actor {

@@ -20,6 +20,7 @@ pub enum Effect {
     Stream(),
 }
 
+#[derive(Debug, PartialEq)]
 pub enum BlobEffect {
     //GetOperator { bucket: Option<String>, },
     Write {

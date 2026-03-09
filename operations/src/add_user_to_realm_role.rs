@@ -301,14 +301,14 @@ impl Operation for AddUserToRealmRolesOperation {
 
 #[cfg(test)]
 pub mod test {
+    use crate::add_user_to_realm_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
+    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use crate::driver::{drive, DriverContext};
     use aruna_core::structs::Actor;
     use aruna_storage::storage;
     use iroh::PublicKey;
     use tempfile::tempdir;
     use ulid::Ulid;
-    use crate::add_user_to_realm_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
-    use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{DriverContext, drive};
 
     #[tokio::test]
     pub async fn test_add_user() {
@@ -319,6 +319,7 @@ pub mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
         };
 
         let user_id = Ulid::new();
