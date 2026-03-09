@@ -7,7 +7,8 @@ use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{Backend, BackendBucket, BackendConfig, BackendLocation};
+use aruna_core::structs::{Backend, BackendBucket, BackendConfig, BackendLocation, BlobInfo};
+use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
 use bytes::Bytes;
 use crossfire::{mpsc, oneshot};
@@ -243,6 +244,30 @@ impl BlobHandler {
             return BlobEvent::Error(BlobError::DeleteError(e.to_string()));
         }
         BlobEvent::DeleteFinished
+    }
+
+    pub async fn negotiate_replication(
+        &self,
+        (_sx, _rx): BiStream,
+        blob_info: BlobInfo,
+    ) -> Result<(), BlobError> {
+        //TODO: Handle replication init:
+        // - User allowed to write to this node?
+        // - Node has enough space?
+        // - ...?
+        todo!()
+    }
+
+    pub async fn replicate_blob(
+        &self,
+        (_sx, _rx): BiStream,
+        blob_location: BackendLocation,
+    ) -> Result<(), BlobError> {
+        todo!()
+    }
+
+    pub async fn handle_incoming_replication(&self, (_sx, _rx): BiStream) -> Result<(), BlobError> {
+        todo!()
     }
 
     async fn eval_backend_bucket(&self) -> Result<String, BlobError> {

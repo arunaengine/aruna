@@ -124,6 +124,7 @@ name = "aruna-blob"
 version = "3.0.0"
 dependencies = [
  "aruna-core",
+ "aruna-net",
  "aruna-storage",
  "aws-config",
  "aws-sdk-s3",
@@ -131,6 +132,8 @@ dependencies = [
  "bytes",
  "crossfire",
  "futures",
+ "iroh-io",
+ "iroh-quinn",
  "md5",
  "opendal",
  "sha2 0.11.0-rc.5",
@@ -2952,6 +2955,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-io"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0a5feb781017b983ff1b155cd1faf8174da2acafd807aa482876da2d7e6577a"
+dependencies = [
+ "bytes",
+ "futures-lite",
+ "pin-project",
+ "smallvec",
+ "tokio",
+]
+
+[[package]]
 name = "iroh-metrics"
 version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3017,6 +3033,7 @@ dependencies = [
  "rustc-hash",
  "rustls 0.23.37",
  "rustls-pki-types",
+ "rustls-platform-verifier",
  "slab",
  "sorted-index-buffer",
  "thiserror 2.0.18",
