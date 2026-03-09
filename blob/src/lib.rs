@@ -1,3 +1,4 @@
+pub mod bao_tree;
 pub mod blob;
 pub mod error;
 pub mod hash;
