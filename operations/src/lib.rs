@@ -1,5 +1,7 @@
+pub mod check_permissions;
 pub mod create_group;
 pub mod create_token;
+pub mod create_realm;
 pub mod driver;
 pub mod get_group;
 pub mod incoming;
@@ -7,3 +9,7 @@ pub mod incoming_automerge;
 pub mod incoming_bao;
 pub mod incoming_gossip;
 pub mod list_groups;
+pub mod add_user_to_group;
+pub mod add_group_role;
+pub mod add_user_to_realm_role;
+pub mod add_realm_role;

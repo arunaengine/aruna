@@ -17,11 +17,15 @@ pub type EffectHandle = (StorageEffect, oneshot::TxOneshot<StorageEvent>);
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 
+enum Txn {
+    Read(fjall::Snapshot),
+    Write(fjall::OptimisticWriteTx),
+}
+
 pub struct FjallStorage {
     db: OptimisticTxDatabase,
     keyspaces: HashMap<String, OptimisticTxKeyspace>,
-    read_txns: HashMap<Ulid, fjall::Snapshot>,
-    write_txns: HashMap<Ulid, fjall::OptimisticWriteTx>,
+    txns: HashMap<Ulid, Txn>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,8 +102,7 @@ impl FjallStorage {
             let mut storage = FjallStorage {
                 db,
                 keyspaces: HashMap::new(),
-                read_txns: HashMap::new(),
-                write_txns: HashMap::new(),
+                txns: HashMap::new(),
             };
             storage.receive_loop(receiver);
         });
@@ -159,11 +162,11 @@ impl FjallStorage {
 
         if read {
             let txn = self.db.read_tx();
-            self.read_txns.insert(txn_id, txn);
+            self.txns.insert(txn_id, Txn::Read(txn));
         } else {
             match self.db.write_tx() {
                 Ok(txn) => {
-                    self.write_txns.insert(txn_id, txn);
+                    self.txns.insert(txn_id, Txn::Write(txn));
                 }
                 Err(_e) => {
                     return StorageEvent::Error {
@@ -176,21 +179,17 @@ impl FjallStorage {
     }
 
     fn abort_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
-        let write_txn = self.write_txns.remove(&txn_id);
-        let read_txn = self.read_txns.remove(&txn_id);
+        let txn = self.txns.remove(&txn_id);
 
-        if let Some(txn) = write_txn {
-            txn.rollback();
-            return StorageEvent::TransactionAborted { txn_id };
-        }
-
-        if read_txn.is_some() {
-            // No rollback needed for read transactions
-            StorageEvent::TransactionAborted { txn_id }
-        } else {
-            StorageEvent::Error {
-                error: StorageError::TransactionNotFound,
+        match txn {
+            Some(Txn::Write(txn)) => {
+                txn.rollback();
+                StorageEvent::TransactionAborted { txn_id }
             }
+            Some(Txn::Read(_txn)) => StorageEvent::TransactionAborted { txn_id },
+            None => StorageEvent::Error {
+                error: StorageError::TransactionNotFound,
+            },
         }
     }
 
@@ -215,14 +214,25 @@ impl FjallStorage {
         };
 
         if let Some(txn_id) = txn_id {
-            if let Some(txn) = self.read_txns.get(&txn_id) {
-                match txn.get(keyspace, &key) {
-                    Ok(value_opt) => StorageEvent::ReadResult {
-                        key,
-                        value: value_opt.map(|v| v.into()),
+            if let Some(txn) = self.txns.get(&txn_id) {
+                match txn {
+                    Txn::Read(txn) => match txn.get(keyspace, &key) {
+                        Ok(value_opt) => StorageEvent::ReadResult {
+                            key,
+                            value: value_opt.map(|v| v.into()),
+                        },
+                        Err(_e) => StorageEvent::Error {
+                            error: StorageError::ReadError,
+                        },
                     },
-                    Err(_e) => StorageEvent::Error {
-                        error: StorageError::ReadError,
+                    Txn::Write(txn) => match txn.get(keyspace, &key) {
+                        Ok(value_opt) => StorageEvent::ReadResult {
+                            key,
+                            value: value_opt.map(|v| v.into()),
+                        },
+                        Err(_e) => StorageEvent::Error {
+                            error: StorageError::ReadError,
+                        },
                     },
                 }
             } else {
@@ -258,7 +268,7 @@ impl FjallStorage {
         };
 
         if let Some(txn_id) = txn_id {
-            if let Some(txn) = self.write_txns.get_mut(&txn_id) {
+            if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
                 txn.insert(keyspace, key.clone(), value);
                 StorageEvent::WriteResult { key }
             } else {
@@ -277,22 +287,21 @@ impl FjallStorage {
     }
 
     fn commit_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
-        if let Some(_txn) = self.read_txns.remove(&txn_id) {
-            // Read-only transactions do not need to commit
-            return StorageEvent::TransactionCommitted { txn_id };
-        }
+        match self.txns.remove(&txn_id) {
+            Some(Txn::Read(_txn)) => {
+                // Read-only transactions do not need to commit
+                StorageEvent::TransactionCommitted { txn_id }
+            }
 
-        if let Some(txn) = self.write_txns.remove(&txn_id) {
-            match txn.commit() {
+            Some(Txn::Write(txn)) => match txn.commit() {
                 Ok(_) => StorageEvent::TransactionCommitted { txn_id },
                 Err(_e) => StorageEvent::Error {
                     error: StorageError::TransactionConflict,
                 },
-            }
-        } else {
-            StorageEvent::Error {
+            },
+            None => StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
-            }
+            },
         }
     }
 
@@ -303,7 +312,7 @@ impl FjallStorage {
         };
 
         if let Some(txn_id) = txn_id {
-            if let Some(txn) = self.write_txns.get_mut(&txn_id) {
+            if let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) {
                 txn.remove(keyspace, key.clone());
                 StorageEvent::DeleteResult { key }
             } else {
@@ -342,8 +351,11 @@ impl FjallStorage {
         }
 
         let result = if let Some(txn_id) = txn_id {
-            match self.read_txns.get(&txn_id) {
-                Some(txn) => {
+            match self.txns.get(&txn_id) {
+                Some(Txn::Read(txn)) => {
+                    iterate_page(txn, &keyspace, prefix.as_ref(), start_after.as_ref(), limit)
+                }
+                Some(Txn::Write(txn)) => {
                     iterate_page(txn, &keyspace, prefix.as_ref(), start_after.as_ref(), limit)
                 }
                 None => {

@@ -1,0 +1,268 @@
+use crate::NodeId;
+use crate::errors::ConversionError;
+use crate::structs::realm::RealmId;
+use crate::types::autosurgeon_ulid;
+use crate::types::{RoleId, UserId};
+use autosurgeon::{Hydrate, Reconcile};
+use core::fmt;
+use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
+use ed25519_dalek::pkcs8::EncodePublicKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use ulid::Ulid;
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub enum Permission {
+    READ,
+    WRITE,
+    DENY,
+}
+
+impl fmt::Display for Permission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Permission::READ => "Read",
+                Permission::WRITE => "Write",
+                Permission::DENY => "Deny",
+            }
+        )
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct Role {
+    #[autosurgeon(with = "autosurgeon_ulid")]
+    pub role_id: RoleId,
+    pub name: String,
+    pub permissions: HashMap<String, Permission>,
+    #[autosurgeon(with = "autosurgeon_ulid_set")]
+    pub assigned_users: HashSet<UserId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenClaims {
+    /// Subject: user identity in format `{user_ulid}@{realm_pubkey_base64}`.
+    pub sub: String,
+    /// Issuer: realm public key (base64-encoded).
+    pub iss: String,
+    /// Issued at: Unix timestamp in seconds.
+    pub iat: u64,
+    /// Expiration: Unix timestamp in seconds.
+    pub exp: u64,
+    /// JWT ID: unique token identifier (ULID string).
+    pub jti: String,
+    /// Path restrictions: List of (path_pattern, permission) pairs acting as a whitelist
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restrictions: Option<Vec<PathRestriction>>,
+    /// Issuer public key (base64-encoded).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_pubkey: Option<String>,
+    /// Delegation signature: Realm signature over issuer_pubkey
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegation_signature: Option<String>,
+}
+
+/// Path restriction for token scope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathRestriction {
+    /// Path pattern (supports * and ** wildcards).
+    pub pattern: String,
+    /// Permission level for this pattern.
+    pub permission: Permission,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeCapabilities {
+    // This may seem redundant, but because we need both representations both
+    // and need both on (nearly) every request, this mitigates unneeded conversions
+    Management {
+        /// ed25519-dalek representation
+        realm_signing_key: SigningKey,
+        /// pkcs8_pem bytes representation
+        realm_verifying_key: [u8; 113],
+        realm_encoding_key: [u8; 168],
+    },
+    Server {
+        /// ed25519-dalek representation
+        issuer_signing_key: SigningKey,
+        /// pkcs8_pem bytes representation
+        issuer_verifying_key: [u8; 113],
+        issuer_encoding_key: [u8; 168],
+
+        /// pkcs8_pem bytes representation
+        realm_verifying_key: [u8; 113],
+        /// Realm signature over issuer_pubkey
+        delegation_signature: String,
+    },
+    Local {
+        //realm_pubkey: [u8; 32],
+        realm_verifying_key: [u8; 113],
+    },
+}
+
+impl NodeCapabilities {
+    pub fn management_node(realm_signing_key: SigningKey) -> Result<Self, ConversionError> {
+        let privkey = realm_signing_key.to_pkcs8_pem(LineEnding::default())?;
+        let pubkey = realm_signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::default())?;
+        let realm_verifying_key = pubkey.as_bytes().try_into()?;
+        let realm_encoding_key = privkey.as_bytes().try_into()?;
+        Ok(NodeCapabilities::Management {
+            realm_signing_key,
+            realm_verifying_key,
+            realm_encoding_key,
+        })
+    }
+    pub fn server_node(
+        issuer_signing_key: SigningKey,
+        realm_id: RealmId,
+        delegation_signature: String,
+    ) -> Result<Self, ConversionError> {
+        let privkey = issuer_signing_key.to_pkcs8_pem(LineEnding::default())?;
+        let pubkey = issuer_signing_key
+            .verifying_key()
+            .to_public_key_pem(LineEnding::default())?;
+        let issuer_verifying_key = pubkey.as_bytes().try_into()?;
+        let issuer_encoding_key = privkey.as_bytes().try_into()?;
+        let realm_verifying_key = realm_id.to_pkcs8_pem_bytes()?;
+        Ok(NodeCapabilities::Server {
+            issuer_signing_key,
+            issuer_verifying_key,
+            issuer_encoding_key,
+            delegation_signature,
+            realm_verifying_key,
+        })
+    }
+    pub fn local_node(realm_id: RealmId) -> Result<Self, ConversionError> {
+        let realm_verifying_key = realm_id.to_pkcs8_pem_bytes()?;
+        Ok(NodeCapabilities::Local {
+            realm_verifying_key,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AuthContext {
+    pub user_id: UserId,
+    pub realm_id: RealmId,
+    pub path_restrictions: Option<Vec<PathRestriction>>,
+}
+
+impl TryFrom<TokenClaims> for AuthContext {
+    type Error = ConversionError;
+
+    fn try_from(value: TokenClaims) -> Result<Self, Self::Error> {
+        let (user, realm) = value
+            .sub
+            .split_once('@')
+            .ok_or_else(|| ConversionError::InvalidUserId)?;
+        let user_id = Ulid::from_string(&user)?;
+        let realm_id = RealmId::from_base64(realm)?;
+        let path_restrictions = value.restrictions;
+
+        Ok(Self {
+            user_id,
+            realm_id,
+            path_restrictions,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Actor {
+    pub node_id: NodeId,
+    pub user_id: UserId,
+    pub realm_id: RealmId,
+}
+
+impl TryFrom<&[u8]> for Actor {
+    type Error = ConversionError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        Ok(postcard::from_bytes(value)?)
+    }
+}
+
+impl TryFrom<&Actor> for Vec<u8> {
+    type Error = ConversionError;
+
+    fn try_from(value: &Actor) -> Result<Self, Self::Error> {
+        Ok(postcard::to_allocvec(value)?)
+    }
+}
+
+pub mod autosurgeon_ulid_set {
+    use std::collections::{HashMap, HashSet};
+
+    use autosurgeon::reconcile::MapReconciler;
+    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
+    use ulid::Ulid;
+
+    use crate::types::UserId;
+    pub fn hydrate<'a, D: ReadDoc>(
+        doc: &D,
+        obj: &automerge::ObjId,
+        prop: Prop<'a>,
+    ) -> Result<HashSet<UserId>, HydrateError> {
+        let inner: HashMap<String, String> = HashMap::hydrate(doc, obj, prop)?;
+        let role_set = inner
+            .iter()
+            .map(|(k, _)| Ulid::from_string(&k))
+            .collect::<Result<HashSet<UserId>, ulid::DecodeError>>()
+            .map_err(|e| {
+                HydrateError::unexpected("valid Ulid string", format!("Invalid Ulid {}", e))
+            })?;
+        Ok(role_set)
+    }
+    pub fn reconcile<R: Reconciler>(
+        ulid: &HashSet<UserId>,
+        mut reconciler: R,
+    ) -> Result<(), R::Error> {
+        let mut map = reconciler.map()?;
+        for id in ulid.iter().map(|k| k.to_string()) {
+            map.put(&id, "")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::structs::{Permission, RealmId, Role};
+    use autosurgeon::{hydrate, reconcile};
+    use std::collections::{HashMap, HashSet};
+    use ulid::Ulid;
+
+    #[test]
+    pub fn test_role_conversion() {
+        let role = Role {
+            role_id: Ulid::new(),
+            name: "admin".to_string(),
+            permissions: HashMap::from([(
+                format!(
+                    "/{}/g/{}/**",
+                    RealmId([0u8; 32]).to_string(),
+                    Ulid::new().to_string()
+                ),
+                Permission::WRITE,
+            )]),
+            assigned_users: HashSet::from([Ulid::new()]),
+        };
+
+        let mut automerge_doc = automerge::AutoCommit::new();
+        reconcile(&mut automerge_doc, &role).unwrap();
+
+        let bytes = automerge_doc.save();
+
+        let stored_automerge_doc = automerge::AutoCommit::load(&bytes).unwrap();
+        let hydrated_role: Role = hydrate(&stored_automerge_doc).unwrap();
+
+        assert_eq!(role, hydrated_role);
+    }
+}

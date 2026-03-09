@@ -1,3 +1,4 @@
+use aruna_core::consts::GROUP_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -8,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct ListGroupOperation {
     txn_id: Option<Ulid>,
     output: Option<Result<Vec<Group>, ListGroupError>>,
@@ -37,7 +38,7 @@ impl ListGroupOperation {
     fn emit_list_groups(&mut self) -> aruna_core::types::Effects {
         let scan_limit = self.offset.saturating_add(self.limit).max(1);
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: "groups".to_string(),
+            key_space: GROUP_KEYSPACE.to_string(),
             prefix: None,
             start_after: None,
             limit: scan_limit,
@@ -157,7 +158,7 @@ impl ListGroupOperation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ListGroupState {
     Init,
     StartTransaction,
@@ -167,7 +168,7 @@ pub enum ListGroupState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum ListGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
@@ -239,6 +240,7 @@ mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::list_groups::ListGroupOperation;
+    use aruna_core::structs::Actor;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -257,8 +259,11 @@ mod test {
         let mut groups = Vec::new();
         for i in 0..100 {
             let group_config = CreateGroupConfig {
-                user_id: Ulid::new(),
-                realm_id: aruna_core::structs::RealmId([0u8; 32]),
+                actor: Actor {
+                    user_id: Ulid::new(),
+                    realm_id: aruna_core::structs::RealmId([0u8; 32]),
+                    node_id: iroh::PublicKey::from_bytes(&[0u8; 32]).unwrap(),
+                },
                 display_name: format!("Test group {i}"),
             };
             let group_operation = CreateGroupOperation::new(group_config.clone());

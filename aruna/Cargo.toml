@@ -6,3 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aruna-core = { path = "../core" }
+aruna-operations = { path = "../operations" }
+aruna-storage = { path = "../storage" }
+aruna-api = { path = "../api" }
+aruna-net = { path = "../net" }
+base64 = { workspace = true }
+dotenvy = "0.15.7"
+ed25519-dalek = { workspace = true }
+iroh = { workspace = true }
+jsonwebtoken = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }

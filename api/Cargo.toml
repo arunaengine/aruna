@@ -6,11 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ahash = { workspace = true }
 aruna-core = { path = "../core" }
 aruna-operations = { path = "../operations" }
 aruna-storage = { path = "../storage" }
 axum = "0.8.8"
+base64 = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
@@ -21,3 +26,4 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rand = { workspace = true }

@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+automerge = { workspace = true }
+autosurgeon = { workspace = true }
 aruna-core = { path = "../core" }
 aruna-storage = { path = "../storage" }
 aruna-net = { path = "../net" }
@@ -13,12 +15,16 @@ async-trait = { workspace = true }
 byteview = { workspace = true }
 chrono = { workspace = true }
 globset = { workspace = true }
+iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 smallvec = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
+ed25519-dalek = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rand = { workspace = true }

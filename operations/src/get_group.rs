@@ -1,25 +1,26 @@
+use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{AuthorizationDocument, Group};
+use aruna_core::structs::{Group, GroupAuthorizationDocument};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GetGroupConfig {
     pub group_id: GroupId,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct GetGroupOperation {
     config: GetGroupConfig,
     txn_id: Option<Ulid>,
     group: Option<Group>,
-    auth_doc: Option<AuthorizationDocument>,
-    output: Option<Result<(Group, AuthorizationDocument), GetGroupError>>,
+    auth_doc: Option<GroupAuthorizationDocument>,
+    output: Option<Result<(Group, GroupAuthorizationDocument), GetGroupError>>,
     state: GetGroupState,
 }
 
@@ -39,7 +40,7 @@ impl GetGroupOperation {
         let key = self.config.group_id.to_bytes().into();
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: "groups".to_string(),
+            key_space: GROUP_KEYSPACE.to_string(),
             key,
             txn_id: self.txn_id,
         })]
@@ -57,7 +58,7 @@ impl GetGroupOperation {
         let key = self.config.group_id.to_bytes().into();
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: "auth".to_string(),
+            key_space: AUTH_KEYSPACE.to_string(),
             key,
             txn_id: self.txn_id,
         })]
@@ -67,7 +68,7 @@ impl GetGroupOperation {
         value: Option<byteview::ByteView>,
     ) -> Result<Effects, GetGroupError> {
         let value = value.ok_or_else(|| GetGroupError::AuthDocNotFound)?;
-        let auth_doc = AuthorizationDocument::from_bytes(&value)?;
+        let auth_doc = GroupAuthorizationDocument::from_bytes(&value)?;
         self.auth_doc = Some(auth_doc);
         let txn_id = self
             .txn_id
@@ -189,7 +190,7 @@ impl GetGroupOperation {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GetGroupState {
     Init,
     StartTransaction,
@@ -200,7 +201,7 @@ pub enum GetGroupState {
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum GetGroupError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
@@ -223,7 +224,7 @@ pub enum GetGroupError {
 }
 
 impl Operation for GetGroupOperation {
-    type Output = (Group, AuthorizationDocument);
+    type Output = (Group, GroupAuthorizationDocument);
 
     type Error = GetGroupError;
 
@@ -271,6 +272,7 @@ mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::get_group::{GetGroupConfig, GetGroupOperation};
+    use aruna_core::structs::Actor;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -286,9 +288,14 @@ mod test {
             net_handle: None,
         };
 
-        let group_config = CreateGroupConfig {
+        let actor = Actor {
             user_id: Ulid::new(),
             realm_id: aruna_core::structs::RealmId([0u8; 32]),
+            node_id: iroh::PublicKey::from_bytes(&[0u8; 32]).unwrap(),
+        };
+
+        let group_config = CreateGroupConfig {
+            actor,
             display_name: "Test group".to_string(),
         };
         let group_operation = CreateGroupOperation::new(group_config.clone());

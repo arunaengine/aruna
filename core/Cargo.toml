@@ -6,10 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+automerge = { workspace = true }
+autosurgeon = { workspace = true }
 smallvec = { workspace = true }
 ulid = { workspace = true }
 thiserror = { workspace = true }
-byteview = "0.10.0"
+byteview = "0.10.1"
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
@@ -18,3 +20,5 @@ base64 = { workspace = true }
 hex = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
+ed25519-dalek = { workspace = true }
+globset = { workspace = true }

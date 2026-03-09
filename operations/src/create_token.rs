@@ -1,51 +1,58 @@
 use aruna_core::operation::Operation;
-use aruna_core::structs::{RealmId, TokenClaims};
+use aruna_core::structs::{NodeCapabilities, RealmId, TokenClaims};
 use aruna_core::types::UserId;
+use base64::Engine;
 use chrono::Months;
-use jsonwebtoken::{EncodingKey, Header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreateTokenConfig {
     pub time: u64,
     pub expiry: Option<u64>,
     pub user_id: UserId,
     pub realm_id: RealmId,
-    pub keypair: [u8; 64],
+    pub node_capabilities: NodeCapabilities,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct CreateTokenOperation {
     config: CreateTokenConfig,
     state: CreateTokenState,
     output: Option<Result<String, CreateTokenError>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum CreateTokenState {
     Init,
     Finish,
     Error,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum CreateTokenError {
+    #[error("Node has no capability to create tokens")]
+    NotEnoughCapabilities,
     #[error("Creating Group did not finish")]
     NotFinished,
     #[error("Invalid timestamp")]
     InvalidTimestamp,
-    #[error("Invalid timestamp")]
+    #[error(transparent)]
     EncodingError(#[from] jsonwebtoken::errors::Error),
 }
 
 impl CreateTokenOperation {
-    pub fn new(config: CreateTokenConfig) -> Self {
-        CreateTokenOperation {
-            config,
-            state: CreateTokenState::Init,
-            output: None,
+    pub fn new(config: CreateTokenConfig) -> Result<Self, CreateTokenError> {
+        if matches!(config.node_capabilities, NodeCapabilities::Local { .. }) {
+            Err(CreateTokenError::NotEnoughCapabilities)
+        } else {
+            Ok(CreateTokenOperation {
+                config,
+                state: CreateTokenState::Init,
+                output: None,
+            })
         }
     }
     pub fn emit_token(&mut self) -> Result<(), CreateTokenError> {
@@ -68,23 +75,66 @@ impl CreateTokenOperation {
             }
         };
 
-        let claims = TokenClaims {
-            sub: format!(
-                "{}@{}",
-                self.config.user_id.to_string(),
-                self.config.realm_id.to_string()
-            ),
-            iss: self.config.realm_id.to_string(),
-            iat,
-            exp,
-            jti: Ulid::new().to_string(), // TODO: Save tokens somewhere
+        match &self.config.node_capabilities {
+            NodeCapabilities::Management {
+                realm_encoding_key, ..
+            } => {
+                let claims = TokenClaims {
+                    sub: format!(
+                        "{}@{}",
+                        self.config.user_id.to_string(),
+                        self.config.realm_id.to_string()
+                    ),
+                    iss: self.config.realm_id.to_string(),
+                    iat,
+                    exp,
+                    jti: Ulid::new().to_string(),
+                    restrictions: None,
+                    issuer_pubkey: None,
+                    delegation_signature: None,
+                };
+
+                let token = encode(
+                    &Header::new(Algorithm::EdDSA),
+                    &claims,
+                    &EncodingKey::from_ed_pem(realm_encoding_key)?,
+                )?;
+                self.output = Some(Ok(token));
+            }
+            NodeCapabilities::Server {
+                issuer_signing_key,
+                issuer_encoding_key,
+                delegation_signature,
+                ..
+            } => {
+                let issuer_pubkey = Some(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(issuer_signing_key.verifying_key().to_bytes()),
+                );
+                let claims = TokenClaims {
+                    sub: format!(
+                        "{}@{}",
+                        self.config.user_id.to_string(),
+                        self.config.realm_id.to_string()
+                    ),
+                    iss: self.config.realm_id.to_string(),
+                    iat,
+                    exp,
+                    jti: Ulid::new().to_string(),
+                    restrictions: None,
+                    issuer_pubkey,
+                    delegation_signature: Some(delegation_signature.clone()),
+                };
+
+                let token = encode(
+                    &Header::new(Algorithm::EdDSA),
+                    &claims,
+                    &EncodingKey::from_ed_pem(issuer_encoding_key)?,
+                )?;
+                self.output = Some(Ok(token));
+            }
+            NodeCapabilities::Local { .. } => return Err(CreateTokenError::NotEnoughCapabilities),
         };
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(&self.config.keypair),
-        )?;
-        self.output = Some(Ok(token));
 
         Ok(())
     }
@@ -128,8 +178,9 @@ impl Operation for CreateTokenOperation {
 mod test {
     use crate::create_token::{CreateTokenConfig, CreateTokenOperation};
     use crate::driver::{DriverContext, drive};
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_storage::storage;
+    use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -144,14 +195,21 @@ mod test {
             net_handle: None,
         };
 
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let realm_id = RealmId::from_bytes(pubkey);
+        let capabilities = NodeCapabilities::management_node(signing_key).unwrap();
+
         let token_config = CreateTokenConfig {
             time: chrono::Utc::now().timestamp() as u64,
             expiry: None,
             user_id: Ulid::new(),
-            realm_id: RealmId([0u8; 32]),
-            keypair: [0u8; 64],
+            realm_id: realm_id.clone(),
+            node_capabilities: capabilities,
         };
-        let token_operation = CreateTokenOperation::new(token_config.clone());
+
+        let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
         drive(token_operation, &context).await.unwrap();
     }
 }

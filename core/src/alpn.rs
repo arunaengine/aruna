@@ -1,5 +1,5 @@
 /// Application Layer Protocol Negotiation identifiers for Aruna streams.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Alpn {
     /// DHT RPC protocol
     Dht,

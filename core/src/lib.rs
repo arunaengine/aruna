@@ -9,5 +9,6 @@ pub mod operation;
 pub mod structs;
 pub mod types;
 pub mod util;
+pub mod consts;
 
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};

@@ -1,10 +1,10 @@
 use crate::{
-    errors::{DhtError, GossipError, StorageError, StreamError},
+    errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
     id::NodeId,
     types::{DhtKey, Key, TopicId, TxnId, Value},
 };
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Event {
     Storage(StorageEvent),
     Net(NetEvent),
@@ -14,12 +14,17 @@ pub enum Event {
     Stream(),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum SubOperationEvent {
-    DepthLimitExceeded { max_depth: usize },
+    DepthLimitExceeded {
+        max_depth: usize,
+    },
+    AuthorizationResult {
+        allowed: Result<bool, AuthorizationError>,
+    },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum StorageEvent {
     TransactionStarted {
         txn_id: TxnId,
@@ -50,7 +55,7 @@ pub enum StorageEvent {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum NetEvent {
     Dht(DhtEvent),
     Gossip(GossipEvent),
@@ -58,21 +63,21 @@ pub enum NetEvent {
     Error(NetError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum DhtEvent {
     PutComplete { key: DhtKey },
     GetResult { key: DhtKey, values: Vec<DhtEntry> },
     Error { error: DhtError },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DhtEntry {
     pub node_id: NodeId,
     pub value: Vec<u8>,
     pub expires_at: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum GossipEvent {
     Subscribed { topic: TopicId },
     BroadcastComplete { topic: TopicId },
@@ -80,14 +85,14 @@ pub enum GossipEvent {
     Error { error: GossipError },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum StreamEvent {
     Opened { stream_id: u64, node_id: NodeId },
     Closed { stream_id: u64 },
     Error { stream_id: u64, error: StreamError },
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum NetError {
     InvalidEffect,
     ChannelClosed,
