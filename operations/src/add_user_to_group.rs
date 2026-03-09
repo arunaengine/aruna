@@ -307,7 +307,7 @@ pub mod test {
 
     use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
 
     #[tokio::test]
     pub async fn test_add_user() {

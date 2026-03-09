@@ -245,12 +245,7 @@ impl GossipService {
     }
 
     async fn persist_subscriptions(&self) {
-        let persisted: Vec<TopicId> = self
-            .subscriptions
-            .read()
-            .keys()
-            .map(|topic| topic.clone())
-            .collect();
+        let persisted: Vec<TopicId> = self.subscriptions.read().keys().cloned().collect();
 
         let Ok(data) = postcard::to_allocvec(&persisted) else {
             // Serialization failed - skip persisting

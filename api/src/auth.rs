@@ -9,7 +9,7 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use http::HeaderMap;
 use jsonwebtoken::dangerous::insecure_decode;
-use jsonwebtoken::{decode, Validation};
+use jsonwebtoken::{Validation, decode};
 use s3s::header;
 use std::str::FromStr;
 use thiserror::Error;
@@ -41,7 +41,7 @@ pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaim
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
 
     // - Check token hash against revocation list
-    if state.is_token_blacklisted(&token).await {
+    if state.is_token_blacklisted(token).await {
         return Err(TokenError::TokenBlacklisted);
     }
 
@@ -51,23 +51,23 @@ pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaim
     ) {
         (Some(issuer), true) => {
             let decoding_key = state.get_cached_pubkey(issuer).await?;
-            let claims = decode::<TokenClaims>(
+
+            decode::<TokenClaims>(
                 token,
                 &decoding_key,
                 &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?;
-            claims
+            )?
         }
         (_, _) => {
             let pubkey = state
                 .get_cached_pubkey(unvalidated_claims.claims.iss)
                 .await?;
-            let claims = decode::<TokenClaims>(
+
+            decode::<TokenClaims>(
                 token,
                 &pubkey,
                 &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?;
-            claims
+            )?
         }
     };
     validate_claims(state, &claims.claims).await?;
@@ -127,9 +127,9 @@ mod test {
     use crate::server::ServerState;
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_operations::driver::{drive, DriverContext};
+    use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
-    use axum::http::{header, HeaderMap};
+    use axum::http::{HeaderMap, header};
     use base64::Engine;
     use chrono::Days;
     use ed25519_dalek::SigningKey;

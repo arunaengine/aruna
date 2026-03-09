@@ -3,7 +3,7 @@ use aruna_core::structs::{NodeCapabilities, RealmId, TokenClaims};
 use aruna_core::types::UserId;
 use base64::Engine;
 use chrono::Months;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -67,10 +67,10 @@ impl CreateTokenOperation {
             }
             None => {
                 let time = chrono::DateTime::from_timestamp_secs(iat as i64)
-                    .ok_or_else(|| CreateTokenError::InvalidTimestamp)?;
+                    .ok_or(CreateTokenError::InvalidTimestamp)?;
                 let new = time
                     .checked_add_months(Months::new(12))
-                    .ok_or_else(|| CreateTokenError::InvalidTimestamp)?;
+                    .ok_or(CreateTokenError::InvalidTimestamp)?;
                 new.timestamp() as u64
             }
         };
@@ -83,7 +83,7 @@ impl CreateTokenOperation {
                     sub: format!(
                         "{}@{}",
                         self.config.user_id.to_string(),
-                        self.config.realm_id.to_string()
+                        self.config.realm_id
                     ),
                     iss: self.config.realm_id.to_string(),
                     iat,
@@ -115,7 +115,7 @@ impl CreateTokenOperation {
                     sub: format!(
                         "{}@{}",
                         self.config.user_id.to_string(),
-                        self.config.realm_id.to_string()
+                        self.config.realm_id
                     ),
                     iss: self.config.realm_id.to_string(),
                     iat,
@@ -166,7 +166,7 @@ impl Operation for CreateTokenOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| CreateTokenError::NotFinished)?
+        self.output.ok_or(CreateTokenError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
@@ -177,7 +177,7 @@ impl Operation for CreateTokenOperation {
 #[cfg(test)]
 mod test {
     use crate::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;

@@ -291,7 +291,7 @@ pub mod test {
 
     use crate::add_realm_role::{AddRealmRoleConfig, AddRealmRoleOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
     use aruna_core::structs::{Actor, Permission, Role};
     use aruna_storage::storage;
     use iroh::PublicKey;

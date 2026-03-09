@@ -303,7 +303,7 @@ impl Operation for AddUserToRealmRolesOperation {
 pub mod test {
     use crate::add_user_to_realm_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
     use aruna_core::structs::Actor;
     use aruna_storage::storage;
     use iroh::PublicKey;

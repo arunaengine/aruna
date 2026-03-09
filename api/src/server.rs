@@ -1,8 +1,8 @@
 use crate::error::ServerSetupError;
 use crate::routes::rest_router;
-pub(crate) use crate::server_state::{swagger_ui, ServerState};
-use axum::response::Redirect;
+pub(crate) use crate::server_state::{ServerState, swagger_ui};
 use axum::Router;
+use axum::response::Redirect;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -27,15 +27,14 @@ impl Server {
         let api_v1 = Router::new().merge(rest_router(self.state.clone()));
 
         // Build the root router with body size limit for REST API
-        let router = Router::new()
+
+        Router::new()
             .route(
                 "/",
                 axum::routing::get(|| async { Redirect::permanent("/swagger-ui") }),
             )
             .nest("/api/v1", api_v1)
-            .merge(swagger_ui());
-
-        router
+            .merge(swagger_ui())
     }
 
     pub async fn run(self) -> Result<(), ServerSetupError> {

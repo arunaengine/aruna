@@ -7,13 +7,13 @@ use aruna_core::util::xor_distance_32;
 use smallvec::SmallVec;
 
 use super::constants::{DRIVER_TICK_INTERVAL, LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, RPC_TIMEOUT_TICKS};
-use super::kbucket::{InsertResult, PeerInfo, RoutingTable, K};
+use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
 use super::protocol::{
-    DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput, DhtOutputValue,
-    InboundId, OpId, RpcPhase, StorageStage, CLEANUP_OP_ID, INTERNAL_OP_START,
+    CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
+    DhtOutputValue, INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage,
 };
 use super::rpc::{DhtRequest, DhtResponse, ErrorCode, StoredValue};
-use super::storage::{live_entries, merge_entry, StoredEntry, CLEANUP_PAGE_SIZE};
+use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, live_entries, merge_entry};
 
 type PendingMap = HashMap<PendingKey, PendingMeta>;
 
@@ -1484,10 +1484,10 @@ impl DhtStateMachine {
                 let PendingKey::Rpc { phase, peer } = key else {
                     continue;
                 };
-                if let Some(deadline_tick) = meta.deadline_tick {
-                    if deadline_tick <= self.current_tick {
-                        timed_out.push((*op_id, *phase, *peer));
-                    }
+                if let Some(deadline_tick) = meta.deadline_tick
+                    && deadline_tick <= self.current_tick
+                {
+                    timed_out.push((*op_id, *phase, *peer));
                 }
             }
         }
@@ -2132,9 +2132,11 @@ mod tests {
             peer: peer_a,
             response: DhtResponse::Pong,
         }));
-        assert!(first
-            .iter()
-            .all(|effect| !matches!(effect, DhtEffect::Output(_))));
+        assert!(
+            first
+                .iter()
+                .all(|effect| !matches!(effect, DhtEffect::Output(_)))
+        );
 
         let second = state.step(DhtInput::Io(DhtIo::RpcError {
             op_id: 17,

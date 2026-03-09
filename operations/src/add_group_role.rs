@@ -386,7 +386,7 @@ impl Operation for AddGroupRoleOperation {
             auth_context: self.input.auth_context.clone(),
             path: format!(
                 "/{}/g/{}/admin",
-                self.input.realm_id.to_string(),
+                self.input.realm_id,
                 self.input.group_id.to_string()
             ),
             required_permission: aruna_core::structs::Permission::WRITE,

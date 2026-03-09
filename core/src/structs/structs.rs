@@ -1,15 +1,15 @@
+use crate::NodeId;
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::realm::RealmId;
 use crate::types::autosurgeon_ulid;
 use crate::types::{RoleId, UserId};
-use crate::NodeId;
 use autosurgeon::{Hydrate, Reconcile};
 use byteview::ByteView;
 use core::fmt;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
@@ -167,7 +167,7 @@ impl TryFrom<TokenClaims> for AuthContext {
             .sub
             .split_once('@')
             .ok_or_else(|| ConversionError::InvalidUserId)?;
-        let user_id = Ulid::from_string(&user)?;
+        let user_id = Ulid::from_string(user)?;
         let realm_id = RealmId::from_base64(realm)?;
         let path_restrictions = value.restrictions;
 
@@ -217,8 +217,8 @@ pub mod autosurgeon_ulid_set {
     ) -> Result<HashSet<UserId>, HydrateError> {
         let inner: HashMap<String, String> = HashMap::hydrate(doc, obj, prop)?;
         let role_set = inner
-            .iter()
-            .map(|(k, _)| Ulid::from_string(&k))
+            .keys()
+            .map(|k| Ulid::from_string(k))
             .collect::<Result<HashSet<UserId>, ulid::DecodeError>>()
             .map_err(|e| {
                 HydrateError::unexpected("valid Ulid string", format!("Invalid Ulid {}", e))

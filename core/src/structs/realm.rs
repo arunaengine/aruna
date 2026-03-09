@@ -79,7 +79,7 @@ impl Realm {
         Ok(doc.save())
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(&bytes)?;
+        let doc = automerge::AutoCommit::load(bytes)?;
         Ok(hydrate(&doc)?)
     }
 }
@@ -157,7 +157,7 @@ impl RealmAuthorizationDocument {
         Ok(doc.save())
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(&bytes)?;
+        let doc = automerge::AutoCommit::load(bytes)?;
         Ok(hydrate(&doc)?)
     }
 }
@@ -202,9 +202,7 @@ pub mod autosurgeon_operation_map {
             .map(
                 |(operation, users)| -> Result<(RealmLevelOperation, HashSet<Ulid>), ConversionError> {
                     let operation: RealmLevelOperation = operation.try_into()?;
-                    let user_map: Result<HashSet<Ulid>, ConversionError> = users
-                        .iter()
-                        .map(|(u, _)| {
+                    let user_map: Result<HashSet<Ulid>, ConversionError> = users.keys().map(|u| {
                             Ulid::from_string(u).map_err(|_e| ConversionError::InvalidUserId)
                         })
                         .collect();

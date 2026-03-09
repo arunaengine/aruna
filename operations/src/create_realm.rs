@@ -295,7 +295,7 @@ mod test {
     use ulid::Ulid;
 
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
 
     #[tokio::test]
     pub async fn test_realm_creation() {

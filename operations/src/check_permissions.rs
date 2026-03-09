@@ -88,11 +88,11 @@ impl CheckPermissionsOperation {
                 Err(err) => self.fail(err),
             }
         } else {
-            return self.unexpected_event(
+            self.unexpected_event(
                 self.state,
                 "Event::Storage(StorageEvent::TransactionStart)",
                 got,
-            );
+            )
         }
     }
 
@@ -108,11 +108,7 @@ impl CheckPermissionsOperation {
                 Err(err) => self.fail(err),
             }
         } else {
-            return self.unexpected_event(
-                self.state,
-                "Event::Storage(StorageEvent::ReadResult)",
-                got,
-            );
+            self.unexpected_event(self.state, "Event::Storage(StorageEvent::ReadResult)", got)
         }
     }
 
@@ -128,11 +124,7 @@ impl CheckPermissionsOperation {
                 Err(err) => self.fail(err),
             }
         } else {
-            return self.unexpected_event(
-                self.state,
-                "Event::Storage(StorageEvent::ReadResult)",
-                got,
-            );
+            self.unexpected_event(self.state, "Event::Storage(StorageEvent::ReadResult)", got)
         }
     }
 
@@ -148,11 +140,11 @@ impl CheckPermissionsOperation {
                 Err(err) => self.fail(err),
             }
         } else {
-            return self.unexpected_event(
+            self.unexpected_event(
                 self.state,
                 "Event::Storage(StorageEvent::TransactionCommitted)",
                 got,
-            );
+            )
         }
     }
 
@@ -388,7 +380,7 @@ mod test {
     use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
 
     #[tokio::test]
     pub async fn test_path_parsing() {

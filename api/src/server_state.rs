@@ -1,13 +1,13 @@
 use crate::auth::OidcValidator;
 use crate::error::TokenError;
 use crate::openapi::ApiDoc;
-use aruna_core::NodeId;
 use aruna_core::structs::{NodeCapabilities, RealmId};
+use aruna_core::NodeId;
 use aruna_operations::driver::DriverContext;
 use base64::Engine;
-use ed25519_dalek::VerifyingKey;
-use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use ed25519_dalek::pkcs8::EncodePublicKey;
+use ed25519_dalek::VerifyingKey;
 use jsonwebtoken::DecodingKey;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,7 +32,7 @@ pub struct ServerState {
     // Realm membership
     node_id: NodeId,
     // TODO: OIDC handling
-    oidc_validator: Option<Arc<OidcValidator>>,
+    _oidc_validator: Option<Arc<OidcValidator>>,
 }
 
 impl ServerState {
@@ -49,7 +49,7 @@ impl ServerState {
             driver_ctx,
             realm_id,
             node_id,
-            oidc_validator,
+            _oidc_validator: oidc_validator,
             node_capabilities,
             token_revocation_list: Arc::new(RwLock::new(HashSet::default())),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
@@ -80,7 +80,7 @@ impl ServerState {
     }
 
     pub fn get_node_id(&self) -> NodeId {
-        self.node_id.clone()
+        self.node_id
     }
 
     pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {
@@ -116,11 +116,7 @@ impl ServerState {
 
     pub async fn is_token_blacklisted(&self, token: &str) -> bool {
         let hash = blake3::hash(token.as_bytes()).to_string();
-        self.token_revocation_list
-            .read()
-            .await
-            .get(&hash)
-            .is_some()
+        self.token_revocation_list.read().await.get(&hash).is_some()
     }
 
     pub async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
