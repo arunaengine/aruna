@@ -36,7 +36,7 @@ impl NodeIdExt for NodeId {
 }
 
 /// A 32-byte DHT key for storing/retrieving values.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub struct DhtKeyId([u8; 32]);
 
 impl DhtKeyId {
@@ -93,6 +93,8 @@ pub enum TopicId {
     Group(Ulid),
     /// Metadata document topic (prefix 'm')
     MetadataDocument(Ulid),
+    /// Generic Automerge document topic (prefix 'a')
+    AutomergeDocument(DhtKeyId),
 }
 
 /// Prefix bytes for TopicId variants
@@ -100,6 +102,7 @@ const PREFIX_REALM: u8 = b'r';
 const PREFIX_NODE: u8 = b'n';
 const PREFIX_GROUP: u8 = b'g';
 const PREFIX_METADATA_DOCUMENT: u8 = b'm';
+const PREFIX_AUTOMERGE_DOCUMENT: u8 = b'a';
 
 impl TopicId {
     /// Create a realm-scoped topic
@@ -124,6 +127,12 @@ impl TopicId {
     #[inline]
     pub fn metadata_document(id: Ulid) -> Self {
         Self::MetadataDocument(id)
+    }
+
+    /// Create a generic automerge document topic
+    #[inline]
+    pub fn automerge_document(id: DhtKeyId) -> Self {
+        Self::AutomergeDocument(id)
     }
 
     /// Serialize to bytes (prefix + payload)
@@ -151,6 +160,12 @@ impl TopicId {
                 let mut buf = Vec::with_capacity(17);
                 buf.push(PREFIX_METADATA_DOCUMENT);
                 buf.extend_from_slice(&ulid.to_bytes());
+                buf
+            }
+            Self::AutomergeDocument(id) => {
+                let mut buf = Vec::with_capacity(33);
+                buf.push(PREFIX_AUTOMERGE_DOCUMENT);
+                buf.extend_from_slice(id.as_bytes());
                 buf
             }
         }
@@ -193,6 +208,13 @@ impl TopicId {
                 let bytes: [u8; 16] = payload.try_into().ok()?;
                 Some(Self::MetadataDocument(Ulid::from_bytes(bytes)))
             }
+            PREFIX_AUTOMERGE_DOCUMENT => {
+                if payload.len() != 32 {
+                    return None;
+                }
+                let bytes: [u8; 32] = payload.try_into().ok()?;
+                Some(Self::AutomergeDocument(DhtKeyId::from_bytes(bytes)))
+            }
             _ => None,
         }
     }
@@ -213,6 +235,7 @@ impl fmt::Debug for TopicId {
             Self::Node(id) => write!(f, "TopicId::Node({})", id),
             Self::Group(id) => write!(f, "TopicId::Group({})", id),
             Self::MetadataDocument(id) => write!(f, "TopicId::MetadataDocument({})", id),
+            Self::AutomergeDocument(id) => write!(f, "TopicId::AutomergeDocument({})", id),
         }
     }
 }
@@ -224,6 +247,7 @@ impl fmt::Display for TopicId {
             Self::Node(id) => write!(f, "n:{}", id),
             Self::Group(id) => write!(f, "g:{}", id),
             Self::MetadataDocument(id) => write!(f, "m:{}", id),
+            Self::AutomergeDocument(id) => write!(f, "a:{}", id),
         }
     }
 }

@@ -1,4 +1,5 @@
 // core/src/keys.rs
+use crate::automerge::AutomergeDocumentVariant;
 use crate::id::{DhtKeyId, TopicId};
 
 /// Derive a DHT key from arbitrary bytes using BLAKE3.
@@ -29,6 +30,13 @@ pub fn dht_key_from_domain(domain: &[u8], input: &[u8]) -> DhtKeyId {
 #[inline]
 pub fn gossip_peer_key(topic: &TopicId) -> DhtKeyId {
     dht_key_from_domain(b"gossip", &topic.to_bytes())
+}
+
+/// Hash the logical Automerge document identifier for holder discovery.
+#[must_use]
+#[inline]
+pub fn automerge_document_holder_key(document: &AutomergeDocumentVariant) -> DhtKeyId {
+    DhtKeyId::from_data(&document.holder_lookup_bytes())
 }
 
 #[cfg(test)]
