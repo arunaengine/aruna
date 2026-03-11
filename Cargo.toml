@@ -41,6 +41,8 @@ iroh = "0.96.1"
 iroh-base = "0.96.1"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 iroh-gossip = "0.96.0"
+oxrdf = "0.3"
+ro-crate-rs = { version = "0.5.0", features = ["rdf"] }
 tokio-util = "0.7"
 bytes = "1"
 hex = "0.4"
