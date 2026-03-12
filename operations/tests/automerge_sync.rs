@@ -339,6 +339,17 @@ async fn metadata_gossip_announcement_triggers_sync() -> Result<(), Box<dyn std:
         context_a.as_ref(),
     )
     .await?;
+    sleep(Duration::from_millis(250)).await;
+    drive(
+        AnnounceAutomergeDocumentOperation::new(document.clone()),
+        context_a.as_ref(),
+    )
+    .await?;
+    drive(
+        AnnounceAutomergeDocumentOperation::new(document.clone()),
+        context_b.as_ref(),
+    )
+    .await?;
 
     let expected = [
         "<http://example.org/root> <http://schema.org/name> \"from-a\"".to_string(),
