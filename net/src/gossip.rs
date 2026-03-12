@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::consts::GOSSIP_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -20,8 +21,8 @@ use tracing::warn;
 use crate::DhtHandle;
 use crate::error::{NetError, Result};
 
-const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
 const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
+const GOSSIP_TOPIC_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug)]
 struct TopicSubscription {
@@ -90,7 +91,7 @@ impl GossipService {
 
     pub async fn subscribe(&self, topic: TopicId) -> Result<()> {
         if self.subscriptions.read().contains_key(&topic) {
-            return Err(NetError::Gossip("Already subscribed".to_string()));
+            return Ok(());
         }
 
         self.announce_topic_subscription(&topic).await?;
@@ -117,6 +118,26 @@ impl GossipService {
 
         let subscriptions = self.subscriptions.clone();
         let event_tx = self.event_tx.clone();
+        let reannounce_cancel = cancel.clone();
+        let reannounce_topic = topic.clone();
+        let reannounce_dht = self.dht.clone();
+        let reannounce_local_node_id = self.local_node_id;
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = reannounce_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(GOSSIP_TOPIC_REANNOUNCE_INTERVAL) => {
+                        if let Err(error) = announce_topic_subscription(
+                            &reannounce_dht,
+                            reannounce_local_node_id,
+                            &reannounce_topic,
+                        ).await {
+                            warn!(topic = %reannounce_topic, error = %error, "Failed to refresh gossip topic announcement");
+                        }
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
             use futures::stream::StreamExt;
             let mut unexpected_termination = false;
@@ -177,34 +198,15 @@ impl GossipService {
     }
 
     async fn announce_topic_subscription(&self, topic: &TopicId) -> Result<()> {
-        let dht_key = aruna_core::keys::gossip_peer_key(topic);
-        self.dht
-            .put(
-                &dht_key,
-                self.local_node_id.as_bytes().to_vec(),
-                GOSSIP_TOPIC_ANNOUNCE_TTL,
-            )
-            .await
-            .map_err(|e| NetError::Gossip(format!("Failed to announce gossip topic in DHT: {e}")))
+        announce_topic_subscription(&self.dht, self.local_node_id, topic).await
     }
 
     async fn lookup_topic_bootstrap_nodes(&self, topic: &TopicId) -> Result<Vec<NodeId>> {
-        let dht_key = aruna_core::keys::gossip_peer_key(topic);
-        let entries = self.dht.get(&dht_key).await.map_err(|e| {
-            NetError::Gossip(format!(
-                "Failed to lookup gossip topic bootstrap nodes: {e}"
-            ))
-        })?;
-
         let configured_nodes = self.bootstrap_nodes.read().clone();
         let mut seen = HashSet::new();
         let mut bootstrap_nodes = Vec::new();
 
-        for node_id in entries
-            .into_iter()
-            .map(|entry| entry.node_id)
-            .chain(configured_nodes.into_iter())
-        {
+        for node_id in self.lookup_bootstrap_candidates(topic).await?.into_iter().chain(configured_nodes.into_iter()) {
             if node_id == self.local_node_id {
                 continue;
             }
@@ -214,6 +216,24 @@ impl GossipService {
         }
 
         Ok(bootstrap_nodes)
+    }
+
+    async fn lookup_bootstrap_candidates(&self, topic: &TopicId) -> Result<Vec<NodeId>> {
+        let topic_key = aruna_core::keys::gossip_peer_key(topic);
+        let mut candidates = self.lookup_nodes_for_key(&topic_key).await?;
+        if let TopicId::AutomergeDocument(document_key) = topic {
+            candidates.extend(self.lookup_nodes_for_key(document_key).await?);
+        }
+        Ok(candidates)
+    }
+
+    async fn lookup_nodes_for_key(&self, dht_key: &aruna_core::DhtKeyId) -> Result<Vec<NodeId>> {
+        let entries = self.dht.get(dht_key).await.map_err(|e| {
+            NetError::Gossip(format!(
+                "Failed to lookup gossip topic bootstrap nodes: {e}"
+            ))
+        })?;
+        Ok(entries.into_iter().map(|entry| entry.node_id).collect())
     }
 
     pub async fn broadcast(&self, topic: TopicId, message: Vec<u8>) -> Result<()> {
@@ -266,6 +286,33 @@ impl GossipService {
 
         let _ = self.storage.send_effect(effect).await;
     }
+}
+
+async fn announce_topic_subscription(
+    dht: &DhtHandle,
+    local_node_id: NodeId,
+    topic: &TopicId,
+) -> Result<()> {
+    let topic_key = aruna_core::keys::gossip_peer_key(topic);
+    dht.put(
+        &topic_key,
+        local_node_id.as_bytes().to_vec(),
+        GOSSIP_TOPIC_ANNOUNCE_TTL,
+    )
+    .await
+    .map_err(|e| NetError::Gossip(format!("Failed to announce gossip topic in DHT: {e}")))?;
+
+    if let TopicId::AutomergeDocument(document_key) = topic {
+        dht.put(
+            document_key,
+            local_node_id.as_bytes().to_vec(),
+            GOSSIP_TOPIC_ANNOUNCE_TTL,
+        )
+        .await
+        .map_err(|e| NetError::Gossip(format!("Failed to announce automerge document in DHT: {e}")))?;
+    }
+
+    Ok(())
 }
 
 fn decode_persisted_subscriptions(bytes: &[u8]) -> Vec<TopicId> {
