@@ -254,6 +254,8 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let mut groups = Vec::new();
@@ -262,7 +264,7 @@ mod test {
                 actor: Actor {
                     user_id: Ulid::new(),
                     realm_id: aruna_core::structs::RealmId([0u8; 32]),
-                    node_id: iroh::PublicKey::from_bytes(&[0u8; 32]).unwrap(),
+                    node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
                 },
                 display_name: format!("Test group {i}"),
             };

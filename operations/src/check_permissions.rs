@@ -378,7 +378,6 @@ mod test {
     use aruna_core::structs::{Actor, Permission, RealmId};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
-    use iroh::PublicKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -424,11 +423,13 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let admin_id = Ulid::new();
         let realm_id = RealmId([0u8; 32]);
-        let node_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 
         let realm_config = CreateRealmConfig {
             actor: aruna_core::structs::Actor {

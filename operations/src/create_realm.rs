@@ -1,12 +1,15 @@
 use aruna_core::consts::{AUTH_KEYSPACE, REALM_KEYSPACE};
+use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, Realm, RealmAuthorizationDocument};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {
@@ -195,6 +198,33 @@ impl CreateRealmOperation {
         };
 
         if let Some(realm) = &self.realm
+            && self.auth_doc.is_some()
+        {
+            self.state = CreateRealmState::AnnounceAuthDoc;
+            smallvec![Effect::SubOperation(boxed_suboperation(
+                AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::RealmAuthorization {
+                    realm_id: realm.realm_id.clone(),
+                }),
+                |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                    result: result.map_err(|error| error.to_string()),
+                }),
+            ))]
+        } else {
+            self.fail(CreateRealmError::RealmNotFound)
+        }
+    }
+
+    fn handle_announce_auth_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) = event else {
+            return self.unexpected_event(
+                CreateRealmState::AnnounceAuthDoc,
+                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                got,
+            );
+        };
+
+        if let Some(realm) = &self.realm
             && let Some(auth) = &self.auth_doc
         {
             self.state = CreateRealmState::Finish;
@@ -213,6 +243,7 @@ pub enum CreateRealmState {
     CreateRealm,
     CreateAuthDoc,
     CommitTransaction,
+    AnnounceAuthDoc,
     Finish,
     Error,
 }
@@ -261,6 +292,7 @@ impl Operation for CreateRealmOperation {
             CreateRealmState::CreateRealm => self.handle_create_realm(event),
             CreateRealmState::CreateAuthDoc => self.handle_create_auth_doc(event),
             CreateRealmState::CommitTransaction => self.handle_commit_transaction(event),
+            CreateRealmState::AnnounceAuthDoc => self.handle_announce_auth_doc(event),
             CreateRealmState::Init | CreateRealmState::Finish | CreateRealmState::Error => {
                 smallvec![]
             }
@@ -306,13 +338,15 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
         let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
-        let node_id = iroh::PublicKey::from_bytes(&[0u8; 32]).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let realm_admin = Ulid::new();
 
         let realm_config = CreateRealmConfig {

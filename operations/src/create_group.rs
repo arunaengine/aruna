@@ -1,13 +1,16 @@
 use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument};
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
+
+use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -205,6 +208,33 @@ impl CreateGroupOperation {
         };
 
         if let Some(group) = &self.group
+            && self.auth_doc.is_some()
+        {
+            self.state = CreateGroupState::AnnounceAuthDoc;
+            smallvec![Effect::SubOperation(boxed_suboperation(
+                AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::GroupAuthorization {
+                    group_id: group.group_id,
+                }),
+                |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                    result: result.map_err(|error| error.to_string()),
+                }),
+            ))]
+        } else {
+            self.fail(CreateGroupError::GroupNotFound)
+        }
+    }
+
+    fn handle_announce_auth_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) = event else {
+            return self.unexpected_event(
+                CreateGroupState::AnnounceAuthDoc,
+                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                got,
+            );
+        };
+
+        if let Some(group) = &self.group
             && let Some(auth) = &self.auth_doc
         {
             self.state = CreateGroupState::Finish;
@@ -223,6 +253,7 @@ pub enum CreateGroupState {
     CreateGroup,
     CreateRoles,
     CommitTransaction,
+    AnnounceAuthDoc,
     Finish,
     Error,
 }
@@ -271,6 +302,7 @@ impl Operation for CreateGroupOperation {
             CreateGroupState::CreateGroup => self.handle_create_group(event),
             CreateGroupState::CreateRoles => self.handle_create_roles(event),
             CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
+            CreateGroupState::AnnounceAuthDoc => self.handle_announce_auth_doc(event),
             CreateGroupState::Init | CreateGroupState::Finish | CreateGroupState::Error => {
                 smallvec![]
             }
@@ -302,7 +334,6 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::structs::Actor;
     use aruna_storage::storage;
-    use iroh::PublicKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -315,11 +346,13 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
-        let node_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let group_config = CreateGroupConfig {
             actor: Actor {
                 node_id,
