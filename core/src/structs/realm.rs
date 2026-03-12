@@ -283,7 +283,7 @@ pub mod autosurgeon_realm_id {
     ) -> Result<RealmId, HydrateError> {
         let inner = autosurgeon::bytes::ByteVec::hydrate(doc, obj, prop)?;
         let realm_id = RealmId(inner.as_slice().try_into().map_err(|_| {
-            HydrateError::unexpected("&[u8; 16]", "Invalid slice of bytes".to_string())
+            HydrateError::unexpected("&[u8; 32]", "Invalid slice of bytes".to_string())
         })?);
         Ok(realm_id)
     }
@@ -333,6 +333,11 @@ pub mod autosurgeon_operation_map {
         mut reconciler: R,
     ) -> Result<(), R::Error> {
         let mut map = reconciler.map()?;
+        map.retain(|operation, _| {
+            RealmLevelOperation::try_from(operation.to_string())
+                .ok()
+                .is_some_and(|operation| operation_map.contains_key(&operation))
+        })?;
         for (operation, users) in operation_map.iter() {
             map.put(
                 operation.to_string(),

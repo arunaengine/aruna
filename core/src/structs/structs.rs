@@ -225,6 +225,11 @@ pub mod autosurgeon_ulid_set {
         mut reconciler: R,
     ) -> Result<(), R::Error> {
         let mut map = reconciler.map()?;
+        map.retain(|id, _| {
+            Ulid::from_string(id)
+                .ok()
+                .is_some_and(|id| ulid.contains(&id))
+        })?;
         for id in ulid.iter().map(|k| k.to_string()) {
             map.put(&id, "")?;
         }

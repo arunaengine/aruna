@@ -110,7 +110,7 @@ impl FjallStorage {
         Ok(sender)
     }
 
-    pub fn receive_loop(&mut self, receiver: EffectReceiver) -> ! {
+    pub fn receive_loop(&mut self, receiver: EffectReceiver) {
         loop {
             match receiver.recv() {
                 Ok((effect, response_tx)) => {
@@ -146,12 +146,13 @@ impl FjallStorage {
                             txn_id,
                         } => self.iterate(key_space, prefix, start_after, limit, txn_id),
                     };
-                    response_tx.send(event);
+                    let _ = response_tx.send(event);
                 }
                 Err(_) => {
                     tracing::warn!(
                         "Storage receiver channel closed, shutting down storage thread."
                     );
+                    break;
                 }
             }
         }
@@ -426,16 +427,21 @@ fn collect_page(
     iter: fjall::Iter,
     limit: usize,
 ) -> Result<(Vec<(ByteView, ByteView)>, Option<ByteView>), StorageError> {
-    let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit);
+    let mut iter = iter.peekable();
+    let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
 
-    for guard in iter {
+    while let Some(guard) = iter.next() {
         let (key, value) = guard.into_inner().map_err(|_| StorageError::ReadError)?;
+        values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
+
         if values.len() == limit {
-            let next_start_after = values.last().map(|(k, _)| k.clone());
+            let next_start_after = if iter.peek().is_some() {
+                values.last().map(|(k, _)| k.clone())
+            } else {
+                None
+            };
             return Ok((values, next_start_after));
         }
-
-        values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
     }
 
     Ok((values, None))
