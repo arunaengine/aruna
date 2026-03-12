@@ -1,5 +1,5 @@
-use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -10,8 +10,8 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddGroupRoleConfig {
@@ -79,6 +79,8 @@ pub enum AddGroupRoleError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("automerge announcement failed: {0}")]
+    AutomergeState(String),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unauthorized")]
@@ -353,13 +355,16 @@ impl AddGroupRoleOperation {
         auth_doc: GroupAuthorizationDocument,
     ) -> aruna_core::types::Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) = event else {
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
                 "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
                 got,
             );
         };
+        if let Err(error) = result {
+            return self.fail(AddGroupRoleError::AutomergeState(error));
+        }
         self.state = AddGroupRoleState::Finish;
         self.output = Some(Ok((group, auth_doc)));
         smallvec![]
@@ -659,7 +664,10 @@ pub mod test {
 
         assert!(mutated_group.roles.contains(&add_role_input.role.role_id));
         assert_eq!(
-            mutated_auth_doc.roles.get(&add_role_input.role.role_id).unwrap(),
+            mutated_auth_doc
+                .roles
+                .get(&add_role_input.role.role_id)
+                .unwrap(),
             &add_role_input.role
         );
     }

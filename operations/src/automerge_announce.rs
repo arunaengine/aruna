@@ -23,8 +23,8 @@ pub struct AnnounceAutomergeDocumentOperation {
 #[derive(Debug, Clone, PartialEq)]
 enum AnnounceAutomergeDocumentState {
     Init,
-    Subscribe,
     ResetTimer,
+    Subscribe,
     ReadDocument,
     Broadcast,
     Finish,
@@ -85,32 +85,36 @@ impl Operation for AnnounceAutomergeDocumentOperation {
     type Error = AnnounceAutomergeDocumentError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = AnnounceAutomergeDocumentState::Subscribe;
-        smallvec![Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-            topic: self.document.topic_id(),
-        }))]
+        self.state = AnnounceAutomergeDocumentState::ResetTimer;
+        smallvec![Effect::Task(TaskEffect::ResetTimer {
+            key: self.document.announce_timer_key(),
+            after: AUTOMERGE_ANNOUNCE_INTERVAL,
+        })]
     }
 
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
         match self.state {
+            AnnounceAutomergeDocumentState::ResetTimer => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.state = AnnounceAutomergeDocumentState::Subscribe;
+                    smallvec![Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
+                        topic: self.document.topic_id(),
+                    }))]
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => self.fail(
+                    AnnounceAutomergeDocumentError::GossipError(GossipError::Other(message)),
+                ),
+                other => self.unexpected_event("task timer acknowledgement", format!("{other:?}")),
+            },
             AnnounceAutomergeDocumentState::Subscribe => match event {
                 Event::Net(aruna_core::events::NetEvent::Gossip(GossipEvent::Subscribed {
                     ..
+                }))
+                | Event::Net(aruna_core::events::NetEvent::Gossip(GossipEvent::Error {
+                    error: GossipError::AlreadySubscribed,
                 })) => {
-                    self.state = AnnounceAutomergeDocumentState::ResetTimer;
-                    smallvec![Effect::Task(TaskEffect::ResetTimer {
-                        key: self.document.announce_timer_key(),
-                        after: AUTOMERGE_ANNOUNCE_INTERVAL,
-                    })]
-                }
-                Event::Net(aruna_core::events::NetEvent::Gossip(GossipEvent::Error { error }))
-                    if error == GossipError::AlreadySubscribed =>
-                {
-                    self.state = AnnounceAutomergeDocumentState::ResetTimer;
-                    smallvec![Effect::Task(TaskEffect::ResetTimer {
-                        key: self.document.announce_timer_key(),
-                        after: AUTOMERGE_ANNOUNCE_INTERVAL,
-                    })]
+                    self.state = AnnounceAutomergeDocumentState::ReadDocument;
+                    smallvec![read_effect(&self.document, None)]
                 }
                 Event::Net(aruna_core::events::NetEvent::Gossip(GossipEvent::Error { error })) => {
                     self.fail(error.into())
@@ -118,16 +122,6 @@ impl Operation for AnnounceAutomergeDocumentOperation {
                 other => {
                     self.unexpected_event("gossip subscribe acknowledgement", format!("{other:?}"))
                 }
-            },
-            AnnounceAutomergeDocumentState::ResetTimer => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = AnnounceAutomergeDocumentState::ReadDocument;
-                    smallvec![read_effect(&self.document, None)]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => self.fail(
-                    AnnounceAutomergeDocumentError::GossipError(GossipError::Other(message)),
-                ),
-                other => self.unexpected_event("task timer acknowledgement", format!("{other:?}")),
             },
             AnnounceAutomergeDocumentState::ReadDocument => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
