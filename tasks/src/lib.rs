@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -23,9 +24,11 @@ pub struct TaskHandle {
 struct TaskInner {
     timers: Mutex<HashMap<TaskKey, TimerEntry>>,
     inbound_handler: RwLock<Option<Arc<dyn InboundTaskHandler>>>,
+    next_timer_id: AtomicU64,
 }
 
 struct TimerEntry {
+    id: u64,
     cancel: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -36,6 +39,7 @@ impl TaskHandle {
             inner: Arc::new(TaskInner {
                 timers: Mutex::new(HashMap::new()),
                 inbound_handler: RwLock::new(None),
+                next_timer_id: AtomicU64::new(1),
             }),
         }
     }
@@ -49,6 +53,7 @@ impl TaskHandle {
     }
 
     async fn reset_timer(&self, key: TaskKey, after: std::time::Duration) -> TaskEvent {
+        let timer_id = self.inner.next_timer_id.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
         let key_for_task = key.clone();
@@ -64,13 +69,22 @@ impl TaskHandle {
                     }
 
                     let mut timers = inner.timers.lock().await;
-                    timers.remove(&key_for_task);
+                    if matches!(timers.get(&key_for_task), Some(entry) if entry.id == timer_id) {
+                        timers.remove(&key_for_task);
+                    }
                 }
             }
         });
 
         let mut timers = self.inner.timers.lock().await;
-        if let Some(existing) = timers.insert(key.clone(), TimerEntry { cancel, task }) {
+        if let Some(existing) = timers.insert(
+            key.clone(),
+            TimerEntry {
+                id: timer_id,
+                cancel,
+                task,
+            },
+        ) {
             existing.cancel.cancel();
             existing.task.abort();
         }
@@ -116,5 +130,73 @@ impl Handle for TaskHandle {
                 message: "invalid effect for task handle".to_string(),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    #[derive(Clone)]
+    struct ReschedulingHandler {
+        handle: TaskHandle,
+        count: Arc<AtomicUsize>,
+        notify: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for ReschedulingHandler {
+        async fn handle_timer(&self, key: TaskKey) {
+            let seen = self.count.fetch_add(1, Ordering::SeqCst) + 1;
+            if seen == 1 {
+                let _ = self
+                    .handle
+                    .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                        key,
+                        after: Duration::from_millis(10),
+                    }))
+                    .await;
+            }
+
+            self.notify.notify_waiters();
+        }
+    }
+
+    #[tokio::test]
+    async fn reset_timer_keeps_newly_rescheduled_entry() {
+        let handle = TaskHandle::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let notify = Arc::new(Notify::new());
+        let key = TaskKey::RealmPresence {
+            realm_id: aruna_core::structs::RealmId([7u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+        };
+
+        handle
+            .set_inbound_handler(Arc::new(ReschedulingHandler {
+                handle: handle.clone(),
+                count: count.clone(),
+                notify: notify.clone(),
+            }))
+            .await;
+
+        let _ = handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key,
+                after: Duration::from_millis(10),
+            }))
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while count.load(Ordering::SeqCst) < 2 {
+                notify.notified().await;
+            }
+        })
+        .await
+        .expect("rescheduled timer should fire twice");
     }
 }

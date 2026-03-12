@@ -10,3 +10,6 @@ aruna-core = { path = "../core" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+
+[dev-dependencies]
+iroh = { workspace = true }
