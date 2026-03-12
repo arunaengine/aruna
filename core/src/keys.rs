@@ -36,7 +36,7 @@ pub fn gossip_peer_key(topic: &TopicId) -> DhtKeyId {
 #[must_use]
 #[inline]
 pub fn automerge_document_holder_key(document: &AutomergeDocumentVariant) -> DhtKeyId {
-    DhtKeyId::from_data(&document.holder_lookup_bytes())
+    document.topic_key()
 }
 
 #[cfg(test)]

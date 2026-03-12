@@ -34,7 +34,7 @@ impl AutomergeDocumentVariant {
     }
 
     pub fn topic_key(&self) -> DhtKeyId {
-        DhtKeyId::from_data(&self.topic_bytes())
+        DhtKeyId::from_data(&self.holder_lookup_bytes())
     }
 
     pub fn holder_lookup_bytes(&self) -> Vec<u8> {
@@ -47,23 +47,6 @@ impl AutomergeDocumentVariant {
 
     pub fn announce_timer_key(&self) -> TaskKey {
         TaskKey::AutomergeAnnounce(self.clone())
-    }
-
-    fn topic_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::Metadata {
-                group_id,
-                document_id,
-            } => {
-                let mut buf = Vec::with_capacity(1 + 16 + 16);
-                buf.push(b'm');
-                buf.extend_from_slice(&group_id.to_bytes());
-                buf.extend_from_slice(&document_id.to_bytes());
-                buf
-            }
-            Self::GroupAuthorization { group_id } => format!("perm_{group_id}").into_bytes(),
-            Self::RealmAuthorization { realm_id } => format!("realm_perm_{realm_id}").into_bytes(),
-        }
     }
 }
 

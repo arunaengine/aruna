@@ -42,15 +42,27 @@ impl MetadataDocument {
     }
 
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
-        let actor = postcard::to_allocvec(actor)?;
-        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
-        reconcile(&mut doc, self)?;
-        Ok(doc.save())
+        self.reconcile_bytes(None, actor)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         let doc = automerge::AutoCommit::load(bytes)?;
         Ok(hydrate(&doc)?)
+    }
+
+    pub fn reconcile_bytes(
+        &self,
+        current: Option<&[u8]>,
+        actor: &Actor,
+    ) -> Result<Vec<u8>, ConversionError> {
+        let actor = postcard::to_allocvec(actor)?;
+        let mut doc = match current {
+            Some(bytes) if !bytes.is_empty() => automerge::AutoCommit::load(bytes)?,
+            _ => automerge::AutoCommit::new(),
+        };
+        doc.set_actor((&actor).into());
+        reconcile(&mut doc, self)?;
+        Ok(doc.save())
     }
 
     pub fn from_rocrate(
