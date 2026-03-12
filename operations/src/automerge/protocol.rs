@@ -2,7 +2,7 @@ use aruna_core::automerge::{AutomergeInit, AutomergeRejectReason, AutomergeSyncE
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
 
-const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AutomergeTransportMessage {
@@ -18,9 +18,9 @@ pub async fn write_message(
 ) -> Result<(), AutomergeSyncError> {
     let bytes = postcard::to_allocvec(message)
         .map_err(|err| AutomergeSyncError::Protocol(err.to_string()))?;
-    if bytes.len() > MAX_FRAME_SIZE {
+    if bytes.len() > MAX_MESSAGE_SIZE {
         return Err(AutomergeSyncError::Protocol(
-            "automerge frame exceeds maximum size".to_string(),
+            "automerge message exceeds maximum size".to_string(),
         ));
     }
 
@@ -49,7 +49,7 @@ pub async fn read_message(
         .map_err(|err| AutomergeSyncError::Network(err.to_string()))?;
 
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_SIZE {
+    if len > MAX_MESSAGE_SIZE {
         return Err(AutomergeSyncError::InvalidFrame);
     }
 
@@ -70,7 +70,7 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn transport_frame_roundtrip() {
+    fn transport_message_roundtrip() {
         let message = AutomergeTransportMessage::Init(AutomergeInit::new(
             AutomergeDocumentVariant::Metadata {
                 group_id: Ulid::new(),
