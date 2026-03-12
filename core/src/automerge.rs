@@ -19,6 +19,9 @@ pub enum AutomergeDocumentVariant {
     RealmAuthorization {
         realm_id: RealmId,
     },
+    RealmConfig {
+        realm_id: RealmId,
+    },
 }
 
 impl AutomergeDocumentVariant {
@@ -42,6 +45,7 @@ impl AutomergeDocumentVariant {
             Self::Metadata { document_id, .. } => document_id.to_bytes().to_vec(),
             Self::GroupAuthorization { group_id } => format!("perm_{group_id}").into_bytes(),
             Self::RealmAuthorization { realm_id } => format!("realm_perm_{realm_id}").into_bytes(),
+            Self::RealmConfig { realm_id } => format!("realm_config_{realm_id}").into_bytes(),
         }
     }
 

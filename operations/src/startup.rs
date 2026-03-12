@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use aruna_core::TopicId;
-use aruna_core::consts::{AUTH_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, METADATA_KEYSPACE};
+use aruna_core::consts::{
+    AUTH_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -10,7 +12,9 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::automerge::repository::{parse_auth_document, parse_metadata_key};
+use crate::automerge::repository::{
+    parse_auth_document, parse_metadata_key, parse_realm_config_document,
+};
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 
 #[derive(Debug, PartialEq)]
@@ -26,6 +30,7 @@ enum RestoreAutomergeSubscriptionsState {
     Init,
     ListMetadata,
     ListAuth,
+    ListRealmConfig,
     ReadSubscriptions,
     WaitAnnouncement,
     Finish,
@@ -125,6 +130,26 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
                     for (key, _value) in values {
                         match parse_auth_document(&key) {
+                            Ok(document) => self.documents.push(document),
+                            Err(error) => return self.fail(error.into()),
+                        }
+                    }
+                    self.state = RestoreAutomergeSubscriptionsState::ListRealmConfig;
+                    smallvec![Effect::Storage(StorageEffect::Iter {
+                        key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                        prefix: None,
+                        start_after: None,
+                        limit: usize::MAX,
+                        txn_id: None,
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage iteration result", format!("{other:?}")),
+            },
+            RestoreAutomergeSubscriptionsState::ListRealmConfig => match event {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                    for (key, _) in values {
+                        match parse_realm_config_document(&key) {
                             Ok(document) => self.documents.push(document),
                             Err(error) => return self.fail(error.into()),
                         }
