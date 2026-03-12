@@ -2,11 +2,16 @@ use aruna::config::read_config;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_net::{NetConfig, NetHandle};
+use aruna_operations::announce_realm_presence::{
+    AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
+};
 use aruna_operations::automerge::AutomergeHandle;
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use std::sync::Arc;
+use ulid::Ulid;
 
 #[tokio::main]
 async fn main() {
@@ -43,6 +48,34 @@ async fn main() {
     .await
     {
         eprintln!("failed to restore automerge subscriptions: {err}");
+    }
+    if let Err(err) = drive(
+        EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+            actor: aruna_core::structs::Actor {
+                node_id: config.node_id,
+                user_id: Ulid::from_bytes([0u8; 16]),
+                realm_id: config.realm_id.clone(),
+            },
+            bootstrap_peers: config.bootstrap_nodes.clone(),
+            default_metadata_replication_factor: config.default_metadata_replication_factor,
+        }),
+        driver_ctx.as_ref(),
+    )
+    .await
+    {
+        eprintln!("failed to ensure realm config: {err}");
+    }
+    if let Err(err) = drive(
+        AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            realm_id: config.realm_id.clone(),
+            node_id: config.node_id,
+            schedule_refresh: true,
+        }),
+        driver_ctx.as_ref(),
+    )
+    .await
+    {
+        eprintln!("failed to announce realm presence: {err}");
     }
 
     let state = Arc::new(ServerState::new(

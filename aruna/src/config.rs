@@ -7,6 +7,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh::KeyParsingError;
 use std::array::TryFromSliceError;
 use std::net::SocketAddr;
+use std::num::ParseIntError;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -19,6 +20,7 @@ pub struct Config {
     pub node_id: iroh::PublicKey,
     pub net_secret_key: iroh::SecretKey,
     pub bootstrap_nodes: Vec<iroh::PublicKey>,
+    pub default_metadata_replication_factor: u32,
 }
 
 #[derive(Error, Debug)]
@@ -39,6 +41,8 @@ pub enum SetupError {
     PKCSError(#[from] ed25519_dalek::pkcs8::Error),
     #[error(transparent)]
     IrohKeyError(#[from] KeyParsingError),
+    #[error(transparent)]
+    ParseIntError(#[from] ParseIntError),
     #[error("NODE_PUBLIC_KEY does not match NODE_PRIVATE_KEY")]
     NodeKeyMismatch,
 }
@@ -65,6 +69,12 @@ pub fn read_config() -> Result<Config, SetupError> {
         })
         .transpose()?
         .unwrap_or_default();
+    let default_metadata_replication_factor = dotenvy::var("METADATA_REPLICATION_FACTOR")
+        .ok()
+        .map(|value| value.parse::<u32>())
+        .transpose()?
+        .unwrap_or(3)
+        .max(1);
 
     let realm_key = VerifyingKey::from_public_key_pem(&realm_pubkey)?;
     let realm_id = RealmId::from_bytes(*realm_key.as_bytes());
@@ -104,5 +114,6 @@ pub fn read_config() -> Result<Config, SetupError> {
         node_id,
         net_secret_key,
         bootstrap_nodes,
+        default_metadata_replication_factor,
     })
 }

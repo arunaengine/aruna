@@ -5,6 +5,7 @@ use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use tracing::error;
 
+use crate::announce_realm_presence::{AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation};
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 use crate::driver::{DriverContext, drive};
 
@@ -33,6 +34,16 @@ impl InboundTaskHandler for OperationsTaskHandler {
                 let op = AnnounceAutomergeDocumentOperation::new(document);
                 if let Err(err) = drive(op, self.context.as_ref()).await {
                     error!(error = ?err, "Failed to process automerge timer event");
+                }
+            }
+            TaskKey::RealmPresence { realm_id, node_id } => {
+                let op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+                    realm_id,
+                    node_id,
+                    schedule_refresh: true,
+                });
+                if let Err(err) = drive(op, self.context.as_ref()).await {
+                    error!(error = ?err, "Failed to process realm presence timer event");
                 }
             }
         }

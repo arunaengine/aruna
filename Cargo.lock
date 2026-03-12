@@ -109,6 +109,7 @@ dependencies = [
  "jsonwebtoken",
  "thiserror 2.0.18",
  "tokio",
+ "ulid",
 ]
 
 [[package]]
