@@ -62,6 +62,14 @@ pub fn write_effect(
     })
 }
 
+pub fn delete_effect(document: &AutomergeDocumentVariant, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Delete {
+        key_space: storage_keyspace(document).to_string(),
+        key: storage_key(document),
+        txn_id,
+    })
+}
+
 pub fn iter_metadata_effect(
     group_id: GroupId,
     txn_id: Option<TxnId>,
