@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
+use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::Operation;
@@ -38,6 +39,8 @@ enum AnnounceRealmPresenceState {
 
 #[derive(Debug, Error, PartialEq)]
 pub enum AnnounceRealmPresenceError {
+    #[error("failed to announce realm presence: {0}")]
+    PutFailed(DhtError),
     #[error("failed to schedule realm presence refresh: {0}")]
     ScheduleFailed(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -110,8 +113,7 @@ impl Operation for AnnounceRealmPresenceOperation {
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
         match self.state {
             AnnounceRealmPresenceState::PutPresence => match event {
-                Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
-                | Event::Net(NetEvent::Dht(DhtEvent::Error { .. })) => {
+                Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => {
                     if self.config.schedule_refresh {
                         self.state = AnnounceRealmPresenceState::ScheduleRefresh;
                         smallvec![Effect::Task(TaskEffect::ResetTimer {
@@ -121,6 +123,9 @@ impl Operation for AnnounceRealmPresenceOperation {
                     } else {
                         self.finish_success()
                     }
+                }
+                Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => {
+                    self.fail(AnnounceRealmPresenceError::PutFailed(error))
                 }
                 other => self.unexpected_event("dht put result", format!("{other:?}")),
             },
@@ -150,5 +155,33 @@ impl Operation for AnnounceRealmPresenceOperation {
 
     fn abort(&mut self) -> aruna_core::types::Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dht_put_error_fails_operation() {
+        let realm_id = RealmId([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            realm_id,
+            node_id,
+            schedule_refresh: true,
+        });
+
+        let effects = op.start();
+        assert_eq!(effects.len(), 1);
+
+        let effects = op.step(Event::Net(NetEvent::Dht(DhtEvent::Error {
+            error: DhtError::Other("boom".to_string()),
+        })));
+        assert!(effects.is_empty());
+        assert!(matches!(
+            op.finalize(),
+            Err(AnnounceRealmPresenceError::PutFailed(DhtError::Other(message))) if message == "boom"
+        ));
     }
 }

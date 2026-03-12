@@ -19,7 +19,7 @@ pub enum AuthorizationError {
     InvalidGroupId,
     #[error("No group found")]
     GroupNotFound,
-    #[error("No group found")]
+    #[error("Authorization document not found")]
     AuthDocNotFound,
     #[error("Creating Group did not finish")]
     NotFinished,

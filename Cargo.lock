@@ -109,6 +109,7 @@ dependencies = [
  "jsonwebtoken",
  "thiserror 2.0.18",
  "tokio",
+ "tracing-subscriber",
  "ulid",
 ]
 
@@ -123,15 +124,18 @@ dependencies = [
  "axum",
  "base64",
  "blake3",
+ "byteview",
  "chrono",
  "ed25519-dalek 2.2.0",
  "iroh",
  "jsonwebtoken",
+ "postcard",
  "rand 0.9.2",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "ulid",
  "utoipa",
  "utoipa-swagger-ui",
@@ -242,6 +246,7 @@ version = "3.0.0"
 dependencies = [
  "aruna-core",
  "async-trait",
+ "iroh",
  "tokio",
  "tokio-util",
 ]
@@ -4981,6 +4986,7 @@ dependencies = [
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "time",
  "tracing",
  "tracing-core",
  "tracing-log",

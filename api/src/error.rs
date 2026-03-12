@@ -14,6 +14,8 @@ pub enum ServerError {
     Unimplemented,
     #[error("Unauthorized")]
     Unauthorized,
+    #[error("Forbidden")]
+    Forbidden,
     #[error("{0}")]
     InternalError(String),
     #[error("Bad request")]
@@ -103,7 +105,7 @@ impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
         let status = self.status_code();
         let code = self.error_code();
-        let message = self.to_string();
+        let message = self.public_message();
 
         let body = ErrorResponse::new(&message).with_code(code);
 
@@ -116,6 +118,7 @@ impl ServerError {
         match self {
             ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::BadRequest => StatusCode::BAD_REQUEST,
         }
@@ -125,8 +128,16 @@ impl ServerError {
         match self {
             ServerError::Unimplemented => "Not implemented".to_string(),
             ServerError::Unauthorized => "Not authorized".to_string(),
-            ServerError::InternalError(msg) => msg.clone(),
+            ServerError::Forbidden => "Forbidden".to_string(),
+            ServerError::InternalError(_) => "Internal error".to_string(),
             ServerError::BadRequest => "Bad request".to_string(),
+        }
+    }
+
+    fn public_message(&self) -> String {
+        match self {
+            ServerError::InternalError(_) => "Internal server error".to_string(),
+            _ => self.to_string(),
         }
     }
 }

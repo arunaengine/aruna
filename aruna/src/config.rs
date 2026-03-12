@@ -43,6 +43,8 @@ pub enum SetupError {
     IrohKeyError(#[from] KeyParsingError),
     #[error(transparent)]
     ParseIntError(#[from] ParseIntError),
+    #[error("REALM_PUBLIC_KEY does not match REALM_PRIVATE_KEY")]
+    RealmKeyMismatch,
     #[error("NODE_PUBLIC_KEY does not match NODE_PRIVATE_KEY")]
     NodeKeyMismatch,
 }
@@ -84,9 +86,11 @@ pub fn read_config() -> Result<Config, SetupError> {
         .try_into()?;
 
     let realm_signing_key = SigningKey::from_pkcs8_pem(&realm_privkey)?;
+    if realm_signing_key.verifying_key().to_bytes() != realm_key.to_bytes() {
+        return Err(SetupError::RealmKeyMismatch);
+    }
     let realm_encoding_key = realm_signing_key
-        .to_pkcs8_pem(LineEnding::default())
-        .unwrap()
+        .to_pkcs8_pem(LineEnding::default())?
         .as_bytes()
         .try_into()?;
 

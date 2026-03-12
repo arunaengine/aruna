@@ -11,12 +11,30 @@ use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealm
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use std::sync::Arc;
+use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
 
 #[tokio::main]
 async fn main() {
-    let config = read_config().unwrap();
-    let storage_handle = storage::FjallStorage::open(&config.storage_path).unwrap();
+    init_tracing();
+
+    if let Err(err) = run().await {
+        eprintln!("{err}");
+        std::process::exit(1);
+    }
+}
+
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let config = read_config()?;
+    let storage_handle = storage::FjallStorage::open(&config.storage_path)?;
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: config.p2p_socket_addr,
@@ -26,8 +44,7 @@ async fn main() {
         },
         storage_handle.clone(),
     )
-    .await
-    .unwrap();
+    .await?;
     let task_handle = TaskHandle::new();
     let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
 
@@ -41,15 +58,12 @@ async fn main() {
     aruna_operations::incoming::initialize_net_incoming(driver_ctx.clone());
     aruna_operations::task_incoming::initialize_task_incoming(driver_ctx.clone(), task_handle)
         .await;
-    if let Err(err) = drive(
+    drive(
         aruna_operations::startup::RestoreAutomergeSubscriptionsOperation::new(),
         driver_ctx.as_ref(),
     )
-    .await
-    {
-        eprintln!("failed to restore automerge subscriptions: {err}");
-    }
-    if let Err(err) = drive(
+    .await?;
+    drive(
         EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
             actor: aruna_core::structs::Actor {
                 node_id: config.node_id,
@@ -61,11 +75,8 @@ async fn main() {
         }),
         driver_ctx.as_ref(),
     )
-    .await
-    {
-        eprintln!("failed to ensure realm config: {err}");
-    }
-    if let Err(err) = drive(
+    .await?;
+    drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
             realm_id: config.realm_id.clone(),
             node_id: config.node_id,
@@ -73,24 +84,24 @@ async fn main() {
         }),
         driver_ctx.as_ref(),
     )
-    .await
-    {
-        eprintln!("failed to announce realm presence: {err}");
-    }
+    .await?;
 
-    let state = Arc::new(ServerState::new(
-        driver_ctx,
-        config.realm_id,
-        config.node_id,
-        config.node_capabilities,
-        None,
-    ));
+    let state = Arc::new(
+        ServerState::new(
+            driver_ctx,
+            config.realm_id,
+            config.node_id,
+            config.node_capabilities,
+            None,
+        )
+        .await,
+    );
 
     let config = ServerConfig {
         http_addr: config.http_socket_addr,
     };
     let server = Server::new(state, config);
-    if let Err(err) = server.run().await {
-        eprintln!("{}", err);
-    }
+    server.run().await?;
+
+    Ok(())
 }

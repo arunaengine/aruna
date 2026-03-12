@@ -2,18 +2,28 @@ use crate::auth::OidcValidator;
 use crate::error::TokenError;
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_operations::driver::DriverContext;
 use base64::Engine;
+use byteview::ByteView;
 use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::DecodingKey;
+use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::warn;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+const API_STATE_KEYSPACE: &str = "api_state";
+const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
+const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 
 #[derive(Clone, Debug)]
 pub struct ServerState {
@@ -36,25 +46,38 @@ pub struct ServerState {
 }
 
 impl ServerState {
-    pub fn new(
+    pub async fn new(
         driver_ctx: Arc<DriverContext>,
         realm_id: RealmId,
         node_id: NodeId,
         node_capabilities: NodeCapabilities,
         oidc_validator: Option<Arc<OidcValidator>>,
     ) -> Self {
-        let mut trusted_realms = HashSet::default();
+        let token_revocation_list = load_persisted_state::<HashSet<String, ahash::RandomState>>(
+            driver_ctx.as_ref(),
+            TOKEN_REVOCATION_LIST_KEY,
+        )
+        .await
+        .unwrap_or_default();
+        let mut trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
+            driver_ctx.as_ref(),
+            TRUSTED_REALMS_LIST_KEY,
+        )
+        .await
+        .unwrap_or_default();
         trusted_realms.insert(realm_id.clone());
-        Self {
+        let state = Self {
             driver_ctx,
             realm_id,
             node_id,
             _oidc_validator: oidc_validator,
             node_capabilities,
-            token_revocation_list: Arc::new(RwLock::new(HashSet::default())),
+            token_revocation_list: Arc::new(RwLock::new(token_revocation_list)),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
             issuer_keys: Arc::new(RwLock::new(HashMap::default())),
-        }
+        };
+        state.persist_trusted_realms().await;
+        state
     }
     pub fn get_ctx(&self) -> Arc<DriverContext> {
         self.driver_ctx.clone()
@@ -109,9 +132,11 @@ impl ServerState {
     pub async fn add_token_to_blacklist(&self, token: &str) {
         let hash = blake3::hash(token.as_bytes()).to_string();
         self.token_revocation_list.write().await.insert(hash);
+        self.persist_token_revocation_list().await;
     }
     pub async fn add_trusted_realm(&self, realm_id: RealmId) {
         self.trusted_realms_list.write().await.insert(realm_id);
+        self.persist_trusted_realms().await;
     }
 
     pub async fn is_token_blacklisted(&self, token: &str) -> bool {
@@ -125,6 +150,79 @@ impl ServerState {
             .await
             .get(realm_id)
             .is_some()
+    }
+
+    async fn persist_token_revocation_list(&self) {
+        let blacklist = self.token_revocation_list.read().await.clone();
+        persist_state(
+            self.driver_ctx.as_ref(),
+            TOKEN_REVOCATION_LIST_KEY,
+            &blacklist,
+        )
+        .await;
+    }
+
+    async fn persist_trusted_realms(&self) {
+        let trusted_realms = self.trusted_realms_list.read().await.clone();
+        persist_state(
+            self.driver_ctx.as_ref(),
+            TRUSTED_REALMS_LIST_KEY,
+            &trusted_realms,
+        )
+        .await;
+    }
+}
+
+async fn load_persisted_state<T>(driver_ctx: &DriverContext, key: &[u8]) -> Option<T>
+where
+    T: DeserializeOwned,
+{
+    match driver_ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: API_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(key),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => match postcard::from_bytes(&bytes) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                warn!(error = %error, "Failed to decode persisted API state");
+                None
+            }
+        },
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(error = %error, "Failed to load persisted API state");
+            None
+        }
+        _ => None,
+    }
+}
+
+async fn persist_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
+where
+    T: Serialize,
+{
+    let Ok(bytes) = postcard::to_allocvec(value) else {
+        warn!("Failed to serialize API state for persistence");
+        return;
+    };
+
+    if let Event::Storage(StorageEvent::Error { error }) = driver_ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: API_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(key),
+            value: ByteView::from(bytes),
+            txn_id: None,
+        }))
+        .await
+    {
+        warn!(error = %error, "Failed to persist API state");
     }
 }
 
