@@ -1,14 +1,17 @@
 use aruna_core::consts::AUTH_KEYSPACE;
+use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, GroupAuthorizationDocument};
 use aruna_core::types::{GroupId, RoleId, TxnId, UserId};
 use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
+
+use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddUserToGroupInput {
@@ -47,6 +50,9 @@ pub enum AddUserToGroupState {
         auth_doc: GroupAuthorizationDocument,
     },
     CommitTransaction {
+        auth_doc: GroupAuthorizationDocument,
+    },
+    AnnounceAuthDoc {
         auth_doc: GroupAuthorizationDocument,
     },
     Finish,
@@ -189,9 +195,34 @@ impl AddUserToGroupOperation {
                 got,
             );
         };
+        self.state = AddUserToGroupState::AnnounceAuthDoc {
+            auth_doc: auth_doc.clone(),
+        };
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::GroupAuthorization {
+                group_id: auth_doc.group_id,
+            }),
+            |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                result: result.map_err(|error| error.to_string()),
+            }),
+        ))]
+    }
+
+    fn handle_announce_auth_doc(
+        &mut self,
+        event: Event,
+        auth_doc: GroupAuthorizationDocument,
+    ) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                got,
+            );
+        };
         self.state = AddUserToGroupState::Finish;
         self.output = Some(Ok(auth_doc));
-
         smallvec![]
     }
 
@@ -265,6 +296,9 @@ impl Operation for AddUserToGroupOperation {
             AddUserToGroupState::CommitTransaction { auth_doc } => {
                 self.handle_commit_transaction(event, auth_doc)
             }
+            AddUserToGroupState::AnnounceAuthDoc { auth_doc } => {
+                self.handle_announce_auth_doc(event, auth_doc)
+            }
             AddUserToGroupState::Init
             | AddUserToGroupState::Finish
             | AddUserToGroupState::Error => {
@@ -301,7 +335,6 @@ impl Operation for AddUserToGroupOperation {
 pub mod test {
     use aruna_core::structs::Actor;
     use aruna_storage::storage;
-    use iroh::PublicKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -318,11 +351,13 @@ pub mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
-        let node_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let group_config = CreateGroupConfig {
             actor: Actor {
                 node_id,

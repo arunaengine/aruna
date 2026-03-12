@@ -50,7 +50,12 @@ impl InboundEventHandler for OperationsInboundHandler {
                 }
             }
             Alpn::Automerge => {
-                let op = IncomingAutomergeOperation::new(stream, node_id);
+                let Some(automerge_handle) = self.context.automerge_handle.clone() else {
+                    warn!(node_id = %node_id, "Dropping inbound automerge stream without automerge handle");
+                    return;
+                };
+                let sync_id = automerge_handle.register_inbound_stream(stream, node_id).await;
+                let op = IncomingAutomergeOperation::new(sync_id, node_id);
                 if let Err(err) = drive(op, self.context.as_ref()).await {
                     error!(error = ?err, "Failed to process inbound automerge stream event");
                 }
