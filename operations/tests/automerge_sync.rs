@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::alpn::Alpn;
+use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::{Actor, MetadataDocument, RealmId};
-use aruna_net::streams::BiStream;
 use aruna_net::InboundEventHandler;
+use aruna_net::streams::BiStream;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::automerge::AutomergeHandle;
 use aruna_operations::automerge::repository::{read_effect, write_effect};
@@ -27,7 +27,8 @@ use tokio::time::{Instant, sleep, timeout};
 use ulid::Ulid;
 
 #[tokio::test]
-async fn metadata_automerge_sync_converges_between_nodes() -> Result<(), Box<dyn std::error::Error>> {
+async fn metadata_automerge_sync_converges_between_nodes() -> Result<(), Box<dyn std::error::Error>>
+{
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
@@ -162,7 +163,8 @@ async fn metadata_automerge_sync_converges_between_nodes() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
-async fn metadata_automerge_sync_populates_missing_document() -> Result<(), Box<dyn std::error::Error>> {
+async fn metadata_automerge_sync_populates_missing_document()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
@@ -396,7 +398,10 @@ async fn write_document(
     document: &AutomergeDocumentVariant,
     bytes: Vec<u8>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match storage.send_effect(write_effect(document, bytes, None)).await {
+    match storage
+        .send_effect(write_effect(document, bytes, None))
+        .await
+    {
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string().into()),
         other => Err(format!("unexpected storage event: {other:?}").into()),
@@ -408,9 +413,9 @@ async fn read_document(
     document: &AutomergeDocumentVariant,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     match storage.send_effect(read_effect(document, None)).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            value.map(|value| value.to_vec()).ok_or_else(|| "missing document bytes".into())
-        }
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|value| value.to_vec())
+            .ok_or_else(|| "missing document bytes".into()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string().into()),
         other => Err(format!("unexpected storage event: {other:?}").into()),
     }
@@ -426,7 +431,12 @@ async fn apply_metadata_triple(
     let mut metadata = MetadataDocument::from_bytes(&current)?;
     metadata.triples.insert(triple.to_string());
 
-    write_document(storage, document, metadata.reconcile_bytes(Some(&current), actor)?).await
+    write_document(
+        storage,
+        document,
+        metadata.reconcile_bytes(Some(&current), actor)?,
+    )
+    .await
 }
 
 #[derive(Debug)]
@@ -445,7 +455,12 @@ impl InboundEventHandler for TestInboundHandler {
     ) {
     }
 
-    async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: aruna_core::NodeId) {
+    async fn handle_incoming_stream(
+        &self,
+        alpn: Alpn,
+        stream: BiStream,
+        node_id: aruna_core::NodeId,
+    ) {
         if !matches!(alpn, Alpn::Automerge) {
             return;
         }
@@ -457,7 +472,9 @@ impl InboundEventHandler for TestInboundHandler {
             return;
         };
 
-        let sync_id = automerge_handle.register_inbound_stream(stream, node_id).await;
+        let sync_id = automerge_handle
+            .register_inbound_stream(stream, node_id)
+            .await;
         let result = drive(
             IncomingAutomergeOperation::new(sync_id, node_id),
             self.context.as_ref(),

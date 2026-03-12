@@ -80,7 +80,8 @@ mod tests {
         ));
 
         let encoded = postcard::to_allocvec(&message).expect("message encodes");
-        let decoded: AutomergeTransportMessage = postcard::from_bytes(&encoded).expect("message decodes");
+        let decoded: AutomergeTransportMessage =
+            postcard::from_bytes(&encoded).expect("message decodes");
         assert_eq!(message, decoded);
     }
 }

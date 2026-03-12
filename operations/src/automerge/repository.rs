@@ -96,6 +96,10 @@ pub fn parse_document_bytes(event: Event) -> Result<Option<Vec<u8>>, StorageErro
 }
 
 pub fn automerge_heads(bytes: &[u8]) -> Result<Vec<ChangeHash>, ConversionError> {
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut doc = AutoCommit::load(bytes)?;
     Ok(doc.get_heads())
 }

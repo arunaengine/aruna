@@ -2,7 +2,7 @@ use aruna_core::automerge::AutomergeState;
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::task::{TaskEffect, TaskEvent};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -37,6 +37,8 @@ pub enum IncomingGossipError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("automerge sync failed: {0}")]
+    AutomergeSync(String),
     #[error("invalid gossip announcement")]
     InvalidAnnouncement,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -152,10 +154,15 @@ impl Operation for IncomingGossipOperation {
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
             },
             IncomingGossipState::WaitForSync => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { .. }) => {
-                    self.state = IncomingGossipState::Finish;
-                    self.output = Some(Ok(()));
-                    smallvec![]
+                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            self.state = IncomingGossipState::Finish;
+                            self.output = Some(Ok(()));
+                            smallvec![]
+                        }
+                        Err(error) => self.fail(IncomingGossipError::AutomergeSync(error)),
+                    }
                 }
                 other => self.unexpected_event("automerge sync result", format!("{other:?}")),
             },

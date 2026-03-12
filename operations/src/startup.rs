@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 
+use aruna_core::TopicId;
 use aruna_core::consts::{AUTH_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, METADATA_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{boxed_suboperation, Operation};
-use aruna_core::TopicId;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -27,7 +27,6 @@ enum RestoreAutomergeSubscriptionsState {
     ListMetadata,
     ListAuth,
     ReadSubscriptions,
-    AnnounceNext,
     WaitAnnouncement,
     Finish,
     Error,
@@ -39,6 +38,8 @@ pub enum RestoreAutomergeSubscriptionsError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("automerge announcement failed: {0}")]
+    AutomergeState(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -151,8 +152,8 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                     self.documents
                         .retain(|document| self.subscriptions.contains(&document.topic_id()));
 
-                    self.state = RestoreAutomergeSubscriptionsState::AnnounceNext;
                     if let Some(document) = self.documents.pop() {
+                        self.state = RestoreAutomergeSubscriptionsState::WaitAnnouncement;
                         smallvec![Effect::SubOperation(boxed_suboperation(
                             AnnounceAutomergeDocumentOperation::new(document),
                             |result| {
@@ -170,25 +171,31 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
             },
-            RestoreAutomergeSubscriptionsState::AnnounceNext => {
-                self.state = RestoreAutomergeSubscriptionsState::WaitAnnouncement;
-                self.step(event)
-            }
             RestoreAutomergeSubscriptionsState::WaitAnnouncement => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) => {
-                    if let Some(document) = self.documents.pop() {
-                        smallvec![Effect::SubOperation(boxed_suboperation(
-                            AnnounceAutomergeDocumentOperation::new(document),
-                            |result| {
-                                Event::SubOperation(SubOperationEvent::AutomergeStateResult {
-                                    result: result.map_err(|error| error.to_string()),
-                                })
-                            },
-                        ))]
-                    } else {
-                        self.state = RestoreAutomergeSubscriptionsState::Finish;
-                        self.output = Some(Ok(()));
-                        smallvec![]
+                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            if let Some(document) = self.documents.pop() {
+                                self.state = RestoreAutomergeSubscriptionsState::WaitAnnouncement;
+                                smallvec![Effect::SubOperation(boxed_suboperation(
+                                    AnnounceAutomergeDocumentOperation::new(document),
+                                    |result| {
+                                        Event::SubOperation(
+                                            SubOperationEvent::AutomergeStateResult {
+                                                result: result.map_err(|error| error.to_string()),
+                                            },
+                                        )
+                                    },
+                                ))]
+                            } else {
+                                self.state = RestoreAutomergeSubscriptionsState::Finish;
+                                self.output = Some(Ok(()));
+                                smallvec![]
+                            }
+                        }
+                        Err(error) => {
+                            self.fail(RestoreAutomergeSubscriptionsError::AutomergeState(error))
+                        }
                     }
                 }
                 other => {

@@ -270,7 +270,8 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-async fn test_automerge_topic_subscription_announces_document_holders() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_automerge_topic_subscription_announces_document_holders()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
@@ -308,11 +309,15 @@ async fn test_automerge_topic_subscription_announces_document_holders() -> Resul
     let mut found = false;
     for _ in 0..10 {
         let get = handle_b
-            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get { key: holder_key })))
+            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
+                key: holder_key,
+            })))
             .await;
 
         if let Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) = get
-            && values.iter().any(|entry| entry.node_id == handle_a.node_id())
+            && values
+                .iter()
+                .any(|entry| entry.node_id == handle_a.node_id())
         {
             found = true;
             break;

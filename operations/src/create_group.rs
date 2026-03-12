@@ -1,5 +1,5 @@
-use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -212,9 +212,11 @@ impl CreateGroupOperation {
         {
             self.state = CreateGroupState::AnnounceAuthDoc;
             smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::GroupAuthorization {
-                    group_id: group.group_id,
-                }),
+                AnnounceAutomergeDocumentOperation::new(
+                    AutomergeDocumentVariant::GroupAuthorization {
+                        group_id: group.group_id,
+                    }
+                ),
                 |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
@@ -226,13 +228,17 @@ impl CreateGroupOperation {
 
     fn handle_announce_auth_doc(&mut self, event: Event) -> aruna_core::types::Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) = event else {
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
             return self.unexpected_event(
                 CreateGroupState::AnnounceAuthDoc,
                 "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
                 got,
             );
         };
+
+        if let Err(error) = result {
+            return self.fail(CreateGroupError::AutomergeState(error));
+        }
 
         if let Some(group) = &self.group
             && let Some(auth) = &self.auth_doc
@@ -264,6 +270,8 @@ pub enum CreateGroupError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("automerge announcement failed: {0}")]
+    AutomergeState(String),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("No group found")]
@@ -333,7 +341,9 @@ mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::structs::Actor;
+    use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -342,12 +352,23 @@ mod test {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                use_dns_discovery: false,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let task_handle = TaskHandle::new();
 
         let context = DriverContext {
             storage_handle,
-            net_handle: None,
+            net_handle: Some(net_handle.clone()),
             automerge_handle: None,
-            task_handle: None,
+            task_handle: Some(task_handle),
         };
 
         let user_id = Ulid::new();
@@ -393,5 +414,7 @@ mod test {
                 .iter()
                 .any(|(_id, role)| { role.name == "viewer" })
         );
+
+        net_handle.shutdown().await;
     }
 }

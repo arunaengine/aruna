@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
 use aruna_core::automerge::{
-    AutomergeSyncFeature, AutomergeEffect, AutomergeEvent, AutomergeInit,
-    AutomergeRejectReason, AutomergeSyncError,
+    AutomergeEffect, AutomergeEvent, AutomergeInit, AutomergeRejectReason, AutomergeSyncError,
+    AutomergeSyncFeature,
 };
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -12,13 +13,15 @@ use aruna_core::handle::Handle;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use automerge::sync::{self, SyncDoc};
 use automerge::AutoCommit;
-use tokio::io::AsyncWriteExt;
+use automerge::sync::{self, SyncDoc};
 use tokio::sync::Mutex;
 use ulid::Ulid;
 
-use super::protocol::{read_message, write_message, AutomergeTransportMessage};
+use super::protocol::{AutomergeTransportMessage, read_message, write_message};
+
+const SYNC_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_SYNC_ROUNDS: usize = 256;
 
 #[derive(Clone)]
 pub struct AutomergeHandle {
@@ -83,7 +86,11 @@ impl AutomergeHandle {
         self.inner.active_syncs.lock().await.remove(&sync_id)
     }
 
-    async fn start_outbound_sync(&self, peer: aruna_core::NodeId, init: AutomergeInit) -> AutomergeEvent {
+    async fn start_outbound_sync(
+        &self,
+        peer: aruna_core::NodeId,
+        init: AutomergeInit,
+    ) -> AutomergeEvent {
         let Some(net_handle) = self.inner.net_handle.clone() else {
             return AutomergeEvent::SyncRejected {
                 sync_id: Ulid::new(),
@@ -112,7 +119,7 @@ impl AutomergeHandle {
             remote_init: None,
         };
 
-        if let Err(error) = write_message(
+        if let Err(error) = write_transport_message(
             &mut sync.stream,
             &AutomergeTransportMessage::Init(init.clone()),
         )
@@ -126,7 +133,7 @@ impl AutomergeHandle {
             };
         }
 
-        match read_message(&mut sync.stream).await {
+        match read_transport_message(&mut sync.stream).await {
             Ok(AutomergeTransportMessage::Init(remote_init)) => {
                 sync.remote_init = Some(remote_init.clone());
                 self.store_active_sync(sync_id, sync).await;
@@ -176,7 +183,7 @@ impl AutomergeHandle {
         };
 
         let peer = sync.peer;
-        match read_message(&mut sync.stream).await {
+        match read_transport_message(&mut sync.stream).await {
             Ok(AutomergeTransportMessage::Init(remote_init)) => {
                 sync.remote_init = Some(remote_init.clone());
                 self.store_active_sync(sync_id, sync).await;
@@ -245,7 +252,7 @@ impl AutomergeHandle {
         };
 
         if let Some(local_init) = response_init.as_ref() {
-            if let Err(error) = write_message(
+            if let Err(error) = write_transport_message(
                 &mut sync.stream,
                 &AutomergeTransportMessage::Init(local_init.clone()),
             )
@@ -287,6 +294,7 @@ impl AutomergeHandle {
 
         match result {
             Ok(()) => {
+                close_stream(&mut sync.stream).await;
                 let after_heads = doc.get_heads();
                 let changed = before_heads != after_heads;
                 let updated_document = doc.save();
@@ -320,7 +328,7 @@ impl AutomergeHandle {
         };
         let mut sync = sync;
         let document = sync.remote_init.as_ref().map(|init| init.document.clone());
-        let _ = write_message(
+        let _ = write_transport_message(
             &mut sync.stream,
             &AutomergeTransportMessage::Reject(reason.clone()),
         )
@@ -375,7 +383,9 @@ impl Handle for AutomergeHandle {
             _ => Event::Automerge(AutomergeEvent::SyncRejected {
                 sync_id: Ulid::new(),
                 document: None,
-                error: AutomergeSyncError::Protocol("invalid effect for automerge handle".to_string()),
+                error: AutomergeSyncError::Protocol(
+                    "invalid effect for automerge handle".to_string(),
+                ),
             }),
         }
     }
@@ -387,7 +397,7 @@ async fn run_sync_rounds(
     remote_init: &AutomergeInit,
 ) -> Result<(), AutomergeSyncError> {
     if doc.get_heads() == remote_init.heads {
-        write_message(stream, &AutomergeTransportMessage::Done).await?;
+        write_transport_message(stream, &AutomergeTransportMessage::Done).await?;
         let _ = read_done_or_close(stream).await;
         return Ok(());
     }
@@ -395,13 +405,22 @@ async fn run_sync_rounds(
     let mut state = fresh_sync_state(remote_init);
     let mut sent_done = false;
     let mut received_done = false;
+    let mut rounds = 0usize;
 
     loop {
+        rounds += 1;
+        if rounds > MAX_SYNC_ROUNDS {
+            return Err(AutomergeSyncError::Protocol(
+                "automerge sync exceeded maximum rounds".to_string(),
+            ));
+        }
+
         if !sent_done {
             if let Some(message) = doc.sync().generate_sync_message(&mut state) {
-                write_message(stream, &AutomergeTransportMessage::Sync(message.encode())).await?;
+                write_transport_message(stream, &AutomergeTransportMessage::Sync(message.encode()))
+                    .await?;
             } else {
-                write_message(stream, &AutomergeTransportMessage::Done).await?;
+                write_transport_message(stream, &AutomergeTransportMessage::Done).await?;
                 sent_done = true;
                 if received_done {
                     return Ok(());
@@ -409,7 +428,7 @@ async fn run_sync_rounds(
             }
         }
 
-        let message = match read_message(stream).await {
+        let message = match read_transport_message(stream).await {
             Ok(message) => message,
             Err(AutomergeSyncError::Network(_)) if sent_done => return Ok(()),
             Err(error) => return Err(error),
@@ -440,7 +459,7 @@ async fn run_sync_rounds(
 }
 
 async fn read_done_or_close(stream: &mut BiStream) -> Result<(), AutomergeSyncError> {
-    match read_message(stream).await {
+    match read_transport_message(stream).await {
         Ok(AutomergeTransportMessage::Done) => Ok(()),
         Ok(AutomergeTransportMessage::Reject(reason)) => Err(reject_reason_to_error(reason)),
         Ok(_) => Err(AutomergeSyncError::InvalidFrame),
@@ -451,12 +470,7 @@ async fn read_done_or_close(stream: &mut BiStream) -> Result<(), AutomergeSyncEr
 
 fn fresh_sync_state(init: &AutomergeInit) -> sync::State {
     let mut state = sync::State::new();
-    state.their_capabilities = Some(
-        init.capabilities
-            .iter()
-            .map(map_capability)
-            .collect(),
-    );
+    state.their_capabilities = Some(init.capabilities.iter().map(map_capability).collect());
     state
 }
 
@@ -477,7 +491,27 @@ fn load_document(bytes: &[u8]) -> Result<AutoCommit, AutomergeSyncError> {
 
 async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
-    let _ = stream.0.shutdown().await;
+}
+
+async fn write_transport_message(
+    stream: &mut BiStream,
+    message: &AutomergeTransportMessage,
+) -> Result<(), AutomergeSyncError> {
+    tokio::time::timeout(SYNC_IO_TIMEOUT, write_message(stream, message))
+        .await
+        .map_err(|_| {
+            AutomergeSyncError::Network("timed out writing automerge message".to_string())
+        })?
+}
+
+async fn read_transport_message(
+    stream: &mut BiStream,
+) -> Result<AutomergeTransportMessage, AutomergeSyncError> {
+    tokio::time::timeout(SYNC_IO_TIMEOUT, read_message(stream))
+        .await
+        .map_err(|_| {
+            AutomergeSyncError::Network("timed out waiting for automerge message".to_string())
+        })?
 }
 
 fn reject_reason_to_error(reason: AutomergeRejectReason) -> AutomergeSyncError {

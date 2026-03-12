@@ -1,19 +1,19 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use oxrdf::Triple;
 use rocraters::ro_crate::context::RoCrateContext;
 use rocraters::ro_crate::rdf::{
-    rdf_graph_to_rocrate, rocrate_to_rdf_with_options, ContextResolverBuilder, ConversionOptions,
-    RdfFormat, RdfGraph,
+    ContextResolverBuilder, ConversionOptions, RdfFormat, RdfGraph, rdf_graph_to_rocrate,
+    rocrate_to_rdf_with_options,
 };
 use rocraters::ro_crate::rocrate::RoCrate;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::ConversionError;
 use crate::structs::Actor;
-use crate::types::{autosurgeon_ulid, GroupId};
+use crate::types::{GroupId, autosurgeon_ulid};
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
 pub struct MetadataDocument {
@@ -168,6 +168,7 @@ pub mod autosurgeon_triple_set {
         mut reconciler: R,
     ) -> Result<(), R::Error> {
         let mut map = reconciler.map()?;
+        map.retain(|triple, _| triples.contains(triple))?;
         for triple in triples {
             map.put(triple, String::new())?;
         }
@@ -219,5 +220,29 @@ mod tests {
             MetadataDocument::from_rdf_graph(document.group_id, document.document_id, graph)
                 .expect("from graph");
         assert_eq!(document.triples, restored.triples);
+    }
+
+    #[test]
+    fn metadata_document_reconcile_removes_deleted_triples() {
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+            user_id: GroupId::new(),
+            realm_id: crate::structs::RealmId([2u8; 32]),
+        };
+
+        let original = sample_document();
+        let original_bytes = original.to_bytes(&actor).expect("original bytes");
+
+        let mut updated = original.clone();
+        updated
+            .triples
+            .remove("<http://example.org/root> <http://schema.org/name> \"example\"");
+
+        let updated_bytes = updated
+            .reconcile_bytes(Some(&original_bytes), &actor)
+            .expect("updated bytes");
+        let restored = MetadataDocument::from_bytes(&updated_bytes).expect("restored metadata");
+
+        assert_eq!(restored.triples, updated.triples);
     }
 }

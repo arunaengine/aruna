@@ -1,7 +1,7 @@
 use aruna_core::automerge::{
     AutomergeDocumentVariant, AutomergeEffect, AutomergeEvent, AutomergeInit, AutomergeSyncError,
 };
-use aruna_core::effects::Effect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
@@ -16,6 +16,7 @@ pub struct OutgoingAutomergeOperation {
     document: AutomergeDocumentVariant,
     state: OutgoingAutomergeState,
     local_document: Option<Vec<u8>>,
+    persist_txn_id: Option<aruna_core::types::TxnId>,
     synced_document: Option<Vec<u8>>,
     output: Option<Result<(), OutgoingAutomergeError>>,
 }
@@ -26,8 +27,10 @@ enum OutgoingAutomergeState {
     ReadLocal,
     InitializeSession,
     RunSync,
+    StartPersistTransaction,
     ReconcileRead,
     Persist,
+    CommitPersist,
     Finish,
     Error,
 }
@@ -55,15 +58,17 @@ impl OutgoingAutomergeOperation {
             document,
             state: OutgoingAutomergeState::Init,
             local_document: None,
+            persist_txn_id: None,
             synced_document: None,
             output: None,
         }
     }
 
     fn fail(&mut self, error: OutgoingAutomergeError) -> aruna_core::types::Effects {
+        let cleanup = self.abort();
         self.state = OutgoingAutomergeState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        cleanup
     }
 
     fn unexpected_event(
@@ -137,8 +142,10 @@ impl Operation for OutgoingAutomergeOperation {
                     }
 
                     self.synced_document = Some(updated_document);
-                    self.state = OutgoingAutomergeState::ReconcileRead;
-                    smallvec![read_effect(&self.document, None)]
+                    self.state = OutgoingAutomergeState::StartPersistTransaction;
+                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                        read: false,
+                    })]
                 }
                 Event::Automerge(AutomergeEvent::SyncRejected { error, .. }) => {
                     self.fail(OutgoingAutomergeError::Sync(error))
@@ -146,6 +153,15 @@ impl Operation for OutgoingAutomergeOperation {
                 other => {
                     self.unexpected_event("automerge session completion", format!("{other:?}"))
                 }
+            },
+            OutgoingAutomergeState::StartPersistTransaction => match event {
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                    self.persist_txn_id = Some(txn_id);
+                    self.state = OutgoingAutomergeState::ReconcileRead;
+                    smallvec![read_effect(&self.document, Some(txn_id))]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("transaction start result", format!("{other:?}")),
             },
             OutgoingAutomergeState::ReconcileRead => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -156,20 +172,42 @@ impl Operation for OutgoingAutomergeOperation {
                             Err(error) => return self.fail(error.into()),
                         };
 
+                    let Some(txn_id) = self.persist_txn_id else {
+                        return self.fail(OutgoingAutomergeError::StorageError(
+                            StorageError::TransactionNotFound,
+                        ));
+                    };
                     self.state = OutgoingAutomergeState::Persist;
-                    smallvec![write_effect(&self.document, merged, None)]
+                    smallvec![write_effect(&self.document, merged, Some(txn_id))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
             },
             OutgoingAutomergeState::Persist => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.persist_txn_id else {
+                        return self.fail(OutgoingAutomergeError::StorageError(
+                            StorageError::TransactionNotFound,
+                        ));
+                    };
+                    self.state = OutgoingAutomergeState::CommitPersist;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage write result", format!("{other:?}")),
+            },
+            OutgoingAutomergeState::CommitPersist => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.persist_txn_id = None;
                     self.state = OutgoingAutomergeState::Finish;
                     self.output = Some(Ok(()));
                     smallvec![]
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.persist_txn_id = None;
+                    self.fail(error.into())
+                }
+                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             OutgoingAutomergeState::Finish
             | OutgoingAutomergeState::Error
@@ -191,7 +229,10 @@ impl Operation for OutgoingAutomergeOperation {
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
-        smallvec![]
+        match self.persist_txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
     }
 }
 

@@ -376,7 +376,9 @@ mod test {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::structs::{Actor, Permission, RealmId};
+    use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -419,12 +421,23 @@ mod test {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                use_dns_discovery: false,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let task_handle = TaskHandle::new();
 
         let context = DriverContext {
             storage_handle,
-            net_handle: None,
+            net_handle: Some(net_handle.clone()),
             automerge_handle: None,
-            task_handle: None,
+            task_handle: Some(task_handle),
         };
 
         let admin_id = Ulid::new();
@@ -691,5 +704,7 @@ mod test {
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(drive(perm_operation, &context).await.unwrap());
+
+        net_handle.shutdown().await;
     }
 }

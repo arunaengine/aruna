@@ -241,7 +241,9 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use crate::list_groups::ListGroupOperation;
     use aruna_core::structs::Actor;
+    use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -250,12 +252,23 @@ mod test {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                use_dns_discovery: false,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let task_handle = TaskHandle::new();
 
         let context = DriverContext {
             storage_handle,
-            net_handle: None,
+            net_handle: Some(net_handle.clone()),
             automerge_handle: None,
-            task_handle: None,
+            task_handle: Some(task_handle),
         };
 
         let mut groups = Vec::new();
@@ -279,5 +292,7 @@ mod test {
         groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
 
         assert_eq!(list_result, groups);
+
+        net_handle.shutdown().await;
     }
 }

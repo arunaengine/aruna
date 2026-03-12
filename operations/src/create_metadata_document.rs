@@ -1,8 +1,8 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::effects::Effect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, MetadataDocument};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -19,6 +19,7 @@ pub struct CreateMetadataDocumentConfig {
 #[derive(Debug, PartialEq)]
 pub struct CreateMetadataDocumentOperation {
     config: CreateMetadataDocumentConfig,
+    txn_id: Option<aruna_core::types::TxnId>,
     state: CreateMetadataDocumentState,
     output: Option<Result<MetadataDocument, CreateMetadataDocumentError>>,
 }
@@ -26,7 +27,10 @@ pub struct CreateMetadataDocumentOperation {
 #[derive(Debug, Clone, PartialEq)]
 enum CreateMetadataDocumentState {
     Init,
+    StartTransaction,
+    CheckExisting,
     WriteDocument,
+    CommitTransaction,
     Announce,
     Finish,
     Error,
@@ -38,6 +42,12 @@ pub enum CreateMetadataDocumentError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("document already exists")]
+    DocumentAlreadyExists,
+    #[error("missing active transaction")]
+    MissingTransaction,
+    #[error("automerge announcement failed: {0}")]
+    AutomergeState(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -50,6 +60,7 @@ impl CreateMetadataDocumentOperation {
     pub fn new(config: CreateMetadataDocumentConfig) -> Self {
         Self {
             config,
+            txn_id: None,
             state: CreateMetadataDocumentState::Init,
             output: None,
         }
@@ -63,9 +74,10 @@ impl CreateMetadataDocumentOperation {
     }
 
     fn fail(&mut self, error: CreateMetadataDocumentError) -> aruna_core::types::Effects {
+        let cleanup = self.abort();
         self.state = CreateMetadataDocumentState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        cleanup
     }
 
     fn unexpected_event(
@@ -87,22 +99,62 @@ impl Operation for CreateMetadataDocumentOperation {
     type Error = CreateMetadataDocumentError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        let bytes = match self
-            .config
-            .document
-            .reconcile_bytes(None, &self.config.actor)
-        {
-            Ok(bytes) => bytes,
-            Err(error) => return self.fail(error.into()),
-        };
-        self.state = CreateMetadataDocumentState::WriteDocument;
-        smallvec![write_effect(&self.document_ref(), bytes, None)]
+        self.state = CreateMetadataDocumentState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
         match self.state {
+            CreateMetadataDocumentState::StartTransaction => match event {
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                    self.txn_id = Some(txn_id);
+                    self.state = CreateMetadataDocumentState::CheckExisting;
+                    smallvec![crate::automerge::repository::read_effect(
+                        &self.document_ref(),
+                        Some(txn_id),
+                    )]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::CheckExisting => match event {
+                Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {
+                    self.fail(CreateMetadataDocumentError::DocumentAlreadyExists)
+                }
+                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                    let bytes = match self
+                        .config
+                        .document
+                        .reconcile_bytes(None, &self.config.actor)
+                    {
+                        Ok(bytes) => bytes,
+                        Err(error) => return self.fail(error.into()),
+                    };
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = CreateMetadataDocumentState::WriteDocument;
+                    smallvec![write_effect(&self.document_ref(), bytes, Some(txn_id))]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage read result", format!("{other:?}")),
+            },
             CreateMetadataDocumentState::WriteDocument => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = CreateMetadataDocumentState::CommitTransaction;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage write result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::CommitTransaction => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.txn_id = None;
                     self.state = CreateMetadataDocumentState::Announce;
                     smallvec![Effect::SubOperation(boxed_suboperation(
                         AnnounceAutomergeDocumentOperation::new(self.document_ref()),
@@ -113,14 +165,22 @@ impl Operation for CreateMetadataDocumentOperation {
                         },
                     ))]
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.txn_id = None;
+                    self.fail(error.into())
+                }
+                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) => {
-                    self.state = CreateMetadataDocumentState::Finish;
-                    self.output = Some(Ok(self.config.document.clone()));
-                    smallvec![]
+                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            self.state = CreateMetadataDocumentState::Finish;
+                            self.output = Some(Ok(self.config.document.clone()));
+                            smallvec![]
+                        }
+                        Err(error) => self.fail(CreateMetadataDocumentError::AutomergeState(error)),
+                    }
                 }
                 other => {
                     self.unexpected_event("automerge announcement result", format!("{other:?}"))
@@ -144,6 +204,9 @@ impl Operation for CreateMetadataDocumentOperation {
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
-        smallvec![]
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
     }
 }

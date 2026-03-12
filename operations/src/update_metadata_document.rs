@@ -1,8 +1,8 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::effects::Effect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, MetadataDocument};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -19,6 +19,7 @@ pub struct UpdateMetadataDocumentConfig {
 #[derive(Debug, PartialEq)]
 pub struct UpdateMetadataDocumentOperation {
     config: UpdateMetadataDocumentConfig,
+    txn_id: Option<aruna_core::types::TxnId>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataDocument, UpdateMetadataDocumentError>>,
 }
@@ -26,8 +27,10 @@ pub struct UpdateMetadataDocumentOperation {
 #[derive(Debug, Clone, PartialEq)]
 enum UpdateMetadataDocumentState {
     Init,
+    StartTransaction,
     ReadCurrent,
     WriteDocument,
+    CommitTransaction,
     Announce,
     Finish,
     Error,
@@ -39,6 +42,12 @@ pub enum UpdateMetadataDocumentError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("document not found")]
+    DocumentNotFound,
+    #[error("missing active transaction")]
+    MissingTransaction,
+    #[error("automerge announcement failed: {0}")]
+    AutomergeState(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -51,6 +60,7 @@ impl UpdateMetadataDocumentOperation {
     pub fn new(config: UpdateMetadataDocumentConfig) -> Self {
         Self {
             config,
+            txn_id: None,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -64,9 +74,10 @@ impl UpdateMetadataDocumentOperation {
     }
 
     fn fail(&mut self, error: UpdateMetadataDocumentError) -> aruna_core::types::Effects {
+        let cleanup = self.abort();
         self.state = UpdateMetadataDocumentState::Error;
         self.output = Some(Err(error));
-        smallvec![]
+        cleanup
     }
 
     fn unexpected_event(
@@ -88,30 +99,61 @@ impl Operation for UpdateMetadataDocumentOperation {
     type Error = UpdateMetadataDocumentError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = UpdateMetadataDocumentState::ReadCurrent;
-        smallvec![read_effect(&self.document_ref(), None)]
+        self.state = UpdateMetadataDocumentState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
     }
 
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
         match self.state {
+            UpdateMetadataDocumentState::StartTransaction => match event {
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                    self.txn_id = Some(txn_id);
+                    self.state = UpdateMetadataDocumentState::ReadCurrent;
+                    smallvec![read_effect(&self.document_ref(), Some(txn_id))]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+            },
             UpdateMetadataDocumentState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                Event::Storage(StorageEvent::ReadResult {
+                    value: Some(value), ..
+                }) => {
                     let bytes = match self
                         .config
                         .document
-                        .reconcile_bytes(value.as_deref(), &self.config.actor)
+                        .reconcile_bytes(Some(value.as_ref()), &self.config.actor)
                     {
                         Ok(bytes) => bytes,
                         Err(error) => return self.fail(error.into()),
                     };
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
                     self.state = UpdateMetadataDocumentState::WriteDocument;
-                    smallvec![write_effect(&self.document_ref(), bytes, None)]
+                    smallvec![write_effect(&self.document_ref(), bytes, Some(txn_id))]
+                }
+                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                    self.fail(UpdateMetadataDocumentError::DocumentNotFound)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::WriteDocument => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = UpdateMetadataDocumentState::CommitTransaction;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage write result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::CommitTransaction => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.txn_id = None;
                     self.state = UpdateMetadataDocumentState::Announce;
                     smallvec![Effect::SubOperation(boxed_suboperation(
                         AnnounceAutomergeDocumentOperation::new(self.document_ref()),
@@ -122,14 +164,22 @@ impl Operation for UpdateMetadataDocumentOperation {
                         },
                     ))]
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.txn_id = None;
+                    self.fail(error.into())
+                }
+                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) => {
-                    self.state = UpdateMetadataDocumentState::Finish;
-                    self.output = Some(Ok(self.config.document.clone()));
-                    smallvec![]
+                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            self.state = UpdateMetadataDocumentState::Finish;
+                            self.output = Some(Ok(self.config.document.clone()));
+                            smallvec![]
+                        }
+                        Err(error) => self.fail(UpdateMetadataDocumentError::AutomergeState(error)),
+                    }
                 }
                 other => {
                     self.unexpected_event("automerge announcement result", format!("{other:?}"))
@@ -153,6 +203,9 @@ impl Operation for UpdateMetadataDocumentOperation {
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
-        smallvec![]
+        match self.txn_id.take() {
+            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
+            None => smallvec![],
+        }
     }
 }
