@@ -27,7 +27,7 @@ ulid = { workspace = true }
 ed25519-dalek = { workspace = true }
 base64 = { workspace = true }
 postcard = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-rand = { workspace = true }

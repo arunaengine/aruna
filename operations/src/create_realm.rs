@@ -1,10 +1,10 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::consts::{AUTH_KEYSPACE, REALM_KEYSPACE};
+use aruna_core::consts::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, Realm, RealmAuthorizationDocument};
+use aruna_core::structs::{Actor, Realm, RealmAuthorizationDocument, RealmConfigDocument};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -22,6 +22,7 @@ pub struct CreateRealmOperation {
     config: CreateRealmConfig,
     txn_id: Option<Ulid>,
     auth_doc: Option<RealmAuthorizationDocument>,
+    config_doc: Option<RealmConfigDocument>,
     realm: Option<Realm>,
     state: CreateRealmState,
     output: Option<Result<(Realm, RealmAuthorizationDocument), CreateRealmError>>,
@@ -32,6 +33,7 @@ impl std::fmt::Debug for CreateRealmOperation {
         f.debug_struct("CreateRealmOperation")
             .field("config", &self.config)
             .field("auth_doc", &self.auth_doc)
+            .field("config_doc", &self.config_doc)
             .field("state", &self.state)
             .field("txn_id", &self.txn_id)
             .field("output", &self.output)
@@ -44,6 +46,7 @@ impl CreateRealmOperation {
         CreateRealmOperation {
             config,
             auth_doc: None,
+            config_doc: None,
             realm: None,
             state: CreateRealmState::Init,
             txn_id: None,
@@ -87,6 +90,24 @@ impl CreateRealmOperation {
         let value = auth_doc.to_bytes(&self.config.actor)?.into();
         Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: AUTH_KEYSPACE.to_string(),
+            key,
+            value,
+            txn_id: self.txn_id,
+        })])
+    }
+
+    fn emit_create_config_doc(&mut self) -> Result<aruna_core::types::Effects, CreateRealmError> {
+        self.txn_id
+            .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
+
+        let realm_id = self.config.actor.realm_id.clone();
+        let config_doc = RealmConfigDocument::default_for_realm(realm_id.clone());
+        self.config_doc = Some(config_doc.clone());
+
+        let key = (*realm_id.as_bytes()).into();
+        let value = config_doc.to_bytes(&self.config.actor)?.into();
+        Ok(smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
             key,
             value,
             txn_id: self.txn_id,
@@ -179,6 +200,23 @@ impl CreateRealmOperation {
             );
         };
 
+        self.state = CreateRealmState::CreateConfigDoc;
+        match self.emit_create_config_doc() {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn handle_create_config_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.unexpected_event(
+                CreateRealmState::CreateConfigDoc,
+                "Event::Storage(StorageEvent::WriteResult)",
+                got,
+            );
+        };
+
         self.state = CreateRealmState::CommitTransaction;
         if let Some(txn_id) = self.txn_id {
             smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -199,6 +237,7 @@ impl CreateRealmOperation {
 
         if let Some(realm) = &self.realm
             && self.auth_doc.is_some()
+            && self.config_doc.is_some()
         {
             self.state = CreateRealmState::AnnounceAuthDoc;
             smallvec![Effect::SubOperation(boxed_suboperation(
@@ -230,6 +269,35 @@ impl CreateRealmOperation {
             return self.fail(CreateRealmError::AutomergeState(error));
         }
 
+        if let Some(realm) = &self.realm {
+            self.state = CreateRealmState::AnnounceConfigDoc;
+            smallvec![Effect::SubOperation(boxed_suboperation(
+                AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::RealmConfig {
+                    realm_id: realm.realm_id.clone(),
+                }),
+                |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                    result: result.map_err(|error| error.to_string()),
+                }),
+            ))]
+        } else {
+            self.fail(CreateRealmError::RealmNotFound)
+        }
+    }
+
+    fn handle_announce_config_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+            return self.unexpected_event(
+                CreateRealmState::AnnounceConfigDoc,
+                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                got,
+            );
+        };
+
+        if let Err(error) = result {
+            return self.fail(CreateRealmError::AutomergeState(error));
+        }
+
         if let Some(realm) = &self.realm
             && let Some(auth) = &self.auth_doc
         {
@@ -248,8 +316,10 @@ pub enum CreateRealmState {
     StartTransaction,
     CreateRealm,
     CreateAuthDoc,
+    CreateConfigDoc,
     CommitTransaction,
     AnnounceAuthDoc,
+    AnnounceConfigDoc,
     Finish,
     Error,
 }
@@ -299,8 +369,10 @@ impl Operation for CreateRealmOperation {
             CreateRealmState::StartTransaction => self.handle_start_transaction(event),
             CreateRealmState::CreateRealm => self.handle_create_realm(event),
             CreateRealmState::CreateAuthDoc => self.handle_create_auth_doc(event),
+            CreateRealmState::CreateConfigDoc => self.handle_create_config_doc(event),
             CreateRealmState::CommitTransaction => self.handle_commit_transaction(event),
             CreateRealmState::AnnounceAuthDoc => self.handle_announce_auth_doc(event),
+            CreateRealmState::AnnounceConfigDoc => self.handle_announce_config_doc(event),
             CreateRealmState::Init | CreateRealmState::Finish | CreateRealmState::Error => {
                 smallvec![]
             }

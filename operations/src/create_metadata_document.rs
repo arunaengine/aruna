@@ -1,14 +1,18 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
+use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, MetadataDocument};
+use aruna_core::structs::{Actor, MetadataDocument, RealmConfigDocument};
+use rand::seq::SliceRandom;
 use smallvec::smallvec;
+use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::automerge::repository::write_effect;
+use crate::automerge::repository::{read_effect, write_effect};
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::outgoing_automerge::OutgoingAutomergeOperation;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMetadataDocumentConfig {
@@ -21,6 +25,8 @@ pub struct CreateMetadataDocumentOperation {
     config: CreateMetadataDocumentConfig,
     txn_id: Option<aruna_core::types::TxnId>,
     state: CreateMetadataDocumentState,
+    replication_targets: Vec<aruna_core::NodeId>,
+    selected_replication_factor: usize,
     output: Option<Result<MetadataDocument, CreateMetadataDocumentError>>,
 }
 
@@ -32,6 +38,9 @@ enum CreateMetadataDocumentState {
     WriteDocument,
     CommitTransaction,
     Announce,
+    LoadRealmConfig,
+    LoadReplicationTargets,
+    Replicate,
     Finish,
     Error,
 }
@@ -62,6 +71,8 @@ impl CreateMetadataDocumentOperation {
             config,
             txn_id: None,
             state: CreateMetadataDocumentState::Init,
+            replication_targets: Vec::new(),
+            selected_replication_factor: 1,
             output: None,
         }
     }
@@ -71,6 +82,20 @@ impl CreateMetadataDocumentOperation {
             group_id: self.config.document.group_id,
             document_id: self.config.document.document_id,
         }
+    }
+
+    fn realm_config_ref(&self) -> AutomergeDocumentVariant {
+        AutomergeDocumentVariant::RealmConfig {
+            realm_id: self.config.actor.realm_id.clone(),
+        }
+    }
+
+    fn finish_success(&mut self) -> aruna_core::types::Effects {
+        self.state = CreateMetadataDocumentState::Finish;
+        if self.output.is_none() {
+            self.output = Some(Ok(self.config.document.clone()));
+        }
+        smallvec![]
     }
 
     fn fail(&mut self, error: CreateMetadataDocumentError) -> aruna_core::types::Effects {
@@ -111,10 +136,7 @@ impl Operation for CreateMetadataDocumentOperation {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.txn_id = Some(txn_id);
                     self.state = CreateMetadataDocumentState::CheckExisting;
-                    smallvec![crate::automerge::repository::read_effect(
-                        &self.document_ref(),
-                        Some(txn_id),
-                    )]
+                    smallvec![read_effect(&self.document_ref(), Some(txn_id))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("transaction start result", format!("{other:?}")),
@@ -155,6 +177,7 @@ impl Operation for CreateMetadataDocumentOperation {
             CreateMetadataDocumentState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
+                    self.output = Some(Ok(self.config.document.clone()));
                     self.state = CreateMetadataDocumentState::Announce;
                     smallvec![Effect::SubOperation(boxed_suboperation(
                         AnnounceAutomergeDocumentOperation::new(self.document_ref()),
@@ -175,9 +198,8 @@ impl Operation for CreateMetadataDocumentOperation {
                 Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
                     match result {
                         Ok(()) => {
-                            self.state = CreateMetadataDocumentState::Finish;
-                            self.output = Some(Ok(self.config.document.clone()));
-                            smallvec![]
+                            self.state = CreateMetadataDocumentState::LoadRealmConfig;
+                            smallvec![read_effect(&self.realm_config_ref(), None)]
                         }
                         Err(error) => self.fail(CreateMetadataDocumentError::AutomergeState(error)),
                     }
@@ -185,6 +207,67 @@ impl Operation for CreateMetadataDocumentOperation {
                 other => {
                     self.unexpected_event("automerge announcement result", format!("{other:?}"))
                 }
+            },
+            CreateMetadataDocumentState::LoadRealmConfig => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let realm_config = match value.as_deref() {
+                        Some(bytes) => {
+                            RealmConfigDocument::from_bytes(bytes).unwrap_or_else(|_| {
+                                RealmConfigDocument::default_for_realm(
+                                    self.config.actor.realm_id.clone(),
+                                )
+                            })
+                        }
+                        None => RealmConfigDocument::default_for_realm(
+                            self.config.actor.realm_id.clone(),
+                        ),
+                    };
+                    self.selected_replication_factor = realm_config
+                        .metadata_replication_factor_for(self.config.document.group_id, None);
+                    self.state = CreateMetadataDocumentState::LoadReplicationTargets;
+                    smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
+                        key: *realm_presence_key(&self.config.actor.realm_id).as_bytes(),
+                    }))]
+                }
+                Event::Storage(StorageEvent::Error { .. }) => {
+                    self.selected_replication_factor =
+                        RealmConfigDocument::default_for_realm(self.config.actor.realm_id.clone())
+                            .metadata_replication_factor_for(self.config.document.group_id, None);
+                    self.state = CreateMetadataDocumentState::LoadReplicationTargets;
+                    smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
+                        key: *realm_presence_key(&self.config.actor.realm_id).as_bytes(),
+                    }))]
+                }
+                other => self.unexpected_event("storage read result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::LoadReplicationTargets => match event {
+                Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => {
+                    self.replication_targets = select_replication_targets(
+                        values.into_iter().map(|entry| entry.node_id).collect(),
+                        self.config.actor.node_id,
+                        self.selected_replication_factor,
+                    );
+                    if self.replication_targets.is_empty() {
+                        return self.finish_success();
+                    }
+
+                    self.state = CreateMetadataDocumentState::Replicate;
+                    let document = self.document_ref();
+                    emit_next_replication(&mut self.replication_targets, document)
+                }
+                Event::Net(NetEvent::Dht(DhtEvent::Error { .. })) => self.finish_success(),
+                other => self.unexpected_event("dht get result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::Replicate => match event {
+                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { .. }) => {
+                    if self.replication_targets.is_empty() {
+                        self.finish_success()
+                    } else {
+                        let document = self.document_ref();
+                        emit_next_replication(&mut self.replication_targets, document)
+                    }
+                }
+                other => self.unexpected_event("automerge sync result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::Finish
             | CreateMetadataDocumentState::Error
@@ -209,4 +292,42 @@ impl Operation for CreateMetadataDocumentOperation {
             None => smallvec![],
         }
     }
+}
+
+fn emit_next_replication(
+    targets: &mut Vec<aruna_core::NodeId>,
+    document: AutomergeDocumentVariant,
+) -> aruna_core::types::Effects {
+    let Some(target) = targets.pop() else {
+        return smallvec![];
+    };
+
+    smallvec![Effect::SubOperation(boxed_suboperation(
+        OutgoingAutomergeOperation::new(target, document),
+        |result| {
+            Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
+                result: result.map_err(|error| error.to_string()),
+            })
+        },
+    ))]
+}
+
+pub(crate) fn select_replication_targets(
+    realm_nodes: HashSet<aruna_core::NodeId>,
+    local_node_id: aruna_core::NodeId,
+    replication_factor: usize,
+) -> Vec<aruna_core::NodeId> {
+    let remote_target_count = replication_factor.max(1).saturating_sub(1);
+    if remote_target_count == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates: Vec<_> = realm_nodes
+        .into_iter()
+        .filter(|node_id| *node_id != local_node_id)
+        .collect();
+    let mut rng = rand::rng();
+    candidates.shuffle(&mut rng);
+    candidates.truncate(remote_target_count);
+    candidates
 }

@@ -1,13 +1,14 @@
 use aruna_core::automerge::{AutomergeEffect, AutomergeEvent, AutomergeInit, AutomergeSyncError};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
+use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 
 #[derive(Debug, PartialEq)]
 pub struct IncomingAutomergeOperation {
@@ -31,6 +32,7 @@ enum IncomingAutomergeState {
     ReconcileRead,
     Persist,
     CommitPersist,
+    Announce,
     Finish,
     Error,
 }
@@ -217,15 +219,36 @@ impl Operation for IncomingAutomergeOperation {
             IncomingAutomergeState::CommitPersist => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.persist_txn_id = None;
-                    self.state = IncomingAutomergeState::Finish;
-                    self.output = Some(Ok(()));
-                    smallvec![]
+                    let Some(remote_init) = self.remote_init.as_ref() else {
+                        return self.fail(IncomingAutomergeError::Sync(
+                            AutomergeSyncError::InvalidInit,
+                        ));
+                    };
+                    self.state = IncomingAutomergeState::Announce;
+                    smallvec![Effect::SubOperation(boxed_suboperation(
+                        AnnounceAutomergeDocumentOperation::new(remote_init.document.clone()),
+                        |result| {
+                            Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                                result: result.map_err(|error| error.to_string()),
+                            })
+                        },
+                    ))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.persist_txn_id = None;
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            },
+            IncomingAutomergeState::Announce => match event {
+                Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) => {
+                    self.state = IncomingAutomergeState::Finish;
+                    self.output = Some(Ok(()));
+                    smallvec![]
+                }
+                other => {
+                    self.unexpected_event("automerge announcement result", format!("{other:?}"))
+                }
             },
             IncomingAutomergeState::Finish
             | IncomingAutomergeState::Error
