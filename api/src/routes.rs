@@ -1,7 +1,8 @@
 use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument};
+use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument, Permission};
+use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
@@ -102,11 +103,31 @@ pub async fn create_group(
     Json(request): Json<CreateGroupRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
     let auth = auth.ok_or_else(|| ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+
+    if auth.realm_id != realm_id {
+        return Err(ServerError::Forbidden);
+    }
+
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: auth.clone(),
+            path: format!("/{realm_id}/admin/groups"),
+            required_permission: Permission::WRITE,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    if !allowed {
+        return Err(ServerError::Forbidden);
+    }
 
     let actor = Actor {
         node_id: state.get_node_id(),
         user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
+        realm_id,
     };
 
     let config = CreateGroupConfig {

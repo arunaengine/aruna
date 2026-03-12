@@ -237,7 +237,13 @@ impl CheckPermissionsOperation {
     fn emit_check_permissions(&mut self) -> Result<Effects, AuthorizationError> {
         self.state = CheckPermissionsState::Finish;
         let roles = self.collect_roles()?;
-        self.output = Some(self.check_permissions(roles));
+        let allowed = self.check_permissions(roles)?;
+        let allowed = if allowed {
+            self.check_path_restrictions()?
+        } else {
+            false
+        };
+        self.output = Some(Ok(allowed));
         Ok(smallvec![])
     }
 
@@ -281,6 +287,30 @@ impl CheckPermissionsOperation {
                 }
             }
         }
+        Ok(allowed)
+    }
+
+    fn check_path_restrictions(&self) -> Result<bool, AuthorizationError> {
+        let Some(restrictions) = self.config.auth_context.path_restrictions.as_ref() else {
+            return Ok(true);
+        };
+
+        let mut allowed = false;
+        for restriction in restrictions {
+            let glob = Glob::new(&restriction.pattern)?.compile_matcher();
+            if glob.is_match(&self.config.path) {
+                match restriction.permission {
+                    Permission::DENY => return Ok(false),
+                    Permission::READ => {
+                        if self.config.required_permission == Permission::READ {
+                            allowed = true;
+                        }
+                    }
+                    Permission::WRITE => allowed = true,
+                }
+            }
+        }
+
         Ok(allowed)
     }
 

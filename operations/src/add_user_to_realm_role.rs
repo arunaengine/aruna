@@ -1,10 +1,10 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::consts::AUTH_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, RealmAuthorizationDocument, RealmId};
+use aruna_core::structs::{Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId};
 use aruna_core::types::{RoleId, TxnId, UserId};
 use byteview::ByteView;
 use smallvec::smallvec;
@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddUserToRealmRolesInput {
@@ -30,7 +31,7 @@ pub struct AddUserToRealmRolesOperation {
 
 impl std::fmt::Debug for AddUserToRealmRolesOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AddRoleOperation")
+        f.debug_struct("AddUserToRealmRolesOperation")
             .field("input", &self.input)
             .field("state", &self.state)
             .field("output", &self.output)
@@ -41,6 +42,7 @@ impl std::fmt::Debug for AddUserToRealmRolesOperation {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AddUserToRealmRolesState {
     Init,
+    Auth,
     StartTransaction,
     GetAuthDoc {
         txn_id: TxnId,
@@ -69,10 +71,14 @@ pub enum AddUserToRealmRolesError {
     AutomergeState(String),
     #[error("No transaction found")]
     NoTransactionFound,
+    #[error("Unauthorized")]
+    Unauthorized,
     #[error("Role not found")]
     RoleNotFound,
     #[error("Authorization document not found")]
     AuthDocNotFound,
+    #[error(transparent)]
+    CheckPermissionsError(#[from] AuthorizationError),
     #[error("Adding user to realm  did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -104,6 +110,44 @@ impl AddUserToRealmRolesOperation {
         match self.emit_get_auth_doc(txn_id) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
+        }
+    }
+
+    fn auth_context(&self) -> AuthContext {
+        AuthContext {
+            user_id: self.input.actor.user_id,
+            realm_id: self.input.actor.realm_id.clone(),
+            path_restrictions: None,
+        }
+    }
+
+    fn handle_authorization(&mut self, event: Event) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
+            return self.unexpected_event(
+                AddUserToRealmRolesState::Auth,
+                "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
+                got,
+            );
+        };
+
+        match self.emit_start_transaction(allowed) {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn emit_start_transaction(
+        &mut self,
+        auth_result: Result<bool, AuthorizationError>,
+    ) -> Result<aruna_core::types::Effects, AddUserToRealmRolesError> {
+        if auth_result? {
+            self.state = AddUserToRealmRolesState::StartTransaction;
+            Ok(smallvec![Effect::Storage(
+                StorageEffect::StartTransaction { read: false }
+            )])
+        } else {
+            Err(AddUserToRealmRolesError::Unauthorized)
         }
     }
 
@@ -279,11 +323,21 @@ impl Operation for AddUserToRealmRolesOperation {
     type Error = AddUserToRealmRolesError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = AddUserToRealmRolesState::StartTransaction;
+        self.state = AddUserToRealmRolesState::Auth;
 
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: self.auth_context(),
+                path: format!(
+                    "/{}/admin/roles/{}",
+                    self.input.realm_id, self.input.user_id
+                ),
+                required_permission: Permission::WRITE,
+            }),
+            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                allowed: result
+            }),
+        ))]
     }
 
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
@@ -293,6 +347,7 @@ impl Operation for AddUserToRealmRolesOperation {
         };
 
         match self.state.clone() {
+            AddUserToRealmRolesState::Auth => self.handle_authorization(event),
             AddUserToRealmRolesState::StartTransaction => self.handle_start_transaction(event),
             AddUserToRealmRolesState::GetAuthDoc { txn_id } => {
                 self.handle_get_auth_doc(event, txn_id)
