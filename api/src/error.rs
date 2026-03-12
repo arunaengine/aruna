@@ -44,7 +44,6 @@ pub enum TokenError {
     JWTError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64Error(#[from] base64::DecodeError),
-
 }
 
 /// Standard error response for API endpoints.

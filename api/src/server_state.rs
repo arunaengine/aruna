@@ -116,11 +116,7 @@ impl ServerState {
 
     pub async fn is_token_blacklisted(&self, token: &str) -> bool {
         let hash = blake3::hash(token.as_bytes()).to_string();
-        self.token_revocation_list
-            .read()
-            .await
-            .get(&hash)
-            .is_some()
+        self.token_revocation_list.read().await.get(&hash).is_some()
     }
 
     pub async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
