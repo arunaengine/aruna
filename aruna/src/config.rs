@@ -12,10 +12,13 @@ use thiserror::Error;
 
 pub struct Config {
     pub storage_path: String,
-    pub socket_addr: SocketAddr,
+    pub http_socket_addr: SocketAddr,
+    pub p2p_socket_addr: SocketAddr,
     pub node_capabilities: NodeCapabilities,
     pub realm_id: RealmId,
     pub node_id: iroh::PublicKey,
+    pub net_secret_key: iroh::SecretKey,
+    pub bootstrap_nodes: Vec<iroh::PublicKey>,
 }
 
 #[derive(Error, Debug)]
@@ -36,16 +39,32 @@ pub enum SetupError {
     PKCSError(#[from] ed25519_dalek::pkcs8::Error),
     #[error(transparent)]
     IrohKeyError(#[from] KeyParsingError),
+    #[error("NODE_PUBLIC_KEY does not match NODE_PRIVATE_KEY")]
+    NodeKeyMismatch,
 }
 
 pub fn read_config() -> Result<Config, SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
-    let socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
+    let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
+    let p2p_socket_addr = SocketAddr::from_str(
+        &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
+    )?;
     let realm_pubkey = dotenvy::var("REALM_PUBLIC_KEY")?;
     let realm_privkey = dotenvy::var("REALM_PRIVATE_KEY")?;
     let node_pubkey = dotenvy::var("NODE_PUBLIC_KEY")?;
-    // TODO: Use for Capabilities
-    let _node_privkey = dotenvy::var("NODE_PRIVATE_KEY")?;
+    let node_privkey = dotenvy::var("NODE_PRIVATE_KEY")?;
+    let bootstrap_nodes = dotenvy::var("BOOTSTRAP_NODES")
+        .ok()
+        .map(|nodes| {
+            nodes
+                .split(',')
+                .map(str::trim)
+                .filter(|node| !node.is_empty())
+                .map(iroh::PublicKey::from_str)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
 
     let realm_key = VerifyingKey::from_public_key_pem(&realm_pubkey)?;
     let realm_id = RealmId::from_bytes(*realm_key.as_bytes());
@@ -62,7 +81,12 @@ pub fn read_config() -> Result<Config, SetupError> {
         .try_into()?;
 
     let node_key = VerifyingKey::from_public_key_pem(&node_pubkey)?;
-    let node_id = iroh::PublicKey::from_bytes(&node_key.to_bytes())?;
+    let node_signing_key = SigningKey::from_pkcs8_pem(&node_privkey)?;
+    let net_secret_key = iroh::SecretKey::from_bytes(&node_signing_key.to_bytes());
+    let node_id = net_secret_key.public();
+    if node_id.as_bytes() != node_key.to_bytes().as_slice() {
+        return Err(SetupError::NodeKeyMismatch);
+    }
 
     // TODO: Configure capabilities
     let node_capabilities = NodeCapabilities::Management {
@@ -73,9 +97,12 @@ pub fn read_config() -> Result<Config, SetupError> {
 
     Ok(Config {
         storage_path,
-        socket_addr,
+        http_socket_addr,
+        p2p_socket_addr,
         node_capabilities,
         realm_id,
         node_id,
+        net_secret_key,
+        bootstrap_nodes,
     })
 }

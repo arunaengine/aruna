@@ -146,6 +146,8 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -274,6 +276,8 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;

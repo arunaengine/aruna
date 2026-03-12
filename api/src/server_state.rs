@@ -32,7 +32,7 @@ pub struct ServerState {
     // Realm membership
     node_id: NodeId,
     // TODO: OIDC handling
-    oidc_validator: Option<Arc<OidcValidator>>,
+    _oidc_validator: Option<Arc<OidcValidator>>,
 }
 
 impl ServerState {
@@ -49,7 +49,7 @@ impl ServerState {
             driver_ctx,
             realm_id,
             node_id,
-            oidc_validator,
+            _oidc_validator: oidc_validator,
             node_capabilities,
             token_revocation_list: Arc::new(RwLock::new(HashSet::default())),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
