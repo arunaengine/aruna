@@ -7,7 +7,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{BlobInfo, UserIdentity};
 use aruna_core::types::Effects;
 use bytes::Bytes;
-use smallvec::{SmallVec, smallvec};
+use smallvec::{smallvec, SmallVec};
 use std::ops::Range;
 use thiserror::Error;
 use ulid::Ulid;
@@ -245,15 +245,16 @@ impl Operation for GetObjectOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation, GetObjectState};
-    use aruna_blob::blob::{BLOB_LOCATION_DB, BLOB_PATH_DB, BlobHandler};
+    use aruna_blob::blob::{BlobHandler, BLOB_LOCATION_DB, BLOB_PATH_DB};
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, BlobInfo, RealmId, UserIdentity,
     };
+    use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use futures_util::StreamExt;
     use std::collections::HashMap;
@@ -267,6 +268,9 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
         let blob_handle = BlobHandler::new(
             BackendConfig {
                 backend_type: Backend::FileSystem,
@@ -276,6 +280,7 @@ mod test {
                 service_config: HashMap::new(),
             },
             storage_handle.clone(),
+            net_handle.clone(),
         )
         .await
         .unwrap();
@@ -348,7 +353,7 @@ mod test {
         // Read file with operation
         let driver_ctx = DriverContext {
             storage_handle,
-            net_handle: None,
+            net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
         };
         let operation = GetObjectOperation {

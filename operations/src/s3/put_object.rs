@@ -300,11 +300,12 @@ impl Operation for PutObjectOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Backend, BackendConfig};
+    use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::fs::{exists, read_to_string};
@@ -316,6 +317,9 @@ mod test {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
         let blob_handle = BlobHandler::new(
             BackendConfig {
                 backend_type: Backend::FileSystem,
@@ -325,6 +329,7 @@ mod test {
                 service_config: HashMap::new(),
             },
             storage_handle.clone(),
+            net_handle.clone(),
         )
         .await
         .unwrap();
@@ -346,7 +351,7 @@ mod test {
 
         let context = DriverContext {
             storage_handle,
-            net_handle: None,
+            net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
         };
         // Jesus, Take the Wheel!

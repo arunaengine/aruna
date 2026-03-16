@@ -10,6 +10,7 @@ rust-version.workspace = true
 aruna-api = { path = "../api" }
 aruna-blob = { path = "../blob" }
 aruna-core = { path = "../core" }
+aruna-net = { path = "../net" }
 aruna-operations = { path = "../operations" }
 aruna-storage = { path = "../storage" }
 
