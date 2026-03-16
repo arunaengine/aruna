@@ -38,6 +38,30 @@ pub struct BlobHandle {
     write_channel: EffectSender,
 }
 
+#[async_trait]
+impl Handle for BlobHandle {
+    async fn send_effect(&self, effect: Effect) -> Event {
+        match effect {
+            Effect::Blob(blob_effect) => {
+                let (response_tx, response_rx) = oneshot::oneshot();
+                if self
+                    .write_channel
+                    .send((blob_effect, response_tx))
+                    .await
+                    .is_err()
+                {
+                    return Event::Blob(BlobEvent::Error(BlobError::ChannelClosed));
+                }
+                match response_rx.await {
+                    Ok(event) => Event::Blob(event),
+                    Err(_) => Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)),
+                }
+            }
+            _ => Event::Blob(BlobEvent::Error(BlobError::InvalidEffect)),
+        }
+    }
+}
+
 impl BlobHandle {
     pub fn new() -> (Self, EffectReceiver) {
         let (sender, receiver) = mpsc::bounded_async(2048);
@@ -49,7 +73,7 @@ impl BlobHandle {
         )
     }
 
-    pub async fn send_effect(&self, effect: BlobEffect) -> Event {
+    pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
         let blob_event = {
             let (response_tx, response_rx) = oneshot::oneshot();
             if self
