@@ -1,16 +1,16 @@
+use crate::error::BlobLibError;
 use crate::hash::Hasher;
-use aruna_core::structs::BlobInfo;
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use iroh_io::{AsyncSliceReader, AsyncSliceWriter, AsyncStreamReader, AsyncStreamWriter};
 use iroh_quinn::{RecvStream, SendStream};
-use opendal::{FuturesAsyncReader, FuturesAsyncWriter};
+use opendal::{FuturesAsyncReader, FuturesAsyncWriter, Operator};
 use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;
 use tracing::debug;
 // ----- SendStream/RecvStream impls for bao_tree ----------
 
-pub struct SendStreamWrapper(pub SendStream);
-impl AsyncStreamWriter for SendStreamWrapper {
+pub struct SendStreamWrapper<'a>(pub &'a mut SendStream);
+impl AsyncStreamWriter for SendStreamWrapper<'_> {
     async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
         debug!("Sending chunk with len: {}", data.len());
         self.0.write_all(data).await?;
@@ -28,8 +28,8 @@ impl AsyncStreamWriter for SendStreamWrapper {
     }
 }
 
-pub struct RecvStreamWrapper(pub RecvStream);
-impl AsyncStreamReader for RecvStreamWrapper {
+pub struct RecvStreamWrapper<'a>(pub &'a mut RecvStream);
+impl AsyncStreamReader for RecvStreamWrapper<'_> {
     async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
         debug!("Receiving chunk with len: {}", len);
         // Read bytes into buffer
@@ -60,6 +60,7 @@ pub struct OpenDalWriter {
     pub len: u64,
     pub hasher: Hasher,
 }
+
 impl AsyncSliceWriter for OpenDalWriter {
     async fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
         debug!("[OpenDalWriter] Try to write data with offset {}", offset);
@@ -78,6 +79,7 @@ impl AsyncSliceWriter for OpenDalWriter {
     }
 
     async fn set_len(&mut self, _len: u64) -> std::io::Result<()> {
+        //Note: Nonsensical for most storage backends so just a no-op implementation
         Ok(())
     }
 
@@ -87,9 +89,26 @@ impl AsyncSliceWriter for OpenDalWriter {
     }
 }
 
+impl OpenDalWriter {
+    pub async fn new(
+        operator: &Operator,
+        storage_path: &str,
+        blob_size: u64,
+    ) -> Result<Self, BlobLibError> {
+        Ok(Self {
+            writer: operator
+                .writer(storage_path)
+                .await?
+                .into_futures_async_write(),
+            len: blob_size,
+            hasher: Hasher::new(),
+        })
+    }
+}
+
 pub struct OpenDalReader {
     pub stream: FuturesAsyncReader,
-    pub info: BlobInfo,
+    pub blob_size: u64,
 }
 
 impl AsyncSliceReader for OpenDalReader {
@@ -116,6 +135,23 @@ impl AsyncSliceReader for OpenDalReader {
     }
 
     async fn size(&mut self) -> std::io::Result<u64> {
-        Ok(self.info.blob_size)
+        Ok(self.blob_size)
+    }
+}
+
+impl OpenDalReader {
+    pub async fn new(
+        operator: &Operator,
+        storage_path: &str,
+        blob_size: u64,
+    ) -> Result<Self, BlobLibError> {
+        Ok(OpenDalReader {
+            stream: operator
+                .reader(storage_path)
+                .await?
+                .into_futures_async_read(..)
+                .await?,
+            blob_size,
+        })
     }
 }
