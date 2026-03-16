@@ -4,10 +4,11 @@ use crate::alpn::Alpn;
 use crate::id::NodeId;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::BackendLocation;
+use crate::structs::{BackendLocation, BlobInfo};
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 use bytes::Bytes;
 use std::ops::Range;
+use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
 pub enum Effect {
@@ -23,6 +24,7 @@ pub enum Effect {
 #[derive(Debug, PartialEq)]
 pub enum BlobEffect {
     //GetOperator { bucket: Option<String>, },
+    // ----- Blob read & write -----
     Write {
         bucket: String,
         key: String,
@@ -37,6 +39,27 @@ pub enum BlobEffect {
     },
     Delete {
         location: BackendLocation,
+    },
+    // ----- Replication -----
+    OpenConnection {
+        node_id: NodeId,
+    },
+    NegotiateIncoming {
+        stream_id: Ulid,
+    },
+    NegotiateOutgoing {
+        replication_id: Ulid,
+        stream_id: Ulid,
+        blob_info: BlobInfo,
+    },
+    Replicate {
+        replication_id: Ulid,
+        stream_id: Ulid,
+        blob_info: BlobInfo,
+    },
+    HandleReplication {
+        replication_id: Ulid,
+        stream_id: Ulid,
     },
 }
 

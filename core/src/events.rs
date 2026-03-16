@@ -1,6 +1,6 @@
 use crate::errors::BlobError;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::BackendLocation;
+use crate::structs::{BackendLocation, BlobInfo, NegotiationResult};
 use crate::{
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
     id::NodeId,
@@ -9,6 +9,7 @@ use crate::{
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
 pub enum Event {
@@ -33,19 +34,24 @@ pub enum SubOperationEvent {
 
 #[derive(Debug, PartialEq)]
 pub enum BlobEvent {
-    //TicketReceived { ticket: String, },
-    //OperatorCreated { operator: Operator, },
     WriteFinished {
         location: BackendLocation,
         bytes_written: u64,
-        hashes: HashMap<String, Vec<u8>>,
-        //checksums: HashMap<String, String>,
+        hashes: HashMap<String, Vec<u8>>, // Includes checksums?
+                                          //checksums: HashMap<String, String>,
     },
     ReadFinished {
         blob: BackendStream<Result<Bytes, BackendStreamError>>,
         stream_size: u64,
     },
     DeleteFinished,
+    ConnectionEstablished {
+        stream_id: Ulid,
+    },
+    NegotiationFinished(NegotiationResult),
+    ReplicationFinished {
+        blob_info: BlobInfo,
+    },
     Error(BlobError),
 }
 

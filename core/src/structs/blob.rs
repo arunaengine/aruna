@@ -130,6 +130,13 @@ impl BackendLocation {
     }
 }
 
+pub enum MaterializationStrategy {
+    Local,
+    Reference,
+    Snapshot,
+    Sync,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NegotiationResult {
     Accepted(Ulid),
