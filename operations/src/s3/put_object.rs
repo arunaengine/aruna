@@ -300,7 +300,7 @@ impl Operation for PutObjectOperation {
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_core::stream::BackendStream;

@@ -1,10 +1,10 @@
 use crate::replication::error::ReplicationError;
+use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{BlobInfo, NegotiationResult};
 use aruna_core::types::Effects;
-use aruna_core::NodeId;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -159,7 +159,7 @@ impl OutgoingBaoOperation {
                 self.state = OutgoingBaoState::Replicate;
                 smallvec![Effect::Blob(BlobEffect::Replicate {
                     replication_id,
-                    stream_id: stream_id.clone(),
+                    stream_id: *stream_id,
                     blob_info: blob_info.to_owned(),
                 })]
             }
@@ -225,9 +225,7 @@ impl Operation for OutgoingBaoOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         if OutgoingBaoState::Error == self.state {
-            if let Err(error) = self.result {
-                return Err(error);
-            }
+            self.result?;
             return Err(ReplicationError::ReplicationFailed);
         }
         Ok(self.result)

@@ -4,6 +4,7 @@ use crate::hash::Hasher;
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::opendal::{init_backend_operator, init_operator};
 use crate::s3::make_bucket;
+use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -14,12 +15,11 @@ use aruna_core::structs::NegotiationResult::{Accepted, Rejected};
 use aruna_core::structs::{
     Backend, BackendBucket, BackendConfig, BackendLocation, BlobInfo, RealmId, UserIdentity,
 };
-use aruna_core::NodeId;
-use aruna_net::streams::BiStream;
 use aruna_net::NetHandle;
+use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
 use async_trait::async_trait;
-use bao_tree::io::fsm::{decode_ranges, encode_ranges_validated, CreateOutboard};
+use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, BlockSize, ByteRanges};
@@ -200,7 +200,7 @@ impl BlobHandler {
     }
 
     pub async fn add_connection(&mut self, stream_id: Option<Ulid>, stream: BiStream) -> Ulid {
-        let stream_id = stream_id.unwrap_or_else(|| Ulid::new());
+        let stream_id = stream_id.unwrap_or_else(Ulid::new);
         self.connections.lock().await.insert(stream_id, stream);
         stream_id
     }

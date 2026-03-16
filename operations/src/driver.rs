@@ -115,11 +115,11 @@ pub async fn drive<O: Operation>(
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
     use aruna_core::{
         effects::{Effect, StorageEffect},
         events::{Event, StorageEvent, SubOperationEvent},
-        operation::{boxed_suboperation, Operation},
+        operation::{Operation, boxed_suboperation},
     };
     use aruna_storage::storage;
     use byteview::ByteView;

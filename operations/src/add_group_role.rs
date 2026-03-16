@@ -535,7 +535,7 @@ pub mod test {
                 CheckPermissionsOperation::new(CheckPermissionsConfig {
                     auth_context: auth_context.clone(),
                     path: format!("/{}/g/{}/admin", realm_id.to_string(), group_id.to_string()),
-                    required_permission: aruna_core::structs::Permission::WRITE,
+                    required_permission: Permission::WRITE,
                 }),
                 |_| {
                     Event::SubOperation(

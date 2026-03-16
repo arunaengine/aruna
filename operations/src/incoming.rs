@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use crate::driver::{drive, DriverContext};
+use crate::driver::{DriverContext, drive};
 use crate::incoming_automerge::IncomingAutomergeOperation;
 use crate::incoming_gossip::IncomingGossipOperation;
 use crate::replication::incoming_bao::IncomingBaoOperation;
 use aruna_core::alpn::Alpn;
 use aruna_core::id::{NodeId, TopicId};
-use aruna_net::streams::BiStream;
 use aruna_net::InboundEventHandler;
+use aruna_net::streams::BiStream;
 use async_trait::async_trait;
 use tracing::{error, warn};
 

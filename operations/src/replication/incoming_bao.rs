@@ -236,9 +236,7 @@ impl Operation for IncomingBaoOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         if IncomingBaoState::Error == self.state {
-            if let Err(error) = self.result {
-                return Err(error);
-            }
+            self.result?;
             return Err(ReplicationError::ReplicationFailed);
         }
         Ok(self.result)

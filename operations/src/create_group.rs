@@ -54,7 +54,7 @@ impl CreateGroupOperation {
         let group = Group {
             roles: HashSet::new(),
             display_name: self.config.display_name.clone(),
-            group_id: group_id,
+            group_id,
             realm_id: self.config.actor.realm_id.clone(),
         };
 
