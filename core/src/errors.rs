@@ -34,6 +34,10 @@ pub enum AuthorizationError {
 pub enum BlobError {
     #[error("Channel closed")]
     ChannelClosed,
+    #[error("Failed to send message")]
+    SendError,
+    #[error("Invalid effect type")]
+    InvalidEffect,
     #[error("Blob handle missing")]
     HandleMissing,
     #[error(transparent)]
@@ -42,12 +46,20 @@ pub enum BlobError {
     MakeBucketError(String),
     #[error("Operator creation failed: {0}")]
     OperatorCreationFailed(String),
+    #[error("Outboard creation failed: {0}")]
+    OutboardCreationFailed(String),
+    #[error("Failed to open connection: {0}")]
+    ConnectionFailed(String),
     #[error("Write error: {0}")]
     WriteError(String),
     #[error("Read error: {0}")]
     ReadError(String),
     #[error("Delete error: {0}")]
     DeleteError(String),
+    #[error("Replication rejected: {0}")]
+    ReplicationRejected(String),
+    #[error("Replication failed: {0}")]
+    ReplicationFailed(String),
 }
 
 #[derive(Debug, Error, PartialEq)]

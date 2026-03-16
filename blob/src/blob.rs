@@ -1,40 +1,60 @@
+use crate::bao_tree::{OpenDalReader, OpenDalWriter, RecvStreamWrapper, SendStreamWrapper};
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
+use crate::messages::{MessageType, ReplicationMessage};
 use crate::opendal::{init_backend_operator, init_operator};
 use crate::s3::make_bucket;
+use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{Backend, BackendBucket, BackendConfig, BackendLocation, BlobInfo};
+use aruna_core::structs::NegotiationResult::{Accepted, Rejected};
+use aruna_core::structs::{
+    Backend, BackendBucket, BackendConfig, BackendLocation, BlobInfo, RealmId, UserIdentity,
+};
+use aruna_core::NodeId;
 use aruna_net::streams::BiStream;
+use aruna_net::NetHandle;
 use aruna_storage::storage::StorageHandle;
-use bytes::Bytes;
+use async_trait::async_trait;
+use bao_tree::io::fsm::{decode_ranges, encode_ranges_validated, CreateOutboard};
+use bao_tree::io::outboard::PreOrderOutboard;
+use bao_tree::io::round_up_to_chunks;
+use bao_tree::{BaoTree, BlockSize, ByteRanges};
+use bytes::{Bytes, BytesMut};
 use crossfire::{mpsc, oneshot};
-use futures::StreamExt;
+use futures::{AsyncWriteExt, StreamExt};
 use opendal::Operator;
+use std::collections::HashMap;
 use std::ops::RangeBounds;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tracing::debug;
 use ulid::Ulid;
 
 pub const BLOB_LOCATION_DB: &str = "locations";
 pub const BLOB_PATH_DB: &str = "path_locations_mapping";
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
+pub const BAO_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); // 2^16 bytes
 
 pub type EffectHandle = (BlobEffect, oneshot::TxOneshot<BlobEvent>);
 pub type EffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::AsyncRx<mpsc::Array<EffectHandle>>;
 
-//TODO: BaoTree replication (immer getrieben vom Initiator)
-
+#[derive(Clone, Debug)]
 pub struct BlobHandler {
     backend_config: BackendConfig,
-    //backend_operators: HashMap<String, Operator>, // Store operator for each bucket !?
+    //backend_operators: HashMap<String, Operator>, // Store operator for each bucket
     storage: StorageHandle, // For storage backend bucket evaluation
+    net: NetHandle,         // To create replication connections
+    connections: Arc<Mutex<HashMap<Ulid, BiStream>>>, // Open connections for replication
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BlobHandle {
+    handler: BlobHandler,
     write_channel: EffectSender,
 }
 
@@ -63,10 +83,11 @@ impl Handle for BlobHandle {
 }
 
 impl BlobHandle {
-    pub fn new() -> (Self, EffectReceiver) {
+    pub fn new(handler: BlobHandler) -> (Self, EffectReceiver) {
         let (sender, receiver) = mpsc::bounded_async(2048);
         (
             BlobHandle {
+                handler,
                 write_channel: sender,
             },
             receiver,
@@ -90,20 +111,26 @@ impl BlobHandle {
         };
         Event::Blob(blob_event)
     }
+
+    pub async fn store_connection(&mut self, stream: BiStream) -> Ulid {
+        self.handler.add_connection(None, stream).await
+    }
 }
 
 impl BlobHandler {
     pub async fn new(
         config: BackendConfig,
-        handle: StorageHandle,
+        storage: StorageHandle,
+        net: NetHandle,
     ) -> Result<BlobHandle, BlobLibError> {
-        let (blob_handle, rx) = BlobHandle::new();
-
-        tokio::spawn(async {
-            let mut blob_handler = BlobHandler {
-                backend_config: config,
-                storage: handle,
-            };
+        let mut blob_handler = BlobHandler {
+            backend_config: config,
+            storage,
+            net,
+            connections: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let (blob_handle, rx) = BlobHandle::new(blob_handler.clone());
+        tokio::spawn(async move {
             blob_handler.receive_loop(rx).await;
         });
 
@@ -123,6 +150,35 @@ impl BlobHandler {
                             self.read_blob_range(location, range).await
                         }
                         BlobEffect::Delete { location } => self.delete_blob(location).await,
+                        BlobEffect::OpenConnection { node_id } => {
+                            self.open_connection(node_id).await
+                        }
+                        BlobEffect::NegotiateIncoming { stream_id } => {
+                            self.negotiate_incoming(stream_id).await
+                        }
+                        BlobEffect::NegotiateOutgoing {
+                            replication_id,
+                            stream_id,
+                            blob_info,
+                        } => {
+                            self.negotiate_outgoing(replication_id, stream_id, blob_info)
+                                .await
+                        }
+                        BlobEffect::Replicate {
+                            replication_id,
+                            stream_id,
+                            blob_info,
+                        } => {
+                            self.replicate_blob(replication_id, stream_id, blob_info)
+                                .await
+                        }
+                        BlobEffect::HandleReplication {
+                            replication_id,
+                            stream_id,
+                        } => {
+                            self.handle_incoming_replication(replication_id, stream_id)
+                                .await
+                        }
                     };
                     response_tx.send(event);
                 }
@@ -131,6 +187,22 @@ impl BlobHandler {
                 }
             }
         }
+    }
+
+    // Connection handling
+    pub async fn open_connection(&mut self, node_id: NodeId) -> BlobEvent {
+        match self.net.open_stream(node_id, Alpn::Bao).await {
+            Ok(stream) => BlobEvent::ConnectionEstablished {
+                stream_id: self.add_connection(None, stream).await,
+            },
+            Err(err) => BlobEvent::Error(BlobError::ConnectionFailed(err.to_string())),
+        }
+    }
+
+    pub async fn add_connection(&mut self, stream_id: Option<Ulid>, stream: BiStream) -> Ulid {
+        let stream_id = stream_id.unwrap_or_else(|| Ulid::new());
+        self.connections.lock().await.insert(stream_id, stream);
+        stream_id
     }
 
     pub async fn write_blob(
@@ -167,7 +239,11 @@ impl BlobHandler {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
         };
-        let mut writer = operator.writer(&storage_path).await.unwrap();
+        let Ok(mut writer) = operator.writer(&storage_path).await else {
+            return BlobEvent::Error(BlobError::OperatorCreationFailed(
+                "Failed to create writer from operator".to_string(),
+            ));
+        };
 
         // Write blob to backend storage
         while let Some(Ok(bytes)) = blob.next().await {
@@ -177,7 +253,7 @@ impl BlobHandler {
             }
             bytes_written += bytes.len() as u64;
         }
-        writer.close().await.unwrap();
+        _ = writer.close().await; // Can only fail if already closed/aborted
 
         // Return write result
         BlobEvent::WriteFinished {
@@ -188,7 +264,6 @@ impl BlobHandler {
         }
     }
 
-    //pub async fn read_blob(&self, operator: Operator, path: &str) -> BlobEvent {
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
         // Get operator for provided location
         let operator = match self.operator_from_location(&location) {
@@ -270,28 +345,268 @@ impl BlobHandler {
         BlobEvent::DeleteFinished
     }
 
-    pub async fn negotiate_replication(
-        &self,
-        (_sx, _rx): BiStream,
-        _blob_info: BlobInfo,
-    ) -> Result<(), BlobError> {
-        //TODO: Handle replication init:
-        // - User allowed to write to this node?
-        // - Node has enough space?
-        // - ...?
-        todo!()
+    pub async fn negotiate_outgoing(
+        &mut self,
+        replication_id: Ulid,
+        stream_id: Ulid,
+        blob_info: BlobInfo,
+    ) -> BlobEvent {
+        // Send replication request and evaluate response
+        if let Some((sx, rx)) = self.connections.lock().await.get_mut(&stream_id) {
+            if let Err(err) = ReplicationMessage::new(
+                replication_id,
+                MessageType::NegotiationRequest {
+                    user_id: UserIdentity {
+                        //TODO
+                        user_id: Default::default(),
+                        realm_key: RealmId([0u8; 32]),
+                    },
+                    group_id: Default::default(),
+                    size: blob_info.blob_size,
+                },
+            )
+            .send(sx)
+            .await
+            {
+                return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+            }
+
+            // Evaluate response
+            let response = ReplicationMessage::read(rx)
+                .await
+                .map_err(|err| BlobEvent::Error(BlobError::ReadError(err.to_string())));
+            match response {
+                Err(event) => event,
+                Ok(response) => match response.msg_type {
+                    MessageType::NegotiationResponse(result) => {
+                        BlobEvent::NegotiationFinished(result)
+                    }
+                    _ => BlobEvent::NegotiationFinished(Rejected(
+                        "Invalid negotiation response".to_string(),
+                    )),
+                },
+            }
+        } else {
+            BlobEvent::NegotiationFinished(Rejected("Stream not available".to_string()))
+        }
+    }
+
+    pub async fn negotiate_incoming(&mut self, stream_id: Ulid) -> BlobEvent {
+        // Read the incoming replication request and run acceptance criteria checks
+        if let Some((sx, rx)) = self.connections.lock().await.get_mut(&stream_id) {
+            let message = match ReplicationMessage::read2(rx).await {
+                Ok(msg) => msg,
+                Err(err) => return err,
+            };
+            if let MessageType::NegotiationRequest { .. } = &message.msg_type {
+                //TODO: Things to check in the future:
+                // - Quotas (User/Group)
+                // - Node Policies
+                // - Storage space left
+                // - ...
+                // (- S3 Path already occupied)
+                // (- ODRL Data Usage Agreements)
+
+                // Send the negotiation response after acceptance criteria checks
+                if let Err(err) = ReplicationMessage::new(
+                    message.id,
+                    MessageType::NegotiationResponse(Accepted(message.id)),
+                )
+                .send(sx)
+                .await
+                {
+                    return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+                }
+
+                BlobEvent::NegotiationFinished(Accepted(message.id))
+            } else {
+                BlobEvent::NegotiationFinished(Rejected("Invalid negotiating message".to_string()))
+            }
+        } else {
+            BlobEvent::NegotiationFinished(Rejected("Stream not available".to_string()))
+        }
     }
 
     pub async fn replicate_blob(
-        &self,
-        (_sx, _rx): BiStream,
-        _blob_location: BackendLocation,
-    ) -> Result<(), BlobError> {
-        todo!()
+        &mut self,
+        replication_id: Ulid,
+        stream_id: Ulid,
+        blob_info: BlobInfo,
+    ) -> BlobEvent {
+        // Get operator for blob location
+        let operator = match self.operator_from_location(&blob_info.location) {
+            Ok(op) => op,
+            Err(err) => {
+                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
+            }
+        };
+
+        // Create replication Outboard
+        let storage_path = match blob_info.location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
+        };
+
+        let mut reader =
+            match OpenDalReader::new(&operator, &storage_path, blob_info.blob_size).await {
+                Ok(reader) => reader,
+                Err(err) => {
+                    return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
+                }
+            };
+        let mut outboard =
+            match PreOrderOutboard::<BytesMut>::create(&mut reader, BAO_BLOCK_SIZE).await {
+                Ok(outboard) => outboard,
+                Err(err) => {
+                    return BlobEvent::Error(BlobError::OutboardCreationFailed(err.to_string()));
+                }
+            };
+
+        let mut connections = self.connections.lock().await;
+        let Some((sx, rx)) = connections.get_mut(&stream_id) else {
+            return BlobEvent::Error(BlobError::ReplicationRejected(
+                "Stream not available".to_string(),
+            ));
+        };
+
+        // Send stuff to the recipient node for outboard creation and wait for ack
+        let replication_init = ReplicationMessage {
+            id: replication_id,
+            msg_type: MessageType::BaoTreeInfo {
+                blob_info: blob_info.clone(),
+                root: outboard.root,
+            },
+        };
+        if let Err(err) = replication_init.send(sx).await {
+            return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+        }
+
+        //TODO: Acknowledge necessary or just hose data into stream?
+        match ReplicationMessage::read2(rx).await {
+            Ok(msg) => {
+                if let MessageType::BaoTreeInfoReceived = msg.msg_type {
+                    return BlobEvent::Error(BlobError::ReplicationRejected(
+                        "Recipient node did not acknowledge replication init".to_string(),
+                    ));
+                }
+            }
+            Err(err) => return err,
+        }
+
+        match ReplicationMessage::read(rx).await {
+            Ok(msg) if msg.msg_type == MessageType::BaoTreeInfoReceived => {}
+            Ok(_) => {
+                return BlobEvent::Error(BlobError::ReplicationRejected(
+                    "unexpected message type".to_string(),
+                ));
+            }
+            Err(err) => return BlobEvent::Error(BlobError::ReplicationRejected(err.to_string())),
+        }
+
+        // Send bao_tree encoded chunks
+        let mut sx_wrapper = SendStreamWrapper(sx);
+        let ranges = ByteRanges::from(0..blob_info.blob_size);
+        let ranges = round_up_to_chunks(&ranges);
+        debug!("Chunk Ranges: {:#?}", ranges.boundaries());
+
+        // Actually send blob chunks
+        if let Err(err) =
+            encode_ranges_validated(reader, &mut outboard, &ranges, &mut sx_wrapper).await
+        {
+            return BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()));
+        }
+
+        // Close connection and return
+        _ = sx.finish();
+        _ = rx.stop(0u32.into());
+        BlobEvent::ReplicationFinished { blob_info }
     }
 
-    pub async fn handle_incoming_replication(&self, (_sx, _rx): BiStream) -> Result<(), BlobError> {
-        todo!()
+    pub async fn handle_incoming_replication(
+        &mut self,
+        replication_id: Ulid,
+        stream_id: Ulid,
+    ) -> BlobEvent {
+        let (root, mut blob_info) = {
+            let mut connections = self.connections.lock().await;
+            let Some((sx, rx)) = connections.get_mut(&stream_id) else {
+                return BlobEvent::Error(BlobError::ReplicationRejected(
+                    "Stream not available".to_string(),
+                ));
+            };
+
+            match ReplicationMessage::read(rx).await {
+                Ok(msg) => {
+                    let MessageType::BaoTreeInfo { root, blob_info } = msg.msg_type else {
+                        return BlobEvent::Error(BlobError::ReplicationRejected(
+                            "Invalid BaoTreeInfo message".to_string(),
+                        ));
+                    };
+
+                    if let Err(err) =
+                        ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived)
+                            .send(sx)
+                            .await
+                    {
+                        return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+                    };
+                    (root, blob_info)
+                }
+                Err(e) => return BlobEvent::Error(BlobError::ReadError(e.to_string())),
+            }
+        };
+
+        // Eval suitable backend bucket
+        let backend_bucket = match self.eval_backend_bucket().await {
+            Ok(bucket) => bucket,
+            Err(err) => return BlobEvent::Error(err),
+        };
+        blob_info.location.root = self.backend_config.root.clone();
+        blob_info.location.storage_bucket = backend_bucket.clone();
+        blob_info.location.ulid = Ulid::new();
+
+        // Get operator for blob location
+        let operator = match self.operator_from_location(&blob_info.location) {
+            Ok(op) => op,
+            Err(err) => {
+                return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
+            }
+        };
+
+        let mut connections = self.connections.lock().await;
+        let Some((_, rx)) = connections.get_mut(&stream_id) else {
+            return BlobEvent::Error(BlobError::ReplicationRejected(
+                "Stream not available".to_string(),
+            ));
+        };
+        let rx_wrapper = RecvStreamWrapper(rx);
+        let storage_path = match blob_info.location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
+        };
+        let mut writer =
+            match OpenDalWriter::new(&operator, &storage_path, blob_info.blob_size).await {
+                Ok(writer) => writer,
+                Err(err) => {
+                    return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
+                }
+            };
+        let mut ob = PreOrderOutboard {
+            tree: BaoTree::new(blob_info.blob_size, BAO_BLOCK_SIZE),
+            root,
+            data: BytesMut::new(),
+        };
+        let byte_ranges = ByteRanges::from(0..blob_info.blob_size);
+        let chunk_ranges = round_up_to_chunks(&byte_ranges);
+
+        debug!("Try to decode chunks received from bidi stream");
+        if let Err(err) = decode_ranges(rx_wrapper, chunk_ranges, &mut writer, &mut ob).await {
+            return BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()));
+        }
+        _ = writer.writer.close().await; // Can only fail if already closed/aborted
+        debug!("Decoded all chunks and wrote them into the backend");
+
+        BlobEvent::ReplicationFinished { blob_info }
     }
 
     async fn eval_backend_bucket(&self) -> Result<String, BlobError> {
