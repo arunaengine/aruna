@@ -23,7 +23,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
     match effect {
         Effect::Blob(blob_effect) => {
             if let Some(blob_handle) = &context.blob_handle {
-                blob_handle.send_effect(blob_effect).await
+                blob_handle.send_blob_effect(blob_effect).await
             } else {
                 Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
             }
@@ -115,11 +115,11 @@ pub async fn drive<O: Operation>(
 
 #[cfg(test)]
 mod test {
-    use crate::driver::{DriverContext, drive};
+    use crate::driver::{drive, DriverContext};
     use aruna_core::{
         effects::{Effect, StorageEffect},
         events::{Event, StorageEvent, SubOperationEvent},
-        operation::{Operation, boxed_suboperation},
+        operation::{boxed_suboperation, Operation},
     };
     use aruna_storage::storage;
     use byteview::ByteView;

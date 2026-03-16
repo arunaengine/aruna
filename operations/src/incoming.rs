@@ -1,16 +1,15 @@
 use std::sync::Arc;
 
+use crate::driver::{drive, DriverContext};
+use crate::incoming_automerge::IncomingAutomergeOperation;
+use crate::incoming_gossip::IncomingGossipOperation;
+use crate::replication::incoming_bao::IncomingBaoOperation;
 use aruna_core::alpn::Alpn;
 use aruna_core::id::{NodeId, TopicId};
-use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
+use aruna_net::InboundEventHandler;
 use async_trait::async_trait;
 use tracing::{error, warn};
-
-use crate::driver::{DriverContext, drive};
-use crate::incoming_automerge::IncomingAutomergeOperation;
-use crate::incoming_bao::IncomingBaoOperation;
-use crate::incoming_gossip::IncomingGossipOperation;
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -44,10 +43,16 @@ impl InboundEventHandler for OperationsInboundHandler {
     async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
         match alpn {
             Alpn::Bao => {
-                let op = IncomingBaoOperation::new(stream, node_id);
-                if let Err(err) = drive(op, self.context.as_ref()).await {
-                    error!(error = ?err, "Failed to process inbound bao stream event");
-                }
+                if let Some(mut blob_handle) = self.context.blob_handle.clone() {
+                    let stream_id = blob_handle.store_connection(stream).await;
+                    let op = IncomingBaoOperation::new(stream_id, node_id);
+                    if let Err(err) = drive(op, self.context.as_ref()).await {
+                        error!(error = ?err, "Failed to process inbound bao stream");
+                    }
+                } else {
+                    error!("Cannot handle incoming bao stream without blob handle");
+                    return;
+                };
             }
             Alpn::Automerge => {
                 let op = IncomingAutomergeOperation::new(stream, node_id);
