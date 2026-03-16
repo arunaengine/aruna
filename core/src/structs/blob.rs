@@ -131,6 +131,12 @@ impl BackendLocation {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum NegotiationResult {
+    Accepted(Ulid),
+    Rejected(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BlobInfo {
     pub location: BackendLocation,
     pub created_by: UserId,
