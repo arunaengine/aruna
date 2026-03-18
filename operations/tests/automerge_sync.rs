@@ -46,6 +46,8 @@ async fn metadata_automerge_sync_converges_between_nodes() -> Result<(), Box<dyn
     net_a.add_peer_addr(net_b.endpoint_addr()).await;
     net_b.add_peer_addr(net_a.endpoint_addr()).await;
 
+    let task_a = TaskHandle::new();
+    let task_b = TaskHandle::new();
     let automerge_a = AutomergeHandle::new(Some(net_a.clone()));
     let automerge_b = AutomergeHandle::new(Some(net_b.clone()));
 
@@ -53,14 +55,17 @@ async fn metadata_automerge_sync_converges_between_nodes() -> Result<(), Box<dyn
         storage_handle: storage_a.clone(),
         net_handle: Some(net_a.clone()),
         automerge_handle: Some(automerge_a),
-        task_handle: None,
+        task_handle: Some(task_a.clone()),
     });
     let context_b = Arc::new(DriverContext {
         storage_handle: storage_b.clone(),
         net_handle: Some(net_b.clone()),
         automerge_handle: Some(automerge_b),
-        task_handle: None,
+        task_handle: Some(task_b.clone()),
     });
+
+    initialize_task_incoming(context_a.clone(), task_a).await;
+    initialize_task_incoming(context_b.clone(), task_b).await;
 
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
     net_b.set_inbound_handler(Arc::new(TestInboundHandler {
@@ -182,6 +187,8 @@ async fn metadata_automerge_sync_populates_missing_document()
     net_a.add_peer_addr(net_b.endpoint_addr()).await;
     net_b.add_peer_addr(net_a.endpoint_addr()).await;
 
+    let task_a = TaskHandle::new();
+    let task_b = TaskHandle::new();
     let automerge_a = AutomergeHandle::new(Some(net_a.clone()));
     let automerge_b = AutomergeHandle::new(Some(net_b.clone()));
 
@@ -189,14 +196,17 @@ async fn metadata_automerge_sync_populates_missing_document()
         storage_handle: storage_a.clone(),
         net_handle: Some(net_a.clone()),
         automerge_handle: Some(automerge_a),
-        task_handle: None,
+        task_handle: Some(task_a.clone()),
     });
     let context_b = Arc::new(DriverContext {
         storage_handle: storage_b.clone(),
         net_handle: Some(net_b.clone()),
         automerge_handle: Some(automerge_b),
-        task_handle: None,
+        task_handle: Some(task_b.clone()),
     });
+
+    initialize_task_incoming(context_a.clone(), task_a).await;
+    initialize_task_incoming(context_b.clone(), task_b).await;
 
     let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
     net_b.set_inbound_handler(Arc::new(TestInboundHandler {

@@ -1,6 +1,6 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::errors::{ConversionError, DhtError, StorageError};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -51,12 +51,16 @@ pub enum CreateMetadataDocumentError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    DhtError(#[from] DhtError),
     #[error("document already exists")]
     DocumentAlreadyExists,
     #[error("missing active transaction")]
     MissingTransaction,
     #[error("automerge announcement failed: {0}")]
     AutomergeState(String),
+    #[error("automerge replication failed: {0}")]
+    AutomergeSync(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -255,16 +259,21 @@ impl Operation for CreateMetadataDocumentOperation {
                     let document = self.document_ref();
                     emit_next_replication(&mut self.replication_targets, document)
                 }
-                Event::Net(NetEvent::Dht(DhtEvent::Error { .. })) => self.finish_success(),
+                Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => self.fail(error.into()),
                 other => self.unexpected_event("dht get result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::Replicate => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { .. }) => {
-                    if self.replication_targets.is_empty() {
-                        self.finish_success()
-                    } else {
-                        let document = self.document_ref();
-                        emit_next_replication(&mut self.replication_targets, document)
+                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            if self.replication_targets.is_empty() {
+                                self.finish_success()
+                            } else {
+                                let document = self.document_ref();
+                                emit_next_replication(&mut self.replication_targets, document)
+                            }
+                        }
+                        Err(error) => self.fail(CreateMetadataDocumentError::AutomergeSync(error)),
                     }
                 }
                 other => self.unexpected_event("automerge sync result", format!("{other:?}")),
@@ -330,4 +339,23 @@ pub(crate) fn select_replication_targets(
     candidates.shuffle(&mut rng);
     candidates.truncate(remote_target_count);
     candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_replication_targets;
+    use std::collections::HashSet;
+
+    #[test]
+    fn select_replication_targets_excludes_local_node() {
+        let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let remote_a = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let remote_b = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+
+        let targets =
+            select_replication_targets(HashSet::from([local, remote_a, remote_b]), local, 3);
+
+        assert_eq!(targets.len(), 2);
+        assert!(!targets.contains(&local));
+    }
 }

@@ -45,6 +45,8 @@ pub enum IncomingAutomergeError {
     ConversionError(#[from] ConversionError),
     #[error("automerge sync error: {0:?}")]
     Sync(AutomergeSyncError),
+    #[error("automerge announcement failed: {0}")]
+    AutomergeState(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -241,10 +243,15 @@ impl Operation for IncomingAutomergeOperation {
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             IncomingAutomergeState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { .. }) => {
-                    self.state = IncomingAutomergeState::Finish;
-                    self.output = Some(Ok(()));
-                    smallvec![]
+                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            self.state = IncomingAutomergeState::Finish;
+                            self.output = Some(Ok(()));
+                            smallvec![]
+                        }
+                        Err(error) => self.fail(IncomingAutomergeError::AutomergeState(error)),
+                    }
                 }
                 other => {
                     self.unexpected_event("automerge announcement result", format!("{other:?}"))

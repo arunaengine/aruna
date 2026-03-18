@@ -50,6 +50,8 @@ pub enum EnsureRealmConfigError {
     MissingTransaction,
     #[error("automerge announcement failed: {0}")]
     AutomergeState(String),
+    #[error("automerge replication failed: {0}")]
+    AutomergeSync(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -209,13 +211,18 @@ impl Operation for EnsureRealmConfigOperation {
                 }
             },
             EnsureRealmConfigState::Replicate => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { .. }) => {
-                    if self.replication_targets.is_empty() {
-                        self.state = EnsureRealmConfigState::Finish;
-                        smallvec![]
-                    } else {
-                        let document = self.document_ref();
-                        emit_next_replication(&mut self.replication_targets, document)
+                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            if self.replication_targets.is_empty() {
+                                self.state = EnsureRealmConfigState::Finish;
+                                smallvec![]
+                            } else {
+                                let document = self.document_ref();
+                                emit_next_replication(&mut self.replication_targets, document)
+                            }
+                        }
+                        Err(error) => self.fail(EnsureRealmConfigError::AutomergeSync(error)),
                     }
                 }
                 other => self.unexpected_event("automerge sync result", format!("{other:?}")),

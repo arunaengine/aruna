@@ -42,7 +42,15 @@ impl AutomergeDocumentVariant {
 
     pub fn holder_lookup_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Metadata { document_id, .. } => document_id.to_bytes().to_vec(),
+            Self::Metadata {
+                group_id,
+                document_id,
+            } => {
+                let mut bytes = Vec::with_capacity(32);
+                bytes.extend_from_slice(&group_id.to_bytes());
+                bytes.extend_from_slice(&document_id.to_bytes());
+                bytes
+            }
             Self::GroupAuthorization { group_id } => format!("perm_{group_id}").into_bytes(),
             Self::RealmAuthorization { realm_id } => format!("realm_perm_{realm_id}").into_bytes(),
             Self::RealmConfig { realm_id } => format!("realm_config_{realm_id}").into_bytes(),
@@ -51,6 +59,28 @@ impl AutomergeDocumentVariant {
 
     pub fn announce_timer_key(&self) -> TaskKey {
         TaskKey::AutomergeAnnounce(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AutomergeDocumentVariant;
+    use ulid::Ulid;
+
+    #[test]
+    fn metadata_documents_with_different_groups_have_distinct_topic_keys() {
+        let document_id = Ulid::from_bytes([7u8; 16]);
+        let left = AutomergeDocumentVariant::Metadata {
+            group_id: Ulid::from_bytes([1u8; 16]),
+            document_id,
+        };
+        let right = AutomergeDocumentVariant::Metadata {
+            group_id: Ulid::from_bytes([2u8; 16]),
+            document_id,
+        };
+
+        assert_ne!(left.topic_key(), right.topic_key());
+        assert_ne!(left.topic_id(), right.topic_id());
     }
 }
 
