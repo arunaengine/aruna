@@ -13,19 +13,20 @@ aruna-net = { path = "../net" }
 async-trait = { workspace = true }
 automerge = { workspace = true }
 autosurgeon = { workspace = true }
+base64 = { workspace = true }
 bytes.workspace = true
 byteview = { workspace = true }
 chrono = { workspace = true }
 globset = { workspace = true }
 iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
+rand.workspace = true
 smallvec = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 ulid = { workspace = true }
 ed25519-dalek = { workspace = true }
-base64 = { workspace = true }
 
 [dev-dependencies]
 futures-util.workspace = true
