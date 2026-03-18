@@ -248,4 +248,301 @@ impl Operation for IncomingBaoOperation {
 }
 
 #[cfg(test)]
-pub mod test {}
+pub mod test {
+    use super::*;
+    use aruna_blob::blob::BLOB_LOCATION_DB;
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::structs::{BackendLocation, BlobInfo, NegotiationResult};
+    use aruna_core::types::Key;
+    use std::collections::HashMap;
+    use std::str::FromStr;
+    use std::time::SystemTime;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn test_incoming_bao() {
+        let node_key = iroh::SecretKey::from_str(
+            "98f15bd901074f210926f8dfb2e3f179e858bf15b49ab8faefe23cea0dcdd9ac",
+        )
+        .unwrap();
+        let node_id = node_key.public();
+        let stream_id = Ulid::new();
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+
+        // 1. Start -> Should transition to NegotiateReplication and emit Blob::NegotiateIncoming
+        let effects = op.start();
+        assert_eq!(op.state, IncomingBaoState::NegotiateReplication);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0],
+            Effect::Blob(BlobEffect::NegotiateIncoming { stream_id })
+        );
+
+        // 2. Feed NegotiationFinished(Accepted) -> Should transition to HandleReplication
+        let replication_id = Ulid::new();
+        let event = Event::Blob(BlobEvent::NegotiationFinished(NegotiationResult::Accepted(
+            replication_id,
+        )));
+        let effects = op.step(event);
+        assert_eq!(op.state, IncomingBaoState::HandleReplication);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0],
+            Effect::Blob(BlobEffect::HandleReplication {
+                replication_id,
+                stream_id,
+            })
+        );
+
+        // 3. Feed ReplicationFinished -> Should transition to StartTransaction
+        let mut hashes = HashMap::new();
+        hashes.insert("blake3".to_string(), vec![0u8; 32]);
+        let blob_info = BlobInfo {
+            location: BackendLocation {
+                root: "/tmp".to_string(),
+                storage_bucket: "bucket".to_string(),
+                object_bucket: "obj".to_string(),
+                object_key: "key".to_string(),
+                ulid: Ulid::new(),
+                compressed: false,
+                encrypted: false,
+            },
+            created_by: Ulid::new(),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 1024,
+            hashes,
+        };
+        let event = Event::Blob(BlobEvent::ReplicationFinished {
+            blob_info: blob_info.clone(),
+        });
+        let effects = op.step(event);
+        assert_eq!(op.state, IncomingBaoState::StartTransaction);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0],
+            Effect::Storage(StorageEffect::StartTransaction { read: false })
+        );
+
+        // 4. Feed TransactionStarted -> Should transition to CreateBlob and emit Storage::Write
+        let txn_id = Ulid::new();
+        let event = Event::Storage(StorageEvent::TransactionStarted { txn_id });
+        let effects = op.step(event);
+        assert_eq!(op.state, IncomingBaoState::CreateBlob);
+        assert_eq!(effects.len(), 1);
+        let blake3 = blob_info.get_blake3().expect("blake3 hash set");
+        assert_eq!(
+            effects[0],
+            Effect::Storage(StorageEffect::Write {
+                key_space: BLOB_LOCATION_DB.to_string(),
+                key: Key::from(blake3.as_slice().to_vec()),
+                value: blob_info.to_bytes().unwrap().into(),
+                txn_id: Some(txn_id),
+            })
+        );
+
+        // 5. Feed WriteResult -> Should transition to CommitTransaction
+        let event = Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(blake3.as_slice().to_vec()),
+        });
+        let effects = op.step(event);
+        assert_eq!(op.state, IncomingBaoState::CommitTransaction);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0],
+            Effect::Storage(StorageEffect::CommitTransaction { txn_id })
+        );
+
+        // 6. Feed TransactionCommitted -> Should transition to Finish
+        let event = Event::Storage(StorageEvent::TransactionCommitted { txn_id });
+        let effects = op.step(event);
+        assert_eq!(op.state, IncomingBaoState::Finish);
+        assert_eq!(effects.len(), 0);
+        assert!(op.is_complete());
+
+        // 7. Finalize
+        let result = op.finalize();
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_bao_invalid_steps() {
+        let node_key = iroh::SecretKey::from_str(
+            "98f15bd901074f210926f8dfb2e3f179e858bf15b49ab8faefe23cea0dcdd9ac",
+        )
+        .unwrap();
+        let node_id = node_key.public();
+        let stream_id = Ulid::new();
+
+        // 1. Invalid state: start twice
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+        op.start();
+        let effects = op.start();
+        assert!(effects.is_empty());
+        assert_eq!(op.state, IncomingBaoState::Error);
+        assert_eq!(
+            op.finalize().unwrap_err(),
+            ReplicationError::IncomingBaoError(IncomingBaoError::InvalidState {
+                current: IncomingBaoState::NegotiateReplication,
+                expected: IncomingBaoState::Init,
+            })
+        );
+
+        // 2. Invalid event at NegotiateReplication
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+        op.start();
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(vec![0u8; 32]),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, IncomingBaoState::Error);
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            ReplicationError::IncomingBaoError(IncomingBaoError::InvalidStateEvent { .. })
+        ));
+
+        // 3. Invalid event at HandleReplication
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+        op.start();
+        let replication_id = Ulid::new();
+        op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Accepted(replication_id),
+        )));
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(vec![0u8; 32]),
+        }));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, IncomingBaoState::Error);
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            ReplicationError::IncomingBaoError(IncomingBaoError::InvalidStateEvent { .. })
+        ));
+
+        // 4. Invalid event at StartTransaction
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+        op.start();
+        let replication_id = Ulid::new();
+        op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Accepted(replication_id),
+        )));
+        let mut hashes = HashMap::new();
+        hashes.insert("blake3".to_string(), vec![0u8; 32]);
+        let blob_info = BlobInfo {
+            location: BackendLocation {
+                root: "/tmp".to_string(),
+                storage_bucket: "bucket".to_string(),
+                object_bucket: "obj".to_string(),
+                object_key: "key".to_string(),
+                ulid: Ulid::new(),
+                compressed: false,
+                encrypted: false,
+            },
+            created_by: Ulid::new(),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 1024,
+            hashes,
+        };
+        op.step(Event::Blob(BlobEvent::ReplicationFinished {
+            blob_info: blob_info.clone(),
+        }));
+        let effects = op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Rejected("bad".to_string()),
+        )));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, IncomingBaoState::Error);
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            ReplicationError::IncomingBaoError(IncomingBaoError::InvalidStateEvent { .. })
+        ));
+
+        // 5. Invalid event at CreateBlob
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+        op.start();
+        let replication_id = Ulid::new();
+        op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Accepted(replication_id),
+        )));
+        let mut hashes = HashMap::new();
+        hashes.insert("blake3".to_string(), vec![0u8; 32]);
+        let blob_info = BlobInfo {
+            location: BackendLocation {
+                root: "/tmp".to_string(),
+                storage_bucket: "bucket".to_string(),
+                object_bucket: "obj".to_string(),
+                object_key: "key".to_string(),
+                ulid: Ulid::new(),
+                compressed: false,
+                encrypted: false,
+            },
+            created_by: Ulid::new(),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 1024,
+            hashes,
+        };
+        op.step(Event::Blob(BlobEvent::ReplicationFinished {
+            blob_info: blob_info.clone(),
+        }));
+        let txn_id = Ulid::new();
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Rejected("bad".to_string()),
+        )));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, IncomingBaoState::Error);
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            ReplicationError::IncomingBaoError(IncomingBaoError::InvalidStateEvent { .. })
+        ));
+
+        // 6. Invalid event at CommitTransaction
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+        op.start();
+        let replication_id = Ulid::new();
+        op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Accepted(replication_id),
+        )));
+        let mut hashes = HashMap::new();
+        hashes.insert("blake3".to_string(), vec![0u8; 32]);
+        let blob_info = BlobInfo {
+            location: BackendLocation {
+                root: "/tmp".to_string(),
+                storage_bucket: "bucket".to_string(),
+                object_bucket: "obj".to_string(),
+                object_key: "key".to_string(),
+                ulid: Ulid::new(),
+                compressed: false,
+                encrypted: false,
+            },
+            created_by: Ulid::new(),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 1024,
+            hashes,
+        };
+        op.step(Event::Blob(BlobEvent::ReplicationFinished {
+            blob_info: blob_info.clone(),
+        }));
+        let txn_id = Ulid::new();
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let blake3 = blob_info.get_blake3().unwrap();
+        op.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(blake3.as_slice().to_vec()),
+        }));
+        let effects = op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Rejected("bad".to_string()),
+        )));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, IncomingBaoState::Error);
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            ReplicationError::IncomingBaoError(IncomingBaoError::InvalidStateEvent { .. })
+        ));
+    }
+}
