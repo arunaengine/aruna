@@ -1,11 +1,16 @@
 use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument};
+use aruna_core::structs::{
+    Actor, AuthContext, Group, GroupAuthorizationDocument, UserIdentity,
+};
+use aruna_core::NodeId;
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::list_groups::ListGroupOperation;
+use aruna_operations::replication::outgoing_bao::OutgoingBaoOperation;
+use aruna_operations::s3::create_user_access::CreateUserAccessOperation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::from_fn_with_state;
@@ -13,6 +18,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
 use utoipa::ToSchema;
@@ -20,11 +26,43 @@ use utoipa::ToSchema;
 /// Build the group routes.
 pub fn rest_router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .route("/blobs/replicate", post(replicate_blob))
         .route("/groups/{id}", get(get_group))
         .route("/groups", post(create_group))
         .route("/groups", get(list_groups))
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state)
+}
+
+/// Request to create S3 credentials
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateS3CredentialsRequest {
+    /// S3 credentials are group specific
+    pub group_id: String,
+}
+
+/// Request to create S3 credentials
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateS3CredentialsResponse {
+    /// S3 credentials
+    pub access_key_id: String,
+    pub access_secret: String,
+}
+
+/// Request to replicate a blob.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReplicateBlobRequest {
+    /// Hex encoded Blake3 hash of the blob.
+    pub hash: String,
+    /// Recipient node of the replication.
+    pub node_id: String,
+}
+
+///
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ReplicateBlobResponse {
+    ///
+    pub success: bool,
 }
 
 /// Request to create a new group.
@@ -73,6 +111,99 @@ impl From<(Group, GroupAuthorizationDocument)> for CreateGroupResponse {
             group_id: group.group_id.to_string(),
             realm_id: group.realm_id.to_string(),
             roles: map_roles(auth),
+        }
+    }
+}
+
+/// Replicate a blob.
+///
+/// POST /api/v1/blobs/replicate
+///
+#[utoipa::path(
+    post,
+    path = "/blobs/replicate",
+    tag = "blobs",
+    request_body = ReplicateBlobRequest,
+    responses(
+        (status = 201, description = "Blob replicated successfully", body = ReplicateBlobResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - cannot replicate blobs in foreign realms", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn replicate_blob(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<ReplicateBlobRequest>,
+) -> ServerResult<(StatusCode, Json<ReplicateBlobResponse>)> {
+    let _auth = auth.ok_or(ServerError::Unauthorized)?;
+
+    // Evaluate request input
+    let node_id = NodeId::from_str(&request.node_id).map_err(|_e| ServerError::BadRequest)?;
+    let hash = blake3::Hash::from_hex(&request.hash).map_err(|_e| ServerError::BadRequest)?;
+    let op = OutgoingBaoOperation::new(node_id, *hash.as_bytes());
+
+    // Execute operation
+    let result = drive(op, &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    let response = ReplicateBlobResponse {
+        success: result.is_ok(),
+    };
+
+    Ok((StatusCode::OK, response.into()))
+}
+
+/// Create S3 credentials.
+///
+/// POST /api/v1/user/credentials
+///
+#[utoipa::path(
+    post,
+    path = "/users/credentials",
+    tag = "users",
+    request_body = CreateS3CredentialsRequest,
+    responses(
+        (status = 201, description = "Credentials created successfully", body = CreateS3CredentialsResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden - cannot create credentials in foreign realms", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_s3_credentials(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Json(request): Json<CreateS3CredentialsRequest>,
+) -> ServerResult<(StatusCode, Json<CreateS3CredentialsResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let user_identity = UserIdentity {
+        user_id: auth.user_id,
+        realm_key: auth.realm_id,
+    };
+
+    // Evaluate request input
+    let group_id = Ulid::from_str(&request.group_id).map_err(|_e| ServerError::BadRequest)?;
+    let op = CreateUserAccessOperation::new(user_identity, group_id);
+
+    // Execute operation
+    let result = drive(op, &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    match result {
+        Ok((access_key_id, access_secret)) => {
+            let response = CreateS3CredentialsResponse {
+                access_key_id: access_key_id.to_string(),
+                access_secret: access_secret.secret,
+            };
+            Ok((StatusCode::OK, response.into()))
+        }
+        Err(err) => {
+            //TODO: Differentiate return type based on error
+            Err(ServerError::InternalError(err.to_string()))
         }
     }
 }
