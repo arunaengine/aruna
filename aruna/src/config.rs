@@ -16,6 +16,9 @@ pub struct Config {
     pub node_capabilities: NodeCapabilities,
     pub realm_id: RealmId,
     pub node_id: iroh::PublicKey,
+    pub s3_port: u16,
+    pub s3_host: String,
+    pub s3_address: String,
 }
 
 #[derive(Error, Debug)]
@@ -36,6 +39,8 @@ pub enum SetupError {
     PKCSError(#[from] ed25519_dalek::pkcs8::Error),
     #[error(transparent)]
     IrohKeyError(#[from] KeyParsingError),
+    #[error(transparent)]
+    ParseIntError(#[from] std::num::ParseIntError),
 }
 
 pub fn read_config() -> Result<Config, SetupError> {
@@ -64,6 +69,10 @@ pub fn read_config() -> Result<Config, SetupError> {
     let node_key = VerifyingKey::from_public_key_pem(&node_pubkey)?;
     let node_id = iroh::PublicKey::from_bytes(&node_key.to_bytes())?;
 
+    let s3_port = dotenvy::var("S3_PORT")?.parse::<u16>()?;
+    let s3_host = dotenvy::var("S3_HOST")?;
+    let s3_address = dotenvy::var("S3_ADDRESS")?;
+
     // TODO: Configure capabilities
     let node_capabilities = NodeCapabilities::Management {
         realm_signing_key,
@@ -77,5 +86,8 @@ pub fn read_config() -> Result<Config, SetupError> {
         node_capabilities,
         realm_id,
         node_id,
+        s3_port,
+        s3_host,
+        s3_address,
     })
 }

@@ -26,7 +26,7 @@ async fn main() {
     }));
 
     let logging_env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or("none".into())
+        .unwrap_or("aruna=trace".into())
         .add_directive("aruna_api=trace".parse().unwrap());
 
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -37,6 +37,7 @@ async fn main() {
 
     tracing_subscriber::registry().with(fmt_layer).init();
 
+    dotenvy::dotenv().unwrap();
     let config = read_config().unwrap();
     let storage_handle = storage::FjallStorage::open(&config.storage_path).unwrap();
     let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
@@ -71,13 +72,16 @@ async fn main() {
         None,
     ));
 
-    let config = ServerConfig {
+    let server_config = ServerConfig {
         http_addr: config.socket_addr,
     };
-    let server = Server::new(state, config);
+    let server = Server::new(state, server_config);
 
     // S3 Server
-    let s3_server = S3Server::new("0.0.0.0:1337", "localhost:1337", driver_ctx)
+    let s3_address = format!("{}:{}", config.s3_address, config.s3_port);
+    let s3_host = format!("{}:{}", config.s3_host, config.s3_port);
+    info!(?s3_address, ?s3_host);
+    let s3_server = S3Server::new(&s3_address, &s3_host, driver_ctx)
         .await
         .unwrap();
 
