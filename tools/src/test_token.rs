@@ -16,6 +16,8 @@ pub async fn create_token() -> String {
         storage_handle,
         net_handle: None,
         blob_handle: None,
+        automerge_handle: None,
+        task_handle: None,
     });
 
     let token_config = CreateTokenConfig {

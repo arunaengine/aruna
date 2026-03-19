@@ -194,6 +194,8 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;

@@ -1,10 +1,12 @@
 use std::time::Duration;
 
 use crate::alpn::Alpn;
+use crate::automerge::AutomergeEffect;
 use crate::id::NodeId;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::{BackendLocation, BlobInfo};
+use crate::task::TaskEffect;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 use bytes::Bytes;
 use std::ops::Range;
@@ -15,8 +17,9 @@ pub enum Effect {
     Blob(BlobEffect),
     Storage(StorageEffect),
     Net(NetEffect),
+    Automerge(AutomergeEffect),
     SubOperation(Box<dyn SubOperation>),
-    Task(),
+    Task(TaskEffect),
     Search(),
     Stream(),
 }

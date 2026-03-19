@@ -2,8 +2,10 @@ use crate::errors::BlobError;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{BackendLocation, BlobInfo, NegotiationResult};
 use crate::{
+    automerge::AutomergeEvent,
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
     id::NodeId,
+    task::TaskEvent,
     types::{DhtKey, Key, TopicId, TxnId, Value},
 };
 use bytes::Bytes;
@@ -16,8 +18,9 @@ pub enum Event {
     Blob(BlobEvent),
     Storage(StorageEvent),
     Net(NetEvent),
+    Automerge(AutomergeEvent),
     SubOperation(SubOperationEvent),
-    Task(),
+    Task(TaskEvent),
     Search(),
     Stream(),
 }
@@ -29,6 +32,12 @@ pub enum SubOperationEvent {
     },
     AuthorizationResult {
         allowed: Result<bool, AuthorizationError>,
+    },
+    AutomergeSyncResult {
+        result: Result<(), String>,
+    },
+    AutomergeStateResult {
+        result: Result<(), String>,
     },
 }
 

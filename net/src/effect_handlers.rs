@@ -43,7 +43,10 @@ async fn handle_gossip_effect(gossip: &GossipService, effect: GossipEffect) -> N
         GossipEffect::Subscribe { topic } => match gossip.subscribe(topic.clone()).await {
             Ok(()) => NetEvent::Gossip(GossipEvent::Subscribed { topic }),
             Err(e) => NetEvent::Gossip(GossipEvent::Error {
-                error: aruna_core::errors::GossipError::Other(e.to_string()),
+                error: match e.to_string().as_str() {
+                    "Already subscribed" => aruna_core::errors::GossipError::AlreadySubscribed,
+                    other => aruna_core::errors::GossipError::Other(other.to_string()),
+                },
             }),
         },
         GossipEffect::Broadcast { topic, message } => {
@@ -57,7 +60,10 @@ async fn handle_gossip_effect(gossip: &GossipService, effect: GossipEffect) -> N
         GossipEffect::Unsubscribe { topic } => match gossip.unsubscribe(topic.clone()).await {
             Ok(()) => NetEvent::Gossip(GossipEvent::Unsubscribed { topic }),
             Err(e) => NetEvent::Gossip(GossipEvent::Error {
-                error: aruna_core::errors::GossipError::Other(e.to_string()),
+                error: match e.to_string().as_str() {
+                    "Not subscribed" => aruna_core::errors::GossipError::NotSubscribed,
+                    other => aruna_core::errors::GossipError::Other(other.to_string()),
+                },
             }),
         },
     }

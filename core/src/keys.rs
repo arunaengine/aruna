@@ -1,5 +1,7 @@
 // core/src/keys.rs
+use crate::automerge::AutomergeDocumentVariant;
 use crate::id::{DhtKeyId, TopicId};
+use crate::structs::RealmId;
 
 /// Derive a DHT key from arbitrary bytes using BLAKE3.
 #[must_use]
@@ -29,6 +31,20 @@ pub fn dht_key_from_domain(domain: &[u8], input: &[u8]) -> DhtKeyId {
 #[inline]
 pub fn gossip_peer_key(topic: &TopicId) -> DhtKeyId {
     dht_key_from_domain(b"gossip", &topic.to_bytes())
+}
+
+/// Hash the logical Automerge document identifier for holder discovery.
+#[must_use]
+#[inline]
+pub fn automerge_document_holder_key(document: &AutomergeDocumentVariant) -> DhtKeyId {
+    document.topic_key()
+}
+
+/// Derive a DHT key for active realm node presence announcements.
+#[must_use]
+#[inline]
+pub fn realm_presence_key(realm_id: &RealmId) -> DhtKeyId {
+    dht_key_from_domain(b"realm-presence", realm_id.as_bytes())
 }
 
 #[cfg(test)]

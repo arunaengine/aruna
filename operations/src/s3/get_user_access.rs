@@ -173,6 +173,8 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let operation = GetUserAccessOperation::new(access_key_id.to_string());

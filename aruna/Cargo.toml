@@ -13,6 +13,7 @@ aruna-core = { path = "../core" }
 aruna-net = { path = "../net" }
 aruna-operations = { path = "../operations" }
 aruna-storage = { path = "../storage" }
+aruna-tasks = { path = "../tasks" }
 
 # The rest
 base64.workspace = true

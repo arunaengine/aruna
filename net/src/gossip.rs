@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::consts::GOSSIP_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -13,15 +14,16 @@ use iroh::Endpoint;
 use iroh_gossip::api::GossipSender;
 use iroh_gossip::net::Gossip;
 use parking_lot::RwLock;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::DhtHandle;
 use crate::error::{NetError, Result};
 
-const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
 const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
+const GOSSIP_TOPIC_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const GOSSIP_RESUBSCRIBE_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct TopicSubscription {
@@ -29,12 +31,14 @@ struct TopicSubscription {
     sender: GossipSender,
 }
 
+#[derive(Clone)]
 pub struct GossipService {
     gossip: Gossip,
     storage: StorageHandle,
     dht: Arc<DhtHandle>,
     local_node_id: NodeId,
     subscriptions: Arc<RwLock<HashMap<TopicId, TopicSubscription>>>,
+    pending_subscriptions: Arc<Mutex<HashMap<TopicId, Arc<Notify>>>>,
     bootstrap_nodes: Arc<RwLock<Vec<NodeId>>>,
     shutdown: CancellationToken,
     /// Channel to forward incoming gossip messages.
@@ -59,6 +63,7 @@ impl GossipService {
             dht,
             local_node_id,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
+            pending_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_nodes: Arc::new(RwLock::new(bootstrap_nodes)),
             shutdown,
             event_tx,
@@ -81,7 +86,9 @@ impl GossipService {
         }) = self.storage.send_effect(effect).await
         {
             for topic in decode_persisted_subscriptions(&data) {
-                let _ = self.subscribe(topic).await;
+                if let Err(error) = self.subscribe(topic.clone()).await {
+                    warn!(topic = %topic, error = %error, "Failed to restore persisted gossip subscription");
+                }
             }
         }
 
@@ -89,84 +96,19 @@ impl GossipService {
     }
 
     pub async fn subscribe(&self, topic: TopicId) -> Result<()> {
-        if self.subscriptions.read().contains_key(&topic) {
-            return Err(NetError::Gossip("Already subscribed".to_string()));
-        }
-
-        self.announce_topic_subscription(&topic).await?;
-        let bootstrap_nodes = self.lookup_topic_bootstrap_nodes(&topic).await?;
-
-        let cancel = self.shutdown.child_token();
-
-        let gossip_topic = self
-            .gossip
-            .subscribe(topic.to_iroh_topic(), bootstrap_nodes)
-            .await
-            .map_err(|e| NetError::Gossip(e.to_string()))?;
-
-        let (sender, mut stream) = gossip_topic.split();
-
-        self.subscriptions.write().insert(
-            topic.clone(),
-            TopicSubscription {
-                cancel: cancel.clone(),
-                sender,
-            },
-        );
-        self.persist_subscriptions().await;
-
-        let subscriptions = self.subscriptions.clone();
-        let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
-            use futures::stream::StreamExt;
-            let mut unexpected_termination = false;
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    event = stream.next() => {
-                        match event {
-                            Some(Ok(event)) => {
-                                if let iroh_gossip::api::Event::Received(msg) = event {
-                                    match event_tx.try_send((
-                                        topic.clone(),
-                                        msg.delivered_from,
-                                        msg.content.to_vec(),
-                                    )) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            warn!(
-                                                topic = %topic,
-                                                "Gossip event channel full, dropping message"
-                                            );
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                                            // Event channel closed, stop processing
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            Some(Err(e)) => {
-                                warn!(topic = %topic, error = %e, "Gossip subscription stream error");
-                                unexpected_termination = true;
-                                break;
-                            }
-                            None => {
-                                warn!(topic = %topic, "Gossip subscription stream closed unexpectedly");
-                                unexpected_termination = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            if unexpected_termination {
-                warn!(topic = %topic, "Subscription terminated unexpectedly");
-            }
-            subscriptions.write().remove(&topic);
-        });
-
-        Ok(())
+        subscribe_owned(
+            self.gossip.clone(),
+            self.storage.clone(),
+            self.dht.clone(),
+            self.local_node_id,
+            self.subscriptions.clone(),
+            self.pending_subscriptions.clone(),
+            self.bootstrap_nodes.clone(),
+            self.shutdown.clone(),
+            self.event_tx.clone(),
+            topic,
+        )
+        .await
     }
 
     pub fn add_bootstrap_node(&self, node_id: NodeId) {
@@ -174,46 +116,6 @@ impl GossipService {
         if !nodes.contains(&node_id) {
             nodes.push(node_id);
         }
-    }
-
-    async fn announce_topic_subscription(&self, topic: &TopicId) -> Result<()> {
-        let dht_key = aruna_core::keys::gossip_peer_key(topic);
-        self.dht
-            .put(
-                &dht_key,
-                self.local_node_id.as_bytes().to_vec(),
-                GOSSIP_TOPIC_ANNOUNCE_TTL,
-            )
-            .await
-            .map_err(|e| NetError::Gossip(format!("Failed to announce gossip topic in DHT: {e}")))
-    }
-
-    async fn lookup_topic_bootstrap_nodes(&self, topic: &TopicId) -> Result<Vec<NodeId>> {
-        let dht_key = aruna_core::keys::gossip_peer_key(topic);
-        let entries = self.dht.get(&dht_key).await.map_err(|e| {
-            NetError::Gossip(format!(
-                "Failed to lookup gossip topic bootstrap nodes: {e}"
-            ))
-        })?;
-
-        let configured_nodes = self.bootstrap_nodes.read().clone();
-        let mut seen = HashSet::new();
-        let mut bootstrap_nodes = Vec::new();
-
-        for node_id in entries
-            .into_iter()
-            .map(|entry| entry.node_id)
-            .chain(configured_nodes.into_iter())
-        {
-            if node_id == self.local_node_id {
-                continue;
-            }
-            if seen.insert(node_id) {
-                bootstrap_nodes.push(node_id);
-            }
-        }
-
-        Ok(bootstrap_nodes)
     }
 
     pub async fn broadcast(&self, topic: TopicId, message: Vec<u8>) -> Result<()> {
@@ -261,6 +163,300 @@ impl GossipService {
 
         let _ = self.storage.send_effect(effect).await;
     }
+}
+
+async fn subscribe_owned(
+    gossip: Gossip,
+    storage: StorageHandle,
+    dht: Arc<DhtHandle>,
+    local_node_id: NodeId,
+    subscriptions: Arc<RwLock<HashMap<TopicId, TopicSubscription>>>,
+    pending_subscriptions: Arc<Mutex<HashMap<TopicId, Arc<Notify>>>>,
+    bootstrap_nodes_state: Arc<RwLock<Vec<NodeId>>>,
+    shutdown: CancellationToken,
+    event_tx: mpsc::Sender<(TopicId, NodeId, Vec<u8>)>,
+    topic: TopicId,
+) -> Result<()> {
+    let pending_topic = topic.clone();
+
+    loop {
+        let waiter = {
+            let mut pending = pending_subscriptions.lock().await;
+            let already_subscribed = {
+                let guard = subscriptions.read();
+                guard.contains_key(&topic)
+            };
+            if already_subscribed {
+                return Ok(());
+            }
+
+            if let Some(waiter) = pending.get(&topic) {
+                Some(waiter.clone())
+            } else {
+                pending.insert(topic.clone(), Arc::new(Notify::new()));
+                None
+            }
+        };
+
+        match waiter {
+            Some(waiter) => waiter.notified().await,
+            None => break,
+        }
+    }
+
+    let result = async {
+        if let Err(error) = announce_topic_subscription(&dht, local_node_id, &topic).await {
+            warn!(topic = %topic, error = %error, "Failed to announce gossip subscription in DHT");
+        }
+        let bootstrap_nodes = lookup_topic_bootstrap_nodes_owned(
+            &dht,
+            local_node_id,
+            &bootstrap_nodes_state,
+            &topic,
+        )
+        .await?;
+
+        let cancel = shutdown.child_token();
+        let gossip_topic = gossip
+            .subscribe(topic.to_iroh_topic(), bootstrap_nodes)
+            .await
+            .map_err(|e| NetError::Gossip(e.to_string()))?;
+
+        let (sender, mut stream) = gossip_topic.split();
+
+        {
+            let mut guard = subscriptions.write();
+            guard.insert(
+                topic.clone(),
+                TopicSubscription {
+                    cancel: cancel.clone(),
+                    sender,
+                },
+            );
+        }
+        persist_subscriptions(&storage, &subscriptions).await;
+
+        let reannounce_cancel = cancel.clone();
+        let reannounce_topic = topic.clone();
+        let reannounce_dht = dht.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = reannounce_cancel.cancelled() => break,
+                    _ = tokio::time::sleep(GOSSIP_TOPIC_REANNOUNCE_INTERVAL) => {
+                        if let Err(error) = announce_topic_subscription(
+                            &reannounce_dht,
+                            local_node_id,
+                            &reannounce_topic,
+                        ).await {
+                            warn!(topic = %reannounce_topic, error = %error, "Failed to refresh gossip topic announcement");
+                        }
+                    }
+                }
+            }
+        });
+
+        let subscriptions_for_stream = subscriptions.clone();
+        let pending_for_stream = pending_subscriptions.clone();
+        let storage_for_stream = storage.clone();
+        let gossip_for_stream = gossip.clone();
+        let dht_for_stream = dht.clone();
+        let bootstrap_nodes_for_stream = bootstrap_nodes_state.clone();
+        let shutdown_for_stream = shutdown.clone();
+        tokio::spawn(async move {
+            use futures::stream::StreamExt;
+            let mut unexpected_termination = false;
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    event = stream.next() => {
+                        match event {
+                            Some(Ok(event)) => {
+                                if let iroh_gossip::api::Event::Received(msg) = event {
+                                    match event_tx.try_send((
+                                        topic.clone(),
+                                        msg.delivered_from,
+                                        msg.content.to_vec(),
+                                    )) {
+                                        Ok(()) => {}
+                                        Err(mpsc::error::TrySendError::Full(_)) => {
+                                            warn!(
+                                                topic = %topic,
+                                                "Gossip event channel full, dropping message"
+                                            );
+                                        }
+                                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                warn!(topic = %topic, error = %e, "Gossip subscription stream error");
+                                unexpected_termination = true;
+                                break;
+                            }
+                            None => {
+                                warn!(topic = %topic, "Gossip subscription stream closed unexpectedly");
+                                unexpected_termination = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if unexpected_termination {
+                warn!(topic = %topic, "Subscription terminated unexpectedly");
+            }
+
+            {
+                let mut guard = subscriptions_for_stream.write();
+                if let Some(subscription) = guard.remove(&topic) {
+                    subscription.cancel.cancel();
+                }
+            }
+
+            if unexpected_termination {
+                tokio::task::spawn_blocking(move || {
+                    std::thread::sleep(GOSSIP_RESUBSCRIBE_DELAY);
+                    if shutdown_for_stream.is_cancelled() {
+                        return;
+                    }
+                    let runtime = tokio::runtime::Handle::current();
+                    if let Err(error) = runtime.block_on(subscribe_owned(
+                        gossip_for_stream,
+                        storage_for_stream,
+                        dht_for_stream,
+                        local_node_id,
+                        subscriptions_for_stream,
+                        pending_for_stream,
+                        bootstrap_nodes_for_stream,
+                        shutdown_for_stream,
+                        event_tx,
+                        topic.clone(),
+                    )) {
+                        warn!(topic = %topic, error = %error, "Failed to restore gossip subscription");
+                    }
+                });
+            }
+        });
+
+        Ok(())
+    }
+    .await;
+
+    let notify = {
+        let mut pending = pending_subscriptions.lock().await;
+        pending.remove(&pending_topic)
+    };
+    if let Some(notify) = notify {
+        notify.notify_waiters();
+    }
+
+    result
+}
+
+async fn lookup_topic_bootstrap_nodes_owned(
+    dht: &Arc<DhtHandle>,
+    local_node_id: NodeId,
+    bootstrap_nodes_state: &Arc<RwLock<Vec<NodeId>>>,
+    topic: &TopicId,
+) -> Result<Vec<NodeId>> {
+    let configured_nodes = {
+        let guard = bootstrap_nodes_state.read();
+        guard.clone()
+    };
+    let mut seen = HashSet::new();
+    let mut bootstrap_nodes = Vec::new();
+
+    for node_id in lookup_bootstrap_candidates_owned(dht, topic)
+        .await?
+        .into_iter()
+        .chain(configured_nodes.into_iter())
+    {
+        if node_id == local_node_id {
+            continue;
+        }
+        if seen.insert(node_id) {
+            bootstrap_nodes.push(node_id);
+        }
+    }
+
+    Ok(bootstrap_nodes)
+}
+
+async fn lookup_bootstrap_candidates_owned(
+    dht: &Arc<DhtHandle>,
+    topic: &TopicId,
+) -> Result<Vec<NodeId>> {
+    let topic_key = aruna_core::keys::gossip_peer_key(topic);
+    let mut candidates = lookup_nodes_for_key_owned(dht, &topic_key).await?;
+    if let TopicId::AutomergeDocument(document_key) = topic {
+        candidates.extend(lookup_nodes_for_key_owned(dht, document_key).await?);
+    }
+    Ok(candidates)
+}
+
+async fn lookup_nodes_for_key_owned(
+    dht: &Arc<DhtHandle>,
+    dht_key: &aruna_core::DhtKeyId,
+) -> Result<Vec<NodeId>> {
+    let entries = dht.get(dht_key).await.map_err(|e| {
+        NetError::Gossip(format!(
+            "Failed to lookup gossip topic bootstrap nodes: {e}"
+        ))
+    })?;
+    Ok(entries.into_iter().map(|entry| entry.node_id).collect())
+}
+
+async fn persist_subscriptions(
+    storage: &StorageHandle,
+    subscriptions: &Arc<RwLock<HashMap<TopicId, TopicSubscription>>>,
+) {
+    let persisted: Vec<TopicId> = {
+        let guard = subscriptions.read();
+        guard.iter().map(|(topic, _)| topic.clone()).collect()
+    };
+
+    let Ok(data) = postcard::to_allocvec(&persisted) else {
+        return;
+    };
+
+    let effect = Effect::Storage(StorageEffect::Write {
+        key_space: GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
+        key: ByteView::from(b"topics".as_slice()),
+        value: ByteView::from(data),
+        txn_id: None,
+    });
+
+    let _ = storage.send_effect(effect).await;
+}
+
+async fn announce_topic_subscription(
+    dht: &DhtHandle,
+    local_node_id: NodeId,
+    topic: &TopicId,
+) -> Result<()> {
+    let topic_key = aruna_core::keys::gossip_peer_key(topic);
+    dht.put(
+        &topic_key,
+        local_node_id.as_bytes().to_vec(),
+        GOSSIP_TOPIC_ANNOUNCE_TTL,
+    )
+    .await
+    .map_err(|e| NetError::Gossip(format!("Failed to announce gossip topic in DHT: {e}")))?;
+
+    if let TopicId::AutomergeDocument(document_key) = topic {
+        dht.put(
+            document_key,
+            local_node_id.as_bytes().to_vec(),
+            GOSSIP_TOPIC_ANNOUNCE_TTL,
+        )
+        .await
+        .map_err(|e| {
+            NetError::Gossip(format!("Failed to announce automerge document in DHT: {e}"))
+        })?;
+    }
+
+    Ok(())
 }
 
 fn decode_persisted_subscriptions(bytes: &[u8]) -> Vec<TopicId> {

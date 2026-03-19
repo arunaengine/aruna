@@ -3,10 +3,12 @@ use std::time::Duration;
 
 use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
+use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{DhtEffect, Effect, GossipEffect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::keys::automerge_document_holder_key;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_net::streams::BiStream;
 use aruna_net::{InboundEventHandler, NetConfig, NetHandle};
@@ -261,6 +263,70 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
     }
 
     assert!(got_message, "expected gossip message on second node");
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_automerge_topic_subscription_announces_document_holders()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+
+    let cfg = || NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        use_dns_discovery: false,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(), storage_b).await?;
+
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+
+    let document = AutomergeDocumentVariant::Metadata {
+        group_id: Ulid::new(),
+        document_id: Ulid::new(),
+    };
+    let topic = document.topic_id();
+    let holder_key = *automerge_document_holder_key(&document).as_bytes();
+
+    let subscribe = handle_a
+        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
+            topic: topic.clone(),
+        })))
+        .await;
+    assert!(matches!(
+        subscribe,
+        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
+    ));
+
+    let mut found = false;
+    for _ in 0..10 {
+        let get = handle_b
+            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
+                key: holder_key,
+            })))
+            .await;
+
+        if let Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) = get
+            && values
+                .iter()
+                .any(|entry| entry.node_id == handle_a.node_id())
+        {
+            found = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    assert!(found, "expected automerge holder DHT entry on second node");
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;

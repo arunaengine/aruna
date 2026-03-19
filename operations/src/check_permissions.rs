@@ -229,7 +229,13 @@ impl CheckPermissionsOperation {
     fn emit_check_permissions(&mut self) -> Result<Effects, AuthorizationError> {
         self.state = CheckPermissionsState::Finish;
         let roles = self.collect_roles()?;
-        self.output = Some(self.check_permissions(roles));
+        let allowed = self.check_permissions(roles)?;
+        let allowed = if allowed {
+            self.check_path_restrictions()?
+        } else {
+            false
+        };
+        self.output = Some(Ok(allowed));
         Ok(smallvec![])
     }
 
@@ -273,6 +279,30 @@ impl CheckPermissionsOperation {
                 }
             }
         }
+        Ok(allowed)
+    }
+
+    fn check_path_restrictions(&self) -> Result<bool, AuthorizationError> {
+        let Some(restrictions) = self.config.auth_context.path_restrictions.as_ref() else {
+            return Ok(true);
+        };
+
+        let mut allowed = false;
+        for restriction in restrictions {
+            let glob = Glob::new(&restriction.pattern)?.compile_matcher();
+            if glob.is_match(&self.config.path) {
+                match restriction.permission {
+                    Permission::DENY => return Ok(false),
+                    Permission::READ => {
+                        if self.config.required_permission == Permission::READ {
+                            allowed = true;
+                        }
+                    }
+                    Permission::WRITE => allowed = true,
+                }
+            }
+        }
+
         Ok(allowed)
     }
 
@@ -368,9 +398,10 @@ mod test {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::structs::{Actor, Permission, RealmId};
+    use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;
-    use iroh::PublicKey;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -412,16 +443,29 @@ mod test {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                use_dns_discovery: false,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let task_handle = TaskHandle::new();
 
         let context = DriverContext {
             storage_handle,
-            net_handle: None,
             blob_handle: None,
+            net_handle: Some(net_handle.clone()),
+            automerge_handle: None,
+            task_handle: Some(task_handle),
         };
 
         let admin_id = Ulid::new();
         let realm_id = RealmId([0u8; 32]);
-        let node_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 
         let realm_config = CreateRealmConfig {
             actor: aruna_core::structs::Actor {
@@ -683,5 +727,7 @@ mod test {
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
         assert!(drive(perm_operation, &context).await.unwrap());
+
+        net_handle.shutdown().await;
     }
 }
