@@ -80,7 +80,7 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 smallvec = "1.15.1"
 byteview = "0.10.1"
 tempfile = "3.25.0"
-sha2 = "0.11.0-rc.2"
+sha2 = "0.11.0-rc.5"
 
 [patch.crates-io]
 # Temporarily fixes the dependency conflict of digest 0.10.x and 0.11.x until dependencies are updated

@@ -24,7 +24,6 @@ axum = "0.8.8"
 blake3 = { workspace = true }
 chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
-iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
@@ -32,12 +31,13 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 # S3
 async-trait.workspace = true
 futures-core = "0.3.32"
-http = "1.3.1"
+http = "1.4.0"
 hyper = { version = "1.8.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["server", "http1", "http2", "tokio", "service", ] }
-s3s = "0.13.0-alpha.3"
+s3s = "0.13.0"
 
 [dev-dependencies]
 aruna-storage = { path = "../storage" }
+iroh = { workspace = true }
 tempfile.workspace = true
 rand = { workspace = true }
