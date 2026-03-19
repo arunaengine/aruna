@@ -19,7 +19,7 @@ pub enum AuthorizationError {
     InvalidGroupId,
     #[error("No group found")]
     GroupNotFound,
-    #[error("No group found")]
+    #[error("Authorization document not found")]
     AuthDocNotFound,
     #[error("Creating Group did not finish")]
     NotFinished,
@@ -100,6 +100,8 @@ pub enum ConversionError {
     #[error(transparent)]
     PostcardError(#[from] postcard::Error),
     #[error(transparent)]
+    SerdeJsonError(#[from] serde_json::Error),
+    #[error(transparent)]
     PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
     #[error(transparent)]
     FromSliceError(#[from] TryFromSliceError),
@@ -115,6 +117,8 @@ pub enum ConversionError {
     HydrateError(#[from] autosurgeon::HydrateError),
     #[error(transparent)]
     AutomergeError(#[from] AutomergeError),
+    #[error("RO-Crate conversion error: {0}")]
+    RoCrateError(String),
 }
 
 impl PartialEq for ConversionError {

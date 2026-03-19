@@ -15,6 +15,8 @@ pub async fn create_token() -> String {
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
+        automerge_handle: None,
+        task_handle: None,
     });
 
     let token_config = CreateTokenConfig {

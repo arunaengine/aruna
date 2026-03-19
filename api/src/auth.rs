@@ -146,6 +146,8 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -171,7 +173,8 @@ mod test {
             node_id.clone(),
             capabilities.clone(),
             None,
-        );
+        )
+        .await;
 
         let token_config = CreateTokenConfig {
             time,
@@ -211,7 +214,8 @@ mod test {
             node_id.clone(),
             capabilities.clone(),
             None,
-        );
+        )
+        .await;
 
         let token_config = CreateTokenConfig {
             time,
@@ -243,7 +247,8 @@ mod test {
             node_id.clone(),
             capabilities.clone(),
             None,
-        );
+        )
+        .await;
 
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -274,6 +279,8 @@ mod test {
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -301,7 +308,8 @@ mod test {
             node_id.clone(),
             capabilities.clone(),
             None,
-        );
+        )
+        .await;
 
         //
         // Valid management token with expiry
@@ -373,7 +381,8 @@ mod test {
             node_id.clone(),
             capabilities.clone(),
             None,
-        );
+        )
+        .await;
 
         let old_time = chrono::Utc::now()
             .checked_sub_days(Days::new(10))
@@ -412,7 +421,8 @@ mod test {
             node_id.clone(),
             capabilities.clone(),
             None,
-        );
+        )
+        .await;
 
         let token_config = CreateTokenConfig {
             time,
@@ -446,7 +456,8 @@ mod test {
             node_id.clone(),
             capabilities.clone(),
             None,
-        );
+        )
+        .await;
 
         let token_config = CreateTokenConfig {
             time,

@@ -516,7 +516,9 @@ impl DhtDriver {
 
             match storage.send_effect(effect).await {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                    let _ = io_tx.send(DhtIo::StorageDeleteResult { op_id, stage }).await;
+                    let _ = io_tx
+                        .send(DhtIo::StorageDeleteResult { op_id, stage })
+                        .await;
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     let _ = io_tx
@@ -613,16 +615,11 @@ async fn rpc_request(
         .await?
         .map_err(DhtIoError::network)?;
 
-    let (mut send, mut recv) = conn
-        .open_bi()
-        .await
-        .map_err(DhtIoError::network)?;
+    let (mut send, mut recv) = conn.open_bi().await.map_err(DhtIoError::network)?;
 
     let request_bytes = encode_request(&request)?;
     let len = (request_bytes.len() as u32).to_be_bytes();
-    send.write_all(&len)
-        .await
-        .map_err(DhtIoError::network)?;
+    send.write_all(&len).await.map_err(DhtIoError::network)?;
     send.write_all(&request_bytes)
         .await
         .map_err(DhtIoError::network)?;
@@ -684,9 +681,7 @@ async fn write_response_to_stream(
     }
 
     let len = (response_bytes.len() as u32).to_be_bytes();
-    send.write_all(&len)
-        .await
-        .map_err(DhtIoError::network)?;
+    send.write_all(&len).await.map_err(DhtIoError::network)?;
     send.write_all(&response_bytes)
         .await
         .map_err(DhtIoError::network)?;

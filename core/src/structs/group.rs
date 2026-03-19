@@ -147,6 +147,11 @@ pub mod autosurgeon_role_map {
         mut reconciler: R,
     ) -> Result<(), R::Error> {
         let mut map = reconciler.map()?;
+        map.retain(|role_id, _| {
+            Ulid::from_string(role_id)
+                .ok()
+                .is_some_and(|role_id| role_map.contains_key(&role_id))
+        })?;
         for (role_id, role) in role_map.iter() {
             map.put(role_id.to_string(), role)?;
         }
@@ -186,6 +191,11 @@ pub mod autosurgeon_role_set {
         mut reconciler: R,
     ) -> Result<(), R::Error> {
         let mut map = reconciler.map()?;
+        map.retain(|role_id, _| {
+            Ulid::from_string(role_id)
+                .ok()
+                .is_some_and(|role_id| role_set.contains(&role_id))
+        })?;
         for role_id in role_set.iter() {
             map.put(role_id.to_string(), String::new())?;
         }

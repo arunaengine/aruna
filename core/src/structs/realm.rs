@@ -2,7 +2,7 @@ use crate::errors::ConversionError;
 use crate::structs::Actor;
 use crate::structs::group::autosurgeon_role_map;
 use crate::structs::structs::{Permission, Role};
-use crate::types::{RoleId, UserId};
+use crate::types::{GroupId, RoleId, UserId, autosurgeon_ulid};
 use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
@@ -162,6 +162,116 @@ impl RealmAuthorizationDocument {
     }
 }
 
+pub const DEFAULT_METADATA_REPLICATION_FACTOR: u32 = 3;
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct RealmConfigDocument {
+    #[autosurgeon(with = "autosurgeon_realm_id")]
+    pub realm_id: RealmId,
+    pub metadata_replication: MetadataReplicationConfig,
+}
+
+impl RealmConfigDocument {
+    pub fn new(realm_id: RealmId, default_replication_factor: u32) -> Self {
+        Self {
+            realm_id,
+            metadata_replication: MetadataReplicationConfig::new(default_replication_factor),
+        }
+    }
+
+    pub fn default_for_realm(realm_id: RealmId) -> Self {
+        Self::new(realm_id, DEFAULT_METADATA_REPLICATION_FACTOR)
+    }
+
+    pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
+        self.metadata_replication.factor_for(group_id, path)
+    }
+
+    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        self.reconcile_bytes(None, actor)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let doc = automerge::AutoCommit::load(bytes)?;
+        Ok(hydrate(&doc)?)
+    }
+
+    pub fn reconcile_bytes(
+        &self,
+        current: Option<&[u8]>,
+        actor: &Actor,
+    ) -> Result<Vec<u8>, ConversionError> {
+        let actor = postcard::to_allocvec(actor)?;
+        let mut doc = match current {
+            Some(bytes) if !bytes.is_empty() => automerge::AutoCommit::load(bytes)?,
+            _ => automerge::AutoCommit::new(),
+        };
+        doc.set_actor((&actor).into());
+        reconcile(&mut doc, self)?;
+        Ok(doc.save())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct MetadataReplicationConfig {
+    pub default_replication_factor: u32,
+    pub group_overrides: Vec<MetadataGroupReplicationOverride>,
+    pub path_overrides: Vec<MetadataPathReplicationOverride>,
+}
+
+impl MetadataReplicationConfig {
+    pub fn new(default_replication_factor: u32) -> Self {
+        Self {
+            default_replication_factor,
+            group_overrides: Vec::new(),
+            path_overrides: Vec::new(),
+        }
+    }
+
+    pub fn factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
+        if let Some(path) = path
+            && let Some(path_override) = self
+                .path_overrides
+                .iter()
+                .filter(|override_| {
+                    override_.group_id == group_id && path.starts_with(&override_.path_prefix)
+                })
+                .max_by_key(|override_| override_.path_prefix.len())
+        {
+            return normalize_replication_factor(path_override.replication_factor);
+        }
+
+        if let Some(group_override) = self
+            .group_overrides
+            .iter()
+            .find(|override_| override_.group_id == group_id)
+        {
+            return normalize_replication_factor(group_override.replication_factor);
+        }
+
+        normalize_replication_factor(self.default_replication_factor)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct MetadataGroupReplicationOverride {
+    #[autosurgeon(with = "autosurgeon_ulid")]
+    pub group_id: GroupId,
+    pub replication_factor: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct MetadataPathReplicationOverride {
+    #[autosurgeon(with = "autosurgeon_ulid")]
+    pub group_id: GroupId,
+    pub path_prefix: String,
+    pub replication_factor: u32,
+}
+
+fn normalize_replication_factor(replication_factor: u32) -> usize {
+    replication_factor.max(1) as usize
+}
+
 pub mod autosurgeon_realm_id {
     use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
 
@@ -173,7 +283,7 @@ pub mod autosurgeon_realm_id {
     ) -> Result<RealmId, HydrateError> {
         let inner = autosurgeon::bytes::ByteVec::hydrate(doc, obj, prop)?;
         let realm_id = RealmId(inner.as_slice().try_into().map_err(|_| {
-            HydrateError::unexpected("&[u8; 16]", "Invalid slice of bytes".to_string())
+            HydrateError::unexpected("&[u8; 32]", "Invalid slice of bytes".to_string())
         })?);
         Ok(realm_id)
     }
@@ -223,6 +333,11 @@ pub mod autosurgeon_operation_map {
         mut reconciler: R,
     ) -> Result<(), R::Error> {
         let mut map = reconciler.map()?;
+        map.retain(|operation, _| {
+            RealmLevelOperation::try_from(operation.to_string())
+                .ok()
+                .is_some_and(|operation| operation_map.contains_key(&operation))
+        })?;
         for (operation, users) in operation_map.iter() {
             map.put(
                 operation.to_string(),
@@ -238,7 +353,10 @@ pub mod autosurgeon_operation_map {
 
 #[cfg(test)]
 mod test {
-    use crate::structs::{RealmAuthorizationDocument, RealmId};
+    use crate::structs::{
+        Actor, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    };
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
 
@@ -255,5 +373,77 @@ mod test {
         let hydrated_auth_doc: RealmAuthorizationDocument = hydrate(&stored_automerge_doc).unwrap();
 
         assert_eq!(auth_doc, hydrated_auth_doc);
+    }
+
+    #[test]
+    pub fn test_realm_config_doc_roundtrip() {
+        let group_id = Ulid::new();
+        let document = RealmConfigDocument {
+            realm_id: RealmId([4u8; 32]),
+            metadata_replication: super::MetadataReplicationConfig {
+                default_replication_factor: 3,
+                group_overrides: vec![MetadataGroupReplicationOverride {
+                    group_id,
+                    replication_factor: 5,
+                }],
+                path_overrides: vec![MetadataPathReplicationOverride {
+                    group_id,
+                    path_prefix: "/datasets/demo".to_string(),
+                    replication_factor: 7,
+                }],
+            },
+        };
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
+            user_id: Ulid::new(),
+            realm_id: RealmId([4u8; 32]),
+        };
+
+        let bytes = document.to_bytes(&actor).expect("to bytes");
+        let restored = RealmConfigDocument::from_bytes(&bytes).expect("from bytes");
+
+        assert_eq!(document, restored);
+    }
+
+    #[test]
+    pub fn test_realm_config_replication_resolution() {
+        let group_id = Ulid::new();
+        let other_group_id = Ulid::new();
+        let document = RealmConfigDocument {
+            realm_id: RealmId([5u8; 32]),
+            metadata_replication: super::MetadataReplicationConfig {
+                default_replication_factor: 3,
+                group_overrides: vec![MetadataGroupReplicationOverride {
+                    group_id,
+                    replication_factor: 5,
+                }],
+                path_overrides: vec![
+                    MetadataPathReplicationOverride {
+                        group_id,
+                        path_prefix: "/datasets".to_string(),
+                        replication_factor: 6,
+                    },
+                    MetadataPathReplicationOverride {
+                        group_id,
+                        path_prefix: "/datasets/important".to_string(),
+                        replication_factor: 7,
+                    },
+                ],
+            },
+        };
+
+        assert_eq!(
+            document.metadata_replication_factor_for(other_group_id, None),
+            3
+        );
+        assert_eq!(document.metadata_replication_factor_for(group_id, None), 5);
+        assert_eq!(
+            document.metadata_replication_factor_for(group_id, Some("/datasets/demo")),
+            6
+        );
+        assert_eq!(
+            document.metadata_replication_factor_for(group_id, Some("/datasets/important/item")),
+            7
+        );
     }
 }

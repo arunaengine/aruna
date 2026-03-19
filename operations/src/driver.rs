@@ -4,14 +4,19 @@ use aruna_core::handle::Handle;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
+use aruna_tasks::TaskHandle;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+
+use crate::automerge::AutomergeHandle;
 
 #[derive(Debug)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
+    pub automerge_handle: Option<AutomergeHandle>,
+    pub task_handle: Option<TaskHandle>,
 }
 
 const MAX_SUBOP_DEPTH: usize = 32;
@@ -31,6 +36,21 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                 Event::Net(NetEvent::Error(aruna_core::events::NetError::ChannelClosed))
             }
         }
+        Effect::Automerge(automerge_effect) => {
+            if let Some(automerge_handle) = &context.automerge_handle {
+                automerge_handle
+                    .send_effect(Effect::Automerge(automerge_effect))
+                    .await
+            } else {
+                Event::Automerge(aruna_core::automerge::AutomergeEvent::SyncRejected {
+                    sync_id: ulid::Ulid::new(),
+                    document: None,
+                    error: aruna_core::automerge::AutomergeSyncError::Network(
+                        "automerge handle unavailable".to_string(),
+                    ),
+                })
+            }
+        }
         Effect::SubOperation(sub_operation) => {
             if depth >= MAX_SUBOP_DEPTH {
                 Event::SubOperation(SubOperationEvent::DepthLimitExceeded {
@@ -40,9 +60,15 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                 drive_suboperation(sub_operation, context, depth + 1).await
             }
         }
-        Effect::Task() => {
-            tracing::warn!("Task effect is not handled by driver yet");
-            Event::Task()
+        Effect::Task(task_effect) => {
+            if let Some(task_handle) = &context.task_handle {
+                task_handle.send_effect(Effect::Task(task_effect)).await
+            } else {
+                Event::Task(aruna_core::task::TaskEvent::Error {
+                    key: None,
+                    message: "task handle unavailable".to_string(),
+                })
+            }
         }
         Effect::Search() => {
             tracing::warn!("Search effect is not handled by driver yet");
@@ -107,9 +133,11 @@ pub async fn drive<O: Operation>(
 mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::{
+        automerge::AutomergeDocumentVariant,
         effects::{Effect, StorageEffect},
         events::{Event, StorageEvent, SubOperationEvent},
         operation::{Operation, boxed_suboperation},
+        task::{TaskEffect, TaskKey},
     };
     use aruna_storage::storage;
     use byteview::ByteView;
@@ -211,6 +239,8 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let operation = TestOperation::new();
@@ -236,12 +266,19 @@ mod test {
         type Error = ();
 
         fn start(&mut self) -> aruna_core::types::Effects {
-            smallvec::smallvec![Effect::Task(), Effect::Search()]
+            smallvec::smallvec![
+                Effect::Task(TaskEffect::CancelTimer {
+                    key: TaskKey::AutomergeAnnounce(AutomergeDocumentVariant::GroupAuthorization {
+                        group_id: ulid::Ulid::from_bytes([0u8; 16]),
+                    }),
+                }),
+                Effect::Search()
+            ]
         }
 
         fn step(&mut self, event: Event) -> aruna_core::types::Effects {
             match event {
-                Event::Task() => self.observed.push("task"),
+                Event::Task(_) => self.observed.push("task"),
                 Event::Search() => self.observed.push("search"),
                 _ => {}
             }
@@ -269,6 +306,8 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let operation = EffectOrderOperation::new();
@@ -331,6 +370,8 @@ mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            automerge_handle: None,
+            task_handle: None,
         };
 
         let event = drive(RecursiveSubOperation::new(), &context)

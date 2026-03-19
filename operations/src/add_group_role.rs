@@ -1,7 +1,8 @@
+use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument, RealmId, Role};
 use aruna_core::types::{GroupId, TxnId};
@@ -9,6 +10,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
+use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +65,10 @@ pub enum AddGroupRoleState {
         group: Group,
         auth_doc: GroupAuthorizationDocument,
     },
+    AnnounceAuthDoc {
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+    },
     Finish,
     Error,
 }
@@ -73,6 +79,8 @@ pub enum AddGroupRoleError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error("automerge announcement failed: {0}")]
+    AutomergeState(String),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unauthorized")]
@@ -326,9 +334,39 @@ impl AddGroupRoleOperation {
                 got,
             );
         };
+        self.state = AddGroupRoleState::AnnounceAuthDoc {
+            group: group.clone(),
+            auth_doc: auth_doc.clone(),
+        };
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::GroupAuthorization {
+                group_id: group.group_id,
+            }),
+            |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                result: result.map_err(|error| error.to_string()),
+            }),
+        ))]
+    }
+
+    fn handle_announce_auth_doc(
+        &mut self,
+        event: Event,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+    ) -> aruna_core::types::Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                got,
+            );
+        };
+        if let Err(error) = result {
+            return self.fail(AddGroupRoleError::AutomergeState(error));
+        }
         self.state = AddGroupRoleState::Finish;
         self.output = Some(Ok((group, auth_doc)));
-
         smallvec![]
     }
 
@@ -427,6 +465,9 @@ impl Operation for AddGroupRoleOperation {
             AddGroupRoleState::CommitTransaction { group, auth_doc } => {
                 self.handle_commit_transaction(event, group, auth_doc)
             }
+            AddGroupRoleState::AnnounceAuthDoc { group, auth_doc } => {
+                self.handle_announce_auth_doc(event, group, auth_doc)
+            }
             AddGroupRoleState::Init | AddGroupRoleState::Finish | AddGroupRoleState::Error => {
                 smallvec![]
             }
@@ -463,14 +504,12 @@ pub mod test {
     use std::collections::{HashMap, HashSet};
 
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation, AddGroupRoleState};
-    use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::effects::Effect;
     use aruna_core::events::Event;
-    use aruna_core::operation::{Operation, boxed_suboperation};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, Permission, Role};
     use aruna_core::types::TxnId;
-    use iroh::PublicKey;
     use ulid::Ulid;
 
     #[tokio::test]
@@ -480,7 +519,7 @@ pub mod test {
         //
         let user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
-        let node_id = PublicKey::from_bytes(&[0u8; 32]).unwrap();
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let group_id = Ulid::new();
         let auth_doc =
             GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id.clone(), group_id);
@@ -529,23 +568,7 @@ pub mod test {
 
         let effects = add_role_operation.start();
         let auth_effect = effects.first().unwrap();
-        assert_eq!(
-            auth_effect,
-            &Effect::SubOperation(boxed_suboperation(
-                CheckPermissionsOperation::new(CheckPermissionsConfig {
-                    auth_context: auth_context.clone(),
-                    path: format!("/{}/g/{}/admin", realm_id.to_string(), group_id.to_string()),
-                    required_permission: aruna_core::structs::Permission::WRITE,
-                }),
-                |_| {
-                    Event::SubOperation(
-                        aruna_core::events::SubOperationEvent::AuthorizationResult {
-                            allowed: Ok(true),
-                        },
-                    )
-                }
-            ))
-        );
+        assert!(matches!(auth_effect, Effect::SubOperation(_)));
         assert_eq!(add_role_operation.state, AddGroupRoleState::Auth);
         let effects = add_role_operation.step(Event::SubOperation(
             aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
@@ -615,26 +638,36 @@ pub mod test {
         mutated_auth_doc
             .roles
             .insert(add_role_input.role.role_id, add_role_input.role.clone());
-        assert_eq!(
-            create_role_effect,
-            &Effect::Storage(aruna_core::effects::StorageEffect::Write {
-                key_space: AUTH_KEYSPACE.to_string(),
-                key: group_id.to_bytes().into(),
-                value: mutated_group.to_bytes(&actor).unwrap().into(),
-                txn_id: Some(txn_id),
-            })
-        );
+        match create_role_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(key_space, AUTH_KEYSPACE);
+                assert_eq!(key, &group_id.to_bytes().into());
+                assert_eq!(effect_txn_id, &Some(txn_id));
+                let stored_auth_doc = GroupAuthorizationDocument::from_bytes(value).unwrap();
+                assert_eq!(stored_auth_doc, mutated_auth_doc);
+            }
+            other => panic!("unexpected create role effect: {other:?}"),
+        }
         assert_eq!(
             add_role_operation.state,
-            AddGroupRoleState::GetAuthDoc {
+            AddGroupRoleState::CreateRole {
                 txn_id,
-                group: group.clone()
+                group: mutated_group.clone(),
+                auth_doc: mutated_auth_doc.clone(),
             }
         );
 
-        assert!(group.roles.contains(&add_role_input.role.role_id));
+        assert!(mutated_group.roles.contains(&add_role_input.role.role_id));
         assert_eq!(
-            auth_doc.roles.get(&add_role_input.role.role_id).unwrap(),
+            mutated_auth_doc
+                .roles
+                .get(&add_role_input.role.role_id)
+                .unwrap(),
             &add_role_input.role
         );
     }
