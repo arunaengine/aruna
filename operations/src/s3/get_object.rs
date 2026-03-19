@@ -361,4 +361,130 @@ mod test {
         }
         assert_eq!(read_buffer, content.as_bytes());
     }
+
+    #[tokio::test]
+    pub async fn test_get_object_hash_mismatch() {
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let blob_handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some("aruna_".to_string()),
+                max_bucket_size: Some(100000),
+                root: temp_root.to_string(),
+                service_config: HashMap::new(),
+            },
+            storage_handle.clone(),
+            net_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let content = "Hello, World!";
+        let tampered = "Hallo, World!";
+        let hasher = Hasher::new_with_bytes(content.as_bytes());
+        let hashes = hasher.finalize();
+
+        let bucket = "s3test".to_string();
+        let key = "test.txt".to_string();
+        let blob_ulid = Ulid::new();
+        let location = BackendLocation {
+            root: temp_root.to_string(),
+            storage_bucket: format!("aruna_{}", Ulid::new()),
+            backend_path: format!("{bucket}/{key}_{blob_ulid}"),
+            ulid: blob_ulid,
+            compressed: false,
+            encrypted: false,
+            created_by: Default::default(),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: content.len() as u64,
+            hashes: hasher.to_map(),
+        };
+
+        std::fs::create_dir_all(
+            Path::new(&location.get_full_path().unwrap())
+                .parent()
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(location.get_full_path().unwrap(), tampered).unwrap();
+
+        if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            let hash_lookup_key = LookupKey::from_blake3_hash(hashes.blake3.as_slice())
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key: hash_lookup_key.into(),
+                    value: Location::Real(location.clone()).to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await;
+
+            let object_lookup_key = LookupKey::object(&bucket, &key).to_bytes().unwrap();
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key: object_lookup_key.into(),
+                    value: Location::Real(location.clone()).to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await;
+
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+                .await;
+        } else {
+            panic!("Failed to start transaction");
+        }
+
+        let driver_ctx = DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            automerge_handle: None,
+            task_handle: None,
+        };
+        let operation = GetObjectOperation::new(GetObjectInput {
+            bucket,
+            key,
+            range: None,
+            group_id: Ulid::new(),
+            user_identity: UserIdentity {
+                user_id: Default::default(),
+                realm_key: RealmId([0u8; 32]),
+            },
+        });
+
+        let mut blob_stream = drive(operation, &driver_ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut read_buffer = Vec::new();
+        let mut read_error = None;
+        while let Some(result) = blob_stream.next().await {
+            match result {
+                Ok(bytes) => read_buffer.extend_from_slice(&bytes),
+                Err(err) => {
+                    read_error = Some(err.to_string());
+                    break;
+                }
+            }
+        }
+
+        assert_eq!(read_buffer, tampered.as_bytes());
+        assert!(read_error.is_some());
+        assert!(read_error.unwrap().contains("Integrity check failed"));
+    }
 }

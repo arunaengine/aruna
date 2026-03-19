@@ -56,6 +56,8 @@ pub enum BlobError {
     ReadError(String),
     #[error("Delete error: {0}")]
     DeleteError(String),
+    #[error("Integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
     #[error("Replication rejected: {0}")]
     ReplicationRejected(String),
     #[error("Replication failed: {0}")]

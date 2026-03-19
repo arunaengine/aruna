@@ -239,7 +239,7 @@ mod test {
     use ulid::Ulid;
 
     #[tokio::test]
-    async fn test_delete_object_writes_tombstone_and_preserves_blob() {
+    async fn test_delete_object_tombstone() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");

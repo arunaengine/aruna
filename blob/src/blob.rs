@@ -27,7 +27,7 @@ use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, BlockSize, ByteRanges};
 use bytes::{Bytes, BytesMut};
 use crossfire::{mpsc, oneshot};
-use futures::{AsyncWriteExt, StreamExt};
+use futures::{AsyncWriteExt, StreamExt, stream};
 use opendal::Operator;
 use std::collections::HashMap;
 use std::ops::RangeBounds;
@@ -278,6 +278,22 @@ impl BlobHandler {
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
+        let expected_blake3: [u8; 32] = match location.get_blake3() {
+            Some(hash) => match hash.as_slice().try_into() {
+                Ok(hash) => hash,
+                Err(_) => {
+                    return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                        "invalid stored blake3 hash".to_string(),
+                    ));
+                }
+            },
+            None => {
+                return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                    "missing stored blake3 hash".to_string(),
+                ));
+            }
+        };
+
         // Get operator for provided location
         let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
@@ -299,9 +315,40 @@ impl BlobHandler {
             Err(e) => return BlobEvent::Error(BlobError::ReadError(e.to_string())),
         };
 
+        let expected_size = location.blob_size;
+        let blob = BackendStream::new(stream::try_unfold(
+            (BackendStream::new(reader), Hasher::new(), 0u64),
+            move |(mut stream, mut hasher, bytes_read)| async move {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        hasher.update(&bytes);
+                        let next_bytes_read = bytes_read + bytes.len() as u64;
+                        Ok(Some((bytes, (stream, hasher, next_bytes_read))))
+                    }
+                    Some(Err(err)) => Err(BlobError::ReadError(err.to_string())),
+                    None => {
+                        if bytes_read != expected_size {
+                            return Err(BlobError::IntegrityCheckFailed(format!(
+                                "expected {} bytes but streamed {} bytes",
+                                expected_size, bytes_read
+                            )));
+                        }
+
+                        if hasher.finalize().blake3.as_bytes() != &expected_blake3 {
+                            return Err(BlobError::IntegrityCheckFailed(
+                                "blake3 hash mismatch".to_string(),
+                            ));
+                        }
+
+                        Ok(None)
+                    }
+                }
+            },
+        ));
+
         BlobEvent::ReadFinished {
-            blob: BackendStream::new(reader),
-            stream_size: 0, //TODO: Should this be queried in the state machine?
+            blob,
+            stream_size: expected_size,
         }
     }
 
@@ -623,6 +670,17 @@ impl BlobHandler {
         }
         _ = writer.writer.close().await; // Can only fail if already closed/aborted
         debug!("Decoded all chunks and wrote them into the backend");
+
+        let hashes = writer.hasher.to_map();
+        let actual_blake3 = writer.hasher.finalize().blake3;
+        if actual_blake3 != root {
+            let _ = operator.delete(&storage_path).await;
+            return BlobEvent::Error(BlobError::IntegrityCheckFailed(
+                "replicated content hash mismatch".to_string(),
+            ));
+        }
+
+        location.hashes = hashes;
 
         BlobEvent::ReplicationFinished { location }
     }

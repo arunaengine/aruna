@@ -17,6 +17,8 @@ pub enum ReplicationError {
     ConnectionMissing,
     #[error("Blob is missing blake3 hash")]
     HashMissing,
+    #[error("Integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
     #[error("Transaction id missing")]
     TransactionMissing,
     #[error("Replication rejected: {0}")]

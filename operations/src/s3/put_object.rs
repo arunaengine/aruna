@@ -559,7 +559,7 @@ mod test {
     }
 
     #[tokio::test]
-    pub async fn test_put_object_reuses_canonical_blob_for_duplicates() {
+    pub async fn test_put_object_dedup() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");

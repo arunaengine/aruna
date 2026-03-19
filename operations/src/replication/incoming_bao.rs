@@ -1,5 +1,6 @@
 use crate::replication::error::ReplicationError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
@@ -16,9 +17,10 @@ pub enum IncomingBaoState {
     NegotiateReplication,
     HandleReplication,
     StartTransaction,
-    CreateBlob,
-    CreatePermissions,
+    CheckHashLookup,
+    CreateHashLookup,
     CommitTransaction,
+    CleanupDuplicate,
     Finish,
     Error,
 }
@@ -43,7 +45,8 @@ pub struct IncomingBaoOperation {
     state: IncomingBaoState,
     stream_id: Ulid,
     node_id: NodeId,
-    location: Option<BackendLocation>,
+    received_location: Option<BackendLocation>,
+    cleanup_location: Option<BackendLocation>,
     txn_id: Option<TxnId>,
     result: Result<(), ReplicationError>,
 }
@@ -54,7 +57,8 @@ impl IncomingBaoOperation {
             state: IncomingBaoState::Init,
             stream_id,
             node_id,
-            location: None,
+            received_location: None,
+            cleanup_location: None,
             txn_id: None,
             result: Ok(()),
         }
@@ -100,18 +104,41 @@ impl IncomingBaoOperation {
     }
 
     fn handle_replication_result(&mut self, event: Event) -> Effects {
-        let Event::Blob(BlobEvent::ReplicationFinished { location }) = event else {
-            return self.handle_error(
-                IncomingBaoError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::Blob(BlobEvent::ReplicationResult)",
-                    received: event,
-                }
-                .into(),
-            );
+        let blob_event = match event {
+            Event::Blob(blob_event) => blob_event,
+            other => {
+                return self.handle_error(
+                    IncomingBaoError::InvalidStateEvent {
+                        state: self.state.clone(),
+                        expected: "Event::Blob(BlobEvent::ReplicationResult)",
+                        received: other,
+                    }
+                    .into(),
+                );
+            }
         };
 
-        self.location = Some(location);
+        let location = match blob_event {
+            BlobEvent::ReplicationFinished { location } => location,
+            BlobEvent::Error(BlobError::IntegrityCheckFailed(message)) => {
+                return self.handle_error(ReplicationError::IntegrityCheckFailed(message));
+            }
+            BlobEvent::Error(error) => {
+                return self.handle_error(ReplicationError::ReplicationRejected(error.to_string()));
+            }
+            other => {
+                return self.handle_error(
+                    IncomingBaoError::InvalidStateEvent {
+                        state: self.state.clone(),
+                        expected: "Event::Blob(BlobEvent::ReplicationResult)",
+                        received: Event::Blob(other),
+                    }
+                    .into(),
+                );
+            }
+        };
+
+        self.received_location = Some(location);
         self.state = IncomingBaoState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -131,7 +158,7 @@ impl IncomingBaoOperation {
         };
         self.txn_id = Some(txn_id);
 
-        let Some(location) = &self.location else {
+        let Some(location) = &self.received_location else {
             return self.handle_error(ReplicationError::NoSuchKey);
         };
         let Some(blake3) = location.get_blake3() else {
@@ -141,21 +168,71 @@ impl IncomingBaoOperation {
             Ok(bytes) => bytes,
             Err(err) => return self.handle_error(err.into()),
         };
-        let bytes = match Location::Real(location.clone()).to_bytes() {
-            Ok(bytes) => bytes,
+
+        self.state = IncomingBaoState::CheckHashLookup;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key: lookup_key.into(),
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_hash_lookup_checked(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.handle_error(
+                IncomingBaoError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Storage(StorageEvent::ReadResult)",
+                    received: event,
+                }
+                .into(),
+            );
+        };
+
+        let Some(received_location) = self.received_location.clone() else {
+            return self.handle_error(ReplicationError::NoSuchKey);
+        };
+
+        match value {
+            Some(value) => {
+                let existing_location = match Location::from_bytes(value.as_ref()) {
+                    Ok(Location::Real(location)) => location,
+                    Ok(Location::Deleted) => return self.create_hash_lookup(received_location),
+                    Err(err) => return self.handle_error(err.into()),
+                };
+
+                if existing_location != received_location {
+                    self.cleanup_location = Some(received_location);
+                }
+                self.commit_transaction()
+            }
+            None => self.create_hash_lookup(received_location),
+        }
+    }
+
+    fn create_hash_lookup(&mut self, location: BackendLocation) -> Effects {
+        let Some(blake3) = location.get_blake3() else {
+            return self.handle_error(ReplicationError::HashMissing);
+        };
+        let key = match LookupKey::from_blake3_hash(blake3).and_then(|lookup| lookup.to_bytes()) {
+            Ok(bytes) => bytes.into(),
+            Err(err) => return self.handle_error(err.into()),
+        };
+        let value = match Location::Real(location).to_bytes() {
+            Ok(bytes) => bytes.into(),
             Err(err) => return self.handle_error(err.into()),
         };
 
-        self.state = IncomingBaoState::CreateBlob;
+        self.state = IncomingBaoState::CreateHashLookup;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: S3_LOOKUP_KEYSPACE.to_string(),
-            key: lookup_key.into(),
-            value: bytes.into(),
+            key,
+            value,
             txn_id: self.txn_id,
         })]
     }
 
-    fn handle_blob_created(&mut self, event: Event) -> Effects {
+    fn handle_hash_lookup_created(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.handle_error(
                 IncomingBaoError::InvalidStateEvent {
@@ -167,18 +244,15 @@ impl IncomingBaoOperation {
             );
         };
 
-        //TODO: Create permissions
+        self.commit_transaction()
+    }
 
+    fn commit_transaction(&mut self) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.handle_error(ReplicationError::TransactionMissing);
         };
         self.state = IncomingBaoState::CommitTransaction;
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_permissions_created(&mut self, _event: Event) -> Effects {
-        //TODO
-        smallvec![]
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -194,8 +268,33 @@ impl IncomingBaoOperation {
         };
 
         self.txn_id = None;
-        self.state = IncomingBaoState::Finish;
-        smallvec![]
+        if let Some(location) = self.cleanup_location.take() {
+            self.state = IncomingBaoState::CleanupDuplicate;
+            smallvec![Effect::Blob(BlobEffect::Delete { location })]
+        } else {
+            self.state = IncomingBaoState::Finish;
+            smallvec![]
+        }
+    }
+
+    fn handle_duplicate_cleanup(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::DeleteFinished) => {
+                self.state = IncomingBaoState::Finish;
+                smallvec![]
+            }
+            Event::Blob(BlobEvent::Error(error)) => {
+                self.handle_error(ReplicationError::ReplicationRejected(error.to_string()))
+            }
+            other => self.handle_error(
+                IncomingBaoError::InvalidStateEvent {
+                    state: self.state.clone(),
+                    expected: "Event::Blob(BlobEvent::DeleteFinished)",
+                    received: other,
+                }
+                .into(),
+            ),
+        }
     }
 }
 
@@ -223,9 +322,10 @@ impl Operation for IncomingBaoOperation {
             IncomingBaoState::NegotiateReplication => self.handle_negotiation_result(event),
             IncomingBaoState::HandleReplication => self.handle_replication_result(event),
             IncomingBaoState::StartTransaction => self.handle_transaction_started(event),
-            IncomingBaoState::CreateBlob => self.handle_blob_created(event),
-            IncomingBaoState::CreatePermissions => self.handle_permissions_created(event),
+            IncomingBaoState::CheckHashLookup => self.handle_hash_lookup_checked(event),
+            IncomingBaoState::CreateHashLookup => self.handle_hash_lookup_created(event),
             IncomingBaoState::CommitTransaction => self.handle_transaction_committed(event),
+            IncomingBaoState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
             IncomingBaoState::Finish => smallvec![],
             IncomingBaoState::Error => self.abort(),
         }
@@ -247,7 +347,16 @@ impl Operation for IncomingBaoOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        smallvec![]
+        let mut effects = smallvec![];
+
+        if let Some(location) = self.received_location.take() {
+            effects.push(Effect::Blob(BlobEffect::Delete { location }));
+        }
+        if let Some(txn_id) = self.txn_id {
+            effects.push(Effect::Storage(StorageEffect::AbortTransaction { txn_id }));
+        }
+
+        effects
     }
 }
 
@@ -333,17 +442,34 @@ pub mod test {
             Effect::Storage(StorageEffect::StartTransaction { read: false })
         );
 
-        // 4. Feed TransactionStarted -> Should transition to CreateBlob and emit Storage::Write
+        // 4. Feed TransactionStarted -> Should transition to CheckHashLookup and emit Storage::Read
         let txn_id = Ulid::new();
         let event = Event::Storage(StorageEvent::TransactionStarted { txn_id });
         let effects = op.step(event);
-        assert_eq!(op.state, IncomingBaoState::CreateBlob);
+        assert_eq!(op.state, IncomingBaoState::CheckHashLookup);
         assert_eq!(effects.len(), 1);
         let blake3 = location.get_blake3().expect("blake3 hash set");
         let lookup_key = LookupKey::from_blake3_hash(blake3)
             .unwrap()
             .to_bytes()
             .unwrap();
+        assert_eq!(
+            effects[0],
+            Effect::Storage(StorageEffect::Read {
+                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key: Key::from(lookup_key.clone()),
+                txn_id: Some(txn_id),
+            })
+        );
+
+        // 5. Feed empty lookup -> Should transition to CreateHashLookup and emit Storage::Write
+        let event = Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(lookup_key.clone()),
+            value: None,
+        });
+        let effects = op.step(event);
+        assert_eq!(op.state, IncomingBaoState::CreateHashLookup);
+        assert_eq!(effects.len(), 1);
         assert_eq!(
             effects[0],
             Effect::Storage(StorageEffect::Write {
@@ -354,7 +480,7 @@ pub mod test {
             })
         );
 
-        // 5. Feed WriteResult -> Should transition to CommitTransaction
+        // 6. Feed WriteResult -> Should transition to CommitTransaction
         let event = Event::Storage(StorageEvent::WriteResult {
             key: Key::from(lookup_key),
         });
@@ -366,16 +492,76 @@ pub mod test {
             Effect::Storage(StorageEffect::CommitTransaction { txn_id })
         );
 
-        // 6. Feed TransactionCommitted -> Should transition to Finish
+        // 7. Feed TransactionCommitted -> Should transition to Finish
         let event = Event::Storage(StorageEvent::TransactionCommitted { txn_id });
         let effects = op.step(event);
         assert_eq!(op.state, IncomingBaoState::Finish);
         assert_eq!(effects.len(), 0);
         assert!(op.is_complete());
 
-        // 7. Finalize
+        // 8. Finalize
         let result = op.finalize();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_incoming_bao_dedup() {
+        let node_key = iroh::SecretKey::from_str(
+            "98f15bd901074f210926f8dfb2e3f179e858bf15b49ab8faefe23cea0dcdd9ac",
+        )
+        .unwrap();
+        let node_id = node_key.public();
+        let stream_id = Ulid::new();
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+
+        op.start();
+        let replication_id = Ulid::new();
+        op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Accepted(replication_id),
+        )));
+
+        let duplicate_location = make_location();
+        let event = Event::Blob(BlobEvent::ReplicationFinished {
+            location: duplicate_location.clone(),
+        });
+        op.step(event);
+
+        let txn_id = Ulid::new();
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, IncomingBaoState::CheckHashLookup);
+        assert_eq!(effects.len(), 1);
+
+        let existing_location = make_location();
+        let lookup_key = LookupKey::from_blake3_hash(duplicate_location.get_blake3().unwrap())
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(lookup_key),
+            value: Some(Location::Real(existing_location).to_bytes().unwrap().into()),
+        }));
+        assert_eq!(op.state, IncomingBaoState::CommitTransaction);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0],
+            Effect::Storage(StorageEffect::CommitTransaction { txn_id })
+        );
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert_eq!(op.state, IncomingBaoState::CleanupDuplicate);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0],
+            Effect::Blob(BlobEffect::Delete {
+                location: duplicate_location.clone(),
+            })
+        );
+
+        let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));
+        assert!(effects.is_empty());
+        assert_eq!(op.state, IncomingBaoState::Finish);
     }
 
     #[tokio::test]
@@ -445,14 +631,14 @@ pub mod test {
         let effects = op.step(Event::Blob(BlobEvent::NegotiationFinished(
             NegotiationResult::Rejected("bad".to_string()),
         )));
-        assert!(effects.is_empty());
+        assert!(!effects.is_empty());
         assert_eq!(op.state, IncomingBaoState::Error);
         assert!(matches!(
             op.finalize().unwrap_err(),
             ReplicationError::IncomingBaoError(IncomingBaoError::InvalidStateEvent { .. })
         ));
 
-        // 5. Invalid event at CreateBlob
+        // 5. Invalid event at CheckHashLookup
         let mut op = IncomingBaoOperation::new(stream_id, node_id);
         op.start();
         let replication_id = Ulid::new();
@@ -468,14 +654,14 @@ pub mod test {
         let effects = op.step(Event::Blob(BlobEvent::NegotiationFinished(
             NegotiationResult::Rejected("bad".to_string()),
         )));
-        assert!(effects.is_empty());
+        assert!(!effects.is_empty());
         assert_eq!(op.state, IncomingBaoState::Error);
         assert!(matches!(
             op.finalize().unwrap_err(),
             ReplicationError::IncomingBaoError(IncomingBaoError::InvalidStateEvent { .. })
         ));
 
-        // 6. Invalid event at CommitTransaction
+        // 6. Invalid event at CreateHashLookup
         let mut op = IncomingBaoOperation::new(stream_id, node_id);
         op.start();
         let replication_id = Ulid::new();
@@ -489,13 +675,52 @@ pub mod test {
         let txn_id = Ulid::new();
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let blake3 = location.get_blake3().unwrap();
-        op.step(Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(blake3.as_slice().to_vec()),
+        let lookup_key = LookupKey::from_blake3_hash(blake3)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(lookup_key.clone()),
+            value: None,
         }));
         let effects = op.step(Event::Blob(BlobEvent::NegotiationFinished(
             NegotiationResult::Rejected("bad".to_string()),
         )));
-        assert!(effects.is_empty());
+        assert!(!effects.is_empty());
+        assert_eq!(op.state, IncomingBaoState::Error);
+        assert!(matches!(
+            op.finalize().unwrap_err(),
+            ReplicationError::IncomingBaoError(IncomingBaoError::InvalidStateEvent { .. })
+        ));
+
+        // 7. Invalid event at CleanupDuplicate
+        let mut op = IncomingBaoOperation::new(stream_id, node_id);
+        op.start();
+        let replication_id = Ulid::new();
+        op.step(Event::Blob(BlobEvent::NegotiationFinished(
+            NegotiationResult::Accepted(replication_id),
+        )));
+        let location = make_location();
+        op.step(Event::Blob(BlobEvent::ReplicationFinished {
+            location: location.clone(),
+        }));
+        let txn_id = Ulid::new();
+        op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let lookup_key = LookupKey::from_blake3_hash(location.get_blake3().unwrap())
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: Key::from(lookup_key),
+            value: Some(Location::Real(make_location()).to_bytes().unwrap().into()),
+        }));
+        op.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: Key::from(vec![1u8; 32]),
+        }));
+        assert!(!effects.is_empty());
         assert_eq!(op.state, IncomingBaoState::Error);
         assert!(matches!(
             op.finalize().unwrap_err(),
