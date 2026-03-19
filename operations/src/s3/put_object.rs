@@ -65,11 +65,18 @@ pub struct PutObjectConfig {
     pub exists: bool, //Note: For version shenanigans which will be implemented later
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PutObjectResult {
+    pub location: BackendLocation,
+    pub version_id: Ulid,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct PutObjectOperation {
     state: PutObjectState,
     config: PutObjectConfig,
     txn_id: Option<ulid::Ulid>,
+    version_id: Option<Ulid>,
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
     output: Option<Result<BackendLocation, PutObjectError>>,
@@ -81,6 +88,7 @@ impl PutObjectOperation {
             state: PutObjectState::Init,
             config,
             txn_id: None,
+            version_id: None,
             written_location: None,
             cleanup_location: None,
             output: None,
@@ -251,6 +259,7 @@ impl PutObjectOperation {
                 return self.emit_error(PutObjectError::MissingOutput);
             };
             let version_id = Ulid::new();
+            self.version_id = Some(version_id);
             self.state = PutObjectState::CreateVersionRecord;
 
             let key = match VersionKey::new(
@@ -345,7 +354,7 @@ impl PutObjectOperation {
 }
 
 impl Operation for PutObjectOperation {
-    type Output = Option<Result<BackendLocation, PutObjectError>>;
+    type Output = Option<Result<PutObjectResult, PutObjectError>>;
     type Error = PutObjectError;
 
     fn start(&mut self) -> Effects {
@@ -383,7 +392,16 @@ impl Operation for PutObjectOperation {
             }
             return Err(PutObjectError::PutObjectFailed);
         }
-        Ok(self.output)
+        Ok(self.output.map(|result| {
+            result.and_then(|location| {
+                self.version_id
+                    .map(|version_id| PutObjectResult {
+                        location,
+                        version_id,
+                    })
+                    .ok_or(PutObjectError::PutObjectFailed)
+            })
+        }))
     }
 
     fn abort(&mut self) -> Effects {
@@ -488,13 +506,13 @@ mod test {
             .unwrap()
             .unwrap();
 
-        assert!(exists(result.get_full_path().unwrap()).unwrap());
+        assert!(exists(result.location.get_full_path().unwrap()).unwrap());
         assert_eq!(
-            read_to_string(result.get_full_path().unwrap()).unwrap(),
+            read_to_string(result.location.get_full_path().unwrap()).unwrap(),
             String::from_utf8_lossy(&data[..]).to_string()
         );
 
-        let hash_lookup_key = LookupKey::from_blake3_hash(result.get_blake3().unwrap())
+        let hash_lookup_key = LookupKey::from_blake3_hash(result.location.get_blake3().unwrap())
             .unwrap()
             .to_bytes()
             .unwrap();
@@ -514,7 +532,7 @@ mod test {
         };
         assert_eq!(
             Location::from_bytes(hash_lookup_value.as_ref()).unwrap(),
-            Location::Real(result.clone())
+            Location::Real(result.location.clone())
         );
 
         let object_lookup_key = LookupKey::object("mybucket", "some-file.txt")
@@ -536,7 +554,7 @@ mod test {
         };
         assert_eq!(
             Location::from_bytes(object_lookup_value.as_ref()).unwrap(),
-            Location::Real(result.clone())
+            Location::Real(result.location.clone())
         );
 
         let version_prefix = VersionKey::object_prefix("mybucket", "some-file.txt").unwrap();
@@ -555,7 +573,8 @@ mod test {
         };
         assert_eq!(values.len(), 1);
         let version = VersionMetadata::from_bytes(values[0].1.as_ref()).unwrap();
-        assert_eq!(version.location, Location::Real(result));
+        assert_eq!(version.version_id, result.version_id);
+        assert_eq!(version.location, Location::Real(result.location));
     }
 
     #[tokio::test]
@@ -634,7 +653,7 @@ mod test {
         .unwrap()
         .unwrap();
 
-        assert_eq!(first, second);
+        assert_eq!(first.location, second.location);
         assert_eq!(count_files(Path::new(&blob_root)), 1);
 
         for key in ["first.txt", "second.txt"] {
@@ -656,7 +675,7 @@ mod test {
 
             assert_eq!(
                 Location::from_bytes(object_lookup_value.as_ref()).unwrap(),
-                Location::Real(first.clone())
+                Location::Real(first.location.clone())
             );
         }
     }

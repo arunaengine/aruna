@@ -5,8 +5,10 @@ use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissio
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use aruna_operations::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
-use aruna_operations::s3::delete_object::{DeleteObjectInput as DOI, DeleteObjectOperation};
-use aruna_operations::s3::get_object::{GetObjectInput as GOI, GetObjectOperation};
+use aruna_operations::s3::delete_object::{
+    DeleteObjectError, DeleteObjectInput as DOI, DeleteObjectOperation,
+};
+use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput as GOI, GetObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
 use s3s::dto::{
@@ -67,6 +69,15 @@ impl ArunaS3Service {
         )
         .await
         .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))
+    }
+
+    fn parse_version_id(version_id: Option<String>) -> S3Result<Option<ulid::Ulid>> {
+        version_id
+            .map(|version_id| {
+                ulid::Ulid::from_string(&version_id)
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid version id"))
+            })
+            .transpose()
     }
 }
 
@@ -184,19 +195,20 @@ impl S3 for ArunaS3Service {
         };
         let operation = PutObjectOperation::new(config);
 
-        if let Some(Ok(location)) = drive(operation, &self.state)
+        if let Some(Ok(result)) = drive(operation, &self.state)
             .await
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
         {
-            debug!(?location);
+            debug!(?result);
             Ok(S3Response::new(PutObjectOutput {
                 e_tag: Some(ETag::Strong(to_base64(
-                    location.hashes.get("md5").ok_or_else(|| {
+                    result.location.hashes.get("md5").ok_or_else(|| {
                         error!(error = "Missing MD5 hash");
                         s3_error!(InternalError, "Missing MD5 hash")
                     })?,
                 ))),
-                size: Some(location.blob_size as i64),
+                size: Some(result.location.blob_size as i64),
+                version_id: Some(result.version_id.to_string()),
                 ..Default::default()
             }))
         } else {
@@ -218,10 +230,12 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let version_id = Self::parse_version_id(req.input.version_id)?;
 
         let operation = GetObjectOperation::new(GOI {
             bucket: req.input.bucket,
             key: req.input.key,
+            version_id,
             range: None,
             group_id: bucket_info
                 .as_ref()
@@ -230,16 +244,33 @@ impl S3 for ArunaS3Service {
             user_identity: user_access.user_identity,
         });
 
-        if let Ok(Some(Ok(blob_stream))) = drive(operation, &self.state).await {
-            let wut = StreamingBlob::wrap(blob_stream);
+        match drive(operation, &self.state).await {
+            Ok(Some(Ok(result))) => {
+                let wut = StreamingBlob::wrap(result.blob);
 
-            Ok(S3Response::new(GetObjectOutput {
-                body: Some(wut),
-                ..Default::default()
-            }))
-        } else {
-            //TODO: Better error handling
-            Err(s3_error!(InternalError, "Failed to process GET request"))
+                Ok(S3Response::new(GetObjectOutput {
+                    body: Some(wut),
+                    version_id: result.version_id.map(|version_id| version_id.to_string()),
+                    ..Default::default()
+                }))
+            }
+            Ok(Some(Err(GetObjectError::NoSuchVersion))) | Err(GetObjectError::NoSuchVersion) => {
+                Err(s3_error!(
+                    NoSuchVersion,
+                    "The specified version does not exist."
+                ))
+            }
+            Ok(Some(Err(GetObjectError::DeleteMarker))) | Err(GetObjectError::DeleteMarker) => {
+                Err(s3_error!(
+                    MethodNotAllowed,
+                    "The specified version is a delete marker."
+                ))
+            }
+            Ok(Some(Err(GetObjectError::NoSuchKey))) | Err(GetObjectError::NoSuchKey) => {
+                Err(s3_error!(NoSuchKey, "The specified key does not exist."))
+            }
+            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err)),
+            Ok(None) => Err(s3_error!(InternalError, "Failed to process GET request")),
         }
     }
 
@@ -250,21 +281,16 @@ impl S3 for ArunaS3Service {
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         debug!("Received DELETE Request: {:#?}", req);
 
-        if req.input.version_id.is_some() {
-            return Err(s3_error!(
-                NotImplemented,
-                "Deleting explicit object versions is not implemented yet"
-            ));
-        }
-
         let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+        let version_id = Self::parse_version_id(req.input.version_id)?;
 
         let operation = DeleteObjectOperation::new(DOI {
             bucket: req.input.bucket,
             key: req.input.key,
+            version_id,
             deleted_by: user_access.user_identity.user_id,
         });
 
@@ -273,10 +299,13 @@ impl S3 for ArunaS3Service {
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
         {
             Some(Ok(result)) => Ok(S3Response::new(DeleteObjectOutput {
-                delete_marker: Some(true),
+                delete_marker: Some(result.delete_marker),
                 version_id: Some(result.version_id.to_string()),
                 ..Default::default()
             })),
+            Some(Err(err @ DeleteObjectError::NoSuchVersion)) => {
+                Err(s3_error!(NoSuchVersion, "{}", err))
+            }
             Some(Err(err)) => Err(s3_error!(InternalError, "{}", err.to_string())),
             None => Err(s3_error!(InternalError, "Failed to process DELETE request")),
         }

@@ -1,10 +1,10 @@
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
+use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{Location, LookupKey, UserIdentity};
+use aruna_core::structs::{Location, LookupKey, UserIdentity, VersionKey, VersionMetadata};
 use aruna_core::types::Effects;
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
@@ -16,6 +16,7 @@ use ulid::Ulid;
 pub enum GetObjectState {
     Init,
     StartTransaction,
+    GetVersion,
     GetLookup,
     CommitTransaction,
     GetBlob,
@@ -44,6 +45,10 @@ pub enum GetObjectError {
     NoTransactionFound,
     #[error("The specified key does not exist.")]
     NoSuchKey,
+    #[error("The specified version does not exist.")]
+    NoSuchVersion,
+    #[error("The specified version is a delete marker.")]
+    DeleteMarker,
     #[error("GetObject failed (miserably)")]
     GetObjectFailed,
 }
@@ -52,6 +57,7 @@ pub enum GetObjectError {
 pub struct GetObjectInput {
     pub bucket: String,
     pub key: String,
+    pub version_id: Option<Ulid>,
     pub range: Option<Range<u64>>,
     pub group_id: Ulid,
     pub user_identity: UserIdentity,
@@ -59,11 +65,17 @@ pub struct GetObjectInput {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct GetObjectResult {
+    pub blob: BackendStream<Result<Bytes, StreamError>>,
+    pub version_id: Option<Ulid>,
+}
+
+#[derive(Debug, PartialEq)]
 pub struct GetObjectOperation {
     input: GetObjectInput,
     state: GetObjectState,
     txn_id: Option<Ulid>,
-    output: Option<Result<BackendStream<Result<Bytes, StreamError>>, GetObjectError>>,
+    output: Option<Result<GetObjectResult, GetObjectError>>,
 }
 
 impl GetObjectOperation {
@@ -99,17 +111,32 @@ impl GetObjectOperation {
     pub fn handle_transaction_started(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
-            self.state = GetObjectState::GetLookup;
+            if let Some(version_id) = self.input.version_id {
+                self.state = GetObjectState::GetVersion;
+                let key = match VersionKey::new(&self.input.bucket, &self.input.key, version_id)
+                    .to_bytes()
+                {
+                    Ok(key) => key.into(),
+                    Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+                };
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: S3_VERSION_KEYSPACE.to_string(),
+                    key,
+                    txn_id: self.txn_id,
+                })]
+            } else {
+                self.state = GetObjectState::GetLookup;
 
-            let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
-                Ok(key) => key.into(),
-                Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-            };
-            smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: S3_LOOKUP_KEYSPACE.to_string(),
-                key,
-                txn_id: self.txn_id,
-            })]
+                let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
+                    Ok(key) => key.into(),
+                    Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+                };
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key,
+                    txn_id: self.txn_id,
+                })]
+            }
         } else {
             self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -117,6 +144,41 @@ impl GetObjectOperation {
                 received: event,
             })
         }
+    }
+
+    pub fn handle_received_version(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+
+        let Some(val) = value else {
+            return self.emit_error(GetObjectError::NoSuchVersion);
+        };
+
+        let metadata = match VersionMetadata::from_bytes(val.as_ref()) {
+            Ok(metadata) => metadata,
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+
+        let location = match metadata.location {
+            Location::Real(location) => location,
+            Location::Deleted => return self.emit_error(GetObjectError::DeleteMarker),
+        };
+
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(GetObjectError::NoTransactionFound);
+        };
+
+        self.state = GetObjectState::CommitTransaction;
+
+        smallvec![
+            Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
+            Effect::Blob(BlobEffect::Read { location })
+        ]
     }
 
     pub fn handle_received_lookup(&mut self, event: Event) -> Effects {
@@ -166,7 +228,10 @@ impl GetObjectOperation {
     pub fn handle_received_blob(&mut self, event: Event) -> Effects {
         if let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = event {
             self.state = GetObjectState::Finish;
-            self.output = Some(Ok(blob));
+            self.output = Some(Ok(GetObjectResult {
+                blob,
+                version_id: self.input.version_id,
+            }));
             smallvec![]
         } else {
             self.emit_error(GetObjectError::InvalidStateEvent {
@@ -179,7 +244,7 @@ impl GetObjectOperation {
 }
 
 impl Operation for GetObjectOperation {
-    type Output = Option<Result<BackendStream<Result<Bytes, StreamError>>, GetObjectError>>;
+    type Output = Option<Result<GetObjectResult, GetObjectError>>;
     type Error = GetObjectError;
 
     fn start(&mut self) -> Effects {
@@ -190,6 +255,7 @@ impl Operation for GetObjectOperation {
         match &self.state {
             GetObjectState::Init => self.handle_init(),
             GetObjectState::StartTransaction => self.handle_transaction_started(event),
+            GetObjectState::GetVersion => self.handle_received_version(event),
             GetObjectState::GetLookup => self.handle_received_lookup(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
@@ -338,6 +404,7 @@ mod test {
             input: GetObjectInput {
                 bucket,
                 key,
+                version_id: None,
                 range: None,
                 group_id: Ulid::new(),
                 user_identity: UserIdentity {
@@ -354,7 +421,8 @@ mod test {
             .await
             .unwrap()
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .blob;
         let mut read_buffer = Vec::new();
         while let Some(Ok(bytes)) = blob_stream.next().await {
             read_buffer.extend_from_slice(&bytes);
@@ -458,6 +526,7 @@ mod test {
         let operation = GetObjectOperation::new(GetObjectInput {
             bucket,
             key,
+            version_id: None,
             range: None,
             group_id: Ulid::new(),
             user_identity: UserIdentity {
@@ -470,7 +539,8 @@ mod test {
             .await
             .unwrap()
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .blob;
         let mut read_buffer = Vec::new();
         let mut read_error = None;
         while let Some(result) = blob_stream.next().await {
