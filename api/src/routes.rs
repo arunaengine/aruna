@@ -2,6 +2,7 @@ use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
+use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::{
     Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, UserIdentity,
 };
@@ -181,13 +182,40 @@ pub async fn create_s3_credentials(
     Json(request): Json<CreateS3CredentialsRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateS3CredentialsResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+
+    if auth.realm_id != realm_id {
+        return Err(ServerError::Forbidden);
+    }
+
     let user_identity = UserIdentity {
         user_id: auth.user_id,
-        realm_key: auth.realm_id,
+        realm_key: auth.realm_id.clone(),
     };
 
     // Evaluate request input
     let group_id = Ulid::from_str(&request.group_id).map_err(|_e| ServerError::BadRequest)?;
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: auth.clone(),
+            path: format!("/{realm_id}/g/{group_id}/data/{}", state.get_node_id()),
+            required_permission: Permission::WRITE,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        AuthorizationError::InvalidRealmId
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
+        _ => ServerError::InternalError(err.to_string()),
+    })?;
+
+    if !allowed {
+        return Err(ServerError::Forbidden);
+    }
+
     let op = CreateUserAccessOperation::new(user_identity, group_id);
 
     // Execute operation
@@ -198,10 +226,10 @@ pub async fn create_s3_credentials(
     match result {
         Ok((access_key_id, access_secret)) => {
             let response = CreateS3CredentialsResponse {
-                access_key_id: access_key_id.to_string(),
+                access_key_id,
                 access_secret: access_secret.secret,
             };
-            Ok((StatusCode::OK, response.into()))
+            Ok((StatusCode::CREATED, response.into()))
         }
         Err(err) => {
             //TODO: Differentiate return type based on error

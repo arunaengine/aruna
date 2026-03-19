@@ -5,6 +5,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::keyspaces::DHT_KEYSPACE;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
@@ -26,9 +27,7 @@ use super::rpc::{
     encode_response,
 };
 use super::state::DhtStateMachine;
-use super::storage::{
-    CLEANUP_PAGE_SIZE, DHT_KEYSPACE, StoredEntry, decode_entries, encode_entries,
-};
+use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, decode_entries, encode_entries};
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
 pub type InboundDhtStream = (Connection, SendStream, RecvStream, NodeId);

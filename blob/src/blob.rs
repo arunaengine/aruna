@@ -10,11 +10,13 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keyspaces::BUCKET_STATS_DB;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::NegotiationResult::{Accepted, Rejected};
 use aruna_core::structs::{
-    Backend, BackendBucket, BackendConfig, BackendLocation, BlobInfo, RealmId, UserIdentity,
+    Backend, BackendBucket, BackendConfig, BackendLocation, RealmId, UserIdentity,
 };
+use aruna_core::types::UserId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
@@ -29,14 +31,13 @@ use futures::{AsyncWriteExt, StreamExt};
 use opendal::Operator;
 use std::collections::HashMap;
 use std::ops::RangeBounds;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tracing::debug;
 use ulid::Ulid;
 
-pub const BLOB_LOCATION_DB: &str = "locations";
-pub const BLOB_PATH_DB: &str = "path_locations_mapping";
-pub const BUCKET_STATS_DB: &str = "bucket_stats";
 pub const BAO_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); // 2^16 bytes
 
 pub type EffectHandle = (BlobEffect, oneshot::TxOneshot<BlobEvent>);
@@ -142,9 +143,12 @@ impl BlobHandler {
             match receiver.recv().await {
                 Ok((effect, response_tx)) => {
                     let event = match effect {
-                        BlobEffect::Write { bucket, key, blob } => {
-                            self.write_blob(&bucket, &key, blob).await
-                        }
+                        BlobEffect::Write {
+                            bucket,
+                            key,
+                            created_by,
+                            blob,
+                        } => self.write_blob(&bucket, &key, created_by, blob).await,
                         BlobEffect::Read { location } => self.read_blob(location).await,
                         BlobEffect::ReadRange { location, range } => {
                             self.read_blob_range(location, range).await
@@ -159,17 +163,17 @@ impl BlobHandler {
                         BlobEffect::NegotiateOutgoing {
                             replication_id,
                             stream_id,
-                            blob_info,
+                            location,
                         } => {
-                            self.negotiate_outgoing(replication_id, stream_id, blob_info)
+                            self.negotiate_outgoing(replication_id, stream_id, location)
                                 .await
                         }
                         BlobEffect::Replicate {
                             replication_id,
                             stream_id,
-                            blob_info,
+                            location,
                         } => {
-                            self.replicate_blob(replication_id, stream_id, blob_info)
+                            self.replicate_blob(replication_id, stream_id, location)
                                 .await
                         }
                         BlobEffect::HandleReplication {
@@ -209,6 +213,7 @@ impl BlobHandler {
         &self,
         request_bucket: &str,
         request_key: &str,
+        created_by: UserId,
         mut blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
         // Init stuff
@@ -220,14 +225,24 @@ impl BlobHandler {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
+        let ulid = Ulid::new();
+        let backend_path = match build_backend_path(request_bucket, request_key, ulid) {
+            Ok(path) => path,
+            Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
+        };
         let location = BackendLocation {
             root: self.backend_config.root.clone(),
             storage_bucket: backend_bucket.clone(),
-            object_bucket: request_bucket.to_string(),
-            object_key: request_key.to_string(),
-            ulid: Ulid::new(),
+            backend_path,
+            ulid,
             compressed: false,
             encrypted: false,
+            created_by,
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
         };
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
@@ -256,12 +271,10 @@ impl BlobHandler {
         _ = writer.close().await; // Can only fail if already closed/aborted
 
         // Return write result
-        BlobEvent::WriteFinished {
-            location,
-            bytes_written,
-            hashes: hasher.to_map(),
-            //checksums: Default::default(),
-        }
+        let mut location = location;
+        location.blob_size = bytes_written;
+        location.hashes = hasher.to_map();
+        BlobEvent::WriteFinished { location }
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
@@ -349,7 +362,7 @@ impl BlobHandler {
         &mut self,
         replication_id: Ulid,
         stream_id: Ulid,
-        blob_info: BlobInfo,
+        location: BackendLocation,
     ) -> BlobEvent {
         // Send replication request and evaluate response
         if let Some((sx, rx)) = self.connections.lock().await.get_mut(&stream_id) {
@@ -362,7 +375,7 @@ impl BlobHandler {
                         realm_key: RealmId([0u8; 32]),
                     },
                     group_id: Default::default(),
-                    size: blob_info.blob_size,
+                    size: location.blob_size,
                 },
             )
             .send(sx)
@@ -431,10 +444,10 @@ impl BlobHandler {
         &mut self,
         replication_id: Ulid,
         stream_id: Ulid,
-        blob_info: BlobInfo,
+        location: BackendLocation,
     ) -> BlobEvent {
         // Get operator for blob location
-        let operator = match self.operator_from_location(&blob_info.location) {
+        let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
             Err(err) => {
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
@@ -442,13 +455,13 @@ impl BlobHandler {
         };
 
         // Create replication Outboard
-        let storage_path = match blob_info.location.get_storage_path() {
+        let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
 
         let mut reader =
-            match OpenDalReader::new(&operator, &storage_path, blob_info.blob_size).await {
+            match OpenDalReader::new(&operator, &storage_path, location.blob_size).await {
                 Ok(reader) => reader,
                 Err(err) => {
                     return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
@@ -473,7 +486,7 @@ impl BlobHandler {
         let replication_init = ReplicationMessage {
             id: replication_id,
             msg_type: MessageType::BaoTreeInfo {
-                blob_info: blob_info.clone(),
+                location: location.clone(),
                 root: outboard.root,
             },
         };
@@ -505,7 +518,7 @@ impl BlobHandler {
 
         // Send bao_tree encoded chunks
         let mut sx_wrapper = SendStreamWrapper(sx);
-        let ranges = ByteRanges::from(0..blob_info.blob_size);
+        let ranges = ByteRanges::from(0..location.blob_size);
         let ranges = round_up_to_chunks(&ranges);
         debug!("Chunk Ranges: {:#?}", ranges.boundaries());
 
@@ -519,7 +532,7 @@ impl BlobHandler {
         // Close connection and return
         _ = sx.finish();
         _ = rx.stop(0u32.into());
-        BlobEvent::ReplicationFinished { blob_info }
+        BlobEvent::ReplicationFinished { location }
     }
 
     pub async fn handle_incoming_replication(
@@ -527,7 +540,7 @@ impl BlobHandler {
         replication_id: Ulid,
         stream_id: Ulid,
     ) -> BlobEvent {
-        let (root, mut blob_info) = {
+        let (root, mut location) = {
             let mut connections = self.connections.lock().await;
             let Some((sx, rx)) = connections.get_mut(&stream_id) else {
                 return BlobEvent::Error(BlobError::ReplicationRejected(
@@ -537,7 +550,7 @@ impl BlobHandler {
 
             match ReplicationMessage::read(rx).await {
                 Ok(msg) => {
-                    let MessageType::BaoTreeInfo { root, blob_info } = msg.msg_type else {
+                    let MessageType::BaoTreeInfo { root, location } = msg.msg_type else {
                         return BlobEvent::Error(BlobError::ReplicationRejected(
                             "Invalid BaoTreeInfo message".to_string(),
                         ));
@@ -550,7 +563,7 @@ impl BlobHandler {
                     {
                         return BlobEvent::Error(BlobError::WriteError(err.to_string()));
                     };
-                    (root, blob_info)
+                    (root, location)
                 }
                 Err(e) => return BlobEvent::Error(BlobError::ReadError(e.to_string())),
             }
@@ -561,12 +574,17 @@ impl BlobHandler {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
         };
-        blob_info.location.root = self.backend_config.root.clone();
-        blob_info.location.storage_bucket = backend_bucket.clone();
-        blob_info.location.ulid = Ulid::new();
+        let ulid = Ulid::new();
+        location.root = self.backend_config.root.clone();
+        location.storage_bucket = backend_bucket.clone();
+        location.backend_path = match rebuild_backend_path(&location.backend_path, ulid) {
+            Ok(path) => path,
+            Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
+        };
+        location.ulid = ulid;
 
         // Get operator for blob location
-        let operator = match self.operator_from_location(&blob_info.location) {
+        let operator = match self.operator_from_location(&location) {
             Ok(op) => op,
             Err(err) => {
                 return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
@@ -580,23 +598,23 @@ impl BlobHandler {
             ));
         };
         let rx_wrapper = RecvStreamWrapper(rx);
-        let storage_path = match blob_info.location.get_storage_path() {
+        let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
         let mut writer =
-            match OpenDalWriter::new(&operator, &storage_path, blob_info.blob_size).await {
+            match OpenDalWriter::new(&operator, &storage_path, location.blob_size).await {
                 Ok(writer) => writer,
                 Err(err) => {
                     return BlobEvent::Error(BlobError::OperatorCreationFailed(err.to_string()));
                 }
             };
         let mut ob = PreOrderOutboard {
-            tree: BaoTree::new(blob_info.blob_size, BAO_BLOCK_SIZE),
+            tree: BaoTree::new(location.blob_size, BAO_BLOCK_SIZE),
             root,
             data: BytesMut::new(),
         };
-        let byte_ranges = ByteRanges::from(0..blob_info.blob_size);
+        let byte_ranges = ByteRanges::from(0..location.blob_size);
         let chunk_ranges = round_up_to_chunks(&byte_ranges);
 
         debug!("Try to decode chunks received from bidi stream");
@@ -606,7 +624,7 @@ impl BlobHandler {
         _ = writer.writer.close().await; // Can only fail if already closed/aborted
         debug!("Decoded all chunks and wrote them into the backend");
 
-        BlobEvent::ReplicationFinished { blob_info }
+        BlobEvent::ReplicationFinished { location }
     }
 
     async fn eval_backend_bucket(&self) -> Result<String, BlobError> {
@@ -684,4 +702,30 @@ impl BlobHandler {
 
 fn generate_bucket_name() -> String {
     format!("aruna-{}", Ulid::new().to_string().to_lowercase())
+}
+
+fn build_backend_path(bucket: &str, key: &str, ulid: Ulid) -> Result<String, ConversionError> {
+    PathBuf::from(bucket)
+        .join(format!("{}_{}", key, ulid))
+        .into_os_string()
+        .into_string()
+        .map_err(|_| ConversionError::OsStringError)
+}
+
+fn rebuild_backend_path(original_path: &str, ulid: Ulid) -> Result<String, ConversionError> {
+    let original = PathBuf::from(original_path);
+    let parent = original.parent().map(PathBuf::from).unwrap_or_default();
+    let file_name = original
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(ConversionError::OsStringError)?;
+    let base_name = file_name
+        .rsplit_once('_')
+        .map_or(file_name, |(base, _)| base);
+
+    parent
+        .join(format!("{}_{}", base_name, ulid))
+        .into_os_string()
+        .into_string()
+        .map_err(|_| ConversionError::OsStringError)
 }

@@ -1,7 +1,7 @@
 use crate::error::BlobLibError;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
-use aruna_core::structs::{BlobInfo, NegotiationResult, UserIdentity};
+use aruna_core::structs::{BackendLocation, NegotiationResult, UserIdentity};
 use iroh_quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,7 +18,7 @@ pub(crate) enum MessageType {
     SomeTest(NegotiationResult),
     BaoTreeInfo {
         root: blake3::Hash,
-        blob_info: BlobInfo,
+        location: BackendLocation,
     },
     BaoTreeInfoReceived,
 }

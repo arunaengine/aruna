@@ -1,6 +1,8 @@
 use super::auth::AuthProvider;
 use super::s3_service::ArunaS3Service;
 use crate::error::S3ServerError;
+use aruna_core::NodeId;
+use aruna_core::structs::RealmId;
 use aruna_operations::driver::DriverContext;
 use futures_core::future::BoxFuture;
 use http::Request;
@@ -36,11 +38,15 @@ impl S3Server {
         address: impl Into<String> + Copy,
         hostname: impl Into<String>,
         driver_ctx: Arc<DriverContext>,
+        realm_id: RealmId,
+        node_id: NodeId,
     ) -> Result<Self, S3ServerError> {
         let s3service = ArunaS3Service::new(driver_ctx.clone()).await;
 
         let auth = AuthProvider {
-            _driver_ctx: driver_ctx.clone(),
+            driver_ctx: driver_ctx.clone(),
+            realm_id,
+            node_id,
         };
 
         let service = {

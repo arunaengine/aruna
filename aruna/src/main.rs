@@ -110,7 +110,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
-            config.realm_id,
+            config.realm_id.clone(),
             config.node_id,
             config.node_capabilities,
             None,
@@ -126,9 +126,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // S3 Server
     let s3_address = format!("{}:{}", config.s3_address, config.s3_port);
     let s3_host = format!("{}:{}", config.s3_host, config.s3_port);
-    let s3_server = S3Server::new(&s3_address, &s3_host, driver_ctx)
-        .await
-        .unwrap();
+    let s3_server = S3Server::new(
+        &s3_address,
+        &s3_host,
+        driver_ctx,
+        config.realm_id.clone(),
+        config.node_id,
+    )
+    .await
+    .unwrap();
 
     let server_handle = s3_server.run().await.unwrap();
 

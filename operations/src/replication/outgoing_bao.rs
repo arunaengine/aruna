@@ -1,10 +1,10 @@
 use crate::replication::error::ReplicationError;
-use aruna_blob::blob::BLOB_LOCATION_DB;
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::keyspaces::BLOB_LOCATION_DB;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BlobInfo, NegotiationResult};
+use aruna_core::structs::{BackendLocation, NegotiationResult};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -41,7 +41,7 @@ pub struct OutgoingBaoOperation {
     state: OutgoingBaoState,
     node_id: NodeId,
     hash: [u8; 32], // or path?
-    blob_info: Option<BlobInfo>,
+    location: Option<BackendLocation>,
     stream_id: Option<Ulid>,
     replication_id: Option<Ulid>,
     result: Result<(), ReplicationError>,
@@ -53,7 +53,7 @@ impl OutgoingBaoOperation {
             state: OutgoingBaoState::Init,
             node_id,
             hash,
-            blob_info: None,
+            location: None,
             replication_id: None,
             stream_id: None,
             result: Ok(()),
@@ -101,12 +101,12 @@ impl OutgoingBaoOperation {
             return self.handle_error(ReplicationError::NoSuchKey);
         };
 
-        let blob_info = match BlobInfo::from_bytes(val.as_ref()) {
-            Ok(info) => info,
+        let location = match BackendLocation::from_bytes(val.as_ref()) {
+            Ok(location) => location,
             Err(err) => return self.handle_error(ReplicationError::ConversionError(err)),
         };
 
-        self.blob_info = Some(blob_info);
+        self.location = Some(location);
         self.state = OutgoingBaoState::OpenConnection;
         smallvec![Effect::Blob(BlobEffect::OpenConnection {
             node_id: self.node_id
@@ -124,7 +124,7 @@ impl OutgoingBaoOperation {
                 .into(),
             );
         };
-        let Some(blob_info) = &self.blob_info else {
+        let Some(location) = &self.location else {
             return self.handle_error(ReplicationError::NoSuchKey);
         };
 
@@ -135,7 +135,7 @@ impl OutgoingBaoOperation {
         smallvec![Effect::Blob(BlobEffect::NegotiateOutgoing {
             replication_id,
             stream_id,
-            blob_info: blob_info.clone(),
+            location: location.clone(),
         })]
     }
 
@@ -156,7 +156,7 @@ impl OutgoingBaoOperation {
                 let Some(stream_id) = &self.stream_id else {
                     return self.handle_error(ReplicationError::ConnectionMissing);
                 };
-                let Some(blob_info) = &self.blob_info else {
+                let Some(location) = &self.location else {
                     return self.handle_error(ReplicationError::NoSuchKey);
                 };
 
@@ -164,7 +164,7 @@ impl OutgoingBaoOperation {
                 smallvec![Effect::Blob(BlobEffect::Replicate {
                     replication_id,
                     stream_id: *stream_id,
-                    blob_info: blob_info.to_owned(),
+                    location: location.to_owned(),
                 })]
             }
             NegotiationResult::Rejected(reason) => {
@@ -250,17 +250,14 @@ pub mod test {
     use std::str::FromStr;
     use std::time::SystemTime;
 
-    fn make_blob_info() -> BlobInfo {
-        BlobInfo {
-            location: BackendLocation {
-                root: "/tmp".to_string(),
-                storage_bucket: "bucket".to_string(),
-                object_bucket: "obj".to_string(),
-                object_key: "key".to_string(),
-                ulid: Ulid::new(),
-                compressed: false,
-                encrypted: false,
-            },
+    fn make_location() -> BackendLocation {
+        BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: format!("obj/key_{}", Ulid::new()),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
             created_by: Ulid::new(),
             created_at: SystemTime::now(),
             staging: false,
@@ -294,12 +291,12 @@ pub mod test {
             })
         );
 
-        // 2. Feed BlobInfo -> Should transition to OpenConnection and emit Blob::OpenConnection
-        let blob_info = make_blob_info();
-        let blob_info_bytes = blob_info.to_bytes().unwrap();
+        // 2. Feed location -> Should transition to OpenConnection and emit Blob::OpenConnection
+        let location = make_location();
+        let location_bytes = location.to_bytes().unwrap();
         let event = Event::Storage(StorageEvent::ReadResult {
             key,
-            value: Some(ByteView::from(blob_info_bytes)),
+            value: Some(ByteView::from(location_bytes)),
         });
 
         let effects = op.step(event);
@@ -319,11 +316,11 @@ pub mod test {
         if let Effect::Blob(BlobEffect::NegotiateOutgoing {
             replication_id,
             stream_id: s_id,
-            blob_info: b_info,
+            location: found_location,
         }) = &effects[0]
         {
             assert_eq!(*s_id, stream_id);
-            assert_eq!(b_info, &blob_info);
+            assert_eq!(found_location, &location);
             // Verify op state
             assert_eq!(op.replication_id, Some(*replication_id));
             assert_eq!(op.stream_id, Some(stream_id));
@@ -344,13 +341,13 @@ pub mod test {
             Effect::Blob(BlobEffect::Replicate {
                 replication_id,
                 stream_id,
-                blob_info: blob_info.clone(),
+                location: location.clone(),
             })
         );
 
         // 5. Feed ReplicationFinished -> Should transition to Finish
         let event = Event::Blob(BlobEvent::ReplicationFinished {
-            blob_info: blob_info.clone(),
+            location: location.clone(),
         });
         let effects = op.step(event);
         assert_eq!(op.state, OutgoingBaoState::Finish);
@@ -400,11 +397,11 @@ pub mod test {
         let mut op = OutgoingBaoOperation::new(node_id, hash);
         op.start();
         let key = Key::from(hash.to_vec());
-        let blob_info = make_blob_info();
-        let blob_info_bytes = blob_info.to_bytes().unwrap();
+        let location = make_location();
+        let location_bytes = location.to_bytes().unwrap();
         let event = Event::Storage(StorageEvent::ReadResult {
             key: key.clone(),
-            value: Some(ByteView::from(blob_info_bytes)),
+            value: Some(ByteView::from(location_bytes)),
         });
         op.step(event);
         let effects = op.step(Event::Storage(StorageEvent::WriteResult { key }));
@@ -419,11 +416,11 @@ pub mod test {
         let mut op = OutgoingBaoOperation::new(node_id, hash);
         op.start();
         let key = Key::from(hash.to_vec());
-        let blob_info = make_blob_info();
-        let blob_info_bytes = blob_info.to_bytes().unwrap();
+        let location = make_location();
+        let location_bytes = location.to_bytes().unwrap();
         let event = Event::Storage(StorageEvent::ReadResult {
             key,
-            value: Some(ByteView::from(blob_info_bytes)),
+            value: Some(ByteView::from(location_bytes)),
         });
         op.step(event);
         let stream_id = Ulid::new();
@@ -441,11 +438,11 @@ pub mod test {
         let mut op = OutgoingBaoOperation::new(node_id, hash);
         op.start();
         let key = Key::from(hash.to_vec());
-        let blob_info = make_blob_info();
-        let blob_info_bytes = blob_info.to_bytes().unwrap();
+        let location = make_location();
+        let location_bytes = location.to_bytes().unwrap();
         let event = Event::Storage(StorageEvent::ReadResult {
             key,
-            value: Some(ByteView::from(blob_info_bytes)),
+            value: Some(ByteView::from(location_bytes)),
         });
         op.step(event);
         let stream_id = Ulid::new();

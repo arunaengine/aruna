@@ -1,15 +1,14 @@
-use aruna_blob::blob::{BLOB_LOCATION_DB, BLOB_PATH_DB};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::keyspaces::{BLOB_LOCATION_DB, BLOB_PATH_DB};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::BlobInfo;
+use aruna_core::structs::BackendLocation;
 use aruna_core::types::{Effects, GroupId, UserId};
 use bytes::Bytes;
 use byteview::ByteView;
 use smallvec::smallvec;
-use std::time::SystemTime;
 use thiserror::Error;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -69,7 +68,7 @@ pub struct PutObjectOperation {
     state: PutObjectState,
     config: PutObjectConfig,
     txn_id: Option<ulid::Ulid>,
-    output: Option<Result<BlobInfo, PutObjectError>>,
+    output: Option<Result<BackendLocation, PutObjectError>>,
 }
 
 impl PutObjectOperation {
@@ -88,6 +87,7 @@ impl PutObjectOperation {
             smallvec![Effect::Blob(BlobEffect::Write {
                 bucket: self.config.request.bucket.clone(),
                 key: self.config.request.key.clone(),
+                created_by: self.config.user_id,
                 blob
             })]
         } else {
@@ -96,27 +96,19 @@ impl PutObjectOperation {
     }
 
     fn handle_write_finished(&mut self, event: Event) -> Effects {
-        if let Event::Blob(BlobEvent::WriteFinished {
-            location,
-            bytes_written,
-            hashes,
-        }) = event
-        {
+        if let Event::Blob(BlobEvent::WriteFinished { location }) = event {
             // Check if the body was fully written
-            if bytes_written != self.config.request.content_length.unwrap_or(0) {
+            if self
+                .config
+                .request
+                .content_length
+                .is_some_and(|expected| location.blob_size != expected)
+            {
                 return self.emit_error(PutObjectError::IncompleteBody);
             }
 
             // Update output
-            self.output = Some(Ok(BlobInfo {
-                location,
-                created_by: self.config.user_id,
-                created_at: SystemTime::now(),
-                staging: false,
-                partial: false,
-                blob_size: bytes_written,
-                hashes,
-            }));
+            self.output = Some(Ok(location));
 
             self.state = PutObjectState::StartTransaction;
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -232,13 +224,13 @@ impl PutObjectOperation {
             .cloned()
     }
 
-    fn get_output(&self) -> Option<&BlobInfo> {
+    fn get_output(&self) -> Option<&BackendLocation> {
         self.output.as_ref()?.as_ref().ok()
     }
 }
 
 impl Operation for PutObjectOperation {
-    type Output = Option<Result<BlobInfo, PutObjectError>>;
+    type Output = Option<Result<BackendLocation, PutObjectError>>;
     type Error = PutObjectError;
 
     fn start(&mut self) -> Effects {
@@ -284,7 +276,7 @@ impl Operation for PutObjectOperation {
             actions.insert(
                 0,
                 Effect::Blob(BlobEffect::Delete {
-                    location: output.location.clone(),
+                    location: output.clone(),
                 }),
             )
         }
@@ -363,9 +355,9 @@ mod test {
             .unwrap()
             .unwrap();
 
-        assert!(exists(result.location.get_full_path().unwrap()).unwrap());
+        assert!(exists(result.get_full_path().unwrap()).unwrap());
         assert_eq!(
-            read_to_string(result.location.get_full_path().unwrap()).unwrap(),
+            read_to_string(result.get_full_path().unwrap()).unwrap(),
             String::from_utf8_lossy(&data[..]).to_string()
         );
     }

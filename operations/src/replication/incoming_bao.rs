@@ -1,10 +1,10 @@
 use crate::replication::error::ReplicationError;
-use aruna_blob::blob::BLOB_LOCATION_DB;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::keyspaces::BLOB_LOCATION_DB;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BlobInfo, NegotiationResult};
+use aruna_core::structs::{BackendLocation, NegotiationResult};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -43,7 +43,7 @@ pub struct IncomingBaoOperation {
     state: IncomingBaoState,
     stream_id: Ulid,
     node_id: NodeId,
-    blob_info: Option<BlobInfo>,
+    location: Option<BackendLocation>,
     txn_id: Option<TxnId>,
     result: Result<(), ReplicationError>,
 }
@@ -54,7 +54,7 @@ impl IncomingBaoOperation {
             state: IncomingBaoState::Init,
             stream_id,
             node_id,
-            blob_info: None,
+            location: None,
             txn_id: None,
             result: Ok(()),
         }
@@ -100,7 +100,7 @@ impl IncomingBaoOperation {
     }
 
     fn handle_replication_result(&mut self, event: Event) -> Effects {
-        let Event::Blob(BlobEvent::ReplicationFinished { blob_info }) = event else {
+        let Event::Blob(BlobEvent::ReplicationFinished { location }) = event else {
             return self.handle_error(
                 IncomingBaoError::InvalidStateEvent {
                     state: self.state.clone(),
@@ -111,7 +111,7 @@ impl IncomingBaoOperation {
             );
         };
 
-        self.blob_info = Some(blob_info);
+        self.location = Some(location);
         self.state = IncomingBaoState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -131,13 +131,13 @@ impl IncomingBaoOperation {
         };
         self.txn_id = Some(txn_id);
 
-        let Some(blob_info) = &self.blob_info else {
+        let Some(location) = &self.location else {
             return self.handle_error(ReplicationError::NoSuchKey);
         };
-        let Some(blake3) = blob_info.get_blake3() else {
+        let Some(blake3) = location.get_blake3() else {
             return self.handle_error(ReplicationError::HashMissing);
         };
-        let bytes = match blob_info.to_bytes() {
+        let bytes = match location.to_bytes() {
             Ok(bytes) => bytes,
             Err(err) => return self.handle_error(err.into()),
         };
@@ -250,15 +250,36 @@ impl Operation for IncomingBaoOperation {
 #[cfg(test)]
 pub mod test {
     use super::*;
-    use aruna_blob::blob::BLOB_LOCATION_DB;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::structs::{BackendLocation, BlobInfo, NegotiationResult};
+    use aruna_core::keyspaces::BLOB_LOCATION_DB;
+    use aruna_core::structs::{BackendLocation, NegotiationResult};
     use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::str::FromStr;
     use std::time::SystemTime;
     use ulid::Ulid;
+
+    fn make_location() -> BackendLocation {
+        let ulid = Ulid::new();
+        let mut hashes = HashMap::new();
+        hashes.insert("blake3".to_string(), vec![0u8; 32]);
+
+        BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: format!("obj/key_{ulid}"),
+            ulid,
+            compressed: false,
+            encrypted: false,
+            created_by: Ulid::new(),
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 1024,
+            hashes,
+        }
+    }
 
     #[tokio::test]
     async fn test_incoming_bao() {
@@ -296,27 +317,9 @@ pub mod test {
         );
 
         // 3. Feed ReplicationFinished -> Should transition to StartTransaction
-        let mut hashes = HashMap::new();
-        hashes.insert("blake3".to_string(), vec![0u8; 32]);
-        let blob_info = BlobInfo {
-            location: BackendLocation {
-                root: "/tmp".to_string(),
-                storage_bucket: "bucket".to_string(),
-                object_bucket: "obj".to_string(),
-                object_key: "key".to_string(),
-                ulid: Ulid::new(),
-                compressed: false,
-                encrypted: false,
-            },
-            created_by: Ulid::new(),
-            created_at: SystemTime::now(),
-            staging: false,
-            partial: false,
-            blob_size: 1024,
-            hashes,
-        };
+        let location = make_location();
         let event = Event::Blob(BlobEvent::ReplicationFinished {
-            blob_info: blob_info.clone(),
+            location: location.clone(),
         });
         let effects = op.step(event);
         assert_eq!(op.state, IncomingBaoState::StartTransaction);
@@ -332,13 +335,13 @@ pub mod test {
         let effects = op.step(event);
         assert_eq!(op.state, IncomingBaoState::CreateBlob);
         assert_eq!(effects.len(), 1);
-        let blake3 = blob_info.get_blake3().expect("blake3 hash set");
+        let blake3 = location.get_blake3().expect("blake3 hash set");
         assert_eq!(
             effects[0],
             Effect::Storage(StorageEffect::Write {
                 key_space: BLOB_LOCATION_DB.to_string(),
                 key: Key::from(blake3.as_slice().to_vec()),
-                value: blob_info.to_bytes().unwrap().into(),
+                value: location.to_bytes().unwrap().into(),
                 txn_id: Some(txn_id),
             })
         );
@@ -427,27 +430,9 @@ pub mod test {
         op.step(Event::Blob(BlobEvent::NegotiationFinished(
             NegotiationResult::Accepted(replication_id),
         )));
-        let mut hashes = HashMap::new();
-        hashes.insert("blake3".to_string(), vec![0u8; 32]);
-        let blob_info = BlobInfo {
-            location: BackendLocation {
-                root: "/tmp".to_string(),
-                storage_bucket: "bucket".to_string(),
-                object_bucket: "obj".to_string(),
-                object_key: "key".to_string(),
-                ulid: Ulid::new(),
-                compressed: false,
-                encrypted: false,
-            },
-            created_by: Ulid::new(),
-            created_at: SystemTime::now(),
-            staging: false,
-            partial: false,
-            blob_size: 1024,
-            hashes,
-        };
+        let location = make_location();
         op.step(Event::Blob(BlobEvent::ReplicationFinished {
-            blob_info: blob_info.clone(),
+            location: location.clone(),
         }));
         let effects = op.step(Event::Blob(BlobEvent::NegotiationFinished(
             NegotiationResult::Rejected("bad".to_string()),
@@ -466,27 +451,9 @@ pub mod test {
         op.step(Event::Blob(BlobEvent::NegotiationFinished(
             NegotiationResult::Accepted(replication_id),
         )));
-        let mut hashes = HashMap::new();
-        hashes.insert("blake3".to_string(), vec![0u8; 32]);
-        let blob_info = BlobInfo {
-            location: BackendLocation {
-                root: "/tmp".to_string(),
-                storage_bucket: "bucket".to_string(),
-                object_bucket: "obj".to_string(),
-                object_key: "key".to_string(),
-                ulid: Ulid::new(),
-                compressed: false,
-                encrypted: false,
-            },
-            created_by: Ulid::new(),
-            created_at: SystemTime::now(),
-            staging: false,
-            partial: false,
-            blob_size: 1024,
-            hashes,
-        };
+        let location = make_location();
         op.step(Event::Blob(BlobEvent::ReplicationFinished {
-            blob_info: blob_info.clone(),
+            location: location.clone(),
         }));
         let txn_id = Ulid::new();
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
@@ -507,31 +474,13 @@ pub mod test {
         op.step(Event::Blob(BlobEvent::NegotiationFinished(
             NegotiationResult::Accepted(replication_id),
         )));
-        let mut hashes = HashMap::new();
-        hashes.insert("blake3".to_string(), vec![0u8; 32]);
-        let blob_info = BlobInfo {
-            location: BackendLocation {
-                root: "/tmp".to_string(),
-                storage_bucket: "bucket".to_string(),
-                object_bucket: "obj".to_string(),
-                object_key: "key".to_string(),
-                ulid: Ulid::new(),
-                compressed: false,
-                encrypted: false,
-            },
-            created_by: Ulid::new(),
-            created_at: SystemTime::now(),
-            staging: false,
-            partial: false,
-            blob_size: 1024,
-            hashes,
-        };
+        let location = make_location();
         op.step(Event::Blob(BlobEvent::ReplicationFinished {
-            blob_info: blob_info.clone(),
+            location: location.clone(),
         }));
         let txn_id = Ulid::new();
         op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        let blake3 = blob_info.get_blake3().unwrap();
+        let blake3 = location.get_blake3().unwrap();
         op.step(Event::Storage(StorageEvent::WriteResult {
             key: Key::from(blake3.as_slice().to_vec()),
         }));

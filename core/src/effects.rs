@@ -5,8 +5,9 @@ use crate::automerge::AutomergeEffect;
 use crate::id::NodeId;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::{BackendLocation, BlobInfo};
+use crate::structs::BackendLocation;
 use crate::task::TaskEffect;
+use crate::types::UserId;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
 use bytes::Bytes;
 use std::ops::Range;
@@ -31,6 +32,7 @@ pub enum BlobEffect {
     Write {
         bucket: String,
         key: String,
+        created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
     Read {
@@ -53,12 +55,12 @@ pub enum BlobEffect {
     NegotiateOutgoing {
         replication_id: Ulid,
         stream_id: Ulid,
-        blob_info: BlobInfo,
+        location: BackendLocation,
     },
     Replicate {
         replication_id: Ulid,
         stream_id: Ulid,
-        blob_info: BlobInfo,
+        location: BackendLocation,
     },
     HandleReplication {
         replication_id: Ulid,

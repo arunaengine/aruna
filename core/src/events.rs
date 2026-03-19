@@ -1,6 +1,6 @@
 use crate::errors::BlobError;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::{BackendLocation, BlobInfo, NegotiationResult};
+use crate::structs::{BackendLocation, NegotiationResult};
 use crate::{
     automerge::AutomergeEvent,
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
@@ -9,8 +9,6 @@ use crate::{
     types::{DhtKey, Key, TopicId, TxnId, Value},
 };
 use bytes::Bytes;
-use std::collections::HashMap;
-use std::fmt::Debug;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
@@ -45,9 +43,6 @@ pub enum SubOperationEvent {
 pub enum BlobEvent {
     WriteFinished {
         location: BackendLocation,
-        bytes_written: u64,
-        hashes: HashMap<String, Vec<u8>>, // Includes checksums?
-                                          //checksums: HashMap<String, String>,
     },
     ReadFinished {
         blob: BackendStream<Result<Bytes, BackendStreamError>>,
@@ -59,7 +54,7 @@ pub enum BlobEvent {
     },
     NegotiationFinished(NegotiationResult),
     ReplicationFinished {
-        blob_info: BlobInfo,
+        location: BackendLocation,
     },
     Error(BlobError),
 }

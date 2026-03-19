@@ -11,6 +11,8 @@ use std::str::FromStr;
 use std::time::SystemTime;
 use ulid::Ulid;
 
+const ACCESS_KEY_MAX_LEN: usize = 128;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Backend {
     #[default]
@@ -86,19 +88,23 @@ impl From<(String, u64)> for BackendBucket {
 pub struct BackendLocation {
     pub root: String,
     pub storage_bucket: String,
-    pub object_bucket: String, // S3 bucket from request
-    pub object_key: String,    // S3 key from request
+    pub backend_path: String,
     pub ulid: Ulid,
     pub compressed: bool,
     pub encrypted: bool,
+    pub created_by: UserId,
+    pub created_at: SystemTime,
+    pub staging: bool,
+    pub partial: bool,
+    pub blob_size: u64,
+    pub hashes: HashMap<String, Vec<u8>>,
 }
 
 impl Display for BackendLocation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let path = PathBuf::from(&self.root)
             .join(&self.storage_bucket)
-            .join(&self.object_bucket)
-            .join(format!("{}_{}", self.object_key, self.ulid));
+            .join(&self.backend_path);
         write!(
             f,
             "{}",
@@ -113,8 +119,7 @@ impl BackendLocation {
     pub fn get_full_path(&self) -> Result<String, ConversionError> {
         PathBuf::from(&self.root)
             .join(&self.storage_bucket)
-            .join(&self.object_bucket)
-            .join(format!("{}_{}", self.object_key, self.ulid))
+            .join(&self.backend_path)
             .into_os_string()
             .into_string()
             .map_err(|_| ConversionError::OsStringError)
@@ -122,11 +127,89 @@ impl BackendLocation {
 
     pub fn get_storage_path(&self) -> Result<String, BlobError> {
         Ok(PathBuf::from(&self.storage_bucket)
-            .join(&self.object_bucket)
-            .join(format!("{}_{}", self.object_key, self.ulid))
+            .join(&self.backend_path)
             .into_os_string()
             .into_string()
             .map_err(|_| ConversionError::OsStringError)?)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn get_blake3(&self) -> Option<&Vec<u8>> {
+        self.hashes.get("blake3")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketInfo {
+    pub group_id: Ulid,
+    pub created_at: SystemTime,
+    pub created_by: UserId,
+}
+
+impl BucketInfo {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LookupKey {
+    Blake3Hash([u8; 32]),
+    Object { bucket: String, key: String },
+}
+
+impl LookupKey {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Location {
+    Real(BackendLocation),
+    Deleted,
+}
+
+impl Location {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct VersionMetadata {
+    pub version_id: Ulid,
+    pub location: Location,
+    pub created_at: SystemTime,
+    pub created_by: UserId,
+}
+
+impl VersionMetadata {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -143,54 +226,50 @@ pub enum NegotiationResult {
     Rejected(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct BlobInfo {
-    pub location: BackendLocation,
-    pub created_by: UserId,
-    pub created_at: SystemTime,
-    pub staging: bool,
-    pub partial: bool,
-    pub blob_size: u64,
-    pub hashes: HashMap<String, Vec<u8>>, // Raw bytes that can be encoded as needed
-}
-
-impl BlobInfo {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&self)?)
-    }
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-
-    pub fn get_location(&self) -> &BackendLocation {
-        &self.location
-    }
-
-    pub fn get_blake3(&self) -> Option<&Vec<u8>> {
-        self.hashes.get("blake3")
-    }
-}
-
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub user_id: UserId,
     pub realm_key: RealmId,
 }
 
+impl Display for UserIdentity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.user_id, self.realm_key)
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserAccess {
-    pub user_id: UserIdentity,
+    pub access_key: String,
+    pub user_identity: UserIdentity,
     pub group_id: Ulid,
     pub secret: String,
-    //pub expiry: SystemTime
-    //filter: todo!()
+    pub expiry: SystemTime,
 }
 
 impl UserAccess {
+    pub fn build_access_key(
+        user_identity: &UserIdentity,
+        key_id: &str,
+    ) -> Result<String, ConversionError> {
+        let access_key = format!("{user_identity}:{key_id}");
+        if access_key.len() > ACCESS_KEY_MAX_LEN {
+            return Err(ConversionError::InvalidLength(format!(
+                "access key must be <= {ACCESS_KEY_MAX_LEN} characters"
+            )));
+        }
+        Ok(access_key)
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(&self)?)
     }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn is_expired(&self, now: SystemTime) -> bool {
+        self.expiry <= now
     }
 }

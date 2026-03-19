@@ -1,8 +1,6 @@
 use aruna_core::id::NodeId;
 use aruna_core::util::unix_timestamp_secs;
 use serde::{Deserialize, Serialize};
-
-pub const DHT_KEYSPACE: &str = "dht";
 pub const CLEANUP_PAGE_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

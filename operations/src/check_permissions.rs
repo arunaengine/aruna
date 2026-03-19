@@ -1,7 +1,7 @@
-use aruna_core::consts::AUTH_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId, Role,

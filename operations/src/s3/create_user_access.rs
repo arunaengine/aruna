@@ -1,15 +1,18 @@
-use aruna_core::USER_ACCESS_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{UserAccess, UserIdentity};
 use aruna_core::types::{Effects, GroupId};
 use rand::distr::Alphanumeric;
 use rand::{Rng, rng};
 use smallvec::smallvec;
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
+
+const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateUserAccessState {
@@ -51,7 +54,7 @@ pub struct CreateUserAccessOperation {
     user_identity: UserIdentity,
     group_id: GroupId,
     state: CreateUserAccessState,
-    output: Result<(Ulid, UserAccess), CreateUserAccessError>,
+    output: Result<(String, UserAccess), CreateUserAccessError>,
 }
 
 impl CreateUserAccessOperation {
@@ -66,15 +69,21 @@ impl CreateUserAccessOperation {
 
     fn handle_init(&mut self) -> Effects {
         if let CreateUserAccessState::Init = self.state {
-            let access_key_id = Ulid::new();
+            let key_id = Ulid::new().to_string();
+            let access_key = match UserAccess::build_access_key(&self.user_identity, &key_id) {
+                Ok(access_key) => access_key,
+                Err(err) => return self.handle_error(err.into()),
+            };
             let access = UserAccess {
-                user_id: self.user_identity.clone(),
+                access_key: access_key.clone(),
+                user_identity: self.user_identity.clone(),
                 group_id: self.group_id,
                 secret: rng()
                     .sample_iter(&Alphanumeric)
                     .take(30)
                     .map(char::from)
                     .collect::<String>(),
+                expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
             };
             let bytes = match access.to_bytes() {
                 Ok(bytes) => bytes,
@@ -84,7 +93,7 @@ impl CreateUserAccessOperation {
             self.state = CreateUserAccessState::CreateUserAccess(access);
             smallvec![Effect::Storage(StorageEffect::Write {
                 key_space: USER_ACCESS_KEYSPACE.to_string(),
-                key: access_key_id.to_bytes().into(),
+                key: access_key.as_bytes().into(),
                 value: bytes.into(),
                 txn_id: None,
             })]
@@ -109,14 +118,13 @@ impl CreateUserAccessOperation {
             });
         };
 
-        let ulid_bytes: [u8; 16] = match (*key).try_into() {
-            Ok(bytes) => bytes,
+        let access_key = match String::from_utf8(key.to_vec()) {
+            Ok(access_key) => access_key,
             Err(err) => {
                 return self.handle_error(CreateUserAccessError::ConversionError(err.into()));
             }
         };
-        let access_key_id = Ulid::from_bytes(ulid_bytes);
-        self.output = Ok((access_key_id, access.clone()));
+        self.output = Ok((access_key, access.clone()));
         self.state = CreateUserAccessState::Finish;
         smallvec![]
     }
@@ -129,7 +137,7 @@ impl CreateUserAccessOperation {
 }
 
 impl Operation for CreateUserAccessOperation {
-    type Output = Result<(Ulid, UserAccess), CreateUserAccessError>;
+    type Output = Result<(String, UserAccess), CreateUserAccessError>;
     type Error = CreateUserAccessError;
 
     fn start(&mut self) -> Effects {
@@ -161,14 +169,15 @@ impl Operation for CreateUserAccessOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        let Ok((access_key_id, _)) = self.output else {
+        let Ok((access_key, _)) = self.output.as_ref() else {
             return smallvec![];
         };
+        let access_key = access_key.clone();
 
         self.output = Err(CreateUserAccessError::CreateUserAccessAborted);
         smallvec![Effect::Storage(StorageEffect::Delete {
             key_space: USER_ACCESS_KEYSPACE.to_string(),
-            key: access_key_id.to_bytes().into(),
+            key: access_key.as_bytes().into(),
             txn_id: None,
         })]
     }
@@ -215,7 +224,7 @@ mod tests {
         let CreateUserAccessState::CreateUserAccess(ref access) = op.state else {
             panic!("Expected CreateUserAccess state");
         };
-        assert_eq!(access.user_id, user_identity);
+        assert_eq!(access.user_identity, user_identity);
         assert_eq!(access.group_id, group_id);
         assert_eq!(access.secret.len(), 30);
 
@@ -227,16 +236,15 @@ mod tests {
         assert_eq!(op.state, CreateUserAccessState::Finish);
         assert!(op.is_complete());
 
-        // 3. Finalize -> Should return Ok with (Ulid, UserAccess)
+        // 3. Finalize -> Should return Ok with (String, UserAccess)
         let result = op.finalize();
         assert!(result.is_ok());
         let inner = result.unwrap();
         assert!(inner.is_ok());
-        let (access_key_id, returned_access) = inner.unwrap();
-        assert_eq!(returned_access.user_id, user_identity);
+        let (access_key, returned_access) = inner.unwrap();
+        assert_eq!(returned_access.user_identity, user_identity);
         assert_eq!(returned_access.group_id, group_id);
-        // access_key_id should be a valid Ulid (non-zero bytes)
-        assert_ne!(access_key_id, Ulid::nil());
+        assert_eq!(returned_access.access_key, access_key);
     }
 
     #[test]

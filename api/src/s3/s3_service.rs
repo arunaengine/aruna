@@ -1,16 +1,18 @@
 use crate::s3::util::{convert_input, to_base64};
-use aruna_core::structs::{RealmId, UserIdentity};
+use aruna_core::structs::{BucketInfo, UserAccess};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
 use aruna_operations::s3::get_object::{GetObjectInput as GOI, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
 use s3s::dto::{
-    ETag, GetObjectInput, GetObjectOutput, PutObjectInput, PutObjectOutput, StreamingBlob,
+    CreateBucketInput, CreateBucketOutput, ETag, GetObjectInput, GetObjectOutput, PutObjectInput,
+    PutObjectOutput, StreamingBlob,
 };
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tracing::{debug, error, warn};
-use ulid::Ulid;
 
 #[derive(Clone)]
 pub struct ArunaS3Service {
@@ -34,6 +36,38 @@ impl ArunaS3Service {
 #[async_trait::async_trait]
 impl S3 for ArunaS3Service {
     #[tracing::instrument(err, skip(self, req))]
+    async fn create_bucket(
+        &self,
+        req: S3Request<CreateBucketInput>,
+    ) -> S3Result<S3Response<CreateBucketOutput>> {
+        debug!("Received CREATE BUCKET Request: {:#?}", req);
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        let operation = CreateBucketOperation::new(
+            req.input.bucket.clone(),
+            BucketInfo {
+                group_id: user_access.group_id,
+                created_at: SystemTime::now(),
+                created_by: user_access.user_identity.user_id,
+            },
+        );
+
+        match drive(operation, &self.state).await {
+            Ok(Some(Ok(_))) => Ok(S3Response::new(CreateBucketOutput::default())),
+            Ok(Some(Err(CreateBucketError::BucketAlreadyExists)))
+            | Err(CreateBucketError::BucketAlreadyExists) => {
+                Err(s3_error!(BucketAlreadyOwnedByYou, "Bucket already exists"))
+            }
+            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
+            Ok(None) => Err(s3_error!(InternalError, "Failed to create bucket")),
+        }
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
     #[allow(clippy::blocks_in_conditions)]
     async fn put_object(
         &self,
@@ -42,39 +76,33 @@ impl S3 for ArunaS3Service {
         debug!("Received PUT Request: {:#?}", req);
 
         // Extract access check result
-        /*
-        let UserAccess {
-            user_id, group_id, ..
-        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        */
-        let user_id = Ulid::new();
-        let group_id = Ulid::new();
 
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
-            user_id,
-            group_id,
+            user_id: user_access.user_identity.user_id,
+            group_id: user_access.group_id,
             request: input,
             exists: false,
         };
         let operation = PutObjectOperation::new(config);
 
-        if let Some(Ok(blob_info)) = drive(operation, &self.state)
+        if let Some(Ok(location)) = drive(operation, &self.state)
             .await
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
         {
-            debug!(?blob_info);
+            debug!(?location);
             Ok(S3Response::new(PutObjectOutput {
                 e_tag: Some(ETag::Strong(to_base64(
-                    blob_info.hashes.get("md5").ok_or_else(|| {
+                    location.hashes.get("md5").ok_or_else(|| {
                         error!(error = "Missing MD5 hash");
                         s3_error!(InternalError, "Missing MD5 hash")
                     })?,
                 ))),
-                size: Some(blob_info.blob_size as i64),
+                size: Some(location.blob_size as i64),
                 ..Default::default()
             }))
         } else {
@@ -91,26 +119,17 @@ impl S3 for ArunaS3Service {
         debug!("Received GET Request: {:#?}", req);
 
         // Extract access check result
-        /*
-        let UserAccess {
-            user_id, group_id, ..
-        } = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-        */
-        let user_id = Ulid::new();
-        let _group_id = Ulid::new();
 
         let operation = GetObjectOperation::new(GOI {
             bucket: req.input.bucket,
             key: req.input.key,
             range: None,
-            group_id: Default::default(),
-            user_identity: UserIdentity {
-                user_id,
-                realm_key: RealmId([0u8; 32]),
-            }, //TODO
+            group_id: user_access.group_id,
+            user_identity: user_access.user_identity,
         });
 
         if let Ok(Some(Ok(blob_stream))) = drive(operation, &self.state).await {

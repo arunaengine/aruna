@@ -1,12 +1,12 @@
 pub mod alpn;
 pub mod automerge;
-pub mod consts;
 pub mod effects;
 pub mod errors;
 pub mod events;
 pub mod handle;
 pub mod id;
 pub mod keys;
+pub mod keyspaces;
 pub mod operation;
 pub mod stream;
 pub mod structs;
@@ -19,6 +19,5 @@ pub use automerge::{
     AutomergeRejectReason, AutomergeState, AutomergeSyncError, AutomergeSyncFeature, InitAuthProof,
 };
 pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
+pub use keyspaces::*;
 pub use task::{TaskEffect, TaskEvent, TaskKey};
-
-pub const USER_ACCESS_KEYSPACE: &str = "user_access";

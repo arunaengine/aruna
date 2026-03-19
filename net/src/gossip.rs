@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::consts::GOSSIP_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
+use aruna_core::keyspaces::GOSSIP_SUBSCRIPTIONS_KEYSPACE;
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;

@@ -1,8 +1,8 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument, RealmId, Role};
 use aruna_core::types::{GroupId, TxnId};
@@ -504,9 +504,9 @@ pub mod test {
     use std::collections::{HashMap, HashSet};
 
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation, AddGroupRoleState};
-    use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::effects::Effect;
     use aruna_core::events::Event;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, Permission, Role};
     use aruna_core::types::TxnId;

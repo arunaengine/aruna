@@ -1,10 +1,10 @@
-use aruna_blob::blob::{BLOB_LOCATION_DB, BLOB_PATH_DB};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::keyspaces::{BLOB_LOCATION_DB, BLOB_PATH_DB};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BlobInfo, UserIdentity};
+use aruna_core::structs::{BackendLocation, UserIdentity};
 use aruna_core::types::Effects;
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
@@ -154,8 +154,8 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::NoSuchKey);
         };
 
-        let blob_info = match BlobInfo::from_bytes(val.as_ref()) {
-            Ok(info) => info,
+        let location = match BackendLocation::from_bytes(val.as_ref()) {
+            Ok(location) => location,
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
@@ -167,9 +167,7 @@ impl GetObjectOperation {
 
         smallvec![
             Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-            Effect::Blob(BlobEffect::Read {
-                location: blob_info.location,
-            })
+            Effect::Blob(BlobEffect::Read { location })
         ]
     }
 
@@ -247,13 +245,12 @@ impl Operation for GetObjectOperation {
 mod test {
     use crate::driver::{DriverContext, drive};
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation, GetObjectState};
-    use aruna_blob::blob::{BLOB_LOCATION_DB, BLOB_PATH_DB, BlobHandler};
+    use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, BlobInfo, RealmId, UserIdentity,
-    };
+    use aruna_core::keyspaces::{BLOB_LOCATION_DB, BLOB_PATH_DB};
+    use aruna_core::structs::{Backend, BackendConfig, BackendLocation, RealmId, UserIdentity};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use futures_util::StreamExt;
@@ -289,17 +286,16 @@ mod test {
         let hashes = hasher.finalize();
 
         let group_id = Ulid::new();
+        let bucket = "s3test".to_string();
+        let key = "test.txt".to_string();
         let blob_ulid = Ulid::new();
-        let blob_info = BlobInfo {
-            location: BackendLocation {
-                root: temp_root.to_string(),
-                storage_bucket: format!("aruna_{}", Ulid::new()),
-                object_bucket: "s3test".to_string(),
-                object_key: "test.txt".to_string(),
-                ulid: blob_ulid,
-                compressed: false,
-                encrypted: false,
-            },
+        let location = BackendLocation {
+            root: temp_root.to_string(),
+            storage_bucket: format!("aruna_{}", Ulid::new()),
+            backend_path: format!("{bucket}/{key}_{blob_ulid}"),
+            ulid: blob_ulid,
+            compressed: false,
+            encrypted: false,
             created_by: Default::default(),
             created_at: SystemTime::now(),
             staging: false,
@@ -310,12 +306,12 @@ mod test {
 
         // Write file + db entries
         std::fs::create_dir_all(
-            Path::new(&blob_info.location.get_full_path().unwrap())
+            Path::new(&location.get_full_path().unwrap())
                 .parent()
                 .unwrap(),
         )
         .unwrap();
-        std::fs::write(blob_info.location.get_full_path().unwrap(), content).unwrap();
+        std::fs::write(location.get_full_path().unwrap(), content).unwrap();
 
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -325,15 +321,12 @@ mod test {
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_LOCATION_DB.to_string(),
                     key: hashes.blake3.as_slice().into(),
-                    value: blob_info.to_bytes().unwrap().into(),
+                    value: location.to_bytes().unwrap().into(),
                     txn_id: None,
                 })
                 .await;
 
-            let frontend_path = format!(
-                "{}/{}/{}",
-                group_id, blob_info.location.object_bucket, blob_info.location.object_key
-            );
+            let frontend_path = format!("{group_id}/{bucket}/{key}");
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_PATH_DB.to_string(),
@@ -360,8 +353,8 @@ mod test {
         };
         let operation = GetObjectOperation {
             input: GetObjectInput {
-                bucket: "s3test".to_string(),
-                key: "test.txt".to_string(),
+                bucket,
+                key,
                 range: None,
                 group_id,
                 user_identity: UserIdentity {

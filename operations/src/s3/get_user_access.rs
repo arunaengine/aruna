@@ -1,6 +1,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::UserAccess;
 use aruna_core::types::Effects;
@@ -58,7 +59,7 @@ impl GetUserAccessOperation {
         if let GetUserAccessState::Init = self.state {
             self.state = GetUserAccessState::GetUserAccess;
             smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: "user_access".to_string(),
+                key_space: USER_ACCESS_KEYSPACE.to_string(),
                 key: self.access_key_id.as_bytes().into(),
                 txn_id: None,
             })]
@@ -136,8 +137,8 @@ mod test {
     use crate::driver::drive;
     use crate::s3::get_user_access::GetUserAccessOperation;
     use crate::s3::get_user_access::UserAccess;
-    use aruna_core::USER_ACCESS_KEYSPACE;
     use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
     use aruna_core::structs::RealmId;
     use aruna_core::structs::UserIdentity;
     use aruna_storage::storage;
@@ -150,14 +151,18 @@ mod test {
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
 
-        let access_key_id = Ulid::new().to_string();
+        let user_identity = UserIdentity {
+            user_id: Ulid::new(),
+            realm_key: RealmId([0u8; 32]),
+        };
+        let access_key_id =
+            UserAccess::build_access_key(&user_identity, &Ulid::new().to_string()).unwrap();
         let user_access = UserAccess {
-            user_id: UserIdentity {
-                user_id: Ulid::new(),
-                realm_key: RealmId([0u8; 32]),
-            },
+            access_key: access_key_id.clone(),
+            user_identity,
             group_id: Ulid::new(),
             secret: "SECRET_KEY".to_string(),
+            expiry: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
         };
 
         let _ = storage_handle
