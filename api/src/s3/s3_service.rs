@@ -2,11 +2,12 @@ use crate::s3::util::{convert_input, to_base64};
 use aruna_core::structs::{BucketInfo, UserAccess};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
+use aruna_operations::s3::delete_object::{DeleteObjectInput as DOI, DeleteObjectOperation};
 use aruna_operations::s3::get_object::{GetObjectInput as GOI, GetObjectOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
 use s3s::dto::{
-    CreateBucketInput, CreateBucketOutput, ETag, GetObjectInput, GetObjectOutput, PutObjectInput,
-    PutObjectOutput, StreamingBlob,
+    CreateBucketInput, CreateBucketOutput, DeleteObjectInput, DeleteObjectOutput, ETag,
+    GetObjectInput, GetObjectOutput, PutObjectInput, PutObjectOutput, StreamingBlob,
 };
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -142,6 +143,45 @@ impl S3 for ArunaS3Service {
         } else {
             //TODO: Better error handling
             Err(s3_error!(InternalError, "Failed to process GET request"))
+        }
+    }
+
+    #[tracing::instrument(err)]
+    async fn delete_object(
+        &self,
+        req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        debug!("Received DELETE Request: {:#?}", req);
+
+        if req.input.version_id.is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "Deleting explicit object versions is not implemented yet"
+            ));
+        }
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        let operation = DeleteObjectOperation::new(DOI {
+            bucket: req.input.bucket,
+            key: req.input.key,
+            deleted_by: user_access.user_identity.user_id,
+        });
+
+        match drive(operation, &self.state)
+            .await
+            .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
+        {
+            Some(Ok(result)) => Ok(S3Response::new(DeleteObjectOutput {
+                delete_marker: Some(true),
+                version_id: Some(result.version_id.to_string()),
+                ..Default::default()
+            })),
+            Some(Err(err)) => Err(s3_error!(InternalError, "{}", err.to_string())),
+            None => Err(s3_error!(InternalError, "Failed to process DELETE request")),
         }
     }
 }
