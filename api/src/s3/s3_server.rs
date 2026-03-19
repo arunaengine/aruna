@@ -41,7 +41,7 @@ impl S3Server {
         realm_id: RealmId,
         node_id: NodeId,
     ) -> Result<Self, S3ServerError> {
-        let s3service = ArunaS3Service::new(driver_ctx.clone()).await;
+        let s3service = ArunaS3Service::new(driver_ctx.clone(), realm_id.clone(), node_id).await;
 
         let auth = AuthProvider {
             driver_ctx: driver_ctx.clone(),

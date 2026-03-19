@@ -135,16 +135,15 @@ impl AuthProvider {
 
     async fn build_authorization_path(
         &self,
-        cx: &S3AccessContext<'_>,
+        cx: &mut S3AccessContext<'_>,
         user_access: &UserAccess,
     ) -> S3Result<String> {
-        let bucket = cx
-            .s3_path()
-            .get_bucket_name()
-            .ok_or_else(|| s3_error!(InvalidRequest, "Bucket name missing"))?;
-        let key = cx.s3_path().get_object_key();
+        let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned) else {
+            return Ok(self.group_data_path(user_access.group_id));
+        };
+        let key = cx.s3_path().get_object_key().map(str::to_owned);
 
-        let group_id = match self.find_bucket_info(bucket).await? {
+        let group_id = match self.find_bucket_info(&bucket).await? {
             Some(bucket_info) => {
                 if bucket_info.group_id != user_access.group_id {
                     return Err(s3_error!(
@@ -152,9 +151,10 @@ impl AuthProvider {
                         "Bucket belongs to a different group"
                     ));
                 }
+                cx.extensions_mut().insert(bucket_info.clone());
                 bucket_info.group_id
             }
-            None if key.is_none() => user_access.group_id,
+            None if cx.s3_op().name() == "CreateBucket" && key.is_none() => user_access.group_id,
             None => {
                 return Err(s3_error!(
                     NoSuchBucket,
@@ -163,10 +163,10 @@ impl AuthProvider {
             }
         };
 
-        let mut path = self.bucket_path(group_id, bucket);
+        let mut path = self.bucket_path(group_id, &bucket);
         if let Some(key) = key {
             path.push('/');
-            path.push_str(key);
+            path.push_str(&key);
         }
         Ok(path)
     }
@@ -176,5 +176,9 @@ impl AuthProvider {
             "/{}/g/{}/data/{}/{bucket}",
             self.realm_id, group_id, self.node_id
         )
+    }
+
+    fn group_data_path(&self, group_id: ulid::Ulid) -> String {
+        format!("/{}/g/{}/data/{}", self.realm_id, group_id, self.node_id)
     }
 }
