@@ -2,9 +2,9 @@ use crate::replication::error::ReplicationError;
 use aruna_core::NodeId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::BLOB_LOCATION_DB;
+use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BackendLocation, NegotiationResult};
+use aruna_core::structs::{BackendLocation, Location, LookupKey, NegotiationResult};
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -78,9 +78,13 @@ impl OutgoingBaoOperation {
         }
 
         self.state = OutgoingBaoState::GetBlobInfo;
+        let key = match LookupKey::Blake3Hash(self.hash).to_bytes() {
+            Ok(key) => key,
+            Err(err) => return self.handle_error(ReplicationError::ConversionError(err)),
+        };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATION_DB.to_string(),
-            key: Key::from(self.hash.to_vec()),
+            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key: Key::from(key),
             txn_id: None,
         })]
     }
@@ -101,8 +105,9 @@ impl OutgoingBaoOperation {
             return self.handle_error(ReplicationError::NoSuchKey);
         };
 
-        let location = match BackendLocation::from_bytes(val.as_ref()) {
-            Ok(location) => location,
+        let location = match Location::from_bytes(val.as_ref()) {
+            Ok(Location::Real(location)) => location,
+            Ok(Location::Deleted) => return self.handle_error(ReplicationError::NoSuchKey),
             Err(err) => return self.handle_error(ReplicationError::ConversionError(err)),
         };
 
@@ -244,7 +249,9 @@ impl Operation for OutgoingBaoOperation {
 #[cfg(test)]
 pub mod test {
     use super::*;
+    use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
     use aruna_core::structs::BackendLocation;
+    use aruna_core::structs::{Location, LookupKey};
     use byteview::ByteView;
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -281,11 +288,11 @@ pub mod test {
         let effects = op.start();
         assert_eq!(op.state, OutgoingBaoState::GetBlobInfo);
         assert_eq!(effects.len(), 1);
-        let key = Key::from(hash.to_vec());
+        let key = Key::from(LookupKey::Blake3Hash(hash).to_bytes().unwrap());
         assert_eq!(
             effects[0],
             Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_LOCATION_DB.to_string(),
+                key_space: S3_LOOKUP_KEYSPACE.to_string(),
                 key: key.clone(),
                 txn_id: None,
             })
@@ -293,7 +300,7 @@ pub mod test {
 
         // 2. Feed location -> Should transition to OpenConnection and emit Blob::OpenConnection
         let location = make_location();
-        let location_bytes = location.to_bytes().unwrap();
+        let location_bytes = Location::Real(location.clone()).to_bytes().unwrap();
         let event = Event::Storage(StorageEvent::ReadResult {
             key,
             value: Some(ByteView::from(location_bytes)),
@@ -396,9 +403,9 @@ pub mod test {
         // 3. Invalid event at OpenConnection
         let mut op = OutgoingBaoOperation::new(node_id, hash);
         op.start();
-        let key = Key::from(hash.to_vec());
+        let key = Key::from(LookupKey::Blake3Hash(hash).to_bytes().unwrap());
         let location = make_location();
-        let location_bytes = location.to_bytes().unwrap();
+        let location_bytes = Location::Real(location).to_bytes().unwrap();
         let event = Event::Storage(StorageEvent::ReadResult {
             key: key.clone(),
             value: Some(ByteView::from(location_bytes)),
@@ -415,9 +422,9 @@ pub mod test {
         // 4. Invalid event at NegotiateReplication
         let mut op = OutgoingBaoOperation::new(node_id, hash);
         op.start();
-        let key = Key::from(hash.to_vec());
+        let key = Key::from(LookupKey::Blake3Hash(hash).to_bytes().unwrap());
         let location = make_location();
-        let location_bytes = location.to_bytes().unwrap();
+        let location_bytes = Location::Real(location).to_bytes().unwrap();
         let event = Event::Storage(StorageEvent::ReadResult {
             key,
             value: Some(ByteView::from(location_bytes)),
@@ -437,9 +444,9 @@ pub mod test {
         // 5. Invalid event at Replicate
         let mut op = OutgoingBaoOperation::new(node_id, hash);
         op.start();
-        let key = Key::from(hash.to_vec());
+        let key = Key::from(LookupKey::Blake3Hash(hash).to_bytes().unwrap());
         let location = make_location();
-        let location_bytes = location.to_bytes().unwrap();
+        let location_bytes = Location::Real(location).to_bytes().unwrap();
         let event = Event::Storage(StorageEvent::ReadResult {
             key,
             value: Some(ByteView::from(location_bytes)),

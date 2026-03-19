@@ -170,6 +170,52 @@ pub enum LookupKey {
 }
 
 impl LookupKey {
+    pub fn from_blake3_hash(hash: &[u8]) -> Result<Self, ConversionError> {
+        Ok(Self::Blake3Hash(hash.try_into()?))
+    }
+
+    pub fn object(bucket: impl Into<String>, key: impl Into<String>) -> Self {
+        Self::Object {
+            bucket: bucket.into(),
+            key: key.into(),
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionKey {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: Ulid,
+}
+
+#[derive(Serialize)]
+struct VersionKeyPrefix<'a> {
+    bucket: &'a str,
+    key: &'a str,
+}
+
+impl VersionKey {
+    pub fn new(bucket: impl Into<String>, key: impl Into<String>, version_id: Ulid) -> Self {
+        Self {
+            bucket: bucket.into(),
+            key: key.into(),
+            version_id,
+        }
+    }
+
+    pub fn object_prefix(bucket: &str, key: &str) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&VersionKeyPrefix { bucket, key })?)
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(&self)?)
     }

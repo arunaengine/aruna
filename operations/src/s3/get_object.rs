@@ -1,10 +1,10 @@
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_LOCATION_DB, BLOB_PATH_DB};
+use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{BackendLocation, UserIdentity};
+use aruna_core::structs::{Location, LookupKey, UserIdentity};
 use aruna_core::types::Effects;
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
@@ -16,8 +16,7 @@ use ulid::Ulid;
 pub enum GetObjectState {
     Init,
     StartTransaction,
-    GetPathMapping,
-    GetBlobInfo,
+    GetLookup,
     CommitTransaction,
     GetBlob,
     Finish,
@@ -100,15 +99,15 @@ impl GetObjectOperation {
     pub fn handle_transaction_started(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
-            self.state = GetObjectState::GetPathMapping;
+            self.state = GetObjectState::GetLookup;
 
-            let frontend_path = format!(
-                "{}/{}/{}",
-                self.input.group_id, self.input.bucket, self.input.key
-            );
+            let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
+                Ok(key) => key.into(),
+                Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+            };
             smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_PATH_DB.to_string(),
-                key: frontend_path.into(),
+                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key,
                 txn_id: self.txn_id,
             })]
         } else {
@@ -120,28 +119,7 @@ impl GetObjectOperation {
         }
     }
 
-    pub fn handle_received_path_mapping(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
-            });
-        };
-
-        let Some(val) = value else {
-            return self.emit_error(GetObjectError::NoSuchKey);
-        };
-
-        self.state = GetObjectState::GetBlobInfo;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_LOCATION_DB.to_string(),
-            key: val,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    pub fn handle_received_blob_info(&mut self, event: Event) -> Effects {
+    pub fn handle_received_lookup(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -154,8 +132,9 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::NoSuchKey);
         };
 
-        let location = match BackendLocation::from_bytes(val.as_ref()) {
-            Ok(location) => location,
+        let location = match Location::from_bytes(val.as_ref()) {
+            Ok(Location::Real(location)) => location,
+            Ok(Location::Deleted) => return self.emit_error(GetObjectError::NoSuchKey),
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
@@ -211,8 +190,7 @@ impl Operation for GetObjectOperation {
         match &self.state {
             GetObjectState::Init => self.handle_init(),
             GetObjectState::StartTransaction => self.handle_transaction_started(event),
-            GetObjectState::GetPathMapping => self.handle_received_path_mapping(event),
-            GetObjectState::GetBlobInfo => self.handle_received_blob_info(event),
+            GetObjectState::GetLookup => self.handle_received_lookup(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::Finish => smallvec![],
@@ -249,8 +227,10 @@ mod test {
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{BLOB_LOCATION_DB, BLOB_PATH_DB};
-    use aruna_core::structs::{Backend, BackendConfig, BackendLocation, RealmId, UserIdentity};
+    use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
+    use aruna_core::structs::{
+        Backend, BackendConfig, BackendLocation, Location, LookupKey, RealmId, UserIdentity,
+    };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use futures_util::StreamExt;
@@ -285,7 +265,6 @@ mod test {
         let hasher = Hasher::new_with_bytes(content.as_bytes());
         let hashes = hasher.finalize();
 
-        let group_id = Ulid::new();
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
         let blob_ulid = Ulid::new();
@@ -317,21 +296,25 @@ mod test {
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
         {
+            let hash_lookup_key = LookupKey::from_blake3_hash(hashes.blake3.as_slice())
+                .unwrap()
+                .to_bytes()
+                .unwrap();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: BLOB_LOCATION_DB.to_string(),
-                    key: hashes.blake3.as_slice().into(),
-                    value: location.to_bytes().unwrap().into(),
+                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key: hash_lookup_key.into(),
+                    value: Location::Real(location.clone()).to_bytes().unwrap().into(),
                     txn_id: None,
                 })
                 .await;
 
-            let frontend_path = format!("{group_id}/{bucket}/{key}");
+            let object_lookup_key = LookupKey::object(&bucket, &key).to_bytes().unwrap();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: BLOB_PATH_DB.to_string(),
-                    key: frontend_path.into(),
-                    value: hashes.blake3.as_slice().into(),
+                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key: object_lookup_key.into(),
+                    value: Location::Real(location.clone()).to_bytes().unwrap().into(),
                     txn_id: None,
                 })
                 .await;
@@ -356,7 +339,7 @@ mod test {
                 bucket,
                 key,
                 range: None,
-                group_id,
+                group_id: Ulid::new(),
                 user_identity: UserIdentity {
                     user_id: Default::default(),
                     realm_key: RealmId([0u8; 32]),

@@ -2,9 +2,9 @@ use crate::replication::error::ReplicationError;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::BLOB_LOCATION_DB;
+use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BackendLocation, NegotiationResult};
+use aruna_core::structs::{BackendLocation, Location, LookupKey, NegotiationResult};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -137,15 +137,19 @@ impl IncomingBaoOperation {
         let Some(blake3) = location.get_blake3() else {
             return self.handle_error(ReplicationError::HashMissing);
         };
-        let bytes = match location.to_bytes() {
+        let lookup_key = match LookupKey::from_blake3_hash(blake3).and_then(|key| key.to_bytes()) {
+            Ok(bytes) => bytes,
+            Err(err) => return self.handle_error(err.into()),
+        };
+        let bytes = match Location::Real(location.clone()).to_bytes() {
             Ok(bytes) => bytes,
             Err(err) => return self.handle_error(err.into()),
         };
 
         self.state = IncomingBaoState::CreateBlob;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: BLOB_LOCATION_DB.to_string(),
-            key: blake3.as_slice().into(),
+            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key: lookup_key.into(),
             value: bytes.into(),
             txn_id: self.txn_id,
         })]
@@ -252,8 +256,8 @@ pub mod test {
     use super::*;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{BlobEvent, Event, StorageEvent};
-    use aruna_core::keyspaces::BLOB_LOCATION_DB;
-    use aruna_core::structs::{BackendLocation, NegotiationResult};
+    use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
+    use aruna_core::structs::{BackendLocation, Location, LookupKey, NegotiationResult};
     use aruna_core::types::Key;
     use std::collections::HashMap;
     use std::str::FromStr;
@@ -336,19 +340,23 @@ pub mod test {
         assert_eq!(op.state, IncomingBaoState::CreateBlob);
         assert_eq!(effects.len(), 1);
         let blake3 = location.get_blake3().expect("blake3 hash set");
+        let lookup_key = LookupKey::from_blake3_hash(blake3)
+            .unwrap()
+            .to_bytes()
+            .unwrap();
         assert_eq!(
             effects[0],
             Effect::Storage(StorageEffect::Write {
-                key_space: BLOB_LOCATION_DB.to_string(),
-                key: Key::from(blake3.as_slice().to_vec()),
-                value: location.to_bytes().unwrap().into(),
+                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key: Key::from(lookup_key.clone()),
+                value: Location::Real(location.clone()).to_bytes().unwrap().into(),
                 txn_id: Some(txn_id),
             })
         );
 
         // 5. Feed WriteResult -> Should transition to CommitTransaction
         let event = Event::Storage(StorageEvent::WriteResult {
-            key: Key::from(blake3.as_slice().to_vec()),
+            key: Key::from(lookup_key),
         });
         let effects = op.step(event);
         assert_eq!(op.state, IncomingBaoState::CommitTransaction);

@@ -10,8 +10,6 @@ pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
 pub const S3_LOOKUP_KEYSPACE: &str = "s3_lookup";
 pub const S3_VERSION_KEYSPACE: &str = "s3_versions";
 
-pub const BLOB_LOCATION_DB: &str = "locations";
-pub const BLOB_PATH_DB: &str = "path_locations_mapping";
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";

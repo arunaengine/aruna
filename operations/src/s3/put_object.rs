@@ -1,24 +1,25 @@
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
-use aruna_core::keyspaces::{BLOB_LOCATION_DB, BLOB_PATH_DB};
+use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::BackendLocation;
+use aruna_core::structs::{BackendLocation, Location, LookupKey, VersionKey, VersionMetadata};
 use aruna_core::types::{Effects, GroupId, UserId};
 use bytes::Bytes;
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum PutObjectState {
     Init,
     WriteBlob,
     StartTransaction,
-    CreateBlob,
-    CreatePathMapping,
-    CreatePermissions,
+    CreateHashLookup,
+    CreateObjectLookup,
+    CreateVersionRecord,
     CommitTransaction,
     Finish,
     Error,
@@ -122,18 +123,23 @@ impl PutObjectOperation {
     fn handle_transaction_started(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
             self.txn_id = Some(txn_id);
-            self.state = PutObjectState::CreateBlob;
+            self.state = PutObjectState::CreateHashLookup;
 
             if let Some(output) = self.get_output() {
                 if let Some(blake3_hash) = output.get_blake3() {
-                    let key = blake3_hash.as_slice().into();
-                    let value: ByteView = match output.to_bytes() {
+                    let key = match LookupKey::from_blake3_hash(blake3_hash)
+                        .and_then(|key| key.to_bytes())
+                    {
+                        Ok(key) => key.into(),
+                        Err(e) => return self.emit_error(PutObjectError::ConversionError(e)),
+                    };
+                    let value: ByteView = match Location::Real(output.clone()).to_bytes() {
                         Ok(bytes) => bytes.into(),
                         Err(e) => return self.emit_error(PutObjectError::ConversionError(e)),
                     };
 
                     smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: BLOB_LOCATION_DB.to_string(),
+                        key_space: S3_LOOKUP_KEYSPACE.to_string(),
                         key,
                         value,
                         txn_id: self.txn_id,
@@ -151,26 +157,31 @@ impl PutObjectOperation {
 
     fn handle_blob_created(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            let frontend_path = format!(
-                "{}/{}/{}",
-                self.config.group_id, self.config.request.bucket, self.config.request.key
-            );
-            self.state = PutObjectState::CreatePermissions;
+            let Some(output) = self.get_output().cloned() else {
+                return self.emit_error(PutObjectError::MissingOutput);
+            };
 
-            match self.get_blake3() {
-                None => self.emit_error(PutObjectError::MissingHash("blake3".to_string())),
-                Some(hash) => {
-                    let key = frontend_path.into();
-                    let value = hash.into();
+            self.state = PutObjectState::CreateObjectLookup;
+            let key = match LookupKey::object(
+                self.config.request.bucket.clone(),
+                self.config.request.key.clone(),
+            )
+            .to_bytes()
+            {
+                Ok(key) => key.into(),
+                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+            };
+            let value = match Location::Real(output).to_bytes() {
+                Ok(bytes) => bytes.into(),
+                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+            };
 
-                    smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: BLOB_PATH_DB.to_string(),
-                        key,
-                        value,
-                        txn_id: self.txn_id,
-                    })]
-                }
-            }
+            smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key,
+                value,
+                txn_id: self.txn_id,
+            })]
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
         }
@@ -178,10 +189,47 @@ impl PutObjectOperation {
 
     fn handle_path_mapping_created(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            //TODO: Create permissions
-            // self.state = PutObjectState::CreatePermissions;
-            // [...]
+            let Some(output) = self.get_output().cloned() else {
+                return self.emit_error(PutObjectError::MissingOutput);
+            };
+            let version_id = Ulid::new();
+            self.state = PutObjectState::CreateVersionRecord;
 
+            let key = match VersionKey::new(
+                self.config.request.bucket.clone(),
+                self.config.request.key.clone(),
+                version_id,
+            )
+            .to_bytes()
+            {
+                Ok(key) => key.into(),
+                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+            };
+            let value = match (VersionMetadata {
+                version_id,
+                location: Location::Real(output.clone()),
+                created_at: output.created_at,
+                created_by: output.created_by,
+            })
+            .to_bytes()
+            {
+                Ok(bytes) => bytes.into(),
+                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+            };
+
+            smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key,
+                value,
+                txn_id: self.txn_id,
+            })]
+        } else {
+            self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn handle_version_record_created(&mut self, event: Event) -> Effects {
+        if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             if let Some(txn_id) = self.txn_id {
                 self.state = PutObjectState::CommitTransaction;
                 smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -214,16 +262,6 @@ impl PutObjectOperation {
         smallvec![]
     }
 
-    fn get_blake3(&self) -> Option<Vec<u8>> {
-        self.output
-            .as_ref()?
-            .as_ref()
-            .ok()?
-            .hashes
-            .get("blake3")
-            .cloned()
-    }
-
     fn get_output(&self) -> Option<&BackendLocation> {
         self.output.as_ref()?.as_ref().ok()
     }
@@ -246,9 +284,9 @@ impl Operation for PutObjectOperation {
             PutObjectState::Init => self.handle_init(),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
-            PutObjectState::CreateBlob => self.handle_blob_created(event),
-            PutObjectState::CreatePathMapping => self.handle_blob_created(event),
-            PutObjectState::CreatePermissions => self.handle_path_mapping_created(event),
+            PutObjectState::CreateHashLookup => self.handle_blob_created(event),
+            PutObjectState::CreateObjectLookup => self.handle_path_mapping_created(event),
+            PutObjectState::CreateVersionRecord => self.handle_version_record_created(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
             PutObjectState::Finish => self.emit_finish(),
             PutObjectState::Error => self.abort(),
@@ -295,8 +333,13 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{Backend, BackendConfig};
+    use aruna_core::structs::{
+        Backend, BackendConfig, Location, LookupKey, VersionKey, VersionMetadata,
+    };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -360,5 +403,68 @@ mod test {
             read_to_string(result.get_full_path().unwrap()).unwrap(),
             String::from_utf8_lossy(&data[..]).to_string()
         );
+
+        let hash_lookup_key = LookupKey::from_blake3_hash(result.get_blake3().unwrap())
+            .unwrap()
+            .to_bytes()
+            .unwrap();
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(hash_lookup_value),
+            ..
+        }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key: hash_lookup_key.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing hash lookup entry");
+        };
+        assert_eq!(
+            Location::from_bytes(hash_lookup_value.as_ref()).unwrap(),
+            Location::Real(result.clone())
+        );
+
+        let object_lookup_key = LookupKey::object("mybucket", "some-file.txt")
+            .to_bytes()
+            .unwrap();
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(object_lookup_value),
+            ..
+        }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key: object_lookup_key.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing object lookup entry");
+        };
+        assert_eq!(
+            Location::from_bytes(object_lookup_value.as_ref()).unwrap(),
+            Location::Real(result.clone())
+        );
+
+        let version_prefix = VersionKey::object_prefix("mybucket", "some-file.txt").unwrap();
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                prefix: Some(version_prefix.into()),
+                start_after: None,
+                limit: 10,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing version metadata entry");
+        };
+        assert_eq!(values.len(), 1);
+        let version = VersionMetadata::from_bytes(values[0].1.as_ref()).unwrap();
+        assert_eq!(version.location, Location::Real(result));
     }
 }
