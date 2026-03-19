@@ -61,7 +61,6 @@ pub struct GetObjectInput {
     pub range: Option<Range<u64>>,
     pub group_id: Ulid,
     pub user_identity: UserIdentity,
-    //TODO: tbc
 }
 
 #[derive(Debug, PartialEq)]

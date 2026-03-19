@@ -66,6 +66,14 @@ impl S3Access for AuthProvider {
             .access_key;
         let user_access = self.query_user_access(access_key_id).await?;
 
+        if user_access.issued_by != *self.node_id.as_bytes() {
+            return Err(s3_error!(InvalidAccessKeyId, "Credential issuer mismatch"));
+        }
+
+        if user_access.is_revoked() {
+            return Err(s3_error!(AccessDenied, "Credential has been revoked"));
+        }
+
         if user_access.is_expired(SystemTime::now()) {
             return Err(s3_error!(AccessDenied, "Credential has expired"));
         }
@@ -82,7 +90,7 @@ impl S3Access for AuthProvider {
                 auth_context: AuthContext {
                     user_id: user_access.user_identity.user_id,
                     realm_id: user_access.user_identity.realm_key.clone(),
-                    path_restrictions: None,
+                    path_restrictions: user_access.path_restrictions.clone(),
                 },
                 path,
                 required_permission,

@@ -13,6 +13,9 @@ use thiserror::Error;
 
 pub struct Config {
     pub storage_path: String,
+    pub blob_root: String,
+    pub blob_bucket_prefix: Option<String>,
+    pub blob_max_bucket_size: Option<u64>,
     pub http_socket_addr: SocketAddr,
     pub p2p_socket_addr: SocketAddr,
     pub node_capabilities: NodeCapabilities,
@@ -54,6 +57,14 @@ pub enum SetupError {
 
 pub fn read_config() -> Result<Config, SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
+    let blob_root =
+        dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
+    let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
+    let blob_max_bucket_size = dotenvy::var("BLOB_MAX_BUCKET_SIZE")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .or(Some(100_000));
     let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
@@ -118,6 +129,9 @@ pub fn read_config() -> Result<Config, SetupError> {
 
     Ok(Config {
         storage_path,
+        blob_root,
+        blob_bucket_prefix,
+        blob_max_bucket_size,
         http_socket_addr,
         p2p_socket_addr,
         node_capabilities,

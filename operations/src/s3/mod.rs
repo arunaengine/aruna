@@ -7,3 +7,4 @@ pub mod get_object;
 pub mod get_user_access;
 pub mod list_buckets;
 pub mod put_object;
+pub mod revoke_user_access;

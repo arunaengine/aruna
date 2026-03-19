@@ -13,8 +13,8 @@ use ulid::Ulid;
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutgoingBaoState {
     Init,
+    ReadBlobLocation,
     OpenConnection,
-    GetBlobInfo,
     NegotiateReplication,
     Replicate,
     Finish,
@@ -40,7 +40,7 @@ pub enum OutgoingBaoError {
 pub struct OutgoingBaoOperation {
     state: OutgoingBaoState,
     node_id: NodeId,
-    hash: [u8; 32], // or path?
+    hash: [u8; 32],
     location: Option<BackendLocation>,
     stream_id: Option<Ulid>,
     replication_id: Option<Ulid>,
@@ -77,7 +77,7 @@ impl OutgoingBaoOperation {
             );
         }
 
-        self.state = OutgoingBaoState::GetBlobInfo;
+        self.state = OutgoingBaoState::ReadBlobLocation;
         let key = match LookupKey::Blake3Hash(self.hash).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.handle_error(ReplicationError::ConversionError(err)),
@@ -216,7 +216,7 @@ impl Operation for OutgoingBaoOperation {
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             OutgoingBaoState::Init => self.handle_init(),
-            OutgoingBaoState::GetBlobInfo => self.handle_info_received(event),
+            OutgoingBaoState::ReadBlobLocation => self.handle_info_received(event),
             OutgoingBaoState::OpenConnection => self.handle_connection_opened(event),
             OutgoingBaoState::NegotiateReplication => self.handle_negotiation_result(event),
             OutgoingBaoState::Replicate => self.handle_replication_finished(event),
@@ -284,9 +284,9 @@ pub mod test {
         let hash = [0u8; 32];
         let mut op = OutgoingBaoOperation::new(node_id, hash);
 
-        // 1. Start -> Should transition to GetBlobInfo and emit Storage::Read
+        // 1. Start -> Should transition to ReadBlobLocation and emit Storage::Read
         let effects = op.start();
-        assert_eq!(op.state, OutgoingBaoState::GetBlobInfo);
+        assert_eq!(op.state, OutgoingBaoState::ReadBlobLocation);
         assert_eq!(effects.len(), 1);
         let key = Key::from(LookupKey::Blake3Hash(hash).to_bytes().unwrap());
         assert_eq!(
@@ -384,12 +384,12 @@ pub mod test {
         assert_eq!(
             op.finalize().unwrap_err(),
             ReplicationError::OutgoingBaoError(OutgoingBaoError::InvalidState {
-                current: OutgoingBaoState::GetBlobInfo,
+                current: OutgoingBaoState::ReadBlobLocation,
                 expected: OutgoingBaoState::Init,
             })
         );
 
-        // 2. Invalid event at GetBlobInfo
+        // 2. Invalid event at ReadBlobLocation
         let mut op = OutgoingBaoOperation::new(node_id, hash);
         op.start();
         let effects = op.step(Event::Blob(BlobEvent::DeleteFinished));

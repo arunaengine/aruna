@@ -3,7 +3,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{UserAccess, UserIdentity};
+use aruna_core::structs::{PathRestriction, UserAccess, UserIdentity};
 use aruna_core::types::{Effects, GroupId};
 use rand::distr::Alphanumeric;
 use rand::{Rng, rng};
@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use ulid::Ulid;
 
-const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
+pub const DEFAULT_CREDENTIAL_TTL: Duration = Duration::from_secs(24 * 60 * 60 * 365);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CreateUserAccessState {
@@ -50,18 +50,25 @@ pub enum CreateUserAccessError {
 }
 
 #[derive(Debug, PartialEq)]
+pub struct CreateUserAccessConfig {
+    pub user_identity: UserIdentity,
+    pub group_id: GroupId,
+    pub expiry: SystemTime,
+    pub path_restrictions: Option<Vec<PathRestriction>>,
+    pub issued_by: [u8; 32],
+}
+
+#[derive(Debug, PartialEq)]
 pub struct CreateUserAccessOperation {
-    user_identity: UserIdentity,
-    group_id: GroupId,
+    config: CreateUserAccessConfig,
     state: CreateUserAccessState,
     output: Result<(String, UserAccess), CreateUserAccessError>,
 }
 
 impl CreateUserAccessOperation {
-    pub fn new(user_identity: UserIdentity, group_id: GroupId) -> Self {
+    pub fn new(config: CreateUserAccessConfig) -> Self {
         Self {
-            user_identity,
-            group_id,
+            config,
             state: CreateUserAccessState::Init,
             output: Err(CreateUserAccessError::NotFinished),
         }
@@ -70,20 +77,24 @@ impl CreateUserAccessOperation {
     fn handle_init(&mut self) -> Effects {
         if let CreateUserAccessState::Init = self.state {
             let key_id = Ulid::new().to_string();
-            let access_key = match UserAccess::build_access_key(&self.user_identity, &key_id) {
+            let access_key = match UserAccess::build_access_key(&self.config.user_identity, &key_id)
+            {
                 Ok(access_key) => access_key,
                 Err(err) => return self.handle_error(err.into()),
             };
             let access = UserAccess {
                 access_key: access_key.clone(),
-                user_identity: self.user_identity.clone(),
-                group_id: self.group_id,
+                user_identity: self.config.user_identity.clone(),
+                group_id: self.config.group_id,
                 secret: rng()
                     .sample_iter(&Alphanumeric)
                     .take(30)
                     .map(char::from)
                     .collect::<String>(),
-                expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
+                expiry: self.config.expiry,
+                path_restrictions: self.config.path_restrictions.clone(),
+                issued_by: self.config.issued_by,
+                revoked_at: None,
             };
             let bytes = match access.to_bytes() {
                 Ok(bytes) => bytes,
@@ -188,6 +199,16 @@ mod tests {
     use super::*;
     use aruna_core::structs::{RealmId, UserIdentity};
 
+    fn make_config(user_identity: UserIdentity, group_id: GroupId) -> CreateUserAccessConfig {
+        CreateUserAccessConfig {
+            user_identity,
+            group_id,
+            expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
+            path_restrictions: None,
+            issued_by: [0u8; 32],
+        }
+    }
+
     fn make_user_identity() -> UserIdentity {
         UserIdentity {
             user_id: Ulid::new(),
@@ -199,7 +220,7 @@ mod tests {
     fn test_create_user_access_happy_path() {
         let user_identity = make_user_identity();
         let group_id = Ulid::new();
-        let mut op = CreateUserAccessOperation::new(user_identity.clone(), group_id);
+        let mut op = CreateUserAccessOperation::new(make_config(user_identity.clone(), group_id));
 
         // 1. Start -> Should transition to CreateUserAccess and emit Storage::Write
         let effects = op.start();
@@ -227,6 +248,9 @@ mod tests {
         assert_eq!(access.user_identity, user_identity);
         assert_eq!(access.group_id, group_id);
         assert_eq!(access.secret.len(), 30);
+        assert_eq!(access.path_restrictions, None);
+        assert_eq!(access.issued_by, [0u8; 32]);
+        assert_eq!(access.revoked_at, None);
 
         // 2. Feed WriteResult -> Should transition to Finish
         let write_key = key.clone();
@@ -253,7 +277,7 @@ mod tests {
         let group_id = Ulid::new();
 
         // 1. Invalid state: start twice -> second start calls abort since state is not Init
-        let mut op = CreateUserAccessOperation::new(user_identity.clone(), group_id);
+        let mut op = CreateUserAccessOperation::new(make_config(user_identity.clone(), group_id));
         op.start();
         // State is now CreateUserAccess; calling start again calls handle_init which calls abort.
         // abort returns empty effects (output is still Err since WriteResult not yet received).
@@ -266,7 +290,7 @@ mod tests {
         ));
 
         // 2. Invalid event at CreateUserAccess state (wrong event type)
-        let mut op = CreateUserAccessOperation::new(user_identity.clone(), group_id);
+        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
         op.start();
         // Feed a ReadResult instead of WriteResult
         let key = Ulid::new().to_bytes().into();

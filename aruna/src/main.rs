@@ -57,10 +57,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let blob_handle = BlobHandler::new(
         BackendConfig {
             backend_type: FileSystem,
-            root: "/tmp".to_string(),
+            root: config.blob_root.clone(),
             service_config: HashMap::new(),
-            bucket_prefix: None,
-            max_bucket_size: Some(100000),
+            bucket_prefix: config.blob_bucket_prefix.clone(),
+            max_bucket_size: config.blob_max_bucket_size,
         },
         storage_handle.clone(),
         net_handle.clone(),

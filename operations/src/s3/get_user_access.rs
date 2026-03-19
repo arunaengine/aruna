@@ -163,6 +163,9 @@ mod test {
             group_id: Ulid::new(),
             secret: "SECRET_KEY".to_string(),
             expiry: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            path_restrictions: None,
+            issued_by: [0u8; 32],
+            revoked_at: None,
         };
 
         let _ = storage_handle

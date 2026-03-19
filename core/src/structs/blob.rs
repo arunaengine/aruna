@@ -1,5 +1,5 @@
 use crate::errors::{BlobError, ConversionError};
-use crate::structs::RealmId;
+use crate::structs::{PathRestriction, RealmId};
 use crate::types::UserId;
 use byteview::ByteView;
 use core::fmt;
@@ -291,6 +291,9 @@ pub struct UserAccess {
     pub group_id: Ulid,
     pub secret: String,
     pub expiry: SystemTime,
+    pub path_restrictions: Option<Vec<PathRestriction>>,
+    pub issued_by: [u8; 32],
+    pub revoked_at: Option<SystemTime>,
 }
 
 impl UserAccess {
@@ -317,5 +320,9 @@ impl UserAccess {
 
     pub fn is_expired(&self, now: SystemTime) -> bool {
         self.expiry <= now
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.revoked_at.is_some()
     }
 }

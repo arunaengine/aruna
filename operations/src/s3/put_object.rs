@@ -54,7 +54,6 @@ pub struct PutObjectInput {
     pub key: String,
     pub content_length: Option<u64>,
     pub body: Option<BackendStream<Result<Bytes, StreamError>>>,
-    //TODO: tbc
 }
 
 #[derive(Debug, PartialEq)]
