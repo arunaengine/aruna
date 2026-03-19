@@ -244,7 +244,7 @@ mod test {
     pub async fn test_driver() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
 
         let context = DriverContext {
             storage_handle,
@@ -313,7 +313,7 @@ mod test {
     async fn test_driver_preserves_effect_order_fifo() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
@@ -378,7 +378,7 @@ mod test {
     async fn test_suboperation_depth_limit_is_enforced() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

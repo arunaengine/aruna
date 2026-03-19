@@ -527,7 +527,7 @@ pub mod test {
             display_name: "test".to_string(),
             group_id,
             realm_id: realm_id.clone(),
-            roles: auth_doc.roles.iter().map(|(r, _)| *r).collect(),
+            roles: auth_doc.roles.keys().copied().collect(),
         };
         let auth_context = aruna_core::structs::AuthContext {
             user_id,
@@ -550,7 +550,7 @@ pub mod test {
                 permissions: HashMap::from([(
                     format!(
                         "{}/g/{}/meta/{}",
-                        realm_id.to_string(),
+                        realm_id,
                         group_id.to_string(),
                         Ulid::new(),
                     ),

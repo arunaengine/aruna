@@ -119,6 +119,7 @@ impl BlobHandle {
 }
 
 impl BlobHandler {
+    #[allow(clippy::new_ret_no_self)]
     pub async fn new(
         config: BackendConfig,
         storage: StorageHandle,

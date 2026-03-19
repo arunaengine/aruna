@@ -250,11 +250,7 @@ mod test {
             role_id: Ulid::new(),
             name: "admin".to_string(),
             permissions: HashMap::from([(
-                format!(
-                    "/{}/g/{}/**",
-                    RealmId([0u8; 32]).to_string(),
-                    Ulid::new().to_string()
-                ),
+                format!("/{}/g/{}/**", RealmId([0u8; 32]), Ulid::new().to_string()),
                 Permission::WRITE,
             )]),
             assigned_users: HashSet::from([Ulid::new()]),

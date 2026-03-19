@@ -1,3 +1,5 @@
+#![allow(clippy::large_enum_variant, clippy::result_large_err)]
+
 pub mod add_group_role;
 pub mod add_realm_role;
 pub mod add_user_to_group;

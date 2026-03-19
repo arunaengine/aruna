@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 pub mod bao_tree;
 pub mod blob;
 pub mod error;

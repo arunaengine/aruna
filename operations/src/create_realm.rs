@@ -415,7 +415,7 @@ mod test {
     pub async fn test_realm_creation() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -449,7 +449,7 @@ mod test {
                 user_id: realm_admin,
                 realm_id,
             },
-            realm_description: format!("A realm description"),
+            realm_description: "A realm description".to_string(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let result = drive(realm_operation, &context).await.unwrap();

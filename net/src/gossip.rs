@@ -165,6 +165,7 @@ impl GossipService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn subscribe_owned(
     gossip: Gossip,
     storage: StorageHandle,
@@ -413,7 +414,7 @@ async fn persist_subscriptions(
 ) {
     let persisted: Vec<TopicId> = {
         let guard = subscriptions.read();
-        guard.keys().map(|topic| topic.clone()).collect()
+        guard.keys().cloned().collect()
     };
 
     let Ok(data) = postcard::to_allocvec(&persisted) else {

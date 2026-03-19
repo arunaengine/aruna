@@ -188,7 +188,7 @@ mod test {
     pub async fn test_token_creation() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
 
         let context = DriverContext {
             storage_handle,

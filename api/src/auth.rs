@@ -141,8 +141,8 @@ mod test {
     #[tokio::test]
     pub async fn test_token_capabilities() {
         let mut tempdir = temp_dir();
-        tempdir.push(format!("{}", Ulid::new().to_string()));
-        let storage_handle = storage::FjallStorage::open(&tempdir.to_str().unwrap()).unwrap();
+        tempdir.push(Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
@@ -171,7 +171,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -212,7 +212,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -245,7 +245,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -275,8 +275,8 @@ mod test {
     #[tokio::test]
     pub async fn test_token_validation() {
         let mut tempdir = temp_dir();
-        tempdir.push(format!("{}", Ulid::new().to_string()));
-        let storage_handle = storage::FjallStorage::open(&tempdir.to_str().unwrap()).unwrap();
+        tempdir.push(Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
@@ -307,7 +307,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -380,7 +380,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -420,7 +420,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -455,7 +455,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )

@@ -83,10 +83,8 @@ pub struct ReplicateBlobRequest {
     pub node_id: String,
 }
 
-///
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReplicateBlobResponse {
-    ///
     pub success: bool,
 }
 

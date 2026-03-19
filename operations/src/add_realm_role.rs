@@ -399,7 +399,7 @@ pub mod test {
     pub async fn test_add_role() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -445,7 +445,7 @@ pub mod test {
                 role_id: Ulid::new(),
                 name: "test_role".to_string(),
                 permissions: HashMap::from([(
-                    format!("{}/admin/create_group/*", realm_id.to_string()),
+                    format!("{}/admin/create_group/*", realm_id),
                     Permission::WRITE,
                 )]),
                 assigned_users: HashSet::from([user_id]),

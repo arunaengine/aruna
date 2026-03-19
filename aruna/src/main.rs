@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use aruna::config::read_config;
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};

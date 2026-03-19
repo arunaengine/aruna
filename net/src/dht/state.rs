@@ -1585,7 +1585,7 @@ mod tests {
         let mut state_b = DhtStateMachine::new(local_id_b, local_secret_b, 100);
 
         let key = DhtKeyId::from_data(b"deterministic-key");
-        let trace = vec![
+        let trace = [
             DhtInput::Cmd(DhtCmd::Put {
                 op_id: 1,
                 key,

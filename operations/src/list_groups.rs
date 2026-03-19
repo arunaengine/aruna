@@ -257,7 +257,7 @@ mod test {
     pub async fn test_list_group() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -295,8 +295,8 @@ mod test {
 
         let list_operation = ListGroupOperation::new();
         let mut list_result = drive(list_operation, &context).await.unwrap();
-        list_result.sort_by(|a, b| a.group_id.cmp(&b.group_id));
-        groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+        list_result.sort_by_key(|a| a.group_id);
+        groups.sort_by_key(|a| a.group_id);
 
         assert_eq!(list_result, groups);
 

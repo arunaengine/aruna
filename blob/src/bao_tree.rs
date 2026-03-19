@@ -118,7 +118,7 @@ impl AsyncSliceReader for OpenDalReader {
 
         // Read bytes into buffer
         let mut bs = vec![0u8; len];
-        self.stream.read(&mut bs).await?;
+        self.stream.read_exact(&mut bs).await?;
 
         Ok(Bytes::from(bs))
     }
