@@ -1,9 +1,7 @@
 use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, UserIdentity,
-};
+use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument, UserIdentity};
 use aruna_core::NodeId;
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
@@ -26,6 +24,7 @@ use utoipa::ToSchema;
 /// Build the group routes.
 pub fn rest_router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .route("/users/credentials", post(create_s3_credentials))
         .route("/blobs/replicate", post(replicate_blob))
         .route("/groups/{id}", get(get_group))
         .route("/groups", post(create_group))
