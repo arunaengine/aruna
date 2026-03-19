@@ -1,12 +1,12 @@
+use aruna_core::USER_ACCESS_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{UserAccess, UserIdentity};
 use aruna_core::types::{Effects, GroupId};
-use aruna_core::USER_ACCESS_KEYSPACE;
 use rand::distr::Alphanumeric;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -154,9 +154,7 @@ impl Operation for CreateUserAccessOperation {
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         if CreateUserAccessState::Error == self.state {
-            if let Err(error) = self.output {
-                return Err(error);
-            }
+            self.output?;
             return Err(CreateUserAccessError::CreateUserAccessFailed);
         }
         Ok(self.output)

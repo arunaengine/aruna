@@ -200,7 +200,7 @@ impl BlobHandler {
     }
 
     pub async fn add_connection(&mut self, stream_id: Option<Ulid>, stream: BiStream) -> Ulid {
-        let stream_id = stream_id.unwrap_or_else(Ulid::new);
+        let stream_id = stream_id.unwrap_or_default();
         self.connections.lock().await.insert(stream_id, stream);
         stream_id
     }

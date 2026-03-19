@@ -146,7 +146,7 @@ impl FjallStorage {
                             txn_id,
                         } => self.iterate(key_space, prefix, start_after, limit, txn_id),
                     };
-                    let _ = response_tx.send(event);
+                    response_tx.send(event);
                 }
                 Err(_) => {
                     tracing::warn!(

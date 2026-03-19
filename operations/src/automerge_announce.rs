@@ -130,7 +130,7 @@ impl Operation for AnnounceAutomergeDocumentOperation {
                     };
                     let heads = match automerge_heads(&value) {
                         Ok(heads) => heads,
-                        Err(error) => return self.fail(ConversionError::from(error).into()),
+                        Err(error) => return self.fail(error.into()),
                     };
                     let message = match postcard::to_allocvec(&AutomergeState::new(
                         self.document.clone(),

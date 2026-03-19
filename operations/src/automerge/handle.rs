@@ -251,21 +251,20 @@ impl AutomergeHandle {
             }
         };
 
-        if let Some(local_init) = response_init.as_ref() {
-            if let Err(error) = write_transport_message(
+        if let Some(local_init) = response_init.as_ref()
+            && let Err(error) = write_transport_message(
                 &mut sync.stream,
                 &AutomergeTransportMessage::Init(local_init.clone()),
             )
             .await
-            {
-                let document = Some(local_init.document.clone());
-                close_stream(&mut sync.stream).await;
-                return AutomergeEvent::SyncRejected {
-                    sync_id,
-                    document,
-                    error,
-                };
-            }
+        {
+            let document = Some(local_init.document.clone());
+            close_stream(&mut sync.stream).await;
+            return AutomergeEvent::SyncRejected {
+                sync_id,
+                document,
+                error,
+            };
         }
 
         let document = response_init

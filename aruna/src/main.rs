@@ -1,8 +1,10 @@
-use std::collections::HashMap;
 use aruna::config::read_config;
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
+use aruna_blob::blob::BlobHandler;
+use aruna_core::structs::Backend::FileSystem;
+use aruna_core::structs::BackendConfig;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -12,13 +14,11 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
-use aruna_blob::blob::BlobHandler;
-use aruna_core::structs::Backend::FileSystem;
-use aruna_core::structs::BackendConfig;
 
 #[tokio::main]
 async fn main() {
@@ -107,13 +107,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // REST Server
-    let state = Arc::new(ServerState::new(
-        driver_ctx.clone(),
-        config.realm_id,
-        config.node_id,
-        config.node_capabilities,
-        None,
-    ).await);
+    let state = Arc::new(
+        ServerState::new(
+            driver_ctx.clone(),
+            config.realm_id,
+            config.node_id,
+            config.node_capabilities,
+            None,
+        )
+        .await,
+    );
 
     let server_config = ServerConfig {
         http_addr: config.http_socket_addr,

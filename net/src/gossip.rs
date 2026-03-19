@@ -413,7 +413,7 @@ async fn persist_subscriptions(
 ) {
     let persisted: Vec<TopicId> = {
         let guard = subscriptions.read();
-        guard.iter().map(|(topic, _)| topic.clone()).collect()
+        guard.keys().map(|topic| topic.clone()).collect()
     };
 
     let Ok(data) = postcard::to_allocvec(&persisted) else {
