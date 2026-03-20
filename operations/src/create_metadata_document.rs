@@ -3,7 +3,7 @@ use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, DhtError, StorageError};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keys::realm_presence_key;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{boxed_suboperation, Operation};
 use aruna_core::structs::{Actor, MetadataDocument, RealmConfigDocument};
 use rand::seq::SliceRandom;
 use smallvec::smallvec;
@@ -184,7 +184,10 @@ impl Operation for CreateMetadataDocumentOperation {
                     self.output = Some(Ok(self.config.document.clone()));
                     self.state = CreateMetadataDocumentState::Announce;
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceAutomergeDocumentOperation::new(self.document_ref()),
+                        AnnounceAutomergeDocumentOperation::new(
+                            self.document_ref(),
+                            self.config.actor.node_id,
+                        ),
                         |result| {
                             Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                                 result: result.map_err(|error| error.to_string()),
@@ -231,6 +234,7 @@ impl Operation for CreateMetadataDocumentOperation {
                     self.state = CreateMetadataDocumentState::LoadReplicationTargets;
                     smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
                         key: *realm_presence_key(&self.config.actor.realm_id).as_bytes(),
+                        realm_filter: Some(self.config.actor.realm_id.clone()),
                     }))]
                 }
                 Event::Storage(StorageEvent::Error { .. }) => {
@@ -240,6 +244,7 @@ impl Operation for CreateMetadataDocumentOperation {
                     self.state = CreateMetadataDocumentState::LoadReplicationTargets;
                     smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
                         key: *realm_presence_key(&self.config.actor.realm_id).as_bytes(),
+                        realm_filter: Some(self.config.actor.realm_id.clone()),
                     }))]
                 }
                 other => self.unexpected_event("storage read result", format!("{other:?}")),

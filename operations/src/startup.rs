@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
-use aruna_core::TopicId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::TopicId;
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -19,6 +19,7 @@ use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 
 #[derive(Debug, PartialEq)]
 pub struct RestoreAutomergeSubscriptionsOperation {
+    local_node_id: aruna_core::NodeId,
     state: RestoreAutomergeSubscriptionsState,
     documents: Vec<aruna_core::automerge::AutomergeDocumentVariant>,
     subscriptions: HashSet<TopicId>,
@@ -54,8 +55,9 @@ pub enum RestoreAutomergeSubscriptionsError {
 }
 
 impl RestoreAutomergeSubscriptionsOperation {
-    pub fn new() -> Self {
+    pub fn new(local_node_id: aruna_core::NodeId) -> Self {
         Self {
+            local_node_id,
             state: RestoreAutomergeSubscriptionsState::Init,
             documents: Vec::new(),
             subscriptions: HashSet::new(),
@@ -85,7 +87,7 @@ impl RestoreAutomergeSubscriptionsOperation {
 
 impl Default for RestoreAutomergeSubscriptionsOperation {
     fn default() -> Self {
-        Self::new()
+        Self::new(iroh::SecretKey::from_bytes(&[0u8; 32]).public())
     }
 }
 
@@ -180,7 +182,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                     if let Some(document) = self.documents.pop() {
                         self.state = RestoreAutomergeSubscriptionsState::WaitAnnouncement;
                         smallvec![Effect::SubOperation(boxed_suboperation(
-                            AnnounceAutomergeDocumentOperation::new(document),
+                            AnnounceAutomergeDocumentOperation::new(document, self.local_node_id),
                             |result| {
                                 Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                                     result: result.map_err(|error| error.to_string()),
@@ -203,7 +205,10 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                             if let Some(document) = self.documents.pop() {
                                 self.state = RestoreAutomergeSubscriptionsState::WaitAnnouncement;
                                 smallvec![Effect::SubOperation(boxed_suboperation(
-                                    AnnounceAutomergeDocumentOperation::new(document),
+                                    AnnounceAutomergeDocumentOperation::new(
+                                        document,
+                                        self.local_node_id,
+                                    ),
                                     |result| {
                                         Event::SubOperation(
                                             SubOperationEvent::AutomergeStateResult {

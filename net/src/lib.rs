@@ -15,6 +15,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
+use aruna_core::structs::RealmId;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use crossfire::TrySendError;
@@ -35,6 +36,7 @@ pub use streams::StreamsService;
 pub struct NetConfig {
     pub bind_addr: SocketAddr,
     pub secret_key: Option<iroh::SecretKey>,
+    pub realm_id: RealmId,
     pub bootstrap_nodes: Vec<NodeId>,
     pub use_dns_discovery: bool,
 }
@@ -44,6 +46,7 @@ impl Default for NetConfig {
         Self {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             secret_key: None,
+            realm_id: RealmId::from_bytes([0u8; 32]),
             bootstrap_nodes: vec![],
             use_dns_discovery: true,
         }
@@ -55,6 +58,7 @@ impl std::fmt::Debug for NetConfig {
         f.debug_struct("NetConfig")
             .field("bind_addr", &self.bind_addr)
             .field("has_secret_key", &self.secret_key.is_some())
+            .field("realm_id", &self.realm_id)
             .field("bootstrap_nodes", &self.bootstrap_nodes.len())
             .field("use_dns_discovery", &self.use_dns_discovery)
             .finish()
@@ -150,6 +154,7 @@ impl NetHandle {
                 endpoint.clone(),
                 storage.clone(),
                 dht.clone(),
+                config.realm_id.clone(),
                 config.bootstrap_nodes.clone(),
                 shutdown.child_token(),
                 gossip_msg_tx.clone(),

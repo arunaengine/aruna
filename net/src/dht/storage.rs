@@ -1,4 +1,5 @@
 use aruna_core::id::NodeId;
+use aruna_core::structs::RealmId;
 use aruna_core::util::unix_timestamp_secs;
 use serde::{Deserialize, Serialize};
 pub const CLEANUP_PAGE_SIZE: usize = 256;
@@ -6,6 +7,7 @@ pub const CLEANUP_PAGE_SIZE: usize = 256;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEntry {
     pub publisher: NodeId,
+    pub realm_id: RealmId,
     pub value: Vec<u8>,
     pub expires_at: u64,
     pub signature: Option<iroh::Signature>,
@@ -33,7 +35,10 @@ pub fn merge_entry(
 ) -> Vec<StoredEntry> {
     let mut filtered: Vec<StoredEntry> = entries
         .into_iter()
-        .filter(|entry| entry.expires_at > now && entry.publisher != new_entry.publisher)
+        .filter(|entry| {
+            entry.expires_at > now
+                && (entry.publisher != new_entry.publisher || entry.realm_id != new_entry.realm_id)
+        })
         .collect();
     filtered.push(new_entry);
     filtered

@@ -9,6 +9,7 @@ use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keys::automerge_document_holder_key;
+use aruna_core::structs::RealmId;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_net::streams::BiStream;
 use aruna_net::{InboundEventHandler, NetConfig, NetHandle};
@@ -137,6 +138,7 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
         let put = handle_a
             .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
                 key,
+                realm_id: RealmId::from_bytes([1u8; 32]),
                 value: value.clone(),
                 ttl: Duration::from_secs(3600),
             })))
@@ -160,7 +162,10 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
     let mut found = false;
     for _ in 0..10 {
         let get = handle_b
-            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get { key })))
+            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
+                key,
+                realm_filter: None,
+            })))
             .await;
 
         if let Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) = get
@@ -206,7 +211,7 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
-    let topic = TopicId::realm(Ulid::new());
+    let topic = TopicId::realm(RealmId::from_bytes([2u8; 32]));
 
     let subscribe_a = handle_a
         .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
@@ -311,6 +316,7 @@ async fn test_automerge_topic_subscription_announces_document_holders()
         let get = handle_b
             .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
                 key: holder_key,
+                realm_filter: None,
             })))
             .await;
 
@@ -446,7 +452,7 @@ fn test_dht_key_id_hashing() {
 
 #[test]
 fn test_topic_id_creation() {
-    let realm_id = Ulid::new();
+    let realm_id = RealmId::from_bytes([3u8; 32]);
     let topic1 = TopicId::realm(realm_id);
 
     let bytes = topic1.to_bytes();

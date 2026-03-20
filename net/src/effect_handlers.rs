@@ -17,18 +17,23 @@ pub async fn handle_net_effect(
 
 async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
     match effect {
-        DhtEffect::Put { key, value, ttl } => {
+        DhtEffect::Put {
+            key,
+            realm_id,
+            value,
+            ttl,
+        } => {
             let key_id = aruna_core::id::DhtKeyId::from_bytes(key);
-            match dht.put(&key_id, value, ttl).await {
+            match dht.put(&key_id, realm_id, value, ttl).await {
                 Ok(()) => NetEvent::Dht(DhtEvent::PutComplete { key }),
                 Err(e) => NetEvent::Dht(DhtEvent::Error {
                     error: aruna_core::errors::DhtError::StoreFailed(e.to_string()),
                 }),
             }
         }
-        DhtEffect::Get { key } => {
+        DhtEffect::Get { key, realm_filter } => {
             let key_id = aruna_core::id::DhtKeyId::from_bytes(key);
-            match dht.get(&key_id).await {
+            match dht.get(&key_id, realm_filter).await {
                 Ok(values) => NetEvent::Dht(DhtEvent::GetResult { key, values }),
                 Err(e) => NetEvent::Dht(DhtEvent::Error {
                     error: aruna_core::errors::DhtError::Other(e.to_string()),

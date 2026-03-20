@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::structs::RealmId;
 use thiserror::Error;
 
 use super::rpc::{DhtRequest, DhtResponse};
@@ -25,12 +26,14 @@ pub enum DhtCmd {
     Put {
         op_id: OpId,
         key: DhtKeyId,
+        realm_id: RealmId,
         value: Vec<u8>,
         ttl: Duration,
     },
     Get {
         op_id: OpId,
         key: DhtKeyId,
+        realm_filter: Option<RealmId>,
     },
     Bootstrap {
         op_id: OpId,

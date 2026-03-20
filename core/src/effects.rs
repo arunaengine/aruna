@@ -6,6 +6,7 @@ use crate::id::NodeId;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::BackendLocation;
+use crate::structs::RealmId;
 use crate::task::TaskEffect;
 use crate::types::UserId;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
@@ -121,11 +122,13 @@ pub enum NetEffect {
 pub enum DhtEffect {
     Put {
         key: DhtKey,
+        realm_id: RealmId,
         value: Vec<u8>,
         ttl: Duration,
     },
     Get {
         key: DhtKey,
+        realm_filter: Option<RealmId>,
     },
 }
 

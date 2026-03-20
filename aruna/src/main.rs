@@ -48,6 +48,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NetConfig {
             bind_addr: config.p2p_socket_addr,
             secret_key: Some(config.net_secret_key.clone()),
+            realm_id: config.realm_id.clone(),
             bootstrap_nodes: config.bootstrap_nodes.clone(),
             use_dns_discovery: false,
         },
@@ -81,7 +82,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     aruna_operations::task_incoming::initialize_task_incoming(driver_ctx.clone(), task_handle)
         .await;
     drive(
-        aruna_operations::startup::RestoreAutomergeSubscriptionsOperation::new(),
+        aruna_operations::startup::RestoreAutomergeSubscriptionsOperation::new(config.node_id),
         driver_ctx.as_ref(),
     )
     .await?;

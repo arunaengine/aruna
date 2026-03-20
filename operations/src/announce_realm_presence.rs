@@ -105,6 +105,7 @@ impl Operation for AnnounceRealmPresenceOperation {
         self.state = AnnounceRealmPresenceState::PutPresence;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
             key: self.presence_key(),
+            realm_id: self.config.realm_id.clone(),
             value: self.config.node_id.as_bytes().to_vec(),
             ttl: REALM_PRESENCE_TTL,
         }))]

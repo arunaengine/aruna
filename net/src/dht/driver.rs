@@ -6,6 +6,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keyspaces::DHT_KEYSPACE;
+use aruna_core::structs::RealmId;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
@@ -43,12 +44,14 @@ type IoReceiver = AsyncRx<mpsc::Array<DhtIo>>;
 pub enum DriverCmd {
     Put {
         key: DhtKeyId,
+        realm_id: RealmId,
         value: Vec<u8>,
         ttl: Duration,
         reply: oneshot::Sender<CallerOutcome>,
     },
     Get {
         key: DhtKeyId,
+        realm_filter: Option<RealmId>,
         reply: oneshot::Sender<CallerOutcome>,
     },
     Bootstrap {
@@ -67,14 +70,25 @@ impl std::fmt::Debug for DriverCmd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Put {
-                key, value, ttl, ..
+                key,
+                realm_id,
+                value,
+                ttl,
+                ..
             } => f
                 .debug_struct("DriverCmd::Put")
                 .field("key", key)
+                .field("realm_id", realm_id)
                 .field("value_len", &value.len())
                 .field("ttl", ttl)
                 .finish(),
-            Self::Get { key, .. } => f.debug_struct("DriverCmd::Get").field("key", key).finish(),
+            Self::Get {
+                key, realm_filter, ..
+            } => f
+                .debug_struct("DriverCmd::Get")
+                .field("key", key)
+                .field("realm_filter", realm_filter)
+                .finish(),
             Self::Bootstrap { nodes, .. } => f
                 .debug_struct("DriverCmd::Bootstrap")
                 .field("nodes", &nodes.len())
@@ -193,6 +207,7 @@ impl DhtDriver {
         match cmd {
             DriverCmd::Put {
                 key,
+                realm_id,
                 value,
                 ttl,
                 reply,
@@ -201,13 +216,22 @@ impl DhtDriver {
                 self.process_input(DhtInput::Cmd(DhtCmd::Put {
                     op_id,
                     key,
+                    realm_id,
                     value,
                     ttl,
                 }));
             }
-            DriverCmd::Get { key, reply } => {
+            DriverCmd::Get {
+                key,
+                realm_filter,
+                reply,
+            } => {
                 let op_id = self.register_caller(reply);
-                self.process_input(DhtInput::Cmd(DhtCmd::Get { op_id, key }));
+                self.process_input(DhtInput::Cmd(DhtCmd::Get {
+                    op_id,
+                    key,
+                    realm_filter,
+                }));
             }
             DriverCmd::Bootstrap { nodes, reply } => {
                 let op_id = self.register_caller(reply);
