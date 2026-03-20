@@ -2,7 +2,7 @@ use crate::errors::ConversionError;
 use crate::structs::Actor;
 use crate::structs::group::autosurgeon_role_map;
 use crate::structs::structs::{Permission, Role};
-use crate::types::{GroupId, RoleId, UserId, autosurgeon_ulid};
+use crate::types::{GroupId, RoleId, autosurgeon_ulid};
 use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use core::fmt;
 use ed25519_dalek::VerifyingKey;
@@ -131,7 +131,7 @@ impl std::fmt::Display for RealmLevelOperation {
 }
 
 impl RealmAuthorizationDocument {
-    pub fn new_default_realm_doc(user_id: UserId, realm_id: RealmId) -> Self {
+    pub fn new_default_realm_doc(realm_id: RealmId) -> Self {
         let mut roles = HashMap::new();
         let admin = Ulid::new();
         roles.insert(
@@ -140,7 +140,7 @@ impl RealmAuthorizationDocument {
                 role_id: admin,
                 name: "realm_admin".to_string(),
                 permissions: HashMap::from([(format!("/{realm_id}/admin/**"), Permission::WRITE)]),
-                assigned_users: HashSet::from([(user_id)]),
+                assigned_users: HashSet::new(),
             },
         );
         RealmAuthorizationDocument {
@@ -360,8 +360,7 @@ mod test {
 
     #[test]
     pub fn test_realm_auth_doc_conversion() {
-        let auth_doc =
-            RealmAuthorizationDocument::new_default_realm_doc(Ulid::new(), RealmId([0u8; 32]));
+        let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(RealmId([0u8; 32]));
         let mut automerge_doc = automerge::AutoCommit::new();
         reconcile(&mut automerge_doc, &auth_doc).unwrap();
 
@@ -371,6 +370,9 @@ mod test {
         let hydrated_auth_doc: RealmAuthorizationDocument = hydrate(&stored_automerge_doc).unwrap();
 
         assert_eq!(auth_doc, hydrated_auth_doc);
+        assert!(hydrated_auth_doc.roles.iter().any(|(_id, role)| {
+            role.name == "realm_admin" && role.assigned_users.is_empty()
+        }));
     }
 
     #[test]

@@ -3,11 +3,16 @@ use crate::error::TokenError;
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::API_STATE_KEYSPACE;
-use aruna_core::structs::{NodeCapabilities, RealmId};
-use aruna_operations::driver::DriverContext;
+use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId};
+use aruna_operations::claim_initial_realm_admin::{
+    ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    ClaimInitialRealmAdminResult,
+};
+use aruna_operations::driver::{DriverContext, drive};
 use base64::Engine;
 use byteview::ByteView;
 use ed25519_dalek::VerifyingKey;
@@ -16,6 +21,7 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use jsonwebtoken::DecodingKey;
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -24,6 +30,7 @@ use utoipa_swagger_ui::SwaggerUi;
 
 const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
 const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
+const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 
 #[derive(Clone, Debug)]
 pub struct ServerState {
@@ -37,6 +44,7 @@ pub struct ServerState {
     token_revocation_list: Arc<RwLock<HashSet<String, ahash::RandomState>>>,
     // Contains trusted realms
     trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
+    initial_admin_claim: Option<Arc<AtomicBool>>,
     // Realm membership
     realm_id: RealmId,
     // Realm membership
@@ -51,6 +59,7 @@ impl ServerState {
         realm_id: RealmId,
         node_id: NodeId,
         node_capabilities: NodeCapabilities,
+        claim_initial_admin_enabled: bool,
         oidc_validator: Option<Arc<OidcValidator>>,
     ) -> Self {
         let token_revocation_list = load_persisted_state::<HashSet<String, ahash::RandomState>>(
@@ -65,6 +74,15 @@ impl ServerState {
         )
         .await
         .unwrap_or_default();
+        let initial_admin_claim = if claim_initial_admin_enabled {
+            Some(Arc::new(AtomicBool::new(
+                load_persisted_state::<bool>(driver_ctx.as_ref(), INITIAL_REALM_ADMIN_CLAIMED_KEY)
+                    .await
+                    .unwrap_or(false),
+            )))
+        } else {
+            None
+        };
         trusted_realms.insert(realm_id.clone());
         let state = Self {
             driver_ctx,
@@ -75,6 +93,7 @@ impl ServerState {
             token_revocation_list: Arc::new(RwLock::new(token_revocation_list)),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
             issuer_keys: Arc::new(RwLock::new(HashMap::default())),
+            initial_admin_claim,
         };
         state.persist_trusted_realms().await;
         state
@@ -152,6 +171,57 @@ impl ServerState {
             .is_some()
     }
 
+    pub async fn claim_initial_realm_admin(
+        &self,
+        auth: &AuthContext,
+    ) -> Result<(), ClaimInitialRealmAdminError> {
+        let Some(initial_admin_claim) = &self.initial_admin_claim else {
+            return Ok(());
+        };
+
+        if auth.realm_id != self.realm_id {
+            return Ok(());
+        }
+
+        if initial_admin_claim.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        for _ in 0..3 {
+            let result = drive(
+                ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                    actor: Actor {
+                        node_id: self.node_id,
+                        user_id: auth.user_id,
+                        realm_id: auth.realm_id.clone(),
+                    },
+                }),
+                &self.driver_ctx,
+            )
+            .await;
+
+            match result {
+                Ok(ClaimInitialRealmAdminResult::Claimed(_))
+                | Ok(ClaimInitialRealmAdminResult::AlreadyClaimed) => {
+                    initial_admin_claim.store(true, Ordering::Release);
+                    self.persist_initial_admin_claimed().await;
+                    return Ok(());
+                }
+                Err(ClaimInitialRealmAdminError::StorageError(StorageError::TransactionConflict)) => {
+                    if initial_admin_claim.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        Err(ClaimInitialRealmAdminError::StorageError(
+            StorageError::TransactionConflict,
+        ))
+    }
+
     async fn persist_token_revocation_list(&self) {
         let blacklist = self.token_revocation_list.read().await.clone();
         persist_state(
@@ -168,6 +238,19 @@ impl ServerState {
             self.driver_ctx.as_ref(),
             TRUSTED_REALMS_LIST_KEY,
             &trusted_realms,
+        )
+        .await;
+    }
+
+    async fn persist_initial_admin_claimed(&self) {
+        let Some(initial_admin_claim) = &self.initial_admin_claim else {
+            return;
+        };
+        let claimed = initial_admin_claim.load(Ordering::Acquire);
+        persist_state(
+            self.driver_ctx.as_ref(),
+            INITIAL_REALM_ADMIN_CLAIMED_KEY,
+            &claimed,
         )
         .await;
     }

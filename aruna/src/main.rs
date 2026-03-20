@@ -1,25 +1,33 @@
 #![allow(clippy::result_large_err)]
 
-use aruna::config::read_config;
+use aruna::config::{StartupMode, load, mark_node_state_complete};
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
+use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
+use aruna_core::structs::NodeCapabilities;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
+use aruna_operations::automerge_announce::AnnounceAutomergeDocumentOperation;
 use aruna_operations::automerge::AutomergeHandle;
+use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::startup::RestoreAutomergeSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
-use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use byteview::ByteView;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -46,8 +54,7 @@ fn init_tracing() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv()?;
-    let config = read_config()?;
-    let storage_handle = storage::FjallStorage::open(&config.storage_path)?;
+    let (config, storage_handle) = load().await?;
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: config.p2p_socket_addr,
@@ -84,24 +91,53 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
-    drive(
-        RestoreAutomergeSubscriptionsOperation::new(config.node_id),
-        driver_ctx.as_ref(),
-    )
-    .await?;
-    drive(
-        EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
-            actor: Actor {
-                node_id: config.node_id,
-                user_id: Ulid::from_bytes([0u8; 16]),
-                realm_id: config.realm_id.clone(),
-            },
-            bootstrap_peers: config.bootstrap_nodes.clone(),
-            default_metadata_replication_factor: config.default_metadata_replication_factor,
-        }),
-        driver_ctx.as_ref(),
-    )
-    .await?;
+
+    match &config.startup_mode {
+        StartupMode::InitializeRealm { realm_description } => {
+            if realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
+                announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
+            } else {
+                drive(
+                    CreateRealmOperation::new(CreateRealmConfig {
+                        actor: Actor {
+                            node_id: config.node_id,
+                            user_id: Ulid::from_bytes([0u8; 16]),
+                            realm_id: config.realm_id.clone(),
+                        },
+                        realm_description: realm_description.clone(),
+                    }),
+                    driver_ctx.as_ref(),
+                )
+                .await?;
+            }
+
+            mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+        }
+        StartupMode::Provisioned => {
+            drive(
+                RestoreAutomergeSubscriptionsOperation::new(config.node_id),
+                driver_ctx.as_ref(),
+            )
+            .await?;
+
+            if matches!(&config.node_capabilities, NodeCapabilities::Management { .. }) {
+                drive(
+                    EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+                        actor: Actor {
+                            node_id: config.node_id,
+                            user_id: Ulid::from_bytes([0u8; 16]),
+                            realm_id: config.realm_id.clone(),
+                        },
+                        bootstrap_peers: config.bootstrap_nodes.clone(),
+                        default_metadata_replication_factor: config.default_metadata_replication_factor,
+                    }),
+                    driver_ctx.as_ref(),
+                )
+                .await?;
+            }
+        }
+    }
+
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
             realm_id: config.realm_id.clone(),
@@ -113,12 +149,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // REST Server
+    let is_initial_node = config.is_initial_node();
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
             config.realm_id.clone(),
             config.node_id,
             config.node_capabilities,
+            is_initial_node,
             None,
         )
         .await,
@@ -161,6 +199,55 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         _ = tokio::signal::ctrl_c() => {
             info!("Shutting down S3 interface");
         }
+    }
+
+    Ok(())
+}
+
+async fn realm_bootstrap_exists(
+    driver_ctx: &DriverContext,
+    realm_id: &aruna_core::structs::RealmId,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let key = ByteView::from(*realm_id.as_bytes());
+
+    for key_space in [AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE] {
+        match driver_ctx
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: key_space.to_string(),
+                key: key.clone(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {}
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => return Ok(false),
+            Event::Storage(StorageEvent::Error { error }) => return Err(Box::new(error)),
+            other => return Err(format!("unexpected storage event: {other:?}").into()),
+        }
+    }
+
+    Ok(true)
+}
+
+async fn announce_core_documents(
+    driver_ctx: &DriverContext,
+    node_id: aruna_core::NodeId,
+    realm_id: &aruna_core::structs::RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for document in [
+        AutomergeDocumentVariant::RealmAuthorization {
+            realm_id: realm_id.clone(),
+        },
+        AutomergeDocumentVariant::RealmConfig {
+            realm_id: realm_id.clone(),
+        },
+    ] {
+        drive(
+            AnnounceAutomergeDocumentOperation::new(document, node_id),
+            driver_ctx,
+        )
+        .await?;
     }
 
     Ok(())

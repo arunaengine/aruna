@@ -8,6 +8,7 @@ pub mod announce_realm_presence;
 pub mod automerge;
 pub mod automerge_announce;
 pub mod check_permissions;
+pub mod claim_initial_realm_admin;
 pub mod create_group;
 pub mod create_metadata_document;
 pub mod create_realm;

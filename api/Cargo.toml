@@ -39,7 +39,9 @@ hyper-util = { version = "0.1.20", features = ["server", "http1", "http2", "toki
 s3s = "0.13.0"
 
 [dev-dependencies]
+aruna-net = { path = "../net" }
 aruna-storage = { path = "../storage" }
+aruna-tasks = { path = "../tasks" }
 iroh = { workspace = true }
 tempfile.workspace = true
 rand = { workspace = true }

@@ -13,6 +13,7 @@ use jsonwebtoken::{Validation, decode};
 use s3s::header;
 use std::str::FromStr;
 use thiserror::Error;
+use tracing::warn;
 
 #[derive(Debug)]
 pub struct OidcValidator {}
@@ -34,7 +35,11 @@ async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Optio
         .and_then(|value| value.strip_prefix("Bearer "))?;
 
     let token = handle_token(state, token).await.ok()?;
-    token.try_into().ok()
+    let auth_context: AuthContext = token.try_into().ok()?;
+    if let Err(error) = state.claim_initial_realm_admin(&auth_context).await {
+        warn!(error = %error, "Failed to claim initial realm admin");
+    }
+    Some(auth_context)
 }
 
 pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaims, TokenError> {
@@ -125,18 +130,43 @@ pub async fn auth_middleware(
 mod test {
     use crate::auth::extract_auth_context;
     use crate::server::ServerState;
-    use aruna_core::structs::{NodeCapabilities, RealmId};
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::{Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId};
+    use aruna_net::{NetConfig, NetHandle};
+    use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use axum::http::{HeaderMap, header};
     use base64::Engine;
+    use byteview::ByteView;
     use chrono::Days;
     use ed25519_dalek::SigningKey;
     use jsonwebtoken::signature::SignerMut;
     use std::sync::Arc;
     use tempfile::env::temp_dir;
     use ulid::Ulid;
+    use aruna_tasks::TaskHandle;
+
+    async fn read_auth_doc(driver_ctx: &DriverContext, realm_id: &RealmId) -> RealmAuthorizationDocument {
+        match driver_ctx
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: AUTH_KEYSPACE.to_string(),
+                key: ByteView::from(*realm_id.as_bytes()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => RealmAuthorizationDocument::from_bytes(&bytes).unwrap(),
+            other => panic!("unexpected auth doc read result: {other:?}"),
+        }
+    }
 
     #[tokio::test]
     pub async fn test_token_capabilities() {
@@ -173,6 +203,7 @@ mod test {
             realm_id.clone(),
             node_id,
             capabilities.clone(),
+            false,
             None,
         )
         .await;
@@ -214,6 +245,7 @@ mod test {
             realm_id.clone(),
             node_id,
             capabilities.clone(),
+            false,
             None,
         )
         .await;
@@ -247,6 +279,7 @@ mod test {
             realm_id.clone(),
             node_id,
             capabilities.clone(),
+            false,
             None,
         )
         .await;
@@ -270,6 +303,127 @@ mod test {
         let ctx = extract_auth_context(&state, &headers).await.unwrap();
         assert_eq!(ctx.realm_id, realm_id);
         assert_eq!(ctx.user_id, token_config.user_id);
+    }
+
+    #[tokio::test]
+    pub async fn test_first_local_user_claims_initial_realm_admin() {
+        let mut tempdir = temp_dir();
+        tempdir.push(Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                use_dns_discovery: false,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let task_handle = TaskHandle::new();
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle.clone()),
+            automerge_handle: None,
+            task_handle: Some(task_handle),
+            blob_handle: None,
+        });
+
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let realm_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+
+        let node_signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        let node_id =
+            iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes()).unwrap();
+
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: Ulid::from_bytes([0u8; 16]),
+                    realm_id: realm_id.clone(),
+                },
+                realm_description: "Realm".to_string(),
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
+        let state = ServerState::new(
+            driver_ctx.clone(),
+            realm_id.clone(),
+            node_id,
+            capabilities.clone(),
+            true,
+            None,
+        )
+        .await;
+
+        let time = chrono::Utc::now().timestamp() as u64;
+        let first_user = Ulid::new();
+        let first_token = drive(
+            CreateTokenOperation::new(CreateTokenConfig {
+                time,
+                expiry: None,
+                user_id: first_user,
+                realm_id: realm_id.clone(),
+                node_capabilities: capabilities.clone(),
+            })
+            .unwrap(),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", first_token)).unwrap(),
+        );
+        let auth_context = extract_auth_context(&state, &headers).await.unwrap();
+        assert_eq!(auth_context.user_id, first_user);
+
+        let auth_doc = read_auth_doc(&driver_ctx, &realm_id).await;
+        assert!(auth_doc.roles.values().any(|role| {
+            role.name == "realm_admin" && role.assigned_users.contains(&first_user)
+        }));
+
+        let second_user = Ulid::new();
+        let second_token = drive(
+            CreateTokenOperation::new(CreateTokenConfig {
+                time,
+                expiry: None,
+                user_id: second_user,
+                realm_id: realm_id.clone(),
+                node_capabilities: capabilities,
+            })
+            .unwrap(),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", second_token)).unwrap(),
+        );
+        let auth_context = extract_auth_context(&state, &headers).await.unwrap();
+        assert_eq!(auth_context.user_id, second_user);
+
+        let auth_doc = read_auth_doc(&driver_ctx, &realm_id).await;
+        let realm_admin = auth_doc
+            .roles
+            .values()
+            .find(|role| role.name == "realm_admin")
+            .unwrap();
+        assert!(realm_admin.assigned_users.contains(&first_user));
+        assert!(!realm_admin.assigned_users.contains(&second_user));
+
+        net_handle.shutdown().await;
     }
 
     #[tokio::test]
@@ -309,6 +463,7 @@ mod test {
             realm_id.clone(),
             node_id,
             capabilities.clone(),
+            false,
             None,
         )
         .await;
@@ -382,6 +537,7 @@ mod test {
             realm_id.clone(),
             node_id,
             capabilities.clone(),
+            false,
             None,
         )
         .await;
@@ -422,6 +578,7 @@ mod test {
             realm_id.clone(),
             node_id,
             capabilities.clone(),
+            false,
             None,
         )
         .await;
@@ -457,6 +614,7 @@ mod test {
             realm_id.clone(),
             node_id,
             capabilities.clone(),
+            false,
             None,
         )
         .await;

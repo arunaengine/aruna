@@ -1,15 +1,23 @@
-use aruna_core::errors::ConversionError;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::structs::{NodeCapabilities, RealmId};
+use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
+use byteview::ByteView;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey};
-use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+use ed25519_dalek::SigningKey;
 use iroh::KeyParsingError;
+use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
 use std::net::SocketAddr;
 use std::num::ParseIntError;
 use std::str::FromStr;
 use thiserror::Error;
+
+const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
 
 pub struct Config {
     pub storage_path: String,
@@ -27,6 +35,40 @@ pub struct Config {
     pub s3_port: u16,
     pub s3_host: String,
     pub s3_address: String,
+    pub onboarding_secret: Option<String>,
+    pub startup_mode: StartupMode,
+    pub node_state: PersistedNodeState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartupMode {
+    InitializeRealm { realm_description: String },
+    Provisioned,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootOrigin {
+    InitializedRealm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistedNodeStatus {
+    PendingInitialization,
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistedNodeIdentity {
+    Management { realm_private_key_pem: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedNodeState {
+    pub boot_origin: BootOrigin,
+    pub status: PersistedNodeStatus,
+    pub realm_id: RealmId,
+    pub net_secret_key: [u8; 32],
+    pub identity: PersistedNodeIdentity,
 }
 
 #[derive(Error, Debug)]
@@ -49,13 +91,27 @@ pub enum SetupError {
     IrohKeyError(#[from] KeyParsingError),
     #[error(transparent)]
     ParseIntError(#[from] ParseIntError),
-    #[error("REALM_PUBLIC_KEY does not match REALM_PRIVATE_KEY")]
-    RealmKeyMismatch,
-    #[error("NODE_PUBLIC_KEY does not match NODE_PRIVATE_KEY")]
-    NodeKeyMismatch,
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    StorageLibError(#[from] StorageLibError),
+    #[error("persisted node state is incompatible with this binary")]
+    UnsupportedNodeIdentity,
+    #[error("persisted node state does not match derived realm id")]
+    PersistedNodeStateMismatch,
+    #[error("onboarding bootstrap is not implemented yet")]
+    OnboardingBootstrapNotImplemented,
+    #[error("unexpected storage event while loading node state: {0}")]
+    UnexpectedStorageEvent(String),
 }
 
-pub fn read_config() -> Result<Config, SetupError> {
+impl Config {
+    pub fn is_initial_node(&self) -> bool {
+        matches!(self.node_state.boot_origin, BootOrigin::InitializedRealm)
+    }
+}
+
+pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
@@ -69,10 +125,6 @@ pub fn read_config() -> Result<Config, SetupError> {
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
     )?;
-    let realm_pubkey = dotenvy::var("REALM_PUBLIC_KEY")?;
-    let realm_privkey = dotenvy::var("REALM_PRIVATE_KEY")?;
-    let node_pubkey = dotenvy::var("NODE_PUBLIC_KEY")?;
-    let node_privkey = dotenvy::var("NODE_PRIVATE_KEY")?;
     let bootstrap_nodes = dotenvy::var("BOOTSTRAP_NODES")
         .ok()
         .map(|nodes| {
@@ -91,57 +143,168 @@ pub fn read_config() -> Result<Config, SetupError> {
         .transpose()?
         .unwrap_or(3)
         .max(1);
-
-    let realm_key = VerifyingKey::from_public_key_pem(&realm_pubkey)?;
-    let realm_id = RealmId::from_bytes(*realm_key.as_bytes());
-    let realm_verifying_key = realm_key
-        .to_public_key_pem(LineEnding::default())?
-        .as_bytes()
-        .try_into()?;
-
-    let realm_signing_key = SigningKey::from_pkcs8_pem(&realm_privkey)?;
-    if realm_signing_key.verifying_key().to_bytes() != realm_key.to_bytes() {
-        return Err(SetupError::RealmKeyMismatch);
-    }
-    let realm_encoding_key = realm_signing_key
-        .to_pkcs8_pem(LineEnding::default())?
-        .as_bytes()
-        .try_into()?;
-
-    let node_key = VerifyingKey::from_public_key_pem(&node_pubkey)?;
-    let node_signing_key = SigningKey::from_pkcs8_pem(&node_privkey)?;
-    let net_secret_key = iroh::SecretKey::from_bytes(&node_signing_key.to_bytes());
-    let node_id = net_secret_key.public();
-    if node_id.as_bytes() != node_key.to_bytes().as_slice() {
-        return Err(SetupError::NodeKeyMismatch);
-    }
-
     let s3_port = dotenvy::var("S3_PORT")?.parse::<u16>()?;
     let s3_host = dotenvy::var("S3_HOST")?;
     let s3_address = dotenvy::var("S3_ADDRESS")?;
+    let realm_description = dotenvy::var("REALM_DESCRIPTION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Aruna Realm".to_string());
+    let onboarding_secret = dotenvy::var("ONBOARDING_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
 
-    // TODO: Configure capabilities
-    let node_capabilities = NodeCapabilities::Management {
-        realm_signing_key,
-        realm_verifying_key,
-        realm_encoding_key,
+    let storage_handle = FjallStorage::open(&storage_path)?;
+    let node_state = match load_persisted_node_state(&storage_handle).await? {
+        Some(state) => state,
+        None => {
+            if onboarding_secret.is_some() {
+                return Err(SetupError::OnboardingBootstrapNotImplemented);
+            }
+
+            let state = generate_initialized_node_state()?;
+            persist_node_state(&storage_handle, &state).await?;
+            state
+        }
     };
 
-    Ok(Config {
-        storage_path,
-        blob_root,
-        blob_bucket_prefix,
-        blob_max_bucket_size,
-        http_socket_addr,
-        p2p_socket_addr,
-        node_capabilities,
-        realm_id,
-        node_id,
-        net_secret_key,
-        bootstrap_nodes,
-        default_metadata_replication_factor,
-        s3_port,
-        s3_host,
-        s3_address,
+    let net_secret_key = iroh::SecretKey::from_bytes(&node_state.net_secret_key);
+    let node_id = net_secret_key.public();
+    let (realm_id, node_capabilities) = node_capabilities_from_state(&node_state)?;
+    if realm_id != node_state.realm_id {
+        return Err(SetupError::PersistedNodeStateMismatch);
+    }
+
+    let startup_mode = match node_state.status {
+        PersistedNodeStatus::PendingInitialization => StartupMode::InitializeRealm {
+            realm_description: realm_description.clone(),
+        },
+        PersistedNodeStatus::Complete => StartupMode::Provisioned,
+    };
+
+    Ok((
+        Config {
+            storage_path,
+            blob_root,
+            blob_bucket_prefix,
+            blob_max_bucket_size,
+            http_socket_addr,
+            p2p_socket_addr,
+            node_capabilities,
+            realm_id,
+            node_id,
+            net_secret_key,
+            bootstrap_nodes,
+            default_metadata_replication_factor,
+            s3_port,
+            s3_host,
+            s3_address,
+            onboarding_secret,
+            startup_mode,
+            node_state,
+        },
+        storage_handle,
+    ))
+}
+
+pub async fn mark_node_state_complete(
+    storage: &StorageHandle,
+    node_state: &PersistedNodeState,
+) -> Result<(), SetupError> {
+    if matches!(node_state.status, PersistedNodeStatus::Complete) {
+        return Ok(());
+    }
+
+    let mut updated_state = node_state.clone();
+    updated_state.status = PersistedNodeStatus::Complete;
+    persist_node_state(storage, &updated_state).await
+}
+
+fn node_capabilities_from_state(
+    node_state: &PersistedNodeState,
+) -> Result<(RealmId, NodeCapabilities), SetupError> {
+    match &node_state.identity {
+        PersistedNodeIdentity::Management {
+            realm_private_key_pem,
+        } => {
+            let realm_signing_key = SigningKey::from_pkcs8_pem(realm_private_key_pem)?;
+            let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+            let realm_verifying_key = realm_signing_key
+                .verifying_key()
+                .to_public_key_pem(LineEnding::default())?
+                .as_bytes()
+                .try_into()?;
+            let realm_encoding_key = realm_signing_key
+                .to_pkcs8_pem(LineEnding::default())?
+                .as_bytes()
+                .try_into()?;
+
+            Ok((
+                realm_id,
+                NodeCapabilities::Management {
+                    realm_signing_key,
+                    realm_verifying_key,
+                    realm_encoding_key,
+                },
+            ))
+        }
+    }
+}
+
+fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
+    let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+    let realm_signing_key = SigningKey::generate(&mut csprng);
+    let node_signing_key = SigningKey::generate(&mut csprng);
+
+    Ok(PersistedNodeState {
+        boot_origin: BootOrigin::InitializedRealm,
+        status: PersistedNodeStatus::PendingInitialization,
+        realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
+        net_secret_key: node_signing_key.to_bytes(),
+        identity: PersistedNodeIdentity::Management {
+            realm_private_key_pem: realm_signing_key
+                .to_pkcs8_pem(LineEnding::default())?
+                .to_string(),
+        },
     })
+}
+
+async fn load_persisted_node_state(
+    storage: &StorageHandle,
+) -> Result<Option<PersistedNodeState>, SetupError> {
+    match storage
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(NODE_STATE_RECORD_KEY),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => Ok(Some(postcard::from_bytes(&bytes).map_err(ConversionError::from)?)),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(SetupError::UnexpectedStorageEvent(format!("{other:?}"))),
+    }
+}
+
+async fn persist_node_state(
+    storage: &StorageHandle,
+    node_state: &PersistedNodeState,
+) -> Result<(), SetupError> {
+    let value = postcard::to_allocvec(node_state).map_err(ConversionError::from)?;
+    match storage
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: NODE_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(NODE_STATE_RECORD_KEY),
+            value: ByteView::from(value),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(SetupError::UnexpectedStorageEvent(format!("{other:?}"))),
+    }
 }

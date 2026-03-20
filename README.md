@@ -61,7 +61,7 @@ cargo run -p aruna
 
 ### Configuration
 
-Aruna reads configuration from environment variables. Copy `.env.example` to `.env` in the repository root and fill in the key material:
+Aruna reads configuration from environment variables. Copy `.env.example` to `.env` in the repository root:
 
 ```bash
 cp .env.example .env
@@ -72,14 +72,12 @@ Required variables from `aruna/src/config.rs`:
 ```bash
 STORAGE_PATH=/var/lib/aruna/data
 SOCKET_ADDRESS=0.0.0.0:8080
-REALM_PUBLIC_KEY="-----BEGIN PUBLIC KEY----- ..."
-REALM_PRIVATE_KEY="-----BEGIN PRIVATE KEY----- ..."
-NODE_PUBLIC_KEY="-----BEGIN PUBLIC KEY----- ..."
-NODE_PRIVATE_KEY="-----BEGIN PRIVATE KEY----- ..."
 S3_PORT=1337
 S3_HOST=localhost
 S3_ADDRESS=0.0.0.0
 ```
+
+On first boot without an `ONBOARDING_SECRET`, the node initializes a new realm and persists its local identity under `STORAGE_PATH`. Additional nodes join an existing realm with `ONBOARDING_SECRET`.
 
 Optional variables:
 
@@ -96,18 +94,17 @@ BLOB_MAX_BUCKET_SIZE=100000
 # Defaults to SOCKET_ADDRESS when omitted
 P2P_SOCKET_ADDRESS=0.0.0.0:4433
 
+# Defaults to "Aruna Realm"
+REALM_DESCRIPTION="Aruna Realm"
+
+# Present only on joining nodes
+ONBOARDING_SECRET=...
+
 # Comma-separated iroh public keys
 BOOTSTRAP_NODES=pubkey1,pubkey2
 
 # Defaults to 3 and is clamped to at least 1
 METADATA_REPLICATION_FACTOR=3
-```
-
-Generate Ed25519 keypairs with OpenSSL:
-
-```bash
-openssl genpkey -algorithm ed25519 -out key.pem
-openssl pkey -in key.pem -pubout -out key.pub.pem
 ```
 
 ### Using S3

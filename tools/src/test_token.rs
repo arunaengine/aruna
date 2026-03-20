@@ -1,4 +1,4 @@
-use aruna::config::read_config;
+use aruna::config::load;
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_storage::storage;
@@ -7,9 +7,8 @@ use tempfile::tempdir;
 use ulid::Ulid;
 
 pub async fn create_token() -> String {
-    let config = read_config().unwrap();
+    let (config, _) = load().await.unwrap();
     let tempdir = tempdir().unwrap();
-
     let storage_handle = storage::FjallStorage::open(&tempdir.path().to_string_lossy()).unwrap();
 
     let driver_ctx = Arc::new(DriverContext {
