@@ -21,6 +21,10 @@ use tracing::warn;
 
 use crate::DhtHandle;
 use crate::error::{NetError, Result};
+use aruna_core::AutomergeDocumentVariant;
+use aruna_core::DhtKeyId;
+use aruna_core::keys::automerge_document_holder_key;
+use aruna_core::keys::gossip_peer_key;
 
 const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
 const GOSSIP_TOPIC_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -401,10 +405,10 @@ async fn lookup_bootstrap_candidates_owned(
     local_realm_id: &RealmId,
     topic: &TopicId,
 ) -> Result<Vec<NodeId>> {
-    let topic_key = aruna_core::keys::gossip_peer_key(topic);
+    let topic_key = gossip_peer_key(topic);
     let mut candidates = lookup_nodes_for_key_owned(dht, &topic_key, local_realm_id).await?;
-    if let Some(document) = aruna_core::automerge::AutomergeDocumentVariant::from_topic_id(topic) {
-        let holder_key = aruna_core::keys::automerge_document_holder_key(&document);
+    if let Some(document) = AutomergeDocumentVariant::from_topic_id(topic) {
+        let holder_key = automerge_document_holder_key(&document);
         candidates.extend(lookup_nodes_for_key_owned(dht, &holder_key, local_realm_id).await?);
     }
     Ok(candidates)
@@ -412,7 +416,7 @@ async fn lookup_bootstrap_candidates_owned(
 
 async fn lookup_nodes_for_key_owned(
     dht: &Arc<DhtHandle>,
-    dht_key: &aruna_core::DhtKeyId,
+    dht_key: &DhtKeyId,
     local_realm_id: &RealmId,
 ) -> Result<Vec<NodeId>> {
     let entries = dht
@@ -455,7 +459,7 @@ async fn announce_topic_subscription(
     local_realm_id: &RealmId,
     topic: &TopicId,
 ) -> Result<()> {
-    let topic_key = aruna_core::keys::gossip_peer_key(topic);
+    let topic_key = gossip_peer_key(topic);
     dht.put(
         &topic_key,
         local_realm_id.clone(),
@@ -465,8 +469,8 @@ async fn announce_topic_subscription(
     .await
     .map_err(|e| NetError::Gossip(format!("Failed to announce gossip topic in DHT: {e}")))?;
 
-    if let Some(document) = aruna_core::automerge::AutomergeDocumentVariant::from_topic_id(topic) {
-        let document_key = aruna_core::keys::automerge_document_holder_key(&document);
+    if let Some(document) = AutomergeDocumentVariant::from_topic_id(topic) {
+        let document_key = automerge_document_holder_key(&document);
         dht.put(
             &document_key,
             local_realm_id.clone(),

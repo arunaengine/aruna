@@ -9,16 +9,19 @@ use ulid::Ulid;
 
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use aruna_core::NodeId;
+use aruna_core::types::Effects;
+use aruna_core::types::TxnId;
 
 #[derive(Debug, PartialEq)]
 pub struct IncomingAutomergeOperation {
     sync_id: Ulid,
-    node_id: aruna_core::NodeId,
-    local_node_id: aruna_core::NodeId,
+    node_id: NodeId,
+    local_node_id: NodeId,
     state: IncomingAutomergeState,
     remote_init: Option<AutomergeInit>,
     local_document: Option<Vec<u8>>,
-    persist_txn_id: Option<aruna_core::types::TxnId>,
+    persist_txn_id: Option<TxnId>,
     synced_document: Option<Vec<u8>>,
     output: Option<Result<(), IncomingAutomergeError>>,
 }
@@ -57,11 +60,7 @@ pub enum IncomingAutomergeError {
 }
 
 impl IncomingAutomergeOperation {
-    pub fn new(
-        sync_id: Ulid,
-        node_id: aruna_core::NodeId,
-        local_node_id: aruna_core::NodeId,
-    ) -> Self {
+    pub fn new(sync_id: Ulid, node_id: NodeId, local_node_id: NodeId) -> Self {
         Self {
             sync_id,
             node_id,
@@ -75,18 +74,14 @@ impl IncomingAutomergeOperation {
         }
     }
 
-    fn fail(&mut self, error: IncomingAutomergeError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: IncomingAutomergeError) -> Effects {
         let cleanup = self.abort();
         self.state = IncomingAutomergeState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(IncomingAutomergeError::UnexpectedEvent {
             state,
@@ -100,14 +95,14 @@ impl Operation for IncomingAutomergeOperation {
     type Output = ();
     type Error = IncomingAutomergeError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = IncomingAutomergeState::AwaitInit;
         smallvec![Effect::Automerge(AutomergeEffect::StartInboundSync {
             sync_id: self.sync_id,
         })]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             IncomingAutomergeState::AwaitInit => match event {
                 Event::Automerge(AutomergeEvent::SyncInitialized { remote_init, .. }) => {
@@ -285,7 +280,7 @@ impl Operation for IncomingAutomergeOperation {
         self.output.unwrap_or(Ok(()))
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         match self.persist_txn_id.take() {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],

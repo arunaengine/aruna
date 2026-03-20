@@ -1,8 +1,9 @@
+use aruna_core::alpn::Alpn;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::RealmId;
 use serde::{Deserialize, Serialize};
 
-pub const DHT_ALPN: &[u8] = aruna_core::alpn::Alpn::Dht.as_bytes();
+pub const DHT_ALPN: &[u8] = Alpn::Dht.as_bytes();
 
 /// DHT RPC request messages
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -17,6 +17,7 @@ use aruna_operations::s3::create_user_access::{
     CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::revoke_user_access::RevokeUserAccessError;
 use aruna_operations::s3::revoke_user_access::RevokeUserAccessOperation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -332,10 +333,8 @@ pub async fn revoke_s3_credentials(
     {
         Ok(Some(Ok(_))) => {}
         Ok(None)
-        | Ok(Some(Err(
-            aruna_operations::s3::revoke_user_access::RevokeUserAccessError::NotFound,
-        )))
-        | Err(aruna_operations::s3::revoke_user_access::RevokeUserAccessError::NotFound) => {
+        | Ok(Some(Err(RevokeUserAccessError::NotFound)))
+        | Err(RevokeUserAccessError::NotFound) => {
             return Err(ServerError::NotFound);
         }
         Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),

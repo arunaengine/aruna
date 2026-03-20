@@ -35,7 +35,7 @@ impl GetGroupOperation {
             state: GetGroupState::Init,
         }
     }
-    fn emit_get_group(&mut self) -> aruna_core::types::Effects {
+    fn emit_get_group(&mut self) -> Effects {
         let key = self.config.group_id.to_bytes().into();
 
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -52,7 +52,7 @@ impl GetGroupOperation {
         Ok(())
     }
 
-    fn emit_get_auth_doc(&mut self) -> aruna_core::types::Effects {
+    fn emit_get_auth_doc(&mut self) -> Effects {
         let key = self.config.group_id.to_bytes().into();
 
         smallvec![Effect::Storage(StorageEffect::Read {
@@ -226,7 +226,7 @@ impl Operation for GetGroupOperation {
 
     type Error = GetGroupError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = GetGroupState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -234,7 +234,7 @@ impl Operation for GetGroupOperation {
         })]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         let event = match self.fail_on_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
@@ -257,7 +257,7 @@ impl Operation for GetGroupOperation {
         self.output.ok_or_else(|| GetGroupError::NotFinished)?
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],

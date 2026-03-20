@@ -5,6 +5,7 @@ use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
+use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_net::{NetConfig, NetHandle};
@@ -14,6 +15,9 @@ use aruna_operations::announce_realm_presence::{
 use aruna_operations::automerge::AutomergeHandle;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
+use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::startup::RestoreAutomergeSubscriptionsOperation;
+use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
@@ -78,17 +82,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         task_handle: Some(task_handle.clone()),
     });
 
-    aruna_operations::incoming::initialize_net_incoming(driver_ctx.clone());
-    aruna_operations::task_incoming::initialize_task_incoming(driver_ctx.clone(), task_handle)
-        .await;
+    initialize_net_incoming(driver_ctx.clone());
+    initialize_task_incoming(driver_ctx.clone(), task_handle).await;
     drive(
-        aruna_operations::startup::RestoreAutomergeSubscriptionsOperation::new(config.node_id),
+        RestoreAutomergeSubscriptionsOperation::new(config.node_id),
         driver_ctx.as_ref(),
     )
     .await?;
     drive(
         EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
-            actor: aruna_core::structs::Actor {
+            actor: Actor {
                 node_id: config.node_id,
                 user_id: Ulid::from_bytes([0u8; 16]),
                 realm_id: config.realm_id.clone(),

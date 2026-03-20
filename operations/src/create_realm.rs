@@ -10,6 +10,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateRealmConfig {
@@ -53,7 +54,7 @@ impl CreateRealmOperation {
             output: None,
         }
     }
-    fn emit_create_realm(&mut self) -> Result<aruna_core::types::Effects, CreateRealmError> {
+    fn emit_create_realm(&mut self) -> Result<Effects, CreateRealmError> {
         let realm = Realm {
             realm_id: self.config.actor.realm_id.clone(),
             description: self.config.realm_description.clone(),
@@ -73,7 +74,7 @@ impl CreateRealmOperation {
         })])
     }
 
-    fn emit_create_auth_doc(&mut self) -> Result<aruna_core::types::Effects, CreateRealmError> {
+    fn emit_create_auth_doc(&mut self) -> Result<Effects, CreateRealmError> {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
@@ -96,7 +97,7 @@ impl CreateRealmOperation {
         })])
     }
 
-    fn emit_create_config_doc(&mut self) -> Result<aruna_core::types::Effects, CreateRealmError> {
+    fn emit_create_config_doc(&mut self) -> Result<Effects, CreateRealmError> {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
@@ -114,17 +115,13 @@ impl CreateRealmOperation {
         })])
     }
 
-    fn fail(&mut self, err: CreateRealmError) -> aruna_core::types::Effects {
+    fn fail(&mut self, err: CreateRealmError) -> Effects {
         self.state = CreateRealmState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
-    fn fail_with_cleanup(
-        &mut self,
-        err: CreateRealmError,
-        cleanup_effects: aruna_core::types::Effects,
-    ) -> aruna_core::types::Effects {
+    fn fail_with_cleanup(&mut self, err: CreateRealmError, cleanup_effects: Effects) -> Effects {
         self.state = CreateRealmState::Error;
         self.output = Some(Err(err));
         cleanup_effects
@@ -135,7 +132,7 @@ impl CreateRealmOperation {
         state: CreateRealmState,
         expected: &'static str,
         got: String,
-    ) -> aruna_core::types::Effects {
+    ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
             CreateRealmError::UnexpectedEvent {
@@ -147,7 +144,7 @@ impl CreateRealmOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, aruna_core::types::Effects> {
+    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -155,7 +152,7 @@ impl CreateRealmOperation {
         Ok(event)
     }
 
-    fn handle_start_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_start_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
@@ -173,7 +170,7 @@ impl CreateRealmOperation {
         }
     }
 
-    fn handle_create_realm(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_create_realm(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -190,7 +187,7 @@ impl CreateRealmOperation {
         }
     }
 
-    fn handle_create_auth_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_create_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -207,7 +204,7 @@ impl CreateRealmOperation {
         }
     }
 
-    fn handle_create_config_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_create_config_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -225,7 +222,7 @@ impl CreateRealmOperation {
         }
     }
 
-    fn handle_commit_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_commit_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
@@ -256,7 +253,7 @@ impl CreateRealmOperation {
         }
     }
 
-    fn handle_announce_auth_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
             return self.unexpected_event(
@@ -288,7 +285,7 @@ impl CreateRealmOperation {
         }
     }
 
-    fn handle_announce_config_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_announce_config_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
             return self.unexpected_event(
@@ -355,7 +352,7 @@ impl Operation for CreateRealmOperation {
 
     type Error = CreateRealmError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = CreateRealmState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -363,7 +360,7 @@ impl Operation for CreateRealmOperation {
         })]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         let event = match self.fail_on_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
@@ -394,7 +391,7 @@ impl Operation for CreateRealmOperation {
         self.output.ok_or_else(|| CreateRealmError::NotFinished)?
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],

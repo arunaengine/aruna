@@ -10,14 +10,18 @@ use thiserror::Error;
 use crate::automerge::repository::{automerge_clock, read_effect};
 use crate::automerge_announce::{AUTOMERGE_ANNOUNCE_INTERVAL, AUTOMERGE_ANNOUNCE_SHORT_INTERVAL};
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
+use aruna_core::AutomergeDocumentVariant;
+use aruna_core::NodeId;
+use aruna_core::TopicId;
+use aruna_core::types::Effects;
 
 #[derive(Debug, PartialEq)]
 pub struct IncomingGossipOperation {
-    topic: aruna_core::TopicId,
-    sender: aruna_core::NodeId,
+    topic: TopicId,
+    sender: NodeId,
     data: Vec<u8>,
     announcement: Option<AutomergeState>,
-    document: Option<aruna_core::automerge::AutomergeDocumentVariant>,
+    document: Option<AutomergeDocumentVariant>,
     state: IncomingGossipState,
     output: Option<Result<(), IncomingGossipError>>,
 }
@@ -53,7 +57,7 @@ pub enum IncomingGossipError {
 }
 
 impl IncomingGossipOperation {
-    pub fn new(topic: aruna_core::TopicId, sender: aruna_core::NodeId, data: Vec<u8>) -> Self {
+    pub fn new(topic: TopicId, sender: NodeId, data: Vec<u8>) -> Self {
         Self {
             topic,
             sender,
@@ -65,17 +69,13 @@ impl IncomingGossipOperation {
         }
     }
 
-    fn fail(&mut self, error: IncomingGossipError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: IncomingGossipError) -> Effects {
         self.state = IncomingGossipState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(IncomingGossipError::UnexpectedEvent {
             state,
@@ -89,7 +89,7 @@ impl Operation for IncomingGossipOperation {
     type Output = ();
     type Error = IncomingGossipError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         let announcement: AutomergeState = match postcard::from_bytes(&self.data) {
             Ok(announcement) => announcement,
             Err(_) => {
@@ -99,9 +99,7 @@ impl Operation for IncomingGossipOperation {
             }
         };
 
-        let Some(document) =
-            aruna_core::automerge::AutomergeDocumentVariant::from_topic_id(&self.topic)
-        else {
+        let Some(document) = AutomergeDocumentVariant::from_topic_id(&self.topic) else {
             self.state = IncomingGossipState::Finish;
             self.output = Some(Ok(()));
             return smallvec![];
@@ -119,7 +117,7 @@ impl Operation for IncomingGossipOperation {
         smallvec![read_effect(&document, None)]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             IncomingGossipState::ReadDocument => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -208,7 +206,7 @@ impl Operation for IncomingGossipOperation {
         self.output.unwrap_or(Ok(()))
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         smallvec![]
     }
 }

@@ -10,20 +10,23 @@ use thiserror::Error;
 use crate::automerge::repository::{read_effect, write_effect};
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
+use aruna_core::NodeId;
+use aruna_core::types::Effects;
+use aruna_core::types::TxnId;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsureRealmConfigConfig {
     pub actor: Actor,
-    pub bootstrap_peers: Vec<aruna_core::NodeId>,
+    pub bootstrap_peers: Vec<NodeId>,
     pub default_metadata_replication_factor: u32,
 }
 
 #[derive(Debug, PartialEq)]
 pub struct EnsureRealmConfigOperation {
     config: EnsureRealmConfigConfig,
-    txn_id: Option<aruna_core::types::TxnId>,
+    txn_id: Option<TxnId>,
     state: EnsureRealmConfigState,
-    replication_targets: Vec<aruna_core::NodeId>,
+    replication_targets: Vec<NodeId>,
     output: Option<Result<RealmConfigDocument, EnsureRealmConfigError>>,
 }
 
@@ -77,18 +80,14 @@ impl EnsureRealmConfigOperation {
         }
     }
 
-    fn fail(&mut self, error: EnsureRealmConfigError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: EnsureRealmConfigError) -> Effects {
         let cleanup = self.abort();
         self.state = EnsureRealmConfigState::Error;
         self.output = Some(Err(error));
         cleanup
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(EnsureRealmConfigError::UnexpectedEvent {
             state,
@@ -102,14 +101,14 @@ impl Operation for EnsureRealmConfigOperation {
     type Output = RealmConfigDocument;
     type Error = EnsureRealmConfigError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = EnsureRealmConfigState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false
         })]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             EnsureRealmConfigState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -251,7 +250,7 @@ impl Operation for EnsureRealmConfigOperation {
         })
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         match self.txn_id.take() {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],
@@ -259,10 +258,7 @@ impl Operation for EnsureRealmConfigOperation {
     }
 }
 
-fn emit_next_replication(
-    targets: &mut Vec<aruna_core::NodeId>,
-    document: AutomergeDocumentVariant,
-) -> aruna_core::types::Effects {
+fn emit_next_replication(targets: &mut Vec<NodeId>, document: AutomergeDocumentVariant) -> Effects {
     let Some(target) = targets.pop() else {
         return smallvec![];
     };

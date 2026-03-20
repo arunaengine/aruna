@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetEvent};
+use aruna_core::events::{Event, NetError as CoreNetError, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_core::structs::RealmId;
@@ -110,10 +110,10 @@ impl NetHandle {
             .secret_key(secret_key)
             .address_lookup(address_lookup.clone())
             .alpns(vec![
-                aruna_core::alpn::Alpn::Dht.as_bytes().to_vec(),
-                aruna_core::alpn::Alpn::Gossip.as_bytes().to_vec(),
-                aruna_core::alpn::Alpn::Bao.as_bytes().to_vec(),
-                aruna_core::alpn::Alpn::Automerge.as_bytes().to_vec(),
+                Alpn::Dht.as_bytes().to_vec(),
+                Alpn::Gossip.as_bytes().to_vec(),
+                Alpn::Bao.as_bytes().to_vec(),
+                Alpn::Automerge.as_bytes().to_vec(),
             ]);
 
         if config.use_dns_discovery {
@@ -418,19 +418,15 @@ impl Handle for NetHandle {
             Effect::Net(net_effect) => {
                 let (tx, rx) = oneshot::channel();
                 if self.inner.effect_tx.send((net_effect, tx)).await.is_err() {
-                    return Event::Net(NetEvent::Error(
-                        aruna_core::events::NetError::ChannelClosed,
-                    ));
+                    return Event::Net(NetEvent::Error(CoreNetError::ChannelClosed));
                 }
 
                 match rx.await {
                     Ok(event) => Event::Net(event),
-                    Err(_) => {
-                        Event::Net(NetEvent::Error(aruna_core::events::NetError::ChannelClosed))
-                    }
+                    Err(_) => Event::Net(NetEvent::Error(CoreNetError::ChannelClosed)),
                 }
             }
-            _ => Event::Net(NetEvent::Error(aruna_core::events::NetError::InvalidEffect)),
+            _ => Event::Net(NetEvent::Error(CoreNetError::InvalidEffect)),
         }
     }
 }

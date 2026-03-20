@@ -16,12 +16,15 @@ use crate::automerge::repository::{
     parse_auth_document, parse_metadata_key, parse_realm_config_document,
 };
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use aruna_core::AutomergeDocumentVariant;
+use aruna_core::NodeId;
+use aruna_core::types::Effects;
 
 #[derive(Debug, PartialEq)]
 pub struct RestoreAutomergeSubscriptionsOperation {
-    local_node_id: aruna_core::NodeId,
+    local_node_id: NodeId,
     state: RestoreAutomergeSubscriptionsState,
-    documents: Vec<aruna_core::automerge::AutomergeDocumentVariant>,
+    documents: Vec<AutomergeDocumentVariant>,
     subscriptions: HashSet<TopicId>,
     output: Option<Result<(), RestoreAutomergeSubscriptionsError>>,
 }
@@ -55,7 +58,7 @@ pub enum RestoreAutomergeSubscriptionsError {
 }
 
 impl RestoreAutomergeSubscriptionsOperation {
-    pub fn new(local_node_id: aruna_core::NodeId) -> Self {
+    pub fn new(local_node_id: NodeId) -> Self {
         Self {
             local_node_id,
             state: RestoreAutomergeSubscriptionsState::Init,
@@ -65,17 +68,13 @@ impl RestoreAutomergeSubscriptionsOperation {
         }
     }
 
-    fn fail(&mut self, error: RestoreAutomergeSubscriptionsError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: RestoreAutomergeSubscriptionsError) -> Effects {
         self.state = RestoreAutomergeSubscriptionsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(RestoreAutomergeSubscriptionsError::UnexpectedEvent {
             state,
@@ -95,7 +94,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
     type Output = ();
     type Error = RestoreAutomergeSubscriptionsError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = RestoreAutomergeSubscriptionsState::ListMetadata;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: METADATA_KEYSPACE.to_string(),
@@ -106,7 +105,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
         })]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             RestoreAutomergeSubscriptionsState::ListMetadata => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
@@ -251,7 +250,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
         self.output.unwrap_or(Ok(()))
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         smallvec![]
     }
 }
