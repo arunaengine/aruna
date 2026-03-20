@@ -2,7 +2,7 @@ use aruna_core::automerge::{AutomergeEffect, AutomergeEvent, AutomergeInit, Auto
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;

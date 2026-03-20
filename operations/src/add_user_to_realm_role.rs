@@ -450,7 +450,13 @@ pub mod test {
         let admin_role = realm_auth_doc
             .roles
             .iter()
-            .filter_map(|(id, r)| if r.name == "realm_admin" { Some(*id) } else { None })
+            .filter_map(|(id, r)| {
+                if r.name == "realm_admin" {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
             .collect();
 
         let add_user_input = AddUserToRealmRolesInput {

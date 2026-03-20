@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
+use aruna_core::TopicId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::{boxed_suboperation, Operation};
-use aruna_core::TopicId;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;

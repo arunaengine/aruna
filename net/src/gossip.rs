@@ -415,11 +415,14 @@ async fn lookup_nodes_for_key_owned(
     dht_key: &aruna_core::DhtKeyId,
     local_realm_id: &RealmId,
 ) -> Result<Vec<NodeId>> {
-    let entries = dht.get(dht_key, Some(local_realm_id.clone())).await.map_err(|e| {
-        NetError::Gossip(format!(
-            "Failed to lookup gossip topic bootstrap nodes: {e}"
-        ))
-    })?;
+    let entries = dht
+        .get(dht_key, Some(local_realm_id.clone()))
+        .await
+        .map_err(|e| {
+            NetError::Gossip(format!(
+                "Failed to lookup gossip topic bootstrap nodes: {e}"
+            ))
+        })?;
     Ok(entries.into_iter().map(|entry| entry.node_id).collect())
 }
 

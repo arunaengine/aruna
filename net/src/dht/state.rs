@@ -141,6 +141,7 @@ struct MaintenancePingOp {
 struct InboundGetOp {
     inbound_id: InboundId,
     key: DhtKeyId,
+    realm_filter: Option<RealmId>,
     pending: PendingMap,
 }
 
@@ -291,7 +292,7 @@ impl DhtStateMachine {
             last_store_error: None,
             pending: HashMap::new(),
         });
-        self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, out);
+        self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, None, out);
         self.ops.insert(op_id, op);
     }
 
@@ -312,13 +313,20 @@ impl DhtStateMachine {
 
         let mut op = OpState::Get(GetOp {
             key,
-            realm_filter,
+            realm_filter: realm_filter.clone(),
             values: Vec::new(),
             seen_publishers: HashSet::new(),
             frontier: LookupFrontier::default(),
             pending: HashMap::new(),
         });
-        self.queue_storage_read(op_id, &mut op, StorageStage::GetLocalRead, key, out);
+        self.queue_storage_read(
+            op_id,
+            &mut op,
+            StorageStage::GetLocalRead,
+            key,
+            realm_filter,
+            out,
+        );
         self.ops.insert(op_id, op);
     }
 
@@ -891,6 +899,7 @@ impl DhtStateMachine {
                 let now = self.now_secs;
                 let values: Vec<StoredValue> = live_entries(entries, now)
                     .into_iter()
+                    .filter(|entry| realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id))
                     .map(|entry| StoredValue {
                         publisher: entry.publisher,
                         realm_id: entry.realm_id,
@@ -1142,14 +1151,22 @@ impl DhtStateMachine {
                     response: DhtResponse::Nodes { nodes },
                 }));
             }
-            DhtRequest::GetValue { key } => {
+            DhtRequest::GetValue { key, realm_filter } => {
                 let op_id = self.alloc_internal_op_id();
                 let mut op = OpState::InboundGet(InboundGetOp {
                     inbound_id,
                     key,
+                    realm_filter: realm_filter.clone(),
                     pending: HashMap::new(),
                 });
-                self.queue_storage_read(op_id, &mut op, StorageStage::InboundGetRead, key, out);
+                self.queue_storage_read(
+                    op_id,
+                    &mut op,
+                    StorageStage::InboundGetRead,
+                    key,
+                    realm_filter,
+                    out,
+                );
                 self.ops.insert(op_id, op);
             }
             DhtRequest::PutValue {
@@ -1199,7 +1216,14 @@ impl DhtStateMachine {
                     new_entry,
                     pending: HashMap::new(),
                 });
-                self.queue_storage_read(op_id, &mut op, StorageStage::InboundPutRead, key, out);
+                self.queue_storage_read(
+                    op_id,
+                    &mut op,
+                    StorageStage::InboundPutRead,
+                    key,
+                    None,
+                    out,
+                );
                 self.ops.insert(op_id, op);
             }
         }
@@ -1222,7 +1246,10 @@ impl DhtStateMachine {
                 &mut op.pending,
                 RpcPhase::GetLookup,
                 peer,
-                DhtRequest::GetValue { key: op.key },
+                DhtRequest::GetValue {
+                    key: op.key,
+                    realm_filter: op.realm_filter.clone(),
+                },
                 out,
             );
             op.frontier.sent_queries = op.frontier.sent_queries.saturating_add(1);
@@ -1466,6 +1493,7 @@ impl DhtStateMachine {
         op: &mut OpState,
         stage: StorageStage,
         key: DhtKeyId,
+        realm_filter: Option<RealmId>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         op.pending_mut().insert(
@@ -1479,6 +1507,7 @@ impl DhtStateMachine {
             op_id,
             stage,
             key,
+            realm_filter,
         }));
     }
 
@@ -2124,6 +2153,45 @@ mod tests {
     }
 
     #[test]
+    fn get_forwards_realm_filter_to_remote_lookups() {
+        let local_secret = iroh::SecretKey::from_bytes(&[59u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let peer = make_node(24);
+        let realm_filter = make_realm(3);
+        let key = DhtKeyId::from_data(b"get-realm-filter-remote");
+
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 23,
+            key,
+            realm_filter: Some(realm_filter.clone()),
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 23,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    op_id: 23,
+                    phase: RpcPhase::GetLookup,
+                    peer: req_peer,
+                    request: DhtRequest::GetValue {
+                        key: req_key,
+                        realm_filter: Some(req_realm_filter),
+                    },
+                }) if *req_peer == peer && *req_key == key && *req_realm_filter == realm_filter
+            )
+        }));
+    }
+
+    #[test]
     fn get_short_circuits_on_first_remote_value() {
         let local_secret = iroh::SecretKey::from_bytes(&[46u8; 32]);
         let local_id = local_secret.public();
@@ -2358,6 +2426,74 @@ mod tests {
                         ..
                     }
                 })
+            )
+        }));
+    }
+
+    #[test]
+    fn inbound_get_filters_response_entries_by_realm() {
+        let local_secret = iroh::SecretKey::from_bytes(&[60u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let key = DhtKeyId::from_data(b"inbound-get-realm-filter");
+        let realm_filter = make_realm(4);
+
+        let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 10,
+            peer: make_node(25),
+            request: DhtRequest::GetValue {
+                key,
+                realm_filter: Some(realm_filter.clone()),
+            },
+        }));
+
+        let op_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                DhtEffect::IoRequest(DhtIoRequest::StorageRead {
+                    op_id,
+                    stage: StorageStage::InboundGetRead,
+                    key: req_key,
+                    realm_filter: Some(req_realm_filter),
+                }) if *req_key == key && *req_realm_filter == realm_filter => Some(*op_id),
+                _ => None,
+            })
+            .expect("inbound get should enqueue filtered storage read");
+
+        let response_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id,
+            stage: StorageStage::InboundGetRead,
+            entries: vec![
+                StoredEntry {
+                    publisher: make_node(26),
+                    realm_id: realm_filter.clone(),
+                    value: b"allowed".to_vec(),
+                    expires_at: 2_000,
+                    signature: None,
+                },
+                StoredEntry {
+                    publisher: make_node(27),
+                    realm_id: make_realm(5),
+                    value: b"foreign".to_vec(),
+                    expires_at: 2_000,
+                    signature: None,
+                },
+            ],
+        }));
+
+        assert!(response_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                    inbound_id: 10,
+                    response: DhtResponse::Value {
+                        entries,
+                        closer_nodes: _,
+                    },
+                }) if entries.len() == 1
+                    && entries[0].realm_id == realm_filter
+                    && entries[0].value == b"allowed".to_vec()
             )
         }));
     }

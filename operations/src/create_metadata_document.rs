@@ -3,7 +3,7 @@ use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, DhtError, StorageError};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keys::realm_presence_key;
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, MetadataDocument, RealmConfigDocument};
 use rand::seq::SliceRandom;
 use smallvec::smallvec;

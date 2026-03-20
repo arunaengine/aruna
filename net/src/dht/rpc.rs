@@ -14,6 +14,7 @@ pub enum DhtRequest {
     },
     GetValue {
         key: DhtKeyId,
+        realm_filter: Option<RealmId>,
     },
     PutValue {
         key: DhtKeyId,
@@ -140,6 +141,30 @@ mod tests {
     }
 
     #[test]
+    fn test_get_value_request_roundtrip_with_realm_filter() {
+        let key = DhtKeyId::from_data(b"realm-filtered-get");
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+
+        let req = DhtRequest::GetValue {
+            key,
+            realm_filter: Some(realm_id.clone()),
+        };
+        let bytes = encode_request(&req).expect("encode request");
+        let decoded = decode_request(&bytes).expect("decode request");
+
+        match decoded {
+            DhtRequest::GetValue {
+                key: decoded_key,
+                realm_filter,
+            } => {
+                assert_eq!(decoded_key, key);
+                assert_eq!(realm_filter, Some(realm_id));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_put_value_request_roundtrip_with_signature() {
         let publisher_secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
         let publisher = publisher_secret.public();
@@ -184,9 +209,11 @@ mod tests {
                     &decoded_value,
                     decoded_ttl,
                 );
-                assert!(decoded_publisher
-                    .verify(&verify_data, &decoded_signature)
-                    .is_ok());
+                assert!(
+                    decoded_publisher
+                        .verify(&verify_data, &decoded_signature)
+                        .is_ok()
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }

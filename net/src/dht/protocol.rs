@@ -108,6 +108,7 @@ pub enum DhtIoRequest {
         op_id: OpId,
         stage: StorageStage,
         key: DhtKeyId,
+        realm_filter: Option<RealmId>,
     },
     StorageWrite {
         op_id: OpId,

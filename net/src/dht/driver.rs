@@ -355,9 +355,12 @@ impl DhtDriver {
                 response,
             } => self.dispatch_rpc_response(inbound_id, response),
             DhtIoRequest::DropInbound { inbound_id } => self.dispatch_drop_inbound(inbound_id),
-            DhtIoRequest::StorageRead { op_id, stage, key } => {
-                self.dispatch_storage_read(op_id, stage, key)
-            }
+            DhtIoRequest::StorageRead {
+                op_id,
+                stage,
+                key,
+                realm_filter,
+            } => self.dispatch_storage_read(op_id, stage, key, realm_filter),
             DhtIoRequest::StorageWrite {
                 op_id,
                 stage,
@@ -427,7 +430,13 @@ impl DhtDriver {
         self.process_input(DhtInput::Io(DhtIo::InboundDropped { inbound_id }));
     }
 
-    fn dispatch_storage_read(&self, op_id: OpId, stage: StorageStage, key: DhtKeyId) {
+    fn dispatch_storage_read(
+        &self,
+        op_id: OpId,
+        stage: StorageStage,
+        key: DhtKeyId,
+        realm_filter: Option<RealmId>,
+    ) {
         let storage = self.storage.clone();
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {
@@ -439,11 +448,16 @@ impl DhtDriver {
 
             match storage.send_effect(effect).await {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let mut entries = value.map(|data| decode_entries(&data)).unwrap_or_default();
+                    if let Some(realm_filter) = realm_filter {
+                        entries.retain(|entry| entry.realm_id == realm_filter);
+                    }
+
                     let _ = io_tx
                         .send(DhtIo::StorageReadResult {
                             op_id,
                             stage,
-                            entries: value.map(|data| decode_entries(&data)).unwrap_or_default(),
+                            entries,
                         })
                         .await;
                 }
