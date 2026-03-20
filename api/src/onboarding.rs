@@ -26,6 +26,10 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use base64::Engine;
+use crypto_box::{
+    PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
+    aead::{Aead, AeadCore, OsRng as CryptoOsRng},
+};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use std::str::FromStr;
@@ -85,12 +89,35 @@ async fn authorize_onboarding_admin(
     Ok(auth)
 }
 
+async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
+    let now = now_timestamp();
+    let secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    for secret in secrets {
+        if secret.consumed || secret.expires_at < now {
+            drive(
+                DeleteOnboardingSecretOperation::new(DeleteOnboardingSecretInput {
+                    enrollment_id: secret.enrollment_id,
+                }),
+                &state.get_ctx(),
+            )
+            .await
+            .map_err(map_delete_error)?;
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn create_onboarding_secret(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<CreateOnboardingSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateOnboardingSecretResponse>)> {
     let _auth = authorize_onboarding_admin(&state, auth).await?;
+    prune_stale_onboarding_secrets(&state).await?;
 
     let ttl = request
         .expires_in_seconds
@@ -140,6 +167,7 @@ pub async fn list_onboarding_secrets(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<ListOnboardingSecretsResponse>)> {
     let _auth = authorize_onboarding_admin(&state, auth).await?;
+    prune_stale_onboarding_secrets(&state).await?;
     let mut secrets = drive(ListOnboardingSecretsOperation::new(), &state.get_ctx())
         .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
@@ -220,17 +248,31 @@ pub async fn bootstrap_onboarding(
     let bootstrap_endpoint = state
         .bootstrap_endpoint()
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
+    let onboarding_sync_ticket = state
+        .issue_onboarding_sync_ticket(node_id)
+        .map_err(|err| ServerError::InternalError(err.to_string()))?
+        .encode()
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let wrapped_management_key = if matches!(record.mode, OnboardingMode::Management) {
+        Some(wrap_realm_private_key(
+            &state,
+            request.transport_public_key.as_deref().ok_or(ServerError::BadRequest)?,
+        )?)
+    } else {
+        None
+    };
     let response = match record.mode {
         OnboardingMode::Management => BootstrapOnboardingResponse {
             realm_id: state.get_realm_id().to_string(),
             mode: OnboardingMode::Management,
             bootstrap_endpoints: vec![bootstrap_endpoint],
-            realm_private_key_pem: Some(
-                state
-                    .realm_private_key_pem()
-                    .ok_or(ServerError::Forbidden)?,
-            ),
+            wrapped_realm_private_key: wrapped_management_key.as_ref().map(|value| value.0.clone()),
+            wrapped_realm_private_key_nonce: wrapped_management_key
+                .as_ref()
+                .map(|value| value.1.clone()),
+            wrapping_public_key: wrapped_management_key.as_ref().map(|value| value.2.clone()),
             delegation_signature: None,
+            onboarding_sync_ticket,
         },
         OnboardingMode::Server => {
             let issuer_public_key = request
@@ -244,16 +286,22 @@ pub async fn bootstrap_onboarding(
                 realm_id: state.get_realm_id().to_string(),
                 mode: OnboardingMode::Server,
                 bootstrap_endpoints: vec![bootstrap_endpoint],
-                realm_private_key_pem: None,
+                wrapped_realm_private_key: None,
+                wrapped_realm_private_key_nonce: None,
+                wrapping_public_key: None,
                 delegation_signature: Some(delegation_signature),
+                onboarding_sync_ticket,
             }
         }
         OnboardingMode::Local => BootstrapOnboardingResponse {
             realm_id: state.get_realm_id().to_string(),
             mode: OnboardingMode::Local,
             bootstrap_endpoints: vec![bootstrap_endpoint],
-            realm_private_key_pem: None,
+            wrapped_realm_private_key: None,
+            wrapped_realm_private_key_nonce: None,
+            wrapping_public_key: None,
             delegation_signature: None,
+            onboarding_sync_ticket,
         },
     };
 
@@ -300,7 +348,11 @@ fn verify_node_proof(
         VerifyingKey::from_bytes(node_id.as_bytes()).map_err(|_| ServerError::BadRequest)?;
     verifying_key
         .verify(
-            &bootstrap_node_proof_message(&request.onboarding_secret, &request.node_id),
+            &bootstrap_node_proof_message(
+                &request.onboarding_secret,
+                &request.node_id,
+                request.transport_public_key.as_deref(),
+            ),
             &signature,
         )
         .map_err(|_| ServerError::Unauthorized)
@@ -334,6 +386,34 @@ fn verify_issuer_proof(
         .map_err(|_| ServerError::Unauthorized)
 }
 
+fn wrap_realm_private_key(
+    state: &Arc<ServerState>,
+    transport_public_key: &str,
+) -> ServerResult<(String, String, String)> {
+    let realm_private_key_pem = state.realm_private_key_pem().ok_or(ServerError::Forbidden)?;
+    let transport_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(transport_public_key)
+        .map_err(|_| ServerError::BadRequest)?;
+    let transport_public_key = TransportPublicKey::from(
+        <[u8; 32]>::try_from(transport_public_key_bytes.as_slice())
+            .map_err(|_| ServerError::BadRequest)?,
+    );
+    let wrapping_secret_key = TransportSecretKey::generate(&mut CryptoOsRng);
+    let wrapping_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(wrapping_secret_key.public_key().as_bytes());
+    let cipher = SalsaBox::new(&transport_public_key, &wrapping_secret_key);
+    let nonce = SalsaBox::generate_nonce(&mut CryptoOsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, realm_private_key_pem.as_bytes())
+        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    Ok((
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ciphertext),
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce),
+        wrapping_public_key,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -359,6 +439,10 @@ mod tests {
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use base64::Engine;
+    use crypto_box::{
+        PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
+        aead::Aead,
+    };
     use ed25519_dalek::{Signer, SigningKey};
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
@@ -465,7 +549,7 @@ mod tests {
         let bootstrap_node_id = iroh::SecretKey::from_bytes(&node_proof.to_bytes()).public();
         let node_id = bootstrap_node_id.to_string();
         let node_signature = node_proof
-            .sign(&bootstrap_node_proof_message(&onboarding_secret, &node_id))
+            .sign(&bootstrap_node_proof_message(&onboarding_secret, &node_id, None))
             .to_string();
         let issuer_signature = issuer_key
             .sign(&bootstrap_issuer_proof_message(
@@ -481,6 +565,7 @@ mod tests {
                 onboarding_secret,
                 node_id,
                 node_proof: node_signature,
+                transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key.clone()),
                 issuer_proof: Some(issuer_signature),
             }),
@@ -492,8 +577,9 @@ mod tests {
         assert_eq!(bootstrap.realm_id, realm_id.to_string());
         assert_eq!(bootstrap.bootstrap_endpoints.len(), 1);
         assert_eq!(bootstrap.bootstrap_endpoints[0].id, seed_node_id);
-        assert!(bootstrap.realm_private_key_pem.is_none());
+        assert!(bootstrap.wrapped_realm_private_key.is_none());
         assert!(bootstrap.delegation_signature.is_some());
+        assert!(!bootstrap.onboarding_sync_ticket.is_empty());
 
         net_handle.shutdown().await;
     }
@@ -583,6 +669,7 @@ mod tests {
             .sign(&bootstrap_node_proof_message(
                 &created.onboarding_secret,
                 &joiner_node_id_string,
+                None,
             ))
             .to_string();
 
@@ -597,6 +684,7 @@ mod tests {
                 onboarding_secret: onboarding_secret.clone(),
                 node_id: joiner_node_id_string.clone(),
                 node_proof: node_signature.clone(),
+                transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key.clone()),
                 issuer_proof: Some("invalid-signature".to_string()),
             }),
@@ -622,12 +710,89 @@ mod tests {
                 onboarding_secret,
                 node_id: joiner_node_id_string,
                 node_proof: node_signature,
+                transport_public_key: None,
                 issuer_public_key: Some(issuer_public_key),
                 issuer_proof: Some(issuer_signature),
             }),
         )
         .await;
         assert!(result.is_ok());
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn management_bootstrap_wraps_realm_key() {
+        let (state, realm_id, _seed_node_id, user_id, net_handle, _tempdir) =
+            setup_management_state().await;
+        let auth = AuthContext {
+            user_id,
+            realm_id: realm_id.clone(),
+            path_restrictions: None,
+        };
+
+        let (_, Json(created)) = create_onboarding_secret(
+            State(state.clone()),
+            Extension(Some(auth)),
+            Json(CreateOnboardingSecretRequest {
+                seed_url: "http://127.0.0.1:3000".to_string(),
+                mode: OnboardingMode::Management,
+                expires_in_seconds: Some(600),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let joiner_node_key = SigningKey::from_bytes(&[11u8; 32]);
+        let joiner_node_id = iroh::SecretKey::from_bytes(&joiner_node_key.to_bytes()).public();
+        let joiner_node_id_string = joiner_node_id.to_string();
+        let transport_secret_key = TransportSecretKey::generate(&mut crypto_box::aead::OsRng);
+        let transport_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(transport_secret_key.public_key().as_bytes());
+        let node_signature = joiner_node_key
+            .sign(&bootstrap_node_proof_message(
+                &created.onboarding_secret,
+                &joiner_node_id_string,
+                Some(&transport_public_key),
+            ))
+            .to_string();
+
+        let (_, Json(bootstrap)) = bootstrap_onboarding(
+            State(state),
+            Json(BootstrapOnboardingRequest {
+                onboarding_secret: created.onboarding_secret,
+                node_id: joiner_node_id_string,
+                node_proof: node_signature,
+                transport_public_key: Some(transport_public_key),
+                issuer_public_key: None,
+                issuer_proof: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let sender_public_key = TransportPublicKey::from(
+            <[u8; 32]>::try_from(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(bootstrap.wrapping_public_key.unwrap())
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap(),
+        );
+        let cipher = SalsaBox::new(&sender_public_key, &transport_secret_key);
+        let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(bootstrap.wrapped_realm_private_key_nonce.unwrap())
+            .unwrap();
+        let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(bootstrap.wrapped_realm_private_key.unwrap())
+            .unwrap();
+        let nonce = crypto_box::Nonce::from(<[u8; 24]>::try_from(nonce_bytes.as_slice()).unwrap());
+        let plaintext = cipher
+            .decrypt(&nonce, ciphertext.as_ref())
+            .unwrap();
+        let pem = String::from_utf8(plaintext).unwrap();
+        assert!(pem.contains("BEGIN PRIVATE KEY"));
 
         net_handle.shutdown().await;
     }

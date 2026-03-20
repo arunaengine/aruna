@@ -5,12 +5,17 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingSecret,
-    OnboardingSecretError, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+    OnboardingPhase, OnboardingSecretError,
+    bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
 use byteview::ByteView;
+use crypto_box::{
+    PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
+    aead::{Aead, OsRng as CryptoOsRng},
+};
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{Signer, SigningKey};
@@ -50,7 +55,7 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartupMode {
     InitializeRealm { realm_description: String },
-    JoinRealm,
+    JoinRealm { phase: OnboardingPhase },
     Provisioned,
 }
 
@@ -84,6 +89,8 @@ pub struct PersistedNodeState {
     pub realm_id: RealmId,
     pub net_secret_key: [u8; 32],
     pub bootstrap_endpoints: Vec<EndpointAddr>,
+    pub onboarding_phase: Option<OnboardingPhase>,
+    pub onboarding_sync_ticket: Option<String>,
     pub identity: PersistedNodeIdentity,
 }
 
@@ -119,6 +126,8 @@ pub enum SetupError {
     OnboardingSecretError(#[from] OnboardingSecretError),
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
+    #[error(transparent)]
+    Utf8Error(#[from] std::string::FromUtf8Error),
     #[error("onboarding bootstrap failed: {0}")]
     OnboardingBootstrapFailed(String),
     #[error("missing onboarding bootstrap material for {0:?} node")]
@@ -202,7 +211,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         PersistedNodeStatus::PendingInitialization => StartupMode::InitializeRealm {
             realm_description: realm_description.clone(),
         },
-        PersistedNodeStatus::PendingOnboarding => StartupMode::JoinRealm,
+        PersistedNodeStatus::PendingOnboarding => StartupMode::JoinRealm {
+            phase: node_state
+                .onboarding_phase
+                .unwrap_or(OnboardingPhase::Bootstrapped),
+        },
         PersistedNodeStatus::Complete => StartupMode::Provisioned,
     };
 
@@ -242,6 +255,18 @@ pub async fn mark_node_state_complete(
 
     let mut updated_state = node_state.clone();
     updated_state.status = PersistedNodeStatus::Complete;
+    updated_state.onboarding_phase = None;
+    updated_state.onboarding_sync_ticket = None;
+    persist_node_state(storage, &updated_state).await
+}
+
+pub async fn mark_onboarding_phase(
+    storage: &StorageHandle,
+    node_state: &PersistedNodeState,
+    phase: OnboardingPhase,
+) -> Result<(), SetupError> {
+    let mut updated_state = node_state.clone();
+    updated_state.onboarding_phase = Some(phase);
     persist_node_state(storage, &updated_state).await
 }
 
@@ -302,6 +327,8 @@ fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
         realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
         net_secret_key: node_signing_key.to_bytes(),
         bootstrap_endpoints: Vec::new(),
+        onboarding_phase: None,
+        onboarding_sync_ticket: None,
         identity: PersistedNodeIdentity::Management {
             realm_private_key_pem: realm_signing_key
                 .to_pkcs8_pem(LineEnding::default())?
@@ -328,11 +355,21 @@ async fn bootstrap_onboarded_node_state(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_signing_key.verifying_key().to_bytes())
     });
+    let transport_secret_key = if matches!(decoded_secret.mode, OnboardingMode::Management) {
+        Some(TransportSecretKey::generate(&mut CryptoOsRng))
+    } else {
+        None
+    };
+    let transport_public_key = transport_secret_key.as_ref().map(|transport_secret_key| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(transport_secret_key.public_key().as_bytes())
+    });
     let node_id_string = node_id.to_string();
     let node_proof = node_signing_key
         .sign(&bootstrap_node_proof_message(
             onboarding_secret,
             &node_id_string,
+            transport_public_key.as_deref(),
         ))
         .to_string();
     let issuer_proof = issuer_signing_key
@@ -357,6 +394,7 @@ async fn bootstrap_onboarded_node_state(
             onboarding_secret: onboarding_secret.to_string(),
             node_id: node_id_string,
             node_proof,
+            transport_public_key,
             issuer_public_key,
             issuer_proof,
         })
@@ -382,11 +420,45 @@ async fn bootstrap_onboarded_node_state(
 
     let realm_id = response.realm_id()?;
     let identity = match response.mode {
-        OnboardingMode::Management => PersistedNodeIdentity::Management {
-            realm_private_key_pem: response
-                .realm_private_key_pem
-                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?,
-        },
+        OnboardingMode::Management => {
+            let wrapped_key = response
+                .wrapped_realm_private_key
+                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?;
+            let wrapped_nonce = response
+                .wrapped_realm_private_key_nonce
+                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?;
+            let wrapping_public_key = response
+                .wrapping_public_key
+                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?;
+            let transport_secret_key = transport_secret_key
+                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?;
+            let wrapping_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(wrapping_public_key)
+                .map_err(SetupError::Base64Error)?;
+            let wrapping_public_key = TransportPublicKey::from(
+                <[u8; 32]>::try_from(wrapping_public_key_bytes.as_slice())
+                    .map_err(SetupError::FromSliceError)?,
+            );
+            let cipher = SalsaBox::new(&wrapping_public_key, &transport_secret_key);
+            let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(wrapped_nonce)
+                .map_err(SetupError::Base64Error)?;
+            let nonce = crypto_box::Nonce::from(
+                <[u8; 24]>::try_from(nonce_bytes.as_slice()).map_err(SetupError::FromSliceError)?,
+            );
+            let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(wrapped_key)
+                .map_err(SetupError::Base64Error)?;
+            let realm_private_key_pem = String::from_utf8(
+                cipher
+                    .decrypt(&nonce, ciphertext.as_ref())
+                    .map_err(|error| SetupError::OnboardingBootstrapFailed(error.to_string()))?,
+            )?;
+
+            PersistedNodeIdentity::Management {
+                realm_private_key_pem,
+            }
+        }
         OnboardingMode::Server => PersistedNodeIdentity::Server {
             issuer_private_key_pem: issuer_signing_key
                 .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Server))?
@@ -405,6 +477,8 @@ async fn bootstrap_onboarded_node_state(
         realm_id,
         net_secret_key,
         bootstrap_endpoints: response.bootstrap_endpoints,
+        onboarding_phase: Some(OnboardingPhase::Bootstrapped),
+        onboarding_sync_ticket: Some(response.onboarding_sync_ticket),
         identity,
     })
 }
@@ -481,6 +555,8 @@ mod tests {
             realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
             net_secret_key: net_signing_key.to_bytes(),
             bootstrap_endpoints: Vec::new(),
+            onboarding_phase: None,
+            onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::Local,
         };
         persist_node_state(&storage, &node_state).await.unwrap();

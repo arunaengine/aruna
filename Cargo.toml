@@ -32,6 +32,7 @@ axum-extra = { version = "0.12.5", features = ["query"] }
 base64 = "0.22.1"
 blake3 = { version = "1.8.3", features = ["serde"] }
 chrono = { version = "0.4.44", features = ["serde"] }
+crypto_box = "0.9.1"
 data-encoding = "2.10.0"
 dotenvy = "0.15.7"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core", "pem"] }

@@ -17,6 +17,7 @@ aruna-tasks = { path = "../tasks" }
 
 # The rest
 base64.workspace = true
+crypto_box.workspace = true
 dotenvy = "0.15.7"
 ed25519-dalek.workspace = true
 iroh.workspace = true

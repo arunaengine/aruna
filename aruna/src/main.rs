@@ -1,6 +1,6 @@
 #![allow(clippy::result_large_err)]
 
-use aruna::config::{StartupMode, load, mark_node_state_complete};
+use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
@@ -11,6 +11,7 @@ use aruna_core::errors::GossipError;
 use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::onboarding::{OnboardingPhase, OnboardingSyncTicket};
 use aruna_core::TopicId;
 use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
@@ -120,14 +121,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }
-        StartupMode::JoinRealm => {
-            bootstrap_join(
-                driver_ctx.as_ref(),
-                config.node_id,
-                &config.realm_id,
-                config.bootstrap_endpoints.first().map(|endpoint| endpoint.id),
-            )
-            .await?;
+        StartupMode::JoinRealm { phase } => {
+            if matches!(phase, OnboardingPhase::Bootstrapped) {
+                fetch_core_onboarding_documents(
+                    driver_ctx.as_ref(),
+                    &config.node_state,
+                    &config.realm_id,
+                    config.bootstrap_endpoints.first().map(|endpoint| endpoint.id),
+                )
+                .await?;
+                mark_onboarding_phase(
+                    &driver_ctx.storage_handle,
+                    &config.node_state,
+                    OnboardingPhase::CoreDocumentsFetched,
+                )
+                .await?;
+            }
+            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }
         StartupMode::Provisioned => {
@@ -270,9 +280,9 @@ async fn announce_core_documents(
     Ok(())
 }
 
-async fn bootstrap_join(
+async fn fetch_core_onboarding_documents(
     driver_ctx: &DriverContext,
-    node_id: aruna_core::NodeId,
+    node_state: &aruna::config::PersistedNodeState,
     realm_id: &aruna_core::structs::RealmId,
     bootstrap_peer: Option<aruna_core::NodeId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -280,6 +290,11 @@ async fn bootstrap_join(
         return Err("net handle unavailable".into());
     };
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
+    let onboarding_sync_ticket = node_state
+        .onboarding_sync_ticket
+        .as_deref()
+        .ok_or("missing onboarding sync ticket")?;
+    let onboarding_sync_ticket = OnboardingSyncTicket::decode(onboarding_sync_ticket)?;
 
     for topic in [
         TopicId::automerge_document(aruna_core::AutomergeTopicId::RealmAuthorization {
@@ -316,11 +331,15 @@ async fn bootstrap_join(
         },
     ] {
         drive(
-            OutgoingAutomergeOperation::new(bootstrap_peer, document),
+            OutgoingAutomergeOperation::new_with_auth(
+                bootstrap_peer,
+                document,
+                Some(onboarding_sync_ticket.clone().into_auth_proof()),
+            ),
             driver_ctx,
         )
         .await?;
     }
 
-    announce_core_documents(driver_ctx, node_id, realm_id).await
+    Ok(())
 }

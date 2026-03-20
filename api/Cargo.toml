@@ -24,6 +24,7 @@ axum = "0.8.8"
 byteview = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
+crypto_box = { workspace = true }
 ed25519-dalek = { workspace = true }
 jsonwebtoken = { workspace = true }
 postcard = { workspace = true }

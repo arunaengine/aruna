@@ -2,11 +2,13 @@ use crate::auth::OidcValidator;
 use crate::error::TokenError;
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
+use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::API_STATE_KEYSPACE;
+use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId};
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -34,6 +36,7 @@ use utoipa_swagger_ui::SwaggerUi;
 const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
 const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
+const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
 
 #[derive(Clone, Debug)]
 pub struct ServerState {
@@ -157,6 +160,31 @@ impl ServerState {
                 realm_signing_key, ..
             } => Some(realm_signing_key.sign(issuer_public_key.as_bytes()).to_string()),
             _ => None,
+        }
+    }
+
+    pub fn issue_onboarding_sync_ticket(
+        &self,
+        node_id: NodeId,
+    ) -> Result<OnboardingSyncTicket, OnboardingSecretError> {
+        match &self.node_capabilities {
+            NodeCapabilities::Management {
+                realm_signing_key, ..
+            } => OnboardingSyncTicket::issue(
+                realm_signing_key,
+                &self.realm_id,
+                node_id,
+                chrono::Utc::now().timestamp().max(0) as u64 + ONBOARDING_SYNC_TICKET_TTL_SECS,
+                vec![
+                    AutomergeDocumentVariant::RealmAuthorization {
+                        realm_id: self.realm_id.clone(),
+                    },
+                    AutomergeDocumentVariant::RealmConfig {
+                        realm_id: self.realm_id.clone(),
+                    },
+                ],
+            ),
+            _ => Err(OnboardingSecretError::InvalidSecret),
         }
     }
 
