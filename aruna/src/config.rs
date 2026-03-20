@@ -5,7 +5,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingSecret,
-    OnboardingSecretError,
+    OnboardingSecretError, bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
@@ -13,7 +13,7 @@ use base64::Engine;
 use byteview::ByteView;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use iroh::EndpointAddr;
 use iroh::KeyParsingError;
 use serde::{Deserialize, Serialize};
@@ -328,6 +328,25 @@ async fn bootstrap_onboarded_node_state(
         base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(issuer_signing_key.verifying_key().to_bytes())
     });
+    let node_id_string = node_id.to_string();
+    let node_proof = node_signing_key
+        .sign(&bootstrap_node_proof_message(
+            onboarding_secret,
+            &node_id_string,
+        ))
+        .to_string();
+    let issuer_proof = issuer_signing_key
+        .as_ref()
+        .zip(issuer_public_key.as_ref())
+        .map(|(issuer_signing_key, issuer_public_key)| {
+            issuer_signing_key
+                .sign(&bootstrap_issuer_proof_message(
+                    onboarding_secret,
+                    &node_id_string,
+                    issuer_public_key,
+                ))
+                .to_string()
+        });
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -336,8 +355,10 @@ async fn bootstrap_onboarded_node_state(
         ))
         .json(&BootstrapOnboardingRequest {
             onboarding_secret: onboarding_secret.to_string(),
-            node_id: node_id.to_string(),
+            node_id: node_id_string,
+            node_proof,
             issuer_public_key,
+            issuer_proof,
         })
         .send()
         .await?;

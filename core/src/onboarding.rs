@@ -33,7 +33,9 @@ pub struct OnboardingSecretRecord {
 pub struct BootstrapOnboardingRequest {
     pub onboarding_secret: String,
     pub node_id: String,
+    pub node_proof: String,
     pub issuer_public_key: Option<String>,
+    pub issuer_proof: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +87,18 @@ impl BootstrapOnboardingResponse {
     pub fn realm_id(&self) -> Result<RealmId, OnboardingSecretError> {
         RealmId::from_base64(&self.realm_id).map_err(|_| OnboardingSecretError::InvalidSecret)
     }
+}
+
+pub fn bootstrap_node_proof_message(onboarding_secret: &str, node_id: &str) -> Vec<u8> {
+    format!("aruna-bootstrap-node:{onboarding_secret}:{node_id}").into_bytes()
+}
+
+pub fn bootstrap_issuer_proof_message(
+    onboarding_secret: &str,
+    node_id: &str,
+    issuer_public_key: &str,
+) -> Vec<u8> {
+    format!("aruna-bootstrap-issuer:{onboarding_secret}:{node_id}:{issuer_public_key}").into_bytes()
 }
 
 #[cfg(test)]

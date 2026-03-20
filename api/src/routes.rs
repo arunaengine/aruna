@@ -41,6 +41,11 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
             post(onboarding::bootstrap_onboarding),
         )
         .route("/admin/onboarding/secrets", post(onboarding::create_onboarding_secret))
+        .route("/admin/onboarding/secrets", get(onboarding::list_onboarding_secrets))
+        .route(
+            "/admin/onboarding/secrets/{id}",
+            delete(onboarding::revoke_onboarding_secret),
+        )
         .route("/users/me/credentials", post(create_s3_credentials))
         .route(
             "/users/me/credentials/{access_key_id}",

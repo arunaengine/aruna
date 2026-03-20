@@ -117,7 +117,23 @@ aws --endpoint-url http://localhost:1337 s3 ls s3://my-bucket
 
 ### Connecting nodes
 
-Start a second instance with `BOOTSTRAP_NODES` pointing at the first node's P2P address. The nodes will discover each other through DHT and begin synchronizing.
+Additional nodes join through the onboarding API:
+
+1. Start the first node without `ONBOARDING_SECRET` so it initializes a new realm.
+2. Let the first local user authenticate and claim the empty `realm_admin` role.
+3. Create an onboarding secret with `POST /api/v1/admin/onboarding/secrets`.
+4. Start the joining node with that `ONBOARDING_SECRET`.
+5. On first boot, the joining node calls `POST /api/v1/onboarding/bootstrap`, persists its local identity, subscribes to the realm auth/config topics, and explicitly syncs both documents.
+
+Admin routes currently available for onboarding:
+
+- `POST /api/v1/admin/onboarding/secrets`
+- `GET /api/v1/admin/onboarding/secrets`
+- `DELETE /api/v1/admin/onboarding/secrets/{id}`
+
+Bootstrap route:
+
+- `POST /api/v1/onboarding/bootstrap`
 
 ## Development
 
