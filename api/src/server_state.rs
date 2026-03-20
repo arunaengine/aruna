@@ -30,7 +30,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::warn;
-use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";

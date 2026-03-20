@@ -24,7 +24,8 @@ use aruna_operations::inspect_onboarding_secret::{
 use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
+use axum::routing::{delete, get, post};
+use axum::{Extension, Json, Router};
 use base64::Engine;
 use crypto_box::{
     PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
@@ -35,18 +36,84 @@ use rand::RngCore;
 use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
+use utoipa::{OpenApi, ToSchema};
 
 const DEFAULT_ONBOARDING_SECRET_TTL_SECS: u64 = 3600;
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(OpenApi)]
+#[openapi(
+    tags((name = "onboarding", description = "Node onboarding and bootstrap operations")),
+    paths(
+        create_onboarding_secret,
+        list_onboarding_secrets,
+        revoke_onboarding_secret,
+        bootstrap_onboarding
+    )
+)]
+pub struct OnboardingApiDoc;
+
+pub fn router() -> Router<Arc<ServerState>> {
+    Router::new()
+        .route("/onboarding/bootstrap", post(bootstrap_onboarding))
+        .route("/admin/onboarding/secrets", post(create_onboarding_secret))
+        .route("/admin/onboarding/secrets", get(list_onboarding_secrets))
+        .route(
+            "/admin/onboarding/secrets/{id}",
+            delete(revoke_onboarding_secret),
+        )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct BootstrapEndpointDoc {
+    pub id: String,
+    pub addrs: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct CreateOnboardingSecretRequestDoc {
+    pub seed_url: String,
+    pub mode: String,
+    pub expires_in_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct CreateOnboardingSecretResponseDoc {
+    pub onboarding_secret: String,
+    pub mode: String,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct BootstrapOnboardingRequestDoc {
+    pub onboarding_secret: String,
+    pub node_id: String,
+    pub node_proof: String,
+    pub transport_public_key: Option<String>,
+    pub issuer_public_key: Option<String>,
+    pub issuer_proof: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub struct BootstrapOnboardingResponseDoc {
+    pub realm_id: String,
+    pub mode: String,
+    pub bootstrap_endpoints: Vec<BootstrapEndpointDoc>,
+    pub wrapped_realm_private_key: Option<String>,
+    pub wrapped_realm_private_key_nonce: Option<String>,
+    pub wrapping_public_key: Option<String>,
+    pub delegation_signature: Option<String>,
+    pub onboarding_sync_ticket: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct ListOnboardingSecretsResponse {
     pub secrets: Vec<OnboardingSecretSummary>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct OnboardingSecretSummary {
     pub enrollment_id: String,
-    pub mode: OnboardingMode,
+    pub mode: String,
     pub expires_at: u64,
     pub consumed: bool,
 }
@@ -55,7 +122,7 @@ impl From<OnboardingSecretRecord> for OnboardingSecretSummary {
     fn from(record: OnboardingSecretRecord) -> Self {
         Self {
             enrollment_id: record.enrollment_id.to_string(),
-            mode: record.mode,
+            mode: format!("{:?}", record.mode),
             expires_at: record.expires_at,
             consumed: record.consumed,
         }
@@ -111,6 +178,18 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
     Ok(())
 }
 
+#[utoipa::path(
+    post,
+    path = "/admin/onboarding/secrets",
+    tag = "onboarding",
+    request_body = CreateOnboardingSecretRequestDoc,
+    responses(
+        (status = 201, description = "Onboarding secret created", body = CreateOnboardingSecretResponseDoc),
+        (status = 401, description = "Unauthorized", body = crate::error::ErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn create_onboarding_secret(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -162,6 +241,17 @@ pub async fn create_onboarding_secret(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/onboarding/secrets",
+    tag = "onboarding",
+    responses(
+        (status = 200, description = "List onboarding secrets", body = ListOnboardingSecretsResponse),
+        (status = 401, description = "Unauthorized", body = crate::error::ErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn list_onboarding_secrets(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -181,6 +271,19 @@ pub async fn list_onboarding_secrets(
     ))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/admin/onboarding/secrets/{id}",
+    tag = "onboarding",
+    params(("id" = String, Path, description = "Onboarding secret enrollment id")),
+    responses(
+        (status = 204, description = "Secret revoked"),
+        (status = 401, description = "Unauthorized", body = crate::error::ErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::ErrorResponse),
+        (status = 404, description = "Secret not found", body = crate::error::ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
 pub async fn revoke_onboarding_secret(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
@@ -199,6 +302,18 @@ pub async fn revoke_onboarding_secret(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    post,
+    path = "/onboarding/bootstrap",
+    tag = "onboarding",
+    request_body = BootstrapOnboardingRequestDoc,
+    responses(
+        (status = 200, description = "Bootstrap material for joiner", body = BootstrapOnboardingResponseDoc),
+        (status = 400, description = "Invalid request", body = crate::error::ErrorResponse),
+        (status = 401, description = "Unauthorized", body = crate::error::ErrorResponse),
+        (status = 403, description = "Forbidden", body = crate::error::ErrorResponse)
+    )
+)]
 pub async fn bootstrap_onboarding(
     State(state): State<Arc<ServerState>>,
     Json(request): Json<BootstrapOnboardingRequest>,

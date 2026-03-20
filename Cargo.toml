@@ -16,9 +16,10 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0"
+version = "3.0.0-alpha.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/arunaengine/aruna"
 rust-version = "1.93.0"
 
 [workspace.dependencies]
