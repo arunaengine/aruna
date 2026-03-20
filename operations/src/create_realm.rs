@@ -244,7 +244,8 @@ impl CreateRealmOperation {
                 AnnounceAutomergeDocumentOperation::new(
                     AutomergeDocumentVariant::RealmAuthorization {
                         realm_id: realm.realm_id.clone(),
-                    }
+                    },
+                    self.config.actor.node_id,
                 ),
                 |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                     result: result.map_err(|error| error.to_string()),
@@ -272,9 +273,12 @@ impl CreateRealmOperation {
         if let Some(realm) = &self.realm {
             self.state = CreateRealmState::AnnounceConfigDoc;
             smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::RealmConfig {
-                    realm_id: realm.realm_id.clone(),
-                }),
+                AnnounceAutomergeDocumentOperation::new(
+                    AutomergeDocumentVariant::RealmConfig {
+                        realm_id: realm.realm_id.clone(),
+                    },
+                    self.config.actor.node_id,
+                ),
                 |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
@@ -456,7 +460,7 @@ mod test {
         assert_eq!(result.0.description, realm_config.realm_description);
         assert_eq!(result.0.realm_id, realm_config.actor.realm_id);
         assert!(result.1.roles.iter().any(|(_id, role)| {
-            role.name == "admin"
+            role.name == "realm_admin"
                 && role
                     .assigned_users
                     .iter()

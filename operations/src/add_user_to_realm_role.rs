@@ -245,9 +245,12 @@ impl AddUserToRealmRolesOperation {
             auth_doc: auth_doc.clone(),
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::RealmAuthorization {
-                realm_id: auth_doc.realm_id.clone(),
-            }),
+            AnnounceAutomergeDocumentOperation::new(
+                AutomergeDocumentVariant::RealmAuthorization {
+                    realm_id: auth_doc.realm_id.clone(),
+                },
+                self.input.actor.node_id,
+            ),
             |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                 result: result.map_err(|error| error.to_string()),
             }),
@@ -447,7 +450,7 @@ pub mod test {
         let admin_role = realm_auth_doc
             .roles
             .iter()
-            .filter_map(|(id, r)| if r.name == "admin" { Some(*id) } else { None })
+            .filter_map(|(id, r)| if r.name == "realm_admin" { Some(*id) } else { None })
             .collect();
 
         let add_user_input = AddUserToRealmRolesInput {
@@ -475,7 +478,7 @@ pub mod test {
             auth_doc
                 .roles
                 .iter()
-                .find(|(_, v)| v.name == "admin")
+                .find(|(_, v)| v.name == "realm_admin")
                 .unwrap()
                 .1
                 .assigned_users
