@@ -214,7 +214,8 @@ impl CreateGroupOperation {
                 AnnounceAutomergeDocumentOperation::new(
                     AutomergeDocumentVariant::GroupAuthorization {
                         group_id: group.group_id,
-                    }
+                    },
+                    self.config.actor.node_id,
                 ),
                 |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                     result: result.map_err(|error| error.to_string()),

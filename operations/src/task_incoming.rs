@@ -31,7 +31,11 @@ impl InboundTaskHandler for OperationsTaskHandler {
     async fn handle_timer(&self, key: TaskKey) {
         match key {
             TaskKey::AutomergeAnnounce(document) => {
-                let op = AnnounceAutomergeDocumentOperation::new(document);
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    error!("Failed to process automerge timer event without net handle");
+                    return;
+                };
+                let op = AnnounceAutomergeDocumentOperation::new(document, net_handle.node_id());
                 if let Err(err) = drive(op, self.context.as_ref()).await {
                     error!(error = ?err, "Failed to process automerge timer event");
                 }

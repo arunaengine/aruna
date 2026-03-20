@@ -2,7 +2,7 @@ use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{boxed_suboperation, Operation};
 use aruna_core::structs::{Actor, RealmConfigDocument};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -169,7 +169,10 @@ impl Operation for EnsureRealmConfigOperation {
                     self.txn_id = None;
                     self.state = EnsureRealmConfigState::Announce;
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceAutomergeDocumentOperation::new(self.document_ref()),
+                        AnnounceAutomergeDocumentOperation::new(
+                            self.document_ref(),
+                            self.config.actor.node_id,
+                        ),
                         |result| {
                             Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                                 result: result.map_err(|error| error.to_string()),

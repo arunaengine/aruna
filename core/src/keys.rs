@@ -37,7 +37,7 @@ pub fn gossip_peer_key(topic: &TopicId) -> DhtKeyId {
 #[must_use]
 #[inline]
 pub fn automerge_document_holder_key(document: &AutomergeDocumentVariant) -> DhtKeyId {
-    document.topic_key()
+    document.holder_key()
 }
 
 /// Derive a DHT key for active realm node presence announcements.

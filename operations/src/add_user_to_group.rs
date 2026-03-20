@@ -245,9 +245,12 @@ impl AddUserToGroupOperation {
             auth_doc: auth_doc.clone(),
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::GroupAuthorization {
-                group_id: auth_doc.group_id,
-            }),
+            AnnounceAutomergeDocumentOperation::new(
+                AutomergeDocumentVariant::GroupAuthorization {
+                    group_id: auth_doc.group_id,
+                },
+                self.input.actor.node_id,
+            ),
             |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                 result: result.map_err(|error| error.to_string()),
             }),

@@ -239,9 +239,12 @@ impl AddRealmRoleOperation {
             auth_doc: auth_doc.clone(),
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::RealmAuthorization {
-                realm_id: auth_doc.realm_id.clone(),
-            }),
+            AnnounceAutomergeDocumentOperation::new(
+                AutomergeDocumentVariant::RealmAuthorization {
+                    realm_id: auth_doc.realm_id.clone(),
+                },
+                self.input.actor.node_id,
+            ),
             |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                 result: result.map_err(|error| error.to_string()),
             }),

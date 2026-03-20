@@ -348,23 +348,23 @@ async fn metadata_gossip_announcement_triggers_sync() -> Result<(), Box<dyn std:
     .await?;
 
     drive(
-        AnnounceAutomergeDocumentOperation::new(document.clone()),
+        AnnounceAutomergeDocumentOperation::new(document.clone(), net_b.node_id()),
         context_b.as_ref(),
     )
     .await?;
     drive(
-        AnnounceAutomergeDocumentOperation::new(document.clone()),
+        AnnounceAutomergeDocumentOperation::new(document.clone(), net_a.node_id()),
         context_a.as_ref(),
     )
     .await?;
     sleep(Duration::from_millis(250)).await;
     drive(
-        AnnounceAutomergeDocumentOperation::new(document.clone()),
+        AnnounceAutomergeDocumentOperation::new(document.clone(), net_a.node_id()),
         context_a.as_ref(),
     )
     .await?;
     drive(
-        AnnounceAutomergeDocumentOperation::new(document.clone()),
+        AnnounceAutomergeDocumentOperation::new(document.clone(), net_b.node_id()),
         context_b.as_ref(),
     )
     .await?;
@@ -491,8 +491,14 @@ impl InboundEventHandler for TestInboundHandler {
         let sync_id = automerge_handle
             .register_inbound_stream(stream, node_id)
             .await;
+        let Some(net_handle) = self.context.net_handle.as_ref() else {
+            let _ = self
+                .inbound_results
+                .send(Err("missing net handle".to_string()));
+            return;
+        };
         let result = drive(
-            IncomingAutomergeOperation::new(sync_id, node_id),
+            IncomingAutomergeOperation::new(sync_id, node_id, net_handle.node_id()),
             self.context.as_ref(),
         )
         .await

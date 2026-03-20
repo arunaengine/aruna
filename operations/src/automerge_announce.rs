@@ -9,13 +9,15 @@ use aruna_core::task::{TaskEffect, TaskEvent};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::automerge::repository::{automerge_heads, read_effect};
+use crate::automerge::repository::{automerge_clock, read_effect};
 
 pub const AUTOMERGE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+pub const AUTOMERGE_ANNOUNCE_SHORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq)]
 pub struct AnnounceAutomergeDocumentOperation {
     document: AutomergeDocumentVariant,
+    local_node_id: aruna_core::NodeId,
     state: AnnounceAutomergeDocumentState,
     output: Option<Result<(), AnnounceAutomergeDocumentError>>,
 }
@@ -50,9 +52,10 @@ pub enum AnnounceAutomergeDocumentError {
 }
 
 impl AnnounceAutomergeDocumentOperation {
-    pub fn new(document: AutomergeDocumentVariant) -> Self {
+    pub fn new(document: AutomergeDocumentVariant, local_node_id: aruna_core::NodeId) -> Self {
         Self {
             document,
+            local_node_id,
             state: AnnounceAutomergeDocumentState::Init,
             output: None,
         }
@@ -128,13 +131,14 @@ impl Operation for AnnounceAutomergeDocumentOperation {
                     let Some(value) = value else {
                         return self.fail(AnnounceAutomergeDocumentError::DocumentNotFound);
                     };
-                    let heads = match automerge_heads(&value) {
-                        Ok(heads) => heads,
+                    let clock = match automerge_clock(&value) {
+                        Ok(clock) => clock,
                         Err(error) => return self.fail(error.into()),
                     };
                     let message = match postcard::to_allocvec(&AutomergeState::new(
-                        self.document.clone(),
-                        heads,
+                        clock.heads,
+                        clock.change_count,
+                        self.local_node_id,
                     )) {
                         Ok(message) => message,
                         Err(error) => return self.fail(ConversionError::from(error).into()),

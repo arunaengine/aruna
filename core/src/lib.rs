@@ -17,9 +17,9 @@ pub mod types;
 pub mod util;
 
 pub use automerge::{
-    AutomergeDocumentVariant, AutomergeEffect, AutomergeEvent, AutomergeInit,
+    AutomergeClock, AutomergeDocumentVariant, AutomergeEffect, AutomergeEvent, AutomergeInit,
     AutomergeRejectReason, AutomergeState, AutomergeSyncError, AutomergeSyncFeature, InitAuthProof,
 };
-pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
+pub use id::{AutomergeTopicId, DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;
 pub use task::{TaskEffect, TaskEvent, TaskKey};

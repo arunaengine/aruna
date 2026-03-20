@@ -2,7 +2,7 @@ use aruna_core::automerge::{AutomergeEffect, AutomergeEvent, AutomergeInit, Auto
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{boxed_suboperation, Operation};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -14,6 +14,7 @@ use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 pub struct IncomingAutomergeOperation {
     sync_id: Ulid,
     node_id: aruna_core::NodeId,
+    local_node_id: aruna_core::NodeId,
     state: IncomingAutomergeState,
     remote_init: Option<AutomergeInit>,
     local_document: Option<Vec<u8>>,
@@ -56,10 +57,15 @@ pub enum IncomingAutomergeError {
 }
 
 impl IncomingAutomergeOperation {
-    pub fn new(sync_id: Ulid, node_id: aruna_core::NodeId) -> Self {
+    pub fn new(
+        sync_id: Ulid,
+        node_id: aruna_core::NodeId,
+        local_node_id: aruna_core::NodeId,
+    ) -> Self {
         Self {
             sync_id,
             node_id,
+            local_node_id,
             state: IncomingAutomergeState::Init,
             remote_init: None,
             local_document: None,
@@ -228,7 +234,10 @@ impl Operation for IncomingAutomergeOperation {
                     };
                     self.state = IncomingAutomergeState::Announce;
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceAutomergeDocumentOperation::new(remote_init.document.clone()),
+                        AnnounceAutomergeDocumentOperation::new(
+                            remote_init.document.clone(),
+                            self.local_node_id,
+                        ),
                         |result| {
                             Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                                 result: result.map_err(|error| error.to_string()),
