@@ -7,6 +7,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::automerge::repository::read_effect;
+use aruna_core::types::Effects;
+use aruna_core::types::GroupId;
 
 #[derive(Debug, PartialEq)]
 pub struct GetMetadataDocumentOperation {
@@ -40,7 +42,7 @@ pub enum GetMetadataDocumentError {
 }
 
 impl GetMetadataDocumentOperation {
-    pub fn new(group_id: aruna_core::types::GroupId, document_id: ulid::Ulid) -> Self {
+    pub fn new(group_id: GroupId, document_id: ulid::Ulid) -> Self {
         Self {
             document: AutomergeDocumentVariant::Metadata {
                 group_id,
@@ -51,17 +53,13 @@ impl GetMetadataDocumentOperation {
         }
     }
 
-    fn fail(&mut self, error: GetMetadataDocumentError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: GetMetadataDocumentError) -> Effects {
         self.state = GetMetadataDocumentState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(GetMetadataDocumentError::UnexpectedEvent {
             state,
@@ -75,12 +73,12 @@ impl Operation for GetMetadataDocumentOperation {
     type Output = MetadataDocument;
     type Error = GetMetadataDocumentError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = GetMetadataDocumentState::ReadDocument;
         smallvec![read_effect(&self.document, None)]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             GetMetadataDocumentState::ReadDocument => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -116,7 +114,7 @@ impl Operation for GetMetadataDocumentOperation {
         self.output.expect("metadata get operation must set output")
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         smallvec![]
     }
 }

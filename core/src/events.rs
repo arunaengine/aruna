@@ -1,6 +1,6 @@
 use crate::errors::BlobError;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::{BackendLocation, NegotiationResult};
+use crate::structs::{BackendLocation, NegotiationResult, RealmId};
 use crate::{
     automerge::AutomergeEvent,
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
@@ -108,6 +108,7 @@ pub enum DhtEvent {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DhtEntry {
     pub node_id: NodeId,
+    pub realm_id: RealmId,
     pub value: Vec<u8>,
     pub expires_at: u64,
 }

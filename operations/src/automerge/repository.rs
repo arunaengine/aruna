@@ -1,7 +1,7 @@
 use automerge::{AutoCommit, ChangeHash};
 use byteview::ByteView;
 
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::automerge::{AutomergeClock, AutomergeDocumentVariant};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -100,12 +100,18 @@ pub fn parse_document_bytes(event: Event) -> Result<Option<Vec<u8>>, StorageErro
 }
 
 pub fn automerge_heads(bytes: &[u8]) -> Result<Vec<ChangeHash>, ConversionError> {
+    Ok(automerge_clock(bytes)?.heads)
+}
+
+pub fn automerge_clock(bytes: &[u8]) -> Result<AutomergeClock, ConversionError> {
     if bytes.is_empty() {
-        return Ok(Vec::new());
+        return Ok(AutomergeClock::new(Vec::new(), 0));
     }
 
     let mut doc = AutoCommit::load(bytes)?;
-    Ok(doc.get_heads())
+    let heads = doc.get_heads();
+    let change_count = doc.get_changes(&[]).len() as u64;
+    Ok(AutomergeClock::new(heads, change_count))
 }
 
 pub fn parse_metadata_iter(

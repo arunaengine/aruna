@@ -2,7 +2,7 @@ use automerge::ChangeHash;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::id::{DhtKeyId, NodeId, TopicId};
+use crate::id::{AutomergeTopicId, DhtKeyId, NodeId, TopicId};
 use crate::structs::RealmId;
 use crate::task::TaskKey;
 use crate::types::GroupId;
@@ -33,10 +33,59 @@ impl AutomergeDocumentVariant {
     }
 
     pub fn topic_id(&self) -> TopicId {
-        TopicId::automerge_document(self.topic_key())
+        TopicId::automerge_document(self.topic_descriptor())
     }
 
-    pub fn topic_key(&self) -> DhtKeyId {
+    pub fn topic_descriptor(&self) -> AutomergeTopicId {
+        match self {
+            Self::Metadata {
+                group_id,
+                document_id,
+            } => AutomergeTopicId::Metadata {
+                group_id: *group_id,
+                document_id: *document_id,
+            },
+            Self::GroupAuthorization { group_id } => AutomergeTopicId::GroupAuthorization {
+                group_id: *group_id,
+            },
+            Self::RealmAuthorization { realm_id } => AutomergeTopicId::RealmAuthorization {
+                realm_id: realm_id.clone(),
+            },
+            Self::RealmConfig { realm_id } => AutomergeTopicId::RealmConfig {
+                realm_id: realm_id.clone(),
+            },
+        }
+    }
+
+    pub fn from_topic_id(topic: &TopicId) -> Option<Self> {
+        match topic {
+            TopicId::AutomergeDocument(topic) => match topic {
+                AutomergeTopicId::Metadata {
+                    group_id,
+                    document_id,
+                } => Some(Self::Metadata {
+                    group_id: *group_id,
+                    document_id: *document_id,
+                }),
+                AutomergeTopicId::GroupAuthorization { group_id } => {
+                    Some(Self::GroupAuthorization {
+                        group_id: *group_id,
+                    })
+                }
+                AutomergeTopicId::RealmAuthorization { realm_id } => {
+                    Some(Self::RealmAuthorization {
+                        realm_id: realm_id.clone(),
+                    })
+                }
+                AutomergeTopicId::RealmConfig { realm_id } => Some(Self::RealmConfig {
+                    realm_id: realm_id.clone(),
+                }),
+            },
+            _ => None,
+        }
+    }
+
+    pub fn holder_key(&self) -> DhtKeyId {
         DhtKeyId::from_data(&self.holder_lookup_bytes())
     }
 
@@ -79,7 +128,7 @@ mod tests {
             document_id,
         };
 
-        assert_ne!(left.topic_key(), right.topic_key());
+        assert_ne!(left.holder_key(), right.holder_key());
         assert_ne!(left.topic_id(), right.topic_id());
     }
 }
@@ -120,14 +169,34 @@ impl AutomergeInit {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AutomergeState {
-    pub document: AutomergeDocumentVariant,
+pub struct AutomergeClock {
     pub heads: Vec<ChangeHash>,
+    pub change_count: u64,
+}
+
+impl AutomergeClock {
+    pub fn new(heads: Vec<ChangeHash>, change_count: u64) -> Self {
+        Self {
+            heads,
+            change_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomergeState {
+    pub heads: Vec<ChangeHash>,
+    pub change_count: u64,
+    pub node_id: NodeId,
 }
 
 impl AutomergeState {
-    pub fn new(document: AutomergeDocumentVariant, heads: Vec<ChangeHash>) -> Self {
-        Self { document, heads }
+    pub fn new(heads: Vec<ChangeHash>, change_count: u64, node_id: NodeId) -> Self {
+        Self {
+            heads,
+            change_count,
+            node_id,
+        }
     }
 }
 

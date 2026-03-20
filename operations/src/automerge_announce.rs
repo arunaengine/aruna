@@ -9,13 +9,18 @@ use aruna_core::task::{TaskEffect, TaskEvent};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::automerge::repository::{automerge_heads, read_effect};
+use crate::automerge::repository::{automerge_clock, read_effect};
+use aruna_core::NodeId;
+use aruna_core::events::NetEvent;
+use aruna_core::types::Effects;
 
 pub const AUTOMERGE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
+pub const AUTOMERGE_ANNOUNCE_SHORT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq)]
 pub struct AnnounceAutomergeDocumentOperation {
     document: AutomergeDocumentVariant,
+    local_node_id: NodeId,
     state: AnnounceAutomergeDocumentState,
     output: Option<Result<(), AnnounceAutomergeDocumentError>>,
 }
@@ -50,19 +55,16 @@ pub enum AnnounceAutomergeDocumentError {
 }
 
 impl AnnounceAutomergeDocumentOperation {
-    pub fn new(document: AutomergeDocumentVariant) -> Self {
+    pub fn new(document: AutomergeDocumentVariant, local_node_id: NodeId) -> Self {
         Self {
             document,
+            local_node_id,
             state: AnnounceAutomergeDocumentState::Init,
             output: None,
         }
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.state = AnnounceAutomergeDocumentState::Error;
         self.output = Some(Err(AnnounceAutomergeDocumentError::UnexpectedEvent {
@@ -73,7 +75,7 @@ impl AnnounceAutomergeDocumentOperation {
         smallvec![]
     }
 
-    fn fail(&mut self, error: AnnounceAutomergeDocumentError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: AnnounceAutomergeDocumentError) -> Effects {
         self.state = AnnounceAutomergeDocumentState::Error;
         self.output = Some(Err(error));
         smallvec![]
@@ -84,7 +86,7 @@ impl Operation for AnnounceAutomergeDocumentOperation {
     type Output = ();
     type Error = AnnounceAutomergeDocumentError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = AnnounceAutomergeDocumentState::ResetTimer;
         smallvec![Effect::Task(TaskEffect::ResetTimer {
             key: self.document.announce_timer_key(),
@@ -92,7 +94,7 @@ impl Operation for AnnounceAutomergeDocumentOperation {
         })]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             AnnounceAutomergeDocumentState::ResetTimer => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -107,16 +109,14 @@ impl Operation for AnnounceAutomergeDocumentOperation {
                 other => self.unexpected_event("task timer acknowledgement", format!("{other:?}")),
             },
             AnnounceAutomergeDocumentState::Subscribe => match event {
-                Event::Net(aruna_core::events::NetEvent::Gossip(GossipEvent::Subscribed {
-                    ..
-                }))
-                | Event::Net(aruna_core::events::NetEvent::Gossip(GossipEvent::Error {
+                Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
+                | Event::Net(NetEvent::Gossip(GossipEvent::Error {
                     error: GossipError::AlreadySubscribed,
                 })) => {
                     self.state = AnnounceAutomergeDocumentState::ReadDocument;
                     smallvec![read_effect(&self.document, None)]
                 }
-                Event::Net(aruna_core::events::NetEvent::Gossip(GossipEvent::Error { error })) => {
+                Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => {
                     self.fail(error.into())
                 }
                 other => {
@@ -128,13 +128,14 @@ impl Operation for AnnounceAutomergeDocumentOperation {
                     let Some(value) = value else {
                         return self.fail(AnnounceAutomergeDocumentError::DocumentNotFound);
                     };
-                    let heads = match automerge_heads(&value) {
-                        Ok(heads) => heads,
+                    let clock = match automerge_clock(&value) {
+                        Ok(clock) => clock,
                         Err(error) => return self.fail(error.into()),
                     };
                     let message = match postcard::to_allocvec(&AutomergeState::new(
-                        self.document.clone(),
-                        heads,
+                        clock.heads,
+                        clock.change_count,
+                        self.local_node_id,
                     )) {
                         Ok(message) => message,
                         Err(error) => return self.fail(ConversionError::from(error).into()),
@@ -149,14 +150,12 @@ impl Operation for AnnounceAutomergeDocumentOperation {
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
             },
             AnnounceAutomergeDocumentState::Broadcast => match event {
-                Event::Net(aruna_core::events::NetEvent::Gossip(
-                    GossipEvent::BroadcastComplete { .. },
-                )) => {
+                Event::Net(NetEvent::Gossip(GossipEvent::BroadcastComplete { .. })) => {
                     self.state = AnnounceAutomergeDocumentState::Finish;
                     self.output = Some(Ok(()));
                     smallvec![]
                 }
-                Event::Net(aruna_core::events::NetEvent::Gossip(GossipEvent::Error { error })) => {
+                Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => {
                     self.fail(error.into())
                 }
                 other => {
@@ -181,7 +180,7 @@ impl Operation for AnnounceAutomergeDocumentOperation {
         self.output.unwrap_or(Ok(()))
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         smallvec![]
     }
 }

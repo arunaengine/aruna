@@ -7,6 +7,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::automerge::repository::iter_metadata_effect;
+use aruna_core::effects::Effect;
+use aruna_core::types::Effects;
 
 const LIST_METADATA_PAGE_SIZE: usize = 128;
 
@@ -50,17 +52,13 @@ impl ListMetadataDocumentsOperation {
         }
     }
 
-    fn fail(&mut self, error: ListMetadataDocumentsError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: ListMetadataDocumentsError) -> Effects {
         self.state = ListMetadataDocumentsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(ListMetadataDocumentsError::UnexpectedEvent {
             state,
@@ -74,12 +72,12 @@ impl Operation for ListMetadataDocumentsOperation {
     type Output = Vec<MetadataDocument>;
     type Error = ListMetadataDocumentsError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = ListMetadataDocumentsState::ListDocuments;
         smallvec![self.iter_effect(None)]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             ListMetadataDocumentsState::ListDocuments => match event {
                 Event::Storage(StorageEvent::IterResult {
@@ -128,13 +126,13 @@ impl Operation for ListMetadataDocumentsOperation {
         self.output.unwrap_or(Ok(Vec::new()))
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         smallvec![]
     }
 }
 
 impl ListMetadataDocumentsOperation {
-    fn iter_effect(&self, start_after: Option<Key>) -> aruna_core::effects::Effect {
+    fn iter_effect(&self, start_after: Option<Key>) -> Effect {
         iter_metadata_effect(self.group_id, None, start_after, LIST_METADATA_PAGE_SIZE)
     }
 }

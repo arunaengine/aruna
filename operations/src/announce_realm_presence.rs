@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use aruna_core::NodeId;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
@@ -8,6 +9,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::DhtKey;
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -17,7 +19,7 @@ const REALM_PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnounceRealmPresenceConfig {
     pub realm_id: RealmId,
-    pub node_id: aruna_core::NodeId,
+    pub node_id: NodeId,
     pub schedule_refresh: bool,
 }
 
@@ -71,23 +73,19 @@ impl AnnounceRealmPresenceOperation {
         }
     }
 
-    fn finish_success(&mut self) -> aruna_core::types::Effects {
+    fn finish_success(&mut self) -> Effects {
         self.state = AnnounceRealmPresenceState::Finish;
         self.output = Some(Ok(()));
         smallvec![]
     }
 
-    fn fail(&mut self, error: AnnounceRealmPresenceError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: AnnounceRealmPresenceError) -> Effects {
         self.state = AnnounceRealmPresenceState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(AnnounceRealmPresenceError::UnexpectedEvent {
             state,
@@ -101,16 +99,17 @@ impl Operation for AnnounceRealmPresenceOperation {
     type Output = ();
     type Error = AnnounceRealmPresenceError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = AnnounceRealmPresenceState::PutPresence;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
             key: self.presence_key(),
+            realm_id: self.config.realm_id.clone(),
             value: self.config.node_id.as_bytes().to_vec(),
             ttl: REALM_PRESENCE_TTL,
         }))]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             AnnounceRealmPresenceState::PutPresence => match event {
                 Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. })) => {
@@ -153,7 +152,7 @@ impl Operation for AnnounceRealmPresenceOperation {
         self.output.unwrap_or(Ok(()))
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         smallvec![]
     }
 }

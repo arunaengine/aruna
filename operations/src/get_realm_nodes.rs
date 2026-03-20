@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 
+use aruna_core::NodeId;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -13,7 +15,7 @@ use thiserror::Error;
 pub struct GetRealmNodesOperation {
     realm_id: RealmId,
     state: GetRealmNodesState,
-    output: Option<Result<HashSet<aruna_core::NodeId>, GetRealmNodesError>>,
+    output: Option<Result<HashSet<NodeId>, GetRealmNodesError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -45,17 +47,13 @@ impl GetRealmNodesOperation {
         }
     }
 
-    fn fail(&mut self, error: GetRealmNodesError) -> aruna_core::types::Effects {
+    fn fail(&mut self, error: GetRealmNodesError) -> Effects {
         self.state = GetRealmNodesState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
-    fn unexpected_event(
-        &mut self,
-        expected: &'static str,
-        got: String,
-    ) -> aruna_core::types::Effects {
+    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
         let state = format!("{:?}", self.state);
         self.fail(GetRealmNodesError::UnexpectedEvent {
             state,
@@ -66,17 +64,18 @@ impl GetRealmNodesOperation {
 }
 
 impl Operation for GetRealmNodesOperation {
-    type Output = HashSet<aruna_core::NodeId>;
+    type Output = HashSet<NodeId>;
     type Error = GetRealmNodesError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = GetRealmNodesState::ReadDocument;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
             key: *realm_presence_key(&self.realm_id).as_bytes(),
+            realm_filter: Some(self.realm_id.clone()),
         }))]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         match self.state {
             GetRealmNodesState::ReadDocument => match event {
                 Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => {
@@ -105,7 +104,7 @@ impl Operation for GetRealmNodesOperation {
             .expect("realm nodes get operation must set output")
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         smallvec![]
     }
 }

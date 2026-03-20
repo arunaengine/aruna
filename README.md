@@ -34,7 +34,7 @@ The blob layer supports filesystem, S3, PostgreSQL, and HTTP storage backends th
 
 ### Single binary deployment
 
-Aruna compiles to a single binary with an embedded LSM database ([fjall](https://github.com/fjall-rs/fjall)). Configuration is a `.env` file.
+Aruna compiles to a single binary with an embedded LSM database ([fjall](https://github.com/fjall-rs/fjall)). Configuration is a repo-root `.env` file.
 
 ## Roadmap
 
@@ -61,23 +61,45 @@ cargo run -p aruna
 
 ### Configuration
 
-Aruna reads configuration from environment variables. Place a `.env` file in the `aruna/` directory:
+Aruna reads configuration from environment variables. Copy `.env.example` to `.env` in the repository root and fill in the key material:
 
 ```bash
-# Required
+cp .env.example .env
+```
+
+Required variables from `aruna/src/config.rs`:
+
+```bash
 STORAGE_PATH=/var/lib/aruna/data
 SOCKET_ADDRESS=0.0.0.0:8080
 REALM_PUBLIC_KEY="-----BEGIN PUBLIC KEY----- ..."
 REALM_PRIVATE_KEY="-----BEGIN PRIVATE KEY----- ..."
-
-# Optional
-NODE_PUBLIC_KEY="..."          # auto-generated if omitted
-NODE_PRIVATE_KEY="..."
-P2P_SOCKET_ADDRESS=0.0.0.0:4433
-BOOTSTRAP_NODES=addr1,addr2
+NODE_PUBLIC_KEY="-----BEGIN PUBLIC KEY----- ..."
+NODE_PRIVATE_KEY="-----BEGIN PRIVATE KEY----- ..."
 S3_PORT=1337
-S3_ADDRESS=0.0.0.0
 S3_HOST=localhost
+S3_ADDRESS=0.0.0.0
+```
+
+Optional variables:
+
+```bash
+# Defaults to ${STORAGE_PATH}/blobstore when omitted
+BLOB_ROOT=/var/lib/aruna/data/blobstore
+
+# Optional bucket naming prefix
+BLOB_BUCKET_PREFIX=aruna-
+
+# Defaults to 100000
+BLOB_MAX_BUCKET_SIZE=100000
+
+# Defaults to SOCKET_ADDRESS when omitted
+P2P_SOCKET_ADDRESS=0.0.0.0:4433
+
+# Comma-separated iroh public keys
+BOOTSTRAP_NODES=pubkey1,pubkey2
+
+# Defaults to 3 and is clamped to at least 1
 METADATA_REPLICATION_FACTOR=3
 ```
 

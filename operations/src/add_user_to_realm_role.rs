@@ -13,6 +13,7 @@ use thiserror::Error;
 
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddUserToRealmRolesInput {
@@ -98,7 +99,7 @@ impl AddUserToRealmRolesOperation {
         }
     }
 
-    fn handle_start_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_start_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
@@ -121,7 +122,7 @@ impl AddUserToRealmRolesOperation {
         }
     }
 
-    fn handle_authorization(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_authorization(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
@@ -140,7 +141,7 @@ impl AddUserToRealmRolesOperation {
     fn emit_start_transaction(
         &mut self,
         auth_result: Result<bool, AuthorizationError>,
-    ) -> Result<aruna_core::types::Effects, AddUserToRealmRolesError> {
+    ) -> Result<Effects, AddUserToRealmRolesError> {
         if auth_result? {
             self.state = AddUserToRealmRolesState::StartTransaction;
             Ok(smallvec![Effect::Storage(
@@ -151,10 +152,7 @@ impl AddUserToRealmRolesOperation {
         }
     }
 
-    fn emit_get_auth_doc(
-        &mut self,
-        txn_id: TxnId,
-    ) -> Result<aruna_core::types::Effects, AddUserToRealmRolesError> {
+    fn emit_get_auth_doc(&mut self, txn_id: TxnId) -> Result<Effects, AddUserToRealmRolesError> {
         self.state = AddUserToRealmRolesState::GetAuthDoc { txn_id };
         let key = (*self.input.realm_id.as_bytes()).into();
         Ok(smallvec![Effect::Storage(StorageEffect::Read {
@@ -164,7 +162,7 @@ impl AddUserToRealmRolesOperation {
         })])
     }
 
-    fn handle_get_auth_doc(&mut self, event: Event, txn_id: TxnId) -> aruna_core::types::Effects {
+    fn handle_get_auth_doc(&mut self, event: Event, txn_id: TxnId) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.unexpected_event(
@@ -184,7 +182,7 @@ impl AddUserToRealmRolesOperation {
         &mut self,
         txn_id: TxnId,
         auth_doc: Option<ByteView>,
-    ) -> Result<aruna_core::types::Effects, AddUserToRealmRolesError> {
+    ) -> Result<Effects, AddUserToRealmRolesError> {
         let mut auth_doc = RealmAuthorizationDocument::from_bytes(
             &auth_doc.ok_or_else(|| AddUserToRealmRolesError::AuthDocNotFound)?,
         )?;
@@ -214,7 +212,7 @@ impl AddUserToRealmRolesOperation {
         event: Event,
         txn_id: TxnId,
         auth_doc: RealmAuthorizationDocument,
-    ) -> aruna_core::types::Effects {
+    ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -232,7 +230,7 @@ impl AddUserToRealmRolesOperation {
         &mut self,
         event: Event,
         auth_doc: RealmAuthorizationDocument,
-    ) -> aruna_core::types::Effects {
+    ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
@@ -245,9 +243,12 @@ impl AddUserToRealmRolesOperation {
             auth_doc: auth_doc.clone(),
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceAutomergeDocumentOperation::new(AutomergeDocumentVariant::RealmAuthorization {
-                realm_id: auth_doc.realm_id.clone(),
-            }),
+            AnnounceAutomergeDocumentOperation::new(
+                AutomergeDocumentVariant::RealmAuthorization {
+                    realm_id: auth_doc.realm_id.clone(),
+                },
+                self.input.actor.node_id,
+            ),
             |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                 result: result.map_err(|error| error.to_string()),
             }),
@@ -258,7 +259,7 @@ impl AddUserToRealmRolesOperation {
         &mut self,
         event: Event,
         auth_doc: RealmAuthorizationDocument,
-    ) -> aruna_core::types::Effects {
+    ) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
             return self.unexpected_event(
@@ -275,7 +276,7 @@ impl AddUserToRealmRolesOperation {
         smallvec![]
     }
 
-    fn fail(&mut self, err: AddUserToRealmRolesError) -> aruna_core::types::Effects {
+    fn fail(&mut self, err: AddUserToRealmRolesError) -> Effects {
         self.state = AddUserToRealmRolesState::Error;
         self.output = Some(Err(err));
         self.abort()
@@ -284,8 +285,8 @@ impl AddUserToRealmRolesOperation {
     fn fail_with_cleanup(
         &mut self,
         err: AddUserToRealmRolesError,
-        cleanup_effects: aruna_core::types::Effects,
-    ) -> aruna_core::types::Effects {
+        cleanup_effects: Effects,
+    ) -> Effects {
         self.state = AddUserToRealmRolesState::Error;
         self.output = Some(Err(err));
         cleanup_effects
@@ -296,7 +297,7 @@ impl AddUserToRealmRolesOperation {
         state: AddUserToRealmRolesState,
         expected: &'static str,
         got: String,
-    ) -> aruna_core::types::Effects {
+    ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
             AddUserToRealmRolesError::UnexpectedEvent {
@@ -308,7 +309,7 @@ impl AddUserToRealmRolesOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, aruna_core::types::Effects> {
+    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -322,7 +323,7 @@ impl Operation for AddUserToRealmRolesOperation {
 
     type Error = AddUserToRealmRolesError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = AddUserToRealmRolesState::Auth;
 
         smallvec![Effect::SubOperation(boxed_suboperation(
@@ -340,7 +341,7 @@ impl Operation for AddUserToRealmRolesOperation {
         ))]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         let event = match self.fail_on_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
@@ -381,7 +382,7 @@ impl Operation for AddUserToRealmRolesOperation {
             .ok_or_else(|| AddUserToRealmRolesError::NotFinished)?
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         match self.state {
             AddUserToRealmRolesState::GetAuthDoc { txn_id }
             | AddUserToRealmRolesState::UpdateAuthDoc { txn_id, .. } => {
@@ -447,7 +448,13 @@ pub mod test {
         let admin_role = realm_auth_doc
             .roles
             .iter()
-            .filter_map(|(id, r)| if r.name == "admin" { Some(*id) } else { None })
+            .filter_map(|(id, r)| {
+                if r.name == "realm_admin" {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
             .collect();
 
         let add_user_input = AddUserToRealmRolesInput {
@@ -475,7 +482,7 @@ pub mod test {
             auth_doc
                 .roles
                 .iter()
-                .find(|(_, v)| v.name == "admin")
+                .find(|(_, v)| v.name == "realm_admin")
                 .unwrap()
                 .1
                 .assigned_users

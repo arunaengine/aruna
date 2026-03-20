@@ -11,6 +11,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -52,7 +53,7 @@ impl CreateGroupOperation {
             output: None,
         }
     }
-    fn emit_create_group(&mut self) -> Result<aruna_core::types::Effects, CreateGroupError> {
+    fn emit_create_group(&mut self) -> Result<Effects, CreateGroupError> {
         let group_id = Ulid::new();
         let group = Group {
             roles: HashSet::new(),
@@ -75,7 +76,7 @@ impl CreateGroupOperation {
         })])
     }
 
-    fn emit_create_auth_doc(&mut self) -> Result<aruna_core::types::Effects, CreateGroupError> {
+    fn emit_create_auth_doc(&mut self) -> Result<Effects, CreateGroupError> {
         self.txn_id.ok_or(CreateGroupError::NoTransactionFound)?;
 
         let group_id = self
@@ -102,17 +103,13 @@ impl CreateGroupOperation {
         })])
     }
 
-    fn fail(&mut self, err: CreateGroupError) -> aruna_core::types::Effects {
+    fn fail(&mut self, err: CreateGroupError) -> Effects {
         self.state = CreateGroupState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
-    fn fail_with_cleanup(
-        &mut self,
-        err: CreateGroupError,
-        cleanup_effects: aruna_core::types::Effects,
-    ) -> aruna_core::types::Effects {
+    fn fail_with_cleanup(&mut self, err: CreateGroupError, cleanup_effects: Effects) -> Effects {
         self.state = CreateGroupState::Error;
         self.output = Some(Err(err));
         cleanup_effects
@@ -123,7 +120,7 @@ impl CreateGroupOperation {
         state: CreateGroupState,
         expected: &'static str,
         got: String,
-    ) -> aruna_core::types::Effects {
+    ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
             CreateGroupError::UnexpectedEvent {
@@ -135,7 +132,7 @@ impl CreateGroupOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, aruna_core::types::Effects> {
+    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -143,7 +140,7 @@ impl CreateGroupOperation {
         Ok(event)
     }
 
-    fn handle_start_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_start_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
@@ -161,7 +158,7 @@ impl CreateGroupOperation {
         }
     }
 
-    fn handle_create_group(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_create_group(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -178,7 +175,7 @@ impl CreateGroupOperation {
         }
     }
 
-    fn handle_create_roles(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_create_roles(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -196,7 +193,7 @@ impl CreateGroupOperation {
         }
     }
 
-    fn handle_commit_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_commit_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
@@ -214,7 +211,8 @@ impl CreateGroupOperation {
                 AnnounceAutomergeDocumentOperation::new(
                     AutomergeDocumentVariant::GroupAuthorization {
                         group_id: group.group_id,
-                    }
+                    },
+                    self.config.actor.node_id,
                 ),
                 |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
                     result: result.map_err(|error| error.to_string()),
@@ -225,7 +223,7 @@ impl CreateGroupOperation {
         }
     }
 
-    fn handle_announce_auth_doc(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
             return self.unexpected_event(
@@ -290,7 +288,7 @@ impl Operation for CreateGroupOperation {
 
     type Error = CreateGroupError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = CreateGroupState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -298,7 +296,7 @@ impl Operation for CreateGroupOperation {
         })]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         let event = match self.fail_on_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
@@ -327,7 +325,7 @@ impl Operation for CreateGroupOperation {
         self.output.ok_or(CreateGroupError::NotFinished)?
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],

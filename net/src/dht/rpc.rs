@@ -1,7 +1,9 @@
+use aruna_core::alpn::Alpn;
 use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::structs::RealmId;
 use serde::{Deserialize, Serialize};
 
-pub const DHT_ALPN: &[u8] = aruna_core::alpn::Alpn::Dht.as_bytes();
+pub const DHT_ALPN: &[u8] = Alpn::Dht.as_bytes();
 
 /// DHT RPC request messages
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,9 +15,11 @@ pub enum DhtRequest {
     },
     GetValue {
         key: DhtKeyId,
+        realm_filter: Option<RealmId>,
     },
     PutValue {
         key: DhtKeyId,
+        realm_id: RealmId,
         value: Vec<u8>,
         ttl_secs: u64,
         publisher: NodeId,
@@ -59,10 +63,25 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredValue {
     pub publisher: NodeId,
+    pub realm_id: RealmId,
     pub value: Vec<u8>,
     pub expires_at: u64,
     /// Optional Ed25519 signature for publisher verification
     pub signature: Option<iroh::Signature>,
+}
+
+pub fn signed_put_value_bytes(
+    key: &DhtKeyId,
+    realm_id: &RealmId,
+    value: &[u8],
+    ttl_secs: u64,
+) -> Vec<u8> {
+    let mut signed_data = Vec::with_capacity(32 + 32 + value.len() + 8);
+    signed_data.extend_from_slice(key.as_bytes());
+    signed_data.extend_from_slice(realm_id.as_bytes());
+    signed_data.extend_from_slice(value);
+    signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+    signed_data
 }
 
 /// Serialize a request to bytes
@@ -123,22 +142,45 @@ mod tests {
     }
 
     #[test]
+    fn test_get_value_request_roundtrip_with_realm_filter() {
+        let key = DhtKeyId::from_data(b"realm-filtered-get");
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+
+        let req = DhtRequest::GetValue {
+            key,
+            realm_filter: Some(realm_id.clone()),
+        };
+        let bytes = encode_request(&req).expect("encode request");
+        let decoded = decode_request(&bytes).expect("decode request");
+
+        match decoded {
+            DhtRequest::GetValue {
+                key: decoded_key,
+                realm_filter,
+            } => {
+                assert_eq!(decoded_key, key);
+                assert_eq!(realm_filter, Some(realm_id));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_put_value_request_roundtrip_with_signature() {
         let publisher_secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
         let publisher = publisher_secret.public();
 
         let key = DhtKeyId::from_data(b"signed-put");
+        let realm_id = RealmId::from_bytes([7u8; 32]);
         let value = b"payload".to_vec();
         let ttl_secs: u64 = 42;
 
-        let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
-        signed_data.extend_from_slice(key.as_bytes());
-        signed_data.extend_from_slice(&value);
-        signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
         let signature = publisher_secret.sign(&signed_data);
 
         let req = DhtRequest::PutValue {
             key,
+            realm_id: realm_id.clone(),
             value: value.clone(),
             ttl_secs,
             publisher,
@@ -150,20 +192,24 @@ mod tests {
         match decoded {
             DhtRequest::PutValue {
                 key: decoded_key,
+                realm_id: decoded_realm_id,
                 value: decoded_value,
                 ttl_secs: decoded_ttl,
                 publisher: decoded_publisher,
                 signature: Some(decoded_signature),
             } => {
                 assert_eq!(decoded_key, key);
+                assert_eq!(decoded_realm_id, realm_id);
                 assert_eq!(decoded_value, value);
                 assert_eq!(decoded_ttl, ttl_secs);
                 assert_eq!(decoded_publisher, publisher);
 
-                let mut verify_data = Vec::with_capacity(32 + decoded_value.len() + 8);
-                verify_data.extend_from_slice(decoded_key.as_bytes());
-                verify_data.extend_from_slice(&decoded_value);
-                verify_data.extend_from_slice(&decoded_ttl.to_le_bytes());
+                let verify_data = signed_put_value_bytes(
+                    &decoded_key,
+                    &decoded_realm_id,
+                    &decoded_value,
+                    decoded_ttl,
+                );
                 assert!(
                     decoded_publisher
                         .verify(&verify_data, &decoded_signature)

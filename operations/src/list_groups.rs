@@ -4,6 +4,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::GROUP_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::Group;
+use aruna_core::types::Effects;
 use aruna_core::types::{Key, Value};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -41,7 +42,7 @@ impl ListGroupOperation {
         }
     }
 
-    fn emit_list_groups(&mut self) -> aruna_core::types::Effects {
+    fn emit_list_groups(&mut self) -> Effects {
         let scan_limit = self.offset.saturating_add(self.limit).max(1);
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: GROUP_KEYSPACE.to_string(),
@@ -52,10 +53,7 @@ impl ListGroupOperation {
         })]
     }
 
-    fn emit_parse_groups(
-        &mut self,
-        values: Vec<(Key, Value)>,
-    ) -> Result<aruna_core::types::Effects, ListGroupError> {
+    fn emit_parse_groups(&mut self, values: Vec<(Key, Value)>) -> Result<Effects, ListGroupError> {
         self.output = Some(
             values
                 .into_iter()
@@ -74,17 +72,13 @@ impl ListGroupOperation {
         }
     }
 
-    fn fail(&mut self, err: ListGroupError) -> aruna_core::types::Effects {
+    fn fail(&mut self, err: ListGroupError) -> Effects {
         self.state = ListGroupState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
-    fn fail_with_cleanup(
-        &mut self,
-        err: ListGroupError,
-        cleanup_effects: aruna_core::types::Effects,
-    ) -> aruna_core::types::Effects {
+    fn fail_with_cleanup(&mut self, err: ListGroupError, cleanup_effects: Effects) -> Effects {
         self.state = ListGroupState::Error;
         self.output = Some(Err(err));
         cleanup_effects
@@ -95,7 +89,7 @@ impl ListGroupOperation {
         state: ListGroupState,
         expected: &'static str,
         got: String,
-    ) -> aruna_core::types::Effects {
+    ) -> Effects {
         let cleanup_effects = self.abort();
         self.fail_with_cleanup(
             ListGroupError::UnexpectedEvent {
@@ -107,7 +101,7 @@ impl ListGroupOperation {
         )
     }
 
-    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, aruna_core::types::Effects> {
+    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
         }
@@ -115,7 +109,7 @@ impl ListGroupOperation {
         Ok(event)
     }
 
-    fn handle_start_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_start_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
@@ -130,7 +124,7 @@ impl ListGroupOperation {
         self.emit_list_groups()
     }
 
-    fn handle_list_groups(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_list_groups(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
             return self.unexpected_event(
@@ -149,7 +143,7 @@ impl ListGroupOperation {
         }
     }
 
-    fn handle_commit_transaction(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn handle_commit_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
@@ -201,7 +195,7 @@ impl Operation for ListGroupOperation {
 
     type Error = ListGroupError;
 
-    fn start(&mut self) -> aruna_core::types::Effects {
+    fn start(&mut self) -> Effects {
         self.state = ListGroupState::StartTransaction;
 
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -209,7 +203,7 @@ impl Operation for ListGroupOperation {
         })]
     }
 
-    fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+    fn step(&mut self, event: Event) -> Effects {
         let event = match self.fail_on_storage_error(event) {
             Ok(event) => event,
             Err(effects) => return effects,
@@ -233,7 +227,7 @@ impl Operation for ListGroupOperation {
         self.output.ok_or(ListGroupError::NotFinished)?
     }
 
-    fn abort(&mut self) -> aruna_core::types::Effects {
+    fn abort(&mut self) -> Effects {
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
             None => smallvec![],

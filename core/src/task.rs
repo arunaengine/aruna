@@ -15,6 +15,7 @@ pub enum TaskKey {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskEffect {
     ResetTimer { key: TaskKey, after: Duration },
+    ShortenTimer { key: TaskKey, after: Duration },
     CancelTimer { key: TaskKey },
 }
 

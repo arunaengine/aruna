@@ -138,7 +138,7 @@ impl RealmAuthorizationDocument {
             admin,
             Role {
                 role_id: admin,
-                name: "admin".to_string(),
+                name: "realm_admin".to_string(),
                 permissions: HashMap::from([(format!("/{realm_id}/admin/**"), Permission::WRITE)]),
                 assigned_users: HashSet::from([(user_id)]),
             },

@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::structs::RealmId;
 use aruna_storage::StorageHandle;
 use crossfire::{TrySendError, mpsc};
 use iroh::Endpoint;
@@ -87,10 +88,17 @@ impl DhtHandle {
         self.try_enqueue(DriverCmd::AddPeer { node_id })
     }
 
-    pub async fn put(&self, key: &DhtKeyId, value: Vec<u8>, ttl: Duration) -> Result<()> {
+    pub async fn put(
+        &self,
+        key: &DhtKeyId,
+        realm_id: RealmId,
+        value: Vec<u8>,
+        ttl: Duration,
+    ) -> Result<()> {
         match self
             .request(|reply| DriverCmd::Put {
                 key: *key,
+                realm_id,
                 value,
                 ttl,
                 reply,
@@ -104,9 +112,17 @@ impl DhtHandle {
         }
     }
 
-    pub async fn get(&self, key: &DhtKeyId) -> Result<Vec<DhtEntry>> {
+    pub async fn get(
+        &self,
+        key: &DhtKeyId,
+        realm_filter: Option<RealmId>,
+    ) -> Result<Vec<DhtEntry>> {
         match self
-            .request(|reply| DriverCmd::Get { key: *key, reply })
+            .request(|reply| DriverCmd::Get {
+                key: *key,
+                realm_filter,
+                reply,
+            })
             .await?
         {
             DhtOutputValue::GetValues(values) => Ok(values),

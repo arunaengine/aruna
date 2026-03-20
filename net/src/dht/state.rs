@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId, NodeIdExt};
+use aruna_core::structs::RealmId;
 use aruna_core::util::xor_distance_32;
 use smallvec::SmallVec;
 
@@ -12,7 +13,7 @@ use super::protocol::{
     CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
     DhtOutputValue, INTERNAL_OP_START, InboundId, OpId, RpcPhase, StorageStage,
 };
-use super::rpc::{DhtRequest, DhtResponse, ErrorCode, StoredValue};
+use super::rpc::{DhtRequest, DhtResponse, ErrorCode, StoredValue, signed_put_value_bytes};
 use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, live_entries, merge_entry};
 
 type PendingMap = HashMap<PendingKey, PendingMeta>;
@@ -94,6 +95,7 @@ impl OpState {
 #[derive(Debug)]
 struct PutOp {
     key: DhtKeyId,
+    realm_id: RealmId,
     value: Vec<u8>,
     ttl_secs: u64,
     signature: iroh::Signature,
@@ -108,8 +110,9 @@ struct PutOp {
 #[derive(Debug)]
 struct GetOp {
     key: DhtKeyId,
+    realm_filter: Option<RealmId>,
     values: Vec<DhtEntry>,
-    seen_publishers: HashSet<NodeId>,
+    seen_publishers: HashSet<(NodeId, RealmId)>,
     frontier: LookupFrontier,
     pending: PendingMap,
 }
@@ -138,6 +141,7 @@ struct MaintenancePingOp {
 struct InboundGetOp {
     inbound_id: InboundId,
     key: DhtKeyId,
+    realm_filter: Option<RealmId>,
     pending: PendingMap,
 }
 
@@ -234,10 +238,15 @@ impl DhtStateMachine {
             DhtCmd::Put {
                 op_id,
                 key,
+                realm_id,
                 value,
                 ttl,
-            } => self.handle_cmd_put(op_id, key, value, ttl, out),
-            DhtCmd::Get { op_id, key } => self.handle_cmd_get(op_id, key, out),
+            } => self.handle_cmd_put(op_id, key, realm_id, value, ttl, out),
+            DhtCmd::Get {
+                op_id,
+                key,
+                realm_filter,
+            } => self.handle_cmd_get(op_id, key, realm_filter, out),
             DhtCmd::Bootstrap { op_id, nodes } => self.handle_cmd_bootstrap(op_id, nodes, out),
             DhtCmd::RoutingTableSize { op_id } => {
                 out.push(DhtEffect::Output(DhtOutput::Completed {
@@ -253,6 +262,7 @@ impl DhtStateMachine {
         &mut self,
         op_id: OpId,
         key: DhtKeyId,
+        realm_id: RealmId,
         value: Vec<u8>,
         ttl: std::time::Duration,
         out: &mut SmallVec<[DhtEffect; 4]>,
@@ -266,14 +276,12 @@ impl DhtStateMachine {
         }
 
         let ttl_secs = ttl.as_secs();
-        let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
-        signed_data.extend_from_slice(key.as_bytes());
-        signed_data.extend_from_slice(&value);
-        signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
         let signature = self.secret_key.sign(&signed_data);
 
         let mut op = OpState::Put(PutOp {
             key,
+            realm_id,
             value,
             ttl_secs,
             signature,
@@ -284,11 +292,17 @@ impl DhtStateMachine {
             last_store_error: None,
             pending: HashMap::new(),
         });
-        self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, out);
+        self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, None, out);
         self.ops.insert(op_id, op);
     }
 
-    fn handle_cmd_get(&mut self, op_id: OpId, key: DhtKeyId, out: &mut SmallVec<[DhtEffect; 4]>) {
+    fn handle_cmd_get(
+        &mut self,
+        op_id: OpId,
+        key: DhtKeyId,
+        realm_filter: Option<RealmId>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
         if self.ops.contains_key(&op_id) {
             out.push(DhtEffect::Output(DhtOutput::Failed {
                 op_id,
@@ -299,12 +313,20 @@ impl DhtStateMachine {
 
         let mut op = OpState::Get(GetOp {
             key,
+            realm_filter: realm_filter.clone(),
             values: Vec::new(),
             seen_publishers: HashSet::new(),
             frontier: LookupFrontier::default(),
             pending: HashMap::new(),
         });
-        self.queue_storage_read(op_id, &mut op, StorageStage::GetLocalRead, key, out);
+        self.queue_storage_read(
+            op_id,
+            &mut op,
+            StorageStage::GetLocalRead,
+            key,
+            realm_filter,
+            out,
+        );
         self.ops.insert(op_id, op);
     }
 
@@ -565,9 +587,16 @@ impl DhtStateMachine {
                     if entry.expires_at <= now {
                         continue;
                     }
-                    if op.seen_publishers.insert(entry.publisher) {
+                    if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
+                        continue;
+                    }
+                    if op
+                        .seen_publishers
+                        .insert((entry.publisher, entry.realm_id.clone()))
+                    {
                         op.values.push(DhtEntry {
                             node_id: entry.publisher,
+                            realm_id: entry.realm_id,
                             value: entry.value,
                             expires_at: entry.expires_at,
                         });
@@ -805,6 +834,7 @@ impl DhtStateMachine {
 
                 let new_entry = StoredEntry {
                     publisher: self.local_id,
+                    realm_id: op.realm_id.clone(),
                     value: op.value.clone(),
                     expires_at: self.now_secs.saturating_add(op.ttl_secs),
                     signature: Some(op.signature),
@@ -828,9 +858,16 @@ impl DhtStateMachine {
 
                 let now = self.now_secs;
                 for entry in live_entries(entries, now) {
-                    if op.seen_publishers.insert(entry.publisher) {
+                    if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
+                        continue;
+                    }
+                    if op
+                        .seen_publishers
+                        .insert((entry.publisher, entry.realm_id.clone()))
+                    {
                         op.values.push(DhtEntry {
                             node_id: entry.publisher,
+                            realm_id: entry.realm_id,
                             value: entry.value,
                             expires_at: entry.expires_at,
                         });
@@ -862,8 +899,10 @@ impl DhtStateMachine {
                 let now = self.now_secs;
                 let values: Vec<StoredValue> = live_entries(entries, now)
                     .into_iter()
+                    .filter(|entry| realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id))
                     .map(|entry| StoredValue {
                         publisher: entry.publisher,
+                        realm_id: entry.realm_id,
                         value: entry.value,
                         expires_at: entry.expires_at,
                         signature: entry.signature,
@@ -1112,18 +1151,27 @@ impl DhtStateMachine {
                     response: DhtResponse::Nodes { nodes },
                 }));
             }
-            DhtRequest::GetValue { key } => {
+            DhtRequest::GetValue { key, realm_filter } => {
                 let op_id = self.alloc_internal_op_id();
                 let mut op = OpState::InboundGet(InboundGetOp {
                     inbound_id,
                     key,
+                    realm_filter: realm_filter.clone(),
                     pending: HashMap::new(),
                 });
-                self.queue_storage_read(op_id, &mut op, StorageStage::InboundGetRead, key, out);
+                self.queue_storage_read(
+                    op_id,
+                    &mut op,
+                    StorageStage::InboundGetRead,
+                    key,
+                    realm_filter,
+                    out,
+                );
                 self.ops.insert(op_id, op);
             }
             DhtRequest::PutValue {
                 key,
+                realm_id,
                 value,
                 ttl_secs,
                 publisher,
@@ -1140,10 +1188,7 @@ impl DhtStateMachine {
                     return;
                 };
 
-                let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
-                signed_data.extend_from_slice(key.as_bytes());
-                signed_data.extend_from_slice(&value);
-                signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+                let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
 
                 if publisher.verify(&signed_data, &signature).is_err() {
                     out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
@@ -1158,6 +1203,7 @@ impl DhtStateMachine {
 
                 let new_entry = StoredEntry {
                     publisher,
+                    realm_id,
                     value,
                     expires_at: self.now_secs.saturating_add(ttl_secs),
                     signature: Some(signature),
@@ -1170,7 +1216,14 @@ impl DhtStateMachine {
                     new_entry,
                     pending: HashMap::new(),
                 });
-                self.queue_storage_read(op_id, &mut op, StorageStage::InboundPutRead, key, out);
+                self.queue_storage_read(
+                    op_id,
+                    &mut op,
+                    StorageStage::InboundPutRead,
+                    key,
+                    None,
+                    out,
+                );
                 self.ops.insert(op_id, op);
             }
         }
@@ -1193,7 +1246,10 @@ impl DhtStateMachine {
                 &mut op.pending,
                 RpcPhase::GetLookup,
                 peer,
-                DhtRequest::GetValue { key: op.key },
+                DhtRequest::GetValue {
+                    key: op.key,
+                    realm_filter: op.realm_filter.clone(),
+                },
                 out,
             );
             op.frontier.sent_queries = op.frontier.sent_queries.saturating_add(1);
@@ -1248,6 +1304,7 @@ impl DhtStateMachine {
                 peer,
                 DhtRequest::PutValue {
                     key: op.key,
+                    realm_id: op.realm_id.clone(),
                     value: op.value.clone(),
                     ttl_secs: op.ttl_secs,
                     publisher: self.local_id,
@@ -1436,6 +1493,7 @@ impl DhtStateMachine {
         op: &mut OpState,
         stage: StorageStage,
         key: DhtKeyId,
+        realm_filter: Option<RealmId>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         op.pending_mut().insert(
@@ -1449,6 +1507,7 @@ impl DhtStateMachine {
             op_id,
             stage,
             key,
+            realm_filter,
         }));
     }
 
@@ -1517,6 +1576,13 @@ fn take_pending_storage(pending: &mut PendingMap, stage: StorageStage) -> bool {
     pending.remove(&PendingKey::Storage { stage }).is_some()
 }
 
+fn realm_matches_filter(filter: Option<&RealmId>, realm_id: &RealmId) -> bool {
+    match filter {
+        Some(filter) => filter == realm_id,
+        None => true,
+    }
+}
+
 fn compare_distance(target: &[u8; 32], a: &NodeId, b: &NodeId) -> Ordering {
     let dist_a = xor_distance_32(target, a.as_bytes());
     let dist_b = xor_distance_32(target, b.as_bytes());
@@ -1544,6 +1610,12 @@ mod tests {
         let mut seed_bytes = [0u8; 32];
         seed_bytes[0] = seed;
         iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    fn make_realm(seed: u8) -> RealmId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        RealmId::from_bytes(bytes)
     }
 
     #[test]
@@ -1589,6 +1661,7 @@ mod tests {
             DhtInput::Cmd(DhtCmd::Put {
                 op_id: 1,
                 key,
+                realm_id: make_realm(1),
                 value: b"hello".to_vec(),
                 ttl: std::time::Duration::from_secs(30),
             }),
@@ -1674,7 +1747,11 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer {
             node_id: first_peer,
         }));
-        let _ = state.step(DhtInput::Cmd(DhtCmd::Get { op_id: 9, key }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 9,
+            key,
+            realm_filter: None,
+        }));
 
         let local_read_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 9,
@@ -1727,6 +1804,7 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
             op_id: 11,
             key,
+            realm_id: make_realm(1),
             value: b"value".to_vec(),
             ttl: std::time::Duration::from_secs(60),
         }));
@@ -1765,6 +1843,7 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
             op_id: 12,
             key,
+            realm_id: make_realm(1),
             value: b"value".to_vec(),
             ttl: std::time::Duration::from_secs(60),
         }));
@@ -1840,6 +1919,7 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
             op_id: 13,
             key,
+            realm_id: make_realm(1),
             value: b"value".to_vec(),
             ttl: std::time::Duration::from_secs(60),
         }));
@@ -1896,6 +1976,7 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::Put {
             op_id: 14,
             key,
+            realm_id: make_realm(1),
             value: b"value".to_vec(),
             ttl: std::time::Duration::from_secs(60),
         }));
@@ -1997,13 +2078,18 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
 
         let key = DhtKeyId::from_data(b"get-short-circuit-local");
-        let _ = state.step(DhtInput::Cmd(DhtCmd::Get { op_id: 15, key }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 15,
+            key,
+            realm_filter: None,
+        }));
 
         let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 15,
             stage: StorageStage::GetLocalRead,
             entries: vec![StoredEntry {
                 publisher: make_node(9),
+                realm_id: make_realm(1),
                 value: b"cached".to_vec(),
                 expires_at: 2_000,
                 signature: None,
@@ -2031,6 +2117,81 @@ mod tests {
     }
 
     #[test]
+    fn get_applies_realm_filter_to_local_results() {
+        let local_secret = iroh::SecretKey::from_bytes(&[58u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let key = DhtKeyId::from_data(b"get-realm-filter-local");
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 22,
+            key,
+            realm_filter: Some(make_realm(1)),
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 22,
+            stage: StorageStage::GetLocalRead,
+            entries: vec![StoredEntry {
+                publisher: make_node(23),
+                realm_id: make_realm(2),
+                value: b"foreign".to_vec(),
+                expires_at: 2_000,
+                signature: None,
+            }],
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 22,
+                    result: DhtOutputValue::GetValues(values)
+                }) if values.is_empty()
+            )
+        }));
+    }
+
+    #[test]
+    fn get_forwards_realm_filter_to_remote_lookups() {
+        let local_secret = iroh::SecretKey::from_bytes(&[59u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let peer = make_node(24);
+        let realm_filter = make_realm(3);
+        let key = DhtKeyId::from_data(b"get-realm-filter-remote");
+
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 23,
+            key,
+            realm_filter: Some(realm_filter.clone()),
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 23,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+                    op_id: 23,
+                    phase: RpcPhase::GetLookup,
+                    peer: req_peer,
+                    request: DhtRequest::GetValue {
+                        key: req_key,
+                        realm_filter: Some(req_realm_filter),
+                    },
+                }) if *req_peer == peer && *req_key == key && *req_realm_filter == realm_filter
+            )
+        }));
+    }
+
+    #[test]
     fn get_short_circuits_on_first_remote_value() {
         let local_secret = iroh::SecretKey::from_bytes(&[46u8; 32]);
         let local_id = local_secret.public();
@@ -2042,7 +2203,11 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer_b }));
 
         let key = DhtKeyId::from_data(b"get-short-circuit-remote");
-        let _ = state.step(DhtInput::Cmd(DhtCmd::Get { op_id: 16, key }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 16,
+            key,
+            realm_filter: None,
+        }));
 
         let local_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 16,
@@ -2074,6 +2239,7 @@ mod tests {
             response: DhtResponse::Value {
                 entries: vec![StoredValue {
                     publisher: make_node(12),
+                    realm_id: make_realm(1),
                     value: b"first".to_vec(),
                     expires_at: 2_000,
                     signature: None,
@@ -2199,7 +2365,11 @@ mod tests {
         let mut state = DhtStateMachine::new(local_id, local_secret, 0);
 
         let key = DhtKeyId::from_data(b"wrong-stage");
-        let _ = state.step(DhtInput::Cmd(DhtCmd::Get { op_id: 19, key }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 19,
+            key,
+            realm_filter: None,
+        }));
 
         let wrong_stage = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 19,
@@ -2232,11 +2402,13 @@ mod tests {
 
         let publisher = make_node(17);
         let key = DhtKeyId::from_data(b"missing-signature");
+        let realm_id = make_realm(1);
         let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
             inbound_id: 7,
             peer: make_node(18),
             request: DhtRequest::PutValue {
                 key,
+                realm_id,
                 value: b"value".to_vec(),
                 ttl_secs: 30,
                 publisher,
@@ -2259,6 +2431,74 @@ mod tests {
     }
 
     #[test]
+    fn inbound_get_filters_response_entries_by_realm() {
+        let local_secret = iroh::SecretKey::from_bytes(&[60u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
+
+        let key = DhtKeyId::from_data(b"inbound-get-realm-filter");
+        let realm_filter = make_realm(4);
+
+        let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
+            inbound_id: 10,
+            peer: make_node(25),
+            request: DhtRequest::GetValue {
+                key,
+                realm_filter: Some(realm_filter.clone()),
+            },
+        }));
+
+        let op_id = effects
+            .iter()
+            .find_map(|effect| match effect {
+                DhtEffect::IoRequest(DhtIoRequest::StorageRead {
+                    op_id,
+                    stage: StorageStage::InboundGetRead,
+                    key: req_key,
+                    realm_filter: Some(req_realm_filter),
+                }) if *req_key == key && *req_realm_filter == realm_filter => Some(*op_id),
+                _ => None,
+            })
+            .expect("inbound get should enqueue filtered storage read");
+
+        let response_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id,
+            stage: StorageStage::InboundGetRead,
+            entries: vec![
+                StoredEntry {
+                    publisher: make_node(26),
+                    realm_id: realm_filter.clone(),
+                    value: b"allowed".to_vec(),
+                    expires_at: 2_000,
+                    signature: None,
+                },
+                StoredEntry {
+                    publisher: make_node(27),
+                    realm_id: make_realm(5),
+                    value: b"foreign".to_vec(),
+                    expires_at: 2_000,
+                    signature: None,
+                },
+            ],
+        }));
+
+        assert!(response_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                    inbound_id: 10,
+                    response: DhtResponse::Value {
+                        entries,
+                        closer_nodes: _,
+                    },
+                }) if entries.len() == 1
+                    && entries[0].realm_id == realm_filter
+                    && entries[0].value == b"allowed".to_vec()
+            )
+        }));
+    }
+
+    #[test]
     fn inbound_put_invalid_signature_returns_invalid_signature_error() {
         let local_secret = iroh::SecretKey::from_bytes(&[51u8; 32]);
         let local_id = local_secret.public();
@@ -2268,12 +2508,10 @@ mod tests {
         let attacker_secret = iroh::SecretKey::from_bytes(&[53u8; 32]);
 
         let key = DhtKeyId::from_data(b"invalid-signature");
+        let realm_id = make_realm(1);
         let value = b"value".to_vec();
         let ttl_secs: u64 = 45;
-        let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
-        signed_data.extend_from_slice(key.as_bytes());
-        signed_data.extend_from_slice(&value);
-        signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
         let invalid_signature = attacker_secret.sign(&signed_data);
 
         let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
@@ -2281,6 +2519,7 @@ mod tests {
             peer: make_node(19),
             request: DhtRequest::PutValue {
                 key,
+                realm_id,
                 value,
                 ttl_secs,
                 publisher: publisher_secret.public(),
@@ -2310,13 +2549,11 @@ mod tests {
 
         let publisher_secret = iroh::SecretKey::from_bytes(&[57u8; 32]);
         let key = DhtKeyId::from_data(b"valid-signature");
+        let realm_id = make_realm(1);
         let value = b"value".to_vec();
         let ttl_secs: u64 = 45;
 
-        let mut signed_data = Vec::with_capacity(32 + value.len() + 8);
-        signed_data.extend_from_slice(key.as_bytes());
-        signed_data.extend_from_slice(&value);
-        signed_data.extend_from_slice(&ttl_secs.to_le_bytes());
+        let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
         let signature = publisher_secret.sign(&signed_data);
 
         let effects = state.step(DhtInput::Io(DhtIo::InboundRequest {
@@ -2324,6 +2561,7 @@ mod tests {
             peer: make_node(22),
             request: DhtRequest::PutValue {
                 key,
+                realm_id,
                 value,
                 ttl_secs,
                 publisher: publisher_secret.public(),

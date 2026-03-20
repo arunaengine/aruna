@@ -7,6 +7,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_core::keyspaces::GOSSIP_SUBSCRIPTIONS_KEYSPACE;
+use aruna_core::structs::RealmId;
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -20,6 +21,10 @@ use tracing::warn;
 
 use crate::DhtHandle;
 use crate::error::{NetError, Result};
+use aruna_core::AutomergeDocumentVariant;
+use aruna_core::DhtKeyId;
+use aruna_core::keys::automerge_document_holder_key;
+use aruna_core::keys::gossip_peer_key;
 
 const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
 const GOSSIP_TOPIC_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(30 * 60);
@@ -37,6 +42,7 @@ pub struct GossipService {
     storage: StorageHandle,
     dht: Arc<DhtHandle>,
     local_node_id: NodeId,
+    local_realm_id: RealmId,
     subscriptions: Arc<RwLock<HashMap<TopicId, TopicSubscription>>>,
     pending_subscriptions: Arc<Mutex<HashMap<TopicId, Arc<Notify>>>>,
     bootstrap_nodes: Arc<RwLock<Vec<NodeId>>>,
@@ -50,6 +56,7 @@ impl GossipService {
         endpoint: Endpoint,
         storage: StorageHandle,
         dht: Arc<DhtHandle>,
+        local_realm_id: RealmId,
         bootstrap_nodes: Vec<NodeId>,
         shutdown: CancellationToken,
         event_tx: mpsc::Sender<(TopicId, NodeId, Vec<u8>)>,
@@ -62,6 +69,7 @@ impl GossipService {
             storage,
             dht,
             local_node_id,
+            local_realm_id,
             subscriptions: Arc::new(RwLock::new(HashMap::new())),
             pending_subscriptions: Arc::new(Mutex::new(HashMap::new())),
             bootstrap_nodes: Arc::new(RwLock::new(bootstrap_nodes)),
@@ -101,6 +109,7 @@ impl GossipService {
             self.storage.clone(),
             self.dht.clone(),
             self.local_node_id,
+            self.local_realm_id.clone(),
             self.subscriptions.clone(),
             self.pending_subscriptions.clone(),
             self.bootstrap_nodes.clone(),
@@ -171,6 +180,7 @@ async fn subscribe_owned(
     storage: StorageHandle,
     dht: Arc<DhtHandle>,
     local_node_id: NodeId,
+    local_realm_id: RealmId,
     subscriptions: Arc<RwLock<HashMap<TopicId, TopicSubscription>>>,
     pending_subscriptions: Arc<Mutex<HashMap<TopicId, Arc<Notify>>>>,
     bootstrap_nodes_state: Arc<RwLock<Vec<NodeId>>>,
@@ -206,12 +216,13 @@ async fn subscribe_owned(
     }
 
     let result = async {
-        if let Err(error) = announce_topic_subscription(&dht, local_node_id, &topic).await {
+        if let Err(error) = announce_topic_subscription(&dht, local_node_id, &local_realm_id, &topic).await {
             warn!(topic = %topic, error = %error, "Failed to announce gossip subscription in DHT");
         }
         let bootstrap_nodes = lookup_topic_bootstrap_nodes_owned(
             &dht,
             local_node_id,
+            &local_realm_id,
             &bootstrap_nodes_state,
             &topic,
         )
@@ -240,6 +251,7 @@ async fn subscribe_owned(
         let reannounce_cancel = cancel.clone();
         let reannounce_topic = topic.clone();
         let reannounce_dht = dht.clone();
+        let reannounce_realm_id = local_realm_id.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -248,6 +260,7 @@ async fn subscribe_owned(
                         if let Err(error) = announce_topic_subscription(
                             &reannounce_dht,
                             local_node_id,
+                            &reannounce_realm_id,
                             &reannounce_topic,
                         ).await {
                             warn!(topic = %reannounce_topic, error = %error, "Failed to refresh gossip topic announcement");
@@ -264,6 +277,7 @@ async fn subscribe_owned(
         let dht_for_stream = dht.clone();
         let bootstrap_nodes_for_stream = bootstrap_nodes_state.clone();
         let shutdown_for_stream = shutdown.clone();
+        let stream_realm_id = local_realm_id.clone();
         tokio::spawn(async move {
             use futures::stream::StreamExt;
             let mut unexpected_termination = false;
@@ -327,6 +341,7 @@ async fn subscribe_owned(
                         storage_for_stream,
                         dht_for_stream,
                         local_node_id,
+                        stream_realm_id.clone(),
                         subscriptions_for_stream,
                         pending_for_stream,
                         bootstrap_nodes_for_stream,
@@ -358,6 +373,7 @@ async fn subscribe_owned(
 async fn lookup_topic_bootstrap_nodes_owned(
     dht: &Arc<DhtHandle>,
     local_node_id: NodeId,
+    local_realm_id: &RealmId,
     bootstrap_nodes_state: &Arc<RwLock<Vec<NodeId>>>,
     topic: &TopicId,
 ) -> Result<Vec<NodeId>> {
@@ -368,7 +384,7 @@ async fn lookup_topic_bootstrap_nodes_owned(
     let mut seen = HashSet::new();
     let mut bootstrap_nodes = Vec::new();
 
-    for node_id in lookup_bootstrap_candidates_owned(dht, topic)
+    for node_id in lookup_bootstrap_candidates_owned(dht, local_realm_id, topic)
         .await?
         .into_iter()
         .chain(configured_nodes.into_iter())
@@ -386,25 +402,31 @@ async fn lookup_topic_bootstrap_nodes_owned(
 
 async fn lookup_bootstrap_candidates_owned(
     dht: &Arc<DhtHandle>,
+    local_realm_id: &RealmId,
     topic: &TopicId,
 ) -> Result<Vec<NodeId>> {
-    let topic_key = aruna_core::keys::gossip_peer_key(topic);
-    let mut candidates = lookup_nodes_for_key_owned(dht, &topic_key).await?;
-    if let TopicId::AutomergeDocument(document_key) = topic {
-        candidates.extend(lookup_nodes_for_key_owned(dht, document_key).await?);
+    let topic_key = gossip_peer_key(topic);
+    let mut candidates = lookup_nodes_for_key_owned(dht, &topic_key, local_realm_id).await?;
+    if let Some(document) = AutomergeDocumentVariant::from_topic_id(topic) {
+        let holder_key = automerge_document_holder_key(&document);
+        candidates.extend(lookup_nodes_for_key_owned(dht, &holder_key, local_realm_id).await?);
     }
     Ok(candidates)
 }
 
 async fn lookup_nodes_for_key_owned(
     dht: &Arc<DhtHandle>,
-    dht_key: &aruna_core::DhtKeyId,
+    dht_key: &DhtKeyId,
+    local_realm_id: &RealmId,
 ) -> Result<Vec<NodeId>> {
-    let entries = dht.get(dht_key).await.map_err(|e| {
-        NetError::Gossip(format!(
-            "Failed to lookup gossip topic bootstrap nodes: {e}"
-        ))
-    })?;
+    let entries = dht
+        .get(dht_key, Some(local_realm_id.clone()))
+        .await
+        .map_err(|e| {
+            NetError::Gossip(format!(
+                "Failed to lookup gossip topic bootstrap nodes: {e}"
+            ))
+        })?;
     Ok(entries.into_iter().map(|entry| entry.node_id).collect())
 }
 
@@ -434,20 +456,24 @@ async fn persist_subscriptions(
 async fn announce_topic_subscription(
     dht: &DhtHandle,
     local_node_id: NodeId,
+    local_realm_id: &RealmId,
     topic: &TopicId,
 ) -> Result<()> {
-    let topic_key = aruna_core::keys::gossip_peer_key(topic);
+    let topic_key = gossip_peer_key(topic);
     dht.put(
         &topic_key,
+        local_realm_id.clone(),
         local_node_id.as_bytes().to_vec(),
         GOSSIP_TOPIC_ANNOUNCE_TTL,
     )
     .await
     .map_err(|e| NetError::Gossip(format!("Failed to announce gossip topic in DHT: {e}")))?;
 
-    if let TopicId::AutomergeDocument(document_key) = topic {
+    if let Some(document) = AutomergeDocumentVariant::from_topic_id(topic) {
+        let document_key = automerge_document_holder_key(&document);
         dht.put(
-            document_key,
+            &document_key,
+            local_realm_id.clone(),
             local_node_id.as_bytes().to_vec(),
             GOSSIP_TOPIC_ANNOUNCE_TTL,
         )

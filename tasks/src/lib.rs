@@ -9,6 +9,7 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use async_trait::async_trait;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
@@ -29,6 +30,7 @@ struct TaskInner {
 
 struct TimerEntry {
     id: u64,
+    deadline: Instant,
     cancel: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -52,7 +54,7 @@ impl TaskHandle {
         self.inner.inbound_handler.write().await.take();
     }
 
-    async fn reset_timer(&self, key: TaskKey, after: std::time::Duration) -> TaskEvent {
+    fn spawn_timer(&self, key: TaskKey, deadline: Instant) -> TimerEntry {
         let timer_id = self.inner.next_timer_id.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let cancel_for_task = cancel.clone();
@@ -62,7 +64,7 @@ impl TaskHandle {
         let task = tokio::spawn(async move {
             tokio::select! {
                 _ = cancel_for_task.cancelled() => {}
-                _ = tokio::time::sleep(after) => {
+                _ = tokio::time::sleep_until(deadline) => {
                     let handler = inner.inbound_handler.read().await.clone();
                     if let Some(handler) = handler {
                         handler.handle_timer(key_for_task.clone()).await;
@@ -76,15 +78,43 @@ impl TaskHandle {
             }
         });
 
+        TimerEntry {
+            id: timer_id,
+            deadline,
+            cancel,
+            task,
+        }
+    }
+
+    async fn reset_timer(&self, key: TaskKey, after: std::time::Duration) -> TaskEvent {
+        let deadline = Instant::now() + after;
+        let entry = self.spawn_timer(key.clone(), deadline);
+
         let mut timers = self.inner.timers.lock().await;
-        if let Some(existing) = timers.insert(
-            key.clone(),
-            TimerEntry {
-                id: timer_id,
-                cancel,
-                task,
-            },
-        ) {
+        if let Some(existing) = timers.insert(key.clone(), entry) {
+            existing.cancel.cancel();
+            existing.task.abort();
+        }
+
+        TaskEvent::TimerScheduled { key, after }
+    }
+
+    async fn shorten_timer(&self, key: TaskKey, after: std::time::Duration) -> TaskEvent {
+        let now = Instant::now();
+        let requested_deadline = now + after;
+        let mut timers = self.inner.timers.lock().await;
+
+        if let Some(existing) = timers.get(&key)
+            && existing.deadline <= requested_deadline
+        {
+            return TaskEvent::TimerScheduled {
+                key,
+                after: existing.deadline.saturating_duration_since(now),
+            };
+        }
+
+        let entry = self.spawn_timer(key.clone(), requested_deadline);
+        if let Some(existing) = timers.insert(key.clone(), entry) {
             existing.cancel.cancel();
             existing.task.abort();
         }
@@ -121,6 +151,7 @@ impl Handle for TaskHandle {
             Effect::Task(task_effect) => {
                 let event = match task_effect {
                     TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after).await,
+                    TaskEffect::ShortenTimer { key, after } => self.shorten_timer(key, after).await,
                     TaskEffect::CancelTimer { key } => self.cancel_timer(key).await,
                 };
                 Event::Task(event)
@@ -198,5 +229,36 @@ mod tests {
         })
         .await
         .expect("rescheduled timer should fire twice");
+    }
+
+    #[tokio::test]
+    async fn shorten_timer_does_not_lengthen_existing_entry() {
+        let handle = TaskHandle::new();
+        let key = TaskKey::RealmPresence {
+            realm_id: aruna_core::structs::RealmId([7u8; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+        };
+
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: key.clone(),
+                after: Duration::from_millis(10),
+            }))
+            .await
+        else {
+            panic!("expected timer scheduled event");
+        };
+        assert_eq!(after, Duration::from_millis(10));
+
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::ShortenTimer {
+                key,
+                after: Duration::from_millis(50),
+            }))
+            .await
+        else {
+            panic!("expected timer scheduled event");
+        };
+        assert!(after <= Duration::from_millis(10));
     }
 }

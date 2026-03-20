@@ -1,5 +1,6 @@
 // core/src/id.rs
 use crate::util::xor_distance_32;
+use crate::{structs::RealmId, types::GroupId};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use ulid::Ulid;
@@ -84,30 +85,175 @@ impl From<[u8; 32]> for DhtKeyId {
 /// Topic identifier for gossip pub/sub with semantic prefixes.
 /// Format: prefix byte + payload, hashed to 32 bytes for network use.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
+pub enum AutomergeTopicId {
+    Metadata {
+        group_id: GroupId,
+        document_id: Ulid,
+    },
+    GroupAuthorization {
+        group_id: GroupId,
+    },
+    RealmAuthorization {
+        realm_id: RealmId,
+    },
+    RealmConfig {
+        realm_id: RealmId,
+    },
+}
+
+impl AutomergeTopicId {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Self::Metadata {
+                group_id,
+                document_id,
+            } => {
+                let mut buf = Vec::with_capacity(33);
+                buf.push(PREFIX_AUTOMERGE_METADATA);
+                buf.extend_from_slice(&group_id.to_bytes());
+                buf.extend_from_slice(&document_id.to_bytes());
+                buf
+            }
+            Self::GroupAuthorization { group_id } => {
+                let mut buf = Vec::with_capacity(17);
+                buf.push(PREFIX_AUTOMERGE_GROUP_AUTHORIZATION);
+                buf.extend_from_slice(&group_id.to_bytes());
+                buf
+            }
+            Self::RealmAuthorization { realm_id } => {
+                let mut buf = Vec::with_capacity(33);
+                buf.push(PREFIX_AUTOMERGE_REALM_AUTHORIZATION);
+                buf.extend_from_slice(realm_id.as_bytes());
+                buf
+            }
+            Self::RealmConfig { realm_id } => {
+                let mut buf = Vec::with_capacity(33);
+                buf.push(PREFIX_AUTOMERGE_REALM_CONFIG);
+                buf.extend_from_slice(realm_id.as_bytes());
+                buf
+            }
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+
+        let prefix = bytes[0];
+        let payload = &bytes[1..];
+        match prefix {
+            PREFIX_AUTOMERGE_METADATA => {
+                if payload.len() != 32 {
+                    return None;
+                }
+
+                let group_bytes: [u8; 16] = payload[..16].try_into().ok()?;
+                let document_bytes: [u8; 16] = payload[16..].try_into().ok()?;
+                Some(Self::Metadata {
+                    group_id: GroupId::from_bytes(group_bytes),
+                    document_id: Ulid::from_bytes(document_bytes),
+                })
+            }
+            PREFIX_AUTOMERGE_GROUP_AUTHORIZATION => {
+                if payload.len() != 16 {
+                    return None;
+                }
+
+                let group_bytes: [u8; 16] = payload.try_into().ok()?;
+                Some(Self::GroupAuthorization {
+                    group_id: GroupId::from_bytes(group_bytes),
+                })
+            }
+            PREFIX_AUTOMERGE_REALM_AUTHORIZATION => {
+                if payload.len() != 32 {
+                    return None;
+                }
+
+                let realm_bytes: [u8; 32] = payload.try_into().ok()?;
+                Some(Self::RealmAuthorization {
+                    realm_id: RealmId::from_bytes(realm_bytes),
+                })
+            }
+            PREFIX_AUTOMERGE_REALM_CONFIG => {
+                if payload.len() != 32 {
+                    return None;
+                }
+
+                let realm_bytes: [u8; 32] = payload.try_into().ok()?;
+                Some(Self::RealmConfig {
+                    realm_id: RealmId::from_bytes(realm_bytes),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for AutomergeTopicId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Metadata {
+                group_id,
+                document_id,
+            } => write!(
+                f,
+                "AutomergeTopicId::Metadata({}, {})",
+                group_id, document_id
+            ),
+            Self::GroupAuthorization { group_id } => {
+                write!(f, "AutomergeTopicId::GroupAuthorization({group_id})")
+            }
+            Self::RealmAuthorization { realm_id } => {
+                write!(f, "AutomergeTopicId::RealmAuthorization({realm_id})")
+            }
+            Self::RealmConfig { realm_id } => {
+                write!(f, "AutomergeTopicId::RealmConfig({realm_id})")
+            }
+        }
+    }
+}
+
+impl fmt::Display for AutomergeTopicId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Metadata {
+                group_id,
+                document_id,
+            } => write!(f, "metadata:{group_id}:{document_id}"),
+            Self::GroupAuthorization { group_id } => write!(f, "group_auth:{group_id}"),
+            Self::RealmAuthorization { realm_id } => write!(f, "realm_auth:{realm_id}"),
+            Self::RealmConfig { realm_id } => write!(f, "realm_config:{realm_id}"),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum TopicId {
     /// Realm-scoped topic (prefix 'r')
-    Realm(Ulid),
+    Realm(RealmId),
     /// Node-specific topic (prefix 'n')
     Node(NodeId),
     /// Group-scoped topic (prefix 'g')
     Group(Ulid),
-    /// Metadata document topic (prefix 'm')
-    MetadataDocument(Ulid),
     /// Generic Automerge document topic (prefix 'a')
-    AutomergeDocument(DhtKeyId),
+    AutomergeDocument(AutomergeTopicId),
 }
 
 /// Prefix bytes for TopicId variants
 const PREFIX_REALM: u8 = b'r';
 const PREFIX_NODE: u8 = b'n';
 const PREFIX_GROUP: u8 = b'g';
-const PREFIX_METADATA_DOCUMENT: u8 = b'm';
 const PREFIX_AUTOMERGE_DOCUMENT: u8 = b'a';
+const PREFIX_AUTOMERGE_METADATA: u8 = b'm';
+const PREFIX_AUTOMERGE_GROUP_AUTHORIZATION: u8 = b'g';
+const PREFIX_AUTOMERGE_REALM_AUTHORIZATION: u8 = b'r';
+const PREFIX_AUTOMERGE_REALM_CONFIG: u8 = b'c';
 
 impl TopicId {
     /// Create a realm-scoped topic
     #[inline]
-    pub fn realm(id: Ulid) -> Self {
+    pub fn realm(id: RealmId) -> Self {
         Self::Realm(id)
     }
 
@@ -123,25 +269,19 @@ impl TopicId {
         Self::Group(id)
     }
 
-    /// Create a metadata document topic
-    #[inline]
-    pub fn metadata_document(id: Ulid) -> Self {
-        Self::MetadataDocument(id)
-    }
-
     /// Create a generic automerge document topic
     #[inline]
-    pub fn automerge_document(id: DhtKeyId) -> Self {
+    pub fn automerge_document(id: AutomergeTopicId) -> Self {
         Self::AutomergeDocument(id)
     }
 
     /// Serialize to bytes (prefix + payload)
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            Self::Realm(ulid) => {
-                let mut buf = Vec::with_capacity(17);
+            Self::Realm(realm_id) => {
+                let mut buf = Vec::with_capacity(33);
                 buf.push(PREFIX_REALM);
-                buf.extend_from_slice(&ulid.to_bytes());
+                buf.extend_from_slice(realm_id.as_bytes());
                 buf
             }
             Self::Node(pubkey) => {
@@ -156,16 +296,10 @@ impl TopicId {
                 buf.extend_from_slice(&ulid.to_bytes());
                 buf
             }
-            Self::MetadataDocument(ulid) => {
-                let mut buf = Vec::with_capacity(17);
-                buf.push(PREFIX_METADATA_DOCUMENT);
-                buf.extend_from_slice(&ulid.to_bytes());
-                buf
-            }
             Self::AutomergeDocument(id) => {
-                let mut buf = Vec::with_capacity(33);
+                let mut buf = Vec::with_capacity(1 + id.to_bytes().len());
                 buf.push(PREFIX_AUTOMERGE_DOCUMENT);
-                buf.extend_from_slice(id.as_bytes());
+                buf.extend_from_slice(&id.to_bytes());
                 buf
             }
         }
@@ -181,11 +315,11 @@ impl TopicId {
 
         match prefix {
             PREFIX_REALM => {
-                if payload.len() != 16 {
+                if payload.len() != 32 {
                     return None;
                 }
-                let bytes: [u8; 16] = payload.try_into().ok()?;
-                Some(Self::Realm(Ulid::from_bytes(bytes)))
+                let bytes: [u8; 32] = payload.try_into().ok()?;
+                Some(Self::Realm(RealmId::from_bytes(bytes)))
             }
             PREFIX_NODE => {
                 if payload.len() != 32 {
@@ -201,20 +335,9 @@ impl TopicId {
                 let bytes: [u8; 16] = payload.try_into().ok()?;
                 Some(Self::Group(Ulid::from_bytes(bytes)))
             }
-            PREFIX_METADATA_DOCUMENT => {
-                if payload.len() != 16 {
-                    return None;
-                }
-                let bytes: [u8; 16] = payload.try_into().ok()?;
-                Some(Self::MetadataDocument(Ulid::from_bytes(bytes)))
-            }
-            PREFIX_AUTOMERGE_DOCUMENT => {
-                if payload.len() != 32 {
-                    return None;
-                }
-                let bytes: [u8; 32] = payload.try_into().ok()?;
-                Some(Self::AutomergeDocument(DhtKeyId::from_bytes(bytes)))
-            }
+            PREFIX_AUTOMERGE_DOCUMENT => Some(Self::AutomergeDocument(
+                AutomergeTopicId::from_bytes(payload)?,
+            )),
             _ => None,
         }
     }
@@ -234,7 +357,6 @@ impl fmt::Debug for TopicId {
             Self::Realm(id) => write!(f, "TopicId::Realm({})", id),
             Self::Node(id) => write!(f, "TopicId::Node({})", id),
             Self::Group(id) => write!(f, "TopicId::Group({})", id),
-            Self::MetadataDocument(id) => write!(f, "TopicId::MetadataDocument({})", id),
             Self::AutomergeDocument(id) => write!(f, "TopicId::AutomergeDocument({})", id),
         }
     }
@@ -246,7 +368,6 @@ impl fmt::Display for TopicId {
             Self::Realm(id) => write!(f, "r:{}", id),
             Self::Node(id) => write!(f, "n:{}", id),
             Self::Group(id) => write!(f, "g:{}", id),
-            Self::MetadataDocument(id) => write!(f, "m:{}", id),
             Self::AutomergeDocument(id) => write!(f, "a:{}", id),
         }
     }
@@ -302,7 +423,7 @@ mod tests {
 
     #[test]
     fn test_topic_id_roundtrip() {
-        let realm_id = Ulid::new();
+        let realm_id = RealmId::from_bytes([4u8; 32]);
         let topic = TopicId::realm(realm_id);
         let bytes = topic.to_bytes();
         let parsed = TopicId::from_bytes(&bytes).unwrap();
@@ -320,9 +441,19 @@ mod tests {
 
     #[test]
     fn test_topic_id_display() {
-        let realm_id = Ulid::new();
+        let realm_id = RealmId::from_bytes([5u8; 32]);
         let topic = TopicId::realm(realm_id);
         let display = format!("{}", topic);
         assert!(display.starts_with("r:"));
+    }
+
+    #[test]
+    fn test_automerge_topic_roundtrip() {
+        let topic = TopicId::automerge_document(AutomergeTopicId::Metadata {
+            group_id: Ulid::from_bytes([9u8; 16]),
+            document_id: Ulid::from_bytes([10u8; 16]),
+        });
+        let parsed = TopicId::from_bytes(&topic.to_bytes()).unwrap();
+        assert_eq!(topic, parsed);
     }
 }

@@ -12,6 +12,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::automerge::AutomergeHandle;
+use aruna_core::automerge::AutomergeEvent;
+use aruna_core::automerge::AutomergeSyncError;
+use aruna_core::events::NetError;
+use aruna_core::task::TaskEvent;
 
 #[derive(Debug)]
 pub struct DriverContext {
@@ -43,7 +47,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             if let Some(net_handle) = &context.net_handle {
                 net_handle.send_effect(Effect::Net(net_effect)).await
             } else {
-                Event::Net(NetEvent::Error(aruna_core::events::NetError::ChannelClosed))
+                Event::Net(NetEvent::Error(NetError::ChannelClosed))
             }
         }
         Effect::Automerge(automerge_effect) => {
@@ -52,12 +56,10 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                     .send_effect(Effect::Automerge(automerge_effect))
                     .await
             } else {
-                Event::Automerge(aruna_core::automerge::AutomergeEvent::SyncRejected {
+                Event::Automerge(AutomergeEvent::SyncRejected {
                     sync_id: ulid::Ulid::new(),
                     document: None,
-                    error: aruna_core::automerge::AutomergeSyncError::Network(
-                        "automerge handle unavailable".to_string(),
-                    ),
+                    error: AutomergeSyncError::Network("automerge handle unavailable".to_string()),
                 })
             }
         }
@@ -74,7 +76,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             if let Some(task_handle) = &context.task_handle {
                 task_handle.send_effect(Effect::Task(task_effect)).await
             } else {
-                Event::Task(aruna_core::task::TaskEvent::Error {
+                Event::Task(TaskEvent::Error {
                     key: None,
                     message: "task handle unavailable".to_string(),
                 })
