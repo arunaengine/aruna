@@ -1,7 +1,7 @@
-use aruna_core::consts::GROUP_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::GROUP_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::Group;
 use aruna_core::types::{Key, Value};
@@ -16,6 +16,12 @@ pub struct ListGroupOperation {
     state: ListGroupState,
     limit: usize,
     offset: usize,
+}
+
+impl Default for ListGroupOperation {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ListGroupOperation {
@@ -224,7 +230,7 @@ impl Operation for ListGroupOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| ListGroupError::NotFinished)?
+        self.output.ok_or(ListGroupError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
@@ -251,7 +257,7 @@ mod test {
     pub async fn test_list_group() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -266,6 +272,7 @@ mod test {
 
         let context = DriverContext {
             storage_handle,
+            blob_handle: None,
             net_handle: Some(net_handle.clone()),
             automerge_handle: None,
             task_handle: Some(task_handle),
@@ -288,8 +295,8 @@ mod test {
 
         let list_operation = ListGroupOperation::new();
         let mut list_result = drive(list_operation, &context).await.unwrap();
-        list_result.sort_by(|a, b| a.group_id.cmp(&b.group_id));
-        groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+        list_result.sort_by_key(|a| a.group_id);
+        groups.sort_by_key(|a| a.group_id);
 
         assert_eq!(list_result, groups);
 

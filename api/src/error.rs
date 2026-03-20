@@ -9,9 +9,19 @@ use thiserror::Error;
 use utoipa::ToSchema;
 
 #[derive(Debug, Error)]
+pub enum S3ServerError {
+    #[error(transparent)]
+    DomainError(#[from] s3s::host::DomainError),
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+}
+
+#[derive(Debug, Error)]
 pub enum ServerError {
     #[error("Unimplemented")]
     Unimplemented,
+    #[error("Not found")]
+    NotFound,
     #[error("Unauthorized")]
     Unauthorized,
     #[error("Forbidden")]
@@ -117,6 +127,7 @@ impl ServerError {
     fn status_code(&self) -> StatusCode {
         match self {
             ServerError::Unimplemented => StatusCode::NOT_IMPLEMENTED,
+            ServerError::NotFound => StatusCode::NOT_FOUND,
             ServerError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -127,6 +138,7 @@ impl ServerError {
     fn error_code(&self) -> String {
         match self {
             ServerError::Unimplemented => "Not implemented".to_string(),
+            ServerError::NotFound => "Not found".to_string(),
             ServerError::Unauthorized => "Not authorized".to_string(),
             ServerError::Forbidden => "Forbidden".to_string(),
             ServerError::InternalError(_) => "Internal error".to_string(),

@@ -1,7 +1,7 @@
-use aruna_core::consts::AUTH_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     AuthContext, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId, Role,
@@ -88,11 +88,11 @@ impl CheckPermissionsOperation {
                 Err(err) => self.fail(err),
             }
         } else {
-            return self.unexpected_event(
+            self.unexpected_event(
                 self.state,
                 "Event::Storage(StorageEvent::TransactionStart)",
                 got,
-            );
+            )
         }
     }
 
@@ -108,11 +108,7 @@ impl CheckPermissionsOperation {
                 Err(err) => self.fail(err),
             }
         } else {
-            return self.unexpected_event(
-                self.state,
-                "Event::Storage(StorageEvent::ReadResult)",
-                got,
-            );
+            self.unexpected_event(self.state, "Event::Storage(StorageEvent::ReadResult)", got)
         }
     }
 
@@ -128,11 +124,7 @@ impl CheckPermissionsOperation {
                 Err(err) => self.fail(err),
             }
         } else {
-            return self.unexpected_event(
-                self.state,
-                "Event::Storage(StorageEvent::ReadResult)",
-                got,
-            );
+            self.unexpected_event(self.state, "Event::Storage(StorageEvent::ReadResult)", got)
         }
     }
 
@@ -148,11 +140,11 @@ impl CheckPermissionsOperation {
                 Err(err) => self.fail(err),
             }
         } else {
-            return self.unexpected_event(
+            self.unexpected_event(
                 self.state,
                 "Event::Storage(StorageEvent::TransactionCommitted)",
                 got,
-            );
+            )
         }
     }
 
@@ -450,7 +442,7 @@ mod test {
     pub async fn test_check_permissions() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -465,6 +457,7 @@ mod test {
 
         let context = DriverContext {
             storage_handle,
+            blob_handle: None,
             net_handle: Some(net_handle.clone()),
             automerge_handle: None,
             task_handle: Some(task_handle),
@@ -512,7 +505,7 @@ mod test {
             },
             path: format!(
                 "/{}/g/{}/meta/{}",
-                realm_id.to_string(),
+                realm_id,
                 group_id.to_string(),
                 Ulid::new().to_string()
             ),
@@ -533,7 +526,7 @@ mod test {
             },
             path: format!(
                 "/{}/g/{}/data/{}",
-                realm_id.to_string(),
+                realm_id,
                 group_id.to_string(),
                 Ulid::new().to_string()
             ),
@@ -554,7 +547,7 @@ mod test {
             },
             path: format!(
                 "/{}/g/{}/data/{}",
-                realm_id.to_string(),
+                realm_id,
                 Ulid::new(),
                 Ulid::new().to_string()
             ),
@@ -593,7 +586,7 @@ mod test {
             },
             path: format!(
                 "/{}/g/{}/meta/{}",
-                realm_id.to_string(),
+                realm_id,
                 group_id.to_string(),
                 Ulid::new().to_string()
             ),
@@ -630,7 +623,7 @@ mod test {
                 role_id: Ulid::new(),
                 name: "denied".to_string(),
                 permissions: HashMap::from([(
-                    format!("{}/g/{}/**", realm_id.to_string(), group_id.to_string()),
+                    format!("{}/g/{}/**", realm_id, group_id),
                     Permission::DENY,
                 )]),
                 assigned_users: HashSet::from([denied_user]),
@@ -648,7 +641,7 @@ mod test {
             },
             path: format!(
                 "/{}/g/{}/meta/{}",
-                realm_id.to_string(),
+                realm_id,
                 group_id.to_string(),
                 Ulid::new().to_string()
             ),
@@ -666,11 +659,7 @@ mod test {
                 realm_id: realm_id.clone(),
                 path_restrictions: None,
             },
-            path: format!(
-                "/{}/admin/roles/{}",
-                realm_id.to_string(),
-                Ulid::new().to_string()
-            ),
+            path: format!("/{}/admin/roles/{}", realm_id, Ulid::new().to_string()),
             required_permission: Permission::READ,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
@@ -685,11 +674,7 @@ mod test {
                 realm_id: realm_id.clone(),
                 path_restrictions: None,
             },
-            path: format!(
-                "/{}/admin/roles/{}",
-                realm_id.to_string(),
-                Ulid::new().to_string()
-            ),
+            path: format!("/{}/admin/roles/{}", realm_id, Ulid::new().to_string()),
             required_permission: Permission::WRITE,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());
@@ -725,11 +710,7 @@ mod test {
                 realm_id: realm_id.clone(),
                 path_restrictions: None,
             },
-            path: format!(
-                "/{}/admin/roles/{}",
-                realm_id.to_string(),
-                Ulid::new().to_string()
-            ),
+            path: format!("/{}/admin/roles/{}", realm_id, Ulid::new().to_string()),
             required_permission: Permission::WRITE,
         };
         let perm_operation = CheckPermissionsOperation::new(perm_config.clone());

@@ -162,7 +162,7 @@ impl TryFrom<TokenClaims> for AuthContext {
             .sub
             .split_once('@')
             .ok_or_else(|| ConversionError::InvalidUserId)?;
-        let user_id = Ulid::from_string(&user)?;
+        let user_id = Ulid::from_string(user)?;
         let realm_id = RealmId::from_base64(realm)?;
         let path_restrictions = value.restrictions;
 
@@ -212,8 +212,8 @@ pub mod autosurgeon_ulid_set {
     ) -> Result<HashSet<UserId>, HydrateError> {
         let inner: HashMap<String, String> = HashMap::hydrate(doc, obj, prop)?;
         let role_set = inner
-            .iter()
-            .map(|(k, _)| Ulid::from_string(&k))
+            .keys()
+            .map(|k| Ulid::from_string(k))
             .collect::<Result<HashSet<UserId>, ulid::DecodeError>>()
             .map_err(|e| {
                 HydrateError::unexpected("valid Ulid string", format!("Invalid Ulid {}", e))
@@ -250,11 +250,7 @@ mod test {
             role_id: Ulid::new(),
             name: "admin".to_string(),
             permissions: HashMap::from([(
-                format!(
-                    "/{}/g/{}/**",
-                    RealmId([0u8; 32]).to_string(),
-                    Ulid::new().to_string()
-                ),
+                format!("/{}/g/{}/**", RealmId([0u8; 32]), Ulid::new().to_string()),
                 Permission::WRITE,
             )]),
             assigned_users: HashSet::from([Ulid::new()]),

@@ -54,12 +54,14 @@ async fn metadata_automerge_sync_converges_between_nodes() -> Result<(), Box<dyn
     let context_a = Arc::new(DriverContext {
         storage_handle: storage_a.clone(),
         net_handle: Some(net_a.clone()),
+        blob_handle: None,
         automerge_handle: Some(automerge_a),
         task_handle: Some(task_a.clone()),
     });
     let context_b = Arc::new(DriverContext {
         storage_handle: storage_b.clone(),
         net_handle: Some(net_b.clone()),
+        blob_handle: None,
         automerge_handle: Some(automerge_b),
         task_handle: Some(task_b.clone()),
     });
@@ -195,12 +197,14 @@ async fn metadata_automerge_sync_populates_missing_document()
     let context_a = Arc::new(DriverContext {
         storage_handle: storage_a.clone(),
         net_handle: Some(net_a.clone()),
+        blob_handle: None,
         automerge_handle: Some(automerge_a),
         task_handle: Some(task_a.clone()),
     });
     let context_b = Arc::new(DriverContext {
         storage_handle: storage_b.clone(),
         net_handle: Some(net_b.clone()),
+        blob_handle: None,
         automerge_handle: Some(automerge_b),
         task_handle: Some(task_b.clone()),
     });
@@ -288,12 +292,14 @@ async fn metadata_gossip_announcement_triggers_sync() -> Result<(), Box<dyn std:
     let context_a = Arc::new(DriverContext {
         storage_handle: storage_a.clone(),
         net_handle: Some(net_a.clone()),
+        blob_handle: None,
         automerge_handle: Some(automerge_a),
         task_handle: Some(task_a.clone()),
     });
     let context_b = Arc::new(DriverContext {
         storage_handle: storage_b.clone(),
         net_handle: Some(net_b.clone()),
+        blob_handle: None,
         automerge_handle: Some(automerge_b),
         task_handle: Some(task_b.clone()),
     });

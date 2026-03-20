@@ -5,6 +5,7 @@ use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keyspaces::API_STATE_KEYSPACE;
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_operations::driver::DriverContext;
 use base64::Engine;
@@ -21,7 +22,6 @@ use tracing::warn;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-const API_STATE_KEYSPACE: &str = "api_state";
 const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
 const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 
@@ -103,7 +103,7 @@ impl ServerState {
     }
 
     pub fn get_node_id(&self) -> NodeId {
-        self.node_id.clone()
+        self.node_id
     }
 
     pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {

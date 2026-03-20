@@ -1,6 +1,12 @@
+#![allow(clippy::result_large_err)]
+
 use aruna::config::read_config;
+use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
+use aruna_blob::blob::BlobHandler;
+use aruna_core::structs::Backend::FileSystem;
+use aruna_core::structs::BackendConfig;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -10,7 +16,9 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
 
@@ -33,6 +41,7 @@ fn init_tracing() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv()?;
     let config = read_config()?;
     let storage_handle = storage::FjallStorage::open(&config.storage_path)?;
     let net_handle = NetHandle::new(
@@ -47,10 +56,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let task_handle = TaskHandle::new();
     let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
+    let blob_handle = BlobHandler::new(
+        BackendConfig {
+            backend_type: FileSystem,
+            root: config.blob_root.clone(),
+            service_config: HashMap::new(),
+            bucket_prefix: config.blob_bucket_prefix.clone(),
+            max_bucket_size: config.blob_max_bucket_size,
+        },
+        storage_handle.clone(),
+        net_handle.clone(),
+    )
+    .await?;
 
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: Some(net_handle.clone()),
+        blob_handle: Some(blob_handle),
         automerge_handle: Some(automerge_handle),
         task_handle: Some(task_handle.clone()),
     });
@@ -86,10 +108,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    // REST Server
     let state = Arc::new(
         ServerState::new(
-            driver_ctx,
-            config.realm_id,
+            driver_ctx.clone(),
+            config.realm_id.clone(),
             config.node_id,
             config.node_capabilities,
             None,
@@ -97,11 +120,44 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await,
     );
 
-    let config = ServerConfig {
+    let server_config = ServerConfig {
         http_addr: config.http_socket_addr,
     };
-    let server = Server::new(state, config);
-    server.run().await?;
+    let server = Server::new(state, server_config);
+
+    // S3 Server
+    let s3_address = format!("{}:{}", config.s3_address, config.s3_port);
+    let s3_host = format!("{}:{}", config.s3_host, config.s3_port);
+    let s3_server = S3Server::new(
+        &s3_address,
+        &s3_host,
+        driver_ctx,
+        config.realm_id.clone(),
+        config.node_id,
+    )
+    .await
+    .unwrap();
+
+    let server_handle = s3_server.run().await.unwrap();
+
+    tokio::select! {
+        res = server_handle => {
+            match res {
+                Ok(_) => info!("S3 Server stopped normally"),
+                Err(e) => error!("S3 Server panicked: {:?}", e),
+            }
+        }
+        res = server.run() => {
+            match res {
+                Ok(_) => info!("REST Server stopped normally"),
+                Err(e) => error!("REST Server panicked: {:?}", e),
+            }
+        }
+        // You can add other signals here, e.g., Ctrl+C
+        _ = tokio::signal::ctrl_c() => {
+            info!("Shutting down S3 interface");
+        }
+    }
 
     Ok(())
 }

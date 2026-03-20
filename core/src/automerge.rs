@@ -84,17 +84,12 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AutomergeSyncFeature {
     MessageV1,
+    #[default]
     MessageV2,
     InitAuthProof,
-}
-
-impl Default for AutomergeSyncFeature {
-    fn default() -> Self {
-        Self::MessageV2
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]

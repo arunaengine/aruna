@@ -1,18 +1,18 @@
+use crate::error::TokenError;
+use crate::server_state::ServerState;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
 use axum::extract::Request;
-use axum::http::{HeaderMap, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use http::HeaderMap;
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Validation, decode};
+use s3s::header;
 use std::str::FromStr;
 use thiserror::Error;
-
-use crate::error::TokenError;
-use crate::server_state::ServerState;
 
 #[derive(Debug)]
 pub struct OidcValidator {}
@@ -41,7 +41,7 @@ pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaim
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
 
     // - Check token hash against revocation list
-    if state.is_token_blacklisted(&token).await {
+    if state.is_token_blacklisted(token).await {
         return Err(TokenError::TokenBlacklisted);
     }
 
@@ -51,23 +51,23 @@ pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaim
     ) {
         (Some(issuer), true) => {
             let decoding_key = state.get_cached_pubkey(issuer).await?;
-            let claims = decode::<TokenClaims>(
+
+            decode::<TokenClaims>(
                 token,
                 &decoding_key,
                 &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?;
-            claims
+            )?
         }
         (_, _) => {
             let pubkey = state
                 .get_cached_pubkey(unvalidated_claims.claims.iss)
                 .await?;
-            let claims = decode::<TokenClaims>(
+
+            decode::<TokenClaims>(
                 token,
                 &pubkey,
                 &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?;
-            claims
+            )?
         }
     };
     validate_claims(state, &claims.claims).await?;
@@ -124,7 +124,7 @@ pub async fn auth_middleware(
 #[cfg(test)]
 mod test {
     use crate::auth::extract_auth_context;
-    use crate::server_state::ServerState;
+    use crate::server::ServerState;
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::{DriverContext, drive};
@@ -141,13 +141,14 @@ mod test {
     #[tokio::test]
     pub async fn test_token_capabilities() {
         let mut tempdir = temp_dir();
-        tempdir.push(format!("{}", Ulid::new().to_string()));
-        let storage_handle = storage::FjallStorage::open(&tempdir.to_str().unwrap()).unwrap();
+        tempdir.push(Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
             automerge_handle: None,
             task_handle: None,
+            blob_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -170,7 +171,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -211,7 +212,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -244,7 +245,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -274,13 +275,14 @@ mod test {
     #[tokio::test]
     pub async fn test_token_validation() {
         let mut tempdir = temp_dir();
-        tempdir.push(format!("{}", Ulid::new().to_string()));
-        let storage_handle = storage::FjallStorage::open(&tempdir.to_str().unwrap()).unwrap();
+        tempdir.push(Ulid::new().to_string());
+        let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
             automerge_handle: None,
             task_handle: None,
+            blob_handle: None,
         });
 
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
@@ -305,7 +307,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -378,7 +380,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -418,7 +420,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )
@@ -453,7 +455,7 @@ mod test {
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id.clone(),
-            node_id.clone(),
+            node_id,
             capabilities.clone(),
             None,
         )

@@ -4,11 +4,18 @@ use crate::alpn::Alpn;
 use crate::automerge::AutomergeEffect;
 use crate::id::NodeId;
 use crate::operation::SubOperation;
+use crate::stream::{BackendStream, StreamError};
+use crate::structs::BackendLocation;
 use crate::task::TaskEffect;
+use crate::types::UserId;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
+use bytes::Bytes;
+use std::ops::Range;
+use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
 pub enum Effect {
+    Blob(BlobEffect),
     Storage(StorageEffect),
     Net(NetEffect),
     Automerge(AutomergeEffect),
@@ -16,6 +23,49 @@ pub enum Effect {
     Task(TaskEffect),
     Search(),
     Stream(),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum BlobEffect {
+    //GetOperator { bucket: Option<String>, },
+    // ----- Blob read & write -----
+    Write {
+        bucket: String,
+        key: String,
+        created_by: UserId,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    Read {
+        location: BackendLocation,
+    },
+    ReadRange {
+        location: BackendLocation,
+        range: Range<u64>,
+    },
+    Delete {
+        location: BackendLocation,
+    },
+    // ----- Replication -----
+    OpenConnection {
+        node_id: NodeId,
+    },
+    NegotiateIncoming {
+        stream_id: Ulid,
+    },
+    NegotiateOutgoing {
+        replication_id: Ulid,
+        stream_id: Ulid,
+        location: BackendLocation,
+    },
+    Replicate {
+        replication_id: Ulid,
+        stream_id: Ulid,
+        location: BackendLocation,
+    },
+    HandleReplication {
+        replication_id: Ulid,
+        stream_id: Ulid,
+    },
 }
 
 #[derive(Debug, PartialEq)]

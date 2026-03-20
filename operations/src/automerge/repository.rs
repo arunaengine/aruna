@@ -2,10 +2,10 @@ use automerge::{AutoCommit, ChangeHash};
 use byteview::ByteView;
 
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::consts::{AUTH_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::RealmId;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 

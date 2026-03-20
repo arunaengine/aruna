@@ -15,6 +15,7 @@ pub async fn create_token() -> String {
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
+        blob_handle: None,
         automerge_handle: None,
         task_handle: None,
     });
@@ -27,6 +28,6 @@ pub async fn create_token() -> String {
         node_capabilities: config.node_capabilities,
     };
     let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
-    let token = drive(token_operation, &driver_ctx).await.unwrap();
-    token
+
+    drive(token_operation, &driver_ctx).await.unwrap()
 }

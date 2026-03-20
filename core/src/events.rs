@@ -1,3 +1,6 @@
+use crate::errors::BlobError;
+use crate::stream::{BackendStream, StreamError as BackendStreamError};
+use crate::structs::{BackendLocation, NegotiationResult};
 use crate::{
     automerge::AutomergeEvent,
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
@@ -5,9 +8,12 @@ use crate::{
     task::TaskEvent,
     types::{DhtKey, Key, TopicId, TxnId, Value},
 };
+use bytes::Bytes;
+use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
 pub enum Event {
+    Blob(BlobEvent),
     Storage(StorageEvent),
     Net(NetEvent),
     Automerge(AutomergeEvent),
@@ -31,6 +37,26 @@ pub enum SubOperationEvent {
     AutomergeStateResult {
         result: Result<(), String>,
     },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum BlobEvent {
+    WriteFinished {
+        location: BackendLocation,
+    },
+    ReadFinished {
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+        stream_size: u64,
+    },
+    DeleteFinished,
+    ConnectionEstablished {
+        stream_id: Ulid,
+    },
+    NegotiationFinished(NegotiationResult),
+    ReplicationFinished {
+        location: BackendLocation,
+    },
+    Error(BlobError),
 }
 
 #[derive(Debug, PartialEq)]

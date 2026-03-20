@@ -19,8 +19,10 @@ pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 
 enum Txn {
     Read(fjall::Snapshot),
-    Write(fjall::OptimisticWriteTx),
+    Write(Box<fjall::OptimisticWriteTx>),
 }
+
+type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
 
 pub struct FjallStorage {
     db: OptimisticTxDatabase,
@@ -146,7 +148,7 @@ impl FjallStorage {
                             txn_id,
                         } => self.iterate(key_space, prefix, start_after, limit, txn_id),
                     };
-                    let _ = response_tx.send(event);
+                    response_tx.send(event);
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -167,7 +169,7 @@ impl FjallStorage {
         } else {
             match self.db.write_tx() {
                 Ok(txn) => {
-                    self.txns.insert(txn_id, Txn::Write(txn));
+                    self.txns.insert(txn_id, Txn::Write(Box::new(txn)));
                 }
                 Err(_e) => {
                     return StorageEvent::Error {
@@ -356,9 +358,13 @@ impl FjallStorage {
                 Some(Txn::Read(txn)) => {
                     iterate_page(txn, &keyspace, prefix.as_ref(), start_after.as_ref(), limit)
                 }
-                Some(Txn::Write(txn)) => {
-                    iterate_page(txn, &keyspace, prefix.as_ref(), start_after.as_ref(), limit)
-                }
+                Some(Txn::Write(txn)) => iterate_page(
+                    txn.as_ref(),
+                    &keyspace,
+                    prefix.as_ref(),
+                    start_after.as_ref(),
+                    limit,
+                ),
                 None => {
                     return StorageEvent::Error {
                         error: StorageError::TransactionNotFound,
@@ -392,7 +398,7 @@ fn iterate_page<R: Readable>(
     prefix: Option<&ByteView>,
     start_after: Option<&ByteView>,
     limit: usize,
-) -> Result<(Vec<(ByteView, ByteView)>, Option<ByteView>), StorageError> {
+) -> Result<PageResult, StorageError> {
     let prefix_bytes = prefix.map(|p| p.as_ref().to_vec());
     let start_after_bytes = start_after.map(|s| s.as_ref().to_vec());
 
@@ -423,10 +429,7 @@ fn iterate_page<R: Readable>(
     collect_page(iter, limit)
 }
 
-fn collect_page(
-    iter: fjall::Iter,
-    limit: usize,
-) -> Result<(Vec<(ByteView, ByteView)>, Option<ByteView>), StorageError> {
+fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageError> {
     let mut iter = iter.peekable();
     let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
 

@@ -1,8 +1,8 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::consts::AUTH_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId, Role,
@@ -399,7 +399,7 @@ pub mod test {
     pub async fn test_add_role() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -417,6 +417,7 @@ pub mod test {
             net_handle: Some(net_handle.clone()),
             automerge_handle: None,
             task_handle: Some(task_handle),
+            blob_handle: None,
         };
 
         let user_id = Ulid::new();
@@ -444,7 +445,7 @@ pub mod test {
                 role_id: Ulid::new(),
                 name: "test_role".to_string(),
                 permissions: HashMap::from([(
-                    format!("{}/admin/create_group/*", realm_id.to_string()),
+                    format!("{}/admin/create_group/*", realm_id),
                     Permission::WRITE,
                 )]),
                 assigned_users: HashSet::from([user_id]),

@@ -19,6 +19,8 @@ use utoipa::{Modify, OpenApi};
     ),
     paths(
         // REST API endpoints - Groups
+        crate::routes::create_s3_credentials,
+        crate::routes::replicate_blob,
         crate::routes::create_group,
         crate::routes::list_groups,
         crate::routes::get_group,

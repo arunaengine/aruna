@@ -1,6 +1,6 @@
 use crate::error::ServerSetupError;
 use crate::routes::rest_router;
-use crate::server_state::{ServerState, swagger_ui};
+pub(crate) use crate::server_state::{ServerState, swagger_ui};
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::response::Redirect;
@@ -30,16 +30,15 @@ impl Server {
         let api_v1 = Router::new().merge(rest_router(self.state.clone()));
 
         // Build the root router with body size limit for REST API
-        let router = Router::new()
+
+        Router::new()
             .route(
                 "/",
                 axum::routing::get(|| async { Redirect::permanent("/swagger-ui") }),
             )
             .nest("/api/v1", api_v1)
             .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_SIZE))
-            .merge(swagger_ui());
-
-        router
+            .merge(swagger_ui())
     }
 
     pub async fn run(self) -> Result<(), ServerSetupError> {

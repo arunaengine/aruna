@@ -186,6 +186,7 @@ mod tests {
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
             automerge_handle: None,
             task_handle: None,
         };

@@ -1,5 +1,7 @@
+use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::Effect;
-use aruna_core::events::{Event, NetEvent, SubOperationEvent};
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_net::NetHandle;
@@ -15,6 +17,7 @@ use crate::automerge::AutomergeHandle;
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
+    pub blob_handle: Option<BlobHandle>,
     pub automerge_handle: Option<AutomergeHandle>,
     pub task_handle: Option<TaskHandle>,
 }
@@ -23,6 +26,13 @@ const MAX_SUBOP_DEPTH: usize = 32;
 
 async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
     match effect {
+        Effect::Blob(blob_effect) => {
+            if let Some(blob_handle) = &context.blob_handle {
+                blob_handle.send_blob_effect(blob_effect).await
+            } else {
+                Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
+            }
+        }
         Effect::Storage(storage_effect) => {
             context
                 .storage_handle
@@ -234,11 +244,12 @@ mod test {
     pub async fn test_driver() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
 
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
             automerge_handle: None,
             task_handle: None,
         };
@@ -302,10 +313,11 @@ mod test {
     async fn test_driver_preserves_effect_order_fifo() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
             automerge_handle: None,
             task_handle: None,
         };
@@ -366,10 +378,11 @@ mod test {
     async fn test_suboperation_depth_limit_is_enforced() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
+            blob_handle: None,
             automerge_handle: None,
             task_handle: None,
         };

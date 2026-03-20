@@ -2,11 +2,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::consts::GOSSIP_SUBSCRIPTIONS_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
+use aruna_core::keyspaces::GOSSIP_SUBSCRIPTIONS_KEYSPACE;
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
@@ -147,12 +147,7 @@ impl GossipService {
     }
 
     async fn persist_subscriptions(&self) {
-        let persisted: Vec<TopicId> = self
-            .subscriptions
-            .read()
-            .iter()
-            .map(|(topic, _)| topic.clone())
-            .collect();
+        let persisted: Vec<TopicId> = self.subscriptions.read().keys().cloned().collect();
 
         let Ok(data) = postcard::to_allocvec(&persisted) else {
             // Serialization failed - skip persisting
@@ -170,6 +165,7 @@ impl GossipService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn subscribe_owned(
     gossip: Gossip,
     storage: StorageHandle,
@@ -418,7 +414,7 @@ async fn persist_subscriptions(
 ) {
     let persisted: Vec<TopicId> = {
         let guard = subscriptions.read();
-        guard.iter().map(|(topic, _)| topic.clone()).collect()
+        guard.keys().cloned().collect()
     };
 
     let Ok(data) = postcard::to_allocvec(&persisted) else {

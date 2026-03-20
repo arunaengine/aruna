@@ -1,8 +1,8 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::consts::AUTH_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, AuthContext, Permission, RealmAuthorizationDocument, RealmId};
 use aruna_core::types::{RoleId, TxnId, UserId};
@@ -409,7 +409,7 @@ pub mod test {
     pub async fn test_add_user() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -427,6 +427,7 @@ pub mod test {
             net_handle: Some(net_handle.clone()),
             automerge_handle: None,
             task_handle: Some(task_handle),
+            blob_handle: None,
         };
 
         let user_id = Ulid::new();
@@ -478,8 +479,7 @@ pub mod test {
                 .unwrap()
                 .1
                 .assigned_users
-                .get(&add_user_input.user_id)
-                .is_some()
+                .contains(&add_user_input.user_id)
         );
 
         net_handle.shutdown().await;

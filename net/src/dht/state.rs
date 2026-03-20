@@ -1484,10 +1484,10 @@ impl DhtStateMachine {
                 let PendingKey::Rpc { phase, peer } = key else {
                     continue;
                 };
-                if let Some(deadline_tick) = meta.deadline_tick {
-                    if deadline_tick <= self.current_tick {
-                        timed_out.push((*op_id, *phase, *peer));
-                    }
+                if let Some(deadline_tick) = meta.deadline_tick
+                    && deadline_tick <= self.current_tick
+                {
+                    timed_out.push((*op_id, *phase, *peer));
                 }
             }
         }
@@ -1585,7 +1585,7 @@ mod tests {
         let mut state_b = DhtStateMachine::new(local_id_b, local_secret_b, 100);
 
         let key = DhtKeyId::from_data(b"deterministic-key");
-        let trace = vec![
+        let trace = [
             DhtInput::Cmd(DhtCmd::Put {
                 op_id: 1,
                 key,

@@ -1,6 +1,5 @@
-use std::array::TryFromSliceError;
-
 use automerge::AutomergeError;
+use std::array::TryFromSliceError;
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]
@@ -29,6 +28,40 @@ pub enum AuthorizationError {
         expected: &'static str,
         got: String,
     },
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum BlobError {
+    #[error("Channel closed")]
+    ChannelClosed,
+    #[error("Failed to send message")]
+    SendError,
+    #[error("Invalid effect type")]
+    InvalidEffect,
+    #[error("Blob handle missing")]
+    HandleMissing,
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error("failed to create bucket: {0}")]
+    MakeBucketError(String),
+    #[error("Operator creation failed: {0}")]
+    OperatorCreationFailed(String),
+    #[error("Outboard creation failed: {0}")]
+    OutboardCreationFailed(String),
+    #[error("Failed to open connection: {0}")]
+    ConnectionFailed(String),
+    #[error("Write error: {0}")]
+    WriteError(String),
+    #[error("Read error: {0}")]
+    ReadError(String),
+    #[error("Delete error: {0}")]
+    DeleteError(String),
+    #[error("Integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
+    #[error("Replication rejected: {0}")]
+    ReplicationRejected(String),
+    #[error("Replication failed: {0}")]
+    ReplicationFailed(String),
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -99,6 +132,14 @@ pub enum ConversionError {
     InvalidUserId,
     #[error(transparent)]
     PostcardError(#[from] postcard::Error),
+    #[error(transparent)]
+    FromUtf8Error(#[from] std::string::FromUtf8Error),
+    #[error("Failed to convert from str: {0}")]
+    FromStrError(String),
+    #[error("Failed to convert OsString to String")]
+    OsStringError,
+    #[error(transparent)]
+    ParseIntError(#[from] std::num::ParseIntError),
     #[error(transparent)]
     SerdeJsonError(#[from] serde_json::Error),
     #[error(transparent)]

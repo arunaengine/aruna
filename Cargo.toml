@@ -2,6 +2,7 @@
 members = [
     "api",
     "aruna",
+    "blob",
     "core",
     "search",
     "storage",
@@ -24,6 +25,7 @@ rust-version = "1.93.0"
 ahash = "0.8.12"
 automerge = "0.7.4"
 autosurgeon = "0.10.1"
+crossfire = "3.1.2"
 async-trait = "0.1.89"
 axum = "0.8.8"
 axum-extra = { version = "0.12.5", features = ["query"] }
@@ -37,10 +39,13 @@ fjall = "3.1.1"
 futures = "0.3.32"
 futures-util = "0.3.32"
 globset = "0.4.18"
-iroh = "0.96.1"
-iroh-base = "0.96.1"
-jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+iroh = "0.96.0"
+iroh-base = "0.96.0"
 iroh-gossip = "0.96.0"
+iroh-io = "0.6.2"
+iroh-quinn = "0.16.1"
+jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
+opendal = { version = "0.55", features = ["services-postgresql", "services-fs", "services-s3", "services-http"] }
 oxrdf = "0.3"
 ro-crate-rs = { version = "0.5.0", features = ["rdf"] }
 tokio-util = "0.7"
@@ -77,6 +82,11 @@ utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 smallvec = "1.15.1"
 byteview = "0.10.1"
 tempfile = "3.27.0"
+sha2 = "0.11.0-rc.5"
+
+[patch.crates-io]
+# Temporarily fixes the dependency conflict of digest 0.10.x and 0.11.x until dependencies are updated
+curve25519-dalek = { git = "https://github.com/das-Abroxas/curve25519-dalek", branch = "fix/digest-import" }
 
 [profile.release]
 panic = "abort"

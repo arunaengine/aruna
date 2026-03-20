@@ -1,8 +1,8 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::consts::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument};
 use smallvec::smallvec;
@@ -57,7 +57,7 @@ impl CreateGroupOperation {
         let group = Group {
             roles: HashSet::new(),
             display_name: self.config.display_name.clone(),
-            group_id: group_id.clone(),
+            group_id,
             realm_id: self.config.actor.realm_id.clone(),
         };
 
@@ -76,13 +76,12 @@ impl CreateGroupOperation {
     }
 
     fn emit_create_auth_doc(&mut self) -> Result<aruna_core::types::Effects, CreateGroupError> {
-        self.txn_id
-            .ok_or_else(|| CreateGroupError::NoTransactionFound)?;
+        self.txn_id.ok_or(CreateGroupError::NoTransactionFound)?;
 
         let group_id = self
             .group
             .as_ref()
-            .ok_or_else(|| CreateGroupError::GroupNotFound)?
+            .ok_or(CreateGroupError::GroupNotFound)?
             .group_id;
 
         let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
@@ -325,7 +324,7 @@ impl Operation for CreateGroupOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| CreateGroupError::NotFinished)?
+        self.output.ok_or(CreateGroupError::NotFinished)?
     }
 
     fn abort(&mut self) -> aruna_core::types::Effects {
@@ -351,7 +350,7 @@ mod test {
     pub async fn test_group_creation() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -366,6 +365,7 @@ mod test {
 
         let context = DriverContext {
             storage_handle,
+            blob_handle: None,
             net_handle: Some(net_handle.clone()),
             automerge_handle: None,
             task_handle: Some(task_handle),

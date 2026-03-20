@@ -28,7 +28,7 @@ impl Group {
         Ok(doc.save())
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(&bytes)?;
+        let doc = automerge::AutoCommit::load(bytes)?;
         Ok(hydrate(&doc)?)
     }
 }
@@ -111,7 +111,7 @@ impl GroupAuthorizationDocument {
         Ok(doc.save())
     }
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(&bytes)?;
+        let doc = automerge::AutoCommit::load(bytes)?;
         Ok(hydrate(&doc)?)
     }
 }
@@ -175,8 +175,8 @@ pub mod autosurgeon_role_set {
     ) -> Result<HashSet<RoleId>, HydrateError> {
         let inner: HashMap<String, String> = HashMap::hydrate(doc, obj, prop)?;
         let role_set = inner
-            .into_iter()
-            .map(|(id, _)| -> Result<RoleId, ConversionError> {
+            .into_keys()
+            .map(|id| {
                 let id = Ulid::from_string(&id).map_err(|_e| ConversionError::InvalidUserId)?;
                 Ok(id)
             })

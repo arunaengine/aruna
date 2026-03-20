@@ -1,8 +1,8 @@
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::consts::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, Realm, RealmAuthorizationDocument, RealmConfigDocument};
 use smallvec::smallvec;
@@ -415,7 +415,7 @@ mod test {
     pub async fn test_realm_creation() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(&random_path.path().to_str().unwrap()).unwrap();
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -430,6 +430,7 @@ mod test {
 
         let context = DriverContext {
             storage_handle,
+            blob_handle: None,
             net_handle: Some(net_handle.clone()),
             automerge_handle: None,
             task_handle: Some(task_handle),
@@ -448,7 +449,7 @@ mod test {
                 user_id: realm_admin,
                 realm_id,
             },
-            realm_description: format!("A realm description"),
+            realm_description: "A realm description".to_string(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let result = drive(realm_operation, &context).await.unwrap();

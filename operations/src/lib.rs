@@ -1,3 +1,5 @@
+#![allow(clippy::large_enum_variant, clippy::result_large_err)]
+
 pub mod add_group_role;
 pub mod add_realm_role;
 pub mod add_user_to_group;
@@ -19,11 +21,12 @@ pub mod get_realm_config;
 pub mod get_realm_nodes;
 pub mod incoming;
 pub mod incoming_automerge;
-pub mod incoming_bao;
 pub mod incoming_gossip;
 pub mod list_groups;
 pub mod list_metadata_documents;
 pub mod outgoing_automerge;
+pub mod replication;
+pub mod s3;
 pub mod startup;
 pub mod task_incoming;
 pub mod update_metadata_document;
