@@ -14,4 +14,5 @@ pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";
 pub const NODE_STATE_KEYSPACE: &str = "node_state";
+pub const ONBOARDING_KEYSPACE: &str = "onboarding";
 pub const DHT_KEYSPACE: &str = "dht";

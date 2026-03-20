@@ -3,12 +3,18 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+use aruna_core::onboarding::{
+    BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingSecret,
+    OnboardingSecretError,
+};
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
+use base64::Engine;
 use byteview::ByteView;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::SigningKey;
+use iroh::EndpointAddr;
 use iroh::KeyParsingError;
 use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
@@ -31,6 +37,7 @@ pub struct Config {
     pub node_id: iroh::PublicKey,
     pub net_secret_key: iroh::SecretKey,
     pub bootstrap_nodes: Vec<iroh::PublicKey>,
+    pub bootstrap_endpoints: Vec<EndpointAddr>,
     pub default_metadata_replication_factor: u32,
     pub s3_port: u16,
     pub s3_host: String,
@@ -43,23 +50,31 @@ pub struct Config {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartupMode {
     InitializeRealm { realm_description: String },
+    JoinRealm,
     Provisioned,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BootOrigin {
     InitializedRealm,
+    Onboarded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedNodeStatus {
     PendingInitialization,
+    PendingOnboarding,
     Complete,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedNodeIdentity {
     Management { realm_private_key_pem: String },
+    Server {
+        issuer_private_key_pem: String,
+        delegation_signature: String,
+    },
+    Local,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +83,7 @@ pub struct PersistedNodeState {
     pub status: PersistedNodeStatus,
     pub realm_id: RealmId,
     pub net_secret_key: [u8; 32],
+    pub bootstrap_endpoints: Vec<EndpointAddr>,
     pub identity: PersistedNodeIdentity,
 }
 
@@ -99,8 +115,16 @@ pub enum SetupError {
     UnsupportedNodeIdentity,
     #[error("persisted node state does not match derived realm id")]
     PersistedNodeStateMismatch,
-    #[error("onboarding bootstrap is not implemented yet")]
-    OnboardingBootstrapNotImplemented,
+    #[error(transparent)]
+    OnboardingSecretError(#[from] OnboardingSecretError),
+    #[error(transparent)]
+    ReqwestError(#[from] reqwest::Error),
+    #[error("onboarding bootstrap failed: {0}")]
+    OnboardingBootstrapFailed(String),
+    #[error("missing onboarding bootstrap material for {0:?} node")]
+    MissingOnboardingMaterial(OnboardingMode),
+    #[error("onboarding mode mismatch between secret and bootstrap response")]
+    OnboardingModeMismatch,
     #[error("unexpected storage event while loading node state: {0}")]
     UnexpectedStorageEvent(String),
 }
@@ -158,11 +182,10 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let node_state = match load_persisted_node_state(&storage_handle).await? {
         Some(state) => state,
         None => {
-            if onboarding_secret.is_some() {
-                return Err(SetupError::OnboardingBootstrapNotImplemented);
-            }
-
-            let state = generate_initialized_node_state()?;
+            let state = match onboarding_secret.as_deref() {
+                Some(onboarding_secret) => bootstrap_onboarded_node_state(onboarding_secret).await?,
+                None => generate_initialized_node_state()?,
+            };
             persist_node_state(&storage_handle, &state).await?;
             state
         }
@@ -179,6 +202,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         PersistedNodeStatus::PendingInitialization => StartupMode::InitializeRealm {
             realm_description: realm_description.clone(),
         },
+        PersistedNodeStatus::PendingOnboarding => StartupMode::JoinRealm,
         PersistedNodeStatus::Complete => StartupMode::Provisioned,
     };
 
@@ -195,6 +219,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             node_id,
             net_secret_key,
             bootstrap_nodes,
+            bootstrap_endpoints: node_state.bootstrap_endpoints.clone(),
             default_metadata_replication_factor,
             s3_port,
             s3_host,
@@ -248,6 +273,21 @@ fn node_capabilities_from_state(
                 },
             ))
         }
+        PersistedNodeIdentity::Server {
+            issuer_private_key_pem,
+            delegation_signature,
+        } => Ok((
+            node_state.realm_id.clone(),
+            NodeCapabilities::server_node(
+                SigningKey::from_pkcs8_pem(issuer_private_key_pem)?,
+                node_state.realm_id.clone(),
+                delegation_signature.clone(),
+            )?,
+        )),
+        PersistedNodeIdentity::Local => Ok((
+            node_state.realm_id.clone(),
+            NodeCapabilities::local_node(node_state.realm_id.clone())?,
+        )),
     }
 }
 
@@ -261,11 +301,90 @@ fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
         status: PersistedNodeStatus::PendingInitialization,
         realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
         net_secret_key: node_signing_key.to_bytes(),
+        bootstrap_endpoints: Vec::new(),
         identity: PersistedNodeIdentity::Management {
             realm_private_key_pem: realm_signing_key
                 .to_pkcs8_pem(LineEnding::default())?
                 .to_string(),
         },
+    })
+}
+
+async fn bootstrap_onboarded_node_state(
+    onboarding_secret: &str,
+) -> Result<PersistedNodeState, SetupError> {
+    let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
+    let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+    let node_signing_key = SigningKey::generate(&mut csprng);
+    let net_secret_key = node_signing_key.to_bytes();
+    let node_id = iroh::SecretKey::from_bytes(&net_secret_key).public();
+
+    let issuer_signing_key = if matches!(decoded_secret.mode, OnboardingMode::Server) {
+        Some(SigningKey::generate(&mut csprng))
+    } else {
+        None
+    };
+    let issuer_public_key = issuer_signing_key.as_ref().map(|issuer_signing_key| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(issuer_signing_key.verifying_key().to_bytes())
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/onboarding/bootstrap",
+            decoded_secret.seed_url.trim_end_matches('/'),
+        ))
+        .json(&BootstrapOnboardingRequest {
+            onboarding_secret: onboarding_secret.to_string(),
+            node_id: node_id.to_string(),
+            issuer_public_key,
+        })
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(SetupError::OnboardingBootstrapFailed(format!(
+            "bootstrap endpoint returned {}",
+            response.status()
+        )));
+    }
+
+    let response: BootstrapOnboardingResponse = response.json().await?;
+    if response.mode != decoded_secret.mode {
+        return Err(SetupError::OnboardingModeMismatch);
+    }
+    if response.bootstrap_endpoints.is_empty() {
+        return Err(SetupError::OnboardingBootstrapFailed(
+            "bootstrap endpoint list was empty".to_string(),
+        ));
+    }
+
+    let realm_id = response.realm_id()?;
+    let identity = match response.mode {
+        OnboardingMode::Management => PersistedNodeIdentity::Management {
+            realm_private_key_pem: response
+                .realm_private_key_pem
+                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?,
+        },
+        OnboardingMode::Server => PersistedNodeIdentity::Server {
+            issuer_private_key_pem: issuer_signing_key
+                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Server))?
+                .to_pkcs8_pem(LineEnding::default())?
+                .to_string(),
+            delegation_signature: response
+                .delegation_signature
+                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Server))?,
+        },
+        OnboardingMode::Local => PersistedNodeIdentity::Local,
+    };
+
+    Ok(PersistedNodeState {
+        boot_origin: BootOrigin::Onboarded,
+        status: PersistedNodeStatus::PendingOnboarding,
+        realm_id,
+        net_secret_key,
+        bootstrap_endpoints: response.bootstrap_endpoints,
+        identity,
     })
 }
 
@@ -306,5 +425,73 @@ async fn persist_node_state(
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(SetupError::UnexpectedStorageEvent(format!("{other:?}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, load,
+        persist_node_state,
+    };
+    use aruna_core::structs::RealmId;
+    use aruna_storage::FjallStorage;
+    use ed25519_dalek::SigningKey;
+    use std::sync::{Mutex, OnceLock};
+    use tempfile::tempdir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn ignores_onboarding_secret_when_node_state_exists() {
+        let _guard = env_lock().lock().unwrap();
+        let tempdir = tempdir().unwrap();
+        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let net_signing_key = SigningKey::generate(&mut csprng);
+        let node_state = PersistedNodeState {
+            boot_origin: BootOrigin::Onboarded,
+            status: PersistedNodeStatus::Complete,
+            realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
+            net_secret_key: net_signing_key.to_bytes(),
+            bootstrap_endpoints: Vec::new(),
+            identity: PersistedNodeIdentity::Local,
+        };
+        persist_node_state(&storage, &node_state).await.unwrap();
+        drop(storage);
+
+        let vars = [
+            ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
+            ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
+            ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
+            ("S3_PORT", "1337".to_string()),
+            ("S3_HOST", "localhost".to_string()),
+            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("ONBOARDING_SECRET", "definitely-not-a-valid-secret".to_string()),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+
+        for (key, value) in &vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let (config, _storage) = load().await.unwrap();
+        assert!(!config.is_initial_node());
+        assert!(matches!(config.startup_mode, super::StartupMode::Provisioned));
+
+        for (key, value) in previous {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
     }
 }

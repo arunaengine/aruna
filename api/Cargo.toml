@@ -27,6 +27,8 @@ chrono = { workspace = true }
 ed25519-dalek = { workspace = true }
 jsonwebtoken = { workspace = true }
 postcard = { workspace = true }
+rand = { workspace = true }
+iroh = { workspace = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
@@ -42,6 +44,4 @@ s3s = "0.13.0"
 aruna-net = { path = "../net" }
 aruna-storage = { path = "../storage" }
 aruna-tasks = { path = "../tasks" }
-iroh = { workspace = true }
 tempfile.workspace = true
-rand = { workspace = true }

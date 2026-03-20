@@ -15,9 +15,12 @@ use aruna_operations::claim_initial_realm_admin::{
 use aruna_operations::driver::{DriverContext, drive};
 use base64::Engine;
 use byteview::ByteView;
+use ed25519_dalek::Signer;
 use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
@@ -123,6 +126,38 @@ impl ServerState {
 
     pub fn get_node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    pub fn is_management_node(&self) -> bool {
+        matches!(self.node_capabilities, NodeCapabilities::Management { .. })
+    }
+
+    pub fn bootstrap_endpoint(&self) -> Option<EndpointAddr> {
+        self.driver_ctx
+            .net_handle
+            .as_ref()
+            .map(|net_handle| net_handle.endpoint_addr())
+    }
+
+    pub fn realm_private_key_pem(&self) -> Option<String> {
+        match &self.node_capabilities {
+            NodeCapabilities::Management {
+                realm_signing_key, ..
+            } => realm_signing_key
+                .to_pkcs8_pem(LineEnding::default())
+                .ok()
+                .map(|pem| pem.to_string()),
+            _ => None,
+        }
+    }
+
+    pub fn sign_server_delegation(&self, issuer_public_key: &str) -> Option<String> {
+        match &self.node_capabilities {
+            NodeCapabilities::Management {
+                realm_signing_key, ..
+            } => Some(realm_signing_key.sign(issuer_public_key.as_bytes()).to_string()),
+            _ => None,
+        }
     }
 
     pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {

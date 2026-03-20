@@ -6,10 +6,12 @@ use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
 use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{Effect, GossipEffect, NetEffect, StorageEffect};
+use aruna_core::errors::GossipError;
+use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::TopicId;
 use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
@@ -24,6 +26,7 @@ use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::outgoing_automerge::OutgoingAutomergeOperation;
 use aruna_operations::startup::RestoreAutomergeSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_tasks::TaskHandle;
@@ -92,6 +95,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
 
+    for endpoint in &config.bootstrap_endpoints {
+        net_handle.add_peer_addr(endpoint.clone()).await;
+    }
+
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
             if realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
@@ -111,6 +118,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
 
+            mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+        }
+        StartupMode::JoinRealm => {
+            bootstrap_join(
+                driver_ctx.as_ref(),
+                config.node_id,
+                &config.realm_id,
+                config.bootstrap_endpoints.first().map(|endpoint| endpoint.id),
+            )
+            .await?;
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }
         StartupMode::Provisioned => {
@@ -251,4 +268,59 @@ async fn announce_core_documents(
     }
 
     Ok(())
+}
+
+async fn bootstrap_join(
+    driver_ctx: &DriverContext,
+    node_id: aruna_core::NodeId,
+    realm_id: &aruna_core::structs::RealmId,
+    bootstrap_peer: Option<aruna_core::NodeId>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
+        return Err("net handle unavailable".into());
+    };
+    let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
+
+    for topic in [
+        TopicId::automerge_document(aruna_core::AutomergeTopicId::RealmAuthorization {
+            realm_id: realm_id.clone(),
+        }),
+        TopicId::automerge_document(aruna_core::AutomergeTopicId::RealmConfig {
+            realm_id: realm_id.clone(),
+        }),
+    ] {
+        match net_handle
+            .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
+                topic: topic.clone(),
+            })))
+            .await
+        {
+            Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. })) => {}
+            Event::Net(NetEvent::Gossip(GossipEvent::Error {
+                error: GossipError::AlreadySubscribed,
+            })) => {}
+            Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => {
+                return Err(error.to_string().into());
+            }
+            Event::Net(NetEvent::Error(error)) => return Err(format!("{error:?}").into()),
+            other => return Err(format!("unexpected gossip subscribe result: {other:?}").into()),
+        }
+    }
+
+    for document in [
+        AutomergeDocumentVariant::RealmAuthorization {
+            realm_id: realm_id.clone(),
+        },
+        AutomergeDocumentVariant::RealmConfig {
+            realm_id: realm_id.clone(),
+        },
+    ] {
+        drive(
+            OutgoingAutomergeOperation::new(bootstrap_peer, document),
+            driver_ctx,
+        )
+        .await?;
+    }
+
+    announce_core_documents(driver_ctx, node_id, realm_id).await
 }

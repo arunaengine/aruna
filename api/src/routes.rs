@@ -1,5 +1,6 @@
 use crate::auth::auth_middleware;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::onboarding;
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::errors::AuthorizationError;
@@ -35,6 +36,11 @@ use utoipa::ToSchema;
 /// Build the group routes.
 pub fn rest_router(state: Arc<ServerState>) -> Router {
     Router::new()
+        .route(
+            "/onboarding/bootstrap",
+            post(onboarding::bootstrap_onboarding),
+        )
+        .route("/admin/onboarding/secrets", post(onboarding::create_onboarding_secret))
         .route("/users/me/credentials", post(create_s3_credentials))
         .route(
             "/users/me/credentials/{access_key_id}",
