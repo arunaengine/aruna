@@ -383,6 +383,9 @@ pub mod test {
     use std::collections::{HashMap, HashSet};
 
     use crate::add_realm_role::{AddRealmRoleConfig, AddRealmRoleOperation};
+    use crate::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::structs::{Actor, Permission, Role};
@@ -430,6 +433,14 @@ pub mod test {
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let (_realm, _realm_auth_doc) = drive(realm_operation, &context).await.unwrap();
+        drive(
+            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                actor: realm_config.actor.clone(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
 
         let add_role_input = AddRealmRoleConfig {
             actor: Actor {

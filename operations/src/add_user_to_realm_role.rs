@@ -397,6 +397,9 @@ impl Operation for AddUserToRealmRolesOperation {
 #[cfg(test)]
 pub mod test {
     use crate::add_user_to_realm_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
+    use crate::claim_initial_realm_admin::{
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
+    };
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
     use aruna_core::structs::Actor;
@@ -444,6 +447,14 @@ pub mod test {
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let (_realm, realm_auth_doc) = drive(realm_operation, &context).await.unwrap();
+        drive(
+            ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
+                actor: realm_config.actor.clone(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
 
         let admin_role = realm_auth_doc
             .roles
