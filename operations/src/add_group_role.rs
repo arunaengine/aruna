@@ -658,5 +658,85 @@ pub mod test {
                 .unwrap(),
             &add_role_input.role
         );
+
+        let effects = add_role_operation.step(Event::Storage(
+            aruna_core::events::StorageEvent::WriteResult {
+                key: group_id.to_bytes().into(),
+            },
+        ));
+        let update_group_effect = effects.first().unwrap();
+
+        match update_group_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(key_space, GROUP_KEYSPACE);
+                assert_eq!(key, &group_id.to_bytes().into());
+                assert_eq!(effect_txn_id, &Some(txn_id));
+                let stored_group_doc = Group::from_bytes(value).unwrap();
+                assert_eq!(stored_group_doc, mutated_group);
+            }
+            other => panic!("unexpected create role effect: {other:?}"),
+        }
+        assert_eq!(
+            add_role_operation.state,
+            AddGroupRoleState::UpdateGroup {
+                txn_id,
+                group: mutated_group.clone(),
+                auth_doc: mutated_auth_doc.clone(),
+            }
+        );
+
+        let effects = add_role_operation.step(Event::Storage(
+            aruna_core::events::StorageEvent::WriteResult {
+                key: group_id.to_bytes().into(),
+            },
+        ));
+        let commit_transaction_effect = effects.first().unwrap();
+        match commit_transaction_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::CommitTransaction {
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(effect_txn_id, &txn_id);
+            }
+            other => panic!("unexpected create role effect: {other:?}"),
+        }
+        assert_eq!(
+            add_role_operation.state,
+            AddGroupRoleState::CommitTransaction {
+                group: mutated_group.clone(),
+                auth_doc: mutated_auth_doc.clone(),
+            }
+        );
+
+        let effects = add_role_operation.step(Event::Storage(
+            aruna_core::events::StorageEvent::TransactionCommitted { txn_id },
+        ));
+        let announce_auth_doc = effects.first().unwrap();
+        assert!(matches!(announce_auth_doc, Effect::SubOperation(_)));
+        assert_eq!(
+            add_role_operation.state,
+            AddGroupRoleState::AnnounceAuthDoc {
+                group: mutated_group,
+                auth_doc: mutated_auth_doc,
+            }
+        );
+
+        let effects = add_role_operation.step(Event::SubOperation(
+            aruna_core::events::SubOperationEvent::AutomergeStateResult { result: Ok(()) },
+        ));
+        assert!(effects.is_empty());
+        assert_eq!(add_role_operation.state, AddGroupRoleState::Finish);
+
+        // TODO:
+        // AnnounceAuthDoc {
+        //     group: Group,
+        //     auth_doc: GroupAuthorizationDocument,
+        // },
+        // Finish,
+        // Error,
     }
 }
