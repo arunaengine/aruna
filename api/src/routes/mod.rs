@@ -7,10 +7,11 @@ use std::sync::Arc;
 pub mod blobs;
 pub mod credentials;
 pub mod groups;
+pub mod onboarding;
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
     Router::new()
-        .merge(crate::onboarding::router())
+        .merge(onboarding::router())
         .merge(blobs::router())
         .merge(credentials::router())
         .merge(groups::router())

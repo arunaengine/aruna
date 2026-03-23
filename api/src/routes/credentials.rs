@@ -8,9 +8,7 @@ use aruna_operations::s3::create_user_access::{
     CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
-use aruna_operations::s3::revoke_user_access::{
-    RevokeUserAccessError, RevokeUserAccessOperation,
-};
+use aruna_operations::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, post};
@@ -30,10 +28,9 @@ pub struct CredentialsApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/users/me/credentials", post(create_s3_credentials))
         .route("/users/credentials", post(create_s3_credentials))
         .route(
-            "/users/me/credentials/{access_key_id}",
+            "/users/credentials/{access_key_id}",
             delete(revoke_s3_credentials),
         )
 }
@@ -59,7 +56,7 @@ pub struct CreateS3CredentialsResponse {
 
 #[utoipa::path(
     post,
-    path = "/users/me/credentials",
+    path = "/users/credentials",
     tag = "credentials",
     request_body = CreateS3CredentialsRequest,
     responses(
@@ -108,13 +105,9 @@ pub async fn create_s3_credentials(
         return Err(ServerError::Forbidden);
     }
 
-    let path_restrictions = build_credential_restrictions(
-        &auth,
-        &state,
-        group_id,
-        request.path_restrictions.clone(),
-    )
-    .await?;
+    let path_restrictions =
+        build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
+            .await?;
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
     let result = drive(
         CreateUserAccessOperation::new(CreateUserAccessConfig {
@@ -143,7 +136,7 @@ pub async fn create_s3_credentials(
 
 #[utoipa::path(
     delete,
-    path = "/users/me/credentials/{access_key_id}",
+    path = "/users/credentials/{access_key_id}",
     tag = "credentials",
     params(("access_key_id" = String, Path, description = "S3 access key to revoke")),
     responses(
@@ -161,11 +154,16 @@ pub async fn revoke_s3_credentials(
 ) -> ServerResult<StatusCode> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
 
-    let credential = match drive(GetUserAccessOperation::new(access_key_id.clone()), &state.get_ctx()).await {
+    let credential = match drive(
+        GetUserAccessOperation::new(access_key_id.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    {
         Ok(Some(Ok(credential))) => credential,
-        Ok(None) | Ok(Some(Err(GetUserAccessError::NotFound))) | Err(GetUserAccessError::NotFound) => {
-            return Err(ServerError::NotFound)
-        }
+        Ok(None)
+        | Ok(Some(Err(GetUserAccessError::NotFound)))
+        | Err(GetUserAccessError::NotFound) => return Err(ServerError::NotFound),
         Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
     };
 
@@ -188,11 +186,16 @@ pub async fn revoke_s3_credentials(
         return Err(ServerError::Forbidden);
     }
 
-    match drive(RevokeUserAccessOperation::new(access_key_id), &state.get_ctx()).await {
+    match drive(
+        RevokeUserAccessOperation::new(access_key_id),
+        &state.get_ctx(),
+    )
+    .await
+    {
         Ok(Some(Ok(_))) => Ok(StatusCode::NO_CONTENT),
-        Ok(None) | Ok(Some(Err(RevokeUserAccessError::NotFound))) | Err(RevokeUserAccessError::NotFound) => {
-            Err(ServerError::NotFound)
-        }
+        Ok(None)
+        | Ok(Some(Err(RevokeUserAccessError::NotFound)))
+        | Err(RevokeUserAccessError::NotFound) => Err(ServerError::NotFound),
         Ok(Some(Err(err))) | Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
 }
@@ -234,14 +237,20 @@ async fn build_credential_restrictions(
         } else if restriction.pattern.is_empty() {
             group_root.clone()
         } else {
-            format!("{group_root}/{}", restriction.pattern.trim_start_matches('/'))
+            format!(
+                "{group_root}/{}",
+                restriction.pattern.trim_start_matches('/')
+            )
         };
 
         if !pattern.starts_with(&group_root) {
             return Err(ServerError::Forbidden);
         }
 
-        restrictions.push(PathRestriction { pattern, permission });
+        restrictions.push(PathRestriction {
+            pattern,
+            permission,
+        });
     }
 
     for restriction in &restrictions {

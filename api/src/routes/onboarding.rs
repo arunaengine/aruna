@@ -266,7 +266,10 @@ pub async fn list_onboarding_secrets(
     Ok((
         StatusCode::OK,
         Json(ListOnboardingSecretsResponse {
-            secrets: secrets.into_iter().map(OnboardingSecretSummary::from).collect(),
+            secrets: secrets
+                .into_iter()
+                .map(OnboardingSecretSummary::from)
+                .collect(),
         }),
     ))
 }
@@ -371,7 +374,10 @@ pub async fn bootstrap_onboarding(
     let wrapped_management_key = if matches!(record.mode, OnboardingMode::Management) {
         Some(wrap_realm_private_key(
             &state,
-            request.transport_public_key.as_deref().ok_or(ServerError::BadRequest)?,
+            request
+                .transport_public_key
+                .as_deref()
+                .ok_or(ServerError::BadRequest)?,
         )?)
     } else {
         None
@@ -454,11 +460,9 @@ fn map_delete_error(error: DeleteOnboardingSecretError) -> ServerError {
     }
 }
 
-fn verify_node_proof(
-    request: &BootstrapOnboardingRequest,
-    node_id: NodeId,
-) -> ServerResult<()> {
-    let signature = Signature::from_str(&request.node_proof).map_err(|_| ServerError::Unauthorized)?;
+fn verify_node_proof(request: &BootstrapOnboardingRequest, node_id: NodeId) -> ServerResult<()> {
+    let signature =
+        Signature::from_str(&request.node_proof).map_err(|_| ServerError::Unauthorized)?;
     let verifying_key =
         VerifyingKey::from_bytes(node_id.as_bytes()).map_err(|_| ServerError::BadRequest)?;
     verifying_key
@@ -477,7 +481,10 @@ fn verify_issuer_proof(
     request: &BootstrapOnboardingRequest,
     issuer_public_key: &str,
 ) -> ServerResult<()> {
-    let issuer_proof = request.issuer_proof.as_ref().ok_or(ServerError::BadRequest)?;
+    let issuer_proof = request
+        .issuer_proof
+        .as_ref()
+        .ok_or(ServerError::BadRequest)?;
     let signature = Signature::from_str(issuer_proof).map_err(|_| ServerError::Unauthorized)?;
     let issuer_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(issuer_public_key)
@@ -494,7 +501,10 @@ fn verify_issuer_proof(
             &bootstrap_issuer_proof_message(
                 &request.onboarding_secret,
                 &request.node_id,
-                request.issuer_public_key.as_deref().ok_or(ServerError::BadRequest)?,
+                request
+                    .issuer_public_key
+                    .as_deref()
+                    .ok_or(ServerError::BadRequest)?,
             ),
             &signature,
         )
@@ -505,7 +515,9 @@ fn wrap_realm_private_key(
     state: &Arc<ServerState>,
     transport_public_key: &str,
 ) -> ServerResult<(String, String, String)> {
-    let realm_private_key_pem = state.realm_private_key_pem().ok_or(ServerError::Forbidden)?;
+    let realm_private_key_pem = state
+        .realm_private_key_pem()
+        .ok_or(ServerError::Forbidden)?;
     let transport_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(transport_public_key)
         .map_err(|_| ServerError::BadRequest)?;
@@ -555,19 +567,23 @@ mod tests {
     use axum::http::StatusCode;
     use base64::Engine;
     use crypto_box::{
-        PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
-        aead::Aead,
+        PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey, aead::Aead,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use std::sync::Arc;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
-    async fn setup_management_state(
-    ) -> (Arc<ServerState>, RealmId, iroh::PublicKey, Ulid, NetHandle, TempDir) {
+    async fn setup_management_state() -> (
+        Arc<ServerState>,
+        RealmId,
+        iroh::PublicKey,
+        Ulid,
+        NetHandle,
+        TempDir,
+    ) {
         let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -664,7 +680,11 @@ mod tests {
         let bootstrap_node_id = iroh::SecretKey::from_bytes(&node_proof.to_bytes()).public();
         let node_id = bootstrap_node_id.to_string();
         let node_signature = node_proof
-            .sign(&bootstrap_node_proof_message(&onboarding_secret, &node_id, None))
+            .sign(&bootstrap_node_proof_message(
+                &onboarding_secret,
+                &node_id,
+                None,
+            ))
             .to_string();
         let issuer_signature = issuer_key
             .sign(&bootstrap_issuer_proof_message(
@@ -721,16 +741,14 @@ mod tests {
         .await
         .unwrap();
 
-        let (_, Json(listed)) = list_onboarding_secrets(
-            State(state.clone()),
-            Extension(Some(auth.clone())),
-        )
-        .await
-        .unwrap();
+        let (_, Json(listed)) =
+            list_onboarding_secrets(State(state.clone()), Extension(Some(auth.clone())))
+                .await
+                .unwrap();
         assert_eq!(listed.secrets.len(), 1);
 
-        let secret = aruna_core::onboarding::OnboardingSecret::decode(&created.onboarding_secret)
-            .unwrap();
+        let secret =
+            aruna_core::onboarding::OnboardingSecret::decode(&created.onboarding_secret).unwrap();
         let status = revoke_onboarding_secret(
             State(state.clone()),
             Extension(Some(auth)),
@@ -748,8 +766,8 @@ mod tests {
                 path_restrictions: None,
             })),
         )
-            .await
-            .unwrap();
+        .await
+        .unwrap();
         assert!(listed.secrets.is_empty());
 
         net_handle.shutdown().await;
@@ -807,9 +825,10 @@ mod tests {
         .await;
         assert!(matches!(result, Err(ServerError::Unauthorized)));
 
-        let (_, Json(listed)) = list_onboarding_secrets(State(state.clone()), Extension(Some(auth)))
-            .await
-            .unwrap();
+        let (_, Json(listed)) =
+            list_onboarding_secrets(State(state.clone()), Extension(Some(auth)))
+                .await
+                .unwrap();
         assert_eq!(listed.secrets.len(), 1);
 
         let issuer_signature = issuer_key
@@ -903,9 +922,7 @@ mod tests {
             .decode(bootstrap.wrapped_realm_private_key.unwrap())
             .unwrap();
         let nonce = crypto_box::Nonce::from(<[u8; 24]>::try_from(nonce_bytes.as_slice()).unwrap());
-        let plaintext = cipher
-            .decrypt(&nonce, ciphertext.as_ref())
-            .unwrap();
+        let plaintext = cipher.decrypt(&nonce, ciphertext.as_ref()).unwrap();
         let pem = String::from_utf8(plaintext).unwrap();
         assert!(pem.contains("BEGIN PRIVATE KEY"));
 
