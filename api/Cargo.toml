@@ -3,6 +3,7 @@ name = "aruna-api"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -24,9 +25,12 @@ axum = "0.8.8"
 byteview = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
+crypto_box = { workspace = true }
 ed25519-dalek = { workspace = true }
 jsonwebtoken = { workspace = true }
 postcard = { workspace = true }
+rand = { workspace = true }
+iroh = { workspace = true }
 utoipa = { version = "5.4.0", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
 
@@ -39,7 +43,7 @@ hyper-util = { version = "0.1.20", features = ["server", "http1", "http2", "toki
 s3s = "0.13.0"
 
 [dev-dependencies]
+aruna-net = { path = "../net" }
 aruna-storage = { path = "../storage" }
-iroh = { workspace = true }
+aruna-tasks = { path = "../tasks" }
 tempfile.workspace = true
-rand = { workspace = true }

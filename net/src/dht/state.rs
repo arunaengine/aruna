@@ -100,10 +100,9 @@ struct PutOp {
     ttl_secs: u64,
     signature: iroh::Signature,
     frontier: LookupFrontier,
+    local_write_complete: bool,
+    completion_emitted: bool,
     lookup_finished: bool,
-    store_attempted: usize,
-    store_acked: usize,
-    last_store_error: Option<String>,
     pending: PendingMap,
 }
 
@@ -286,10 +285,9 @@ impl DhtStateMachine {
             ttl_secs,
             signature,
             frontier: LookupFrontier::default(),
+            local_write_complete: false,
+            completion_emitted: false,
             lookup_finished: false,
-            store_attempted: 0,
-            store_acked: 0,
-            last_store_error: None,
             pending: HashMap::new(),
         });
         self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, None, out);
@@ -545,15 +543,9 @@ impl DhtStateMachine {
                 }
             }
             RpcPhase::PutStore => match response {
-                DhtResponse::Stored => {
-                    op.store_acked = op.store_acked.saturating_add(1);
-                }
-                DhtResponse::Error { code, message } => {
-                    op.last_store_error = Some(format!("{code:?}: {message}"));
-                }
-                other => {
-                    op.last_store_error = Some(format!("unexpected response: {other:?}"));
-                }
+                DhtResponse::Stored => {}
+                DhtResponse::Error { .. } => {}
+                _ => {}
             },
             _ => {
                 self.ops.insert(op_id, OpState::Put(op));
@@ -727,7 +719,7 @@ impl DhtStateMachine {
         &mut self,
         op_id: OpId,
         phase: RpcPhase,
-        error: DhtIoError,
+        _error: DhtIoError,
         mut op: PutOp,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
@@ -738,9 +730,7 @@ impl DhtStateMachine {
                     self.begin_put_store(op_id, &mut op, out);
                 }
             }
-            RpcPhase::PutStore => {
-                op.last_store_error = Some(error.to_string());
-            }
+            RpcPhase::PutStore => {}
             _ => {
                 self.ops.insert(op_id, OpState::Put(op));
                 return;
@@ -976,6 +966,8 @@ impl DhtStateMachine {
                     self.ops.insert(op_id, OpState::Put(op));
                     return;
                 }
+
+                op.local_write_complete = true;
 
                 op.frontier.add_candidates(
                     self.routing_table
@@ -1295,7 +1287,6 @@ impl DhtStateMachine {
         op.lookup_finished = true;
 
         let targets = op.frontier.closest_discovered(op.key.as_bytes(), K);
-        op.store_attempted = targets.len();
         for peer in targets {
             self.queue_rpc_pending(
                 op_id,
@@ -1330,23 +1321,21 @@ impl DhtStateMachine {
     }
 
     fn maybe_complete_put(&mut self, op_id: OpId, op: PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
-        if op.store_acked > 0 {
+        let mut op = op;
+
+        if op.local_write_complete && !op.completion_emitted {
+            op.completion_emitted = true;
             out.push(DhtEffect::Output(DhtOutput::Completed {
                 op_id,
                 result: DhtOutputValue::Unit,
             }));
-        } else if op.lookup_finished && pending_rpc_count(&op.pending, RpcPhase::PutStore) == 0 {
-            let message = if let Some(last_error) = op.last_store_error {
-                format!("put failed: remote store rejected ({last_error})")
-            } else if op.store_attempted == 0 {
-                "put failed: no remote store targets".to_string()
-            } else {
-                "put failed: no remote store acknowledgement".to_string()
-            };
-            out.push(DhtEffect::Output(DhtOutput::Failed {
-                op_id,
-                error: DhtIoError::Network(message),
-            }));
+        }
+
+        if op.completion_emitted {
+            if op.lookup_finished && pending_rpc_count(&op.pending, RpcPhase::PutStore) == 0 {
+                return;
+            }
+            self.ops.insert(op_id, OpState::Put(op));
         } else {
             self.ops.insert(op_id, OpState::Put(op));
         }
@@ -1795,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn put_fails_without_remote_store_targets() {
+    fn put_succeeds_without_remote_store_targets() {
         let local_secret = iroh::SecretKey::from_bytes(&[41u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 1_000);
@@ -1822,16 +1811,16 @@ mod tests {
         assert!(effects.iter().any(|effect| {
             matches!(
                 effect,
-                DhtEffect::Output(DhtOutput::Failed {
+                DhtEffect::Output(DhtOutput::Completed {
                     op_id: 11,
-                    error: DhtIoError::Network(message)
-                }) if message.contains("no remote store targets")
+                    result: DhtOutputValue::Unit
+                })
             )
         }));
     }
 
     #[test]
-    fn put_fails_when_store_rpc_times_out() {
+    fn put_succeeds_when_store_rpc_times_out() {
         let local_secret = iroh::SecretKey::from_bytes(&[42u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 100);
@@ -1855,6 +1844,16 @@ mod tests {
         let write_effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
             op_id: 12,
             stage: StorageStage::PutLocalWrite,
+        }));
+
+        assert!(write_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 12,
+                    result: DhtOutputValue::Unit
+                })
+            )
         }));
 
         assert!(write_effects.iter().any(|effect| {
@@ -1895,19 +1894,11 @@ mod tests {
             error: DhtIoError::Timeout,
         }));
 
-        assert!(fail_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::Output(DhtOutput::Failed {
-                    op_id: 12,
-                    error: DhtIoError::Network(message)
-                }) if message.contains("remote store rejected")
-            )
-        }));
+        assert!(fail_effects.is_empty());
     }
 
     #[test]
-    fn put_fails_on_non_stored_response() {
+    fn put_succeeds_on_non_stored_response() {
         let local_secret = iroh::SecretKey::from_bytes(&[43u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 100);
@@ -1928,9 +1919,19 @@ mod tests {
             stage: StorageStage::PutLocalRead,
             entries: Vec::new(),
         }));
-        let _ = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
+        let write_effects = state.step(DhtInput::Io(DhtIo::StorageWriteResult {
             op_id: 13,
             stage: StorageStage::PutLocalWrite,
+        }));
+
+        assert!(write_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 13,
+                    result: DhtOutputValue::Unit
+                })
+            )
         }));
 
         let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
@@ -1950,19 +1951,11 @@ mod tests {
             },
         }));
 
-        assert!(fail_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::Output(DhtOutput::Failed {
-                    op_id: 13,
-                    error: DhtIoError::Network(message)
-                }) if message.contains("remote store rejected")
-            )
-        }));
+        assert!(fail_effects.is_empty());
     }
 
     #[test]
-    fn put_succeeds_after_first_store_ack_even_with_other_pending() {
+    fn put_continues_best_effort_replication_after_local_success() {
         let local_secret = iroh::SecretKey::from_bytes(&[44u8; 32]);
         let local_id = local_secret.public();
         let mut state = DhtStateMachine::new(local_id, local_secret, 100);
@@ -2006,6 +1999,15 @@ mod tests {
             lookup_peers.len() >= 2,
             "expected lookup fanout to both peers"
         );
+        assert!(write_effects.iter().any(|effect| {
+            matches!(
+                effect,
+                DhtEffect::Output(DhtOutput::Completed {
+                    op_id: 14,
+                    result: DhtOutputValue::Unit
+                })
+            )
+        }));
 
         let _ = state.step(DhtInput::Io(DhtIo::RpcResponse {
             op_id: 14,
@@ -2049,15 +2051,7 @@ mod tests {
             peer: ack_peer,
             response: DhtResponse::Stored,
         }));
-        assert!(complete_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::Output(DhtOutput::Completed {
-                    op_id: 14,
-                    result: DhtOutputValue::Unit
-                })
-            )
-        }));
+        assert!(complete_effects.is_empty());
 
         let late_effects = state.step(DhtInput::Io(DhtIo::RpcError {
             op_id: 14,

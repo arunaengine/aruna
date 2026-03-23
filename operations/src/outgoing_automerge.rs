@@ -1,5 +1,6 @@
 use aruna_core::automerge::{
     AutomergeDocumentVariant, AutomergeEffect, AutomergeEvent, AutomergeInit, AutomergeSyncError,
+    InitAuthProof,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -14,6 +15,7 @@ use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
 pub struct OutgoingAutomergeOperation {
     peer: aruna_core::NodeId,
     document: AutomergeDocumentVariant,
+    auth_proof: Option<InitAuthProof>,
     state: OutgoingAutomergeState,
     local_document: Option<Vec<u8>>,
     persist_txn_id: Option<aruna_core::types::TxnId>,
@@ -56,6 +58,24 @@ impl OutgoingAutomergeOperation {
         Self {
             peer,
             document,
+            auth_proof: None,
+            state: OutgoingAutomergeState::Init,
+            local_document: None,
+            persist_txn_id: None,
+            synced_document: None,
+            output: None,
+        }
+    }
+
+    pub fn new_with_auth(
+        peer: aruna_core::NodeId,
+        document: AutomergeDocumentVariant,
+        auth_proof: Option<InitAuthProof>,
+    ) -> Self {
+        Self {
+            peer,
+            document,
+            auth_proof,
             state: OutgoingAutomergeState::Init,
             local_document: None,
             persist_txn_id: None,
@@ -105,9 +125,15 @@ impl Operation for OutgoingAutomergeOperation {
                     };
                     self.local_document = Some(bytes);
                     self.state = OutgoingAutomergeState::InitializeSession;
+                    let mut init = AutomergeInit::new(self.document.clone(), heads);
+                    if let Some(auth_proof) = self.auth_proof.clone() {
+                        init.capabilities
+                            .push(aruna_core::automerge::AutomergeSyncFeature::InitAuthProof);
+                        init.auth = Some(auth_proof);
+                    }
                     smallvec![Effect::Automerge(AutomergeEffect::StartOutboundSync {
                         peer: self.peer,
-                        init: AutomergeInit::new(self.document.clone(), heads),
+                        init,
                     })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),

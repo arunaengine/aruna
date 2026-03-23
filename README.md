@@ -61,7 +61,7 @@ cargo run -p aruna
 
 ### Configuration
 
-Aruna reads configuration from environment variables. Copy `.env.example` to `.env` in the repository root and fill in the key material:
+Aruna reads configuration from environment variables. Copy `.env.example` to `.env` in the repository root:
 
 ```bash
 cp .env.example .env
@@ -72,14 +72,12 @@ Required variables from `aruna/src/config.rs`:
 ```bash
 STORAGE_PATH=/var/lib/aruna/data
 SOCKET_ADDRESS=0.0.0.0:8080
-REALM_PUBLIC_KEY="-----BEGIN PUBLIC KEY----- ..."
-REALM_PRIVATE_KEY="-----BEGIN PRIVATE KEY----- ..."
-NODE_PUBLIC_KEY="-----BEGIN PUBLIC KEY----- ..."
-NODE_PRIVATE_KEY="-----BEGIN PRIVATE KEY----- ..."
 S3_PORT=1337
 S3_HOST=localhost
 S3_ADDRESS=0.0.0.0
 ```
+
+On first boot without an `ONBOARDING_SECRET`, the node initializes a new realm and persists its local identity under `STORAGE_PATH`. Additional nodes join an existing realm with `ONBOARDING_SECRET`.
 
 Optional variables:
 
@@ -96,18 +94,17 @@ BLOB_MAX_BUCKET_SIZE=100000
 # Defaults to SOCKET_ADDRESS when omitted
 P2P_SOCKET_ADDRESS=0.0.0.0:4433
 
+# Defaults to "Aruna Realm"
+REALM_DESCRIPTION="Aruna Realm"
+
+# Present only on joining nodes
+ONBOARDING_SECRET=...
+
 # Comma-separated iroh public keys
 BOOTSTRAP_NODES=pubkey1,pubkey2
 
 # Defaults to 3 and is clamped to at least 1
 METADATA_REPLICATION_FACTOR=3
-```
-
-Generate Ed25519 keypairs with OpenSSL:
-
-```bash
-openssl genpkey -algorithm ed25519 -out key.pem
-openssl pkey -in key.pem -pubout -out key.pub.pem
 ```
 
 ### Using S3
@@ -120,7 +117,23 @@ aws --endpoint-url http://localhost:1337 s3 ls s3://my-bucket
 
 ### Connecting nodes
 
-Start a second instance with `BOOTSTRAP_NODES` pointing at the first node's P2P address. The nodes will discover each other through DHT and begin synchronizing.
+Additional nodes join through the onboarding API:
+
+1. Start the first node without `ONBOARDING_SECRET` so it initializes a new realm.
+2. Let the first local user authenticate and claim the empty `realm_admin` role.
+3. Create an onboarding secret with `POST /api/v1/admin/onboarding/secrets`.
+4. Start the joining node with that `ONBOARDING_SECRET`.
+5. On first boot, the joining node calls `POST /api/v1/onboarding/bootstrap`, persists its local identity, subscribes to the realm auth/config topics, and explicitly syncs both documents.
+
+Admin routes currently available for onboarding:
+
+- `POST /api/v1/admin/onboarding/secrets`
+- `GET /api/v1/admin/onboarding/secrets`
+- `DELETE /api/v1/admin/onboarding/secrets/{id}`
+
+Bootstrap route:
+
+- `POST /api/v1/onboarding/bootstrap`
 
 ## Development
 

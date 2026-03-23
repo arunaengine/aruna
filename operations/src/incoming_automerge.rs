@@ -1,17 +1,20 @@
-use aruna_core::automerge::{AutomergeEffect, AutomergeEvent, AutomergeInit, AutomergeSyncError};
+use aruna_core::automerge::{
+    AutomergeDocumentVariant, AutomergeEffect, AutomergeEvent, AutomergeInit, AutomergeSyncError,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::onboarding::OnboardingSyncTicket;
+use aruna_core::operation::{boxed_suboperation, Operation};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
-use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
+use aruna_core::NodeId;
 
 #[derive(Debug, PartialEq)]
 pub struct IncomingAutomergeOperation {
@@ -89,6 +92,51 @@ impl IncomingAutomergeOperation {
             got,
         })
     }
+
+    fn reject_unauthorized(&mut self) -> Effects {
+        self.state = IncomingAutomergeState::Error;
+        self.output = Some(Err(IncomingAutomergeError::Sync(
+            AutomergeSyncError::Unauthorized,
+        )));
+        smallvec![Effect::Automerge(AutomergeEffect::RejectSync {
+            sync_id: self.sync_id,
+            reason: aruna_core::automerge::AutomergeRejectReason::Unauthorized,
+        })]
+    }
+
+    fn requires_onboarding_auth(document: &AutomergeDocumentVariant, heads_empty: bool) -> bool {
+        heads_empty
+            && matches!(
+                document,
+                AutomergeDocumentVariant::RealmAuthorization { .. }
+                    | AutomergeDocumentVariant::RealmConfig { .. }
+            )
+    }
+
+    fn validate_onboarding_auth(
+        &self,
+        remote_init: &AutomergeInit,
+    ) -> Result<(), IncomingAutomergeError> {
+        if !Self::requires_onboarding_auth(&remote_init.document, remote_init.heads.is_empty()) {
+            return Ok(());
+        }
+
+        let auth = remote_init
+            .auth
+            .as_ref()
+            .ok_or(IncomingAutomergeError::Sync(
+                AutomergeSyncError::Unauthorized,
+            ))?;
+        let ticket = OnboardingSyncTicket::from_auth_proof(auth)
+            .map_err(|_| IncomingAutomergeError::Sync(AutomergeSyncError::Unauthorized))?;
+        ticket
+            .verify(
+                self.node_id,
+                &remote_init.document,
+                chrono::Utc::now().timestamp().max(0) as u64,
+            )
+            .map_err(|_| IncomingAutomergeError::Sync(AutomergeSyncError::Unauthorized))
+    }
 }
 
 impl Operation for IncomingAutomergeOperation {
@@ -106,6 +154,9 @@ impl Operation for IncomingAutomergeOperation {
         match self.state {
             IncomingAutomergeState::AwaitInit => match event {
                 Event::Automerge(AutomergeEvent::SyncInitialized { remote_init, .. }) => {
+                    if self.validate_onboarding_auth(&remote_init).is_err() {
+                        return self.reject_unauthorized();
+                    }
                     let document = remote_init.document.clone();
                     self.remote_init = Some(remote_init);
                     self.state = IncomingAutomergeState::LoadLocal;

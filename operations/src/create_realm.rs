@@ -80,10 +80,8 @@ impl CreateRealmOperation {
 
         let realm_id = self.config.actor.realm_id.clone();
 
-        let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(
-            self.config.actor.user_id,
-            self.config.actor.realm_id.clone(),
-        );
+        let auth_doc =
+            RealmAuthorizationDocument::new_default_realm_doc(self.config.actor.realm_id.clone());
 
         self.auth_doc = Some(auth_doc.clone());
 
@@ -457,11 +455,7 @@ mod test {
         assert_eq!(result.0.description, realm_config.realm_description);
         assert_eq!(result.0.realm_id, realm_config.actor.realm_id);
         assert!(result.1.roles.iter().any(|(_id, role)| {
-            role.name == "realm_admin"
-                && role
-                    .assigned_users
-                    .iter()
-                    .any(|user| user == &realm_config.actor.user_id)
+            role.name == "realm_admin" && role.assigned_users.is_empty()
         }));
         assert!(result.1.operation_restrictions.is_empty());
 

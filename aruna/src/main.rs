@@ -1,6 +1,9 @@
 #![allow(clippy::result_large_err)]
 
-use aruna::config::read_config;
+use aruna::bootstrap::{
+    announce_core_documents, fetch_core_onboarding_documents, realm_bootstrap_exists,
+};
+use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
@@ -8,17 +11,19 @@ use aruna_blob::blob::BlobHandler;
 use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
+use aruna_core::structs::NodeCapabilities;
+use aruna_core::onboarding::OnboardingPhase;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
 use aruna_operations::automerge::AutomergeHandle;
+use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::startup::RestoreAutomergeSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
-use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -46,8 +51,7 @@ fn init_tracing() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv()?;
-    let config = read_config()?;
-    let storage_handle = storage::FjallStorage::open(&config.storage_path)?;
+    let (config, storage_handle) = load().await?;
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: config.p2p_socket_addr,
@@ -84,24 +88,76 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
-    drive(
-        RestoreAutomergeSubscriptionsOperation::new(config.node_id),
-        driver_ctx.as_ref(),
-    )
-    .await?;
-    drive(
-        EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
-            actor: Actor {
-                node_id: config.node_id,
-                user_id: Ulid::from_bytes([0u8; 16]),
-                realm_id: config.realm_id.clone(),
-            },
-            bootstrap_peers: config.bootstrap_nodes.clone(),
-            default_metadata_replication_factor: config.default_metadata_replication_factor,
-        }),
-        driver_ctx.as_ref(),
-    )
-    .await?;
+
+    for endpoint in &config.bootstrap_endpoints {
+        net_handle.add_peer_addr(endpoint.clone()).await;
+    }
+
+    match &config.startup_mode {
+        StartupMode::InitializeRealm { realm_description } => {
+            if realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
+                announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
+            } else {
+                drive(
+                    CreateRealmOperation::new(CreateRealmConfig {
+                        actor: Actor {
+                            node_id: config.node_id,
+                            user_id: Ulid::from_bytes([0u8; 16]),
+                            realm_id: config.realm_id.clone(),
+                        },
+                        realm_description: realm_description.clone(),
+                    }),
+                    driver_ctx.as_ref(),
+                )
+                .await?;
+            }
+
+            mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+        }
+        StartupMode::JoinRealm { phase } => {
+            if matches!(phase, OnboardingPhase::Bootstrapped) {
+                fetch_core_onboarding_documents(
+                    driver_ctx.as_ref(),
+                    &config.node_state,
+                    &config.realm_id,
+                    config.bootstrap_endpoints.first().map(|endpoint| endpoint.id),
+                )
+                .await?;
+                mark_onboarding_phase(
+                    &driver_ctx.storage_handle,
+                    &config.node_state,
+                    OnboardingPhase::CoreDocumentsFetched,
+                )
+                .await?;
+            }
+            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
+            mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
+        }
+        StartupMode::Provisioned => {
+            drive(
+                RestoreAutomergeSubscriptionsOperation::new(config.node_id),
+                driver_ctx.as_ref(),
+            )
+            .await?;
+
+            if matches!(&config.node_capabilities, NodeCapabilities::Management { .. }) {
+                drive(
+                    EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+                        actor: Actor {
+                            node_id: config.node_id,
+                            user_id: Ulid::from_bytes([0u8; 16]),
+                            realm_id: config.realm_id.clone(),
+                        },
+                        bootstrap_peers: config.bootstrap_nodes.clone(),
+                        default_metadata_replication_factor: config.default_metadata_replication_factor,
+                    }),
+                    driver_ctx.as_ref(),
+                )
+                .await?;
+            }
+        }
+    }
+
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
             realm_id: config.realm_id.clone(),
@@ -113,12 +169,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // REST Server
+    let is_initial_node = config.is_initial_node();
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
             config.realm_id.clone(),
             config.node_id,
             config.node_capabilities,
+            is_initial_node,
             None,
         )
         .await,
