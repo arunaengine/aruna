@@ -5,8 +5,7 @@ use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_core::onboarding::{
-    CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode,
-    OnboardingPhase,
+    CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
 use aruna_core::structs::{Actor, NodeCapabilities, RealmId};
 use aruna_net::{NetConfig, NetHandle};
@@ -210,8 +209,8 @@ async fn wait_for_realm_nodes(
 }
 
 #[tokio::test]
-async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents(
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
+-> Result<(), Box<dyn std::error::Error>> {
     let _guard = env_lock().lock().unwrap();
     let seed = spawn_seed_node().await?;
     sleep(Duration::from_millis(50)).await;
@@ -219,7 +218,10 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents(
 
     let joiner_dir = tempfile::tempdir()?;
     let vars = [
-        ("STORAGE_PATH", joiner_dir.path().to_str().unwrap().to_string()),
+        (
+            "STORAGE_PATH",
+            joiner_dir.path().to_str().unwrap().to_string(),
+        ),
         ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
         ("P2P_SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
         ("S3_PORT", "1337".to_string()),
@@ -291,7 +293,10 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents(
         joiner_context.as_ref(),
         &config.node_state,
         &config.realm_id,
-        config.bootstrap_endpoints.first().map(|endpoint| endpoint.id),
+        config
+            .bootstrap_endpoints
+            .first()
+            .map(|endpoint| endpoint.id),
     )
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);
