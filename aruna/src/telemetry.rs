@@ -19,24 +19,21 @@ pub fn init_tracing() {
 
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
-    let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_file(true)
+        .with_line_number(true);
 
-    if let Some(provider) = build_tracer_provider() {
-        let tracer = provider.tracer("aruna");
-        let _ = TRACER_PROVIDER.set(provider.clone());
-        global::set_tracer_provider(provider);
+    let provider = build_tracer_provider();
+    let tracer = provider.tracer("aruna");
+    let _ = TRACER_PROVIDER.set(provider.clone());
+    global::set_tracer_provider(provider);
 
-        let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .with(tracing_opentelemetry::layer().with_tracer(tracer))
-            .try_init();
-    } else {
-        let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
-            .try_init();
-    }
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(tracing_opentelemetry::layer().with_tracer(tracer))
+        .try_init();
 }
 
 pub fn shutdown_tracing() {
@@ -45,31 +42,56 @@ pub fn shutdown_tracing() {
     }
 }
 
-fn build_tracer_provider() -> Option<SdkTracerProvider> {
+fn build_tracer_provider() -> SdkTracerProvider {
     let otlp_configured = [
         "OTEL_EXPORTER_OTLP_ENDPOINT",
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     ]
     .into_iter()
     .any(|key| std::env::var_os(key).is_some());
-    if !otlp_configured {
-        return None;
+    let builder = SdkTracerProvider::builder().with_resource(
+        Resource::builder_empty()
+            .with_service_name("aruna")
+            .with_attributes([KeyValue::new("service.version", env!("CARGO_PKG_VERSION"))])
+            .build(),
+    );
+
+    if otlp_configured {
+        return match opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .build()
+        {
+            Ok(exporter) => builder.with_batch_exporter(exporter).build(),
+            Err(error) => {
+                eprintln!("Failed to initialize OTLP span exporter: {error:?}");
+                builder.build()
+            }
+        };
     }
 
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_tonic()
-        .build()
-        .ok()?;
+    builder.build()
+}
 
-    Some(
-        SdkTracerProvider::builder()
-            .with_resource(
-                Resource::builder_empty()
-                    .with_service_name("aruna")
-                    .with_attributes([KeyValue::new("service.version", env!("CARGO_PKG_VERSION"))])
-                    .build(),
-            )
-            .with_batch_exporter(exporter)
-            .build(),
-    )
+#[cfg(test)]
+mod tests {
+    use super::build_tracer_provider;
+    use opentelemetry::trace::{TraceContextExt, TraceId, TracerProvider};
+    use tracing::info_span;
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn tracer_provider_generates_trace_ids_without_exporter() {
+        let provider = build_tracer_provider();
+        let tracer = provider.tracer("test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = info_span!("request");
+            let trace_id = span.context().span().span_context().trace_id();
+
+            assert_ne!(trace_id, TraceId::INVALID);
+        });
+    }
 }
