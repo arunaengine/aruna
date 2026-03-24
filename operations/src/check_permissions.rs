@@ -408,10 +408,10 @@ mod test {
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
     use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
     use crate::add_user_to_realm_role::{AddUserToRealmRolesInput, AddUserToRealmRolesOperation};
+    use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
-    use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
