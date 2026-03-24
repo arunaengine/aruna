@@ -9,6 +9,7 @@ use iroh::Endpoint;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::trace;
 
 use super::constants::{CMD_CHANNEL_CAPACITY, INBOUND_STREAM_CAPACITY};
 use super::driver::{CallerOutcome, DhtDriver, DriverCmd, DriverCmdSender, InboundSender};
@@ -95,6 +96,14 @@ impl DhtHandle {
         value: Vec<u8>,
         ttl: Duration,
     ) -> Result<()> {
+        trace!(
+            event = "dht.put.started",
+            key = %key,
+            realm_id = %realm_id,
+            value_len = value.len(),
+            ttl_secs = ttl.as_secs(),
+            "Starting DHT put"
+        );
         match self
             .request(|reply| DriverCmd::Put {
                 key: *key,
@@ -105,7 +114,10 @@ impl DhtHandle {
             })
             .await?
         {
-            DhtOutputValue::Unit => Ok(()),
+            DhtOutputValue::Unit => {
+                trace!(event = "dht.put.completed", key = %key, "Completed DHT put");
+                Ok(())
+            }
             other => Err(NetError::Dht(format!(
                 "unexpected DHT put output: {other:?}"
             ))),
@@ -117,6 +129,12 @@ impl DhtHandle {
         key: &DhtKeyId,
         realm_filter: Option<RealmId>,
     ) -> Result<Vec<DhtEntry>> {
+        trace!(
+            event = "dht.get.started",
+            key = %key,
+            realm_id = ?realm_filter,
+            "Starting DHT get"
+        );
         match self
             .request(|reply| DriverCmd::Get {
                 key: *key,
@@ -125,7 +143,15 @@ impl DhtHandle {
             })
             .await?
         {
-            DhtOutputValue::GetValues(values) => Ok(values),
+            DhtOutputValue::GetValues(values) => {
+                trace!(
+                    event = "dht.get.completed",
+                    key = %key,
+                    result_count = values.len(),
+                    "Completed DHT get"
+                );
+                Ok(values)
+            }
             other => Err(NetError::Dht(format!(
                 "unexpected DHT get output: {other:?}"
             ))),
