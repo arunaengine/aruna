@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use aruna_core::automerge::{AutomergeDocumentVariant, AutomergeState};
+use aruna_core::automerge::{
+    AutomergeAnnouncementEnvelope, AutomergeDocumentVariant, AutomergeState,
+};
 use aruna_core::effects::{Effect, GossipEffect, NetEffect};
 use aruna_core::errors::{ConversionError, GossipError, StorageError};
 use aruna_core::events::{Event, GossipEvent, StorageEvent};
@@ -10,9 +12,12 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::automerge::repository::{automerge_clock, read_effect};
+use crate::telemetry::current_trace_context;
 use aruna_core::NodeId;
 use aruna_core::events::NetEvent;
 use aruna_core::types::Effects;
+use tracing::trace;
+use ulid::Ulid;
 
 pub const AUTOMERGE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 pub const AUTOMERGE_ANNOUNCE_SHORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -132,17 +137,26 @@ impl Operation for AnnounceAutomergeDocumentOperation {
                         Ok(clock) => clock,
                         Err(error) => return self.fail(error.into()),
                     };
-                    let message = match postcard::to_allocvec(&AutomergeState::new(
-                        clock.heads,
-                        clock.change_count,
-                        self.local_node_id,
-                    )) {
+                    let topic = self.document.topic_id();
+                    let message_id = Ulid::new();
+                    let envelope = AutomergeAnnouncementEnvelope::new(
+                        message_id,
+                        AutomergeState::new(clock.heads, clock.change_count, self.local_node_id),
+                        current_trace_context(),
+                    );
+                    let message = match postcard::to_allocvec(&envelope) {
                         Ok(message) => message,
                         Err(error) => return self.fail(ConversionError::from(error).into()),
                     };
+                    trace!(
+                        event = "gossip.broadcast",
+                        topic = %topic,
+                        message_id = %message_id,
+                        "Broadcasting automerge gossip announcement"
+                    );
                     self.state = AnnounceAutomergeDocumentState::Broadcast;
                     smallvec![Effect::Net(NetEffect::Gossip(GossipEffect::Broadcast {
-                        topic: self.document.topic_id(),
+                        topic,
                         message,
                     }))]
                 }
