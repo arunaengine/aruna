@@ -31,6 +31,9 @@ pub enum SubOperationEvent {
     AuthorizationResult {
         allowed: Result<bool, AuthorizationError>,
     },
+    RealmNodesResult {
+        result: Result<Vec<NodeId>, String>,
+    },
     AutomergeSyncResult {
         result: Result<(), String>,
     },

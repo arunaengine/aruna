@@ -86,6 +86,9 @@ impl From<[u8; 32]> for DhtKeyId {
 /// Format: prefix byte + payload, hashed to 32 bytes for network use.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 pub enum AutomergeTopicId {
+    Group {
+        group_id: GroupId,
+    },
     Metadata {
         group_id: GroupId,
         document_id: Ulid,
@@ -104,6 +107,12 @@ pub enum AutomergeTopicId {
 impl AutomergeTopicId {
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
+            Self::Group { group_id } => {
+                let mut buf = Vec::with_capacity(17);
+                buf.push(PREFIX_AUTOMERGE_GROUP);
+                buf.extend_from_slice(&group_id.to_bytes());
+                buf
+            }
             Self::Metadata {
                 group_id,
                 document_id,
@@ -143,6 +152,16 @@ impl AutomergeTopicId {
         let prefix = bytes[0];
         let payload = &bytes[1..];
         match prefix {
+            PREFIX_AUTOMERGE_GROUP => {
+                if payload.len() != 16 {
+                    return None;
+                }
+
+                let group_bytes: [u8; 16] = payload.try_into().ok()?;
+                Some(Self::Group {
+                    group_id: GroupId::from_bytes(group_bytes),
+                })
+            }
             PREFIX_AUTOMERGE_METADATA => {
                 if payload.len() != 32 {
                     return None;
@@ -193,6 +212,7 @@ impl AutomergeTopicId {
 impl fmt::Debug for AutomergeTopicId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Group { group_id } => write!(f, "AutomergeTopicId::Group({group_id})"),
             Self::Metadata {
                 group_id,
                 document_id,
@@ -217,6 +237,7 @@ impl fmt::Debug for AutomergeTopicId {
 impl fmt::Display for AutomergeTopicId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Group { group_id } => write!(f, "group:{group_id}"),
             Self::Metadata {
                 group_id,
                 document_id,
@@ -245,6 +266,7 @@ const PREFIX_REALM: u8 = b'r';
 const PREFIX_NODE: u8 = b'n';
 const PREFIX_GROUP: u8 = b'g';
 const PREFIX_AUTOMERGE_DOCUMENT: u8 = b'a';
+const PREFIX_AUTOMERGE_GROUP: u8 = b'p';
 const PREFIX_AUTOMERGE_METADATA: u8 = b'm';
 const PREFIX_AUTOMERGE_GROUP_AUTHORIZATION: u8 = b'g';
 const PREFIX_AUTOMERGE_REALM_AUTHORIZATION: u8 = b'r';

@@ -5,12 +5,15 @@ use aruna_core::automerge::{AutomergeClock, AutomergeDocumentVariant};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::structs::RealmId;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 
 pub fn storage_keyspace(document: &AutomergeDocumentVariant) -> &'static str {
     match document {
+        AutomergeDocumentVariant::Group { .. } => GROUP_KEYSPACE,
         AutomergeDocumentVariant::Metadata { .. } => METADATA_KEYSPACE,
         AutomergeDocumentVariant::GroupAuthorization { .. }
         | AutomergeDocumentVariant::RealmAuthorization { .. } => AUTH_KEYSPACE,
@@ -20,6 +23,9 @@ pub fn storage_keyspace(document: &AutomergeDocumentVariant) -> &'static str {
 
 pub fn storage_key(document: &AutomergeDocumentVariant) -> Key {
     match document {
+        AutomergeDocumentVariant::Group { group_id } => {
+            ByteView::from(group_id.to_bytes().to_vec())
+        }
         AutomergeDocumentVariant::Metadata {
             group_id,
             document_id,
@@ -162,6 +168,21 @@ pub fn parse_auth_document(key: &[u8]) -> Result<AutomergeDocumentVariant, Conve
             "unexpected auth key length {other}"
         ))),
     }
+}
+
+pub fn parse_group_document(key: &[u8]) -> Result<AutomergeDocumentVariant, ConversionError> {
+    if key.len() != 16 {
+        return Err(ConversionError::InvalidLength(format!(
+            "unexpected group key length {}",
+            key.len()
+        )));
+    }
+
+    let mut group_bytes = [0u8; 16];
+    group_bytes.copy_from_slice(key);
+    Ok(AutomergeDocumentVariant::Group {
+        group_id: GroupId::from_bytes(group_bytes),
+    })
 }
 
 pub fn parse_realm_config_document(
