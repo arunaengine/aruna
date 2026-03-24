@@ -1,16 +1,27 @@
 use std::sync::OnceLock;
 
-use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry_sdk::Resource;
+use opentelemetry::KeyValue;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use tracing_subscriber::EnvFilter;
+use opentelemetry_sdk::Resource;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
-const DEFAULT_LOG_FILTER: &str = "info,iroh=error,iroh_gossip=error,iroh_quinn=error,quinn=error,pkarr=error,hickory_resolver=error";
+const DEFAULT_LOG_FILTER: &str = concat!(
+    "error,",
+    "aruna=debug,",
+    "aruna_api=debug,",
+    "aruna_blob=debug,",
+    "aruna_core=debug,",
+    "aruna_net=debug,",
+    "aruna_operations=debug,",
+    "aruna_search=debug,",
+    "aruna_storage=debug,",
+    "aruna_tasks=debug"
+);
 
 static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 

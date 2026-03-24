@@ -181,7 +181,11 @@ start_node() {
 
   (
     cd "$node_dir"
-    exec env -i PATH="$PATH" RUST_LOG="${RUST_LOG:-info}" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
+    if [[ -n "${RUST_LOG:-}" ]]; then
+      exec env -i PATH="$PATH" RUST_LOG="$RUST_LOG" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
+    else
+      exec env -i PATH="$PATH" NO_COLOR=1 CLICOLOR=0 "$ARUNA_BIN"
+    fi
   ) >"$log_file" 2>&1 &
 
   local pid=$!
