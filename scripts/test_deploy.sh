@@ -89,7 +89,7 @@ write_node_env() {
     printf 'SOCKET_ADDRESS=127.0.0.1:%s\n' "$http_port"
     printf 'P2P_SOCKET_ADDRESS=127.0.0.1:%s\n' "$p2p_port"
     printf 'S3_PORT=%s\n' "$s3_port"
-    printf 'S3_HOST=127.0.0.1\n'
+    printf 'S3_HOST=localhost\n'
     printf 'S3_ADDRESS=127.0.0.1\n'
     printf 'REALM_DESCRIPTION=Test_Deploy_Realm\n'
     printf 'METADATA_REPLICATION_FACTOR=3\n'
