@@ -26,7 +26,7 @@ use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{Instrument, Span, warn};
 
 pub use dht::DhtHandle;
 pub use error::{NetError, Result};
@@ -65,7 +65,7 @@ impl std::fmt::Debug for NetConfig {
     }
 }
 
-type EffectHandle = (NetEffect, oneshot::Sender<NetEvent>);
+type EffectHandle = (NetEffect, oneshot::Sender<NetEvent>, Span);
 
 #[async_trait]
 pub trait InboundEventHandler: Send + Sync {
@@ -178,7 +178,7 @@ impl NetHandle {
                 tokio::select! {
                     _ = shutdown_for_effects.cancelled() => break,
                     maybe_effect = effect_rx.recv() => {
-                        let Some((effect, response_tx)) = maybe_effect else { break };
+                        let Some((effect, response_tx, span)) = maybe_effect else { break };
                         let dht = dht_for_effects.clone();
                         let gossip = gossip_for_effects.clone();
                         tokio::spawn(async move {
@@ -189,7 +189,7 @@ impl NetHandle {
                             )
                             .await;
                             let _ = response_tx.send(event);
-                        });
+                        }.instrument(span));
                     }
                 }
             }
@@ -417,7 +417,13 @@ impl Handle for NetHandle {
         match effect {
             Effect::Net(net_effect) => {
                 let (tx, rx) = oneshot::channel();
-                if self.inner.effect_tx.send((net_effect, tx)).await.is_err() {
+                if self
+                    .inner
+                    .effect_tx
+                    .send((net_effect, tx, Span::current()))
+                    .await
+                    .is_err()
+                {
                     return Event::Net(NetEvent::Error(CoreNetError::ChannelClosed));
                 }
 
