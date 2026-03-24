@@ -4,15 +4,16 @@ use aruna::bootstrap::{
     announce_core_documents, fetch_core_onboarding_documents, realm_bootstrap_exists,
 };
 use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
+use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
+use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
-use aruna_core::onboarding::OnboardingPhase;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -28,25 +29,19 @@ use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 use ulid::Ulid;
 
 #[tokio::main]
 async fn main() {
     init_tracing();
 
-    if let Err(err) = run().await {
+    let result = run().await;
+    shutdown_tracing();
+
+    if let Err(err) = result {
         eprintln!("{err}");
         std::process::exit(1);
     }
-}
-
-fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -96,7 +91,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
             if realm_bootstrap_exists(driver_ctx.as_ref(), &config.realm_id).await? {
-                announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
+                announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id)
+                    .await?;
             } else {
                 drive(
                     CreateRealmOperation::new(CreateRealmConfig {
@@ -120,7 +116,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     driver_ctx.as_ref(),
                     &config.node_state,
                     &config.realm_id,
-                    config.bootstrap_endpoints.first().map(|endpoint| endpoint.id),
+                    config
+                        .bootstrap_endpoints
+                        .first()
+                        .map(|endpoint| endpoint.id),
                 )
                 .await?;
                 mark_onboarding_phase(
@@ -140,7 +139,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
 
-            if matches!(&config.node_capabilities, NodeCapabilities::Management { .. }) {
+            if matches!(
+                &config.node_capabilities,
+                NodeCapabilities::Management { .. }
+            ) {
                 drive(
                     EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
                         actor: Actor {
@@ -149,7 +151,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             realm_id: config.realm_id.clone(),
                         },
                         bootstrap_peers: config.bootstrap_nodes.clone(),
-                        default_metadata_replication_factor: config.default_metadata_replication_factor,
+                        default_metadata_replication_factor: config
+                            .default_metadata_replication_factor,
                     }),
                     driver_ctx.as_ref(),
                 )
