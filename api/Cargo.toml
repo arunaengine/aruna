@@ -14,10 +14,12 @@ aruna-operations = { path = "../operations" }
 # General
 ahash.workspace = true
 base64.workspace = true
+opentelemetry.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-opentelemetry.workspace = true
 ulid.workspace = true
 
 # REST
