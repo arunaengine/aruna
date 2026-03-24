@@ -454,9 +454,11 @@ mod test {
         let result = drive(realm_operation, &context).await.unwrap();
         assert_eq!(result.0.description, realm_config.realm_description);
         assert_eq!(result.0.realm_id, realm_config.actor.realm_id);
-        assert!(result.1.roles.iter().any(|(_id, role)| {
-            role.name == "realm_admin" && role.assigned_users.is_empty()
-        }));
+        assert!(
+            result.1.roles.iter().any(|(_id, role)| {
+                role.name == "realm_admin" && role.assigned_users.is_empty()
+            })
+        );
         assert!(result.1.operation_restrictions.is_empty());
 
         net_handle.shutdown().await;
