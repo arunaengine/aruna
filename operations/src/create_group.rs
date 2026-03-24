@@ -11,7 +11,11 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::replicate_automerge_to_realm::{
+    ReplicateAutomergeDocumentsToRealmConfig, ReplicateAutomergeDocumentsToRealmOperation,
+};
 use aruna_core::types::Effects;
+use tracing::info;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -63,6 +67,14 @@ impl CreateGroupOperation {
         };
 
         self.group = Some(group.clone());
+
+        info!(
+            event = "group.create.started",
+            group_id = %group.group_id,
+            realm_id = %group.realm_id,
+            user_id = %self.config.actor.user_id,
+            "Creating group"
+        );
 
         let key = group_id.to_bytes().into();
 
@@ -206,6 +218,38 @@ impl CreateGroupOperation {
         if let Some(group) = &self.group
             && self.auth_doc.is_some()
         {
+            self.state = CreateGroupState::AnnounceGroupDoc;
+            smallvec![Effect::SubOperation(boxed_suboperation(
+                AnnounceAutomergeDocumentOperation::new(
+                    AutomergeDocumentVariant::Group {
+                        group_id: group.group_id,
+                    },
+                    self.config.actor.node_id,
+                ),
+                |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                    result: result.map_err(|error| error.to_string()),
+                }),
+            ))]
+        } else {
+            self.fail(CreateGroupError::GroupNotFound)
+        }
+    }
+
+    fn handle_announce_group_doc(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+            return self.unexpected_event(
+                CreateGroupState::AnnounceGroupDoc,
+                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                got,
+            );
+        };
+
+        if let Err(error) = result {
+            return self.fail(CreateGroupError::AutomergeState(error));
+        }
+
+        if let Some(group) = &self.group {
             self.state = CreateGroupState::AnnounceAuthDoc;
             smallvec![Effect::SubOperation(boxed_suboperation(
                 AnnounceAutomergeDocumentOperation::new(
@@ -237,9 +281,55 @@ impl CreateGroupOperation {
             return self.fail(CreateGroupError::AutomergeState(error));
         }
 
+        if let Some(group) = &self.group {
+            self.state = CreateGroupState::ReplicateDocuments;
+            smallvec![Effect::SubOperation(boxed_suboperation(
+                ReplicateAutomergeDocumentsToRealmOperation::new(
+                    ReplicateAutomergeDocumentsToRealmConfig {
+                        realm_id: self.config.actor.realm_id.clone(),
+                        local_node_id: self.config.actor.node_id,
+                        documents: vec![
+                            AutomergeDocumentVariant::Group {
+                                group_id: group.group_id,
+                            },
+                            AutomergeDocumentVariant::GroupAuthorization {
+                                group_id: group.group_id,
+                            },
+                        ],
+                    },
+                ),
+                |result| Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
+                    result: result.map_err(|error| error.to_string()),
+                }),
+            ))]
+        } else {
+            self.fail(CreateGroupError::GroupNotFound)
+        }
+    }
+
+    fn handle_replicate_documents(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) = event else {
+            return self.unexpected_event(
+                CreateGroupState::ReplicateDocuments,
+                "Event::SubOperation(SubOperationEvent::AutomergeSyncResult)",
+                got,
+            );
+        };
+
+        if let Err(error) = result {
+            return self.fail(CreateGroupError::AutomergeSync(error));
+        }
+
         if let Some(group) = &self.group
             && let Some(auth) = &self.auth_doc
         {
+            info!(
+                event = "group.create.completed",
+                group_id = %group.group_id,
+                realm_id = %group.realm_id,
+                "Created and replicated group"
+            );
             self.state = CreateGroupState::Finish;
             self.output = Some(Ok((group.clone(), auth.clone())));
             smallvec![]
@@ -256,7 +346,9 @@ pub enum CreateGroupState {
     CreateGroup,
     CreateRoles,
     CommitTransaction,
+    AnnounceGroupDoc,
     AnnounceAuthDoc,
+    ReplicateDocuments,
     Finish,
     Error,
 }
@@ -269,6 +361,8 @@ pub enum CreateGroupError {
     ConversionError(#[from] ConversionError),
     #[error("automerge announcement failed: {0}")]
     AutomergeState(String),
+    #[error("automerge replication failed: {0}")]
+    AutomergeSync(String),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("No group found")]
@@ -307,7 +401,9 @@ impl Operation for CreateGroupOperation {
             CreateGroupState::CreateGroup => self.handle_create_group(event),
             CreateGroupState::CreateRoles => self.handle_create_roles(event),
             CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
+            CreateGroupState::AnnounceGroupDoc => self.handle_announce_group_doc(event),
             CreateGroupState::AnnounceAuthDoc => self.handle_announce_auth_doc(event),
+            CreateGroupState::ReplicateDocuments => self.handle_replicate_documents(event),
             CreateGroupState::Init | CreateGroupState::Finish | CreateGroupState::Error => {
                 smallvec![]
             }
