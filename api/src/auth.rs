@@ -1,5 +1,6 @@
 use crate::error::TokenError;
 use crate::server_state::ServerState;
+use crate::telemetry::record_auth_context;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
 use axum::extract::Request;
@@ -118,6 +119,7 @@ pub async fn auth_middleware(
     // We clone headers to avoid borrowing issues with the async function
     let headers = request.headers().clone();
     let auth_ctx: Option<AuthContext> = extract_auth_context(&state, &headers).await;
+    record_auth_context(auth_ctx.as_ref());
 
     // Always insert (Some or None) - handlers decide if auth is required
     request.extensions_mut().insert(auth_ctx);
@@ -140,6 +142,7 @@ mod test {
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
     use axum::http::{HeaderMap, header};
     use base64::Engine;
     use byteview::ByteView;
@@ -149,9 +152,11 @@ mod test {
     use std::sync::Arc;
     use tempfile::env::temp_dir;
     use ulid::Ulid;
-    use aruna_tasks::TaskHandle;
 
-    async fn read_auth_doc(driver_ctx: &DriverContext, realm_id: &RealmId) -> RealmAuthorizationDocument {
+    async fn read_auth_doc(
+        driver_ctx: &DriverContext,
+        realm_id: &RealmId,
+    ) -> RealmAuthorizationDocument {
         match driver_ctx
             .storage_handle
             .send_effect(Effect::Storage(StorageEffect::Read {
