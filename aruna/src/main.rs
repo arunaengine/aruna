@@ -33,6 +33,7 @@ use ulid::Ulid;
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().expect("Failed to load .env file");
     init_tracing();
 
     let result = run().await;
@@ -45,7 +46,6 @@ async fn main() {
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv()?;
     let (config, storage_handle) = load().await?;
     let net_handle = NetHandle::new(
         NetConfig {
