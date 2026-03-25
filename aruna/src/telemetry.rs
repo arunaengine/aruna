@@ -1,14 +1,14 @@
 use std::sync::OnceLock;
 
+use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry::KeyValue;
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use opentelemetry_sdk::Resource;
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LOG_FILTER: &str = concat!(
     "error,",
