@@ -4,9 +4,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 use aruna_core::onboarding::{
-    BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingSecret,
-    OnboardingPhase, OnboardingSecretError,
-    bootstrap_issuer_proof_message, bootstrap_node_proof_message,
+    BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
+    OnboardingSecret, OnboardingSecretError, bootstrap_issuer_proof_message,
+    bootstrap_node_proof_message,
 };
 use aruna_core::structs::{NodeCapabilities, RealmId};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
@@ -74,7 +74,9 @@ pub enum PersistedNodeStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedNodeIdentity {
-    Management { realm_private_key_pem: String },
+    Management {
+        realm_private_key_pem: String,
+    },
     Server {
         issuer_private_key_pem: String,
         delegation_signature: String,
@@ -192,7 +194,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         Some(state) => state,
         None => {
             let state = match onboarding_secret.as_deref() {
-                Some(onboarding_secret) => bootstrap_onboarded_node_state(onboarding_secret).await?,
+                Some(onboarding_secret) => {
+                    bootstrap_onboarded_node_state(onboarding_secret).await?
+                }
                 None => generate_initialized_node_state()?,
             };
             persist_node_state(&storage_handle, &state).await?;
@@ -419,57 +423,64 @@ async fn bootstrap_onboarded_node_state(
     }
 
     let realm_id = response.realm_id()?;
-    let identity = match response.mode {
-        OnboardingMode::Management => {
-            let wrapped_key = response
-                .wrapped_realm_private_key
-                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?;
-            let wrapped_nonce = response
-                .wrapped_realm_private_key_nonce
-                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?;
-            let wrapping_public_key = response
-                .wrapping_public_key
-                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?;
-            let transport_secret_key = transport_secret_key
-                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Management))?;
-            let wrapping_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(wrapping_public_key)
-                .map_err(SetupError::Base64Error)?;
-            let wrapping_public_key = TransportPublicKey::from(
-                <[u8; 32]>::try_from(wrapping_public_key_bytes.as_slice())
-                    .map_err(SetupError::FromSliceError)?,
-            );
-            let cipher = SalsaBox::new(&wrapping_public_key, &transport_secret_key);
-            let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(wrapped_nonce)
-                .map_err(SetupError::Base64Error)?;
-            let nonce = crypto_box::Nonce::from(
-                <[u8; 24]>::try_from(nonce_bytes.as_slice()).map_err(SetupError::FromSliceError)?,
-            );
-            let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(wrapped_key)
-                .map_err(SetupError::Base64Error)?;
-            let realm_private_key_pem = String::from_utf8(
-                cipher
-                    .decrypt(&nonce, ciphertext.as_ref())
-                    .map_err(|error| SetupError::OnboardingBootstrapFailed(error.to_string()))?,
-            )?;
+    let identity =
+        match response.mode {
+            OnboardingMode::Management => {
+                let wrapped_key = response.wrapped_realm_private_key.ok_or(
+                    SetupError::MissingOnboardingMaterial(OnboardingMode::Management),
+                )?;
+                let wrapped_nonce = response.wrapped_realm_private_key_nonce.ok_or(
+                    SetupError::MissingOnboardingMaterial(OnboardingMode::Management),
+                )?;
+                let wrapping_public_key =
+                    response
+                        .wrapping_public_key
+                        .ok_or(SetupError::MissingOnboardingMaterial(
+                            OnboardingMode::Management,
+                        ))?;
+                let transport_secret_key = transport_secret_key.ok_or(
+                    SetupError::MissingOnboardingMaterial(OnboardingMode::Management),
+                )?;
+                let wrapping_public_key_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(wrapping_public_key)
+                    .map_err(SetupError::Base64Error)?;
+                let wrapping_public_key = TransportPublicKey::from(
+                    <[u8; 32]>::try_from(wrapping_public_key_bytes.as_slice())
+                        .map_err(SetupError::FromSliceError)?,
+                );
+                let cipher = SalsaBox::new(&wrapping_public_key, &transport_secret_key);
+                let nonce_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(wrapped_nonce)
+                    .map_err(SetupError::Base64Error)?;
+                let nonce = crypto_box::Nonce::from(
+                    <[u8; 24]>::try_from(nonce_bytes.as_slice())
+                        .map_err(SetupError::FromSliceError)?,
+                );
+                let ciphertext = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(wrapped_key)
+                    .map_err(SetupError::Base64Error)?;
+                let realm_private_key_pem =
+                    String::from_utf8(cipher.decrypt(&nonce, ciphertext.as_ref()).map_err(
+                        |error| SetupError::OnboardingBootstrapFailed(error.to_string()),
+                    )?)?;
 
-            PersistedNodeIdentity::Management {
-                realm_private_key_pem,
+                PersistedNodeIdentity::Management {
+                    realm_private_key_pem,
+                }
             }
-        }
-        OnboardingMode::Server => PersistedNodeIdentity::Server {
-            issuer_private_key_pem: issuer_signing_key
-                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Server))?
-                .to_pkcs8_pem(LineEnding::default())?
-                .to_string(),
-            delegation_signature: response
-                .delegation_signature
-                .ok_or(SetupError::MissingOnboardingMaterial(OnboardingMode::Server))?,
-        },
-        OnboardingMode::Local => PersistedNodeIdentity::Local,
-    };
+            OnboardingMode::Server => PersistedNodeIdentity::Server {
+                issuer_private_key_pem: issuer_signing_key
+                    .ok_or(SetupError::MissingOnboardingMaterial(
+                        OnboardingMode::Server,
+                    ))?
+                    .to_pkcs8_pem(LineEnding::default())?
+                    .to_string(),
+                delegation_signature: response.delegation_signature.ok_or(
+                    SetupError::MissingOnboardingMaterial(OnboardingMode::Server),
+                )?,
+            },
+            OnboardingMode::Local => PersistedNodeIdentity::Local,
+        };
 
     Ok(PersistedNodeState {
         boot_origin: BootOrigin::Onboarded,
@@ -496,7 +507,9 @@ async fn load_persisted_node_state(
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
-        }) => Ok(Some(postcard::from_bytes(&bytes).map_err(ConversionError::from)?)),
+        }) => Ok(Some(
+            postcard::from_bytes(&bytes).map_err(ConversionError::from)?,
+        )),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         other => Err(SetupError::UnexpectedStorageEvent(format!("{other:?}"))),
@@ -569,7 +582,10 @@ mod tests {
             ("S3_PORT", "1337".to_string()),
             ("S3_HOST", "localhost".to_string()),
             ("S3_ADDRESS", "127.0.0.1".to_string()),
-            ("ONBOARDING_SECRET", "definitely-not-a-valid-secret".to_string()),
+            (
+                "ONBOARDING_SECRET",
+                "definitely-not-a-valid-secret".to_string(),
+            ),
         ];
         let previous: Vec<_> = vars
             .iter()
@@ -582,7 +598,10 @@ mod tests {
 
         let (config, _storage) = load().await.unwrap();
         assert!(!config.is_initial_node());
-        assert!(matches!(config.startup_mode, super::StartupMode::Provisioned));
+        assert!(matches!(
+            config.startup_mode,
+            super::StartupMode::Provisioned
+        ));
 
         for (key, value) in previous {
             match value {

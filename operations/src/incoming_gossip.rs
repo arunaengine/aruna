@@ -1,25 +1,28 @@
-use aruna_core::automerge::AutomergeState;
+use aruna_core::AutomergeDocumentVariant;
+use aruna_core::NodeId;
+use aruna_core::TopicId;
+use aruna_core::automerge::{AutomergeAnnouncementEnvelope, AutomergeState};
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::task::{TaskEffect, TaskEvent};
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::trace;
+use ulid::Ulid;
 
 use crate::automerge::repository::{automerge_clock, read_effect};
 use crate::automerge_announce::{AUTOMERGE_ANNOUNCE_INTERVAL, AUTOMERGE_ANNOUNCE_SHORT_INTERVAL};
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
-use aruna_core::AutomergeDocumentVariant;
-use aruna_core::NodeId;
-use aruna_core::TopicId;
-use aruna_core::types::Effects;
 
 #[derive(Debug, PartialEq)]
 pub struct IncomingGossipOperation {
     topic: TopicId,
     sender: NodeId,
     data: Vec<u8>,
+    message_id: Option<Ulid>,
     announcement: Option<AutomergeState>,
     document: Option<AutomergeDocumentVariant>,
     state: IncomingGossipState,
@@ -62,6 +65,7 @@ impl IncomingGossipOperation {
             topic,
             sender,
             data,
+            message_id: None,
             announcement: None,
             document: None,
             state: IncomingGossipState::Init,
@@ -90,14 +94,18 @@ impl Operation for IncomingGossipOperation {
     type Error = IncomingGossipError;
 
     fn start(&mut self) -> Effects {
-        let announcement: AutomergeState = match postcard::from_bytes(&self.data) {
-            Ok(announcement) => announcement,
-            Err(_) => {
-                self.state = IncomingGossipState::Finish;
-                self.output = Some(Ok(()));
-                return smallvec![];
-            }
-        };
+        let (announcement, message_id) =
+            match postcard::from_bytes::<AutomergeAnnouncementEnvelope>(&self.data) {
+                Ok(envelope) => (envelope.announcement, Some(envelope.message_id)),
+                Err(_) => match postcard::from_bytes::<AutomergeState>(&self.data) {
+                    Ok(announcement) => (announcement, None),
+                    Err(_) => {
+                        self.state = IncomingGossipState::Finish;
+                        self.output = Some(Ok(()));
+                        return smallvec![];
+                    }
+                },
+            };
 
         let Some(document) = AutomergeDocumentVariant::from_topic_id(&self.topic) else {
             self.state = IncomingGossipState::Finish;
@@ -112,6 +120,7 @@ impl Operation for IncomingGossipOperation {
         }
 
         self.announcement = Some(announcement);
+        self.message_id = message_id;
         self.document = Some(document.clone());
         self.state = IncomingGossipState::ReadDocument;
         smallvec![read_effect(&document, None)]
@@ -135,6 +144,13 @@ impl Operation for IncomingGossipOperation {
                     let same_heads = local_clock.heads == announcement.heads;
 
                     if same_heads && local_clock.change_count == announcement.change_count {
+                        trace!(
+                            event = "gossip.state_matched",
+                            topic = %self.topic,
+                            sender = %self.sender,
+                            message_id = self.message_id.as_ref().map(Ulid::to_string),
+                            "Received gossip announcement with matching local state"
+                        );
                         self.state = IncomingGossipState::ScheduleTimer;
                         return smallvec![Effect::Task(TaskEffect::ResetTimer {
                             key: document.announce_timer_key(),
@@ -143,6 +159,13 @@ impl Operation for IncomingGossipOperation {
                     }
 
                     if announcement.change_count < local_clock.change_count {
+                        trace!(
+                            event = "gossip.state_remote_behind",
+                            topic = %self.topic,
+                            sender = %self.sender,
+                            message_id = self.message_id.as_ref().map(Ulid::to_string),
+                            "Received gossip announcement from peer behind local state"
+                        );
                         self.state = IncomingGossipState::ScheduleTimer;
                         return smallvec![Effect::Task(TaskEffect::ShortenTimer {
                             key: document.announce_timer_key(),
@@ -150,6 +173,13 @@ impl Operation for IncomingGossipOperation {
                         })];
                     }
 
+                    trace!(
+                        event = "gossip.sync_requested",
+                        topic = %self.topic,
+                        sender = %self.sender,
+                        message_id = self.message_id.as_ref().map(Ulid::to_string),
+                        "Received newer gossip announcement and starting sync"
+                    );
                     self.state = IncomingGossipState::WaitForSync;
                     smallvec![Effect::SubOperation(boxed_suboperation(
                         OutgoingAutomergeOperation::new(self.sender, document.clone()),

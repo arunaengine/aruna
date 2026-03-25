@@ -26,8 +26,8 @@ use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 use tracing::warn;
 use utoipa_swagger_ui::SwaggerUi;
@@ -157,7 +157,11 @@ impl ServerState {
         match &self.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
-            } => Some(realm_signing_key.sign(issuer_public_key.as_bytes()).to_string()),
+            } => Some(
+                realm_signing_key
+                    .sign(issuer_public_key.as_bytes())
+                    .to_string(),
+            ),
             _ => None,
         }
     }
@@ -269,7 +273,9 @@ impl ServerState {
                     self.persist_initial_admin_claimed().await;
                     return Ok(());
                 }
-                Err(ClaimInitialRealmAdminError::StorageError(StorageError::TransactionConflict)) => {
+                Err(ClaimInitialRealmAdminError::StorageError(
+                    StorageError::TransactionConflict,
+                )) => {
                     if initial_admin_claim.load(Ordering::Acquire) {
                         return Ok(());
                     }

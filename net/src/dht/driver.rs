@@ -15,6 +15,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
+use tracing::trace;
 
 use super::constants::{
     DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, MAX_MESSAGE_SIZE, RPC_TIMEOUT,
@@ -313,6 +314,15 @@ impl DhtDriver {
     }
 
     fn handle_worker_io(&mut self, io: DhtIo) {
+        if let DhtIo::InboundRequest { peer, request, .. } = &io {
+            trace!(
+                event = "dht.rpc.received",
+                peer = %peer,
+                request = ?request,
+                "Received inbound DHT RPC"
+            );
+        }
+
         if let DhtIo::InboundReadError { inbound_id, error } = io {
             let maybe_send = self.inbound_contexts.remove(&inbound_id);
             let io_tx = self.io_tx.clone();
@@ -388,6 +398,14 @@ impl DhtDriver {
     ) {
         let endpoint = self.endpoint.clone();
         let io_tx = self.io_tx.clone();
+        trace!(
+            event = "dht.rpc.dispatch",
+            op_id,
+            phase = ?phase,
+            peer = %peer,
+            request = ?request,
+            "Dispatching outbound DHT RPC"
+        );
         tokio::spawn(async move {
             match rpc_request(endpoint, peer, request).await {
                 Ok(response) => {

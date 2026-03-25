@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use automerge::AutoCommit;
 use automerge::sync::{self, SyncDoc};
 use tokio::sync::Mutex;
+use tracing::{trace, warn};
 use ulid::Ulid;
 
 use super::protocol::{AutomergeTransportMessage, read_message, write_message};
@@ -101,6 +102,14 @@ impl AutomergeHandle {
 
         let sync_id = Ulid::new();
         let document = init.document.clone();
+        trace!(
+            event = "automerge.sync.started",
+            sync_id = %sync_id,
+            peer = %peer,
+            document = %document.topic_id(),
+            direction = "outbound",
+            "Starting outbound automerge sync"
+        );
         let stream = match net_handle.open_stream(peer, Alpn::Automerge).await {
             Ok(stream) => stream,
             Err(err) => {
@@ -185,6 +194,14 @@ impl AutomergeHandle {
         let peer = sync.peer;
         match read_transport_message(&mut sync.stream).await {
             Ok(AutomergeTransportMessage::Init(remote_init)) => {
+                trace!(
+                    event = "automerge.sync.started",
+                    sync_id = %sync_id,
+                    peer = %peer,
+                    document = %remote_init.document.topic_id(),
+                    direction = "inbound",
+                    "Starting inbound automerge sync"
+                );
                 sync.remote_init = Some(remote_init.clone());
                 self.store_active_sync(sync_id, sync).await;
                 AutomergeEvent::SyncInitialized {
@@ -297,6 +314,14 @@ impl AutomergeHandle {
                 let after_heads = doc.get_heads();
                 let changed = before_heads != after_heads;
                 let updated_document = doc.save();
+                trace!(
+                    event = "automerge.sync.completed",
+                    sync_id = %sync_id,
+                    peer = %sync.peer,
+                    document = %document.topic_id(),
+                    changed,
+                    "Completed automerge sync"
+                );
                 AutomergeEvent::SyncFinished {
                     sync_id,
                     document,
@@ -308,6 +333,14 @@ impl AutomergeHandle {
             }
             Err(error) => {
                 close_stream(&mut sync.stream).await;
+                warn!(
+                    event = "automerge.sync.rejected",
+                    sync_id = %sync_id,
+                    peer = %sync.peer,
+                    document = %document.topic_id(),
+                    error = ?error,
+                    "Automerge sync failed"
+                );
                 AutomergeEvent::SyncRejected {
                     sync_id,
                     document: Some(document),

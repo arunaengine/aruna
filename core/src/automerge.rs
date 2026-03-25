@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use automerge::ChangeHash;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -9,6 +11,9 @@ use crate::types::GroupId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AutomergeDocumentVariant {
+    Group {
+        group_id: GroupId,
+    },
     Metadata {
         group_id: GroupId,
         document_id: Ulid,
@@ -38,6 +43,9 @@ impl AutomergeDocumentVariant {
 
     pub fn topic_descriptor(&self) -> AutomergeTopicId {
         match self {
+            Self::Group { group_id } => AutomergeTopicId::Group {
+                group_id: *group_id,
+            },
             Self::Metadata {
                 group_id,
                 document_id,
@@ -60,6 +68,9 @@ impl AutomergeDocumentVariant {
     pub fn from_topic_id(topic: &TopicId) -> Option<Self> {
         match topic {
             TopicId::AutomergeDocument(topic) => match topic {
+                AutomergeTopicId::Group { group_id } => Some(Self::Group {
+                    group_id: *group_id,
+                }),
                 AutomergeTopicId::Metadata {
                     group_id,
                     document_id,
@@ -91,6 +102,7 @@ impl AutomergeDocumentVariant {
 
     pub fn holder_lookup_bytes(&self) -> Vec<u8> {
         match self {
+            Self::Group { group_id } => format!("group_{group_id}").into_bytes(),
             Self::Metadata {
                 group_id,
                 document_id,
@@ -188,6 +200,27 @@ pub struct AutomergeState {
     pub heads: Vec<ChangeHash>,
     pub change_count: u64,
     pub node_id: NodeId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomergeAnnouncementEnvelope {
+    pub message_id: Ulid,
+    pub trace_context: BTreeMap<String, String>,
+    pub announcement: AutomergeState,
+}
+
+impl AutomergeAnnouncementEnvelope {
+    pub fn new(
+        message_id: Ulid,
+        announcement: AutomergeState,
+        trace_context: BTreeMap<String, String>,
+    ) -> Self {
+        Self {
+            message_id,
+            trace_context,
+            announcement,
+        }
+    }
 }
 
 impl AutomergeState {

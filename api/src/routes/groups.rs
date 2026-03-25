@@ -1,9 +1,7 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission,
-};
+use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument, Permission};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::drive;
@@ -16,6 +14,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::trace;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
@@ -174,12 +173,20 @@ pub async fn create_group(
         return Err(ServerError::Forbidden);
     }
 
+    trace!(
+        event = "request.group.create.authorized",
+        realm_id = %realm_id,
+        user_id = %auth.user_id,
+        group_name = %request.name,
+        "Authorized group creation request"
+    );
+
     let result = drive(
         CreateGroupOperation::new(CreateGroupConfig {
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
-                realm_id,
+                realm_id: realm_id.clone(),
             },
             display_name: request.name,
         }),
@@ -187,6 +194,14 @@ pub async fn create_group(
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    trace!(
+        event = "request.group.create.completed",
+        realm_id = %realm_id,
+        user_id = %auth.user_id,
+        group_id = %result.0.group_id,
+        "Completed group creation request"
+    );
 
     Ok((StatusCode::CREATED, Json(result.into())))
 }
@@ -254,8 +269,11 @@ pub async fn get_group(
 ) -> ServerResult<(StatusCode, Json<GroupInfoResponse>)> {
     let _auth = auth.ok_or(ServerError::Unauthorized)?;
     let group_id = Ulid::from_string(&group_id).map_err(|_| ServerError::BadRequest)?;
-    let result = drive(GetGroupOperation::new(GetGroupConfig { group_id }), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let result = drive(
+        GetGroupOperation::new(GetGroupConfig { group_id }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
     Ok((StatusCode::OK, Json(result.into())))
 }

@@ -370,9 +370,11 @@ mod test {
         let hydrated_auth_doc: RealmAuthorizationDocument = hydrate(&stored_automerge_doc).unwrap();
 
         assert_eq!(auth_doc, hydrated_auth_doc);
-        assert!(hydrated_auth_doc.roles.iter().any(|(_id, role)| {
-            role.name == "realm_admin" && role.assigned_users.is_empty()
-        }));
+        assert!(
+            hydrated_auth_doc.roles.iter().any(|(_id, role)| {
+                role.name == "realm_admin" && role.assigned_users.is_empty()
+            })
+        );
     }
 
     #[test]

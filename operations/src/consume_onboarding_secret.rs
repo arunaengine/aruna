@@ -30,12 +30,16 @@ pub struct ConsumeOnboardingSecretOperation {
 enum ConsumeOnboardingSecretState {
     Init,
     StartTransaction,
-    ReadRecord { txn_id: TxnId },
+    ReadRecord {
+        txn_id: TxnId,
+    },
     WriteConsumed {
         txn_id: TxnId,
         record: OnboardingSecretRecord,
     },
-    CommitTransaction { record: OnboardingSecretRecord },
+    CommitTransaction {
+        record: OnboardingSecretRecord,
+    },
     Finish,
     Error,
 }
@@ -133,7 +137,10 @@ impl Operation for ConsumeOnboardingSecretOperation {
                 let mut record: OnboardingSecretRecord = match postcard::from_bytes(&value) {
                     Ok(record) => record,
                     Err(error) => {
-                        return fail(self, ConsumeOnboardingSecretError::ConversionError(error.into()));
+                        return fail(
+                            self,
+                            ConsumeOnboardingSecretError::ConversionError(error.into()),
+                        );
                     }
                 };
 
@@ -151,7 +158,10 @@ impl Operation for ConsumeOnboardingSecretOperation {
                 let value = match postcard::to_allocvec(&record) {
                     Ok(value) => value,
                     Err(error) => {
-                        return fail(self, ConsumeOnboardingSecretError::ConversionError(error.into()));
+                        return fail(
+                            self,
+                            ConsumeOnboardingSecretError::ConversionError(error.into()),
+                        );
                     }
                 };
                 self.state = ConsumeOnboardingSecretState::WriteConsumed {
@@ -215,7 +225,8 @@ impl Operation for ConsumeOnboardingSecretOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ConsumeOnboardingSecretError::NotFinished)?
+        self.output
+            .ok_or(ConsumeOnboardingSecretError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -242,8 +253,8 @@ fn fail(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
-        ConsumeOnboardingSecretError,
+        ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput,
+        ConsumeOnboardingSecretOperation,
     };
     use crate::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
@@ -257,8 +268,7 @@ mod tests {
     #[tokio::test]
     async fn consumes_secret_once() {
         let tempdir = tempdir().unwrap();
-        let storage_handle =
-            storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,

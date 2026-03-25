@@ -99,7 +99,7 @@ impl Operation for CreateOnboardingSecretOperation {
                         return fail(
                             self,
                             CreateOnboardingSecretError::ConversionError(error.into()),
-                        )
+                        );
                     }
                 };
                 smallvec![Effect::Storage(StorageEffect::Write {

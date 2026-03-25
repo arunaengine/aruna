@@ -5,16 +5,16 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::onboarding::OnboardingSyncTicket;
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
-use aruna_core::NodeId;
 
 #[derive(Debug, PartialEq)]
 pub struct IncomingAutomergeOperation {

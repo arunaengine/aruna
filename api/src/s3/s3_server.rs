@@ -1,6 +1,7 @@
 use super::auth::AuthProvider;
 use super::s3_service::ArunaS3Service;
 use crate::error::S3ServerError;
+use crate::telemetry::{emit_request_completed, make_request_span};
 use aruna_core::NodeId;
 use aruna_core::structs::RealmId;
 use aruna_operations::driver::DriverContext;
@@ -17,10 +18,10 @@ use s3s::host::SingleDomain;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tracing::error;
-use tracing::info;
+use tracing::{Instrument, error, info, trace};
 
 pub struct S3Server {
     address: String,
@@ -108,8 +109,41 @@ impl Service<Request<Incoming>> for WrappingService {
 
         // Default S3 operation call
         let (parts, body) = req.into_parts();
+        let method = parts.method.clone();
+        let path = parts.uri.path().to_string();
+        let span = make_request_span("s3", &parts.headers, &method, &path);
+        let started = Instant::now();
+        {
+            let _guard = span.enter();
+            trace!(
+                event = "request.received",
+                protocol = "s3",
+                method = %method,
+                path = %path,
+                "Received S3 request"
+            );
+        }
         let s3s_request = s3s::HttpRequest::from_parts(parts, body.into());
         let shared = self.shared.clone();
-        Box::pin(async move { shared.call(s3s_request).await })
+        Box::pin(async move {
+            let result = shared.call(s3s_request).instrument(span.clone()).await;
+            match &result {
+                Ok(response) => {
+                    emit_request_completed(&span, "s3", response.status().as_u16(), started)
+                }
+                Err(error) => {
+                    span.record("status_code", 500);
+                    let _guard = span.enter();
+                    error!(
+                        event = "request.failed",
+                        protocol = "s3",
+                        latency_ms = started.elapsed().as_millis() as u64,
+                        error = ?error,
+                        "S3 request failed"
+                    );
+                }
+            }
+            result
+        })
     }
 }

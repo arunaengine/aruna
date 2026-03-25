@@ -5,7 +5,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    AUTH_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE, METADATA_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use byteview::ByteView;
@@ -13,7 +14,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::automerge::repository::{
-    parse_auth_document, parse_metadata_key, parse_realm_config_document,
+    parse_auth_document, parse_group_document, parse_metadata_key, parse_realm_config_document,
 };
 use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 use aruna_core::AutomergeDocumentVariant;
@@ -34,6 +35,7 @@ enum RestoreAutomergeSubscriptionsState {
     Init,
     ListMetadata,
     ListAuth,
+    ListGroups,
     ListRealmConfig,
     ReadSubscriptions,
     WaitAnnouncement,
@@ -131,6 +133,26 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
                     for (key, _value) in values {
                         match parse_auth_document(&key) {
+                            Ok(document) => self.documents.push(document),
+                            Err(error) => return self.fail(error.into()),
+                        }
+                    }
+                    self.state = RestoreAutomergeSubscriptionsState::ListGroups;
+                    smallvec![Effect::Storage(StorageEffect::Iter {
+                        key_space: GROUP_KEYSPACE.to_string(),
+                        prefix: None,
+                        start_after: None,
+                        limit: usize::MAX,
+                        txn_id: None,
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage iteration result", format!("{other:?}")),
+            },
+            RestoreAutomergeSubscriptionsState::ListGroups => match event {
+                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                    for (key, _value) in values {
+                        match parse_group_document(&key) {
                             Ok(document) => self.documents.push(document),
                             Err(error) => return self.fail(error.into()),
                         }

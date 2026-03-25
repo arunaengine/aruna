@@ -7,9 +7,11 @@ use aruna_core::operation::{Operation, SubOperation};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
+use std::any::{type_name, type_name_of_val};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use tracing::{Instrument, debug_span, error, trace};
 
 use crate::automerge::AutomergeHandle;
 use aruna_core::automerge::AutomergeEvent;
@@ -29,7 +31,15 @@ pub struct DriverContext {
 const MAX_SUBOP_DEPTH: usize = 32;
 
 async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
-    match effect {
+    let effect_name = effect_kind(&effect);
+    trace!(
+        event = "operation.effect.dispatch",
+        depth,
+        effect = effect_name,
+        "Dispatching operation effect"
+    );
+
+    let event = match effect {
         Effect::Blob(blob_effect) => {
             if let Some(blob_handle) = &context.blob_handle {
                 blob_handle.send_blob_effect(blob_effect).await
@@ -90,7 +100,17 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             tracing::warn!("Top-level stream effect is not handled by driver yet");
             Event::Stream()
         }
-    }
+    };
+
+    trace!(
+        event = "operation.effect.result",
+        depth,
+        effect = effect_name,
+        result = event_kind(&event),
+        "Received operation event"
+    );
+
+    event
 }
 
 fn drive_suboperation<'a>(
@@ -98,12 +118,64 @@ fn drive_suboperation<'a>(
     context: &'a DriverContext,
     depth: usize,
 ) -> Pin<Box<dyn Future<Output = Event> + Send + 'a>> {
+    let operation_name = type_name_of_val(&*operation).to_string();
     Box::pin(async move {
+        let span = debug_span!("suboperation", operation = %operation_name, depth);
+        async move {
+            trace!(
+                event = "suboperation.started",
+                operation = %operation_name,
+                depth,
+                "Starting suboperation"
+            );
+            let mut queue: VecDeque<_> = operation.start().into_iter().collect();
+
+            while !operation.is_complete() {
+                while let Some(effect) = queue.pop_front() {
+                    let event = dispatch_effect(effect, context, depth).await;
+                    queue.extend(operation.step(event));
+                }
+
+                if queue.is_empty() && !operation.is_complete() {
+                    queue.extend(operation.abort());
+                    if queue.is_empty() {
+                        break;
+                    }
+                }
+            }
+
+            trace!(
+                event = "suboperation.completed",
+                operation = %operation_name,
+                depth,
+                "Completed suboperation"
+            );
+            operation.finalize()
+        }
+        .instrument(span)
+        .await
+    })
+}
+
+pub async fn drive<O: Operation>(
+    mut operation: O,
+    context: &DriverContext,
+) -> Result<O::Output, O::Error> {
+    let operation_name = type_name::<O>();
+    let span = debug_span!("operation", operation = %operation_name);
+
+    async move {
+        trace!(
+            event = "operation.started",
+            operation = %operation_name,
+            "Starting operation"
+        );
+
         let mut queue: VecDeque<_> = operation.start().into_iter().collect();
 
         while !operation.is_complete() {
             while let Some(effect) = queue.pop_front() {
-                let event = dispatch_effect(effect, context, depth).await;
+                let event = dispatch_effect(effect, context, 0).await;
                 queue.extend(operation.step(event));
             }
 
@@ -114,31 +186,50 @@ fn drive_suboperation<'a>(
                 }
             }
         }
-
-        operation.finalize()
-    })
+        let result = operation.finalize();
+        match &result {
+            Ok(_) => trace!(
+                event = "operation.completed",
+                operation = %operation_name,
+                "Completed operation"
+            ),
+            Err(error) => error!(
+                event = "operation.failed",
+                operation = %operation_name,
+                error = ?error,
+                "Operation failed"
+            ),
+        }
+        result
+    }
+    .instrument(span)
+    .await
 }
 
-pub async fn drive<O: Operation>(
-    mut operation: O,
-    context: &DriverContext,
-) -> Result<O::Output, O::Error> {
-    let mut queue: VecDeque<_> = operation.start().into_iter().collect();
-
-    while !operation.is_complete() {
-        while let Some(effect) = queue.pop_front() {
-            let event = dispatch_effect(effect, context, 0).await;
-            queue.extend(operation.step(event));
-        }
-
-        if queue.is_empty() && !operation.is_complete() {
-            queue.extend(operation.abort());
-            if queue.is_empty() {
-                break;
-            }
-        }
+fn effect_kind(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::Blob(_) => "blob",
+        Effect::Storage(_) => "storage",
+        Effect::Net(_) => "net",
+        Effect::Automerge(_) => "automerge",
+        Effect::SubOperation(_) => "suboperation",
+        Effect::Task(_) => "task",
+        Effect::Search() => "search",
+        Effect::Stream() => "stream",
     }
-    operation.finalize()
+}
+
+fn event_kind(event: &Event) -> &'static str {
+    match event {
+        Event::Blob(_) => "blob",
+        Event::Storage(_) => "storage",
+        Event::Net(_) => "net",
+        Event::Automerge(_) => "automerge",
+        Event::SubOperation(_) => "suboperation",
+        Event::Task(_) => "task",
+        Event::Search() => "search",
+        Event::Stream() => "stream",
+    }
 }
 
 #[cfg(test)]

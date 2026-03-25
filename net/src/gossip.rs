@@ -17,7 +17,7 @@ use iroh_gossip::net::Gossip;
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{trace, warn};
 
 use crate::DhtHandle;
 use crate::error::{NetError, Result};
@@ -227,6 +227,7 @@ async fn subscribe_owned(
             &topic,
         )
         .await?;
+        let bootstrap_node_count = bootstrap_nodes.len();
 
         let cancel = shutdown.child_token();
         let gossip_topic = gossip
@@ -247,6 +248,12 @@ async fn subscribe_owned(
             );
         }
         persist_subscriptions(&storage, &subscriptions).await;
+        trace!(
+            event = "gossip.subscribed",
+            topic = %topic,
+            bootstrap_nodes = bootstrap_node_count,
+            "Subscribed to gossip topic"
+        );
 
         let reannounce_cancel = cancel.clone();
         let reannounce_topic = topic.clone();
@@ -288,6 +295,13 @@ async fn subscribe_owned(
                         match event {
                             Some(Ok(event)) => {
                                 if let iroh_gossip::api::Event::Received(msg) = event {
+                                    trace!(
+                                        event = "gossip.received",
+                                        topic = %topic,
+                                        sender = %msg.delivered_from,
+                                        message_len = msg.content.len(),
+                                        "Received gossip message"
+                                    );
                                     match event_tx.try_send((
                                         topic.clone(),
                                         msg.delivered_from,

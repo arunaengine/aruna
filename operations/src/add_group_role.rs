@@ -67,6 +67,10 @@ pub enum AddGroupRoleState {
         group: Group,
         auth_doc: GroupAuthorizationDocument,
     },
+    AnnounceGroupDoc {
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+    },
     AnnounceAuthDoc {
         group: Group,
         auth_doc: GroupAuthorizationDocument,
@@ -325,6 +329,40 @@ impl AddGroupRoleOperation {
                 got,
             );
         };
+        self.state = AddGroupRoleState::AnnounceGroupDoc {
+            group: group.clone(),
+            auth_doc: auth_doc.clone(),
+        };
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            AnnounceAutomergeDocumentOperation::new(
+                AutomergeDocumentVariant::Group {
+                    group_id: group.group_id,
+                },
+                self.input.actor.node_id,
+            ),
+            |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                result: result.map_err(|error| error.to_string()),
+            }),
+        ))]
+    }
+
+    fn handle_announce_group_doc(
+        &mut self,
+        event: Event,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                got,
+            );
+        };
+        if let Err(error) = result {
+            return self.fail(AddGroupRoleError::AutomergeState(error));
+        }
         self.state = AddGroupRoleState::AnnounceAuthDoc {
             group: group.clone(),
             auth_doc: auth_doc.clone(),
@@ -452,6 +490,9 @@ impl Operation for AddGroupRoleOperation {
             } => self.handle_update_group(event, txn_id, group, auth_doc),
             AddGroupRoleState::CommitTransaction { group, auth_doc } => {
                 self.handle_commit_transaction(event, group, auth_doc)
+            }
+            AddGroupRoleState::AnnounceGroupDoc { group, auth_doc } => {
+                self.handle_announce_group_doc(event, group, auth_doc)
             }
             AddGroupRoleState::AnnounceAuthDoc { group, auth_doc } => {
                 self.handle_announce_auth_doc(event, group, auth_doc)

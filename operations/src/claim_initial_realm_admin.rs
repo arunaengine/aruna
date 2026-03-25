@@ -44,14 +44,20 @@ impl std::fmt::Debug for ClaimInitialRealmAdminOperation {
 pub enum ClaimInitialRealmAdminState {
     Init,
     StartTransaction,
-    GetAuthDoc { txn_id: TxnId },
+    GetAuthDoc {
+        txn_id: TxnId,
+    },
     UpdateAuthDoc {
         txn_id: TxnId,
         auth_doc: RealmAuthorizationDocument,
     },
-    CommitTransaction { auth_doc: RealmAuthorizationDocument },
+    CommitTransaction {
+        auth_doc: RealmAuthorizationDocument,
+    },
     AbortTransaction,
-    AnnounceAuthDoc { auth_doc: RealmAuthorizationDocument },
+    AnnounceAuthDoc {
+        auth_doc: RealmAuthorizationDocument,
+    },
     Finish,
     Error,
 }
@@ -128,9 +134,9 @@ impl ClaimInitialRealmAdminOperation {
         if !role.assigned_users.is_empty() {
             self.state = ClaimInitialRealmAdminState::AbortTransaction;
             self.output = Some(Ok(ClaimInitialRealmAdminResult::AlreadyClaimed));
-            return Ok(smallvec![Effect::Storage(StorageEffect::AbortTransaction {
-                txn_id,
-            })]);
+            return Ok(smallvec![Effect::Storage(
+                StorageEffect::AbortTransaction { txn_id }
+            )]);
         }
 
         role.assigned_users.insert(self.input.actor.user_id);
@@ -172,18 +178,15 @@ impl Operation for ClaimInitialRealmAdminOperation {
             ClaimInitialRealmAdminState::StartTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return self.unexpected_event(
-                        "Event::Storage(StorageEvent::TransactionStarted)",
-                        got,
-                    );
+                    return self
+                        .unexpected_event("Event::Storage(StorageEvent::TransactionStarted)", got);
                 };
                 self.emit_get_auth_doc(txn_id)
             }
             ClaimInitialRealmAdminState::GetAuthDoc { txn_id } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self
-                        .unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
+                    return self.unexpected_event("Event::Storage(StorageEvent::ReadResult)", got);
                 };
 
                 match self.emit_update_auth_doc(txn_id, value) {
@@ -194,8 +197,7 @@ impl Operation for ClaimInitialRealmAdminOperation {
             ClaimInitialRealmAdminState::UpdateAuthDoc { txn_id, auth_doc } => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self
-                        .unexpected_event("Event::Storage(StorageEvent::WriteResult)", got);
+                    return self.unexpected_event("Event::Storage(StorageEvent::WriteResult)", got);
                 };
 
                 self.state = ClaimInitialRealmAdminState::CommitTransaction {
@@ -230,10 +232,8 @@ impl Operation for ClaimInitialRealmAdminOperation {
             ClaimInitialRealmAdminState::AbortTransaction => {
                 let got = format!("{event:?}");
                 let Event::Storage(StorageEvent::TransactionAborted { .. }) = event else {
-                    return self.unexpected_event(
-                        "Event::Storage(StorageEvent::TransactionAborted)",
-                        got,
-                    );
+                    return self
+                        .unexpected_event("Event::Storage(StorageEvent::TransactionAborted)", got);
                 };
 
                 self.state = ClaimInitialRealmAdminState::Finish;
@@ -271,7 +271,8 @@ impl Operation for ClaimInitialRealmAdminOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ClaimInitialRealmAdminError::NotFinished)?
+        self.output
+            .ok_or(ClaimInitialRealmAdminError::NotFinished)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -288,8 +289,7 @@ impl Operation for ClaimInitialRealmAdminOperation {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
-        ClaimInitialRealmAdminResult,
+        ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation, ClaimInitialRealmAdminResult,
     };
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
