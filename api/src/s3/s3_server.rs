@@ -17,6 +17,7 @@ use s3s::HttpResponse;
 use s3s::host::SingleDomain;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
+use s3s::validation::AwsNameValidation;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -55,6 +56,7 @@ impl S3Server {
             b.set_host(SingleDomain::new(&hostname.into())?);
             b.set_auth(auth.clone());
             b.set_access(auth);
+            b.set_validation(AwsNameValidation::new());
             b.build()
         };
 
