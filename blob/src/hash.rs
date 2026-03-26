@@ -13,9 +13,9 @@ pub struct Hashes {
     pub crc32: [u8; 4],
     pub crc32c: [u8; 4],
     pub crc64nvme: [u8; 8],
-    pub sha1: Vec<u8>,
-    pub sha256: Vec<u8>,
-    pub md5: Vec<u8>,
+    pub sha1: [u8; 20],
+    pub sha256: [u8; 32],
+    pub md5: [u8; 16],
 }
 
 pub struct Hasher {
@@ -69,9 +69,9 @@ impl Hasher {
             crc32: (self.crc32.finalize() as u32).to_be_bytes(),
             crc32c: (self.crc32c.finalize() as u32).to_be_bytes(),
             crc64nvme: self.crc64nvme.finalize().to_be_bytes(),
-            sha1: self.sha1.clone().finalize().to_vec(),
-            sha256: self.sha256.clone().finalize().to_vec(),
-            md5: self.md5.clone().finalize().to_vec(),
+            sha1: self.sha1.clone().finalize().into(),
+            sha256: self.sha256.clone().finalize().into(),
+            md5: self.md5.clone().finalize().into(),
         }
     }
 
@@ -82,9 +82,9 @@ impl Hasher {
             (HASH_CRC32.to_string(), hashes.crc32.to_vec()),
             (HASH_CRC32C.to_string(), hashes.crc32c.to_vec()),
             (HASH_CRC64NVME.to_string(), hashes.crc64nvme.to_vec()),
-            (HASH_SHA1.to_string(), hashes.sha1),
-            (HASH_SHA256.to_string(), hashes.sha256),
-            (HASH_MD5.to_string(), hashes.md5),
+            (HASH_SHA1.to_string(), hashes.sha1.to_vec()),
+            (HASH_SHA256.to_string(), hashes.sha256.to_vec()),
+            (HASH_MD5.to_string(), hashes.md5.to_vec()),
         ])
     }
 }
@@ -102,7 +102,7 @@ mod tests {
         assert_eq!(hashes.crc64nvme, 0xae8b_1486_0a79_9888u64.to_be_bytes());
         assert_eq!(
             hashes.sha1,
-            vec![
+            [
                 0xf7, 0xc3, 0xbc, 0x1d, 0x80, 0x8e, 0x04, 0x73, 0x2a, 0xdf, 0x67, 0x99, 0x65, 0xcc,
                 0xc3, 0x4c, 0xa7, 0xae, 0x34, 0x41,
             ]

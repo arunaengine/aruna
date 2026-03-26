@@ -280,7 +280,7 @@ impl BlobHandler {
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
         let expected_blake3: [u8; 32] = match location.get_blake3() {
-            Some(hash) => match hash.as_slice().try_into() {
+            Some(hash) => match hash.try_into() {
                 Ok(hash) => hash,
                 Err(_) => {
                     return BlobEvent::Error(BlobError::IntegrityCheckFailed(
