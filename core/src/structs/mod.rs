@@ -1,4 +1,5 @@
 mod blob;
+pub mod checksum;
 mod group;
 mod metadata;
 mod realm;
