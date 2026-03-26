@@ -1,4 +1,5 @@
 use crate::errors::{BlobError, ConversionError};
+use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::{PathRestriction, RealmId};
 use crate::types::UserId;
 use byteview::ByteView;
@@ -141,8 +142,8 @@ impl BackendLocation {
         Ok(postcard::from_bytes(bytes)?)
     }
 
-    pub fn get_blake3(&self) -> Option<&Vec<u8>> {
-        self.hashes.get("blake3")
+    pub fn get_blake3(&self) -> Option<&[u8]> {
+        self.hashes.get(HASH_BLAKE3).map(|h| h.as_slice())
     }
 }
 

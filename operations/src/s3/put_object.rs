@@ -4,6 +4,7 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{BackendLocation, Location, LookupKey, VersionKey, VersionMetadata};
 use aruna_core::types::{Effects, GroupId, UserId};
 use bytes::Bytes;
@@ -15,6 +16,7 @@ use ulid::Ulid;
 pub enum PutObjectState {
     Init,
     WriteBlob,
+    CleanupFailedWrite,
     StartTransaction,
     CheckHashLookup,
     CreateHashLookup,
@@ -42,6 +44,10 @@ pub enum PutObjectError {
     MissingBody,
     #[error("body size did not match Content-Length header")]
     IncompleteBody,
+    #[error("missing stored checksum for {0}")]
+    MissingExpectedChecksum(&'static str),
+    #[error("checksum mismatch for {0}")]
+    ChecksumMismatch(&'static str),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("Something went wrong ...")]
@@ -61,6 +67,8 @@ pub struct PutObjectConfig {
     pub user_id: UserId,
     pub group_id: GroupId,
     pub request: PutObjectInput,
+    pub expected_checksums: Vec<ExpectedChecksum>,
+    pub checksum_type: Option<String>,
     pub exists: bool, //Note: For version shenanigans which will be implemented later
 }
 
@@ -74,10 +82,11 @@ pub struct PutObjectResult {
 pub struct PutObjectOperation {
     state: PutObjectState,
     config: PutObjectConfig,
-    txn_id: Option<ulid::Ulid>,
+    txn_id: Option<Ulid>,
     version_id: Option<Ulid>,
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
+    pending_error: Option<PutObjectError>,
     output: Option<Result<BackendLocation, PutObjectError>>,
 }
 
@@ -90,6 +99,7 @@ impl PutObjectOperation {
             version_id: None,
             written_location: None,
             cleanup_location: None,
+            pending_error: None,
             output: None,
         }
     }
@@ -110,6 +120,8 @@ impl PutObjectOperation {
 
     fn handle_write_finished(&mut self, event: Event) -> Effects {
         if let Event::Blob(BlobEvent::WriteFinished { location }) = event {
+            self.written_location = Some(location.clone());
+
             // Check if the body was fully written
             if self
                 .config
@@ -117,10 +129,22 @@ impl PutObjectOperation {
                 .content_length
                 .is_some_and(|expected| location.blob_size != expected)
             {
-                return self.emit_error(PutObjectError::IncompleteBody);
+                return self.cleanup_failed_write(PutObjectError::IncompleteBody);
             }
 
-            self.written_location = Some(location);
+            for expected in &self.config.expected_checksums {
+                let Some(actual) = location.hashes.get(expected.algorithm.hash_key()) else {
+                    return self.cleanup_failed_write(PutObjectError::MissingExpectedChecksum(
+                        expected.algorithm.s3_name(),
+                    ));
+                };
+
+                if actual != &expected.digest {
+                    return self.cleanup_failed_write(PutObjectError::ChecksumMismatch(
+                        expected.algorithm.s3_name(),
+                    ));
+                }
+            }
 
             self.state = PutObjectState::StartTransaction;
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
@@ -337,6 +361,32 @@ impl PutObjectOperation {
         smallvec![]
     }
 
+    fn cleanup_failed_write(&mut self, error: PutObjectError) -> Effects {
+        self.pending_error = Some(error);
+        self.state = PutObjectState::CleanupFailedWrite;
+
+        self.get_written_location().cloned().map_or_else(
+            || self.emit_pending_error(),
+            |location| smallvec![Effect::Blob(BlobEffect::Delete { location })],
+        )
+    }
+
+    fn handle_failed_write_cleanup(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
+                self.emit_pending_error()
+            }
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    fn emit_pending_error(&mut self) -> Effects {
+        let Some(error) = self.pending_error.take() else {
+            return self.emit_error(PutObjectError::PutObjectFailed);
+        };
+        self.emit_error(error)
+    }
+
     fn emit_error(&mut self, error: PutObjectError) -> Effects {
         self.state = PutObjectState::Error;
         self.output = Some(Err(error));
@@ -368,6 +418,7 @@ impl Operation for PutObjectOperation {
         match &self.state {
             PutObjectState::Init => self.handle_init(),
             PutObjectState::WriteBlob => self.handle_write_finished(event),
+            PutObjectState::CleanupFailedWrite => self.handle_failed_write_cleanup(event),
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             PutObjectState::CreateHashLookup => self.handle_hash_lookup_created(event),
@@ -433,6 +484,7 @@ mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
     use aruna_core::stream::BackendStream;
+    use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
         Backend, BackendConfig, Location, LookupKey, VersionKey, VersionMetadata,
     };
@@ -487,6 +539,8 @@ mod test {
                 content_length: Some(data.len() as u64),
                 body: Some(BackendStream::new(stream)),
             },
+            expected_checksums: vec![],
+            checksum_type: None,
             exists: false,
         };
         let put_operation = PutObjectOperation::new(put_config);
@@ -622,6 +676,8 @@ mod test {
                         &data[..],
                     ))),
                 },
+                expected_checksums: vec![],
+                checksum_type: None,
                 exists: false,
             }),
             &context,
@@ -643,6 +699,8 @@ mod test {
                         &data[..],
                     ))),
                 },
+                expected_checksums: vec![],
+                checksum_type: None,
                 exists: false,
             }),
             &context,
@@ -677,5 +735,69 @@ mod test {
                 Location::Real(first.location.clone())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_put_object_checksum_mismatch_cleans_up_blob() {
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let blob_root = format!("{temp_root}/blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let blob_handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some("aruna_".to_string()),
+                max_bucket_size: Some(100000),
+                root: blob_root.clone(),
+                service_config: HashMap::new(),
+            },
+            storage_handle.clone(),
+            net_handle.clone(),
+        )
+        .await
+        .unwrap();
+
+        let context = DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            automerge_handle: None,
+            task_handle: None,
+        };
+
+        let data = b"hello, world!";
+        let err = drive(
+            PutObjectOperation::new(PutObjectConfig {
+                user_id: Ulid::new(),
+                group_id: Ulid::new(),
+                request: PutObjectInput {
+                    bucket: "mybucket".to_string(),
+                    key: "bad.txt".to_string(),
+                    content_length: Some(data.len() as u64),
+                    body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                        &data[..],
+                    ))),
+                },
+                expected_checksums: vec![ExpectedChecksum {
+                    algorithm: ChecksumAlgorithm::Sha256,
+                    digest: vec![0; 32],
+                }],
+                checksum_type: None,
+                exists: false,
+            }),
+            &context,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::s3::put_object::PutObjectError::ChecksumMismatch("SHA256")
+        ));
+        assert_eq!(count_files(Path::new(&blob_root)), 0);
     }
 }
