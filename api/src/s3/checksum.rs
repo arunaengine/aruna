@@ -1,12 +1,12 @@
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use http::HeaderMap;
 use s3s::dto::{
     ChecksumMode, ChecksumType, CompleteMultipartUploadOutput, GetObjectOutput, HeadObjectOutput,
     PutObjectOutput,
 };
-use s3s::{s3_error, S3Error, S3Result};
+use s3s::{S3Error, S3Result, s3_error};
 use std::collections::HashMap;
 
 const CONTENT_MD5: &str = "content-md5";
@@ -278,9 +278,9 @@ pub fn checksum_mismatch_error() -> S3Error {
 #[cfg(test)]
 mod tests {
     use super::{
-        checksum_mode_enabled, encode_checksums, parse_upload_checksum_request, ApplyChecksums, ChecksumSelection,
-        CONTENT_MD5, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_MODE, X_AMZ_CHECKSUM_TYPE,
-        X_AMZ_SDK_CHECKSUM_ALGORITHM,
+        ApplyChecksums, CONTENT_MD5, ChecksumSelection, X_AMZ_CHECKSUM_CRC32, X_AMZ_CHECKSUM_MODE,
+        X_AMZ_CHECKSUM_TYPE, X_AMZ_SDK_CHECKSUM_ALGORITHM, checksum_mode_enabled, encode_checksums,
+        parse_upload_checksum_request,
     };
     use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_CRC32};
     use http::HeaderMap;

@@ -85,8 +85,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                         }
                     } else {
                         error!("Cannot handle incoming bao stream without blob handle");
-                        return;
-                    };
+                    }
                 }
                 Alpn::Automerge => {
                     let Some(automerge_handle) = self.context.automerge_handle.clone() else {

@@ -258,11 +258,11 @@ impl Operation for HeadObjectOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::structs::checksum::HASH_MD5;
     use aruna_core::structs::BackendConfig;
     use aruna_core::structs::BackendLocation;
+    use aruna_core::structs::checksum::HASH_MD5;
     use aruna_core::structs::{Backend, VersionMetadata};
     use aruna_net::{NetConfig, NetHandle};
     use std::collections::HashMap;

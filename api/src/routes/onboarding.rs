@@ -401,7 +401,7 @@ pub async fn bootstrap_onboarding(
                 .as_deref()
                 .ok_or(ServerError::BadRequest)?;
             let delegation_signature = state
-                .sign_server_delegation(&issuer_public_key)
+                .sign_server_delegation(issuer_public_key)
                 .ok_or(ServerError::Forbidden)?;
             BootstrapOnboardingResponse {
                 realm_id: state.get_realm_id().to_string(),
