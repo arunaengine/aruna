@@ -241,10 +241,13 @@ impl Operation for HeadObjectOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(output) => Ok(Some(output)),
-            None => Err(HeadObjectError::HeadObjectFailed),
+        if HeadObjectState::Error == self.state {
+            if let Some(Err(error)) = self.output {
+                return Err(error);
+            }
+            return Err(HeadObjectError::HeadObjectFailed);
         }
+        Ok(self.output)
     }
 
     fn abort(&mut self) -> Effects {

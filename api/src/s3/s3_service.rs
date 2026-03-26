@@ -353,19 +353,15 @@ impl S3 for ArunaS3Service {
 
                 Ok(S3Response::new(output))
             }
-            Ok(Some(Err(HeadObjectError::NoSuchVersion))) | Err(HeadObjectError::NoSuchVersion) => {
-                Err(s3_error!(
-                    NoSuchVersion,
-                    "The specified version does not exist."
-                ))
-            }
-            Ok(Some(Err(HeadObjectError::DeleteMarker))) | Err(HeadObjectError::DeleteMarker) => {
-                Err(s3_error!(
-                    MethodNotAllowed,
-                    "The specified version is a delete marker."
-                ))
-            }
-            Ok(Some(Err(HeadObjectError::NoSuchKey))) | Err(HeadObjectError::NoSuchKey) => {
+            Err(HeadObjectError::NoSuchVersion) => Err(s3_error!(
+                NoSuchVersion,
+                "The specified version does not exist."
+            )),
+            Err(HeadObjectError::DeleteMarker) => Err(s3_error!(
+                MethodNotAllowed,
+                "The specified version is a delete marker."
+            )),
+            Err(HeadObjectError::NoSuchKey) => {
                 Err(s3_error!(NoSuchKey, "The specified key does not exist."))
             }
             Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err)),
