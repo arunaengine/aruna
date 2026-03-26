@@ -1,3 +1,7 @@
+use crate::s3::checksum::{
+    ApplyChecksums, ChecksumSelection, checksum_mismatch_error, checksum_mode_enabled,
+    encode_checksums, parse_upload_checksum_request,
+};
 use crate::s3::util::{convert_input, to_base64};
 use aruna_core::NodeId;
 use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
@@ -9,12 +13,16 @@ use aruna_operations::s3::delete_object::{
     DeleteObjectError, DeleteObjectInput as DOI, DeleteObjectOperation,
 };
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput as GOI, GetObjectOperation};
+use aruna_operations::s3::head_object::{
+    HeadObjectError, HeadObjectInput as HOI, HeadObjectOperation,
+};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
 use s3s::dto::{
     Bucket, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, ListBucketsInput,
-    ListBucketsOutput, PutObjectInput, PutObjectOutput, StreamingBlob,
+    DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadObjectInput,
+    HeadObjectOutput, ListBucketsInput, ListBucketsOutput, PutObjectInput, PutObjectOutput,
+    StreamingBlob,
 };
 use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
@@ -271,6 +279,68 @@ impl S3 for ArunaS3Service {
             }
             Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err)),
             Ok(None) => Err(s3_error!(InternalError, "Failed to process GET request")),
+        }
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn head_object(
+        &self,
+        req: S3Request<HeadObjectInput>,
+    ) -> S3Result<S3Response<HeadObjectOutput>> {
+        debug!("Received HEAD Request: {:#?}", req);
+
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let version_id = Self::parse_version_id(req.input.version_id)?;
+        let operation = HeadObjectOperation::new(HOI {
+            bucket: req.input.bucket,
+            key: req.input.key,
+            version_id,
+        });
+
+        match drive(operation, &self.state).await {
+            Ok(Some(Ok(result))) => {
+                let mut output = HeadObjectOutput {
+                    content_length: Some(result.location.blob_size as i64),
+                    e_tag: result
+                        .location
+                        .hashes
+                        .get(HASH_MD5)
+                        .map(|value| ETag::Strong(to_base64(value))),
+                    version_id: result.version_id.map(|version_id| version_id.to_string()),
+                    last_modified: Some(result.location.created_at.into()),
+                    ..Default::default()
+                };
+
+                if checksum_mode_enabled(&req.headers) {
+                    output.apply_checksums(encode_checksums(
+                        &result.location.hashes,
+                        ChecksumSelection::AllStored,
+                        s3s::dto::ChecksumType::from_static(s3s::dto::ChecksumType::FULL_OBJECT),
+                    ));
+                }
+
+                Ok(S3Response::new(output))
+            }
+            Ok(Some(Err(HeadObjectError::NoSuchVersion))) | Err(HeadObjectError::NoSuchVersion) => {
+                Err(s3_error!(
+                    NoSuchVersion,
+                    "The specified version does not exist."
+                ))
+            }
+            Ok(Some(Err(HeadObjectError::DeleteMarker))) | Err(HeadObjectError::DeleteMarker) => {
+                Err(s3_error!(
+                    MethodNotAllowed,
+                    "The specified version is a delete marker."
+                ))
+            }
+            Ok(Some(Err(HeadObjectError::NoSuchKey))) | Err(HeadObjectError::NoSuchKey) => {
+                Err(s3_error!(NoSuchKey, "The specified key does not exist."))
+            }
+            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err)),
+            Ok(None) => Err(s3_error!(InternalError, "Failed to process HEAD request")),
         }
     }
 
