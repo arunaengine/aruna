@@ -4,6 +4,7 @@ use crate::s3::checksum::{
 };
 use crate::s3::util::{convert_input, to_base64};
 use aruna_core::NodeId;
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
@@ -17,7 +18,7 @@ use aruna_operations::s3::head_object::{
     HeadObjectError, HeadObjectInput as HOI, HeadObjectOperation,
 };
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
-use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation};
+use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectOperation};
 use s3s::dto::{
     Bucket, CreateBucketInput, CreateBucketOutput, DeleteBucketInput, DeleteBucketOutput,
     DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectInput, GetObjectOutput, HeadObjectInput,
@@ -190,6 +191,7 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let checksum_request = parse_upload_checksum_request(&req.headers)?;
 
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
@@ -199,32 +201,49 @@ impl S3 for ArunaS3Service {
                 .map(|bucket_info| bucket_info.group_id)
                 .unwrap_or(user_access.group_id),
             request: input,
+            expected_checksums: checksum_request.expected,
+            checksum_type: Some(checksum_request.checksum_type.as_str().to_string()),
             exists: false,
         };
         let operation = PutObjectOperation::new(config);
 
-        if let Some(Ok(result)) = drive(operation, &self.state)
-            .await
-            .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
-        {
-            debug!(?result);
-            Ok(S3Response::new(PutObjectOutput {
-                e_tag: Some(ETag::Strong(to_base64(
-                    result.location.hashes.get("md5").ok_or_else(|| {
-                        error!(error = "Missing MD5 hash");
-                        s3_error!(InternalError, "Missing MD5 hash")
-                    })?,
-                ))),
-                size: Some(result.location.blob_size as i64),
-                version_id: Some(result.version_id.to_string()),
-                ..Default::default()
-            }))
-        } else {
-            Err(s3_error!(InternalError, "Failed to process PUT request"))
+        match drive(operation, &self.state).await {
+            Ok(Some(Ok(result))) => {
+                debug!(?result);
+                let mut output = PutObjectOutput {
+                    e_tag: Some(ETag::Strong(to_base64(
+                        result.location.hashes.get(HASH_MD5).ok_or_else(|| {
+                            error!(error = "Missing MD5 hash");
+                            s3_error!(InternalError, "Missing MD5 hash")
+                        })?,
+                    ))),
+                    size: Some(result.location.blob_size as i64),
+                    version_id: Some(result.version_id.to_string()),
+                    ..Default::default()
+                };
+                output.apply_checksums(encode_checksums(
+                    &result.location.hashes,
+                    ChecksumSelection::Requested(checksum_request.response_algorithm),
+                    checksum_request.checksum_type,
+                ));
+                Ok(S3Response::new(output))
+            }
+            Ok(Some(Err(PutObjectError::ChecksumMismatch(algorithm))))
+            | Err(PutObjectError::ChecksumMismatch(algorithm)) => {
+                warn!(algorithm, "Checksum mismatch during PutObject");
+                Err(checksum_mismatch_error())
+            }
+            Ok(Some(Err(PutObjectError::MissingExpectedChecksum(algorithm))))
+            | Err(PutObjectError::MissingExpectedChecksum(algorithm)) => {
+                warn!(algorithm, "Missing checksum during PutObject");
+                Err(s3_error!(InternalError, "Missing stored checksum"))
+            }
+            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
+            Ok(None) => Err(s3_error!(InternalError, "Failed to process PUT request")),
         }
     }
 
-    #[tracing::instrument(err)]
+    #[tracing::instrument(err, skip(self, req))]
     #[allow(clippy::blocks_in_conditions)]
     async fn get_object(
         &self,
@@ -254,13 +273,23 @@ impl S3 for ArunaS3Service {
 
         match drive(operation, &self.state).await {
             Ok(Some(Ok(result))) => {
-                let wut = StreamingBlob::wrap(result.blob);
-
-                Ok(S3Response::new(GetObjectOutput {
-                    body: Some(wut),
-                    version_id: result.version_id.map(|version_id| version_id.to_string()),
+                let version_id = result.version_id;
+                let hashes = result.location.hashes.clone();
+                let content = StreamingBlob::wrap(result.blob);
+                let mut output = GetObjectOutput {
+                    body: Some(content),
+                    version_id: version_id.map(|version_id| version_id.to_string()),
                     ..Default::default()
-                }))
+                };
+                if checksum_mode_enabled(&req.headers) {
+                    output.apply_checksums(encode_checksums(
+                        &hashes,
+                        ChecksumSelection::AllStored,
+                        s3s::dto::ChecksumType::from_static(s3s::dto::ChecksumType::FULL_OBJECT),
+                    ));
+                }
+
+                Ok(S3Response::new(output))
             }
             Ok(Some(Err(GetObjectError::NoSuchVersion))) | Err(GetObjectError::NoSuchVersion) => {
                 Err(s3_error!(

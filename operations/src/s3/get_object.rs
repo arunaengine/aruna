@@ -4,7 +4,9 @@ use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::{Location, LookupKey, UserIdentity, VersionKey, VersionMetadata};
+use aruna_core::structs::{
+    BackendLocation, Location, LookupKey, UserIdentity, VersionKey, VersionMetadata,
+};
 use aruna_core::types::Effects;
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
@@ -66,6 +68,7 @@ pub struct GetObjectInput {
 #[derive(Debug, PartialEq)]
 pub struct GetObjectResult {
     pub blob: BackendStream<Result<Bytes, StreamError>>,
+    pub location: BackendLocation,
     pub version_id: Option<Ulid>,
 }
 
@@ -74,6 +77,7 @@ pub struct GetObjectOperation {
     input: GetObjectInput,
     state: GetObjectState,
     txn_id: Option<Ulid>,
+    location: Option<BackendLocation>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
 }
 
@@ -83,6 +87,7 @@ impl GetObjectOperation {
             input,
             state: GetObjectState::Init,
             txn_id: None,
+            location: None,
             output: None,
         }
     }
@@ -173,6 +178,7 @@ impl GetObjectOperation {
         };
 
         self.state = GetObjectState::CommitTransaction;
+        self.location = Some(location.clone());
 
         smallvec![
             Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
@@ -204,6 +210,7 @@ impl GetObjectOperation {
         };
 
         self.state = GetObjectState::CommitTransaction;
+        self.location = Some(location.clone());
 
         smallvec![
             Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
@@ -226,9 +233,13 @@ impl GetObjectOperation {
 
     pub fn handle_received_blob(&mut self, event: Event) -> Effects {
         if let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = event {
+            let Some(location) = self.location.clone() else {
+                return self.emit_error(GetObjectError::GetObjectFailed);
+            };
             self.state = GetObjectState::Finish;
             self.output = Some(Ok(GetObjectResult {
                 blob,
+                location,
                 version_id: self.input.version_id,
             }));
             smallvec![]
@@ -413,15 +424,17 @@ mod test {
             },
             state: GetObjectState::Init,
             txn_id: None,
+            location: None,
             output: None,
         };
 
-        let mut blob_stream = drive(operation, &driver_ctx)
+        let blob_result = drive(operation, &driver_ctx)
             .await
             .unwrap()
             .unwrap()
-            .unwrap()
-            .blob;
+            .unwrap();
+        assert_eq!(blob_result.location.hashes, location.hashes);
+        let mut blob_stream = blob_result.blob;
         let mut read_buffer = Vec::new();
         while let Some(Ok(bytes)) = blob_stream.next().await {
             read_buffer.extend_from_slice(&bytes);
