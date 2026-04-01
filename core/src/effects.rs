@@ -88,9 +88,17 @@ pub enum StorageEffect {
         value: Value,
         txn_id: Option<TxnId>,
     },
+    BatchWrite {
+        writes: Vec<(KeySpace, Key, Value)>,
+        txn_id: Option<TxnId>,
+    },
     Delete {
         key_space: KeySpace,
         key: Key,
+        txn_id: Option<TxnId>,
+    },
+    BatchDelete {
+        deletes: Vec<(KeySpace, Key)>,
         txn_id: Option<TxnId>,
     },
     AbortTransaction {
