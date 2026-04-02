@@ -1361,10 +1361,12 @@ impl ResourceStates {
             self.objects[2].is_missing(),
             self.objects[3].is_missing(),
         ) {
-            (false, true, true, true)
-            | (false, true, false, true)
-            | (false, false, true, true)
-            | (false, false, false, true)
+            (false, true, true, true)     // Project
+            | (false, false, true, true)  // Project -> Collection
+            | (false, true, false, true)  // Project -> Dataset
+            | (false, true, true, false)  // Project -> Object
+            | (false, false, true, false) // Project -> Collection -> Object exists
+            | (false, false, false, true) // Project -> Collection -> Dataset exists
             | (false, false, false, false) => {}
             _ => {
                 bail!("Invalid resource state")
