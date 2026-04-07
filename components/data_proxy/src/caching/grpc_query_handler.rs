@@ -539,19 +539,16 @@ impl GrpcQueryHandler {
 
     #[tracing::instrument(level = "trace", skip(self, obj, token))]
     pub async fn remove_cors_from_project(&self, token: &str, obj: DPObject) -> Result<()> {
-        let cors = match obj
+        let cors = obj
             .key_values
             .iter()
             .find(|e| e.key == "app.aruna-storage.org/cors")
             .cloned()
-        {
-            Some(cors) => cors,
-            None => KeyValue {
+            .unwrap_or_else(|| KeyValue {
                 key: "app.aruna-storage.org/cors".to_string(),
                 value: String::new(),
                 variant: KeyValueVariant::Label as i32,
-            },
-        };
+            });
         let mut req = Request::new(UpdateProjectKeyValuesRequest {
             project_id: obj.id.to_string(),
             add_key_values: vec![],
@@ -571,21 +568,16 @@ impl GrpcQueryHandler {
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", skip(self, object, token, force_update))]
-    pub async fn init_object_update(
+    #[tracing::instrument(level = "trace", skip(self, request, token))]
+    pub async fn init_object_revision(
         &self,
-        object: DPObject,
+        request: UpdateObjectRequest,
         token: &str,
-        force_update: bool,
     ) -> Result<DPObject> {
-        trace!(?object, "Initializing object update");
-
-        // Create UpdateObjectRequest with provided value for force_revision parameter
-        let mut inner_request = UpdateObjectRequest::from(object);
-        inner_request.force_revision = force_update;
+        trace!(?request, "Initializing object revision");
 
         // Crate gRPC request with provided token in header
-        let mut req = Request::new(inner_request);
+        let mut req = Request::new(request);
 
         Self::add_token_to_md(req.metadata_mut(), token)?;
 

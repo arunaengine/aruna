@@ -7,6 +7,7 @@ use crate::data_backends::storage_backend::StorageBackend;
 use crate::s3_frontend::utils::checksum::{ChecksumHandler, IntegrityChecksum};
 use crate::s3_frontend::utils::crc_transformer::CrcTransformer;
 use crate::s3_frontend::utils::list_objects::list_response;
+use crate::s3_frontend::utils::metadata::{MetadataPatch, S3UserMetadata};
 use crate::structs::CheckAccessResult;
 use crate::structs::NewOrExistingObject;
 use crate::structs::Object as ProxyObject;
@@ -80,6 +81,98 @@ impl ArunaS3Service {
             backend: backend.clone(),
             cache,
         })
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, impersonating_token))]
+    async fn init_object_revision_from_patch(
+        &self,
+        object_id: String,
+        patch: MetadataPatch,
+        impersonating_token: Option<&str>,
+    ) -> S3Result<ProxyObject> {
+        let handler = self
+            .cache
+            .aruna_client
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| {
+                error!("ArunaServer client not available");
+                s3_error!(InternalError, "ArunaServer client not available")
+            })?;
+
+        let token = impersonating_token.ok_or_else(|| {
+            error!("missing impersonating token");
+            s3_error!(InternalError, "Token creation failed")
+        })?;
+
+        handler
+            .init_object_revision(patch.into_update_request(object_id), token)
+            .await
+            .map_err(|_| {
+                error!(error = "Object update failed");
+                s3_error!(InternalError, "Object update failed")
+            })
+    }
+
+    fn reset_prepared_upload_object(object: &mut ProxyObject) {
+        object.hashes = HashMap::default();
+        object.synced = false;
+        object.children = None;
+        object.dynamic = false;
+    }
+
+    #[tracing::instrument(level = "trace", skip(self, object, metadata, impersonating_token))]
+    async fn prepare_object(
+        &self,
+        object: &NewOrExistingObject,
+        metadata: &S3UserMetadata,
+        impersonating_token: Option<&str>,
+    ) -> S3Result<(ProxyObject, bool)> {
+        match object {
+            NewOrExistingObject::Existing(object) => {
+                if object.object_status == Status::Initializing {
+                    let mut object = object.clone();
+                    metadata.apply_to_key_values(&mut object.key_values);
+                    Ok((object, true))
+                } else {
+                    let patch = metadata.diff_against(&object.key_values);
+                    let mut new_revision = self
+                        .init_object_revision_from_patch(
+                            object.id.to_string(),
+                            patch,
+                            impersonating_token,
+                        )
+                        .await?;
+                    Self::reset_prepared_upload_object(&mut new_revision);
+                    Ok((new_revision, true))
+                }
+            }
+            NewOrExistingObject::Missing(object) => {
+                let mut object = object.clone();
+                metadata.apply_to_key_values(&mut object.key_values);
+                Ok((object, false))
+            }
+            NewOrExistingObject::None => Err(s3_error!(
+                InvalidObjectState,
+                "Object in invalid state: None"
+            )),
+        }
+    }
+
+    fn merge_headers(
+        headers: &mut Option<HashMap<String, String>>,
+        new_headers: HashMap<String, String>,
+    ) {
+        if new_headers.is_empty() {
+            return;
+        }
+
+        if let Some(headers) = headers.as_mut() {
+            headers.extend(new_headers);
+        } else {
+            *headers = Some(new_headers);
+        }
     }
 
     #[tracing::instrument(level = "trace", skip(object, headers))]
@@ -376,50 +469,13 @@ impl S3 for ArunaS3Service {
         let (states, _) = objects_state.require_regular()?;
 
         let (_, collection, dataset, object, location_state) = states.to_new_or_existing()?;
+        let user_metadata = S3UserMetadata::try_from(&req.headers)?;
 
         trace!(?collection, ?dataset, ?object);
 
-        let mut new_object = match &object {
-            NewOrExistingObject::Existing(ob) => {
-                if ob.object_status == Status::Initializing {
-                    trace!("Object is initializing");
-                    ob.clone()
-                } else {
-                    let mut new_revision = if let Some(handler) =
-                        self.cache.aruna_client.read().await.as_ref()
-                    {
-                        if let Some(token) = &impersonating_token {
-                            handler
-                                .init_object_update(ob.clone(), token, true)
-                                .await
-                                .map_err(|_| {
-                                    error!(error = "Object update failed");
-                                    s3_error!(InternalError, "Object update failed")
-                                })?
-                        } else {
-                            error!("missing impersonating token");
-                            return Err(s3_error!(InternalError, "Token creation failed"));
-                        }
-                    } else {
-                        //TODO: Enable offline mode
-                        error!("ArunaServer client not available");
-                        return Err(s3_error!(InternalError, "ArunaServer client not available"));
-                    };
-                    new_revision.hashes = HashMap::default();
-                    new_revision.synced = false;
-                    new_revision.children = None;
-                    new_revision.dynamic = false;
-                    new_revision
-                }
-            }
-            NewOrExistingObject::Missing(object) => object.clone(),
-            NewOrExistingObject::None => {
-                return Err(s3_error!(
-                    InvalidObjectState,
-                    "Object in invalid state: None"
-                ))
-            }
-        };
+        let (mut new_object, _) = self
+            .prepare_object(&object, &user_metadata, impersonating_token.as_deref())
+            .await?;
 
         trace!(?new_object);
 
@@ -941,7 +997,7 @@ impl S3 for ArunaS3Service {
     ) -> S3Result<S3Response<HeadObjectOutput>> {
         let CheckAccessResult {
             objects_state,
-            headers,
+            mut headers,
             ..
         } = req
             .extensions
@@ -974,12 +1030,14 @@ impl S3 for ArunaS3Service {
         }
 
         let (object, location) = objects_state.extract_object()?;
-
         let content_len = location.map(|l| l.raw_content_len).unwrap_or_default();
-
         let mime = mime_guess::from_path(object.name.as_str())
             .first()
             .and_then(|mime_guess| ContentType::from_str(mime_guess.as_ref()).ok());
+        Self::merge_headers(
+            &mut headers,
+            S3UserMetadata::from(object.key_values.as_slice()).into_headers(),
+        );
 
         let mut output = HeadObjectOutput {
             content_length: Some(content_len),
@@ -1028,6 +1086,7 @@ impl S3 for ArunaS3Service {
                 );
             }
         }
+        debug!(?resp);
 
         Ok(resp)
     }
@@ -1758,47 +1817,11 @@ impl S3 for ArunaS3Service {
         let (states, _) = objects_state.require_regular()?;
 
         let (_, collection, dataset, object, location_state) = states.to_new_or_existing()?;
+        let user_metadata = S3UserMetadata::try_from(&req.headers)?;
 
-        let (mut new_object, was_init) = match object {
-            NewOrExistingObject::Existing(ob) => {
-                if ob.object_status == Status::Initializing {
-                    trace!("Object is initializing");
-                    (ob, true)
-                } else {
-                    let mut new_revision = if let Some(handler) =
-                        self.cache.aruna_client.read().await.as_ref()
-                    {
-                        if let Some(token) = &impersonating_token {
-                            handler
-                                .init_object_update(ob, token, true)
-                                .await
-                                .map_err(|_| {
-                                    error!(error = "Object update failed");
-                                    s3_error!(InternalError, "Object update failed")
-                                })?
-                        } else {
-                            error!("missing impersonating token");
-                            return Err(s3_error!(InternalError, "Token creation failed"));
-                        }
-                    } else {
-                        error!("ArunaServer client not available");
-                        return Err(s3_error!(InternalError, "ArunaServer client not available"));
-                    };
-                    new_revision.hashes = HashMap::default();
-                    new_revision.synced = false;
-                    new_revision.children = None;
-                    new_revision.dynamic = false;
-                    (new_revision, true)
-                }
-            }
-            NewOrExistingObject::Missing(object) => (object, false),
-            NewOrExistingObject::None => {
-                return Err(s3_error!(
-                    InvalidObjectState,
-                    "Object in invalid state: None"
-                ))
-            }
-        };
+        let (mut new_object, was_init) = self
+            .prepare_object(&object, &user_metadata, impersonating_token.as_deref())
+            .await?;
 
         trace!(?new_object);
         match req.input.content_length {
@@ -2430,33 +2453,23 @@ impl S3 for ArunaS3Service {
                 }
                 (new_object, false)
             }
-            NewOrExistingObject::Existing(mut object) => {
+            NewOrExistingObject::Existing(object) => {
                 if object.object_status == Status::Initializing {
                     (object, true)
                 } else {
-                    if let Some(handler) = self.cache.aruna_client.read().await.as_ref() {
-                        if let Some(token) = &impersonating_token {
-                            handler
-                                .init_object_update(object.clone(), token, true)
-                                .await
-                                .map_err(|_| {
-                                    error!(error = "Object update failed");
-                                    s3_error!(InternalError, "Object update failed")
-                                })?
-                        } else {
-                            error!("missing impersonating token");
-                            return Err(s3_error!(InternalError, "Token creation failed"));
-                        }
-                    } else {
-                        error!("ArunaServer client not available");
-                        return Err(s3_error!(InternalError, "ArunaServer client not available"));
-                    };
-                    object.hashes = existing_object.hashes.clone();
-                    object.synced = existing_object.synced;
-                    object.children = None; // This should be None anyway, because this is an Object
-                    object.dynamic = existing_object.dynamic;
+                    let mut new_revision = self
+                        .init_object_revision_from_patch(
+                            object.id.to_string(),
+                            MetadataPatch::default(),
+                            impersonating_token.as_deref(),
+                        )
+                        .await?;
+                    new_revision.hashes = existing_object.hashes.clone();
+                    new_revision.synced = existing_object.synced;
+                    new_revision.children = None; // This should be None anyway, because this is an Object
+                    new_revision.dynamic = existing_object.dynamic;
 
-                    (object, true)
+                    (new_revision, true)
                 }
             }
             NewOrExistingObject::None => {
