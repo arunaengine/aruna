@@ -1232,7 +1232,13 @@ mod tests {
             user_id,
             realm_id: realm_id.clone(),
         };
-        let metadata_handle = MetadataHandle::new(metadata_dir.path(), node_id).unwrap();
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage_handle.clone(),
+            None,
+        )
+        .unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,

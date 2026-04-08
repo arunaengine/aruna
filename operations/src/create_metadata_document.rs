@@ -56,6 +56,7 @@ enum CreateMetadataDocumentState {
     LoadRealmConfig,
     LoadReplicationTargets,
     CreateGraph,
+    ReplicateGraph,
     StartTransaction,
     WriteRegistry,
     WriteDocumentIndex,
@@ -295,6 +296,29 @@ impl Operation for CreateMetadataDocumentOperation {
             },
             CreateMetadataDocumentState::CreateGraph => match event {
                 Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => {
+                    let Some(record) = self.record.clone() else {
+                        return self
+                            .fail_without_cleanup(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = CreateMetadataDocumentState::ReplicateGraph;
+                    smallvec![Effect::Metadata(MetadataEffect::ReplicateBootstrap {
+                        record,
+                        policy: self.graph_policy(),
+                    })]
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    self.fail_without_cleanup(error.into())
+                }
+                other => self.unexpected_event("metadata create result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::ReplicateGraph => match event {
+                Event::Metadata(MetadataEvent::BootstrapReplicated {
+                    replicated_node_ids,
+                    ..
+                }) => {
+                    if let Some(record) = self.record.as_mut() {
+                        record.holder_node_ids = replicated_node_ids;
+                    }
                     self.state = CreateMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
                         read: false
@@ -303,7 +327,7 @@ impl Operation for CreateMetadataDocumentOperation {
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
                     self.fail_without_cleanup(error.into())
                 }
-                other => self.unexpected_event("metadata create result", format!("{other:?}")),
+                other => self.unexpected_event("metadata bootstrap result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {

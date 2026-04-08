@@ -61,7 +61,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let task_handle = TaskHandle::new();
     let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
-    let metadata_handle = MetadataHandle::new(&config.metadata_storage_path, config.node_id)?;
+    let metadata_handle = MetadataHandle::new(
+        &config.metadata_storage_path,
+        config.node_id,
+        storage_handle.clone(),
+        Some(net_handle.clone()),
+    )?;
     let blob_handle = BlobHandler::new(
         BackendConfig {
             backend_type: FileSystem,

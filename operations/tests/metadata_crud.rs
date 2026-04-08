@@ -133,7 +133,12 @@ fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     let metadata_dir = tempfile::tempdir()?;
     let storage_handle = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
     let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
-    let metadata_handle = MetadataHandle::new(metadata_dir.path(), node_id)?;
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        node_id,
+        storage_handle.clone(),
+        None,
+    )?;
     let actor = Actor {
         node_id,
         user_id: Ulid::new(),

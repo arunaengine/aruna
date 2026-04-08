@@ -94,7 +94,7 @@ pub async fn run_accept_loop(
                                 );
                             }
                         }
-                        Some(alpn @ (Alpn::Bao | Alpn::Automerge)) => {
+                        Some(alpn @ (Alpn::Bao | Alpn::Automerge | Alpn::Metadata)) => {
                             let (send, recv) = match conn.accept_bi().await {
                                 Ok(streams) => streams,
                                 Err(_) => return,

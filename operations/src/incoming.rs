@@ -102,6 +102,15 @@ impl InboundEventHandler for OperationsInboundHandler {
                         error!(error = ?err, "Failed to process inbound automerge stream event");
                     }
                 }
+                Alpn::Metadata => {
+                    let Some(metadata_handle) = self.context.metadata_handle.clone() else {
+                        warn!(node_id = %node_id, "Dropping inbound metadata stream without metadata handle");
+                        return;
+                    };
+                    if let Err(err) = metadata_handle.handle_inbound_stream(stream, node_id).await {
+                        error!(error = ?err, "Failed to process inbound metadata stream");
+                    }
+                }
                 Alpn::Dht | Alpn::Gossip => {
                     warn!(
                         node_id = %node_id,

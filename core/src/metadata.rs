@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::structs::MetadataRegistryRecord;
+use crate::NodeId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
@@ -169,6 +170,10 @@ pub enum MetadataEffect {
     CompactSnapshot {
         graph_iri: String,
     },
+    ReplicateBootstrap {
+        record: MetadataRegistryRecord,
+        policy: MetadataGraphPolicy,
+    },
     ImportCompactSnapshot {
         snapshot: MetadataCompactSnapshot,
         policy: MetadataGraphPolicy,
@@ -234,6 +239,10 @@ pub enum MetadataEvent {
     CompactSnapshotResult {
         graph_iri: String,
         snapshot: MetadataCompactSnapshot,
+    },
+    BootstrapReplicated {
+        graph_iri: String,
+        replicated_node_ids: Vec<NodeId>,
     },
     CompactSnapshotImported {
         graph_iri: String,

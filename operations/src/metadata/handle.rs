@@ -1,10 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use aruna_core::alpn::Alpn;
 use aruna_core::NodeId;
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{
     MetadataBatch, MetadataCompactSnapshot, MetadataCompactSnapshotQuadState,
@@ -12,16 +14,34 @@ use aruna_core::metadata::{
     MetadataGraphPolicy, MetadataQuadOp, MetadataQueryResults, MetadataRoCratePage,
     MetadataSearchHit, MetadataVectorClock,
 };
+use aruna_core::structs::MetadataRegistryRecord;
+use aruna_net::NetHandle;
+use aruna_net::streams::BiStream;
+use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleNode, CreateCrateRequest, GraphId, GraphPolicy,
     QueryResults,
 };
+use tokio::time::timeout;
+use tracing::warn;
+
+use super::protocol::{MetadataTransportMessage, read_message, write_message};
+use super::repository::{write_document_index_effect, write_holders_effect, write_registry_effect};
+
+const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct MetadataHandle {
-    inner: Arc<CraqleNode>,
+    inner: Arc<MetadataInner>,
+}
+
+struct MetadataInner {
+    node: Arc<CraqleNode>,
+    storage_handle: StorageHandle,
+    net_handle: Option<NetHandle>,
+    local_node_id: NodeId,
 }
 
 impl std::fmt::Debug for MetadataHandle {
@@ -31,24 +51,152 @@ impl std::fmt::Debug for MetadataHandle {
 }
 
 impl MetadataHandle {
-    pub fn new(path: impl AsRef<Path>, node_id: NodeId) -> Result<Self, MetadataError> {
+    pub fn new(
+        path: impl AsRef<Path>,
+        node_id: NodeId,
+        storage_handle: StorageHandle,
+        net_handle: Option<NetHandle>,
+    ) -> Result<Self, MetadataError> {
         let actor = ActorId::from_bytes(*node_id.as_bytes());
         let node = CraqleNode::open_with_actor(path, actor)
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
         Ok(Self {
-            inner: Arc::new(node),
+            inner: Arc::new(MetadataInner {
+                node: Arc::new(node),
+                storage_handle,
+                net_handle,
+                local_node_id: node_id,
+            }),
         })
     }
 
     pub async fn send_metadata_effect(&self, effect: MetadataEffect) -> Event {
         let graph_iri = effect_graph_iri(&effect);
-        let node = self.inner.clone();
-        match tokio::task::spawn_blocking(move || handle_effect(node, effect)).await {
-            Ok(event) => Event::Metadata(event),
-            Err(error) => Event::Metadata(MetadataEvent::Error {
+        match effect {
+            MetadataEffect::ReplicateBootstrap { record, policy } => {
+                Event::Metadata(self.replicate_bootstrap(record, policy).await)
+            }
+            other => {
+                let inner = self.inner.clone();
+                match tokio::task::spawn_blocking(move || handle_effect(inner, other)).await {
+                    Ok(event) => Event::Metadata(event),
+                    Err(error) => Event::Metadata(MetadataEvent::Error {
+                        graph_iri,
+                        error: MetadataError::TaskJoin(error.to_string()),
+                    }),
+                }
+            }
+        }
+    }
+
+    pub async fn handle_inbound_stream(
+        &self,
+        mut stream: BiStream,
+        _peer: NodeId,
+    ) -> Result<(), MetadataError> {
+        let message = read_transport_message(&mut stream).await?;
+
+        let response = match message {
+            MetadataTransportMessage::Bootstrap { snapshot, policy } => {
+                match import_snapshot(self.inner.clone(), snapshot, policy).await {
+                    Ok(()) => MetadataTransportMessage::Ack,
+                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                }
+            }
+            MetadataTransportMessage::UpsertRecord { record } => {
+                match persist_replica_record(self.inner.storage_handle.clone(), &record).await {
+                    Ok(()) => MetadataTransportMessage::Ack,
+                    Err(error) => {
+                        let _ = cleanup_replica_graph(self.inner.clone(), &record.graph_iri).await;
+                        MetadataTransportMessage::Reject(error.to_string())
+                    }
+                }
+            }
+            MetadataTransportMessage::Ack | MetadataTransportMessage::Reject(_) => {
+                MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
+            }
+        };
+
+        if let Err(error) = drain_request_stream(&mut stream).await {
+            return Err(error);
+        }
+
+        let _ = write_transport_message(&mut stream, &response).await;
+        close_stream(&mut stream).await;
+        Ok(())
+    }
+
+    async fn replicate_bootstrap(
+        &self,
+        mut record: MetadataRegistryRecord,
+        policy: MetadataGraphPolicy,
+    ) -> MetadataEvent {
+        let graph_iri = record.graph_iri.clone();
+        let Some(net_handle) = self.inner.net_handle.clone() else {
+            record.holder_node_ids = vec![self.inner.local_node_id];
+            return MetadataEvent::BootstrapReplicated {
                 graph_iri,
-                error: MetadataError::TaskJoin(error.to_string()),
-            }),
+                replicated_node_ids: record.holder_node_ids,
+            };
+        };
+
+        let snapshot = match export_compact_snapshot(self.inner.clone(), &graph_iri).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return MetadataEvent::Error {
+                    graph_iri: Some(graph_iri),
+                    error,
+                };
+            }
+        };
+
+        let mut remote_targets = Vec::new();
+        let mut seen = HashSet::new();
+        for node_id in &record.holder_node_ids {
+            if *node_id == self.inner.local_node_id || !seen.insert(*node_id) {
+                continue;
+            }
+            remote_targets.push(*node_id);
+        }
+
+        let mut bootstrapped = Vec::new();
+        for node_id in remote_targets {
+            match send_bootstrap_snapshot(&net_handle, node_id, snapshot.clone(), policy.clone()).await {
+                Ok(()) => bootstrapped.push(node_id),
+                Err(error) => warn!(node_id = %node_id, error = %error, "metadata bootstrap snapshot failed"),
+            }
+        }
+
+        let mut provisional_holders = vec![self.inner.local_node_id];
+        provisional_holders.extend(bootstrapped.iter().copied());
+        record.holder_node_ids = provisional_holders.clone();
+
+        let mut confirmed = Vec::new();
+        for node_id in bootstrapped {
+            match send_upsert_record(&net_handle, node_id, record.clone()).await {
+                Ok(()) => confirmed.push(node_id),
+                Err(error) => warn!(node_id = %node_id, error = %error, "metadata bootstrap record sync failed"),
+            }
+        }
+
+        if confirmed.len() != provisional_holders.len().saturating_sub(1) {
+            let mut corrected = record.clone();
+            corrected.holder_node_ids = vec![self.inner.local_node_id];
+            corrected.holder_node_ids.extend(confirmed.iter().copied());
+            for node_id in &confirmed {
+                if let Err(error) = send_upsert_record(&net_handle, *node_id, corrected.clone()).await {
+                    warn!(node_id = %node_id, error = %error, "metadata holder correction failed");
+                }
+            }
+            return MetadataEvent::BootstrapReplicated {
+                graph_iri,
+                replicated_node_ids: corrected.holder_node_ids,
+            };
+        }
+
+        MetadataEvent::BootstrapReplicated {
+            graph_iri,
+            replicated_node_ids: record.holder_node_ids,
         }
     }
 }
@@ -66,9 +214,10 @@ impl Handle for MetadataHandle {
     }
 }
 
-fn handle_effect(node: Arc<CraqleNode>, effect: MetadataEffect) -> MetadataEvent {
+fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataEvent {
     let auth = AllowAllAuthorizer;
     let graph_iri = effect_graph_iri(&effect);
+    let node = inner.node.clone();
     let result = match effect {
         MetadataEffect::CreateCrate { request } => node
             .create_crate(&auth, craqle_create_request(request.clone()))
@@ -181,6 +330,7 @@ fn handle_effect(node: Arc<CraqleNode>, effect: MetadataEffect) -> MetadataEvent
                 graph_iri,
                 snapshot: metadata_compact_snapshot_from_craqle(snapshot),
             }),
+        MetadataEffect::ReplicateBootstrap { .. } => unreachable!("handled asynchronously"),
         MetadataEffect::ImportCompactSnapshot { snapshot, policy } => {
             let graph_iri = snapshot.graph_iri.clone();
             node.import_compact_graph_snapshot(
@@ -215,6 +365,7 @@ fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::VectorClock { graph_iri }
         | MetadataEffect::CompactSnapshot { graph_iri } => Some(graph_iri.clone()),
         MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
+        MetadataEffect::ReplicateBootstrap { record, .. } => Some(record.graph_iri.clone()),
         MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris.first().cloned(),
         MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris.first().cloned(),
         MetadataEffect::CatchupBatches { graph_iri, .. } => Some(graph_iri.clone()),
@@ -458,4 +609,212 @@ fn metadata_search_hit_from_craqle(hit: craqle::SearchHit) -> MetadataSearchHit 
         subject_iri: hit.subject_iri,
         score: hit.score,
     }
+}
+
+async fn export_compact_snapshot(
+    inner: Arc<MetadataInner>,
+    graph_iri: &str,
+) -> Result<MetadataCompactSnapshot, MetadataError> {
+    let graph_iri = graph_iri.to_string();
+    tokio::task::spawn_blocking(move || {
+        inner
+            .node
+            .compact_graph_snapshot(&GraphId::new(&graph_iri))
+            .map(metadata_compact_snapshot_from_craqle)
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+}
+
+async fn import_snapshot(
+    inner: Arc<MetadataInner>,
+    snapshot: MetadataCompactSnapshot,
+    policy: MetadataGraphPolicy,
+) -> Result<(), MetadataError> {
+    tokio::task::spawn_blocking(move || {
+        inner
+            .node
+            .import_compact_graph_snapshot(
+                &craqle_compact_snapshot(snapshot),
+                craqle_graph_policy(policy),
+            )
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+}
+
+async fn cleanup_replica_graph(inner: Arc<MetadataInner>, graph_iri: &str) -> Result<(), MetadataError> {
+    let graph_iri = graph_iri.to_string();
+    tokio::task::spawn_blocking(move || {
+        inner
+            .node
+            .delete_graph_unchecked(&GraphId::new(&graph_iri))
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+}
+
+async fn persist_replica_record(
+    storage_handle: StorageHandle,
+    record: &MetadataRegistryRecord,
+) -> Result<(), MetadataError> {
+    let txn_id = match storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(MetadataError::Backend(error.to_string()));
+        }
+        other => {
+            return Err(MetadataError::Backend(format!(
+                "unexpected storage start transaction event: {other:?}"
+            )));
+        }
+    };
+
+    let result = async {
+        write_storage_effect(
+            &storage_handle,
+            write_registry_effect(record, Some(txn_id))
+                .map_err(|error| MetadataError::Backend(error.to_string()))?,
+            "metadata registry write",
+        )
+        .await?;
+        write_storage_effect(
+            &storage_handle,
+            write_document_index_effect(record, Some(txn_id))
+                .map_err(|error| MetadataError::Backend(error.to_string()))?,
+            "metadata document index write",
+        )
+        .await?;
+        write_storage_effect(
+            &storage_handle,
+            write_holders_effect(record, Some(txn_id))
+                .map_err(|error| MetadataError::Backend(error.to_string()))?,
+            "metadata holders write",
+        )
+        .await?;
+
+        match storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => {
+                Err(MetadataError::Backend(error.to_string()))
+            }
+            other => Err(MetadataError::Backend(format!(
+                "unexpected storage commit event: {other:?}"
+            ))),
+        }
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+    }
+    result
+}
+
+async fn write_storage_effect(
+    storage_handle: &StorageHandle,
+    effect: Effect,
+    label: &str,
+) -> Result<(), MetadataError> {
+    match storage_handle.send_effect(effect).await {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(MetadataError::Backend(error.to_string()))
+        }
+        other => Err(MetadataError::Backend(format!(
+            "unexpected {label} event: {other:?}"
+        ))),
+    }
+}
+
+async fn send_bootstrap_snapshot(
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    snapshot: MetadataCompactSnapshot,
+    policy: MetadataGraphPolicy,
+) -> Result<(), MetadataError> {
+    let mut stream = net_handle
+        .open_stream(node_id, Alpn::Metadata)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    write_transport_message(
+        &mut stream,
+        &MetadataTransportMessage::Bootstrap { snapshot, policy },
+    )
+    .await?;
+    wait_for_request_delivery(&mut stream).await
+}
+
+async fn send_upsert_record(
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    record: MetadataRegistryRecord,
+) -> Result<(), MetadataError> {
+    let mut stream = net_handle
+        .open_stream(node_id, Alpn::Metadata)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    write_transport_message(&mut stream, &MetadataTransportMessage::UpsertRecord { record }).await?;
+    wait_for_request_delivery(&mut stream).await
+}
+
+async fn write_transport_message(
+    stream: &mut BiStream,
+    message: &MetadataTransportMessage,
+) -> Result<(), MetadataError> {
+    let result: Result<Result<(), String>, tokio::time::error::Elapsed> =
+        timeout(METADATA_IO_TIMEOUT, write_message(stream, message)).await;
+    result
+        .map_err(|_| MetadataError::Backend("timed out writing metadata message".to_string()))?
+        .map_err(MetadataError::Backend)
+}
+
+async fn read_transport_message(
+    stream: &mut BiStream,
+) -> Result<MetadataTransportMessage, MetadataError> {
+    let result: Result<Result<MetadataTransportMessage, String>, tokio::time::error::Elapsed> =
+        timeout(METADATA_IO_TIMEOUT, read_message(stream)).await;
+    result
+        .map_err(|_| MetadataError::Backend("timed out waiting for metadata message".to_string()))?
+        .map_err(MetadataError::Backend)
+}
+
+async fn close_stream(stream: &mut BiStream) {
+    let _ = stream.0.finish();
+}
+
+async fn wait_for_request_delivery(stream: &mut BiStream) -> Result<(), MetadataError> {
+    stream
+        .0
+        .finish()
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    match timeout(METADATA_IO_TIMEOUT, stream.0.stopped()).await {
+        Ok(Ok(None)) => Ok(()),
+        Ok(Ok(Some(code))) => Err(MetadataError::Backend(format!(
+            "metadata stream stopped by peer: {code}"
+        ))),
+        Ok(Err(error)) => Err(MetadataError::Backend(error.to_string())),
+        Err(_) => Err(MetadataError::Backend(
+            "timed out waiting for metadata request delivery".to_string(),
+        )),
+    }
+}
+
+async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError> {
+    timeout(METADATA_IO_TIMEOUT, stream.1.read_to_end(1))
+        .await
+        .map_err(|_| MetadataError::Backend("timed out draining metadata request stream".to_string()))?
+        .map(|_| ())
+        .map_err(|error| MetadataError::Backend(error.to_string()))
 }
