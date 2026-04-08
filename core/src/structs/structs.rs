@@ -1,14 +1,14 @@
-use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::realm::RealmId;
 use crate::types::autosurgeon_ulid;
 use crate::types::{RoleId, UserId};
+use crate::NodeId;
 use autosurgeon::{Hydrate, Reconcile};
 use core::fmt;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
@@ -147,7 +147,7 @@ impl NodeCapabilities {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthContext {
     pub user_id: UserId,
     pub realm_id: RealmId,

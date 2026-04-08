@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::structs::MetadataRegistryRecord;
+use crate::structs::{AuthContext, MetadataRegistryRecord};
 use crate::NodeId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +54,9 @@ pub struct MetadataRoCratePage {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetadataSearchHit {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
     pub graph_iri: String,
     pub subject_iri: String,
     pub score: f32,
@@ -129,12 +132,14 @@ pub enum MetadataEffect {
         limit: usize,
     },
     SearchGraphs {
-        graph_iris: Vec<String>,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
     },
     QueryGraphs {
-        graph_iris: Vec<String>,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
         sparql: String,
     },
     DeleteGraph {

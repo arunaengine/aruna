@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +13,7 @@ use aruna_core::metadata::{
     MetadataEvent, MetadataGraphPolicy, MetadataQuadOp, MetadataQueryResults,
     MetadataRoCratePage, MetadataSearchHit, MetadataVectorClock,
 };
-use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::StorageHandle;
@@ -29,8 +29,11 @@ use tracing::warn;
 use super::protocol::{MetadataTransportMessage, read_message, write_message};
 use super::repository::{
     delete_document_index_effect, delete_holders_effect, delete_registry_effect,
-    write_document_index_effect, write_holders_effect, write_registry_effect,
+    iter_all_registry_effect, parse_registry_iter, write_document_index_effect,
+    write_holders_effect, write_registry_effect,
 };
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::driver::{DriverContext, drive};
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -78,6 +81,35 @@ impl MetadataHandle {
             MetadataEffect::ReplicateBootstrap { record } => {
                 Event::Metadata(self.replicate_bootstrap(record).await)
             }
+            MetadataEffect::QueryGraphs {
+                auth_context,
+                graph_iris,
+                sparql,
+            } => Event::Metadata(match self
+                .query_authorized_local(auth_context, graph_iris, sparql)
+                .await
+            {
+                Ok(results) => MetadataEvent::QueryResult { results },
+                Err(error) => MetadataEvent::Error {
+                    graph_iri: None,
+                    error,
+                },
+            }),
+            MetadataEffect::SearchGraphs {
+                auth_context,
+                graph_iris,
+                query,
+                limit,
+            } => Event::Metadata(match self
+                .search_authorized_local(auth_context, graph_iris, query, limit)
+                .await
+            {
+                Ok(hits) => MetadataEvent::SearchResult { hits },
+                Err(error) => MetadataEvent::Error {
+                    graph_iri: None,
+                    error,
+                },
+            }),
             MetadataEffect::ReplicateBatch { record, batch } => {
                 Event::Metadata(self.replicate_batch(record, batch).await)
             }
@@ -114,6 +146,25 @@ impl MetadataHandle {
                     }
                 }
             }
+            MetadataTransportMessage::QueryGraphs {
+                auth_context,
+                graph_iris,
+                sparql,
+            } => {
+                match query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql).await {
+                    Ok(results) => MetadataTransportMessage::QueryResults { results },
+                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                }
+            }
+            MetadataTransportMessage::SearchGraphs {
+                auth_context,
+                graph_iris,
+                query,
+                limit,
+            } => match search_local_graphs(self.inner.clone(), auth_context, graph_iris, query, limit).await {
+                Ok(hits) => MetadataTransportMessage::SearchResults { hits },
+                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+            },
             MetadataTransportMessage::ApplyBatch { batch } => {
                 match apply_remote_batch(self.inner.clone(), batch).await {
                     Ok(()) => MetadataTransportMessage::Ack,
@@ -126,7 +177,10 @@ impl MetadataHandle {
                     Err(error) => MetadataTransportMessage::Reject(error.to_string()),
                 }
             }
-            MetadataTransportMessage::Ack | MetadataTransportMessage::Reject(_) => {
+            MetadataTransportMessage::QueryResults { .. }
+            | MetadataTransportMessage::SearchResults { .. }
+            | MetadataTransportMessage::Ack
+            | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
         };
@@ -138,6 +192,85 @@ impl MetadataHandle {
         let _ = write_transport_message(&mut stream, &response).await;
         close_stream(&mut stream).await;
         Ok(())
+    }
+
+    pub async fn query_authorized_local(
+        &self,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        sparql: String,
+    ) -> Result<MetadataQueryResults, MetadataError> {
+        query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql).await
+    }
+
+    pub async fn search_authorized_local(
+        &self,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+        search_local_graphs(self.inner.clone(), auth_context, graph_iris, query, limit).await
+    }
+
+    pub async fn request_remote_query_graphs(
+        &self,
+        node_id: NodeId,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        sparql: String,
+    ) -> Result<MetadataQueryResults, MetadataError> {
+        let Some(net_handle) = self.inner.net_handle.clone() else {
+            return Err(MetadataError::HandleMissing);
+        };
+        match send_request(
+            &net_handle,
+            node_id,
+            MetadataTransportMessage::QueryGraphs {
+                auth_context,
+                graph_iris,
+                sparql,
+            },
+        )
+        .await?
+        {
+            MetadataTransportMessage::QueryResults { results } => Ok(results),
+            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected metadata query response: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn request_remote_search_graphs(
+        &self,
+        node_id: NodeId,
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+    ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+        let Some(net_handle) = self.inner.net_handle.clone() else {
+            return Err(MetadataError::HandleMissing);
+        };
+        match send_request(
+            &net_handle,
+            node_id,
+            MetadataTransportMessage::SearchGraphs {
+                auth_context,
+                graph_iris,
+                query,
+                limit,
+            },
+        )
+        .await?
+        {
+            MetadataTransportMessage::SearchResults { hits } => Ok(hits),
+            MetadataTransportMessage::Reject(error) => Err(MetadataError::Backend(error)),
+            other => Err(MetadataError::Backend(format!(
+                "unexpected metadata search response: {other:?}"
+            ))),
+        }
     }
 
     async fn replicate_bootstrap(
@@ -349,29 +482,9 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
                 page: metadata_rocrate_page_from_craqle(page),
             })
         }
-        MetadataEffect::SearchGraphs {
-            graph_iris,
-            query,
-            limit,
-        } => {
-            let allowed: std::collections::HashSet<_> = graph_iris.into_iter().collect();
-            node.search(&auth, &query, limit)
-                .map(|hits| {
-                    MetadataEvent::SearchResult {
-                        hits: hits
-                            .into_iter()
-                            .filter(|hit| allowed.contains(&hit.graph_id))
-                            .take(limit)
-                            .map(metadata_search_hit_from_craqle)
-                            .collect(),
-                    }
-                })
+        MetadataEffect::SearchGraphs { .. } | MetadataEffect::QueryGraphs { .. } => {
+            unreachable!("handled asynchronously")
         }
-        MetadataEffect::QueryGraphs { graph_iris, sparql } => node
-            .query_graphs(&graph_ids(&graph_iris), &sparql)
-            .map(|results| MetadataEvent::QueryResult {
-                results: metadata_query_results_from_craqle(results),
-            }),
         MetadataEffect::DeleteGraph { graph_iri } => node
             .delete_graph_unchecked(&GraphId::new(&graph_iri))
             .map(|_| MetadataEvent::GraphDeleted { graph_iri }),
@@ -436,8 +549,12 @@ fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         MetadataEffect::ReplicateBootstrap { record }
         | MetadataEffect::ReplicateBatch { record, .. }
         | MetadataEffect::ReplicateDelete { record } => Some(record.graph_iri.clone()),
-        MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris.first().cloned(),
-        MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris.first().cloned(),
+        MetadataEffect::SearchGraphs { graph_iris, .. } => {
+            graph_iris.as_ref().and_then(|graph_iris| graph_iris.first().cloned())
+        }
+        MetadataEffect::QueryGraphs { graph_iris, .. } => {
+            graph_iris.as_ref().and_then(|graph_iris| graph_iris.first().cloned())
+        }
         MetadataEffect::CatchupBatches { graph_iri, .. } => Some(graph_iri.clone()),
         MetadataEffect::ApplyRemoteBatch { batch } => Some(batch.graph_iri.clone()),
         MetadataEffect::ListGraphs => None,
@@ -624,8 +741,14 @@ fn metadata_rocrate_page_from_craqle(page: craqle::RoCratePage) -> MetadataRoCra
     }
 }
 
-fn metadata_search_hit_from_craqle(hit: craqle::SearchHit) -> MetadataSearchHit {
+fn metadata_search_hit_from_craqle(
+    hit: craqle::SearchHit,
+    record: &MetadataRegistryRecord,
+) -> MetadataSearchHit {
     MetadataSearchHit {
+        document_id: record.document_id.to_string(),
+        group_id: record.group_id.to_string(),
+        document_path: record.document_path.clone(),
         graph_iri: hit.graph_id,
         subject_iri: hit.subject_iri,
         score: hit.score,
@@ -647,6 +770,143 @@ async fn export_catchup_batches(
     })
     .await
     .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+}
+
+async fn list_local_registry_records(
+    storage_handle: StorageHandle,
+) -> Result<Vec<MetadataRegistryRecord>, MetadataError> {
+    let mut records = Vec::new();
+    let mut start_after = None;
+    loop {
+        let event = storage_handle
+            .send_effect(iter_all_registry_effect(start_after.clone(), None))
+            .await;
+        let (mut page, next_start_after) = parse_registry_iter(event)
+            .map_err(|error| MetadataError::Backend(format!("metadata registry iteration failed: {error:?}")))?;
+        records.append(&mut page);
+        if let Some(cursor) = next_start_after {
+            start_after = Some(cursor);
+        } else {
+            return Ok(records);
+        }
+    }
+}
+
+async fn query_local_graphs(
+    inner: Arc<MetadataInner>,
+    auth_context: Option<AuthContext>,
+    graph_iris: Option<Vec<String>>,
+    sparql: String,
+) -> Result<MetadataQueryResults, MetadataError> {
+    let records = list_local_registry_records(inner.storage_handle.clone()).await?;
+    let allowed = select_authorized_graphs(inner.storage_handle.clone(), auth_context, records, graph_iris).await?;
+    tokio::task::spawn_blocking(move || {
+        inner
+            .node
+            .query_graphs(&graph_ids(&allowed), &sparql)
+            .map(metadata_query_results_from_craqle)
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+}
+
+async fn search_local_graphs(
+    inner: Arc<MetadataInner>,
+    auth_context: Option<AuthContext>,
+    graph_iris: Option<Vec<String>>,
+    query: String,
+    limit: usize,
+) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    let records = list_local_registry_records(inner.storage_handle.clone()).await?;
+    let allowed_records = select_authorized_records(inner.storage_handle.clone(), auth_context, records, graph_iris).await?;
+    tokio::task::spawn_blocking(move || {
+        let by_graph: HashMap<_, _> = allowed_records
+            .into_iter()
+            .map(|record| (record.graph_iri.clone(), record))
+            .collect();
+        inner
+            .node
+            .search(&AllowAllAuthorizer, &query, limit)
+            .map(|hits| {
+                hits.into_iter()
+                    .filter_map(|hit| by_graph.get(&hit.graph_id).map(|record| (hit, record)))
+                    .map(|(hit, record)| metadata_search_hit_from_craqle(hit, record))
+                    .collect()
+            })
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+}
+
+async fn select_authorized_graphs(
+    storage_handle: StorageHandle,
+    auth_context: Option<AuthContext>,
+    records: Vec<MetadataRegistryRecord>,
+    graph_filter: Option<Vec<String>>,
+) -> Result<Vec<String>, MetadataError> {
+    Ok(select_authorized_records(storage_handle, auth_context, records, graph_filter)
+        .await?
+        .into_iter()
+        .map(|record| record.graph_iri)
+        .collect())
+}
+
+async fn select_authorized_records(
+    storage_handle: StorageHandle,
+    auth_context: Option<AuthContext>,
+    records: Vec<MetadataRegistryRecord>,
+    graph_filter: Option<Vec<String>>,
+) -> Result<Vec<MetadataRegistryRecord>, MetadataError> {
+    let allowed_graphs = graph_filter.map(|graphs| graphs.into_iter().collect::<HashSet<_>>());
+    let mut visible = Vec::new();
+    for record in records {
+        if let Some(filter) = allowed_graphs.as_ref() {
+            if !filter.contains(&record.graph_iri) {
+                continue;
+            }
+        }
+        if can_read_record_locally(storage_handle.clone(), auth_context.clone(), &record).await? {
+            visible.push(record);
+        }
+    }
+    Ok(visible)
+}
+
+async fn can_read_record_locally(
+    storage_handle: StorageHandle,
+    auth_context: Option<AuthContext>,
+    record: &MetadataRegistryRecord,
+) -> Result<bool, MetadataError> {
+    if record.public {
+        return Ok(true);
+    }
+    let Some(auth_context) = auth_context else {
+        return Ok(false);
+    };
+    if auth_context.realm_id != record.realm_id {
+        return Ok(false);
+    }
+
+    let context = DriverContext {
+        storage_handle,
+        net_handle: None,
+        blob_handle: None,
+        automerge_handle: None,
+        metadata_handle: None,
+        task_handle: None,
+    };
+    drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context,
+            path: record.permission_path.clone(),
+            required_permission: Permission::READ,
+        }),
+        &context,
+    )
+    .await
+    .map_err(|error| MetadataError::Backend(error.to_string()))
 }
 
 async fn apply_remote_batch(
@@ -817,6 +1077,25 @@ async fn send_apply_batches(
         send_apply_batch(net_handle, node_id, batch.clone()).await?;
     }
     Ok(())
+}
+
+async fn send_request(
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    message: MetadataTransportMessage,
+) -> Result<MetadataTransportMessage, MetadataError> {
+    let mut stream = net_handle
+        .open_stream(node_id, Alpn::Metadata)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    write_transport_message(&mut stream, &message).await?;
+    stream
+        .0
+        .finish()
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    let response = read_transport_message(&mut stream).await?;
+    close_stream(&mut stream).await;
+    Ok(response)
 }
 
 async fn send_delete_record(

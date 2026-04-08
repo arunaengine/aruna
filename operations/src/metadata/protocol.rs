@@ -1,4 +1,6 @@
 use aruna_core::metadata::MetadataBatch;
+use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
+use aruna_core::structs::AuthContext;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
@@ -6,10 +8,27 @@ use tokio::io::AsyncWriteExt;
 
 const MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataTransportMessage {
     UpsertRecord {
         record: MetadataRegistryRecord,
+    },
+    QueryGraphs {
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        sparql: String,
+    },
+    QueryResults {
+        results: MetadataQueryResults,
+    },
+    SearchGraphs {
+        auth_context: Option<AuthContext>,
+        graph_iris: Option<Vec<String>>,
+        query: String,
+        limit: usize,
+    },
+    SearchResults {
+        hits: Vec<MetadataSearchHit>,
     },
     ApplyBatch {
         batch: MetadataBatch,

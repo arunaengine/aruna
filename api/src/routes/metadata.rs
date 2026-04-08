@@ -13,10 +13,9 @@ use aruna_operations::create_metadata_document::{
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::drive;
+use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
-use aruna_operations::metadata::repository::{
-    iter_all_registry_effect, parse_registry_iter, parse_registry_read, read_registry_by_document_effect,
-};
+use aruna_operations::metadata::repository::{parse_registry_read, read_registry_by_document_effect};
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentOperation,
 };
@@ -25,7 +24,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use ulid::Ulid;
 use url::form_urlencoded::Serializer;
@@ -141,6 +140,8 @@ pub struct MetadataSearchParams {
     pub q: String,
     #[serde(default)]
     pub limit: Option<usize>,
+    #[serde(default)]
+    pub mode: Option<MetadataQueryMode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -466,14 +467,16 @@ pub async fn query_metadata_document(
     Path(document_id): Path<String>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
-    ensure_supported_query_mode(&request.mode)?;
-    ensure_supported_query_form(&request.query)?;
-
     let document_id = parse_document_id(&document_id)?;
-    let record = load_metadata_record_by_document(&state, document_id).await?;
-    ensure_record_readable(&state, auth.as_ref(), &record).await?;
-
-    let results = run_query(&state, vec![record.graph_iri.clone()], request.query).await?;
+    ensure_supported_query_form(&request.query)?;
+    let results = run_query_distributed(
+        &state,
+        auth,
+        Some(vec![MetadataRegistryRecord::graph_iri_for(document_id)]),
+        request.query,
+        request.mode,
+    )
+    .await?;
     Ok((StatusCode::OK, Json(map_query_results(results)?)))
 }
 
@@ -493,19 +496,8 @@ pub async fn query_all_metadata(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
-    ensure_supported_query_mode(&request.mode)?;
     ensure_supported_query_form(&request.query)?;
-
-    let records = load_all_metadata_records(&state).await?;
-
-    let mut graph_iris = Vec::new();
-    for record in records {
-        if can_read_record(&state, auth.as_ref(), &record).await? {
-            graph_iris.push(record.graph_iri);
-        }
-    }
-
-    let results = run_query(&state, graph_iris, request.query).await?;
+    let results = run_query_distributed(&state, auth, None, request.query, request.mode).await?;
     Ok((StatusCode::OK, Json(map_query_results(results)?)))
 }
 
@@ -515,7 +507,8 @@ pub async fn query_all_metadata(
     tag = "metadata",
     params(
         ("q" = String, Query, description = "Search query"),
-        ("limit" = Option<usize>, Query, description = "Maximum number of hits")
+        ("limit" = Option<usize>, Query, description = "Maximum number of hits"),
+        ("mode" = Option<MetadataQueryMode>, Query, description = "Search mode: local or distributed")
     ),
     responses(
         (status = 200, description = "Metadata search hits", body = MetadataSearchResponse),
@@ -532,32 +525,11 @@ pub async fn search_metadata(
         return Err(ServerError::BadRequest);
     }
     let limit = params.limit.unwrap_or(25).clamp(1, 250);
-    let records = load_all_metadata_records(&state).await?;
-    let mut visible = Vec::new();
-    let mut by_graph = HashMap::new();
-    for record in records {
-        if can_read_record(&state, auth.as_ref(), &record).await? {
-            by_graph.insert(record.graph_iri.clone(), record.clone());
-            visible.push(record.graph_iri);
-        }
-    }
-    let hits = run_search(&state, visible, params.q, limit).await?;
+    let hits = run_search_distributed(&state, auth, None, params.q, limit, params.mode).await?;
     Ok((
         StatusCode::OK,
         Json(MetadataSearchResponse {
-            hits: hits
-                .into_iter()
-                .filter_map(|hit| {
-                    by_graph.get(&hit.graph_iri).map(|record| MetadataSearchHitResponse {
-                        document_id: record.document_id.to_string(),
-                        group_id: record.group_id.to_string(),
-                        document_path: record.document_path.clone(),
-                        graph_iri: hit.graph_iri,
-                        subject_iri: hit.subject_iri,
-                        score: hit.score,
-                    })
-                })
-                .collect(),
+            hits: hits.into_iter().map(map_search_hit).collect(),
         }),
     ))
 }
@@ -690,33 +662,6 @@ async fn load_metadata_record_by_document(
         Err(_) => Err(ServerError::InternalError(
             "failed to read metadata record".to_string(),
         )),
-    }
-}
-
-async fn load_all_metadata_records(state: &ServerState) -> ServerResult<Vec<MetadataRegistryRecord>> {
-    let mut records = Vec::new();
-    let mut start_after = None;
-    loop {
-        let event = state
-            .get_ctx()
-            .storage_handle
-            .send_effect(iter_all_registry_effect(start_after.clone(), None))
-            .await;
-        match parse_registry_iter(event) {
-            Ok((mut page, next_start_after)) => {
-                records.append(&mut page);
-                if let Some(cursor) = next_start_after {
-                    start_after = Some(cursor);
-                } else {
-                    return Ok(records);
-                }
-            }
-            Err(_) => {
-                return Err(ServerError::InternalError(
-                    "failed to iterate metadata records".to_string(),
-                ));
-            }
-        }
     }
 }
 
@@ -880,66 +825,9 @@ fn rewrite_identifier_value(
     }
 }
 
-async fn run_query(
-    state: &ServerState,
-    graph_iris: Vec<String>,
-    query: String,
-) -> ServerResult<MetadataQueryResults> {
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    match handle
-        .send_effect(Effect::Metadata(MetadataEffect::QueryGraphs {
-            graph_iris,
-            sparql: query,
-        }))
-        .await
-    {
-        Event::Metadata(MetadataEvent::QueryResult { results }) => Ok(results),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected metadata query event: {other:?}"
-        ))),
-    }
-}
-
-async fn run_search(
-    state: &ServerState,
-    graph_iris: Vec<String>,
-    query: String,
-    limit: usize,
-) -> ServerResult<Vec<MetadataSearchHit>> {
-    let handle = state
-        .get_ctx()
-        .metadata_handle
-        .clone()
-        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
-    match handle
-        .send_effect(Effect::Metadata(MetadataEffect::SearchGraphs {
-            graph_iris,
-            query,
-            limit,
-        }))
-        .await
-    {
-        Event::Metadata(MetadataEvent::SearchResult { hits }) => Ok(hits),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
-        other => Err(ServerError::InternalError(format!(
-            "unexpected metadata search event: {other:?}"
-        ))),
-    }
-}
-
 fn ensure_supported_query_mode(mode: &Option<MetadataQueryMode>) -> ServerResult<()> {
     match mode {
-        None | Some(MetadataQueryMode::Local) => Ok(()),
-        Some(MetadataQueryMode::Distributed) => Err(ServerError::Unimplemented),
+        None | Some(MetadataQueryMode::Local) | Some(MetadataQueryMode::Distributed) => Ok(()),
     }
 }
 
@@ -959,6 +847,183 @@ fn map_query_results(results: MetadataQueryResults) -> ServerResult<MetadataQuer
         )),
         MetadataQueryResults::Boolean(value) => Ok(MetadataQueryResponse::Boolean(value)),
         MetadataQueryResults::Graph(_) => Err(ServerError::BadRequest),
+    }
+}
+
+async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
+    let nodes = drive(GetRealmNodesOperation::new(state.get_realm_id()), &state.get_ctx())
+        .await
+        .unwrap_or_default();
+    let mut nodes = nodes.into_iter().collect::<Vec<_>>();
+    if !nodes.contains(&state.get_node_id()) {
+        nodes.push(state.get_node_id());
+    }
+    Ok(nodes)
+}
+
+async fn run_query_distributed(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    graph_iris: Option<Vec<String>>,
+    query: String,
+    mode: Option<MetadataQueryMode>,
+) -> ServerResult<MetadataQueryResults> {
+    ensure_supported_query_mode(&mode)?;
+    let handle = state
+        .get_ctx()
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
+    let query_form = query_form(&query).ok_or(ServerError::BadRequest)?;
+
+    let mut parts = Vec::new();
+    match mode.unwrap_or(MetadataQueryMode::Distributed) {
+        MetadataQueryMode::Local => {
+            parts.push(
+                handle
+                    .query_authorized_local(auth, graph_iris, query)
+                    .await
+                    .map_err(|err| ServerError::InternalError(err.to_string()))?,
+            );
+        }
+        MetadataQueryMode::Distributed => {
+            let nodes = load_realm_nodes(state).await?;
+            for node_id in nodes {
+                let result = if node_id == state.get_node_id() {
+                    handle
+                        .query_authorized_local(auth.clone(), graph_iris.clone(), query.clone())
+                        .await
+                } else {
+                    handle
+                        .request_remote_query_graphs(
+                            node_id,
+                            auth.clone(),
+                            graph_iris.clone(),
+                            query.clone(),
+                        )
+                        .await
+                };
+                if let Ok(result) = result {
+                    parts.push(result);
+                }
+            }
+        }
+    }
+
+    aggregate_query_results(parts, query_form)
+}
+
+async fn run_search_distributed(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    graph_iris: Option<Vec<String>>,
+    query: String,
+    limit: usize,
+    mode: Option<MetadataQueryMode>,
+) -> ServerResult<Vec<MetadataSearchHit>> {
+    ensure_supported_query_mode(&mode)?;
+    let handle = state
+        .get_ctx()
+        .metadata_handle
+        .clone()
+        .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
+
+    let mut hits = Vec::new();
+    match mode.unwrap_or(MetadataQueryMode::Distributed) {
+        MetadataQueryMode::Local => {
+            hits.extend(
+                handle
+                    .search_authorized_local(auth, graph_iris, query, limit)
+                    .await
+                    .map_err(|err| ServerError::InternalError(err.to_string()))?,
+            );
+        }
+        MetadataQueryMode::Distributed => {
+            let nodes = load_realm_nodes(state).await?;
+            for node_id in nodes {
+                let result = if node_id == state.get_node_id() {
+                    handle
+                        .search_authorized_local(auth.clone(), graph_iris.clone(), query.clone(), limit)
+                        .await
+                } else {
+                    handle
+                        .request_remote_search_graphs(
+                            node_id,
+                            auth.clone(),
+                            graph_iris.clone(),
+                            query.clone(),
+                            limit,
+                        )
+                        .await
+                };
+                if let Ok(result) = result {
+                    hits.extend(result);
+                }
+            }
+        }
+    }
+
+    Ok(deduplicate_search_hits(hits, limit))
+}
+
+fn aggregate_query_results(
+    results: Vec<MetadataQueryResults>,
+    query_form: QueryForm,
+) -> ServerResult<MetadataQueryResults> {
+    match query_form {
+        QueryForm::Ask => Ok(MetadataQueryResults::Boolean(results.into_iter().any(|result| {
+            matches!(result, MetadataQueryResults::Boolean(true))
+        }))),
+        QueryForm::Select => {
+            let mut seen = HashSet::new();
+            let mut merged = Vec::new();
+            for result in results {
+                let MetadataQueryResults::Solutions(rows) = result else {
+                    continue;
+                };
+                for row in rows {
+                    let key = serde_json::to_string(&row)
+                        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+                    if seen.insert(key) {
+                        merged.push(row);
+                    }
+                }
+            }
+            Ok(MetadataQueryResults::Solutions(merged))
+        }
+    }
+}
+
+fn deduplicate_search_hits(
+    hits: Vec<MetadataSearchHit>,
+    limit: usize,
+) -> Vec<MetadataSearchHit> {
+    let mut deduped = HashMap::new();
+    for hit in hits {
+        let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
+        deduped
+            .entry(key)
+            .and_modify(|existing: &mut MetadataSearchHit| {
+                if hit.score > existing.score {
+                    *existing = hit.clone();
+                }
+            })
+            .or_insert(hit);
+    }
+    let mut hits = deduped.into_values().collect::<Vec<_>>();
+    hits.sort_by(|left, right| right.score.partial_cmp(&left.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(limit);
+    hits
+}
+
+fn map_search_hit(hit: MetadataSearchHit) -> MetadataSearchHitResponse {
+    MetadataSearchHitResponse {
+        document_id: hit.document_id,
+        group_id: hit.group_id,
+        document_path: hit.document_path,
+        graph_iri: hit.graph_iri,
+        subject_iri: hit.subject_iri,
+        score: hit.score,
     }
 }
 
@@ -1008,6 +1073,7 @@ mod tests {
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
     use aruna_storage::storage;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
 
     struct TestState {
@@ -1174,6 +1240,7 @@ mod tests {
             Query(MetadataSearchParams {
                 q: "Public".to_string(),
                 limit: Some(10),
+                mode: None,
             }),
         )
         .await
@@ -1218,6 +1285,65 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[test]
+    fn deduplicates_select_rows_from_multiple_nodes() {
+        let results = aggregate_query_results(
+            vec![
+                MetadataQueryResults::Solutions(vec![
+                    BTreeMap::from([(String::from("s"), String::from("<urn:a>"))]),
+                    BTreeMap::from([(String::from("s"), String::from("<urn:b>"))]),
+                ]),
+                MetadataQueryResults::Solutions(vec![
+                    BTreeMap::from([(String::from("s"), String::from("<urn:a>"))]),
+                ]),
+            ],
+            QueryForm::Select,
+        )
+        .unwrap();
+
+        let MetadataQueryResults::Solutions(rows) = results else {
+            panic!("expected solutions");
+        };
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn deduplicates_search_hits_across_replicas() {
+        let hits = deduplicate_search_hits(
+            vec![
+                MetadataSearchHit {
+                    document_id: "01A".to_string(),
+                    group_id: "01G".to_string(),
+                    document_path: "datasets/a".to_string(),
+                    graph_iri: "https://w3id.org/aruna/01A".to_string(),
+                    subject_iri: "./file.txt".to_string(),
+                    score: 0.5,
+                },
+                MetadataSearchHit {
+                    document_id: "01A".to_string(),
+                    group_id: "01G".to_string(),
+                    document_path: "datasets/a".to_string(),
+                    graph_iri: "https://w3id.org/aruna/01A".to_string(),
+                    subject_iri: "./file.txt".to_string(),
+                    score: 0.8,
+                },
+                MetadataSearchHit {
+                    document_id: "01B".to_string(),
+                    group_id: "01G".to_string(),
+                    document_path: "datasets/b".to_string(),
+                    graph_iri: "https://w3id.org/aruna/01B".to_string(),
+                    subject_iri: "./file.txt".to_string(),
+                    score: 0.7,
+                },
+            ],
+            10,
+        );
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].graph_iri, "https://w3id.org/aruna/01A");
+        assert_eq!(hits[0].score, 0.8);
     }
 
     async fn setup_state() -> TestState {
