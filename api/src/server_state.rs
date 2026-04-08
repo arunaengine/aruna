@@ -32,9 +32,9 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use utoipa_swagger_ui::SwaggerUi;
 
-const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
-const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
-const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
+pub const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
+pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
+pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
 
 #[derive(Clone, Debug)]
@@ -324,7 +324,7 @@ impl ServerState {
     }
 }
 
-async fn load_persisted_state<T>(driver_ctx: &DriverContext, key: &[u8]) -> Option<T>
+pub async fn load_persisted_state<T>(driver_ctx: &DriverContext, key: &[u8]) -> Option<T>
 where
     T: DeserializeOwned,
 {
