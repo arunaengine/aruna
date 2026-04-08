@@ -21,7 +21,8 @@ use ulid::Ulid;
 
 use crate::automerge::repository::read_effect;
 use crate::metadata::repository::{
-    read_registry_effect, write_audit_effect, write_holders_effect, write_registry_effect,
+    read_registry_by_document_effect, write_audit_effect, write_document_index_effect,
+    write_holders_effect, write_registry_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -29,6 +30,7 @@ pub struct CreateMetadataDocumentConfig {
     pub actor: Actor,
     pub group_id: GroupId,
     pub document_id: Ulid,
+    pub document_path: String,
     pub name: String,
     pub description: String,
     pub date_published: String,
@@ -56,6 +58,7 @@ enum CreateMetadataDocumentState {
     CreateGraph,
     StartTransaction,
     WriteRegistry,
+    WriteDocumentIndex,
     WriteHolders,
     WriteAudit,
     CommitTransaction,
@@ -111,7 +114,7 @@ impl CreateMetadataDocumentOperation {
         MetadataRegistryRecord::permission_path_for(
             &self.config.actor.realm_id,
             self.config.group_id,
-            self.config.document_id,
+            &self.config.document_path,
         )
     }
 
@@ -125,6 +128,9 @@ impl CreateMetadataDocumentOperation {
             realm_id: self.config.actor.realm_id.clone(),
             group_id: self.config.group_id,
             document_id: self.config.document_id,
+            document_path: MetadataRegistryRecord::normalize_document_path(
+                &self.config.document_path,
+            ),
             graph_iri: self.graph_iri(),
             public: self.config.public,
             permission_path: self.permission_path(),
@@ -191,8 +197,7 @@ impl Operation for CreateMetadataDocumentOperation {
 
     fn start(&mut self) -> Effects {
         self.state = CreateMetadataDocumentState::CheckExisting;
-        smallvec![read_registry_effect(
-            self.config.group_id,
+        smallvec![read_registry_by_document_effect(
             self.config.document_id,
             None
         )]
@@ -326,6 +331,25 @@ impl Operation for CreateMetadataDocumentOperation {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(CreateMetadataDocumentError::MissingTransaction);
                     };
+                    self.state = CreateMetadataDocumentState::WriteDocumentIndex;
+                    match write_document_index_effect(record, Some(txn_id)) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(CreateMetadataDocumentError::ConversionError(error))
+                        }
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("registry write result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::WriteDocumentIndex => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
                     self.state = CreateMetadataDocumentState::WriteHolders;
                     match write_holders_effect(record, Some(txn_id)) {
                         Ok(effect) => smallvec![effect],
@@ -335,7 +359,7 @@ impl Operation for CreateMetadataDocumentOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("registry write result", format!("{other:?}")),
+                other => self.unexpected_event("document index write result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::WriteHolders => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {

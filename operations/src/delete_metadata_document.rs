@@ -10,8 +10,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::repository::{
-    delete_holders_effect, delete_registry_effect, parse_registry_read, read_registry_effect,
-    write_audit_effect, StorageReadError,
+    delete_document_index_effect, delete_holders_effect, delete_registry_effect,
+    parse_registry_read, read_registry_effect, write_audit_effect, StorageReadError,
 };
 
 #[derive(Debug, PartialEq)]
@@ -32,6 +32,7 @@ enum DeleteMetadataDocumentState {
     DeleteGraph,
     StartTransaction,
     DeleteRegistry,
+    DeleteDocumentIndex,
     DeleteHolders,
     WriteAudit,
     CommitTransaction,
@@ -155,6 +156,17 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
                     };
+                    self.state = DeleteMetadataDocumentState::DeleteDocumentIndex;
+                    smallvec![delete_document_index_effect(self.document_id, Some(txn_id))]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("registry delete result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::DeleteDocumentIndex => match event {
+                Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
                     self.state = DeleteMetadataDocumentState::DeleteHolders;
                     smallvec![delete_holders_effect(
                         self.group_id,
@@ -163,7 +175,9 @@ impl Operation for DeleteMetadataDocumentOperation {
                     )]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("registry delete result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("document index delete result", format!("{other:?}"))
+                }
             },
             DeleteMetadataDocumentState::DeleteHolders => match event {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => {

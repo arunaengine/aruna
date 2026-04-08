@@ -1,15 +1,16 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
 use crate::structs::RealmId;
 use crate::types::{GroupId, UserId};
+use crate::NodeId;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataRegistryRecord {
     pub realm_id: RealmId,
     pub group_id: GroupId,
     pub document_id: Ulid,
+    pub document_path: String,
     pub graph_iri: String,
     pub public: bool,
     pub permission_path: String,
@@ -23,8 +24,15 @@ impl MetadataRegistryRecord {
         format!("https://w3id.org/aruna/{document_id}")
     }
 
-    pub fn permission_path_for(realm_id: &RealmId, group_id: GroupId, document_id: Ulid) -> String {
-        format!("/{realm_id}/g/{group_id}/meta/{document_id}")
+    pub fn normalize_document_path(path: &str) -> String {
+        path.trim().trim_matches('/').to_string()
+    }
+
+    pub fn permission_path_for(realm_id: &RealmId, group_id: GroupId, path: &str) -> String {
+        format!(
+            "/{realm_id}/g/{group_id}/meta/{}",
+            Self::normalize_document_path(path)
+        )
     }
 }
 

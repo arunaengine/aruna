@@ -9,7 +9,8 @@ use aruna_core::handle::Handle;
 use aruna_core::metadata::{
     MetadataBatch, MetadataCompactSnapshot, MetadataCompactSnapshotQuadState,
     MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataGraphPolicy, MetadataQuadOp, MetadataQueryResults, MetadataVectorClock,
+    MetadataGraphPolicy, MetadataQuadOp, MetadataQueryResults, MetadataRoCratePage,
+    MetadataSearchHit, MetadataVectorClock,
 };
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -98,6 +99,44 @@ fn handle_effect(node: Arc<CraqleNode>, effect: MetadataEffect) -> MetadataEvent
         MetadataEffect::ExportRoCrate { graph_iri } => node
             .export_rocrate(&auth, &GraphId::new(&graph_iri))
             .map(|jsonld| MetadataEvent::RoCrateExportResult { graph_iri, jsonld }),
+        MetadataEffect::ExportRoCrateSummary { graph_iri } => node
+            .export_rocrate_summary(&auth, &GraphId::new(&graph_iri))
+            .map(|jsonld| MetadataEvent::RoCrateSummaryResult { graph_iri, jsonld }),
+        MetadataEffect::ExportRoCratePage {
+            graph_iri,
+            offset,
+            after,
+            limit,
+        } => {
+            let graph = GraphId::new(&graph_iri);
+            let page = if let Some(after) = after.as_deref() {
+                node.export_rocrate_page_after(&auth, &graph, Some(after), limit)
+            } else {
+                node.export_rocrate_page(&auth, &graph, offset.unwrap_or(0), limit)
+            };
+            page.map(|page| MetadataEvent::RoCratePageResult {
+                graph_iri,
+                page: metadata_rocrate_page_from_craqle(page),
+            })
+        }
+        MetadataEffect::SearchGraphs {
+            graph_iris,
+            query,
+            limit,
+        } => {
+            let allowed: std::collections::HashSet<_> = graph_iris.into_iter().collect();
+            node.search(&auth, &query, limit)
+                .map(|hits| {
+                    MetadataEvent::SearchResult {
+                        hits: hits
+                            .into_iter()
+                            .filter(|hit| allowed.contains(&hit.graph_id))
+                            .take(limit)
+                            .map(metadata_search_hit_from_craqle)
+                            .collect(),
+                    }
+                })
+        }
         MetadataEffect::QueryGraphs { graph_iris, sparql } => node
             .query_graphs(&graph_ids(&graph_iris), &sparql)
             .map(|results| MetadataEvent::QueryResult {
@@ -170,10 +209,13 @@ fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         MetadataEffect::SetGraphPolicy { graph_iri, .. }
         | MetadataEffect::GetGraphPolicy { graph_iri }
         | MetadataEffect::ExportRoCrate { graph_iri }
+        | MetadataEffect::ExportRoCrateSummary { graph_iri }
         | MetadataEffect::DeleteGraph { graph_iri }
         | MetadataEffect::ContainsGraph { graph_iri }
         | MetadataEffect::VectorClock { graph_iri }
         | MetadataEffect::CompactSnapshot { graph_iri } => Some(graph_iri.clone()),
+        MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
+        MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris.first().cloned(),
         MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris.first().cloned(),
         MetadataEffect::CatchupBatches { graph_iri, .. } => Some(graph_iri.clone()),
         MetadataEffect::ImportCompactSnapshot { snapshot, .. } => Some(snapshot.graph_iri.clone()),
@@ -397,5 +439,23 @@ fn craqle_compact_snapshot(
                 dots: quad.dots.into_iter().map(craqle_dot).collect(),
             })
             .collect(),
+    }
+}
+
+fn metadata_rocrate_page_from_craqle(page: craqle::RoCratePage) -> MetadataRoCratePage {
+    MetadataRoCratePage {
+        jsonld: page.jsonld,
+        total_data_entities: page.total_data_entities,
+        returned_data_entities: page.returned_data_entities,
+        next_offset: page.next_offset,
+        next_cursor: page.next_cursor,
+    }
+}
+
+fn metadata_search_hit_from_craqle(hit: craqle::SearchHit) -> MetadataSearchHit {
+    MetadataSearchHit {
+        graph_iri: hit.graph_id,
+        subject_iri: hit.subject_iri,
+        score: hit.score,
     }
 }

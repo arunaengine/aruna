@@ -36,6 +36,7 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
             actor: test.actor.clone(),
             group_id,
             document_id,
+            document_path: "datasets/public-dataset".to_string(),
             name: "Initial Dataset".to_string(),
             description: "Created through Craqle".to_string(),
             date_published: "2026-01-01".to_string(),
@@ -48,6 +49,7 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
 
     assert_eq!(created.document_id, document_id);
     assert_eq!(created.graph_iri, format!("https://w3id.org/aruna/{document_id}"));
+    assert_eq!(created.document_path, "datasets/public-dataset");
     assert_eq!(created.holder_node_ids, vec![test.actor.node_id]);
 
     let listed = drive(

@@ -43,6 +43,22 @@ pub struct MetadataDocumentView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataRoCratePage {
+    pub jsonld: String,
+    pub total_data_entities: usize,
+    pub returned_data_entities: usize,
+    pub next_offset: Option<usize>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MetadataSearchHit {
+    pub graph_iri: String,
+    pub subject_iri: String,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataDot {
     pub actor: [u8; 32],
     pub counter: u64,
@@ -118,6 +134,20 @@ pub enum MetadataEffect {
     ExportRoCrate {
         graph_iri: String,
     },
+    ExportRoCrateSummary {
+        graph_iri: String,
+    },
+    ExportRoCratePage {
+        graph_iri: String,
+        offset: Option<usize>,
+        after: Option<String>,
+        limit: usize,
+    },
+    SearchGraphs {
+        graph_iris: Vec<String>,
+        query: String,
+        limit: usize,
+    },
     QueryGraphs {
         graph_iris: Vec<String>,
         sparql: String,
@@ -148,7 +178,7 @@ pub enum MetadataEffect {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum MetadataEvent {
     CreateCrateResult {
         graph_iri: String,
@@ -168,6 +198,17 @@ pub enum MetadataEvent {
     RoCrateExportResult {
         graph_iri: String,
         jsonld: String,
+    },
+    RoCrateSummaryResult {
+        graph_iri: String,
+        jsonld: String,
+    },
+    RoCratePageResult {
+        graph_iri: String,
+        page: MetadataRoCratePage,
+    },
+    SearchResult {
+        hits: Vec<MetadataSearchHit>,
     },
     QueryResult {
         results: MetadataQueryResults,

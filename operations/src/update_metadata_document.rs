@@ -12,8 +12,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::repository::{
-    parse_registry_read, read_registry_effect, write_audit_effect, write_registry_effect,
-    StorageReadError,
+    parse_registry_read, read_registry_effect, write_audit_effect, write_document_index_effect,
+    write_registry_effect, StorageReadError,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,6 +41,7 @@ enum UpdateMetadataDocumentState {
     ApplyRoCrate,
     StartTransaction,
     WriteRegistry,
+    WriteDocumentIndex,
     WriteAudit,
     CommitTransaction,
     Finish,
@@ -199,6 +200,25 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
+                    self.state = UpdateMetadataDocumentState::WriteDocumentIndex;
+                    match write_document_index_effect(record, Some(txn_id)) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(UpdateMetadataDocumentError::ConversionError(error))
+                        }
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("registry write result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::WriteDocumentIndex => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
                     self.state = UpdateMetadataDocumentState::WriteAudit;
                     match write_audit_effect(&self.audit_record(record), Ulid::new(), Some(txn_id))
                     {
@@ -209,7 +229,7 @@ impl Operation for UpdateMetadataDocumentOperation {
                     }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("registry write result", format!("{other:?}")),
+                other => self.unexpected_event("document index write result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::WriteAudit => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
