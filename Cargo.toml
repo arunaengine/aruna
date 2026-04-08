@@ -9,7 +9,7 @@ members = [
     "net",
     "tasks",
     "operations",
-    "tools",
+    "aruna-doctor",
 ]
 # default-members = ["aruna"]
 resolver = "3"

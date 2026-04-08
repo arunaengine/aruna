@@ -1,0 +1,33 @@
+[package]
+name = "aruna-doctor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ahash = { workspace = true }
+aruna = { path = "../aruna" }
+aruna-core = { path = "../core" }
+aruna-blob = { path = "../blob" }
+aruna-storage = { path = "../storage" }
+aruna-operations = { path = "../operations" }
+aruna-net = { path = "../net" }
+aruna-tasks = { path = "../tasks" }
+aruna-api = { path = "../api" }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+clap = { version ="4.6.0", features = ["derive"]}
+ed25519-dalek = { workspace = true }
+fjall = { workspace = true }
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tempfile = { workspace = true }
+ulid = { workspace = true }
