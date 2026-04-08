@@ -599,6 +599,7 @@ mod tests {
             net_handle: Some(net_handle.clone()),
             blob_handle: None,
             automerge_handle: None,
+            metadata_handle: None,
             task_handle: Some(TaskHandle::new()),
         });
 

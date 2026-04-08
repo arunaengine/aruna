@@ -12,6 +12,7 @@ aruna-core = { path = "../core" }
 aruna-storage = { path = "../storage" }
 aruna-net = { path = "../net" }
 aruna-tasks = { path = "../tasks" }
+craqle = { workspace = true }
 async-trait = { workspace = true }
 automerge = { workspace = true }
 autosurgeon = { workspace = true }

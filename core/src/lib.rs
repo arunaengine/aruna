@@ -9,6 +9,7 @@ pub mod handle;
 pub mod id;
 pub mod keys;
 pub mod keyspaces;
+pub mod metadata;
 pub mod onboarding;
 pub mod operation;
 pub mod stream;
@@ -23,5 +24,6 @@ pub use automerge::{
 };
 pub use id::{AutomergeTopicId, DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;
+pub use metadata::*;
 pub use onboarding::*;
 pub use task::{TaskEffect, TaskEvent, TaskKey};

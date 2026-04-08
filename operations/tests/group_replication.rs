@@ -109,6 +109,7 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
         net_handle: Some(net.clone()),
         blob_handle: None,
         automerge_handle: Some(automerge_handle),
+        metadata_handle: None,
         task_handle: Some(task_handle.clone()),
     });
 

@@ -1,0 +1,199 @@
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataGraphPolicy {
+    pub public: bool,
+    pub permission_paths: Vec<String>,
+}
+
+impl MetadataGraphPolicy {
+    pub fn normalized(mut self) -> Self {
+        self.permission_paths.sort();
+        self.permission_paths.dedup();
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataCreateCrateRequest {
+    pub graph_iri: String,
+    pub name: String,
+    pub description: String,
+    pub date_published: String,
+    pub license: String,
+    pub policy: MetadataGraphPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataDot {
+    pub actor: [u8; 32],
+    pub counter: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataVectorClock(pub BTreeMap<[u8; 32], u64>);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataQuadOp {
+    Add {
+        subject: String,
+        predicate: String,
+        object: String,
+        dot: MetadataDot,
+    },
+    Remove {
+        subject: String,
+        predicate: String,
+        object: String,
+        witnessed: MetadataVectorClock,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataBatch {
+    pub graph_iri: String,
+    pub actor: [u8; 32],
+    pub counter: u64,
+    pub base_clock: MetadataVectorClock,
+    pub ops: Vec<MetadataQuadOp>,
+    pub timestamp_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataCompactSnapshotQuadState {
+    pub subject: u32,
+    pub predicate: u32,
+    pub object: u32,
+    pub dots: Vec<MetadataDot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataCompactSnapshot {
+    pub graph_iri: String,
+    pub clock: MetadataVectorClock,
+    pub terms: Vec<String>,
+    pub quads: Vec<MetadataCompactSnapshotQuadState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataQueryResults {
+    Solutions(Vec<BTreeMap<String, String>>),
+    Boolean(bool),
+    Graph(Vec<(String, String, String)>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataEffect {
+    CreateCrate {
+        request: MetadataCreateCrateRequest,
+    },
+    SetGraphPolicy {
+        graph_iri: String,
+        policy: MetadataGraphPolicy,
+    },
+    GetGraphPolicy {
+        graph_iri: String,
+    },
+    ExportRoCrate {
+        graph_iri: String,
+    },
+    QueryGraphs {
+        graph_iris: Vec<String>,
+        sparql: String,
+    },
+    DeleteGraph {
+        graph_iri: String,
+    },
+    ListGraphs,
+    ContainsGraph {
+        graph_iri: String,
+    },
+    VectorClock {
+        graph_iri: String,
+    },
+    CatchupBatches {
+        graph_iri: String,
+        remote_clock: MetadataVectorClock,
+    },
+    CompactSnapshot {
+        graph_iri: String,
+    },
+    ImportCompactSnapshot {
+        snapshot: MetadataCompactSnapshot,
+        policy: MetadataGraphPolicy,
+    },
+    ApplyRemoteBatch {
+        batch: MetadataBatch,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetadataEvent {
+    CreateCrateResult {
+        graph_iri: String,
+        batch: MetadataBatch,
+    },
+    GraphPolicySet {
+        graph_iri: String,
+    },
+    GraphPolicyResult {
+        graph_iri: String,
+        policy: MetadataGraphPolicy,
+    },
+    RoCrateExportResult {
+        graph_iri: String,
+        jsonld: String,
+    },
+    QueryResult {
+        results: MetadataQueryResults,
+    },
+    GraphDeleted {
+        graph_iri: String,
+    },
+    GraphListResult {
+        graph_iris: Vec<String>,
+    },
+    ContainsGraphResult {
+        graph_iri: String,
+        exists: bool,
+    },
+    VectorClockResult {
+        graph_iri: String,
+        clock: MetadataVectorClock,
+    },
+    CatchupBatchesResult {
+        graph_iri: String,
+        batches: Vec<MetadataBatch>,
+    },
+    CompactSnapshotResult {
+        graph_iri: String,
+        snapshot: MetadataCompactSnapshot,
+    },
+    CompactSnapshotImported {
+        graph_iri: String,
+    },
+    RemoteBatchApplied {
+        graph_iri: String,
+    },
+    Error {
+        graph_iri: Option<String>,
+        error: MetadataError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MetadataError {
+    #[error("channel closed")]
+    ChannelClosed,
+    #[error("invalid effect type")]
+    InvalidEffect,
+    #[error("metadata backend unavailable")]
+    HandleMissing,
+    #[error("backend task failed: {0}")]
+    TaskJoin(String),
+    #[error("metadata backend error: {0}")]
+    Backend(String),
+}

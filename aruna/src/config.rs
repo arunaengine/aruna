@@ -32,6 +32,7 @@ const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
 
 pub struct Config {
     pub storage_path: String,
+    pub metadata_storage_path: String,
     pub blob_root: String,
     pub blob_bucket_prefix: Option<String>,
     pub blob_max_bucket_size: Option<u64>,
@@ -149,6 +150,8 @@ impl Config {
 
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
+    let metadata_storage_path =
+        dotenvy::var("CRAQLE_STORAGE_PATH").unwrap_or_else(|_| format!("{storage_path}/craqle"));
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
@@ -231,6 +234,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     Ok((
         Config {
             storage_path,
+            metadata_storage_path,
             blob_root,
             blob_bucket_prefix,
             blob_max_bucket_size,

@@ -1,4 +1,5 @@
 use crate::errors::BlobError;
+use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
 use crate::structs::{BackendLocation, NegotiationResult, RealmId};
 use crate::{
@@ -17,6 +18,7 @@ pub enum Event {
     Storage(StorageEvent),
     Net(NetEvent),
     Automerge(AutomergeEvent),
+    Metadata(MetadataEvent),
     SubOperation(SubOperationEvent),
     Task(TaskEvent),
     Search(),
