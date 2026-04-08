@@ -28,9 +28,14 @@ impl MetadataRegistryRecord {
         path.trim().trim_matches('/').to_string()
     }
 
-    pub fn permission_path_for(realm_id: &RealmId, group_id: GroupId, path: &str) -> String {
+    pub fn permission_path_for(
+        realm_id: &RealmId,
+        group_id: GroupId,
+        path: &str,
+        document_id: Ulid,
+    ) -> String {
         format!(
-            "/{realm_id}/g/{group_id}/meta/{}",
+            "/{realm_id}/g/{group_id}/meta/{}@{document_id}",
             Self::normalize_document_path(path)
         )
     }

@@ -115,6 +115,7 @@ impl CreateMetadataDocumentOperation {
             &self.config.actor.realm_id,
             self.config.group_id,
             &self.config.document_path,
+            self.config.document_id,
         )
     }
 

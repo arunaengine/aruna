@@ -140,6 +140,7 @@ mod tests {
                     &RealmId([4u8; 32]),
                     group_id,
                     &format!("docs/{idx}"),
+                    document_id,
                 ),
                 holder_node_ids: Vec::new(),
                 created_at_ms: now,
