@@ -53,6 +53,10 @@ impl S3UserMetadata {
 }
 
 impl MetadataPatch {
+    pub fn is_empty(&self) -> bool {
+        self.add_key_values.is_empty() && self.remove_key_values.is_empty()
+    }
+
     pub fn into_update_request(self, object_id: String) -> UpdateObjectRequest {
         UpdateObjectRequest {
             object_id,
@@ -62,7 +66,7 @@ impl MetadataPatch {
             remove_key_values: self.remove_key_values,
             data_class: 0,
             hashes: vec![],
-            force_revision: true,
+            force_revision: false,
             parent: None,
             metadata_license_tag: None,
             data_license_tag: None,
@@ -297,6 +301,18 @@ mod tests {
     }
 
     #[test]
+    fn diff_against_returns_empty_patch_for_unchanged_metadata() {
+        let key_values = vec![metadata("x-amz-meta-owner", "alice")];
+
+        let patch = S3UserMetadata {
+            entries: BTreeMap::from([("x-amz-meta-owner".to_string(), "alice".to_string())]),
+        }
+        .diff_against(&key_values);
+
+        assert!(patch.is_empty());
+    }
+
+    #[test]
     fn into_headers_merges_keys_in_canonical_form() {
         let headers = S3UserMetadata::from(
             [
@@ -322,7 +338,7 @@ mod tests {
         }
         .into_update_request("object-id".to_string());
 
-        assert!(request.force_revision);
+        assert!(!request.force_revision);
         assert_eq!(request.object_id, "object-id");
         assert_eq!(
             request.add_key_values,
@@ -332,5 +348,14 @@ mod tests {
             request.remove_key_values,
             vec![metadata("x-amz-meta-mtime", "1")]
         );
+    }
+
+    #[test]
+    fn empty_patch_into_update_request_still_uses_force_revision_flag() {
+        let request = MetadataPatch::default().into_update_request("object-id".to_string());
+
+        assert!(!request.force_revision);
+        assert!(request.add_key_values.is_empty());
+        assert!(request.remove_key_values.is_empty());
     }
 }

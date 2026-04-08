@@ -569,16 +569,15 @@ impl GrpcQueryHandler {
     }
 
     #[tracing::instrument(level = "trace", skip(self, request, token))]
-    pub async fn init_object_revision(
+    pub async fn apply_object_update(
         &self,
         request: UpdateObjectRequest,
         token: &str,
     ) -> Result<DPObject> {
-        trace!(?request, "Initializing object revision");
+        trace!(?request, "Applying object update");
 
         // Crate gRPC request with provided token in header
         let mut req = Request::new(request);
-
         Self::add_token_to_md(req.metadata_mut(), token)?;
 
         // Update Object in ArunaServer and validate response

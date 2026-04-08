@@ -84,7 +84,7 @@ impl ArunaS3Service {
     }
 
     #[tracing::instrument(level = "trace", skip(self, impersonating_token))]
-    async fn init_object_revision_from_patch(
+    async fn apply_object_update_from_patch(
         &self,
         object_id: String,
         patch: MetadataPatch,
@@ -107,7 +107,7 @@ impl ArunaS3Service {
         })?;
 
         handler
-            .init_object_revision(patch.into_update_request(object_id), token)
+            .apply_object_update(patch.into_update_request(object_id), token)
             .await
             .map_err(|_| {
                 error!(error = "Object update failed");
@@ -131,14 +131,24 @@ impl ArunaS3Service {
     ) -> S3Result<(ProxyObject, bool)> {
         match object {
             NewOrExistingObject::Existing(object) => {
+                let patch = metadata.diff_against(&object.key_values);
+
                 if object.object_status == Status::Initializing {
-                    let mut object = object.clone();
-                    metadata.apply_to_key_values(&mut object.key_values);
-                    Ok((object, true))
+                    if patch.is_empty() {
+                        Ok((object.clone(), true))
+                    } else {
+                        let updated_object = self
+                            .apply_object_update_from_patch(
+                                object.id.to_string(),
+                                patch,
+                                impersonating_token,
+                            )
+                            .await?;
+                        Ok((updated_object, true))
+                    }
                 } else {
-                    let patch = metadata.diff_against(&object.key_values);
                     let mut new_revision = self
-                        .init_object_revision_from_patch(
+                        .apply_object_update_from_patch(
                             object.id.to_string(),
                             patch,
                             impersonating_token,
@@ -2458,7 +2468,7 @@ impl S3 for ArunaS3Service {
                     (object, true)
                 } else {
                     let mut new_revision = self
-                        .init_object_revision_from_patch(
+                        .apply_object_update_from_patch(
                             object.id.to_string(),
                             MetadataPatch::default(),
                             impersonating_token.as_deref(),
