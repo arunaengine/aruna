@@ -23,7 +23,10 @@ chrono = { workspace = true }
 clap = { version ="4.6.0", features = ["derive"]}
 ed25519-dalek = { workspace = true }
 fjall = { workspace = true }
+hex = { workspace = true }
+iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
+postcard = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

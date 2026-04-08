@@ -1,9 +1,11 @@
 use crate::error::CliError;
+use crate::explorer::{explore_entries, explore_keyspaces};
 use crate::storage::{import, snapshot};
 use crate::tokens::{create_token, view_token};
 use clap::{Parser, Subcommand};
 
 mod error;
+mod explorer;
 mod storage;
 mod tokens;
 
@@ -29,11 +31,20 @@ pub enum Commands {
         database_path: String,
         target_path: String,
     },
-    Explore,
+    Explore {
+        #[command(subcommand)]
+        command: ExploreCommands,
+    },
     Import {
         snapshot_path: String,
         target_path: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ExploreCommands {
+    Keyspaces { database_path: String },
+    Entries { database_path: String, keyspace: String },
 }
 
 #[tokio::main]
@@ -53,7 +64,13 @@ pub async fn main() -> Result<(), CliError> {
             database_path,
             target_path,
         } => snapshot(database_path, target_path).await?,
-        Commands::Explore => todo!(),
+        Commands::Explore { command } => match command {
+            ExploreCommands::Keyspaces { database_path } => explore_keyspaces(database_path).await?,
+            ExploreCommands::Entries {
+                database_path,
+                keyspace,
+            } => explore_entries(database_path, keyspace).await?,
+        },
         Commands::Import {
             snapshot_path,
             target_path,

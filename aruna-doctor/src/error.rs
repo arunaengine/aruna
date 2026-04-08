@@ -1,3 +1,4 @@
+use crate::explorer::ExplorerError;
 use crate::storage::SnapshotError;
 use aruna::config::SetupError;
 use aruna_operations::create_token::CreateTokenError;
@@ -34,4 +35,6 @@ pub enum CliError {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     SnapshotError(#[from] SnapshotError),
+    #[error(transparent)]
+    ExplorerError(#[from] ExplorerError),
 }
