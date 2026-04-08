@@ -24,6 +24,7 @@ impl ApiDoc {
     pub fn openapi() -> utoipa::openapi::OpenApi {
         let mut openapi = BaseApiDoc::openapi();
         openapi.merge(crate::routes::groups::GroupsApiDoc::openapi());
+        openapi.merge(crate::routes::metadata::MetadataApiDoc::openapi());
         openapi.merge(crate::routes::credentials::CredentialsApiDoc::openapi());
         openapi.merge(crate::routes::blobs::BlobsApiDoc::openapi());
         openapi.merge(crate::routes::onboarding::OnboardingApiDoc::openapi());
