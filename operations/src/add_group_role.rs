@@ -7,6 +7,7 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument, RealmId, Role};
 use aruna_core::types::{GroupId, TxnId};
 use byteview::ByteView;
+use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -41,7 +42,7 @@ impl std::fmt::Debug for AddGroupRoleOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AddGroupRoleState {
     Init,
     Auth,
@@ -534,7 +535,7 @@ pub mod test {
 
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation, AddGroupRoleState};
     use aruna_core::effects::Effect;
-    use aruna_core::events::Event;
+    use aruna_core::events::{Event, SubOperationEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, Permission, Role};
@@ -756,6 +757,19 @@ pub mod test {
         let effects = add_role_operation.step(Event::Storage(
             aruna_core::events::StorageEvent::TransactionCommitted { txn_id },
         ));
+        let announce_group_doc = effects.first().unwrap();
+        assert!(matches!(announce_group_doc, Effect::SubOperation(_)));
+        assert_eq!(
+            add_role_operation.state,
+            AddGroupRoleState::AnnounceGroupDoc {
+                group: mutated_group.clone(),
+                auth_doc: mutated_auth_doc.clone(),
+            }
+        );
+
+        let effects = add_role_operation.step(Event::SubOperation(
+            SubOperationEvent::AutomergeStateResult { result: Ok(()) },
+        ));
         let announce_auth_doc = effects.first().unwrap();
         assert!(matches!(announce_auth_doc, Effect::SubOperation(_)));
         assert_eq!(
@@ -771,13 +785,5 @@ pub mod test {
         ));
         assert!(effects.is_empty());
         assert_eq!(add_role_operation.state, AddGroupRoleState::Finish);
-
-        // TODO:
-        // AnnounceAuthDoc {
-        //     group: Group,
-        //     auth_doc: GroupAuthorizationDocument,
-        // },
-        // Finish,
-        // Error,
     }
 }
