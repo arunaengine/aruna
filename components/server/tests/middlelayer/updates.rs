@@ -1,15 +1,16 @@
 use crate::common::init::init_database_handler_middlelayer;
 use crate::common::test_utils;
-use aruna_rust_api::api::storage::models::v2::{Hash, KeyValue as APIKeyValue};
+use aruna_rust_api::api::storage::models::v2::{Hash as APIHash, KeyValue as APIKeyValue};
 use aruna_rust_api::api::storage::services::v2::{
-    UpdateCollectionDataClassRequest, UpdateCollectionDescriptionRequest,
-    UpdateCollectionKeyValuesRequest, UpdateCollectionNameRequest, UpdateDatasetDataClassRequest,
-    UpdateDatasetDescriptionRequest, UpdateDatasetKeyValuesRequest, UpdateDatasetNameRequest,
-    UpdateObjectRequest, UpdateProjectDataClassRequest, UpdateProjectDescriptionRequest,
-    UpdateProjectKeyValuesRequest, UpdateProjectNameRequest,
+    update_object_request::Parent, UpdateCollectionDataClassRequest,
+    UpdateCollectionDescriptionRequest, UpdateCollectionKeyValuesRequest,
+    UpdateCollectionNameRequest, UpdateDatasetDataClassRequest, UpdateDatasetDescriptionRequest,
+    UpdateDatasetKeyValuesRequest, UpdateDatasetNameRequest, UpdateObjectRequest,
+    UpdateProjectDataClassRequest, UpdateProjectDescriptionRequest, UpdateProjectKeyValuesRequest,
+    UpdateProjectNameRequest,
 };
 use aruna_server::database::crud::CrudDb;
-use aruna_server::database::dsls::license_dsl::ALL_RIGHTS_RESERVED;
+use aruna_server::database::dsls::license_dsl::{License, ALL_RIGHTS_RESERVED};
 use aruna_server::database::dsls::object_dsl::{KeyValue, KeyValueVariant, KeyValues, Object};
 use aruna_server::database::enums::{DataClass, ObjectMapping, ObjectStatus, ObjectType};
 use aruna_server::middlelayer::update_request_types::{
@@ -461,7 +462,7 @@ async fn update_object_test() {
             variant: 1,
         }],
         data_class: 1,
-        hashes: vec![Hash {
+        hashes: vec![APIHash {
             alg: 1,
             hash: "dd98d701915b2bc5aad5dc9190194844".to_string(),
         }],
@@ -536,4 +537,158 @@ async fn update_object_test() {
         license_update.data_license_tag,
         Some(license_updated.object.data_license)
     )
+}
+
+#[tokio::test]
+async fn update_initializing_object_in_place_test() {
+    let db_handler = init_database_handler_middlelayer().await;
+    let object_id = DieselUlid::generate();
+    let object_mapping = ObjectMapping::OBJECT(object_id);
+    let old_parent_id = DieselUlid::generate();
+    let old_parent_mapping = ObjectMapping::PROJECT(old_parent_id);
+    let new_parent_id = DieselUlid::generate();
+    let new_parent_mapping = ObjectMapping::PROJECT(new_parent_id);
+    let mut user =
+        test_utils::new_user(vec![object_mapping, old_parent_mapping, new_parent_mapping]);
+    let mut object = test_utils::object_from_mapping(user.id, object_mapping);
+    let mut old_parent = test_utils::object_from_mapping(user.id, old_parent_mapping);
+    let mut new_parent = test_utils::object_from_mapping(user.id, new_parent_mapping);
+    let mut relation = test_utils::new_internal_relation(&old_parent, &object);
+    let hash_value = "dd98d701915b2bc5aad5dc9190194844".to_string();
+    let metadata_license_tag = format!("stage-meta-{}", DieselUlid::generate());
+    let data_license_tag = format!("stage-data-{}", DieselUlid::generate());
+    let mut metadata_license = License {
+        tag: metadata_license_tag.clone(),
+        name: "Staging metadata license".to_string(),
+        text: "Staging metadata license".to_string(),
+        url: "https://example.com/staging-metadata".to_string(),
+    };
+    let mut data_license = License {
+        tag: data_license_tag.clone(),
+        name: "Staging data license".to_string(),
+        text: "Staging data license".to_string(),
+        url: "https://example.com/staging-data".to_string(),
+    };
+
+    object.object_status = ObjectStatus::INITIALIZING;
+    object.revision_number = 7;
+    object.key_values.0 .0.push(KeyValue {
+        key: "to_delete".to_string(),
+        value: "deleted".to_string(),
+        variant: KeyValueVariant::LABEL,
+    });
+    old_parent.name = "old-parent".to_string();
+    new_parent.name = "new-parent".to_string();
+
+    let client = db_handler.database.get_client().await.unwrap();
+    user.create(&client).await.unwrap();
+    metadata_license.create(&client).await.unwrap();
+    data_license.create(&client).await.unwrap();
+    object.create(&client).await.unwrap();
+    old_parent.create(&client).await.unwrap();
+    new_parent.create(&client).await.unwrap();
+    relation.create(&client).await.unwrap();
+
+    let updates =
+        Object::get_objects_with_relations(&vec![object_id, old_parent_id, new_parent_id], &client)
+            .await
+            .unwrap();
+    for o in updates {
+        db_handler.cache.add_object(o)
+    }
+
+    let request = UpdateObjectRequest {
+        object_id: object_id.to_string(),
+        name: Some("staging-name".to_string()),
+        description: Some("staging-description".to_string()),
+        add_key_values: vec![APIKeyValue {
+            key: "New".to_string(),
+            value: "value".to_string(),
+            variant: 1,
+        }],
+        remove_key_values: vec![APIKeyValue {
+            key: "to_delete".to_string(),
+            value: "deleted".to_string(),
+            variant: 1,
+        }],
+        data_class: 1,
+        hashes: vec![APIHash {
+            alg: 1,
+            hash: hash_value.clone(),
+        }],
+        parent: Some(Parent::ProjectId(new_parent_id.to_string())),
+        force_revision: true,
+        metadata_license_tag: Some(metadata_license_tag.clone()),
+        data_license_tag: Some(data_license_tag.clone()),
+    };
+
+    let (updated, is_new) = db_handler
+        .update_grpc_object(request, user.id, false)
+        .await
+        .unwrap();
+
+    assert!(!is_new);
+    assert_eq!(updated.object.id, object_id);
+    assert_eq!(updated.object.revision_number, 7);
+    assert_eq!(updated.object.object_status, ObjectStatus::INITIALIZING);
+    assert_eq!(updated.object.name, "staging-name".to_string());
+    assert_eq!(
+        updated.object.description,
+        "staging-description".to_string()
+    );
+    assert_eq!(updated.object.data_class, DataClass::PUBLIC);
+    assert_eq!(updated.object.metadata_license, metadata_license_tag);
+    assert_eq!(updated.object.data_license, data_license_tag);
+    assert!(updated.object.key_values.0 .0.contains(&KeyValue {
+        key: "New".to_string(),
+        value: "value".to_string(),
+        variant: KeyValueVariant::LABEL,
+    }));
+    assert!(!updated.object.key_values.0 .0.contains(&KeyValue {
+        key: "to_delete".to_string(),
+        value: "deleted".to_string(),
+        variant: KeyValueVariant::LABEL,
+    }));
+    assert_eq!(updated.object.hashes.0 .0.len(), 1);
+    assert!(updated
+        .object
+        .hashes
+        .0
+         .0
+        .iter()
+        .any(|hash| hash.hash == hash_value));
+    assert!(!updated.inbound_belongs_to.0.contains_key(&old_parent_id));
+    assert!(updated.inbound_belongs_to.0.contains_key(&new_parent_id));
+
+    let rename_request = UpdateObjectRequest {
+        object_id: object_id.to_string(),
+        name: Some("staging-name-2".to_string()),
+        description: None,
+        add_key_values: vec![],
+        remove_key_values: vec![],
+        data_class: 0,
+        hashes: vec![],
+        parent: Some(Parent::ProjectId(new_parent_id.to_string())),
+        force_revision: true,
+        metadata_license_tag: None,
+        data_license_tag: None,
+    };
+
+    let (renamed, renamed_is_new) = db_handler
+        .update_grpc_object(rename_request, user.id, false)
+        .await
+        .unwrap();
+
+    assert!(!renamed_is_new);
+    assert_eq!(renamed.object.id, object_id);
+    assert_eq!(renamed.object.name, "staging-name-2".to_string());
+    assert_eq!(
+        renamed
+            .inbound_belongs_to
+            .0
+            .get(&new_parent_id)
+            .unwrap()
+            .target_name,
+        "staging-name-2".to_string()
+    );
 }

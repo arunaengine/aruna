@@ -17,7 +17,6 @@ use aruna_rust_api::api::storage::services::v2::CreateCollectionRequest;
 use aruna_rust_api::api::storage::services::v2::CreateDatasetRequest;
 use aruna_rust_api::api::storage::services::v2::CreateObjectRequest;
 use aruna_rust_api::api::storage::services::v2::CreateProjectRequest;
-use aruna_rust_api::api::storage::services::v2::UpdateObjectRequest;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use diesel_ulid::DieselUlid;
 use http::{HeaderValue, Method};
@@ -1128,7 +1127,7 @@ impl From<Object> for CreateObjectRequest {
             name: value.name,
             title: value.title,
             description: "".to_string(),
-            key_values: vec![],
+            key_values: value.key_values,
             relations: vec![],
             data_class: value.data_class.into(),
             parent: value
@@ -1139,25 +1138,6 @@ impl From<Object> for CreateObjectRequest {
             metadata_license_tag: value.metadata_license,
             data_license_tag: value.data_license,
             authors: vec![],
-        }
-    }
-}
-
-impl From<Object> for UpdateObjectRequest {
-    #[tracing::instrument(level = "trace", skip(value))]
-    fn from(value: Object) -> Self {
-        UpdateObjectRequest {
-            object_id: value.id.to_string(),
-            name: None,
-            description: None,
-            add_key_values: vec![],
-            remove_key_values: vec![],
-            data_class: value.data_class as i32,
-            hashes: vec![],
-            force_revision: false,
-            parent: None,
-            metadata_license_tag: Some(value.metadata_license),
-            data_license_tag: Some(value.data_license),
         }
     }
 }
@@ -1361,10 +1341,12 @@ impl ResourceStates {
             self.objects[2].is_missing(),
             self.objects[3].is_missing(),
         ) {
-            (false, true, true, true)
-            | (false, true, false, true)
-            | (false, false, true, true)
-            | (false, false, false, true)
+            (false, true, true, true)     // Project
+            | (false, false, true, true)  // Project -> Collection
+            | (false, true, false, true)  // Project -> Dataset
+            | (false, true, true, false)  // Project -> Object
+            | (false, false, true, false) // Project -> Collection -> Object exists
+            | (false, false, false, true) // Project -> Collection -> Dataset exists
             | (false, false, false, false) => {}
             _ => {
                 bail!("Invalid resource state")

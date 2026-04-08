@@ -256,6 +256,35 @@ impl InternalRelation {
         Ok(())
     }
 
+    pub async fn batch_delete_by_target_and_relation(
+        target_pid: DieselUlid,
+        relation_name: &str,
+        client: &Client,
+    ) -> Result<()> {
+        let query = "DELETE FROM internal_relations
+            WHERE target_pid = $1 AND relation_name = $2;";
+        let prepared = client.prepare(query).await?;
+        client
+            .execute(&prepared, &[&target_pid, &relation_name])
+            .await?;
+        Ok(())
+    }
+
+    pub async fn update_target_name(
+        target_pid: DieselUlid,
+        target_name: &str,
+        client: &Client,
+    ) -> Result<()> {
+        let query = "UPDATE internal_relations
+            SET target_name = $2
+            WHERE target_pid = $1;";
+        let prepared = client.prepare(query).await?;
+        client
+            .execute(&prepared, &[&target_pid, &target_name])
+            .await?;
+        Ok(())
+    }
+
     pub fn as_origin_object_mapping(&self) -> ObjectMapping<DieselUlid> {
         match self.origin_type {
             ObjectType::PROJECT => ObjectMapping::PROJECT(self.origin_pid),

@@ -12,6 +12,7 @@ use anyhow::Result;
 use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 use aws_sdk_s3::config::RequestChecksumCalculation;
+use aws_sdk_s3::operation::create_bucket::CreateBucketError;
 use aws_sdk_s3::primitives::SdkBody;
 use aws_sdk_s3::{
     config::Region,
@@ -424,10 +425,14 @@ impl S3Backend {
             Ok(_) => Ok(()),
             Err(e1) => match self.s3_client.create_bucket().bucket(bucket).send().await {
                 Ok(_) => Ok(()),
-                Err(err) => {
-                    error!(?e1, ?err, "Error creating bucket");
-                    Err(err.into())
-                }
+                Err(err) => match err.into_service_error() {
+                    CreateBucketError::BucketAlreadyExists(_)
+                    | CreateBucketError::BucketAlreadyOwnedByYou(_) => Ok(()),
+                    a => {
+                        error!(?e1, ?a, "Error creating bucket");
+                        Err(a.into())
+                    }
+                },
             },
         }
     }
