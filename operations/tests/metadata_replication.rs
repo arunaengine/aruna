@@ -14,12 +14,16 @@ use aruna_operations::announce_realm_presence::{
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation,
 };
+use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_metadata_document::GetMetadataDocumentOperation;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::task_incoming::initialize_task_incoming;
+use aruna_operations::update_metadata_document::{
+    UpdateMetadataDocumentConfig, UpdateMetadataDocumentOperation,
+};
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
@@ -73,6 +77,111 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
     );
 
     wait_for_metadata_convergence(&nodes, group_id, document_id, &created.graph_iri).await?;
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_updates_and_deletes_replicate_to_holders() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([42u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+
+    let created = drive(
+        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: Ulid::new(),
+                realm_id: realm_id.clone(),
+            },
+            group_id,
+            document_id,
+            document_path: "datasets/propagation".to_string(),
+            name: "Initial Dataset".to_string(),
+            description: "Initial description".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            public: false,
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+
+    wait_for_metadata_state(
+        &nodes,
+        group_id,
+        document_id,
+        &created.graph_iri,
+        nodes.len(),
+        "Initial Dataset",
+    )
+    .await?;
+
+    let updated_jsonld = format!(
+        r#"{{
+  "@context": "https://w3id.org/ro/crate/1.2/context",
+  "@graph": [
+    {{
+      "@id": "ro-crate-metadata.json",
+      "@type": "CreativeWork",
+      "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+      "about": {{"@id": "https://w3id.org/aruna/{document_id}"}}
+    }},
+    {{
+      "@id": "https://w3id.org/aruna/{document_id}",
+      "@type": "Dataset",
+      "name": "Updated Dataset",
+      "description": "Replicated update",
+      "datePublished": "2026-02-01",
+      "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+    }}
+  ]
+}}"#
+    );
+
+    let updated = drive(
+        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: Ulid::new(),
+                realm_id: realm_id.clone(),
+            },
+            group_id,
+            document_id,
+            jsonld: updated_jsonld,
+            public: true,
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+    assert!(updated.public);
+
+    wait_for_metadata_state(
+        &nodes[1..],
+        group_id,
+        document_id,
+        &created.graph_iri,
+        nodes.len(),
+        "Updated Dataset",
+    )
+    .await?;
+
+    drive(
+        DeleteMetadataDocumentOperation::new(
+            Actor {
+                node_id: nodes[0].net.node_id(),
+                user_id: Ulid::new(),
+                realm_id,
+            },
+            group_id,
+            document_id,
+        ),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+
+    wait_for_metadata_absence(&nodes[1..], group_id, document_id, &created.graph_iri).await?;
     shutdown_nodes(nodes).await;
     Ok(())
 }
@@ -183,6 +292,17 @@ async fn wait_for_metadata_convergence(
     document_id: Ulid,
     graph_iri: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    wait_for_metadata_state(nodes, group_id, document_id, graph_iri, nodes.len(), "Bootstrap Dataset").await
+}
+
+async fn wait_for_metadata_state(
+    nodes: &[TestNode],
+    group_id: Ulid,
+    document_id: Ulid,
+    graph_iri: &str,
+    expected_holder_count: usize,
+    expected_text: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut last_states = Vec::new();
 
@@ -198,8 +318,8 @@ async fn wait_for_metadata_convergence(
             {
                 Ok(document)
                     if document.record.graph_iri == graph_iri
-                        && document.record.holder_node_ids.len() == nodes.len()
-                        && document.jsonld.contains("Bootstrap Dataset") => {
+                        && document.record.holder_node_ids.len() == expected_holder_count
+                        && document.jsonld.contains(expected_text) => {
                             last_states.push(format!("node={} converged", node.net.node_id()));
                         }
                 Ok(document) => {
@@ -208,7 +328,7 @@ async fn wait_for_metadata_convergence(
                         node.net.node_id(),
                         document.record.graph_iri,
                         document.record.holder_node_ids.len(),
-                        document.jsonld.contains("Bootstrap Dataset")
+                        document.jsonld.contains(expected_text)
                     ));
                     converged = false;
                     break;
@@ -243,6 +363,64 @@ async fn wait_for_metadata_convergence(
         }
         if Instant::now() >= deadline {
             return Err(format!("metadata state did not converge: {last_states:?}").into());
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_metadata_absence(
+    nodes: &[TestNode],
+    group_id: Ulid,
+    document_id: Ulid,
+    graph_iri: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last_states = Vec::new();
+
+    loop {
+        let mut converged = true;
+        last_states.clear();
+        for node in nodes {
+            match drive(
+                GetMetadataDocumentOperation::new(group_id, document_id),
+                node.context.as_ref(),
+            )
+            .await
+            {
+                Err(_) => {
+                    let graph_state = match node
+                        .context
+                        .metadata_handle
+                        .as_ref()
+                        .unwrap()
+                        .send_effect(Effect::Metadata(MetadataEffect::ExportRoCrate {
+                            graph_iri: graph_iri.to_string(),
+                        }))
+                        .await
+                    {
+                        Event::Metadata(MetadataEvent::Error { .. }) => "graph-missing",
+                        _ => "graph-present",
+                    };
+                    if graph_state != "graph-missing" {
+                        last_states.push(format!("node={} graph still present", node.net.node_id()));
+                        converged = false;
+                        break;
+                    }
+                    last_states.push(format!("node={} absent", node.net.node_id()));
+                }
+                Ok(_) => {
+                    last_states.push(format!("node={} document still present", node.net.node_id()));
+                    converged = false;
+                    break;
+                }
+            }
+        }
+
+        if converged {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("metadata deletion did not converge: {last_states:?}").into());
         }
         sleep(Duration::from_millis(50)).await;
     }

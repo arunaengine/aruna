@@ -1,7 +1,8 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{
-    MetadataApplyRoCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
+    MetadataApplyRoCrateRequest, MetadataBatch, MetadataEffect, MetadataError, MetadataEvent,
+    MetadataGraphPolicy,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
@@ -30,6 +31,7 @@ pub struct UpdateMetadataDocumentOperation {
     config: UpdateMetadataDocumentConfig,
     txn_id: Option<TxnId>,
     record: Option<MetadataRegistryRecord>,
+    batch: Option<MetadataBatch>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -44,6 +46,7 @@ enum UpdateMetadataDocumentState {
     WriteDocumentIndex,
     WriteAudit,
     CommitTransaction,
+    ReplicateGraph,
     Finish,
     Error,
 }
@@ -74,6 +77,7 @@ impl UpdateMetadataDocumentOperation {
             config,
             txn_id: None,
             record: None,
+            batch: None,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -162,11 +166,12 @@ impl Operation for UpdateMetadataDocumentOperation {
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
             UpdateMetadataDocumentState::ApplyRoCrate => match event {
-                Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. }) => {
+                Event::Metadata(MetadataEvent::ApplyRoCrateResult { batch, .. }) => {
                     let Some(record) = self.record.take() else {
                         return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
                     };
                     self.record = Some(self.updated_record(record));
+                    self.batch = Some(batch);
                     self.state = UpdateMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
                         read: false
@@ -248,15 +253,32 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let Some(record) = self.record.clone() else {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
-                    self.state = UpdateMetadataDocumentState::Finish;
-                    self.output = Some(Ok(record));
-                    smallvec![]
+                    let Some(batch) = self.batch.take() else {
+                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = UpdateMetadataDocumentState::ReplicateGraph;
+                    smallvec![Effect::Metadata(MetadataEffect::ReplicateBatch {
+                        record,
+                        batch,
+                    })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::ReplicateGraph => match event {
+                Event::Metadata(MetadataEvent::BatchReplicated { .. }) => {
+                    let Some(record) = self.record.clone() else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = UpdateMetadataDocumentState::Finish;
+                    self.output = Some(Ok(record));
+                    smallvec![]
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+                other => self.unexpected_event("metadata replication result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::Finish
             | UpdateMetadataDocumentState::Error

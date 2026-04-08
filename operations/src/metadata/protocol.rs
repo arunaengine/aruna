@@ -1,4 +1,5 @@
 use aruna_core::metadata::{MetadataCompactSnapshot, MetadataGraphPolicy};
+use aruna_core::metadata::MetadataBatch;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,12 @@ pub enum MetadataTransportMessage {
         policy: MetadataGraphPolicy,
     },
     UpsertRecord {
+        record: MetadataRegistryRecord,
+    },
+    ApplyBatch {
+        batch: MetadataBatch,
+    },
+    DeleteRecord {
         record: MetadataRegistryRecord,
     },
     Ack,

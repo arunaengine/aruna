@@ -36,6 +36,7 @@ enum DeleteMetadataDocumentState {
     DeleteHolders,
     WriteAudit,
     CommitTransaction,
+    ReplicateDelete,
     CancelTimer,
     Finish,
     Error,
@@ -213,6 +214,21 @@ impl Operation for DeleteMetadataDocumentOperation {
             DeleteMetadataDocumentState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
+                    let Some(record) = self.record.clone() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::ReplicateDelete;
+                    smallvec![Effect::Metadata(MetadataEffect::ReplicateDelete { record })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.txn_id = None;
+                    self.fail(error.into())
+                }
+                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::ReplicateDelete => match event {
+                Event::Metadata(MetadataEvent::DeleteReplicated { .. })
+                | Event::Metadata(MetadataEvent::Error { .. }) => {
                     self.state = DeleteMetadataDocumentState::CancelTimer;
                     smallvec![Effect::Task(TaskEffect::CancelTimer {
                         key: aruna_core::automerge::AutomergeDocumentVariant::Metadata {
@@ -222,11 +238,8 @@ impl Operation for DeleteMetadataDocumentOperation {
                         .announce_timer_key(),
                     })]
                 }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+                other => self
+                    .unexpected_event("metadata delete replication result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::CancelTimer => match event {
                 Event::Task(TaskEvent::TimerCancelled { .. })

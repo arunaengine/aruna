@@ -174,6 +174,17 @@ pub enum MetadataEffect {
         record: MetadataRegistryRecord,
         policy: MetadataGraphPolicy,
     },
+    ReplicateSnapshot {
+        record: MetadataRegistryRecord,
+        policy: MetadataGraphPolicy,
+    },
+    ReplicateBatch {
+        record: MetadataRegistryRecord,
+        batch: MetadataBatch,
+    },
+    ReplicateDelete {
+        record: MetadataRegistryRecord,
+    },
     ImportCompactSnapshot {
         snapshot: MetadataCompactSnapshot,
         policy: MetadataGraphPolicy,
@@ -241,6 +252,18 @@ pub enum MetadataEvent {
         snapshot: MetadataCompactSnapshot,
     },
     BootstrapReplicated {
+        graph_iri: String,
+        replicated_node_ids: Vec<NodeId>,
+    },
+    SnapshotReplicated {
+        graph_iri: String,
+        replicated_node_ids: Vec<NodeId>,
+    },
+    BatchReplicated {
+        graph_iri: String,
+        replicated_node_ids: Vec<NodeId>,
+    },
+    DeleteReplicated {
         graph_iri: String,
         replicated_node_ids: Vec<NodeId>,
     },

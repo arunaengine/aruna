@@ -28,7 +28,10 @@ use tokio::time::timeout;
 use tracing::warn;
 
 use super::protocol::{MetadataTransportMessage, read_message, write_message};
-use super::repository::{write_document_index_effect, write_holders_effect, write_registry_effect};
+use super::repository::{
+    delete_document_index_effect, delete_holders_effect, delete_registry_effect,
+    write_document_index_effect, write_holders_effect, write_registry_effect,
+};
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -76,6 +79,15 @@ impl MetadataHandle {
             MetadataEffect::ReplicateBootstrap { record, policy } => {
                 Event::Metadata(self.replicate_bootstrap(record, policy).await)
             }
+            MetadataEffect::ReplicateSnapshot { record, policy } => {
+                Event::Metadata(self.replicate_snapshot(record, policy).await)
+            }
+            MetadataEffect::ReplicateBatch { record, batch } => {
+                Event::Metadata(self.replicate_batch(record, batch).await)
+            }
+            MetadataEffect::ReplicateDelete { record } => {
+                Event::Metadata(self.replicate_delete(record).await)
+            }
             other => {
                 let inner = self.inner.clone();
                 match tokio::task::spawn_blocking(move || handle_effect(inner, other)).await {
@@ -110,6 +122,18 @@ impl MetadataHandle {
                         let _ = cleanup_replica_graph(self.inner.clone(), &record.graph_iri).await;
                         MetadataTransportMessage::Reject(error.to_string())
                     }
+                }
+            }
+            MetadataTransportMessage::ApplyBatch { batch } => {
+                match apply_remote_batch(self.inner.clone(), batch).await {
+                    Ok(()) => MetadataTransportMessage::Ack,
+                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                }
+            }
+            MetadataTransportMessage::DeleteRecord { record } => {
+                match delete_replica_record(self.inner.clone(), record).await {
+                    Ok(()) => MetadataTransportMessage::Ack,
+                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
                 }
             }
             MetadataTransportMessage::Ack | MetadataTransportMessage::Reject(_) => {
@@ -197,6 +221,115 @@ impl MetadataHandle {
         MetadataEvent::BootstrapReplicated {
             graph_iri,
             replicated_node_ids: record.holder_node_ids,
+        }
+    }
+
+    async fn replicate_snapshot(
+        &self,
+        record: MetadataRegistryRecord,
+        policy: MetadataGraphPolicy,
+    ) -> MetadataEvent {
+        let graph_iri = record.graph_iri.clone();
+        let Some(net_handle) = self.inner.net_handle.clone() else {
+            return MetadataEvent::SnapshotReplicated {
+                graph_iri,
+                replicated_node_ids: vec![self.inner.local_node_id],
+            };
+        };
+
+        let snapshot = match export_compact_snapshot(self.inner.clone(), &graph_iri).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return MetadataEvent::Error {
+                    graph_iri: Some(graph_iri),
+                    error,
+                };
+            }
+        };
+
+        let mut replicated = vec![self.inner.local_node_id];
+        for node_id in record
+            .holder_node_ids
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != self.inner.local_node_id)
+        {
+            if send_bootstrap_snapshot(&net_handle, node_id, snapshot.clone(), policy.clone())
+                .await
+                .is_ok()
+                && send_upsert_record(&net_handle, node_id, record.clone())
+                    .await
+                    .is_ok()
+            {
+                replicated.push(node_id);
+            }
+        }
+
+        MetadataEvent::SnapshotReplicated {
+            graph_iri,
+            replicated_node_ids: replicated,
+        }
+    }
+
+    async fn replicate_delete(&self, record: MetadataRegistryRecord) -> MetadataEvent {
+        let graph_iri = record.graph_iri.clone();
+        let Some(net_handle) = self.inner.net_handle.clone() else {
+            return MetadataEvent::DeleteReplicated {
+                graph_iri,
+                replicated_node_ids: vec![self.inner.local_node_id],
+            };
+        };
+
+        let mut replicated = vec![self.inner.local_node_id];
+        for node_id in record
+            .holder_node_ids
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != self.inner.local_node_id)
+        {
+            if send_delete_record(&net_handle, node_id, record.clone()).await.is_ok() {
+                replicated.push(node_id);
+            }
+        }
+
+        MetadataEvent::DeleteReplicated {
+            graph_iri,
+            replicated_node_ids: replicated,
+        }
+    }
+
+    async fn replicate_batch(
+        &self,
+        record: MetadataRegistryRecord,
+        batch: MetadataBatch,
+    ) -> MetadataEvent {
+        let graph_iri = record.graph_iri.clone();
+        let Some(net_handle) = self.inner.net_handle.clone() else {
+            return MetadataEvent::BatchReplicated {
+                graph_iri,
+                replicated_node_ids: vec![self.inner.local_node_id],
+            };
+        };
+
+        let mut replicated = vec![self.inner.local_node_id];
+        for node_id in record
+            .holder_node_ids
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != self.inner.local_node_id)
+        {
+            if send_apply_batch(&net_handle, node_id, batch.clone()).await.is_ok()
+                && send_upsert_record(&net_handle, node_id, record.clone())
+                    .await
+                    .is_ok()
+            {
+                replicated.push(node_id);
+            }
+        }
+
+        MetadataEvent::BatchReplicated {
+            graph_iri,
+            replicated_node_ids: replicated,
         }
     }
 }
@@ -330,7 +463,10 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
                 graph_iri,
                 snapshot: metadata_compact_snapshot_from_craqle(snapshot),
             }),
-        MetadataEffect::ReplicateBootstrap { .. } => unreachable!("handled asynchronously"),
+        MetadataEffect::ReplicateBootstrap { .. }
+        | MetadataEffect::ReplicateSnapshot { .. }
+        | MetadataEffect::ReplicateBatch { .. }
+        | MetadataEffect::ReplicateDelete { .. } => unreachable!("handled asynchronously"),
         MetadataEffect::ImportCompactSnapshot { snapshot, policy } => {
             let graph_iri = snapshot.graph_iri.clone();
             node.import_compact_graph_snapshot(
@@ -365,7 +501,10 @@ fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::VectorClock { graph_iri }
         | MetadataEffect::CompactSnapshot { graph_iri } => Some(graph_iri.clone()),
         MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
-        MetadataEffect::ReplicateBootstrap { record, .. } => Some(record.graph_iri.clone()),
+        MetadataEffect::ReplicateBootstrap { record, .. }
+        | MetadataEffect::ReplicateSnapshot { record, .. }
+        | MetadataEffect::ReplicateBatch { record, .. }
+        | MetadataEffect::ReplicateDelete { record } => Some(record.graph_iri.clone()),
         MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris.first().cloned(),
         MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris.first().cloned(),
         MetadataEffect::CatchupBatches { graph_iri, .. } => Some(graph_iri.clone()),
@@ -645,6 +784,20 @@ async fn import_snapshot(
     .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
 }
 
+async fn apply_remote_batch(
+    inner: Arc<MetadataInner>,
+    batch: MetadataBatch,
+) -> Result<(), MetadataError> {
+    tokio::task::spawn_blocking(move || {
+        inner
+            .node
+            .apply_remote_batch(craqle_batch(batch))
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+}
+
 async fn cleanup_replica_graph(inner: Arc<MetadataInner>, graph_iri: &str) -> Result<(), MetadataError> {
     let graph_iri = graph_iri.to_string();
     tokio::task::spawn_blocking(move || {
@@ -769,6 +922,32 @@ async fn send_upsert_record(
     wait_for_request_delivery(&mut stream).await
 }
 
+async fn send_apply_batch(
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    batch: MetadataBatch,
+) -> Result<(), MetadataError> {
+    let mut stream = net_handle
+        .open_stream(node_id, Alpn::Metadata)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    write_transport_message(&mut stream, &MetadataTransportMessage::ApplyBatch { batch }).await?;
+    wait_for_request_delivery(&mut stream).await
+}
+
+async fn send_delete_record(
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    record: MetadataRegistryRecord,
+) -> Result<(), MetadataError> {
+    let mut stream = net_handle
+        .open_stream(node_id, Alpn::Metadata)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    write_transport_message(&mut stream, &MetadataTransportMessage::DeleteRecord { record }).await?;
+    wait_for_request_delivery(&mut stream).await
+}
+
 async fn write_transport_message(
     stream: &mut BiStream,
     message: &MetadataTransportMessage,
@@ -792,6 +971,87 @@ async fn read_transport_message(
 
 async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
+}
+
+async fn delete_replica_record(
+    inner: Arc<MetadataInner>,
+    record: MetadataRegistryRecord,
+) -> Result<(), MetadataError> {
+    cleanup_replica_graph(inner.clone(), &record.graph_iri).await?;
+
+    let storage_handle = inner.storage_handle.clone();
+    let txn_id = match storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(MetadataError::Backend(error.to_string()));
+        }
+        other => {
+            return Err(MetadataError::Backend(format!(
+                "unexpected storage start transaction event: {other:?}"
+            )));
+        }
+    };
+
+    let result = async {
+        delete_storage_effect(
+            &storage_handle,
+            delete_registry_effect(record.group_id, record.document_id, Some(txn_id)),
+            "metadata registry delete",
+        )
+        .await?;
+        delete_storage_effect(
+            &storage_handle,
+            delete_document_index_effect(record.document_id, Some(txn_id)),
+            "metadata document index delete",
+        )
+        .await?;
+        delete_storage_effect(
+            &storage_handle,
+            delete_holders_effect(record.group_id, record.document_id, Some(txn_id)),
+            "metadata holders delete",
+        )
+        .await?;
+
+        match storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => {
+                Err(MetadataError::Backend(error.to_string()))
+            }
+            other => Err(MetadataError::Backend(format!(
+                "unexpected storage commit event: {other:?}"
+            ))),
+        }
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+    }
+    result
+}
+
+async fn delete_storage_effect(
+    storage_handle: &StorageHandle,
+    effect: Effect,
+    label: &str,
+) -> Result<(), MetadataError> {
+    match storage_handle.send_effect(effect).await {
+        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(MetadataError::Backend(error.to_string()))
+        }
+        other => Err(MetadataError::Backend(format!(
+            "unexpected {label} event: {other:?}"
+        ))),
+    }
 }
 
 async fn wait_for_request_delivery(stream: &mut BiStream) -> Result<(), MetadataError> {
