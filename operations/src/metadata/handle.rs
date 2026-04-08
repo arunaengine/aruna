@@ -75,6 +75,17 @@ fn handle_effect(node: Arc<CraqleNode>, effect: MetadataEffect) -> MetadataEvent
                 graph_iri: request.graph_iri,
                 batch: metadata_batch_from_craqle(batch),
             }),
+        MetadataEffect::ApplyRoCrate { request } => node
+            .apply_rocrate_document_with_policy(
+                &auth,
+                GraphId::new(&request.graph_iri),
+                &request.jsonld,
+                craqle_graph_policy(request.policy),
+            )
+            .map(|batch| MetadataEvent::ApplyRoCrateResult {
+                graph_iri: request.graph_iri,
+                batch: metadata_batch_from_craqle(batch),
+            }),
         MetadataEffect::SetGraphPolicy { graph_iri, policy } => node
             .import_graph_policy(&GraphId::new(&graph_iri), craqle_graph_policy(policy))
             .map(|_| MetadataEvent::GraphPolicySet { graph_iri }),
@@ -155,6 +166,7 @@ fn handle_effect(node: Arc<CraqleNode>, effect: MetadataEffect) -> MetadataEvent
 fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
     match effect {
         MetadataEffect::CreateCrate { request } => Some(request.graph_iri.clone()),
+        MetadataEffect::ApplyRoCrate { request } => Some(request.graph_iri.clone()),
         MetadataEffect::SetGraphPolicy { graph_iri, .. }
         | MetadataEffect::GetGraphPolicy { graph_iri }
         | MetadataEffect::ExportRoCrate { graph_iri }

@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::structs::MetadataRegistryRecord;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
     pub public: bool,
@@ -25,6 +27,19 @@ pub struct MetadataCreateCrateRequest {
     pub date_published: String,
     pub license: String,
     pub policy: MetadataGraphPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataApplyRoCrateRequest {
+    pub graph_iri: String,
+    pub jsonld: String,
+    pub policy: MetadataGraphPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataDocumentView {
+    pub record: MetadataRegistryRecord,
+    pub jsonld: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +105,9 @@ pub enum MetadataEffect {
     CreateCrate {
         request: MetadataCreateCrateRequest,
     },
+    ApplyRoCrate {
+        request: MetadataApplyRoCrateRequest,
+    },
     SetGraphPolicy {
         graph_iri: String,
         policy: MetadataGraphPolicy,
@@ -133,6 +151,10 @@ pub enum MetadataEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEvent {
     CreateCrateResult {
+        graph_iri: String,
+        batch: MetadataBatch,
+    },
+    ApplyRoCrateResult {
         graph_iri: String,
         batch: MetadataBatch,
     },

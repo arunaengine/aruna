@@ -1,26 +1,39 @@
+use std::collections::HashSet;
+
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, DhtError, StorageError};
-use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keys::realm_presence_key;
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, MetadataDocument, RealmConfigDocument};
+use aruna_core::metadata::{
+    MetadataCreateCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::{
+    Actor, MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument,
+};
+use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::NodeId;
+use chrono::Utc;
 use rand::seq::SliceRandom;
 use smallvec::smallvec;
-use std::collections::HashSet;
 use thiserror::Error;
+use ulid::Ulid;
 
-use crate::automerge::repository::{read_effect, write_effect};
-use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
-use crate::outgoing_automerge::OutgoingAutomergeOperation;
-use aruna_core::NodeId;
-use aruna_core::types::Effects;
-use aruna_core::types::TxnId;
+use crate::automerge::repository::read_effect;
+use crate::metadata::repository::{
+    read_registry_effect, write_audit_effect, write_holders_effect, write_registry_effect,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMetadataDocumentConfig {
     pub actor: Actor,
-    pub document: MetadataDocument,
+    pub group_id: GroupId,
+    pub document_id: Ulid,
+    pub name: String,
+    pub description: String,
+    pub date_published: String,
+    pub license: String,
+    pub public: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -28,22 +41,25 @@ pub struct CreateMetadataDocumentOperation {
     config: CreateMetadataDocumentConfig,
     txn_id: Option<TxnId>,
     state: CreateMetadataDocumentState,
-    replication_targets: Vec<NodeId>,
     selected_replication_factor: usize,
-    output: Option<Result<MetadataDocument, CreateMetadataDocumentError>>,
+    record: Option<MetadataRegistryRecord>,
+    pending_error: Option<CreateMetadataDocumentError>,
+    output: Option<Result<MetadataRegistryRecord, CreateMetadataDocumentError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum CreateMetadataDocumentState {
     Init,
-    StartTransaction,
     CheckExisting,
-    WriteDocument,
-    CommitTransaction,
-    Announce,
     LoadRealmConfig,
     LoadReplicationTargets,
-    Replicate,
+    CreateGraph,
+    StartTransaction,
+    WriteRegistry,
+    WriteHolders,
+    WriteAudit,
+    CommitTransaction,
+    CleanupGraph,
     Finish,
     Error,
 }
@@ -51,19 +67,15 @@ enum CreateMetadataDocumentState {
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateMetadataDocumentError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    StorageError(#[from] aruna_core::errors::StorageError),
     #[error(transparent)]
-    ConversionError(#[from] ConversionError),
+    ConversionError(#[from] aruna_core::errors::ConversionError),
     #[error(transparent)]
-    DhtError(#[from] DhtError),
+    MetadataError(#[from] MetadataError),
     #[error("document already exists")]
     DocumentAlreadyExists,
     #[error("missing active transaction")]
     MissingTransaction,
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
-    #[error("automerge replication failed: {0}")]
-    AutomergeSync(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -78,16 +90,10 @@ impl CreateMetadataDocumentOperation {
             config,
             txn_id: None,
             state: CreateMetadataDocumentState::Init,
-            replication_targets: Vec::new(),
             selected_replication_factor: 1,
+            record: None,
+            pending_error: None,
             output: None,
-        }
-    }
-
-    fn document_ref(&self) -> AutomergeDocumentVariant {
-        AutomergeDocumentVariant::Metadata {
-            group_id: self.config.document.group_id,
-            document_id: self.config.document.document_id,
         }
     }
 
@@ -97,19 +103,76 @@ impl CreateMetadataDocumentOperation {
         }
     }
 
-    fn finish_success(&mut self) -> Effects {
-        self.state = CreateMetadataDocumentState::Finish;
-        if self.output.is_none() {
-            self.output = Some(Ok(self.config.document.clone()));
+    fn graph_iri(&self) -> String {
+        MetadataRegistryRecord::graph_iri_for(self.config.document_id)
+    }
+
+    fn permission_path(&self) -> String {
+        MetadataRegistryRecord::permission_path_for(
+            &self.config.actor.realm_id,
+            self.config.group_id,
+            self.config.document_id,
+        )
+    }
+
+    fn current_timestamp_ms() -> u64 {
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
+    }
+
+    fn build_record(&self, holder_node_ids: Vec<NodeId>) -> MetadataRegistryRecord {
+        let now = Self::current_timestamp_ms();
+        MetadataRegistryRecord {
+            realm_id: self.config.actor.realm_id.clone(),
+            group_id: self.config.group_id,
+            document_id: self.config.document_id,
+            graph_iri: self.graph_iri(),
+            public: self.config.public,
+            permission_path: self.permission_path(),
+            holder_node_ids,
+            created_at_ms: now,
+            updated_at_ms: now,
         }
-        smallvec![]
+    }
+
+    fn audit_record(&self, record: &MetadataRegistryRecord) -> MetadataAuditRecord {
+        MetadataAuditRecord {
+            realm_id: record.realm_id.clone(),
+            group_id: record.group_id,
+            document_id: record.document_id,
+            graph_iri: record.graph_iri.clone(),
+            user_id: self.config.actor.user_id,
+            node_id: self.config.actor.node_id,
+            operation: MetadataAuditOperation::Create,
+            occurred_at_ms: record.updated_at_ms,
+            details: Some(format!("holders={}", record.holder_node_ids.len())),
+        }
+    }
+
+    fn graph_policy(&self) -> MetadataGraphPolicy {
+        MetadataGraphPolicy {
+            public: self.config.public,
+            permission_paths: vec![self.permission_path()],
+        }
+        .normalized()
     }
 
     fn fail(&mut self, error: CreateMetadataDocumentError) -> Effects {
-        let cleanup = self.abort();
+        if self.record.is_some() {
+            self.pending_error = Some(error);
+            self.state = CreateMetadataDocumentState::CleanupGraph;
+            return smallvec![Effect::Metadata(MetadataEffect::DeleteGraph {
+                graph_iri: self.graph_iri(),
+            })];
+        }
         self.state = CreateMetadataDocumentState::Error;
         self.output = Some(Err(error));
-        cleanup
+        smallvec![]
+    }
+
+    fn fail_without_cleanup(&mut self, error: CreateMetadataDocumentError) -> Effects {
+        self.state = CreateMetadataDocumentState::Error;
+        self.output = Some(Err(error));
+        smallvec![]
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
@@ -123,97 +186,36 @@ impl CreateMetadataDocumentOperation {
 }
 
 impl Operation for CreateMetadataDocumentOperation {
-    type Output = MetadataDocument;
+    type Output = MetadataRegistryRecord;
     type Error = CreateMetadataDocumentError;
 
     fn start(&mut self) -> Effects {
-        self.state = CreateMetadataDocumentState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        self.state = CreateMetadataDocumentState::CheckExisting;
+        smallvec![read_registry_effect(
+            self.config.group_id,
+            self.config.document_id,
+            None
+        )]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            CreateMetadataDocumentState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.txn_id = Some(txn_id);
-                    self.state = CreateMetadataDocumentState::CheckExisting;
-                    smallvec![read_effect(&self.document_ref(), Some(txn_id))]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
-            },
-            CreateMetadataDocumentState::CheckExisting => match event {
-                Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => {
-                    self.fail(CreateMetadataDocumentError::DocumentAlreadyExists)
-                }
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    let bytes = match self
-                        .config
-                        .document
-                        .reconcile_bytes(None, &self.config.actor)
-                    {
-                        Ok(bytes) => bytes,
-                        Err(error) => return self.fail(error.into()),
-                    };
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = CreateMetadataDocumentState::WriteDocument;
-                    smallvec![write_effect(&self.document_ref(), bytes, Some(txn_id))]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage read result", format!("{other:?}")),
-            },
-            CreateMetadataDocumentState::WriteDocument => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = CreateMetadataDocumentState::CommitTransaction;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
-            },
-            CreateMetadataDocumentState::CommitTransaction => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.output = Some(Ok(self.config.document.clone()));
-                    self.state = CreateMetadataDocumentState::Announce;
-                    smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceAutomergeDocumentOperation::new(
-                            self.document_ref(),
-                            self.config.actor.node_id,
-                        ),
-                        |result| {
-                            Event::SubOperation(SubOperationEvent::AutomergeStateResult {
-                                result: result.map_err(|error| error.to_string()),
-                            })
-                        },
-                    ))]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
-            CreateMetadataDocumentState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
-                    match result {
-                        Ok(()) => {
-                            self.state = CreateMetadataDocumentState::LoadRealmConfig;
-                            smallvec![read_effect(&self.realm_config_ref(), None)]
-                        }
-                        Err(error) => self.fail(CreateMetadataDocumentError::AutomergeState(error)),
+            CreateMetadataDocumentState::CheckExisting => {
+                match crate::metadata::repository::parse_registry_read(event) {
+                    Ok(Some(_)) => self
+                        .fail_without_cleanup(CreateMetadataDocumentError::DocumentAlreadyExists),
+                    Ok(None) => {
+                        self.state = CreateMetadataDocumentState::LoadRealmConfig;
+                        smallvec![read_effect(&self.realm_config_ref(), None)]
+                    }
+                    Err(crate::metadata::repository::StorageReadError::Storage(error)) => {
+                        self.fail_without_cleanup(error.into())
+                    }
+                    Err(crate::metadata::repository::StorageReadError::Conversion(error)) => {
+                        self.fail_without_cleanup(error.into())
                     }
                 }
-                other => {
-                    self.unexpected_event("automerge announcement result", format!("{other:?}"))
-                }
-            },
+            }
             CreateMetadataDocumentState::LoadRealmConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     let realm_config = match value.as_deref() {
@@ -228,8 +230,8 @@ impl Operation for CreateMetadataDocumentOperation {
                             self.config.actor.realm_id.clone(),
                         ),
                     };
-                    self.selected_replication_factor = realm_config
-                        .metadata_replication_factor_for(self.config.document.group_id, None);
+                    self.selected_replication_factor =
+                        realm_config.metadata_replication_factor_for(self.config.group_id, None);
                     self.state = CreateMetadataDocumentState::LoadReplicationTargets;
                     smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
                         key: *realm_presence_key(&self.config.actor.realm_id).as_bytes(),
@@ -239,48 +241,160 @@ impl Operation for CreateMetadataDocumentOperation {
                 Event::Storage(StorageEvent::Error { .. }) => {
                     self.selected_replication_factor =
                         RealmConfigDocument::default_for_realm(self.config.actor.realm_id.clone())
-                            .metadata_replication_factor_for(self.config.document.group_id, None);
+                            .metadata_replication_factor_for(self.config.group_id, None);
                     self.state = CreateMetadataDocumentState::LoadReplicationTargets;
                     smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
                         key: *realm_presence_key(&self.config.actor.realm_id).as_bytes(),
                         realm_filter: Some(self.config.actor.realm_id.clone()),
                     }))]
                 }
-                other => self.unexpected_event("storage read result", format!("{other:?}")),
+                other => self.unexpected_event("realm config read result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::LoadReplicationTargets => match event {
                 Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => {
-                    self.replication_targets = select_replication_targets(
+                    let holder_node_ids = select_metadata_holders(
                         values.into_iter().map(|entry| entry.node_id).collect(),
                         self.config.actor.node_id,
                         self.selected_replication_factor,
                     );
-                    if self.replication_targets.is_empty() {
-                        return self.finish_success();
-                    }
-
-                    self.state = CreateMetadataDocumentState::Replicate;
-                    let document = self.document_ref();
-                    emit_next_replication(&mut self.replication_targets, document)
+                    self.record = Some(self.build_record(holder_node_ids));
+                    self.state = CreateMetadataDocumentState::CreateGraph;
+                    smallvec![Effect::Metadata(MetadataEffect::CreateCrate {
+                        request: MetadataCreateCrateRequest {
+                            graph_iri: self.graph_iri(),
+                            name: self.config.name.clone(),
+                            description: self.config.description.clone(),
+                            date_published: self.config.date_published.clone(),
+                            license: self.config.license.clone(),
+                            policy: self.graph_policy(),
+                        },
+                    })]
                 }
-                Event::Net(NetEvent::Dht(DhtEvent::Error { error })) => self.fail(error.into()),
-                other => self.unexpected_event("dht get result", format!("{other:?}")),
+                Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
+                | Event::Net(NetEvent::Error(_)) => {
+                    self.record = Some(self.build_record(vec![self.config.actor.node_id]));
+                    self.state = CreateMetadataDocumentState::CreateGraph;
+                    smallvec![Effect::Metadata(MetadataEffect::CreateCrate {
+                        request: MetadataCreateCrateRequest {
+                            graph_iri: self.graph_iri(),
+                            name: self.config.name.clone(),
+                            description: self.config.description.clone(),
+                            date_published: self.config.date_published.clone(),
+                            license: self.config.license.clone(),
+                            policy: self.graph_policy(),
+                        },
+                    })]
+                }
+                other => self.unexpected_event("replication target lookup", format!("{other:?}")),
             },
-            CreateMetadataDocumentState::Replicate => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) => {
-                    match result {
-                        Ok(()) => {
-                            if self.replication_targets.is_empty() {
-                                self.finish_success()
-                            } else {
-                                let document = self.document_ref();
-                                emit_next_replication(&mut self.replication_targets, document)
-                            }
+            CreateMetadataDocumentState::CreateGraph => match event {
+                Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => {
+                    self.state = CreateMetadataDocumentState::StartTransaction;
+                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                        read: false
+                    })]
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    self.fail_without_cleanup(error.into())
+                }
+                other => self.unexpected_event("metadata create result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::StartTransaction => match event {
+                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                    self.txn_id = Some(txn_id);
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = CreateMetadataDocumentState::WriteRegistry;
+                    match write_registry_effect(record, Some(txn_id)) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(CreateMetadataDocumentError::ConversionError(error))
                         }
-                        Err(error) => self.fail(CreateMetadataDocumentError::AutomergeSync(error)),
                     }
                 }
-                other => self.unexpected_event("automerge sync result", format!("{other:?}")),
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.fail_without_cleanup(error.into())
+                }
+                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::WriteRegistry => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = CreateMetadataDocumentState::WriteHolders;
+                    match write_holders_effect(record, Some(txn_id)) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(CreateMetadataDocumentError::ConversionError(error))
+                        }
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("registry write result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::WriteHolders => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = CreateMetadataDocumentState::WriteAudit;
+                    match write_audit_effect(&self.audit_record(record), Ulid::new(), Some(txn_id))
+                    {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(CreateMetadataDocumentError::ConversionError(error))
+                        }
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("holders write result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::WriteAudit => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = CreateMetadataDocumentState::CommitTransaction;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("audit write result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::CommitTransaction => match event {
+                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
+                    self.txn_id = None;
+                    let Some(record) = self.record.clone() else {
+                        return self
+                            .fail_without_cleanup(CreateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = CreateMetadataDocumentState::Finish;
+                    self.output = Some(Ok(record));
+                    smallvec![]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.txn_id = None;
+                    self.fail(error.into())
+                }
+                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::CleanupGraph => match event {
+                Event::Metadata(MetadataEvent::GraphDeleted { .. })
+                | Event::Metadata(MetadataEvent::Error { .. }) => {
+                    let error = self
+                        .pending_error
+                        .take()
+                        .expect("cleanup state must have pending error");
+                    self.fail_without_cleanup(error)
+                }
+                other => self.unexpected_event("metadata cleanup result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::Finish
             | CreateMetadataDocumentState::Error
@@ -296,7 +410,8 @@ impl Operation for CreateMetadataDocumentOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(self.config.document))
+        self.output
+            .expect("metadata create operation must set output")
     }
 
     fn abort(&mut self) -> Effects {
@@ -307,29 +422,15 @@ impl Operation for CreateMetadataDocumentOperation {
     }
 }
 
-fn emit_next_replication(targets: &mut Vec<NodeId>, document: AutomergeDocumentVariant) -> Effects {
-    let Some(target) = targets.pop() else {
-        return smallvec![];
-    };
-
-    smallvec![Effect::SubOperation(boxed_suboperation(
-        OutgoingAutomergeOperation::new(target, document),
-        |result| {
-            Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
-                result: result.map_err(|error| error.to_string()),
-            })
-        },
-    ))]
-}
-
-pub(crate) fn select_replication_targets(
+pub(crate) fn select_metadata_holders(
     realm_nodes: HashSet<NodeId>,
     local_node_id: NodeId,
     replication_factor: usize,
 ) -> Vec<NodeId> {
     let remote_target_count = replication_factor.max(1).saturating_sub(1);
+    let mut holders = vec![local_node_id];
     if remote_target_count == 0 {
-        return Vec::new();
+        return holders;
     }
 
     let mut candidates: Vec<_> = realm_nodes
@@ -339,24 +440,25 @@ pub(crate) fn select_replication_targets(
     let mut rng = rand::rng();
     candidates.shuffle(&mut rng);
     candidates.truncate(remote_target_count);
-    candidates
+    holders.extend(candidates);
+    holders
 }
 
 #[cfg(test)]
 mod tests {
-    use super::select_replication_targets;
+    use super::select_metadata_holders;
+
     use std::collections::HashSet;
 
     #[test]
-    fn select_replication_targets_excludes_local_node() {
+    fn select_metadata_holders_includes_local_node() {
         let local = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let remote_a = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let remote_b = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
 
-        let targets =
-            select_replication_targets(HashSet::from([local, remote_a, remote_b]), local, 3);
+        let holders = select_metadata_holders(HashSet::from([local, remote_a, remote_b]), local, 3);
 
-        assert_eq!(targets.len(), 2);
-        assert!(!targets.contains(&local));
+        assert_eq!(holders.len(), 3);
+        assert_eq!(holders[0], local);
     }
 }

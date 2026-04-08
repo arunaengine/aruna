@@ -1,26 +1,28 @@
-use aruna_core::automerge::AutomergeDocumentVariant;
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::events::Event;
+use aruna_core::metadata::{MetadataDocumentView, MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::Operation;
-use aruna_core::structs::MetadataDocument;
+use aruna_core::structs::MetadataRegistryRecord;
+use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
-use crate::automerge::repository::read_effect;
-use aruna_core::types::Effects;
-use aruna_core::types::GroupId;
+use crate::metadata::repository::{parse_registry_read, read_registry_effect, StorageReadError};
 
 #[derive(Debug, PartialEq)]
 pub struct GetMetadataDocumentOperation {
-    document: AutomergeDocumentVariant,
+    group_id: GroupId,
+    document_id: Ulid,
+    record: Option<MetadataRegistryRecord>,
     state: GetMetadataDocumentState,
-    output: Option<Result<MetadataDocument, GetMetadataDocumentError>>,
+    output: Option<Result<MetadataDocumentView, GetMetadataDocumentError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum GetMetadataDocumentState {
     Init,
-    ReadDocument,
+    ReadRecord,
+    ExportRoCrate,
     Finish,
     Error,
 }
@@ -28,9 +30,11 @@ enum GetMetadataDocumentState {
 #[derive(Debug, Error, PartialEq)]
 pub enum GetMetadataDocumentError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    StorageError(#[from] aruna_core::errors::StorageError),
     #[error(transparent)]
-    ConversionError(#[from] ConversionError),
+    ConversionError(#[from] aruna_core::errors::ConversionError),
+    #[error(transparent)]
+    MetadataError(#[from] MetadataError),
     #[error("document not found")]
     DocumentNotFound,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -42,12 +46,11 @@ pub enum GetMetadataDocumentError {
 }
 
 impl GetMetadataDocumentOperation {
-    pub fn new(group_id: GroupId, document_id: ulid::Ulid) -> Self {
+    pub fn new(group_id: GroupId, document_id: Ulid) -> Self {
         Self {
-            document: AutomergeDocumentVariant::Metadata {
-                group_id,
-                document_id,
-            },
+            group_id,
+            document_id,
+            record: None,
             state: GetMetadataDocumentState::Init,
             output: None,
         }
@@ -70,32 +73,40 @@ impl GetMetadataDocumentOperation {
 }
 
 impl Operation for GetMetadataDocumentOperation {
-    type Output = MetadataDocument;
+    type Output = MetadataDocumentView;
     type Error = GetMetadataDocumentError;
 
     fn start(&mut self) -> Effects {
-        self.state = GetMetadataDocumentState::ReadDocument;
-        smallvec![read_effect(&self.document, None)]
+        self.state = GetMetadataDocumentState::ReadRecord;
+        smallvec![read_registry_effect(self.group_id, self.document_id, None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            GetMetadataDocumentState::ReadDocument => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let Some(value) = value else {
+            GetMetadataDocumentState::ReadRecord => match parse_registry_read(event) {
+                Ok(Some(record)) => {
+                    let graph_iri = record.graph_iri.clone();
+                    self.record = Some(record);
+                    self.state = GetMetadataDocumentState::ExportRoCrate;
+                    smallvec![aruna_core::effects::Effect::Metadata(
+                        MetadataEffect::ExportRoCrate { graph_iri },
+                    )]
+                }
+                Ok(None) => self.fail(GetMetadataDocumentError::DocumentNotFound),
+                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+            },
+            GetMetadataDocumentState::ExportRoCrate => match event {
+                Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => {
+                    let Some(record) = self.record.take() else {
                         return self.fail(GetMetadataDocumentError::DocumentNotFound);
                     };
-                    match MetadataDocument::from_bytes(&value) {
-                        Ok(document) => {
-                            self.state = GetMetadataDocumentState::Finish;
-                            self.output = Some(Ok(document));
-                            smallvec![]
-                        }
-                        Err(error) => self.fail(error.into()),
-                    }
+                    self.state = GetMetadataDocumentState::Finish;
+                    self.output = Some(Ok(MetadataDocumentView { record, jsonld }));
+                    smallvec![]
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage read result", format!("{other:?}")),
+                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+                other => self.unexpected_event("metadata export result", format!("{other:?}")),
             },
             GetMetadataDocumentState::Finish
             | GetMetadataDocumentState::Error
