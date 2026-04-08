@@ -1,4 +1,3 @@
-use aruna_core::metadata::{MetadataCompactSnapshot, MetadataGraphPolicy};
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_net::streams::BiStream;
@@ -9,10 +8,6 @@ const MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataTransportMessage {
-    Bootstrap {
-        snapshot: MetadataCompactSnapshot,
-        policy: MetadataGraphPolicy,
-    },
     UpsertRecord {
         record: MetadataRegistryRecord,
     },

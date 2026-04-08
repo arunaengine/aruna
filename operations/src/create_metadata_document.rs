@@ -302,8 +302,7 @@ impl Operation for CreateMetadataDocumentOperation {
                     };
                     self.state = CreateMetadataDocumentState::ReplicateGraph;
                     smallvec![Effect::Metadata(MetadataEffect::ReplicateBootstrap {
-                        record,
-                        policy: self.graph_policy(),
+                        record
                     })]
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {

@@ -9,10 +9,9 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{
-    MetadataBatch, MetadataCompactSnapshot, MetadataCompactSnapshotQuadState,
-    MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataGraphPolicy, MetadataQuadOp, MetadataQueryResults, MetadataRoCratePage,
-    MetadataSearchHit, MetadataVectorClock,
+    MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
+    MetadataEvent, MetadataGraphPolicy, MetadataQuadOp, MetadataQueryResults,
+    MetadataRoCratePage, MetadataSearchHit, MetadataVectorClock,
 };
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_net::NetHandle;
@@ -76,11 +75,8 @@ impl MetadataHandle {
     pub async fn send_metadata_effect(&self, effect: MetadataEffect) -> Event {
         let graph_iri = effect_graph_iri(&effect);
         match effect {
-            MetadataEffect::ReplicateBootstrap { record, policy } => {
-                Event::Metadata(self.replicate_bootstrap(record, policy).await)
-            }
-            MetadataEffect::ReplicateSnapshot { record, policy } => {
-                Event::Metadata(self.replicate_snapshot(record, policy).await)
+            MetadataEffect::ReplicateBootstrap { record } => {
+                Event::Metadata(self.replicate_bootstrap(record).await)
             }
             MetadataEffect::ReplicateBatch { record, batch } => {
                 Event::Metadata(self.replicate_batch(record, batch).await)
@@ -109,14 +105,8 @@ impl MetadataHandle {
         let message = read_transport_message(&mut stream).await?;
 
         let response = match message {
-            MetadataTransportMessage::Bootstrap { snapshot, policy } => {
-                match import_snapshot(self.inner.clone(), snapshot, policy).await {
-                    Ok(()) => MetadataTransportMessage::Ack,
-                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
-                }
-            }
             MetadataTransportMessage::UpsertRecord { record } => {
-                match persist_replica_record(self.inner.storage_handle.clone(), &record).await {
+                match persist_replica_record(self.inner.clone(), &record).await {
                     Ok(()) => MetadataTransportMessage::Ack,
                     Err(error) => {
                         let _ = cleanup_replica_graph(self.inner.clone(), &record.graph_iri).await;
@@ -153,7 +143,6 @@ impl MetadataHandle {
     async fn replicate_bootstrap(
         &self,
         mut record: MetadataRegistryRecord,
-        policy: MetadataGraphPolicy,
     ) -> MetadataEvent {
         let graph_iri = record.graph_iri.clone();
         let Some(net_handle) = self.inner.net_handle.clone() else {
@@ -164,8 +153,14 @@ impl MetadataHandle {
             };
         };
 
-        let snapshot = match export_compact_snapshot(self.inner.clone(), &graph_iri).await {
-            Ok(snapshot) => snapshot,
+        let batches = match export_catchup_batches(
+            self.inner.clone(),
+            &graph_iri,
+            MetadataVectorClock::default(),
+        )
+        .await
+        {
+            Ok(batches) => batches,
             Err(error) => {
                 return MetadataEvent::Error {
                     graph_iri: Some(graph_iri),
@@ -185,9 +180,9 @@ impl MetadataHandle {
 
         let mut bootstrapped = Vec::new();
         for node_id in remote_targets {
-            match send_bootstrap_snapshot(&net_handle, node_id, snapshot.clone(), policy.clone()).await {
+            match send_apply_batches(&net_handle, node_id, &batches).await {
                 Ok(()) => bootstrapped.push(node_id),
-                Err(error) => warn!(node_id = %node_id, error = %error, "metadata bootstrap snapshot failed"),
+                Err(error) => warn!(node_id = %node_id, error = %error, "metadata bootstrap batch sync failed"),
             }
         }
 
@@ -221,53 +216,6 @@ impl MetadataHandle {
         MetadataEvent::BootstrapReplicated {
             graph_iri,
             replicated_node_ids: record.holder_node_ids,
-        }
-    }
-
-    async fn replicate_snapshot(
-        &self,
-        record: MetadataRegistryRecord,
-        policy: MetadataGraphPolicy,
-    ) -> MetadataEvent {
-        let graph_iri = record.graph_iri.clone();
-        let Some(net_handle) = self.inner.net_handle.clone() else {
-            return MetadataEvent::SnapshotReplicated {
-                graph_iri,
-                replicated_node_ids: vec![self.inner.local_node_id],
-            };
-        };
-
-        let snapshot = match export_compact_snapshot(self.inner.clone(), &graph_iri).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                return MetadataEvent::Error {
-                    graph_iri: Some(graph_iri),
-                    error,
-                };
-            }
-        };
-
-        let mut replicated = vec![self.inner.local_node_id];
-        for node_id in record
-            .holder_node_ids
-            .iter()
-            .copied()
-            .filter(|node_id| *node_id != self.inner.local_node_id)
-        {
-            if send_bootstrap_snapshot(&net_handle, node_id, snapshot.clone(), policy.clone())
-                .await
-                .is_ok()
-                && send_upsert_record(&net_handle, node_id, record.clone())
-                    .await
-                    .is_ok()
-            {
-                replicated.push(node_id);
-            }
-        }
-
-        MetadataEvent::SnapshotReplicated {
-            graph_iri,
-            replicated_node_ids: replicated,
         }
     }
 
@@ -457,24 +405,9 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
                     .map(metadata_batch_from_craqle)
                     .collect(),
             }),
-        MetadataEffect::CompactSnapshot { graph_iri } => node
-            .compact_graph_snapshot(&GraphId::new(&graph_iri))
-            .map(|snapshot| MetadataEvent::CompactSnapshotResult {
-                graph_iri,
-                snapshot: metadata_compact_snapshot_from_craqle(snapshot),
-            }),
         MetadataEffect::ReplicateBootstrap { .. }
-        | MetadataEffect::ReplicateSnapshot { .. }
         | MetadataEffect::ReplicateBatch { .. }
         | MetadataEffect::ReplicateDelete { .. } => unreachable!("handled asynchronously"),
-        MetadataEffect::ImportCompactSnapshot { snapshot, policy } => {
-            let graph_iri = snapshot.graph_iri.clone();
-            node.import_compact_graph_snapshot(
-                &craqle_compact_snapshot(snapshot),
-                craqle_graph_policy(policy),
-            )
-            .map(|_| MetadataEvent::CompactSnapshotImported { graph_iri })
-        }
         MetadataEffect::ApplyRemoteBatch { batch } => {
             let graph_iri = batch.graph_iri.clone();
             node.apply_remote_batch(craqle_batch(batch))
@@ -498,17 +431,14 @@ fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::ExportRoCrateSummary { graph_iri }
         | MetadataEffect::DeleteGraph { graph_iri }
         | MetadataEffect::ContainsGraph { graph_iri }
-        | MetadataEffect::VectorClock { graph_iri }
-        | MetadataEffect::CompactSnapshot { graph_iri } => Some(graph_iri.clone()),
+        | MetadataEffect::VectorClock { graph_iri } => Some(graph_iri.clone()),
         MetadataEffect::ExportRoCratePage { graph_iri, .. } => Some(graph_iri.clone()),
-        MetadataEffect::ReplicateBootstrap { record, .. }
-        | MetadataEffect::ReplicateSnapshot { record, .. }
+        MetadataEffect::ReplicateBootstrap { record }
         | MetadataEffect::ReplicateBatch { record, .. }
         | MetadataEffect::ReplicateDelete { record } => Some(record.graph_iri.clone()),
         MetadataEffect::SearchGraphs { graph_iris, .. } => graph_iris.first().cloned(),
         MetadataEffect::QueryGraphs { graph_iris, .. } => graph_iris.first().cloned(),
         MetadataEffect::CatchupBatches { graph_iri, .. } => Some(graph_iri.clone()),
-        MetadataEffect::ImportCompactSnapshot { snapshot, .. } => Some(snapshot.graph_iri.clone()),
         MetadataEffect::ApplyRemoteBatch { batch } => Some(batch.graph_iri.clone()),
         MetadataEffect::ListGraphs => None,
     }
@@ -684,54 +614,6 @@ fn craqle_batch(batch: MetadataBatch) -> Batch {
     }
 }
 
-fn metadata_compact_snapshot_from_craqle(
-    snapshot: craqle::GraphReplicaCompactSnapshot,
-) -> MetadataCompactSnapshot {
-    MetadataCompactSnapshot {
-        graph_iri: snapshot.graph.as_str().to_string(),
-        clock: metadata_vector_clock_from_craqle(snapshot.clock),
-        terms: snapshot.terms.into_iter().map(|term| term.0).collect(),
-        quads: snapshot
-            .quads
-            .into_iter()
-            .map(|quad| MetadataCompactSnapshotQuadState {
-                subject: quad.subject,
-                predicate: quad.predicate,
-                object: quad.object,
-                dots: quad
-                    .dots
-                    .into_iter()
-                    .map(metadata_dot_from_craqle)
-                    .collect(),
-            })
-            .collect(),
-    }
-}
-
-fn craqle_compact_snapshot(
-    snapshot: MetadataCompactSnapshot,
-) -> craqle::GraphReplicaCompactSnapshot {
-    craqle::GraphReplicaCompactSnapshot {
-        graph: GraphId::new(&snapshot.graph_iri),
-        clock: craqle_vector_clock(snapshot.clock),
-        terms: snapshot
-            .terms
-            .into_iter()
-            .map(craqle::EncodedTerm)
-            .collect(),
-        quads: snapshot
-            .quads
-            .into_iter()
-            .map(|quad| craqle::CompactSnapshotQuadState {
-                subject: quad.subject,
-                predicate: quad.predicate,
-                object: quad.object,
-                dots: quad.dots.into_iter().map(craqle_dot).collect(),
-            })
-            .collect(),
-    }
-}
-
 fn metadata_rocrate_page_from_craqle(page: craqle::RoCratePage) -> MetadataRoCratePage {
     MetadataRoCratePage {
         jsonld: page.jsonld,
@@ -750,34 +632,17 @@ fn metadata_search_hit_from_craqle(hit: craqle::SearchHit) -> MetadataSearchHit 
     }
 }
 
-async fn export_compact_snapshot(
+async fn export_catchup_batches(
     inner: Arc<MetadataInner>,
     graph_iri: &str,
-) -> Result<MetadataCompactSnapshot, MetadataError> {
+    remote_clock: MetadataVectorClock,
+) -> Result<Vec<MetadataBatch>, MetadataError> {
     let graph_iri = graph_iri.to_string();
     tokio::task::spawn_blocking(move || {
         inner
             .node
-            .compact_graph_snapshot(&GraphId::new(&graph_iri))
-            .map(metadata_compact_snapshot_from_craqle)
-            .map_err(|error| MetadataError::Backend(error.to_string()))
-    })
-    .await
-    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-}
-
-async fn import_snapshot(
-    inner: Arc<MetadataInner>,
-    snapshot: MetadataCompactSnapshot,
-    policy: MetadataGraphPolicy,
-) -> Result<(), MetadataError> {
-    tokio::task::spawn_blocking(move || {
-        inner
-            .node
-            .import_compact_graph_snapshot(
-                &craqle_compact_snapshot(snapshot),
-                craqle_graph_policy(policy),
-            )
+            .catchup_batches(&GraphId::new(&graph_iri), &craqle_vector_clock(remote_clock))
+            .map(|batches| batches.into_iter().map(metadata_batch_from_craqle).collect())
             .map_err(|error| MetadataError::Backend(error.to_string()))
     })
     .await
@@ -811,9 +676,12 @@ async fn cleanup_replica_graph(inner: Arc<MetadataInner>, graph_iri: &str) -> Re
 }
 
 async fn persist_replica_record(
-    storage_handle: StorageHandle,
+    inner: Arc<MetadataInner>,
     record: &MetadataRegistryRecord,
 ) -> Result<(), MetadataError> {
+    persist_graph_policy(inner.clone(), record).await?;
+
+    let storage_handle = inner.storage_handle.clone();
     let txn_id = match storage_handle
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -875,6 +743,29 @@ async fn persist_replica_record(
     result
 }
 
+async fn persist_graph_policy(
+    inner: Arc<MetadataInner>,
+    record: &MetadataRegistryRecord,
+) -> Result<(), MetadataError> {
+    let graph_iri = record.graph_iri.clone();
+    let policy = graph_policy_for_record(record);
+    tokio::task::spawn_blocking(move || {
+        inner
+            .node
+            .import_graph_policy(&GraphId::new(&graph_iri), craqle_graph_policy(policy))
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+}
+
+fn graph_policy_for_record(record: &MetadataRegistryRecord) -> MetadataGraphPolicy {
+    MetadataGraphPolicy {
+        public: record.public,
+        permission_paths: vec![record.permission_path.clone()],
+    }
+}
+
 async fn write_storage_effect(
     storage_handle: &StorageHandle,
     effect: Effect,
@@ -889,24 +780,6 @@ async fn write_storage_effect(
             "unexpected {label} event: {other:?}"
         ))),
     }
-}
-
-async fn send_bootstrap_snapshot(
-    net_handle: &NetHandle,
-    node_id: NodeId,
-    snapshot: MetadataCompactSnapshot,
-    policy: MetadataGraphPolicy,
-) -> Result<(), MetadataError> {
-    let mut stream = net_handle
-        .open_stream(node_id, Alpn::Metadata)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    write_transport_message(
-        &mut stream,
-        &MetadataTransportMessage::Bootstrap { snapshot, policy },
-    )
-    .await?;
-    wait_for_request_delivery(&mut stream).await
 }
 
 async fn send_upsert_record(
@@ -933,6 +806,17 @@ async fn send_apply_batch(
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
     write_transport_message(&mut stream, &MetadataTransportMessage::ApplyBatch { batch }).await?;
     wait_for_request_delivery(&mut stream).await
+}
+
+async fn send_apply_batches(
+    net_handle: &NetHandle,
+    node_id: NodeId,
+    batches: &[MetadataBatch],
+) -> Result<(), MetadataError> {
+    for batch in batches {
+        send_apply_batch(net_handle, node_id, batch.clone()).await?;
+    }
+    Ok(())
 }
 
 async fn send_delete_record(

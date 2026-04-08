@@ -95,22 +95,6 @@ pub struct MetadataBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataCompactSnapshotQuadState {
-    pub subject: u32,
-    pub predicate: u32,
-    pub object: u32,
-    pub dots: Vec<MetadataDot>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataCompactSnapshot {
-    pub graph_iri: String,
-    pub clock: MetadataVectorClock,
-    pub terms: Vec<String>,
-    pub quads: Vec<MetadataCompactSnapshotQuadState>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataQueryResults {
     Solutions(Vec<BTreeMap<String, String>>),
     Boolean(bool),
@@ -167,16 +151,8 @@ pub enum MetadataEffect {
         graph_iri: String,
         remote_clock: MetadataVectorClock,
     },
-    CompactSnapshot {
-        graph_iri: String,
-    },
     ReplicateBootstrap {
         record: MetadataRegistryRecord,
-        policy: MetadataGraphPolicy,
-    },
-    ReplicateSnapshot {
-        record: MetadataRegistryRecord,
-        policy: MetadataGraphPolicy,
     },
     ReplicateBatch {
         record: MetadataRegistryRecord,
@@ -184,10 +160,6 @@ pub enum MetadataEffect {
     },
     ReplicateDelete {
         record: MetadataRegistryRecord,
-    },
-    ImportCompactSnapshot {
-        snapshot: MetadataCompactSnapshot,
-        policy: MetadataGraphPolicy,
     },
     ApplyRemoteBatch {
         batch: MetadataBatch,
@@ -247,15 +219,7 @@ pub enum MetadataEvent {
         graph_iri: String,
         batches: Vec<MetadataBatch>,
     },
-    CompactSnapshotResult {
-        graph_iri: String,
-        snapshot: MetadataCompactSnapshot,
-    },
     BootstrapReplicated {
-        graph_iri: String,
-        replicated_node_ids: Vec<NodeId>,
-    },
-    SnapshotReplicated {
         graph_iri: String,
         replicated_node_ids: Vec<NodeId>,
     },
@@ -266,9 +230,6 @@ pub enum MetadataEvent {
     DeleteReplicated {
         graph_iri: String,
         replicated_node_ids: Vec<NodeId>,
-    },
-    CompactSnapshotImported {
-        graph_iri: String,
     },
     RemoteBatchApplied {
         graph_iri: String,
