@@ -687,6 +687,32 @@ impl Object {
         Ok(())
     }
 
+    pub async fn update_staging(&self, client: &Client) -> Result<()> {
+        let query = "UPDATE objects
+        SET name = $2, description = $3, key_values = $4, data_class = $5, hashes = $6,
+            metadata_license = $7, data_license = $8
+        WHERE id = $1;";
+
+        let prepared = client.prepare(query).await?;
+
+        client
+            .execute(
+                &prepared,
+                &[
+                    &self.id,
+                    &self.name,
+                    &self.description,
+                    &self.key_values,
+                    &self.data_class,
+                    &self.hashes,
+                    &self.metadata_license,
+                    &self.data_license,
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     //ToDo: Docs
     pub async fn batch_claim(
         user_id: &DieselUlid,

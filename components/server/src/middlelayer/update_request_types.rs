@@ -383,6 +383,41 @@ impl UpdateObject {
             target_name: name,
         })
     }
+
+    pub fn get_parent_id(parent: &UpdateParent) -> Result<DieselUlid> {
+        match parent {
+            UpdateParent::ProjectId(id) => Ok(DieselUlid::from_str(id)?),
+            UpdateParent::CollectionId(id) => Ok(DieselUlid::from_str(id)?),
+            UpdateParent::DatasetId(id) => Ok(DieselUlid::from_str(id)?),
+        }
+    }
+
+    pub fn parent_relation_changed(
+        old_object: &ObjectWithRelations,
+        parent: &UpdateParent,
+    ) -> Result<bool> {
+        let requested_parent_id = Self::get_parent_id(parent)?;
+        Ok(!old_object
+            .inbound_belongs_to
+            .0
+            .contains_key(&requested_parent_id))
+    }
+
+    pub fn get_parent_affected_ids(
+        old_object: &ObjectWithRelations,
+        parent: &UpdateParent,
+    ) -> Result<Vec<DieselUlid>> {
+        let requested_parent_id = Self::get_parent_id(parent)?;
+        let mut affected = vec![requested_parent_id];
+
+        affected.extend(old_object.inbound_belongs_to.0.iter().filter_map(|entry| {
+            let parent_id = *entry.key();
+            (parent_id != requested_parent_id).then_some(parent_id)
+        }));
+
+        Ok(affected)
+    }
+
     pub fn get_all_relations(
         old_object: ObjectWithRelations,
         new_object: Object,

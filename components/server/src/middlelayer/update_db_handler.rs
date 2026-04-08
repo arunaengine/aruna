@@ -4,7 +4,7 @@ use super::update_request_types::{
 use crate::database::crud::CrudDb;
 use crate::database::dsls::hook_dsl::TriggerVariant;
 use crate::database::dsls::internal_relation_dsl::{
-    InternalRelation, INTERNAL_RELATION_VARIANT_VERSION,
+    InternalRelation, INTERNAL_RELATION_VARIANT_BELONGS_TO, INTERNAL_RELATION_VARIANT_VERSION,
 };
 use crate::database::dsls::license_dsl::ALL_RIGHTS_RESERVED;
 use crate::database::dsls::object_dsl::{KeyValue, KeyValueVariant, Object, ObjectWithRelations};
@@ -15,6 +15,7 @@ use crate::middlelayer::update_request_types::{
 };
 use anyhow::{anyhow, Result};
 use aruna_rust_api::api::notification::services::v2::EventVariant;
+use aruna_rust_api::api::storage::services::v2::update_object_request::Parent;
 use aruna_rust_api::api::storage::services::v2::UpdateObjectRequest;
 use deadpool_postgres::GenericClient;
 use diesel_ulid::DieselUlid;
@@ -312,14 +313,16 @@ impl DatabaseHandler {
                 (_, _) => true,
             },
         };
+        let initializing_object = old.object_status == ObjectStatus::INITIALIZING;
         let (data_class, dataclass_triggers_new_revision) =
             req.get_dataclass(old.clone(), is_service_account)?;
-        let (id, is_new, affected) = if request.force_revision
-            || request.name.is_some()
-            || !request.remove_key_values.is_empty()
-            || !request.hashes.is_empty()
-            || license_triggers_new_revision
-            || dataclass_triggers_new_revision
+        let (id, is_new, affected) = if !initializing_object
+            && (request.force_revision
+                || request.name.is_some()
+                || !request.remove_key_values.is_empty()
+                || !request.hashes.is_empty()
+                || license_triggers_new_revision
+                || dataclass_triggers_new_revision)
         {
             let object_status = if request.force_revision {
                 ObjectStatus::INITIALIZING
@@ -388,9 +391,9 @@ impl DatabaseHandler {
                 )?;
                 relation.create(transaction_client).await?;
                 let changed = match p {
-                    aruna_rust_api::api::storage::services::v2::update_object_request::Parent::ProjectId(id) => DieselUlid::from_str(&id)?,
-                    aruna_rust_api::api::storage::services::v2::update_object_request::Parent::CollectionId(id) => DieselUlid::from_str(&id)?,
-                    aruna_rust_api::api::storage::services::v2::update_object_request::Parent::DatasetId(id) => DieselUlid::from_str(&id)?,
+                    Parent::ProjectId(id) => DieselUlid::from_str(&id)?,
+                    Parent::CollectionId(id) => DieselUlid::from_str(&id)?,
+                    Parent::DatasetId(id) => DieselUlid::from_str(&id)?,
                 };
                 affected.push(changed);
             }
@@ -400,43 +403,73 @@ impl DatabaseHandler {
             (id, true, affected)
         } else {
             // Update in place
-            let update_object = Object {
-                id: old.id,
-                content_len: old.content_len,
-                count: 1,
-                revision_number: old.revision_number,
-                external_relations: old.clone().external_relations,
-                created_at: None,
-                created_by: old.created_by,
-                authors: old.authors.clone(),
-                data_class,
-                description: req.get_description(old.clone()),
-                name: old.clone().name,
-                title: old.title.clone(),
-                key_values: Json(req.get_add_keyvals(old.clone())?),
-                hashes: old.clone().hashes,
-                object_type: crate::database::enums::ObjectType::OBJECT,
-                object_status: old.object_status.clone(),
-                dynamic: false,
-                endpoints: Json(req.get_endpoints(old.clone(), false)?),
-                metadata_license: old.metadata_license,
-                data_license: old.data_license,
-            };
-            update_object.update(transaction_client).await?;
+            let mut update_object = old.clone();
+            update_object.data_class = data_class;
+            update_object.description = req.get_description(old.clone());
+
+            if initializing_object {
+                let (metadata_license, data_license) =
+                    req.get_license(&old, transaction_client).await?;
+                update_object.name = req.get_name(old.clone());
+                update_object.key_values = Json(req.get_all_kvs(old.clone())?);
+                update_object.hashes = Json(req.get_hashes(old.clone())?);
+                update_object.metadata_license = metadata_license;
+                update_object.data_license = data_license;
+                update_object.update_staging(transaction_client).await?;
+
+                if update_object.name != old.name {
+                    InternalRelation::update_target_name(
+                        update_object.id,
+                        &update_object.name,
+                        transaction_client,
+                    )
+                    .await?;
+                }
+            } else {
+                update_object.key_values = Json(req.get_add_keyvals(old.clone())?);
+                update_object.update(transaction_client).await?;
+            }
+
             // Create & return all affected ids for cache sync
             let affected = if let Some(p) = request.parent.clone() {
-                let mut relation = UpdateObject::add_parent_relation(
-                    id,
-                    p.clone(),
-                    update_object.name.to_string(),
-                )?;
-                relation.create(transaction_client).await?;
-                let p_id = match p {
-                    aruna_rust_api::api::storage::services::v2::update_object_request::Parent::ProjectId(id) => DieselUlid::from_str(&id)?,
-                    aruna_rust_api::api::storage::services::v2::update_object_request::Parent::CollectionId(id) => DieselUlid::from_str(&id)?,
-                    aruna_rust_api::api::storage::services::v2::update_object_request::Parent::DatasetId(id) => DieselUlid::from_str(&id)?,
-                };
-                vec![p_id, update_object.id]
+                let mut affected = vec![update_object.id];
+
+                if initializing_object {
+                    if UpdateObject::parent_relation_changed(&owr, &p)? {
+                        InternalRelation::batch_delete_by_target_and_relation(
+                            update_object.id,
+                            INTERNAL_RELATION_VARIANT_BELONGS_TO,
+                            transaction_client,
+                        )
+                        .await?;
+
+                        let mut relation = UpdateObject::add_parent_relation(
+                            id,
+                            p.clone(),
+                            update_object.name.to_string(),
+                        )?;
+                        relation.create(transaction_client).await?;
+                    }
+
+                    affected.extend(UpdateObject::get_parent_affected_ids(&owr, &p)?);
+                    affected.sort();
+                    affected.dedup();
+                } else {
+                    let mut relation = UpdateObject::add_parent_relation(
+                        id,
+                        p.clone(),
+                        update_object.name.to_string(),
+                    )?;
+                    relation.create(transaction_client).await?;
+                    let p_id = match p {
+                        Parent::ProjectId(id) => DieselUlid::from_str(&id)?,
+                        Parent::CollectionId(id) => DieselUlid::from_str(&id)?,
+                        Parent::DatasetId(id) => DieselUlid::from_str(&id)?,
+                    };
+                    affected.push(p_id);
+                }
+
+                affected
             } else {
                 vec![update_object.id]
             };
