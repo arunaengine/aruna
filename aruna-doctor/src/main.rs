@@ -43,8 +43,13 @@ pub enum Commands {
 
 #[derive(Subcommand, Debug)]
 pub enum ExploreCommands {
-    Keyspaces { database_path: String },
-    Entries { database_path: String, keyspace: String },
+    Keyspaces {
+        database_path: String,
+    },
+    Entries {
+        database_path: String,
+        keyspace: String,
+    },
 }
 
 #[tokio::main]
@@ -65,7 +70,9 @@ pub async fn main() -> Result<(), CliError> {
             target_path,
         } => snapshot(database_path, target_path).await?,
         Commands::Explore { command } => match command {
-            ExploreCommands::Keyspaces { database_path } => explore_keyspaces(database_path).await?,
+            ExploreCommands::Keyspaces { database_path } => {
+                explore_keyspaces(database_path).await?
+            }
             ExploreCommands::Entries {
                 database_path,
                 keyspace,

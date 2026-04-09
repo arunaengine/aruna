@@ -3,13 +3,13 @@ use aruna::config::PersistedNodeState;
 use aruna_api::server_state::{
     INITIAL_REALM_ADMIN_CLAIMED_KEY, TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY,
 };
-use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, AUTH_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
-    GROUP_KEYSPACE, METADATA_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE,
-    S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
-};
 use aruna_core::id::{DhtKeyId, TopicId};
+use aruna_core::keyspaces::{
+    API_STATE_KEYSPACE, AUTH_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
+    METADATA_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
+    USER_ACCESS_KEYSPACE,
+};
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BucketInfo, Group, GroupAuthorizationDocument, Location, LookupKey, MetadataDocument, Realm,
@@ -18,8 +18,8 @@ use aruna_core::structs::{
 };
 use aruna_net::dht::storage::StoredEntry;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
-use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
+use serde::ser::{SerializeStruct, Serializer};
 use std::collections::HashSet;
 use std::path::Path;
 use ulid::Ulid;
@@ -81,23 +81,57 @@ enum DecodedField {
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(tag = "type")]
 enum DecodedValue {
-    Group { data: JsonGroup },
-    GroupAuthorizationDocument { data: GroupAuthorizationDocument },
-    Realm { data: JsonRealm },
-    RealmAuthorizationDocument { data: JsonRealmAuthorizationDocument },
-    RealmConfigDocument { data: JsonRealmConfigDocument },
-    MetadataDocument { data: MetadataDocument },
-    UserAccess { data: JsonUserAccess },
-    BucketInfo { data: BucketInfo },
-    Location { data: Location },
-    VersionMetadata { data: VersionMetadata },
-    ApiTokenRevocationList { data: HashSet<String> },
-    ApiTrustedRealmsList { data: Vec<String> },
-    ApiInitialRealmAdminClaimed { data: bool },
-    GossipSubscriptions { data: Vec<String> },
-    NodeState { data: JsonPersistedNodeState },
-    OnboardingSecretRecord { data: OnboardingSecretRecord },
-    DhtEntries { data: Vec<JsonStoredEntry> },
+    Group {
+        data: JsonGroup,
+    },
+    GroupAuthorizationDocument {
+        data: GroupAuthorizationDocument,
+    },
+    Realm {
+        data: JsonRealm,
+    },
+    RealmAuthorizationDocument {
+        data: JsonRealmAuthorizationDocument,
+    },
+    RealmConfigDocument {
+        data: JsonRealmConfigDocument,
+    },
+    MetadataDocument {
+        data: MetadataDocument,
+    },
+    UserAccess {
+        data: JsonUserAccess,
+    },
+    BucketInfo {
+        data: BucketInfo,
+    },
+    Location {
+        data: Location,
+    },
+    VersionMetadata {
+        data: VersionMetadata,
+    },
+    ApiTokenRevocationList {
+        data: HashSet<String>,
+    },
+    ApiTrustedRealmsList {
+        data: Vec<String>,
+    },
+    ApiInitialRealmAdminClaimed {
+        data: bool,
+    },
+    GossipSubscriptions {
+        data: Vec<String>,
+    },
+    NodeState {
+        data: JsonPersistedNodeState,
+    },
+    OnboardingSecretRecord {
+        data: OnboardingSecretRecord,
+    },
+    DhtEntries {
+        data: Vec<JsonStoredEntry>,
+    },
     Raw {
         hex: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,7 +268,11 @@ impl Serialize for JsonStoredEntry {
         state.serialize_field("expires_at", &self.0.expires_at)?;
         state.serialize_field(
             "signature",
-            &self.0.signature.as_ref().map(std::string::ToString::to_string),
+            &self
+                .0
+                .signature
+                .as_ref()
+                .map(std::string::ToString::to_string),
         )?;
         state.serialize_field("value_len", &self.0.value.len())?;
         state.serialize_field("value_hex", &hex::encode(&self.0.value))?;
@@ -285,7 +323,10 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let mut keyspaces = db.list_keyspace_names();
     keyspaces.sort();
-    let existing = keyspaces.iter().map(|name| name.as_ref()).collect::<HashSet<_>>();
+    let existing = keyspaces
+        .iter()
+        .map(|name| name.as_ref())
+        .collect::<HashSet<_>>();
     let mut missing_keyspaces = defined_keyspaces()
         .into_iter()
         .filter(|name| !existing.contains(name))
@@ -329,7 +370,10 @@ fn defined_keyspaces() -> [&'static str; 14] {
 fn list_entries(database_path: &str, keyspace_name: &str) -> Result<EntriesOutput, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let keyspace_names = db.list_keyspace_names();
-    if !keyspace_names.iter().any(|name| name.as_ref() == keyspace_name) {
+    if !keyspace_names
+        .iter()
+        .any(|name| name.as_ref() == keyspace_name)
+    {
         return Err(ExplorerError::KeyspaceNotFound(keyspace_name.to_string()));
     }
 
@@ -385,36 +429,30 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         REALM_KEYSPACE => decode_value_with(value, Realm::from_bytes, |data| DecodedValue::Realm {
             data: JsonRealm(data),
         }),
-        REALM_CONFIG_KEYSPACE => decode_value_with(
-            value,
-            RealmConfigDocument::from_bytes,
-            |data| DecodedValue::RealmConfigDocument {
-                data: JsonRealmConfigDocument(data),
-            },
-        ),
-        METADATA_KEYSPACE => decode_value_with(
-            value,
-            MetadataDocument::from_bytes,
-            |data| DecodedValue::MetadataDocument { data },
-        ),
-        USER_ACCESS_KEYSPACE => {
-            decode_value_with(value, UserAccess::from_bytes, |data| DecodedValue::UserAccess {
+        REALM_CONFIG_KEYSPACE => {
+            decode_value_with(value, RealmConfigDocument::from_bytes, |data| {
+                DecodedValue::RealmConfigDocument {
+                    data: JsonRealmConfigDocument(data),
+                }
+            })
+        }
+        METADATA_KEYSPACE => decode_value_with(value, MetadataDocument::from_bytes, |data| {
+            DecodedValue::MetadataDocument { data }
+        }),
+        USER_ACCESS_KEYSPACE => decode_value_with(value, UserAccess::from_bytes, |data| {
+            DecodedValue::UserAccess {
                 data: JsonUserAccess(data),
-            })
-        }
-        S3_BUCKET_KEYSPACE => {
-            decode_value_with(value, BucketInfo::from_bytes, |data| DecodedValue::BucketInfo {
-                data,
-            })
-        }
-        S3_LOOKUP_KEYSPACE => {
-            decode_value_with(value, Location::from_bytes, |data| DecodedValue::Location { data })
-        }
-        S3_VERSION_KEYSPACE => decode_value_with(
-            value,
-            VersionMetadata::from_bytes,
-            |data| DecodedValue::VersionMetadata { data },
-        ),
+            }
+        }),
+        S3_BUCKET_KEYSPACE => decode_value_with(value, BucketInfo::from_bytes, |data| {
+            DecodedValue::BucketInfo { data }
+        }),
+        S3_LOOKUP_KEYSPACE => decode_value_with(value, Location::from_bytes, |data| {
+            DecodedValue::Location { data }
+        }),
+        S3_VERSION_KEYSPACE => decode_value_with(value, VersionMetadata::from_bytes, |data| {
+            DecodedValue::VersionMetadata { data }
+        }),
         AUTH_KEYSPACE => decode_auth_value(value),
         API_STATE_KEYSPACE => decode_api_state_value(key, value),
         GOSSIP_SUBSCRIPTIONS_KEYSPACE => decode_gossip_subscriptions_value(value),
@@ -430,19 +468,26 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             |bytes| postcard::from_bytes::<OnboardingSecretRecord>(bytes),
             |data| DecodedValue::OnboardingSecretRecord { data },
         ),
-        DHT_KEYSPACE => decode_value_with(value, decode_dht_entries, |data| DecodedValue::DhtEntries {
-            data,
+        DHT_KEYSPACE => decode_value_with(value, decode_dht_entries, |data| {
+            DecodedValue::DhtEntries { data }
         }),
         _ => raw_value(value, None),
     }
 }
 
 fn decode_gossip_subscriptions_value(value: &[u8]) -> DecodedValue {
-    decode_value_with(value, |bytes| postcard::from_bytes::<Vec<TopicId>>(bytes), |data| {
-        let mut data = data.into_iter().map(|topic| topic.to_string()).collect::<Vec<_>>();
-        data.sort();
-        DecodedValue::GossipSubscriptions { data }
-    })
+    decode_value_with(
+        value,
+        |bytes| postcard::from_bytes::<Vec<TopicId>>(bytes),
+        |data| {
+            let mut data = data
+                .into_iter()
+                .map(|topic| topic.to_string())
+                .collect::<Vec<_>>();
+            data.sort();
+            DecodedValue::GossipSubscriptions { data }
+        },
+    )
 }
 
 fn decode_auth_value(value: &[u8]) -> DecodedValue {
@@ -471,7 +516,10 @@ fn decode_api_state_value(key: &[u8], value: &[u8]) -> DecodedValue {
             .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
         TRUSTED_REALMS_LIST_KEY => postcard::from_bytes::<HashSet<RealmId>>(value)
             .map(|data| {
-                let mut data = data.into_iter().map(|realm_id| realm_id.to_string()).collect::<Vec<_>>();
+                let mut data = data
+                    .into_iter()
+                    .map(|realm_id| realm_id.to_string())
+                    .collect::<Vec<_>>();
                 data.sort();
                 DecodedValue::ApiTrustedRealmsList { data }
             })
@@ -585,8 +633,10 @@ mod tests {
         {
             let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
             db.keyspace("zeta", KeyspaceCreateOptions::default).unwrap();
-            db.keyspace("alpha", KeyspaceCreateOptions::default).unwrap();
-            db.keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default).unwrap();
+            db.keyspace("alpha", KeyspaceCreateOptions::default)
+                .unwrap();
+            db.keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
         }
 
         let output = list_keyspaces(temp.path().to_str().unwrap()).unwrap();
@@ -597,7 +647,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            vec!["alpha".to_string(), GROUP_KEYSPACE.to_string(), "zeta".to_string()]
+            vec![
+                "alpha".to_string(),
+                GROUP_KEYSPACE.to_string(),
+                "zeta".to_string()
+            ]
         );
 
         let missing = output
@@ -644,9 +698,15 @@ mod tests {
 
         {
             let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
-            let keyspace = db.keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default).unwrap();
+            let keyspace = db
+                .keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
             let mut txn = db.write_tx().unwrap();
-            txn.insert(keyspace, group_id.to_bytes().to_vec(), group.to_bytes(&actor).unwrap());
+            txn.insert(
+                keyspace,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            );
             let _ = txn.commit().unwrap();
         }
 
@@ -706,7 +766,11 @@ mod tests {
             description: "Explorer Realm".to_string(),
         };
 
-        let decoded = decode_entry(REALM_KEYSPACE, realm_id.as_bytes(), &realm.to_bytes(&actor).unwrap());
+        let decoded = decode_entry(
+            REALM_KEYSPACE,
+            realm_id.as_bytes(),
+            &realm.to_bytes(&actor).unwrap(),
+        );
         match decoded.value {
             DecodedValue::Realm { data } => assert_eq!(data.0.description, "Explorer Realm"),
             other => panic!("expected realm, got {other:?}"),
@@ -726,10 +790,19 @@ mod tests {
     fn decodes_gossip_subscriptions_value() {
         let realm_id = RealmId::from_bytes([8_u8; 32]);
         let group_id = Ulid::new();
-        let value = postcard::to_allocvec(&vec![TopicId::group(group_id), TopicId::realm(realm_id.clone())]).unwrap();
+        let value = postcard::to_allocvec(&vec![
+            TopicId::group(group_id),
+            TopicId::realm(realm_id.clone()),
+        ])
+        .unwrap();
 
         let decoded = decode_entry(GOSSIP_SUBSCRIPTIONS_KEYSPACE, b"topics", &value);
-        assert_eq!(decoded.key, DecodedField::Utf8 { value: "topics".to_string() });
+        assert_eq!(
+            decoded.key,
+            DecodedField::Utf8 {
+                value: "topics".to_string()
+            }
+        );
         match decoded.value {
             DecodedValue::GossipSubscriptions { data } => {
                 assert_eq!(data, vec![format!("g:{group_id}"), format!("r:{realm_id}")]);
