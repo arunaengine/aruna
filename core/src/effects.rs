@@ -36,6 +36,20 @@ pub enum BlobEffect {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
+    WritePart {
+        upload_id: Ulid,
+        part_number: u16,
+        created_by: UserId,
+        compressed: bool,
+        encrypted: bool,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    Compose {
+        bucket: String,
+        key: String,
+        created_by: UserId,
+        parts: Vec<BackendLocation>,
+    },
     Read {
         location: BackendLocation,
     },

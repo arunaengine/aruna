@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 pub const HASH_BLAKE3: &str = "blake3";
 pub const HASH_MD5: &str = "md5";
 pub const HASH_SHA1: &str = "sha1";
@@ -6,7 +8,7 @@ pub const HASH_CRC32: &str = "crc32";
 pub const HASH_CRC32C: &str = "crc32c";
 pub const HASH_CRC64NVME: &str = "crc64nvme";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ChecksumAlgorithm {
     Md5,
     Sha1,
