@@ -4,7 +4,6 @@ use crate::hash::Hasher;
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::opendal::{init_backend_operator, init_operator};
 use crate::s3::make_bucket;
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -17,17 +16,18 @@ use aruna_core::structs::{
     Backend, BackendBucket, BackendConfig, BackendLocation, RealmId, UserIdentity,
 };
 use aruna_core::types::UserId;
-use aruna_net::NetHandle;
+use aruna_core::NodeId;
 use aruna_net::streams::BiStream;
+use aruna_net::NetHandle;
 use aruna_storage::storage::StorageHandle;
 use async_trait::async_trait;
-use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
+use bao_tree::io::fsm::{decode_ranges, encode_ranges_validated, CreateOutboard};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, BlockSize, ByteRanges};
 use bytes::{Bytes, BytesMut};
 use crossfire::{mpsc, oneshot};
-use futures::{AsyncWriteExt, StreamExt, stream};
+use futures::{stream, AsyncWriteExt, StreamExt};
 use opendal::Operator;
 use std::collections::HashMap;
 use std::ops::RangeBounds;
@@ -151,6 +151,30 @@ impl BlobHandler {
                             created_by,
                             blob,
                         } => self.write_blob(&bucket, &key, created_by, blob).await,
+                        BlobEffect::WritePart {
+                            upload_id,
+                            part_number,
+                            created_by,
+                            compressed,
+                            encrypted,
+                            blob,
+                        } => {
+                            self.write_blob_part(
+                                upload_id,
+                                part_number,
+                                created_by,
+                                compressed,
+                                encrypted,
+                                blob,
+                            )
+                            .await
+                        }
+                        BlobEffect::Compose {
+                            bucket,
+                            key,
+                            created_by,
+                            parts,
+                        } => self.compose_blob(&bucket, &key, created_by, parts).await,
                         BlobEffect::Read { location } => self.read_blob(location).await,
                         BlobEffect::ReadRange { location, range } => {
                             self.read_blob_range(location, range).await
@@ -234,18 +258,126 @@ impl BlobHandler {
             })
     }
 
+    async fn write_stream_to_location(
+        &self,
+        mut location: BackendLocation,
+        operator: Operator,
+        mut blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> BlobEvent {
+        let storage_path = match location.get_storage_path() {
+            Ok(storage_path) => storage_path,
+            Err(e) => return BlobEvent::Error(e),
+        };
+        let Ok(mut writer) = operator.writer(&storage_path).await else {
+            return BlobEvent::Error(BlobError::OperatorCreationFailed(
+                "Failed to create writer from operator".to_string(),
+            ));
+        };
+
+        let mut hasher = Hasher::new();
+        let mut bytes_written = 0u64;
+        while let Some(chunk) = blob.next().await {
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(err) => return BlobEvent::Error(BlobError::WriteError(err.to_string())),
+            };
+            hasher.update(&bytes);
+            if let Err(err) = writer.write(bytes.to_vec()).await {
+                return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+            }
+            bytes_written += bytes.len() as u64;
+        }
+
+        _ = writer.close().await;
+        location.blob_size = bytes_written;
+        location.hashes = hasher.to_map();
+        BlobEvent::WriteFinished { location }
+    }
+
     pub async fn write_blob(
         &self,
         request_bucket: &str,
         request_key: &str,
         created_by: UserId,
-        mut blob: BackendStream<Result<Bytes, StreamError>>,
+        blob: BackendStream<Result<Bytes, StreamError>>,
     ) -> BlobEvent {
-        // Init stuff
-        let mut hasher = Hasher::new();
-        let mut bytes_written: u64 = 0;
-
         // Evaluate backend bucket and init location
+        let backend_bucket = match self.eval_backend_bucket().await {
+            Ok(bucket) => bucket,
+            Err(err) => return BlobEvent::Error(err),
+        };
+        let ulid = Ulid::new();
+        let backend_path = match build_backend_path(request_bucket, request_key, ulid) {
+            Ok(path) => path,
+            Err(err) => return BlobEvent::Error(BlobError::ConversionError(err)),
+        };
+        let location = BackendLocation {
+            root: self.backend_config.root.clone(),
+            storage_bucket: backend_bucket.clone(),
+            backend_path,
+            ulid,
+            compressed: false,
+            encrypted: false,
+            created_by,
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        };
+
+        // Init operator for backend bucket
+        let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
+            Ok(op) => op,
+            Err(err) => return BlobEvent::Error(err),
+        };
+        self.write_stream_to_location(location, operator, blob)
+            .await
+    }
+
+    pub async fn write_blob_part(
+        &self,
+        upload_id: Ulid,
+        part_number: u16,
+        created_by: UserId,
+        compressed: bool,
+        encrypted: bool,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> BlobEvent {
+        let multipart_bucket = match self.multipart_bucket() {
+            Ok(bucket) => bucket.to_string(),
+            Err(err) => return BlobEvent::Error(err),
+        };
+        let ulid = Ulid::new();
+        let location = BackendLocation {
+            root: self.backend_config.root.clone(),
+            storage_bucket: multipart_bucket.clone(),
+            backend_path: build_multipart_part_path(upload_id, part_number, ulid),
+            ulid,
+            compressed,
+            encrypted,
+            created_by,
+            created_at: SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 0,
+            hashes: HashMap::new(),
+        };
+        let operator = match init_backend_operator(self.backend_config.clone(), multipart_bucket) {
+            Ok(op) => op,
+            Err(err) => return BlobEvent::Error(err),
+        };
+        self.write_stream_to_location(location, operator, blob)
+            .await
+    }
+
+    pub async fn compose_blob(
+        &self,
+        request_bucket: &str,
+        request_key: &str,
+        created_by: UserId,
+        parts: Vec<BackendLocation>,
+    ) -> BlobEvent {
         let backend_bucket = match self.eval_backend_bucket().await {
             Ok(bucket) => bucket,
             Err(err) => return BlobEvent::Error(err),
@@ -273,8 +405,6 @@ impl BlobHandler {
             Ok(storage_path) => storage_path,
             Err(e) => return BlobEvent::Error(e),
         };
-
-        // Init operator for backend bucket
         let operator = match init_backend_operator(self.backend_config.clone(), backend_bucket) {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
@@ -285,17 +415,40 @@ impl BlobHandler {
             ));
         };
 
-        // Write blob to backend storage
-        while let Some(Ok(bytes)) = blob.next().await {
-            hasher.update(&bytes);
-            if let Err(e) = writer.write(bytes.to_vec()).await {
-                return BlobEvent::Error(BlobError::WriteError(e.to_string()));
-            }
-            bytes_written += bytes.len() as u64;
-        }
-        _ = writer.close().await; // Can only fail if already closed/aborted
+        let mut hasher = Hasher::new();
+        let mut bytes_written = 0u64;
+        for part in parts {
+            let part_operator = match self.operator_from_location(&part) {
+                Ok(op) => op,
+                Err(err) => return BlobEvent::Error(err),
+            };
+            let part_storage_path = match part.get_storage_path() {
+                Ok(storage_path) => storage_path,
+                Err(err) => return BlobEvent::Error(err),
+            };
+            let reader = match part_operator.reader(&part_storage_path).await {
+                Ok(reader) => match reader.into_bytes_stream(..).await {
+                    Ok(stream) => stream,
+                    Err(err) => return BlobEvent::Error(BlobError::ReadError(err.to_string())),
+                },
+                Err(err) => return BlobEvent::Error(BlobError::ReadError(err.to_string())),
+            };
 
-        // Return write result
+            let mut reader = BackendStream::new(reader);
+            while let Some(chunk) = reader.next().await {
+                let bytes = match chunk {
+                    Ok(bytes) => bytes,
+                    Err(err) => return BlobEvent::Error(BlobError::ReadError(err.to_string())),
+                };
+                hasher.update(&bytes);
+                if let Err(err) = writer.write(bytes.to_vec()).await {
+                    return BlobEvent::Error(BlobError::WriteError(err.to_string()));
+                }
+                bytes_written += bytes.len() as u64;
+            }
+        }
+
+        _ = writer.close().await;
         let mut location = location;
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
@@ -405,7 +558,7 @@ impl BlobHandler {
 
         BlobEvent::ReadFinished {
             blob: BackendStream::new(reader),
-            stream_size: 0, //TODO: Should this be queried in the state machine?
+            stream_size: 0,
         }
     }
 
@@ -793,6 +946,14 @@ fn build_backend_path(bucket: &str, key: &str, ulid: Ulid) -> Result<String, Con
         .into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)
+}
+
+fn build_multipart_part_path(upload_id: Ulid, part_number: u16, ulid: Ulid) -> String {
+    PathBuf::from(upload_id.to_string())
+        .join(format!("{:05}_{}", part_number, ulid))
+        .into_os_string()
+        .into_string()
+        .expect("multipart part path must be valid utf-8")
 }
 
 fn rebuild_backend_path(original_path: &str, ulid: Ulid) -> Result<String, ConversionError> {
