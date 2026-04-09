@@ -4,6 +4,7 @@ use aruna::config::SetupError;
 use aruna_operations::create_token::CreateTokenError;
 use aruna_storage::errors::StorageLibError;
 use thiserror::Error;
+use tokio::task::JoinError;
 
 #[derive(Error, Debug)]
 pub enum CliError {
@@ -26,7 +27,7 @@ pub enum CliError {
     #[error(transparent)]
     JsonError(#[from] serde_json::Error),
     #[error(transparent)]
-    SetupError(#[from] SetupError),
+    SetupError(#[from] Box<SetupError>),
     #[error(transparent)]
     FjallError(#[from] fjall::Error),
     #[error(transparent)]
@@ -35,6 +36,8 @@ pub enum CliError {
     IoError(#[from] std::io::Error),
     #[error(transparent)]
     SnapshotError(#[from] SnapshotError),
+    #[error(transparent)]
+    TokioJoinError(#[from] JoinError),
     #[error(transparent)]
     ExplorerError(#[from] ExplorerError),
 }

@@ -29,7 +29,7 @@ pub async fn create_token(
         .map(|id| Ulid::from_string(&id))
         .unwrap_or(Ok(Ulid::new()))?;
 
-    let (config, _) = load().await?;
+    let (config, _) = load().await.map_err(Box::new)?;
     let storage_handle = storage::FjallStorage::open(&config.storage_path)?;
 
     let driver_ctx = Arc::new(DriverContext {

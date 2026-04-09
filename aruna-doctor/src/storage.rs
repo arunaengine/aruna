@@ -37,8 +37,6 @@ pub enum SnapshotError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Fjall(#[from] fjall::Error),
-    #[error(transparent)]
-    Setup(#[from] aruna::config::SetupError),
     #[error("snapshot path already exists: {0}")]
     SnapshotPathExists(PathBuf),
     #[error("target database path already exists: {0}")]
@@ -66,8 +64,7 @@ pub async fn snapshot(database_path: String, target_path: String) -> Result<(), 
 
     let stats =
         tokio::task::spawn_blocking(move || snapshot_database(&database_path, &snapshot_path))
-            .await
-            .map_err(std::io::Error::other)??;
+            .await??;
 
     println!(
         "Snapshot created: keyspaces={}, entries={}, created_at={}",
@@ -341,10 +338,11 @@ fn ensure_new_target_path(target_db_path: &Path) -> Result<(), SnapshotError> {
         ));
     }
 
-    if let Some(parent) = target_db_path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            return Err(SnapshotError::TargetParentMissing(parent.to_path_buf()));
-        }
+    if let Some(parent) = target_db_path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        return Err(SnapshotError::TargetParentMissing(parent.to_path_buf()));
     }
 
     Ok(())

@@ -49,7 +49,7 @@ pub enum DhtCmd {
 
 #[derive(Debug, Clone)]
 pub enum DhtEffect {
-    IoRequest(DhtIoRequest),
+    IoRequest(Box<DhtIoRequest>),
     Output(DhtOutput),
 }
 

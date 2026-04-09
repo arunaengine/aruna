@@ -257,7 +257,7 @@ impl DhtDriver {
 
     fn handle_effect(&mut self, effect: DhtEffect) {
         match effect {
-            DhtEffect::IoRequest(request) => self.dispatch_io_request(request),
+            DhtEffect::IoRequest(request) => self.dispatch_io_request(*request),
             DhtEffect::Output(output) => self.handle_output(output),
         }
     }
