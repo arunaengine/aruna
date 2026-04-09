@@ -401,7 +401,7 @@ async fn lookup_topic_bootstrap_nodes_owned(
     for node_id in lookup_bootstrap_candidates_owned(dht, local_realm_id, topic)
         .await?
         .into_iter()
-        .chain(configured_nodes.into_iter())
+        .chain(configured_nodes)
     {
         if node_id == local_node_id {
             continue;

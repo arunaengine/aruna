@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 DEPLOY_ROOT="$ROOT_DIR/target/test-deploy"
 ARUNA_BIN="$ROOT_DIR/target/release/aruna"
-ARUNA_TOOLS_BIN="$ROOT_DIR/target/release/aruna-tools"
+ARUNA_DOCTOR_BIN="$ROOT_DIR/target/release/aruna-doctor"
 READY_TIMEOUT_SECS="${ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS:-90}"
 EXIT_AFTER_READY="${ARUNA_TEST_DEPLOY_EXIT_AFTER_READY:-0}"
 BASE_PORT="${ARUNA_TEST_DEPLOY_BASE_PORT:-43000}"
@@ -105,7 +105,7 @@ generate_test_token() {
 
   raw_output="$(
     cd "$node_dir"
-    env -i PATH="$PATH" "$ARUNA_TOOLS_BIN"
+    env -i PATH="$PATH" "$ARUNA_DOCTOR_BIN" create-token
   )"
 
   local token="${raw_output##*TOKEN: }"
@@ -236,7 +236,7 @@ log "Building the full release workspace"
 cargo build --workspace --release --locked
 
 [[ -x "$ARUNA_BIN" ]] || die "missing binary: $ARUNA_BIN"
-[[ -x "$ARUNA_TOOLS_BIN" ]] || die "missing binary: $ARUNA_TOOLS_BIN"
+[[ -x "$ARUNA_DOCTOR_BIN" ]] || die "missing binary: $ARUNA_DOCTOR_BIN"
 
 NODE_1_DIR="$DEPLOY_ROOT/node-1"
 NODE_2_DIR="$DEPLOY_ROOT/node-2"

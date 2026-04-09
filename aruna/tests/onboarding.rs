@@ -26,10 +26,11 @@ use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ed25519_dalek::SigningKey;
 use reqwest::StatusCode;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
@@ -211,7 +212,7 @@ async fn wait_for_realm_nodes(
 #[tokio::test]
 async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
 -> Result<(), Box<dyn std::error::Error>> {
-    let _guard = env_lock().lock().unwrap();
+    let _guard = env_lock().lock().await;
     let seed = spawn_seed_node().await?;
     sleep(Duration::from_millis(50)).await;
     let onboarding_secret = create_onboarding_secret_via_http(&seed, OnboardingMode::Local).await?;

@@ -905,13 +905,13 @@ impl DhtStateMachine {
                     .map(|peer| peer.node_id)
                     .collect();
 
-                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id: op.inbound_id,
                     response: DhtResponse::Value {
                         entries: values,
                         closer_nodes,
                     },
-                }));
+                })));
             }
             OpState::InboundPut(mut op) => {
                 if stage != StorageStage::InboundPutRead {
@@ -989,10 +989,10 @@ impl DhtStateMachine {
                     return;
                 }
 
-                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id: op.inbound_id,
                     response: DhtResponse::Stored,
-                }));
+                })));
             }
             OpState::Get(op) => {
                 self.ops.insert(op_id, OpState::Get(op));
@@ -1050,18 +1050,20 @@ impl DhtStateMachine {
             let original_len = entries.len();
             let live = live_entries(entries, self.now_secs);
             if live.is_empty() {
-                out.push(DhtEffect::IoRequest(DhtIoRequest::StorageDelete {
-                    op_id: CLEANUP_OP_ID,
-                    stage: StorageStage::CleanupDelete,
-                    key,
-                }));
+                out.push(DhtEffect::IoRequest(Box::new(
+                    DhtIoRequest::StorageDelete {
+                        op_id: CLEANUP_OP_ID,
+                        stage: StorageStage::CleanupDelete,
+                        key,
+                    },
+                )));
             } else if live.len() < original_len {
-                out.push(DhtEffect::IoRequest(DhtIoRequest::StorageWrite {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageWrite {
                     op_id: CLEANUP_OP_ID,
                     stage: StorageStage::CleanupWrite,
                     key,
                     entries: live,
-                }));
+                })));
             }
         }
 
@@ -1096,22 +1098,22 @@ impl DhtStateMachine {
                 out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
             }
             OpState::InboundGet(op) => {
-                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id: op.inbound_id,
                     response: DhtResponse::Error {
                         code: ErrorCode::Internal,
                         message: "storage error".to_string(),
                     },
-                }));
+                })));
             }
             OpState::InboundPut(op) => {
-                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id: op.inbound_id,
                     response: DhtResponse::Error {
                         code: ErrorCode::Internal,
                         message: "storage error".to_string(),
                     },
-                }));
+                })));
             }
             OpState::EvictionPing(_) | OpState::MaintenancePing(_) => {}
         }
@@ -1125,10 +1127,10 @@ impl DhtStateMachine {
     ) {
         match request {
             DhtRequest::Ping => {
-                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id,
                     response: DhtResponse::Pong,
-                }));
+                })));
             }
             DhtRequest::FindNode { target } => {
                 let nodes = self
@@ -1138,10 +1140,10 @@ impl DhtStateMachine {
                     .map(|peer| peer.node_id)
                     .collect();
 
-                out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                     inbound_id,
                     response: DhtResponse::Nodes { nodes },
-                }));
+                })));
             }
             DhtRequest::GetValue { key, realm_filter } => {
                 let op_id = self.alloc_internal_op_id();
@@ -1170,26 +1172,26 @@ impl DhtStateMachine {
                 signature,
             } => {
                 let Some(signature) = signature else {
-                    out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                         inbound_id,
                         response: DhtResponse::Error {
                             code: ErrorCode::InvalidSignature,
                             message: "Missing publisher signature".to_string(),
                         },
-                    }));
+                    })));
                     return;
                 };
 
                 let signed_data = signed_put_value_bytes(&key, &realm_id, &value, ttl_secs);
 
                 if publisher.verify(&signed_data, &signature).is_err() {
-                    out.push(DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
                         inbound_id,
                         response: DhtResponse::Error {
                             code: ErrorCode::InvalidSignature,
                             message: "Invalid publisher signature".to_string(),
                         },
-                    }));
+                    })));
                     return;
                 }
 
@@ -1394,12 +1396,12 @@ impl DhtStateMachine {
         }
 
         self.cleanup_inflight = true;
-        out.push(DhtEffect::IoRequest(DhtIoRequest::StorageIter {
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageIter {
             op_id: CLEANUP_OP_ID,
             stage: StorageStage::CleanupIter,
             start_after: self.cleanup_cursor.clone(),
             limit: CLEANUP_PAGE_SIZE,
-        }));
+        })));
     }
 
     fn insert_peer(&mut self, node_id: NodeId, out: &mut SmallVec<[DhtEffect; 4]>) {
@@ -1468,12 +1470,12 @@ impl DhtStateMachine {
             },
         );
 
-        out.push(DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcRequest {
             op_id,
             phase,
             peer,
             request,
-        }));
+        })));
     }
 
     fn queue_storage_read(
@@ -1492,12 +1494,12 @@ impl DhtStateMachine {
             },
         );
 
-        out.push(DhtEffect::IoRequest(DhtIoRequest::StorageRead {
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageRead {
             op_id,
             stage,
             key,
             realm_filter,
-        }));
+        })));
     }
 
     fn queue_storage_write_pending(
@@ -1516,12 +1518,12 @@ impl DhtStateMachine {
             },
         );
 
-        out.push(DhtEffect::IoRequest(DhtIoRequest::StorageWrite {
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageWrite {
             op_id,
             stage,
             key,
             entries,
-        }));
+        })));
     }
 
     fn collect_timed_out_rpc(&self) -> Vec<(OpId, RpcPhase, NodeId)> {
@@ -1690,15 +1692,18 @@ mod tests {
         }));
 
         assert!(effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                    op_id,
-                    phase: RpcPhase::Bootstrap,
-                    peer: req_peer,
-                    ..
-                }) if *op_id == 5 && *req_peer == peer
-            )
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::Bootstrap,
+                        peer: req_peer,
+                        ..
+                    }
+                 if op_id == 5 && req_peer == peer),
+                _ => false,
+            }
         }));
 
         let timeout_effects = state.step(DhtInput::Tick {
@@ -1749,15 +1754,17 @@ mod tests {
         }));
 
         assert!(local_read_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                    op_id,
-                    phase: RpcPhase::GetLookup,
-                    peer,
-                    request: DhtRequest::GetValue { .. },
-                }) if *op_id == 9 && *peer == first_peer
-            )
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::GetLookup,
+                        peer,
+                        request: DhtRequest::GetValue { .. },
+                    } if op_id == 9 && peer == first_peer),
+                _ => false,
+            }
         }));
 
         let follow_up = state.step(DhtInput::Io(DhtIo::RpcResponse {
@@ -1771,15 +1778,17 @@ mod tests {
         }));
 
         assert!(follow_up.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                    op_id,
-                    phase: RpcPhase::GetLookup,
-                    peer,
-                    request: DhtRequest::GetValue { .. },
-                }) if *op_id == 9 && *peer == second_peer
-            )
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcRequest {
+                        op_id,
+                        phase: RpcPhase::GetLookup,
+                        peer,
+                        request: DhtRequest::GetValue { .. },
+                } if op_id == 9 && peer == second_peer),
+                _ => false,
+            }
         }));
     }
 
@@ -1857,15 +1866,17 @@ mod tests {
         }));
 
         assert!(write_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                    op_id: 12,
-                    phase: RpcPhase::PutLookup,
-                    peer: req_peer,
-                    ..
-                }) if *req_peer == peer
-            )
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcRequest {
+                        op_id: 12,
+                        phase: RpcPhase::PutLookup,
+                        peer: req_peer,
+                        ..
+                    } if req_peer == peer),
+                _ => false,
+            }
         }));
 
         let store_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
@@ -1876,15 +1887,17 @@ mod tests {
         }));
 
         assert!(store_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                    op_id: 12,
-                    phase: RpcPhase::PutStore,
-                    peer: req_peer,
-                    ..
-                }) if *req_peer == peer
-            )
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcRequest {
+                        op_id: 12,
+                        phase: RpcPhase::PutStore,
+                        peer: req_peer,
+                        ..
+                    } if req_peer == peer),
+                _ => false,
+            }
         }));
 
         let fail_effects = state.step(DhtInput::Io(DhtIo::RpcError {
@@ -1985,14 +1998,15 @@ mod tests {
 
         let mut lookup_peers = Vec::new();
         for effect in &write_effects {
-            if let DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                op_id: 14,
-                phase: RpcPhase::PutLookup,
-                peer,
-                ..
-            }) = effect
+            if let DhtEffect::IoRequest(inner) = effect
+                && let DhtIoRequest::RpcRequest {
+                    op_id: 14,
+                    phase: RpcPhase::PutLookup,
+                    peer,
+                    ..
+                } = **inner
             {
-                lookup_peers.push(*peer);
+                lookup_peers.push(peer);
             }
         }
         assert!(
@@ -2024,14 +2038,15 @@ mod tests {
 
         let mut store_peers = Vec::new();
         for effect in &store_effects {
-            if let DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                op_id: 14,
-                phase: RpcPhase::PutStore,
-                peer,
-                ..
-            }) = effect
+            if let DhtEffect::IoRequest(inner) = effect
+                && let DhtIoRequest::RpcRequest {
+                    op_id: 14,
+                    phase: RpcPhase::PutStore,
+                    peer,
+                    ..
+                } = **inner
             {
-                store_peers.push(*peer);
+                store_peers.push(peer);
             }
         }
         assert!(
@@ -2100,13 +2115,16 @@ mod tests {
             )
         }));
         assert!(!effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                    phase: RpcPhase::GetLookup,
-                    ..
-                })
-            )
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::GetLookup,
+                        ..
+                    }
+                ),
+                _ => false,
+            }
         }));
     }
 
@@ -2170,9 +2188,10 @@ mod tests {
         }));
 
         assert!(effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                &(**inner),
+                DhtIoRequest::RpcRequest {
                     op_id: 23,
                     phase: RpcPhase::GetLookup,
                     peer: req_peer,
@@ -2180,8 +2199,9 @@ mod tests {
                         key: req_key,
                         realm_filter: Some(req_realm_filter),
                     },
-                }) if *req_peer == peer && *req_key == key && *req_realm_filter == realm_filter
-            )
+                } if *req_peer == peer && *req_key == key && *req_realm_filter == realm_filter),
+                _ => false,
+            }
         }));
     }
 
@@ -2211,14 +2231,15 @@ mod tests {
 
         let mut lookup_peers = Vec::new();
         for effect in &local_effects {
-            if let DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                op_id: 16,
-                phase: RpcPhase::GetLookup,
-                peer,
-                ..
-            }) = effect
+            if let DhtEffect::IoRequest(inner) = effect
+                && let DhtIoRequest::RpcRequest {
+                    op_id: 16,
+                    phase: RpcPhase::GetLookup,
+                    peer,
+                    ..
+                } = **inner
             {
-                lookup_peers.push(*peer);
+                lookup_peers.push(peer);
             }
         }
         assert!(
@@ -2252,13 +2273,16 @@ mod tests {
             )
         }));
         assert!(!response_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
-                    phase: RpcPhase::GetLookup,
-                    ..
-                })
-            )
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcRequest {
+                        phase: RpcPhase::GetLookup,
+                        ..
+                    }
+                ),
+                _ => false,
+            }
         }));
 
         let late_effects = state.step(DhtInput::Io(DhtIo::RpcResponse {
@@ -2411,16 +2435,19 @@ mod tests {
         }));
 
         assert!(effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
-                    inbound_id: 7,
-                    response: DhtResponse::Error {
-                        code: ErrorCode::InvalidSignature,
-                        ..
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcResponse {
+                        inbound_id: 7,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidSignature,
+                            ..
+                        }
                     }
-                })
-            )
+                ),
+                _ => false,
+            }
         }));
     }
 
@@ -2444,19 +2471,28 @@ mod tests {
 
         let op_id = effects
             .iter()
-            .find_map(|effect| match effect {
-                DhtEffect::IoRequest(DhtIoRequest::StorageRead {
-                    op_id,
-                    stage: StorageStage::InboundGetRead,
-                    key: req_key,
-                    realm_filter: Some(req_realm_filter),
-                }) if *req_key == key && *req_realm_filter == realm_filter => Some(*op_id),
-                _ => None,
+            .find_map(|effect| {
+                if let DhtEffect::IoRequest(inner) = effect
+                    && let DhtIoRequest::StorageRead {
+                        op_id,
+                        stage: StorageStage::InboundGetRead,
+                        key: req_key,
+                        realm_filter: Some(req_realm_filter),
+                    } = &(**inner)
+                {
+                    if *req_key == key && *req_realm_filter == realm_filter {
+                        Some(op_id)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             })
             .expect("inbound get should enqueue filtered storage read");
 
         let response_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
-            op_id,
+            op_id: *op_id,
             stage: StorageStage::InboundGetRead,
             entries: vec![
                 StoredEntry {
@@ -2477,18 +2513,20 @@ mod tests {
         }));
 
         assert!(response_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
-                    inbound_id: 10,
-                    response: DhtResponse::Value {
-                        entries,
-                        closer_nodes: _,
-                    },
-                }) if entries.len() == 1
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    &(**inner),
+                    DhtIoRequest::RpcResponse {
+                        inbound_id: 10,
+                        response: DhtResponse::Value {
+                            entries,
+                            closer_nodes: _,
+                        },
+                } if entries.len() == 1
                     && entries[0].realm_id == realm_filter
-                    && entries[0].value == b"allowed".to_vec()
-            )
+                    && entries[0].value == b"allowed".to_vec()),
+                _ => false,
+            }
         }));
     }
 
@@ -2522,16 +2560,19 @@ mod tests {
         }));
 
         assert!(effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcResponse {
-                    inbound_id: 8,
-                    response: DhtResponse::Error {
-                        code: ErrorCode::InvalidSignature,
-                        ..
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                    **inner,
+                    DhtIoRequest::RpcResponse {
+                        inbound_id: 8,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidSignature,
+                            ..
+                        }
                     }
-                })
-            )
+                ),
+                _ => false,
+            }
         }));
     }
 
@@ -2564,14 +2605,16 @@ mod tests {
         }));
 
         assert!(effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::StorageRead {
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                **inner,
+                DhtIoRequest::StorageRead {
                     stage: StorageStage::InboundPutRead,
                     key: req_key,
                     ..
-                }) if *req_key == key
-            )
+                } if req_key == key),
+                _ => false,
+            }
         }));
     }
 
@@ -2595,14 +2638,16 @@ mod tests {
 
         let tick_effects = state.step(DhtInput::Tick { now_tick: 1 });
         assert!(tick_effects.iter().any(|effect| {
-            matches!(
-                effect,
-                DhtEffect::IoRequest(DhtIoRequest::RpcRequest {
+            match effect {
+                DhtEffect::IoRequest(inner) => matches!(
+                **inner,
+                DhtIoRequest::RpcRequest {
                     phase: RpcPhase::MaintenancePing,
                     peer: req_peer,
                     ..
-                }) if *req_peer == peer
-            )
+                } if req_peer == peer),
+                _ => false,
+            }
         }));
 
         let _ = state.step(DhtInput::Tick {
