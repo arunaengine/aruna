@@ -4,7 +4,7 @@ use crate::s3::checksum::{
 };
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
-    parse_multipart_checksum_hint, parse_upload_id, parse_version_id,
+    parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
     s3_checksum_type_from_multipart, to_base64,
 };
 use aruna_core::NodeId;
@@ -46,7 +46,7 @@ use s3s::dto::{
     ListBucketsInput, ListBucketsOutput, PutObjectInput, PutObjectOutput, StreamingBlob,
     UploadPartInput, UploadPartOutput,
 };
-use s3s::{S3, S3Request, S3Response, S3Result, s3_error};
+use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -323,7 +323,10 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket,
             key: req.input.key,
             upload_id,
-            part_number: req.input.part_number as u16,
+            part_number: parse_multipart_part_number(
+                req.input.part_number,
+                S3ErrorCode::InvalidArgument,
+            )?,
             content_length: req.input.content_length.map(|length| length as u64),
             body: Some(body),
             created_by: user_access.user_identity.user_id,

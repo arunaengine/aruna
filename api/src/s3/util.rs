@@ -6,8 +6,10 @@ use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
-use s3s::dto::{ChecksumType, CompletedPart, CreateMultipartUploadInput, PutObjectInput};
-use s3s::{S3Error, S3Result, s3_error};
+use s3s::dto::{
+    ChecksumType, CompletedPart, CreateMultipartUploadInput, PartNumber, PutObjectInput,
+};
+use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use ulid::Ulid;
 
 pub fn to_base64<T: AsRef<[u8]>>(input: T) -> String {
@@ -161,6 +163,7 @@ pub(crate) fn parse_completed_part(part: &CompletedPart) -> S3Result<CompleteMul
     let Some(part_number) = part.part_number else {
         return Err(s3_error!(InvalidPart, "Missing part number"));
     };
+    let part_number = parse_multipart_part_number(part_number, S3ErrorCode::InvalidPart)?;
 
     let mut expected_checksums = Vec::new();
     for (value, algorithm) in [
@@ -182,10 +185,21 @@ pub(crate) fn parse_completed_part(part: &CompletedPart) -> S3Result<CompleteMul
     }
 
     Ok(CompleteMultipartPart {
-        part_number: part_number as u16,
+        part_number,
         etag: part.e_tag.as_ref().map(|etag| etag.value().to_string()),
         expected_checksums,
     })
+}
+
+pub(crate) fn parse_multipart_part_number(
+    part_number: PartNumber,
+    error_code: S3ErrorCode,
+) -> S3Result<u16> {
+    if !(1..=10_000).contains(&part_number) {
+        return Err(S3Error::with_message(error_code, "Invalid part number"));
+    }
+
+    u16::try_from(part_number).map_err(|_| S3Error::with_message(error_code, "Invalid part number"))
 }
 
 pub(crate) fn decode_checksum_header(
@@ -243,6 +257,54 @@ pub(crate) fn checksum_algorithm_from_s3(
         S3ChecksumAlgorithm::SHA1 => Ok(ChecksumAlgorithm::Sha1),
         S3ChecksumAlgorithm::SHA256 => Ok(ChecksumAlgorithm::Sha256),
         _ => Err(s3_error!(InvalidRequest, "Unsupported checksum algorithm")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_multipart_part_number;
+    use s3s::S3ErrorCode;
+
+    #[test]
+    fn rejects_upload_part_number_zero() {
+        assert_eq!(
+            *parse_multipart_part_number(0, S3ErrorCode::InvalidArgument)
+                .unwrap_err()
+                .code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn rejects_upload_part_number_above_limit() {
+        assert_eq!(
+            *parse_multipart_part_number(10_001, S3ErrorCode::InvalidArgument)
+                .unwrap_err()
+                .code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn rejects_negative_completed_part_number() {
+        assert_eq!(
+            *parse_multipart_part_number(-1, S3ErrorCode::InvalidPart)
+                .unwrap_err()
+                .code(),
+            S3ErrorCode::InvalidPart
+        );
+    }
+
+    #[test]
+    fn accepts_multipart_part_number_bounds() {
+        assert_eq!(
+            parse_multipart_part_number(1, S3ErrorCode::InvalidArgument).unwrap(),
+            1
+        );
+        assert_eq!(
+            parse_multipart_part_number(10_000, S3ErrorCode::InvalidPart).unwrap(),
+            10_000
+        );
     }
 }
 
