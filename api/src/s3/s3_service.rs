@@ -212,6 +212,8 @@ impl S3 for ArunaS3Service {
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
                 .unwrap_or(user_access.group_id),
+            realm_id: self.realm_id.clone(),
+            node_id: self.node_id,
             request: input,
             expected_checksums: checksum_request.expected,
             checksum_type: Some(checksum_request.checksum_type.as_str().to_string()),
@@ -407,6 +409,8 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             upload_id,
+            realm_id: self.realm_id.clone(),
+            node_id: self.node_id,
             completed_parts,
             expected_checksums: checksum_request.expected.clone(),
             checksum_type: multipart_checksum_type_from_s3(&checksum_request.checksum_type),

@@ -557,6 +557,8 @@ mod test {
             PutObjectOperation::new(PutObjectConfig {
                 user_id,
                 group_id: Ulid::new(),
+                realm_id: RealmId::from_bytes([1u8; 32]),
+                node_id: context.net_handle.as_ref().unwrap().node_id(),
                 request: PutObjectInput {
                     bucket: "mybucket".to_string(),
                     key: "to-delete.txt".to_string(),
@@ -695,6 +697,8 @@ mod test {
             PutObjectOperation::new(PutObjectConfig {
                 user_id,
                 group_id: Ulid::new(),
+                realm_id: RealmId::from_bytes([1u8; 32]),
+                node_id: context.net_handle.as_ref().unwrap().node_id(),
                 request: PutObjectInput {
                     bucket: "mybucket".to_string(),
                     key: "versioned.txt".to_string(),

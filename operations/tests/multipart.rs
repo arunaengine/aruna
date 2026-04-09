@@ -3,15 +3,16 @@ use aruna_blob::hash::Hasher;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    DHT_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
     Backend, BackendConfig, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartUploadChecksumHint, MultipartUploadPartKey,
+    MultipartObjectSummary, MultipartUploadChecksumHint, MultipartUploadPartKey, RealmId,
 };
+use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::abort_multipart_upload::{
@@ -114,6 +115,7 @@ fn composite_sha256(parts: &[&[u8]]) -> Vec<u8> {
 async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let context = setup_context().await;
     let created_by = Ulid::new();
+    let realm_id = RealmId::from_bytes([7u8; 32]);
 
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
@@ -182,6 +184,8 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
             bucket: "bucket-a".to_string(),
             key: "big.bin".to_string(),
             upload_id,
+            realm_id: realm_id.clone(),
+            node_id: context.driver.net_handle.as_ref().unwrap().node_id(),
             completed_parts: vec![
                 CompleteMultipartPart {
                     part_number: 1,
@@ -302,6 +306,35 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     )
     .unwrap();
     assert_eq!(object_part_2.size, part2.len() as u64);
+
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(dht_value),
+        ..
+    }) = context
+        .driver
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: DHT_KEYSPACE.to_string(),
+            key: complete.location.get_blake3().unwrap().to_vec().into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("missing DHT blob registration")
+    };
+    let entries = decode_entries(dht_value.as_ref());
+    assert!(entries.iter().any(|entry| {
+        entry.realm_id == realm_id
+            && entry.value
+                == context
+                    .driver
+                    .net_handle
+                    .as_ref()
+                    .unwrap()
+                    .node_id()
+                    .as_bytes()
+                    .to_vec()
+    }));
 }
 
 #[tokio::test]
@@ -580,6 +613,8 @@ async fn delete_object_removes_completed_multipart_metadata() {
             bucket: "bucket-a".to_string(),
             key: "delete-me.bin".to_string(),
             upload_id,
+            realm_id: RealmId::from_bytes([7u8; 32]),
+            node_id: context.driver.net_handle.as_ref().unwrap().node_id(),
             completed_parts: vec![
                 CompleteMultipartPart {
                     part_number: 1,

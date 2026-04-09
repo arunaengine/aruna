@@ -1,12 +1,14 @@
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
-use aruna_core::structs::{BackendLocation, Location, LookupKey, VersionKey, VersionMetadata};
-use aruna_core::types::{Effects, GroupId, UserId};
+use aruna_core::structs::{
+    BackendLocation, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
+};
+use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -23,6 +25,7 @@ pub enum PutObjectState {
     CreateObjectLookup,
     CreateVersionRecord,
     CommitTransaction,
+    RegisterBlobInDht,
     CleanupDuplicate,
     Finish,
     Error,
@@ -66,6 +69,8 @@ pub struct PutObjectInput {
 pub struct PutObjectConfig {
     pub user_id: UserId,
     pub group_id: GroupId,
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
     pub request: PutObjectInput,
     pub expected_checksums: Vec<ExpectedChecksum>,
     pub checksum_type: Option<String>,
@@ -334,15 +339,49 @@ impl PutObjectOperation {
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
             self.txn_id = None;
-            if let Some(location) = self.cleanup_location.take() {
-                self.state = PutObjectState::CleanupDuplicate;
-                smallvec![Effect::Blob(BlobEffect::Delete { location })]
-            } else {
-                self.state = PutObjectState::Finish;
-                smallvec![]
-            }
+            self.register_blob_in_dht_or_continue()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn register_blob_in_dht_or_continue(&mut self) -> Effects {
+        let Some(location) = self.get_output() else {
+            return self.continue_after_dht_registration();
+        };
+        let Some(blake3_hash) = location.get_blake3() else {
+            return self.continue_after_dht_registration();
+        };
+        let key: [u8; 32] = match blake3_hash.try_into() {
+            Ok(key) => key,
+            Err(_) => return self.continue_after_dht_registration(),
+        };
+
+        self.state = PutObjectState::RegisterBlobInDht;
+        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
+            key,
+            realm_id: self.config.realm_id.clone(),
+            value: self.config.node_id.as_bytes().to_vec(),
+            ttl: Default::default(),
+        }))]
+    }
+
+    fn handle_blob_registered_in_dht(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
+            | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
+            | Event::Net(NetEvent::Error(_)) => self.continue_after_dht_registration(),
+            _ => self.emit_error(PutObjectError::InvalidOperationState),
+        }
+    }
+
+    fn continue_after_dht_registration(&mut self) -> Effects {
+        if let Some(location) = self.cleanup_location.take() {
+            self.state = PutObjectState::CleanupDuplicate;
+            smallvec![Effect::Blob(BlobEffect::Delete { location })]
+        } else {
+            self.state = PutObjectState::Finish;
+            smallvec![]
         }
     }
 
@@ -425,6 +464,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::CreateObjectLookup => self.handle_object_lookup_created(event),
             PutObjectState::CreateVersionRecord => self.handle_version_record_created(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
+            PutObjectState::RegisterBlobInDht => self.handle_blob_registered_in_dht(event),
             PutObjectState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
             PutObjectState::Finish => self.emit_finish(),
             PutObjectState::Error => self.abort(),
@@ -482,12 +522,13 @@ mod test {
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
+    use aruna_core::keyspaces::{DHT_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
-        Backend, BackendConfig, Location, LookupKey, VersionKey, VersionMetadata,
+        Backend, BackendConfig, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
     };
+    use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -531,9 +572,12 @@ mod test {
 
         let data = b"hello, world!";
         let stream = tokio_util::io::ReaderStream::new(&data[..]);
+        let realm_id = RealmId::from_bytes([1u8; 32]);
         let put_config = PutObjectConfig {
             user_id: Ulid::new(),
             group_id: Ulid::new(),
+            realm_id: realm_id.clone(),
+            node_id: net_handle.node_id(),
             request: PutObjectInput {
                 bucket: "mybucket".to_string(),
                 key: "some-file.txt".to_string(),
@@ -628,7 +672,34 @@ mod test {
         assert_eq!(values.len(), 1);
         let version = VersionMetadata::from_bytes(values[0].1.as_ref()).unwrap();
         assert_eq!(version.version_id, result.version_id);
-        assert_eq!(version.location, Location::Real(result.location));
+        assert_eq!(version.location, Location::Real(result.location.clone()));
+
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(dht_value),
+            ..
+        }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: DHT_KEYSPACE.to_string(),
+                key: result.location.get_blake3().unwrap().to_vec().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing DHT blob registration");
+        };
+        let entries = decode_entries(dht_value.as_ref());
+        assert!(entries.iter().any(|entry| {
+            entry.realm_id == realm_id
+                && entry.value
+                    == context
+                        .net_handle
+                        .as_ref()
+                        .unwrap()
+                        .node_id()
+                        .as_bytes()
+                        .to_vec()
+        }));
     }
 
     #[tokio::test]
@@ -670,6 +741,8 @@ mod test {
             PutObjectOperation::new(PutObjectConfig {
                 user_id: Ulid::new(),
                 group_id: Ulid::new(),
+                realm_id: RealmId::from_bytes([1u8; 32]),
+                node_id: context.net_handle.as_ref().unwrap().node_id(),
                 request: PutObjectInput {
                     bucket: "mybucket".to_string(),
                     key: "first.txt".to_string(),
@@ -693,6 +766,8 @@ mod test {
             PutObjectOperation::new(PutObjectConfig {
                 user_id: Ulid::new(),
                 group_id: Ulid::new(),
+                realm_id: RealmId::from_bytes([1u8; 32]),
+                node_id: context.net_handle.as_ref().unwrap().node_id(),
                 request: PutObjectInput {
                     bucket: "mybucket".to_string(),
                     key: "second.txt".to_string(),
@@ -777,6 +852,8 @@ mod test {
             PutObjectOperation::new(PutObjectConfig {
                 user_id: Ulid::new(),
                 group_id: Ulid::new(),
+                realm_id: RealmId::from_bytes([1u8; 32]),
+                node_id: context.net_handle.as_ref().unwrap().node_id(),
                 request: PutObjectInput {
                     bucket: "mybucket".to_string(),
                     key: "bad.txt".to_string(),

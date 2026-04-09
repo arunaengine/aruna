@@ -1,7 +1,7 @@
 use aruna_blob::hash::Hasher;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
     S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, S3_VERSION_KEYSPACE,
@@ -11,9 +11,9 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD
 use aruna_core::structs::{
     BackendLocation, Location, LookupKey, MultipartChecksumType, MultipartObjectMetadataKey,
     MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
-    MultipartUploadPartKey, MultipartUploadStatus, VersionKey, VersionMetadata,
+    MultipartUploadPartKey, MultipartUploadStatus, RealmId, VersionKey, VersionMetadata,
 };
-use aruna_core::types::{Effects, TxnId, UserId};
+use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use smallvec::smallvec;
@@ -38,6 +38,7 @@ pub enum CompleteMultipartUploadState {
     WriteObjectMetadata,
     DeleteUploadRecords,
     CommitFinalizeTransaction,
+    RegisterBlobInDht,
     CleanupPartBlobs,
     ResetUploadTransaction,
     ReadUploadForReset,
@@ -96,6 +97,8 @@ pub struct CompleteMultipartUploadInput {
     pub bucket: String,
     pub key: String,
     pub upload_id: Ulid,
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
     pub completed_parts: Vec<CompleteMultipartPart>,
     pub expected_checksums: Vec<ExpectedChecksum>,
     pub checksum_type: MultipartChecksumType,
@@ -564,6 +567,40 @@ impl CompleteMultipartUploadOperation {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
         self.txn_id = None;
+        self.register_blob_in_dht_or_continue()
+    }
+
+    fn register_blob_in_dht_or_continue(&mut self) -> Effects {
+        let Some(location) = self.final_location.as_ref() else {
+            return self.begin_cleanup_part_blobs();
+        };
+        let Some(blake3_hash) = location.get_blake3() else {
+            return self.begin_cleanup_part_blobs();
+        };
+        let key: [u8; 32] = match blake3_hash.try_into() {
+            Ok(key) => key,
+            Err(_) => return self.begin_cleanup_part_blobs(),
+        };
+
+        self.state = CompleteMultipartUploadState::RegisterBlobInDht;
+        smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
+            key,
+            realm_id: self.input.realm_id.clone(),
+            value: self.input.node_id.as_bytes().to_vec(),
+            ttl: Default::default(),
+        }))]
+    }
+
+    fn handle_blob_registered_in_dht(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
+            | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
+            | Event::Net(NetEvent::Error(_)) => self.begin_cleanup_part_blobs(),
+            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
+        }
+    }
+
+    fn begin_cleanup_part_blobs(&mut self) -> Effects {
         self.cleanup_part_index = 0;
         self.upload_record = None;
         self.state = CompleteMultipartUploadState::CleanupPartBlobs;
@@ -734,6 +771,9 @@ impl Operation for CompleteMultipartUploadOperation {
             }
             CompleteMultipartUploadState::CommitFinalizeTransaction => {
                 self.handle_finalize_committed(event)
+            }
+            CompleteMultipartUploadState::RegisterBlobInDht => {
+                self.handle_blob_registered_in_dht(event)
             }
             CompleteMultipartUploadState::CleanupPartBlobs => self.handle_cleanup_part_blob(event),
             CompleteMultipartUploadState::ResetUploadTransaction => {
