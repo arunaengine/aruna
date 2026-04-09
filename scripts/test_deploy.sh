@@ -87,6 +87,7 @@ write_node_env() {
     printf 'STORAGE_PATH=%s\n' "$node_dir/storage"
     printf 'BLOB_ROOT=%s\n' "$node_dir/blob"
     printf 'BLOB_MULTIPART_BUCKET=%s\n' "parts"
+    printf 'BLOB_MAX_BUCKET_SIZE=10000\n'
     printf 'SOCKET_ADDRESS=127.0.0.1:%s\n' "$http_port"
     printf 'P2P_SOCKET_ADDRESS=127.0.0.1:%s\n' "$p2p_port"
     printf 'S3_PORT=%s\n' "$s3_port"

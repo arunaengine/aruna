@@ -4,7 +4,6 @@ use crate::hash::Hasher;
 use crate::messages::{MessageType, ReplicationMessage};
 use crate::opendal::{init_backend_operator, init_operator};
 use crate::s3::make_bucket;
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError};
@@ -17,17 +16,18 @@ use aruna_core::structs::{
     Backend, BackendBucket, BackendConfig, BackendLocation, RealmId, UserIdentity,
 };
 use aruna_core::types::UserId;
-use aruna_net::NetHandle;
+use aruna_core::NodeId;
 use aruna_net::streams::BiStream;
+use aruna_net::NetHandle;
 use aruna_storage::storage::StorageHandle;
 use async_trait::async_trait;
-use bao_tree::io::fsm::{CreateOutboard, decode_ranges, encode_ranges_validated};
+use bao_tree::io::fsm::{decode_ranges, encode_ranges_validated, CreateOutboard};
 use bao_tree::io::outboard::PreOrderOutboard;
 use bao_tree::io::round_up_to_chunks;
 use bao_tree::{BaoTree, BlockSize, ByteRanges};
 use bytes::{Bytes, BytesMut};
 use crossfire::{mpsc, oneshot};
-use futures::{AsyncWriteExt, StreamExt, stream};
+use futures::{stream, AsyncWriteExt, StreamExt};
 use opendal::Operator;
 use std::collections::HashMap;
 use std::ops::RangeBounds;
@@ -331,8 +331,19 @@ impl BlobHandler {
             Ok(op) => op,
             Err(err) => return BlobEvent::Error(err),
         };
-        self.write_stream_to_location(location, operator, blob)
+        match self
+            .write_stream_to_location(location, operator, blob)
             .await
+        {
+            BlobEvent::WriteFinished { location } => {
+                if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
+                    BlobEvent::Error(err)
+                } else {
+                    BlobEvent::WriteFinished { location }
+                }
+            }
+            other => other,
+        }
     }
 
     pub async fn write_blob_part(
@@ -452,7 +463,11 @@ impl BlobHandler {
         let mut location = location;
         location.blob_size = bytes_written;
         location.hashes = hasher.to_map();
-        BlobEvent::WriteFinished { location }
+        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
+            BlobEvent::Error(err)
+        } else {
+            BlobEvent::WriteFinished { location }
+        }
     }
 
     pub async fn read_blob(&self, location: BackendLocation) -> BlobEvent {
@@ -579,6 +594,9 @@ impl BlobHandler {
 
         if let Err(e) = operator.delete(&storage_path).await {
             return BlobEvent::Error(BlobError::DeleteError(e.to_string()));
+        }
+        if let Err(err) = self.decrement_bucket_load(&location.storage_bucket).await {
+            return BlobEvent::Error(err);
         }
         BlobEvent::DeleteFinished
     }
@@ -859,8 +877,11 @@ impl BlobHandler {
         }
 
         location.hashes = hashes;
-
-        BlobEvent::ReplicationFinished { location }
+        if let Err(err) = self.increment_bucket_load(&location.storage_bucket).await {
+            BlobEvent::Error(err)
+        } else {
+            BlobEvent::ReplicationFinished { location }
+        }
     }
 
     async fn eval_backend_bucket(&self) -> Result<String, BlobError> {
@@ -869,10 +890,8 @@ impl BlobHandler {
             return Ok(bucket.clone());
         }
 
-        // Fetch bucket stats from database
+        // Fetch bucket stats from database and check if a suitable bucket exists
         let buckets = self.fetch_bucket_stats().await?;
-
-        // Check if a suitable bucket exists
         if let Some(bucket_max_size) = self.backend_config.max_bucket_size {
             // Find bucket with fewer objects than max bucket size
             for bucket in buckets {
@@ -886,7 +905,7 @@ impl BlobHandler {
         }
 
         // No suitable bucket found -> make bucket
-        let bucket_name = generate_bucket_name();
+        let bucket_name = generate_bucket_name(self.backend_config.bucket_prefix.as_deref());
 
         if Backend::S3 == self.backend_config.backend_type {
             // Bucket only needs to be actively created with a S3 storage backend
@@ -897,28 +916,116 @@ impl BlobHandler {
     }
 
     async fn fetch_bucket_stats(&self) -> Result<Vec<BackendBucket>, ConversionError> {
-        if let Event::Storage(StorageEvent::IterResult { values, .. }) = self
+        let mut buckets = Vec::new();
+        let mut start_after = None;
+
+        loop {
+            let event = self
+                .storage
+                .send_effect(Effect::Storage(StorageEffect::Iter {
+                    key_space: BUCKET_STATS_DB.to_string(),
+                    prefix: self
+                        .backend_config
+                        .bucket_prefix
+                        .clone()
+                        .map(|prefix| prefix.into()),
+                    start_after: start_after.clone(),
+                    limit: 1024,
+                    txn_id: None,
+                }))
+                .await;
+
+            let Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) = event
+            else {
+                return Ok(Vec::new());
+            };
+
+            buckets.extend(
+                values
+                    .into_iter()
+                    .map(BackendBucket::try_from)
+                    .collect::<Result<Vec<BackendBucket>, ConversionError>>()?,
+            );
+
+            if let Some(next_start_after) = next_start_after {
+                start_after = Some(next_start_after);
+            } else {
+                break;
+            }
+        }
+
+        Ok(buckets)
+    }
+
+    async fn bucket_load(&self, bucket: &str) -> Result<u64, BlobError> {
+        let event = self
             .storage
-            .send_effect(Effect::Storage(StorageEffect::Iter {
+            .send_effect(Effect::Storage(StorageEffect::Read {
                 key_space: BUCKET_STATS_DB.to_string(),
-                prefix: self
-                    .backend_config
-                    .bucket_prefix
-                    .clone()
-                    .map(|prefix| prefix.into()),
-                start_after: None,
-                limit: 0,
+                key: bucket.as_bytes().to_vec().into(),
                 txn_id: None,
             }))
-            .await
-        {
-            values
-                .into_iter()
-                .map(BackendBucket::try_from)
-                .collect::<Result<Vec<BackendBucket>, ConversionError>>()
-        } else {
-            Ok(Vec::new())
+            .await;
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return Err(BlobError::ReadError(
+                "failed to read bucket stats".to_string(),
+            ));
+        };
+
+        match value {
+            Some(value) => Ok(u64::from_le_bytes(
+                value.as_ref().try_into().map_err(ConversionError::from)?,
+            )),
+            None => Ok(0),
         }
+    }
+
+    async fn write_bucket_load(&self, bucket: &str, load: u64) -> Result<(), BlobError> {
+        let event = self
+            .storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: BUCKET_STATS_DB.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                value: load.to_le_bytes().to_vec().into(),
+                txn_id: None,
+            }))
+            .await;
+
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+            Event::Storage(StorageEvent::Error { error }) => Err(BlobError::ReadError(format!(
+                "failed to write bucket stats: {error}"
+            ))),
+            _ => Err(BlobError::ReadError(
+                "unexpected storage event while writing bucket stats".to_string(),
+            )),
+        }
+    }
+
+    fn is_stats_managed_bucket(&self, bucket: &str) -> bool {
+        self.backend_config.multipart_bucket.as_deref() != Some(bucket)
+    }
+
+    async fn increment_bucket_load(&self, bucket: &str) -> Result<(), BlobError> {
+        if !self.is_stats_managed_bucket(bucket) {
+            return Ok(());
+        }
+
+        let load = self.bucket_load(bucket).await?;
+        self.write_bucket_load(bucket, load.saturating_add(1)).await
+    }
+
+    async fn decrement_bucket_load(&self, bucket: &str) -> Result<(), BlobError> {
+        if !self.is_stats_managed_bucket(bucket) {
+            return Ok(());
+        }
+
+        let load = self.bucket_load(bucket).await?;
+        self.write_bucket_load(bucket, load.saturating_sub(1)).await
     }
 
     fn operator_from_location(&self, location: &BackendLocation) -> Result<Operator, BlobError> {
@@ -936,8 +1043,9 @@ impl BlobHandler {
     }
 }
 
-fn generate_bucket_name() -> String {
-    format!("aruna-{}", Ulid::new().to_string().to_lowercase())
+fn generate_bucket_name(prefix: Option<&str>) -> String {
+    let prefix = prefix.unwrap_or("aruna-");
+    format!("{}{}", prefix, Ulid::new().to_string().to_lowercase())
 }
 
 fn build_backend_path(bucket: &str, key: &str, ulid: Ulid) -> Result<String, ConversionError> {
@@ -972,4 +1080,239 @@ fn rebuild_backend_path(original_path: &str, ulid: Ulid) -> Result<String, Conve
         .into_os_string()
         .into_string()
         .map_err(|_| ConversionError::OsStringError)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlobHandler;
+    use crate::blob::BlobHandle;
+    use aruna_core::effects::{BlobEffect, StorageEffect};
+    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::keyspaces::BUCKET_STATS_DB;
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::{Backend, BackendConfig};
+    use aruna_net::{NetConfig, NetHandle};
+    use aruna_storage::storage;
+    use std::collections::HashMap;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    struct TestContext {
+        _temp_dir: tempfile::TempDir,
+        blob_handle: BlobHandle,
+        storage_handle: aruna_storage::storage::StorageHandle,
+    }
+
+    async fn setup_blob_handle(max_bucket_size: u64) -> TestContext {
+        let temp_dir = tempdir().unwrap();
+        let temp_root = temp_dir.path().to_str().unwrap().to_string();
+        let blob_root = format!("{temp_root}/blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let blob_handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                root: blob_root,
+                service_config: HashMap::new(),
+                bucket_prefix: Some("aruna-test-".to_string()),
+                max_bucket_size: Some(max_bucket_size),
+                multipart_bucket: Some("uploaded-parts".to_string()),
+            },
+            storage_handle.clone(),
+            net_handle,
+        )
+        .await
+        .unwrap();
+
+        TestContext {
+            _temp_dir: temp_dir,
+            blob_handle,
+            storage_handle,
+        }
+    }
+
+    fn stream_from_bytes(
+        bytes: &[u8],
+    ) -> BackendStream<Result<bytes::Bytes, aruna_core::stream::StreamError>> {
+        BackendStream::new(tokio_util::io::ReaderStream::new(std::io::Cursor::new(
+            bytes.to_vec(),
+        )))
+    }
+
+    async fn bucket_load(storage_handle: &storage::StorageHandle, bucket: &str) -> u64 {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BUCKET_STATS_DB.to_string(),
+                key: bucket.as_bytes().to_vec().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage event")
+        };
+
+        value
+            .map(|value| u64::from_le_bytes(value.as_ref().try_into().unwrap()))
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn reuses_bucket_until_max_object_count_is_reached() {
+        let context = setup_blob_handle(2).await;
+
+        let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
+            .blob_handle
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "bucket-a".to_string(),
+                key: "one.bin".to_string(),
+                created_by: Ulid::new(),
+                blob: stream_from_bytes(b"one"),
+            })
+            .await
+        else {
+            panic!("first write failed")
+        };
+
+        let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
+            .blob_handle
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "bucket-a".to_string(),
+                key: "two.bin".to_string(),
+                created_by: Ulid::new(),
+                blob: stream_from_bytes(b"two"),
+            })
+            .await
+        else {
+            panic!("second write failed")
+        };
+
+        assert_eq!(first.storage_bucket, second.storage_bucket);
+        assert!(first.storage_bucket.starts_with("aruna-test-"));
+        assert_eq!(
+            bucket_load(&context.storage_handle, &first.storage_bucket).await,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn creates_new_bucket_after_reaching_max_object_count() {
+        let context = setup_blob_handle(1).await;
+
+        let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
+            .blob_handle
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "bucket-a".to_string(),
+                key: "one.bin".to_string(),
+                created_by: Ulid::new(),
+                blob: stream_from_bytes(b"one"),
+            })
+            .await
+        else {
+            panic!("first write failed")
+        };
+
+        let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
+            .blob_handle
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "bucket-a".to_string(),
+                key: "two.bin".to_string(),
+                created_by: Ulid::new(),
+                blob: stream_from_bytes(b"two"),
+            })
+            .await
+        else {
+            panic!("second write failed")
+        };
+
+        assert_ne!(first.storage_bucket, second.storage_bucket);
+        assert_eq!(
+            bucket_load(&context.storage_handle, &first.storage_bucket).await,
+            1
+        );
+        assert_eq!(
+            bucket_load(&context.storage_handle, &second.storage_bucket).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
+        let context = setup_blob_handle(1).await;
+
+        let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
+            .blob_handle
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "bucket-a".to_string(),
+                key: "one.bin".to_string(),
+                created_by: Ulid::new(),
+                blob: stream_from_bytes(b"one"),
+            })
+            .await
+        else {
+            panic!("write failed")
+        };
+
+        let Event::Blob(BlobEvent::DeleteFinished) = context
+            .blob_handle
+            .send_blob_effect(BlobEffect::Delete {
+                location: first.clone(),
+            })
+            .await
+        else {
+            panic!("delete failed")
+        };
+
+        assert_eq!(
+            bucket_load(&context.storage_handle, &first.storage_bucket).await,
+            0
+        );
+
+        let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
+            .blob_handle
+            .send_blob_effect(BlobEffect::Write {
+                bucket: "bucket-a".to_string(),
+                key: "two.bin".to_string(),
+                created_by: Ulid::new(),
+                blob: stream_from_bytes(b"two"),
+            })
+            .await
+        else {
+            panic!("second write failed")
+        };
+
+        assert_eq!(first.storage_bucket, second.storage_bucket);
+        assert_eq!(
+            bucket_load(&context.storage_handle, &first.storage_bucket).await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
+        let context = setup_blob_handle(5).await;
+
+        let Event::Blob(BlobEvent::WriteFinished { location }) = context
+            .blob_handle
+            .send_blob_effect(BlobEffect::WritePart {
+                upload_id: Ulid::new(),
+                part_number: 1,
+                created_by: Ulid::new(),
+                compressed: false,
+                encrypted: false,
+                blob: stream_from_bytes(b"part"),
+            })
+            .await
+        else {
+            panic!("multipart write failed")
+        };
+
+        assert_eq!(location.storage_bucket, "uploaded-parts");
+        assert_eq!(
+            bucket_load(&context.storage_handle, "uploaded-parts").await,
+            0
+        );
+    }
 }
