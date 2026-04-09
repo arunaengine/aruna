@@ -1,9 +1,18 @@
 use crate::s3::auth::Action;
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
+use aruna_core::structs::{MultipartChecksumType, MultipartUploadChecksumHint};
+use aruna_operations::s3::complete_multipart_upload::CompleteMultipartPart;
 use aruna_operations::s3::put_object::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
-use s3s::dto::PutObjectInput;
+use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
+use s3s::dto::{ChecksumType, CompletedPart, CreateMultipartUploadInput, PutObjectInput};
 use s3s::{S3Error, S3Result, s3_error};
+use ulid::Ulid;
+
+pub fn to_base64<T: AsRef<[u8]>>(input: T) -> String {
+    BASE64_STANDARD.encode(input)
+}
 
 pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
     match operation_name {
@@ -124,8 +133,117 @@ pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObject
     }
 }
 
-pub fn to_base64<T: AsRef<[u8]>>(input: T) -> String {
-    BASE64_STANDARD.encode(input)
+pub(crate) fn parse_multipart_checksum_hint(
+    input: &CreateMultipartUploadInput,
+) -> S3Result<Option<MultipartUploadChecksumHint>> {
+    let algorithm = input
+        .checksum_algorithm
+        .as_ref()
+        .map(checksum_algorithm_from_s3)
+        .transpose()?;
+    let checksum_type = input
+        .checksum_type
+        .as_ref()
+        .map(multipart_checksum_type_from_s3)
+        .unwrap_or(MultipartChecksumType::FullObject);
+
+    Ok(
+        (algorithm.is_some() || input.checksum_type.is_some()).then_some(
+            MultipartUploadChecksumHint {
+                algorithm,
+                checksum_type,
+            },
+        ),
+    )
+}
+
+pub(crate) fn parse_completed_part(part: &CompletedPart) -> S3Result<CompleteMultipartPart> {
+    let Some(part_number) = part.part_number else {
+        return Err(s3_error!(InvalidPart, "Missing part number"));
+    };
+
+    let mut expected_checksums = Vec::new();
+    for (value, algorithm) in [
+        (part.checksum_crc32.as_deref(), ChecksumAlgorithm::Crc32),
+        (part.checksum_crc32c.as_deref(), ChecksumAlgorithm::Crc32c),
+        (
+            part.checksum_crc64nvme.as_deref(),
+            ChecksumAlgorithm::Crc64Nvme,
+        ),
+        (part.checksum_sha1.as_deref(), ChecksumAlgorithm::Sha1),
+        (part.checksum_sha256.as_deref(), ChecksumAlgorithm::Sha256),
+    ] {
+        if let Some(value) = value {
+            expected_checksums.push(ExpectedChecksum {
+                algorithm,
+                digest: decode_checksum_header(algorithm, value)?,
+            });
+        }
+    }
+
+    Ok(CompleteMultipartPart {
+        part_number: part_number as u16,
+        etag: part.e_tag.as_ref().map(|etag| etag.value().to_string()),
+        expected_checksums,
+    })
+}
+
+pub(crate) fn decode_checksum_header(
+    algorithm: ChecksumAlgorithm,
+    value: &str,
+) -> S3Result<Vec<u8>> {
+    let digest = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| s3_error!(InvalidDigest, "Invalid checksum encoding"))?;
+    if digest.len() != algorithm.digest_len() {
+        return Err(s3_error!(InvalidDigest, "Invalid checksum length"));
+    }
+    Ok(digest)
+}
+
+pub(crate) fn parse_upload_id(upload_id: &str) -> S3Result<Ulid> {
+    Ulid::from_string(upload_id)
+        .map_err(|_| s3_error!(NoSuchUpload, "The specified upload does not exist."))
+}
+
+pub(crate) fn parse_version_id(version_id: Option<String>) -> S3Result<Option<Ulid>> {
+    version_id
+        .map(|version_id| {
+            Ulid::from_string(&version_id)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid version id"))
+        })
+        .transpose()
+}
+
+pub(crate) fn multipart_checksum_type_from_s3(
+    checksum_type: &ChecksumType,
+) -> MultipartChecksumType {
+    match checksum_type.as_str() {
+        ChecksumType::COMPOSITE => MultipartChecksumType::Composite,
+        _ => MultipartChecksumType::FullObject,
+    }
+}
+
+pub(crate) fn s3_checksum_type_from_multipart(
+    checksum_type: MultipartChecksumType,
+) -> ChecksumType {
+    match checksum_type {
+        MultipartChecksumType::FullObject => ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+        MultipartChecksumType::Composite => ChecksumType::from_static(ChecksumType::COMPOSITE),
+    }
+}
+
+pub(crate) fn checksum_algorithm_from_s3(
+    algorithm: &S3ChecksumAlgorithm,
+) -> S3Result<ChecksumAlgorithm> {
+    match algorithm.as_str() {
+        S3ChecksumAlgorithm::CRC32 => Ok(ChecksumAlgorithm::Crc32),
+        S3ChecksumAlgorithm::CRC32C => Ok(ChecksumAlgorithm::Crc32c),
+        S3ChecksumAlgorithm::CRC64NVME => Ok(ChecksumAlgorithm::Crc64Nvme),
+        S3ChecksumAlgorithm::SHA1 => Ok(ChecksumAlgorithm::Sha1),
+        S3ChecksumAlgorithm::SHA256 => Ok(ChecksumAlgorithm::Sha256),
+        _ => Err(s3_error!(InvalidRequest, "Unsupported checksum algorithm")),
+    }
 }
 
 /*
