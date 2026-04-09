@@ -545,8 +545,9 @@ mod tests {
     use aruna_core::structs::RealmId;
     use aruna_storage::FjallStorage;
     use ed25519_dalek::SigningKey;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -555,7 +556,7 @@ mod tests {
 
     #[tokio::test]
     async fn ignores_onboarding_secret_when_node_state_exists() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let tempdir = tempdir().unwrap();
         let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
 

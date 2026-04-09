@@ -525,9 +525,10 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, OnceLock};
     use std::time::SystemTime;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
     use tokio_util::io::ReaderStream;
     use ulid::Ulid;
 
@@ -568,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_round_trip_preserves_database_contents() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let temp = tempdir().unwrap();
         let source_db_path = temp.path().join("source-db");
         let snapshot_source_db_path = temp.path().join("snapshot-source-db");
@@ -787,9 +788,9 @@ mod tests {
         assert_eq!(before, after);
     }
 
-    fn read_database_contents(
-        path: &std::path::Path,
-    ) -> Result<BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>>, SnapshotError> {
+    type DatabaseContents = Result<BTreeMap<String, Vec<(Vec<u8>, Vec<u8>)>>, SnapshotError>;
+
+    fn read_database_contents(path: &std::path::Path) -> DatabaseContents {
         let db = OptimisticTxDatabase::builder(path).open()?;
         let snapshot = db.read_tx();
         let mut keyspace_names = db.list_keyspace_names();
