@@ -2,7 +2,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataBatch, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataGraphPolicy,
+    MetadataGraphPolicy, MetadataUpsertEntityRequest,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
@@ -22,8 +22,15 @@ pub struct UpdateMetadataDocumentConfig {
     pub actor: aruna_core::structs::Actor,
     pub group_id: GroupId,
     pub document_id: Ulid,
-    pub jsonld: String,
     pub public: bool,
+    pub mutation: UpdateMetadataDocumentMutation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateMetadataDocumentMutation {
+    ReplaceRoCrate { jsonld: String },
+    UpsertDataEntity { jsonld: String },
+    UpsertContextualEntity { jsonld: String },
 }
 
 #[derive(Debug, PartialEq)]
@@ -40,7 +47,7 @@ pub struct UpdateMetadataDocumentOperation {
 enum UpdateMetadataDocumentState {
     Init,
     ReadCurrent,
-    ApplyRoCrate,
+    ApplyMutation,
     StartTransaction,
     WriteRegistry,
     WriteDocumentIndex,
@@ -102,6 +109,20 @@ impl UpdateMetadataDocumentOperation {
     }
 
     fn audit_record(&self, record: &MetadataRegistryRecord) -> MetadataAuditRecord {
+        let (operation, details) = match &self.config.mutation {
+            UpdateMetadataDocumentMutation::ReplaceRoCrate { .. } => (
+                MetadataAuditOperation::ReplaceRoCrate,
+                "replace ro-crate".to_string(),
+            ),
+            UpdateMetadataDocumentMutation::UpsertDataEntity { .. } => (
+                MetadataAuditOperation::UpsertDataEntity,
+                "upsert data entity".to_string(),
+            ),
+            UpdateMetadataDocumentMutation::UpsertContextualEntity { .. } => (
+                MetadataAuditOperation::UpsertContextualEntity,
+                "upsert contextual entity".to_string(),
+            ),
+        };
         MetadataAuditRecord {
             realm_id: record.realm_id.clone(),
             group_id: record.group_id,
@@ -109,9 +130,40 @@ impl UpdateMetadataDocumentOperation {
             graph_iri: record.graph_iri.clone(),
             user_id: self.config.actor.user_id,
             node_id: self.config.actor.node_id,
-            operation: MetadataAuditOperation::ReplaceRoCrate,
+            operation,
             occurred_at_ms: record.updated_at_ms,
-            details: Some("replace ro-crate".to_string()),
+            details: Some(details),
+        }
+    }
+
+    fn mutation_effect(&self, record: &MetadataRegistryRecord) -> Effect {
+        let graph_iri = record.graph_iri.clone();
+        match &self.config.mutation {
+            UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
+                Effect::Metadata(MetadataEffect::ApplyRoCrate {
+                    request: MetadataApplyRoCrateRequest {
+                        graph_iri,
+                        jsonld: jsonld.clone(),
+                        policy: self.graph_policy(record),
+                    },
+                })
+            }
+            UpdateMetadataDocumentMutation::UpsertDataEntity { jsonld } => {
+                Effect::Metadata(MetadataEffect::UpsertDataEntity {
+                    request: MetadataUpsertEntityRequest {
+                        graph_iri,
+                        jsonld: jsonld.clone(),
+                    },
+                })
+            }
+            UpdateMetadataDocumentMutation::UpsertContextualEntity { jsonld } => {
+                Effect::Metadata(MetadataEffect::UpsertContextualEntity {
+                    request: MetadataUpsertEntityRequest {
+                        graph_iri,
+                        jsonld: jsonld.clone(),
+                    },
+                })
+            }
         }
     }
 
@@ -149,24 +201,20 @@ impl Operation for UpdateMetadataDocumentOperation {
         match self.state {
             UpdateMetadataDocumentState::ReadCurrent => match parse_registry_read(event) {
                 Ok(Some(record)) => {
-                    let graph_iri = record.graph_iri.clone();
-                    let policy = self.graph_policy(&record);
                     self.record = Some(record);
-                    self.state = UpdateMetadataDocumentState::ApplyRoCrate;
-                    smallvec![Effect::Metadata(MetadataEffect::ApplyRoCrate {
-                        request: MetadataApplyRoCrateRequest {
-                            graph_iri,
-                            jsonld: self.config.jsonld.clone(),
-                            policy,
-                        },
-                    })]
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = UpdateMetadataDocumentState::ApplyMutation;
+                    smallvec![self.mutation_effect(record)]
                 }
                 Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
                 Err(StorageReadError::Storage(error)) => self.fail(error.into()),
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
-            UpdateMetadataDocumentState::ApplyRoCrate => match event {
-                Event::Metadata(MetadataEvent::ApplyRoCrateResult { batch, .. }) => {
+            UpdateMetadataDocumentState::ApplyMutation => match event {
+                Event::Metadata(MetadataEvent::ApplyRoCrateResult { batch, .. })
+                | Event::Metadata(MetadataEvent::EntityUpsertResult { batch, .. }) => {
                     let Some(record) = self.record.take() else {
                         return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
                     };
@@ -178,7 +226,7 @@ impl Operation for UpdateMetadataDocumentOperation {
                     })]
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-                other => self.unexpected_event("metadata apply result", format!("{other:?}")),
+                other => self.unexpected_event("metadata mutation result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {

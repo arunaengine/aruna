@@ -38,6 +38,12 @@ pub struct MetadataApplyRoCrateRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataUpsertEntityRequest {
+    pub graph_iri: String,
+    pub jsonld: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataDocumentView {
     pub record: MetadataRegistryRecord,
     pub jsonld: String,
@@ -112,6 +118,12 @@ pub enum MetadataEffect {
     ApplyRoCrate {
         request: MetadataApplyRoCrateRequest,
     },
+    UpsertDataEntity {
+        request: MetadataUpsertEntityRequest,
+    },
+    UpsertContextualEntity {
+        request: MetadataUpsertEntityRequest,
+    },
     SetGraphPolicy {
         graph_iri: String,
         policy: MetadataGraphPolicy,
@@ -178,6 +190,10 @@ pub enum MetadataEvent {
         batch: MetadataBatch,
     },
     ApplyRoCrateResult {
+        graph_iri: String,
+        batch: MetadataBatch,
+    },
+    EntityUpsertResult {
         graph_iri: String,
         batch: MetadataBatch,
     },
@@ -255,6 +271,8 @@ pub enum MetadataError {
     HandleMissing,
     #[error("backend task failed: {0}")]
     TaskJoin(String),
+    #[error("invalid metadata input: {0}")]
+    InvalidInput(String),
     #[error("metadata backend error: {0}")]
     Backend(String),
 }

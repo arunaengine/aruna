@@ -12,7 +12,7 @@ use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
 use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -22,7 +22,7 @@ use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentOperation,
+    UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
 };
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -62,11 +62,13 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
             group_id,
             document_id,
             document_path: "datasets/bootstrap".to_string(),
-            name: "Bootstrap Dataset".to_string(),
-            description: "Replicated metadata".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
             public: true,
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Bootstrap Dataset".to_string(),
+                description: "Replicated metadata".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
         }),
         nodes[0].context.as_ref(),
     )
@@ -105,11 +107,13 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
             group_id,
             document_id,
             document_path: "datasets/propagation".to_string(),
-            name: "Initial Dataset".to_string(),
-            description: "Initial description".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
             public: false,
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Initial Dataset".to_string(),
+                description: "Initial description".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
         }),
         nodes[0].context.as_ref(),
     )
@@ -156,8 +160,10 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
             },
             group_id,
             document_id,
-            jsonld: updated_jsonld,
             public: true,
+            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: updated_jsonld,
+            },
         }),
         nodes[0].context.as_ref(),
     )

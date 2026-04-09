@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aruna_core::structs::{Actor, RealmId};
 use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::{DriverContext, drive};
@@ -12,7 +12,7 @@ use aruna_operations::get_metadata_document::{
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentOperation,
+    UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
 };
 use aruna_storage::FjallStorage;
 use tempfile::TempDir;
@@ -37,11 +37,13 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
             group_id,
             document_id,
             document_path: "datasets/public-dataset".to_string(),
-            name: "Initial Dataset".to_string(),
-            description: "Created through Craqle".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
             public: false,
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Initial Dataset".to_string(),
+                description: "Created through Craqle".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
         }),
         test.context.as_ref(),
     )
@@ -102,8 +104,10 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
             actor: test.actor.clone(),
             group_id,
             document_id,
-            jsonld: updated_jsonld,
             public: true,
+            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: updated_jsonld,
+            },
         }),
         test.context.as_ref(),
     )

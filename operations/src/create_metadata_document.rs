@@ -31,11 +31,21 @@ pub struct CreateMetadataDocumentConfig {
     pub group_id: GroupId,
     pub document_id: Ulid,
     pub document_path: String,
-    pub name: String,
-    pub description: String,
-    pub date_published: String,
-    pub license: String,
     pub public: bool,
+    pub payload: CreateMetadataDocumentPayload,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CreateMetadataDocumentPayload {
+    Scaffold {
+        name: String,
+        description: String,
+        date_published: String,
+        license: String,
+    },
+    RoCrate {
+        jsonld: String,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -164,6 +174,37 @@ impl CreateMetadataDocumentOperation {
         .normalized()
     }
 
+    fn graph_creation_effect(&self) -> Effect {
+        let graph_iri = self.graph_iri();
+        let policy = self.graph_policy();
+        match &self.config.payload {
+            CreateMetadataDocumentPayload::Scaffold {
+                name,
+                description,
+                date_published,
+                license,
+            } => Effect::Metadata(MetadataEffect::CreateCrate {
+                request: MetadataCreateCrateRequest {
+                    graph_iri,
+                    name: name.clone(),
+                    description: description.clone(),
+                    date_published: date_published.clone(),
+                    license: license.clone(),
+                    policy,
+                },
+            }),
+            CreateMetadataDocumentPayload::RoCrate { jsonld } => {
+                Effect::Metadata(MetadataEffect::ApplyRoCrate {
+                    request: aruna_core::metadata::MetadataApplyRoCrateRequest {
+                        graph_iri,
+                        jsonld: jsonld.clone(),
+                        policy,
+                    },
+                })
+            }
+        }
+    }
+
     fn fail(&mut self, error: CreateMetadataDocumentError) -> Effects {
         if self.record.is_some() {
             self.pending_error = Some(error);
@@ -266,36 +307,19 @@ impl Operation for CreateMetadataDocumentOperation {
                     );
                     self.record = Some(self.build_record(holder_node_ids));
                     self.state = CreateMetadataDocumentState::CreateGraph;
-                    smallvec![Effect::Metadata(MetadataEffect::CreateCrate {
-                        request: MetadataCreateCrateRequest {
-                            graph_iri: self.graph_iri(),
-                            name: self.config.name.clone(),
-                            description: self.config.description.clone(),
-                            date_published: self.config.date_published.clone(),
-                            license: self.config.license.clone(),
-                            policy: self.graph_policy(),
-                        },
-                    })]
+                    smallvec![self.graph_creation_effect()]
                 }
                 Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
                 | Event::Net(NetEvent::Error(_)) => {
                     self.record = Some(self.build_record(vec![self.config.actor.node_id]));
                     self.state = CreateMetadataDocumentState::CreateGraph;
-                    smallvec![Effect::Metadata(MetadataEffect::CreateCrate {
-                        request: MetadataCreateCrateRequest {
-                            graph_iri: self.graph_iri(),
-                            name: self.config.name.clone(),
-                            description: self.config.description.clone(),
-                            date_published: self.config.date_published.clone(),
-                            license: self.config.license.clone(),
-                            policy: self.graph_policy(),
-                        },
-                    })]
+                    smallvec![self.graph_creation_effect()]
                 }
                 other => self.unexpected_event("replication target lookup", format!("{other:?}")),
             },
             CreateMetadataDocumentState::CreateGraph => match event {
-                Event::Metadata(MetadataEvent::CreateCrateResult { .. }) => {
+                Event::Metadata(MetadataEvent::CreateCrateResult { .. })
+                | Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. }) => {
                     let Some(record) = self.record.clone() else {
                         return self
                             .fail_without_cleanup(CreateMetadataDocumentError::MissingTransaction);

@@ -45,6 +45,8 @@ impl MetadataRegistryRecord {
 pub enum MetadataAuditOperation {
     Create,
     ReplaceRoCrate,
+    UpsertDataEntity,
+    UpsertContextualEntity,
     Delete,
     SetVisibility,
     PlaceReplicas,

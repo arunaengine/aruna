@@ -4,12 +4,14 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{
-    MetadataEffect, MetadataEvent, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults, MetadataRoCratePage,
+    MetadataSearchHit,
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
-    CreateMetadataDocumentConfig, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
+    CreateMetadataDocumentPayload,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::drive;
@@ -19,13 +21,16 @@ use aruna_operations::metadata::repository::{
     parse_registry_read, read_registry_by_document_effect,
 };
 use aruna_operations::update_metadata_document::{
-    UpdateMetadataDocumentConfig, UpdateMetadataDocumentOperation,
+    UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
+    UpdateMetadataDocumentOperation,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use ulid::Ulid;
@@ -43,6 +48,8 @@ use utoipa::{OpenApi, ToSchema};
         search_metadata,
         export_metadata_rocrate,
         replace_metadata_rocrate,
+        add_metadata_data_entity,
+        add_metadata_contextual_entity,
         query_metadata_document,
         query_all_metadata
     )
@@ -64,6 +71,14 @@ pub fn router() -> Router<Arc<ServerState>> {
             get(export_metadata_rocrate).put(replace_metadata_rocrate),
         )
         .route(
+            "/metadata/{document_id}/rocrate/data-entities",
+            post(add_metadata_data_entity),
+        )
+        .route(
+            "/metadata/{document_id}/rocrate/contextual-entities",
+            post(add_metadata_contextual_entity),
+        )
+        .route(
             "/metadata/{document_id}/sparql/query",
             post(query_metadata_document),
         )
@@ -76,13 +91,14 @@ pub struct MetadataDocumentSummary {
     pub document_path: String,
     pub graph_iri: String,
     pub public: bool,
-    pub holder_count: usize,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
+    pub replicas: usize,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct CreateMetadataRequest {
+#[serde(deny_unknown_fields)]
+pub struct CreateMetadataScaffoldRequest {
     pub group_id: String,
     pub path: String,
     pub name: String,
@@ -91,6 +107,24 @@ pub struct CreateMetadataRequest {
     pub license: String,
     #[serde(default)]
     pub public: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CreateMetadataRoCrateRequest {
+    pub group_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub public: bool,
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum CreateMetadataRequest {
+    Scaffold(CreateMetadataScaffoldRequest),
+    RoCrate(CreateMetadataRoCrateRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -106,19 +140,25 @@ pub struct ListMetadataResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ReplaceMetadataRoCrateRequest {
-    pub jsonld: String,
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
     #[serde(default)]
     pub public: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataRoCrateResponse {
-    pub jsonld: String,
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
     pub total_data_entities: Option<usize>,
     pub returned_data_entities: Option<usize>,
     pub next_offset: Option<usize>,
     pub next_cursor: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(value_type = Object)]
+pub struct JsonLdObject(pub Value);
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -193,9 +233,9 @@ impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
             document_path: record.document_path.clone(),
             graph_iri: record.graph_iri.clone(),
             public: record.public,
-            holder_count: record.holder_node_ids.len(),
-            created_at_ms: record.created_at_ms,
-            updated_at_ms: record.updated_at_ms,
+            replicas: record.holder_node_ids.len(),
+            created_at: format_timestamp_ms(record.created_at_ms),
+            updated_at: format_timestamp_ms(record.updated_at_ms),
         }
     }
 }
@@ -204,9 +244,80 @@ impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
     post,
     path = "/metadata",
     tag = "metadata",
-    request_body = CreateMetadataRequest,
+    request_body(
+        content = CreateMetadataRequest,
+        description = "Create metadata either from scaffold fields or from a full RO-Crate JSON-LD object.",
+        examples(
+            (
+                "ScaffoldCreate" = (
+                    summary = "Create from scaffold fields",
+                    value = json!({
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "path": "datasets/proteomics/run-42",
+                        "name": "Proteomics Run 42",
+                        "description": "Metadata record for LC-MS run 42",
+                        "date_published": "2026-04-09",
+                        "license": "https://creativecommons.org/licenses/by/4.0/",
+                        "public": true
+                    })
+                )
+            ),
+            (
+                "RoCrateCreate" = (
+                    summary = "Create from inline RO-Crate",
+                    value = json!({
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "path": "datasets/proteomics/run-42",
+                        "public": true,
+                        "rocrate": {
+                            "@context": "https://w3id.org/ro/crate/1.2/context",
+                            "@graph": [
+                                {
+                                    "@id": "ro-crate-metadata.json",
+                                    "@type": "CreativeWork",
+                                    "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                    "about": { "@id": "urn:dataset:run-42" }
+                                },
+                                {
+                                    "@id": "urn:dataset:run-42",
+                                    "@type": "Dataset",
+                                    "name": "Proteomics Run 42",
+                                    "description": "Metadata record for LC-MS run 42",
+                                    "datePublished": "2026-04-09",
+                                    "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" }
+                                }
+                            ]
+                        }
+                    })
+                )
+            )
+        )
+    ),
     responses(
-        (status = 201, description = "Metadata document created", body = CreateMetadataResponse),
+        (
+            status = 201,
+            description = "Metadata document created",
+            body = CreateMetadataResponse,
+            examples(
+                (
+                    "Created" = (
+                        summary = "Created metadata summary",
+                        value = json!({
+                            "summary": {
+                                "document_id": "01JMETADATA0123456789ABCDE",
+                                "group_id": "01JABCDEF0123456789ABCDEFG",
+                                "document_path": "datasets/proteomics/run-42",
+                                "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                                "public": true,
+                                "replicas": 3,
+                                "created_at": "2026-04-09T14:23:11.123Z",
+                                "updated_at": "2026-04-09T14:23:11.123Z"
+                            }
+                        })
+                    )
+                )
+            )
+        ),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse)
@@ -219,8 +330,28 @@ pub async fn create_metadata_document(
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
     let auth = require_realm_auth(&state, auth)?;
-    let group_id = parse_group_id(&request.group_id)?;
-    if MetadataRegistryRecord::normalize_document_path(&request.path).is_empty() {
+    let (group_id, path, public, payload) = match request {
+        CreateMetadataRequest::Scaffold(request) => (
+            parse_group_id(&request.group_id)?,
+            request.path,
+            request.public,
+            CreateMetadataDocumentPayload::Scaffold {
+                name: request.name,
+                description: request.description,
+                date_published: request.date_published,
+                license: request.license,
+            },
+        ),
+        CreateMetadataRequest::RoCrate(request) => (
+            parse_group_id(&request.group_id)?,
+            request.path,
+            request.public,
+            CreateMetadataDocumentPayload::RoCrate {
+                jsonld: serialize_jsonld_object(&request.rocrate)?,
+            },
+        ),
+    };
+    if MetadataRegistryRecord::normalize_document_path(&path).is_empty() {
         return Err(ServerError::BadRequest);
     }
     ensure_metadata_write_scope(&state, &auth, group_id).await?;
@@ -234,17 +365,14 @@ pub async fn create_metadata_document(
             },
             group_id,
             document_id: Ulid::new(),
-            document_path: request.path,
-            name: request.name,
-            description: request.description,
-            date_published: request.date_published,
-            license: request.license,
-            public: request.public,
+            document_path: path,
+            public,
+            payload,
         }),
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(map_create_metadata_error)?;
 
     Ok((
         StatusCode::CREATED,
@@ -368,7 +496,49 @@ pub async fn delete_metadata_document(
         ("after" = Option<String>, Query, description = "Entity id cursor for page view")
     ),
     responses(
-        (status = 200, description = "RO-Crate export", body = MetadataRoCrateResponse),
+        (
+            status = 200,
+            description = "RO-Crate export",
+            body = MetadataRoCrateResponse,
+            examples(
+                (
+                    "FullRoCrate" = (
+                        summary = "Full RO-Crate export",
+                        value = json!({
+                            "rocrate": {
+                                "@context": "https://w3id.org/ro/crate/1.2/context",
+                                "@graph": [
+                                    {
+                                        "@id": "ro-crate-metadata.json",
+                                        "@type": "CreativeWork",
+                                        "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                        "about": { "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE" }
+                                    },
+                                    {
+                                        "@id": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                                        "@type": "Dataset",
+                                        "name": "Proteomics Run 42",
+                                        "description": "Metadata record for LC-MS run 42",
+                                        "datePublished": "2026-04-09",
+                                        "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" },
+                                        "hasPart": [{ "@id": "./data/run-42.raw" }]
+                                    },
+                                    {
+                                        "@id": "./data/run-42.raw",
+                                        "@type": "File",
+                                        "name": "run-42.raw"
+                                    }
+                                ]
+                            },
+                            "total_data_entities": null,
+                            "returned_data_entities": null,
+                            "next_offset": null,
+                            "next_cursor": null
+                        })
+                    )
+                )
+            )
+        ),
         (status = 400, description = "Invalid id", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
@@ -386,14 +556,14 @@ pub async fn export_metadata_rocrate(
     ensure_record_readable(&state, auth.as_ref(), &record).await?;
     let response = match params.view.clone().unwrap_or(MetadataRoCrateView::Full) {
         MetadataRoCrateView::Full => MetadataRoCrateResponse {
-            jsonld: export_rocrate_jsonld(&state, &record.graph_iri).await?,
+            rocrate: export_rocrate_jsonld(&state, &record.graph_iri).await?,
             total_data_entities: None,
             returned_data_entities: None,
             next_offset: None,
             next_cursor: None,
         },
         MetadataRoCrateView::Summary => MetadataRoCrateResponse {
-            jsonld: rewrite_view_jsonld(
+            rocrate: rewrite_view_jsonld(
                 export_rocrate_summary_jsonld(&state, &record.graph_iri).await?,
                 &record.graph_iri,
                 &build_view_id(&record.graph_iri, &params, MetadataRoCrateView::Summary),
@@ -417,9 +587,62 @@ pub async fn export_metadata_rocrate(
     path = "/metadata/{document_id}/rocrate",
     tag = "metadata",
     params(("document_id" = String, Path, description = "Metadata document id")),
-    request_body = ReplaceMetadataRoCrateRequest,
+    request_body(
+        content = ReplaceMetadataRoCrateRequest,
+        description = "Replace the full RO-Crate document. Use the entity endpoints for small incremental changes.",
+        examples(
+            (
+                "ReplaceRoCrate" = (
+                    summary = "Replace entire RO-Crate",
+                    value = json!({
+                        "public": true,
+                        "rocrate": {
+                            "@context": "https://w3id.org/ro/crate/1.2/context",
+                            "@graph": [
+                                {
+                                    "@id": "ro-crate-metadata.json",
+                                    "@type": "CreativeWork",
+                                    "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                    "about": { "@id": "urn:dataset:run-42" }
+                                },
+                                {
+                                    "@id": "urn:dataset:run-42",
+                                    "@type": "Dataset",
+                                    "name": "Proteomics Run 42",
+                                    "description": "Updated dataset description",
+                                    "datePublished": "2026-04-09",
+                                    "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" }
+                                }
+                            ]
+                        }
+                    })
+                )
+            )
+        )
+    ),
     responses(
-        (status = 200, description = "Metadata document updated", body = MetadataDocumentSummary),
+        (
+            status = 200,
+            description = "Metadata document updated",
+            body = MetadataDocumentSummary,
+            examples(
+                (
+                    "UpdatedSummary" = (
+                        summary = "Updated metadata summary",
+                        value = json!({
+                            "document_id": "01JMETADATA0123456789ABCDE",
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "document_path": "datasets/proteomics/run-42",
+                            "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                            "public": true,
+                            "replicas": 3,
+                            "created_at": "2026-04-09T14:23:11.123Z",
+                            "updated_at": "2026-04-09T14:25:54.221Z"
+                        })
+                    )
+                )
+            )
+        ),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse),
@@ -447,13 +670,195 @@ pub async fn replace_metadata_rocrate(
             },
             group_id: record.group_id,
             document_id,
-            jsonld: request.jsonld,
             public: request.public.unwrap_or(record.public),
+            mutation: UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: serialize_jsonld_object(&request.rocrate)?,
+            },
         }),
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(map_update_metadata_error)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(MetadataDocumentSummary::from(&updated)),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/metadata/{document_id}/rocrate/data-entities",
+    tag = "metadata",
+    params(("document_id" = String, Path, description = "Metadata document id")),
+    request_body(
+        content = inline(JsonLdObject),
+        description = "Upsert one root-linked RO-Crate data entity as a JSON-LD object.",
+        examples(
+            (
+                "DataEntity" = (
+                    summary = "Add a file data entity",
+                    value = json!({
+                        "@id": "./data/run-42.raw",
+                        "@type": "File",
+                        "name": "run-42.raw",
+                        "description": "Raw instrument output",
+                        "encodingFormat": "application/octet-stream",
+                        "creator": { "@id": "#person-ada" },
+                        "keywords": ["proteomics", "orbitrap", "raw-data"],
+                        "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" }
+                    })
+                )
+            )
+        )
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Data entity upserted",
+            body = MetadataDocumentSummary,
+            examples(
+                (
+                    "UpdatedSummary" = (
+                        summary = "Metadata summary after data entity upsert",
+                        value = json!({
+                            "document_id": "01JMETADATA0123456789ABCDE",
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "document_path": "datasets/proteomics/run-42",
+                            "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                            "public": true,
+                            "replicas": 3,
+                            "created_at": "2026-04-09T14:23:11.123Z",
+                            "updated_at": "2026-04-09T14:26:37.904Z"
+                        })
+                    )
+                )
+            )
+        ),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn add_metadata_data_entity(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(document_id): Path<String>,
+    Json(entity): Json<Value>,
+) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let document_id = parse_document_id(&document_id)?;
+    let record = load_metadata_record_by_document(&state, document_id).await?;
+    ensure_record_writable(&state, &auth, &record).await?;
+
+    let updated = drive(
+        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: auth.user_id,
+                realm_id: state.get_realm_id(),
+            },
+            group_id: record.group_id,
+            document_id,
+            public: record.public,
+            mutation: UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: serialize_jsonld_entity(&entity)?,
+            },
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_update_metadata_error)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(MetadataDocumentSummary::from(&updated)),
+    ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/metadata/{document_id}/rocrate/contextual-entities",
+    tag = "metadata",
+    params(("document_id" = String, Path, description = "Metadata document id")),
+    request_body(
+        content = inline(JsonLdObject),
+        description = "Upsert one RO-Crate contextual entity as a JSON-LD object.",
+        examples(
+            (
+                "ContextualEntity" = (
+                    summary = "Add a person contextual entity",
+                    value = json!({
+                        "@id": "#person-ada",
+                        "@type": "Person",
+                        "name": "Ada Lovelace",
+                        "affiliation": { "@id": "#org-aruna" }
+                    })
+                )
+            )
+        )
+    ),
+    responses(
+        (
+            status = 200,
+            description = "Contextual entity upserted",
+            body = MetadataDocumentSummary,
+            examples(
+                (
+                    "UpdatedSummary" = (
+                        summary = "Metadata summary after contextual entity upsert",
+                        value = json!({
+                            "document_id": "01JMETADATA0123456789ABCDE",
+                            "group_id": "01JABCDEF0123456789ABCDEFG",
+                            "document_path": "datasets/proteomics/run-42",
+                            "graph_iri": "https://w3id.org/aruna/01JMETADATA0123456789ABCDE",
+                            "public": true,
+                            "replicas": 3,
+                            "created_at": "2026-04-09T14:23:11.123Z",
+                            "updated_at": "2026-04-09T14:24:05.011Z"
+                        })
+                    )
+                )
+            )
+        ),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "Not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn add_metadata_contextual_entity(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(document_id): Path<String>,
+    Json(entity): Json<Value>,
+) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
+    let auth = require_realm_auth(&state, auth)?;
+    let document_id = parse_document_id(&document_id)?;
+    let record = load_metadata_record_by_document(&state, document_id).await?;
+    ensure_record_writable(&state, &auth, &record).await?;
+
+    let updated = drive(
+        UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: auth.user_id,
+                realm_id: state.get_realm_id(),
+            },
+            group_id: record.group_id,
+            document_id,
+            public: record.public,
+            mutation: UpdateMetadataDocumentMutation::UpsertContextualEntity {
+                jsonld: serialize_jsonld_entity(&entity)?,
+            },
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_update_metadata_error)?;
 
     Ok((
         StatusCode::OK,
@@ -554,6 +959,57 @@ fn parse_group_id(group_id: &str) -> ServerResult<Ulid> {
 
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
+}
+
+fn format_timestamp_ms(timestamp_ms: u64) -> String {
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(|timestamp_ms| Utc.timestamp_millis_opt(timestamp_ms).single())
+        .map(|timestamp| timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
+}
+
+fn serialize_jsonld_object(value: &Value) -> ServerResult<String> {
+    if !value.is_object() {
+        return Err(ServerError::BadRequest);
+    }
+    serde_json::to_string(value).map_err(|_| ServerError::BadRequest)
+}
+
+fn serialize_jsonld_entity(value: &Value) -> ServerResult<String> {
+    let Some(object) = value.as_object() else {
+        return Err(ServerError::BadRequest);
+    };
+    if object.contains_key("@graph") || object.contains_key("graph") {
+        return Err(ServerError::BadRequest);
+    }
+    serde_json::to_string(value).map_err(|_| ServerError::BadRequest)
+}
+
+fn map_create_metadata_error(error: CreateMetadataDocumentError) -> ServerError {
+    match error {
+        CreateMetadataDocumentError::MetadataError(metadata_error) => {
+            map_metadata_error(metadata_error)
+        }
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError {
+    match error {
+        UpdateMetadataDocumentError::DocumentNotFound => ServerError::NotFound,
+        UpdateMetadataDocumentError::MetadataError(metadata_error) => {
+            map_metadata_error(metadata_error)
+        }
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+fn map_metadata_error(error: MetadataError) -> ServerError {
+    match error {
+        MetadataError::InvalidInput(_) => ServerError::BadRequest,
+        other => ServerError::InternalError(other.to_string()),
+    }
 }
 
 fn require_realm_auth(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
@@ -684,7 +1140,7 @@ async fn load_metadata_record_by_document(
 
 type ReadError = aruna_operations::metadata::repository::StorageReadError;
 
-async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerResult<String> {
+async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerResult<Value> {
     let handle = state
         .get_ctx()
         .metadata_handle
@@ -696,7 +1152,7 @@ async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerRe
         }))
         .await
     {
-        Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => Ok(jsonld),
+        Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => parse_jsonld(jsonld),
         Event::Metadata(MetadataEvent::Error { error, .. }) => {
             Err(ServerError::InternalError(error.to_string()))
         }
@@ -709,7 +1165,7 @@ async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerRe
 async fn export_rocrate_summary_jsonld(
     state: &ServerState,
     graph_iri: &str,
-) -> ServerResult<String> {
+) -> ServerResult<Value> {
     let handle = state
         .get_ctx()
         .metadata_handle
@@ -721,7 +1177,7 @@ async fn export_rocrate_summary_jsonld(
         }))
         .await
     {
-        Event::Metadata(MetadataEvent::RoCrateSummaryResult { jsonld, .. }) => Ok(jsonld),
+        Event::Metadata(MetadataEvent::RoCrateSummaryResult { jsonld, .. }) => parse_jsonld(jsonld),
         Event::Metadata(MetadataEvent::Error { error, .. }) => {
             Err(ServerError::InternalError(error.to_string()))
         }
@@ -770,7 +1226,7 @@ fn map_page_response(
     view_id: &str,
 ) -> ServerResult<MetadataRoCrateResponse> {
     Ok(MetadataRoCrateResponse {
-        jsonld: rewrite_view_jsonld(page.jsonld, graph_iri, view_id)?,
+        rocrate: rewrite_view_jsonld(parse_jsonld(page.jsonld)?, graph_iri, view_id)?,
         total_data_entities: Some(page.total_data_entities),
         returned_data_entities: Some(page.returned_data_entities),
         next_offset: page.next_offset,
@@ -807,11 +1263,14 @@ fn build_view_id(
     }
 }
 
-fn rewrite_view_jsonld(jsonld: String, graph_iri: &str, view_id: &str) -> ServerResult<String> {
-    let mut value: serde_json::Value = serde_json::from_str(&jsonld)
-        .map_err(|_| ServerError::InternalError("invalid jsonld export".to_string()))?;
+fn parse_jsonld(jsonld: String) -> ServerResult<Value> {
+    serde_json::from_str(&jsonld)
+        .map_err(|_| ServerError::InternalError("invalid jsonld export".to_string()))
+}
+
+fn rewrite_view_jsonld(mut value: Value, graph_iri: &str, view_id: &str) -> ServerResult<Value> {
     rewrite_identifier_value(&mut value, None, graph_iri, view_id);
-    serde_json::to_string(&value).map_err(|err| ServerError::InternalError(err.to_string()))
+    Ok(value)
 }
 
 fn rewrite_identifier_value(
@@ -1123,15 +1582,17 @@ mod tests {
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
-            Json(CreateMetadataRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/public-dataset".to_string(),
-                name: "Public Dataset".to_string(),
-                description: "Visible metadata".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
-                public: true,
-            }),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/public-dataset".to_string(),
+                    name: "Public Dataset".to_string(),
+                    description: "Visible metadata".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
         )
         .await
         .unwrap();
@@ -1194,7 +1655,7 @@ mod tests {
             Extension(Some(test.auth.clone())),
             Path(document_id.clone()),
             Json(ReplaceMetadataRoCrateRequest {
-                jsonld: paged_jsonld,
+                rocrate: serde_json::from_str(&paged_jsonld).unwrap(),
                 public: Some(true),
             }),
         )
@@ -1211,7 +1672,8 @@ mod tests {
         .unwrap();
         assert!(
             response
-                .jsonld
+                .rocrate
+                .to_string()
                 .contains(&format!("https://w3id.org/aruna/{document_id}"))
         );
 
@@ -1228,10 +1690,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(summary.jsonld.contains(&format!(
+        assert!(summary.rocrate.to_string().contains(&format!(
             "https://w3id.org/aruna/{document_id}?view=summary"
         )));
-        assert!(!summary.jsonld.contains("file-0.txt"));
+        assert!(!summary.rocrate.to_string().contains("file-0.txt"));
 
         let (_, Json(page)) = export_metadata_rocrate(
             State(test.state.clone()),
@@ -1246,14 +1708,17 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(page.jsonld.contains(&format!(
+        assert!(page.rocrate.to_string().contains(&format!(
             "https://w3id.org/aruna/{document_id}?view=page&limit=2&offset=0"
         )));
         assert_eq!(page.total_data_entities, Some(3));
         assert_eq!(page.returned_data_entities, Some(2));
         assert_eq!(page.next_offset, Some(2));
         assert!(page.next_cursor.is_some());
-        assert!(page.jsonld.contains("file-0.txt") || page.jsonld.contains("file-1.txt"));
+        assert!(
+            page.rocrate.to_string().contains("file-0.txt")
+                || page.rocrate.to_string().contains("file-1.txt")
+        );
 
         let (_, Json(result)) = query_metadata_document(
             State(test.state.clone()),
@@ -1283,21 +1748,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_routes_support_rocrate_create_and_entity_upserts() {
+        let test = setup_state().await;
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::RoCrate(
+                CreateMetadataRoCrateRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/rocrate-dataset".to_string(),
+                    public: true,
+                    rocrate: json!({
+                        "@context": "https://w3id.org/ro/crate/1.2/context",
+                        "@graph": [
+                            {
+                                "@id": "ro-crate-metadata.json",
+                                "@type": "CreativeWork",
+                                "conformsTo": { "@id": "https://w3id.org/ro/crate/1.2" },
+                                "about": { "@id": "urn:dataset:rocrate-create" }
+                            },
+                            {
+                                "@id": "urn:dataset:rocrate-create",
+                                "@type": "Dataset",
+                                "name": "Created From RO-Crate",
+                                "description": "Created from inline JSON-LD",
+                                "datePublished": "2026-01-01",
+                                "license": { "@id": "https://creativecommons.org/licenses/by/4.0/" }
+                            }
+                        ]
+                    }),
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        let document_id = created.summary.document_id.clone();
+        assert_eq!(created.summary.document_path, "datasets/rocrate-dataset");
+        assert!(created.summary.created_at.ends_with('Z'));
+        assert!(created.summary.updated_at.ends_with('Z'));
+
+        let _ = add_metadata_contextual_entity(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(document_id.clone()),
+            Json(json!({
+                "@id": "#person-ada",
+                "@type": "Person",
+                "name": "Ada Lovelace"
+            })),
+        )
+        .await
+        .unwrap();
+
+        let _ = add_metadata_data_entity(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(document_id.clone()),
+            Json(json!({
+                "@id": "./data/run-42.raw",
+                "@type": "File",
+                "name": "run-42.raw",
+                "creator": { "@id": "#person-ada" }
+            })),
+        )
+        .await
+        .unwrap();
+
+        let (_, Json(exported)) = export_metadata_rocrate(
+            State(test.state),
+            Extension(None),
+            Path(document_id.clone()),
+            Query(MetadataRoCrateExportParams::default()),
+        )
+        .await
+        .unwrap();
+
+        let json = exported.rocrate.to_string();
+        assert!(json.contains(&format!("https://w3id.org/aruna/{document_id}")));
+        assert!(json.contains("Created From RO-Crate"));
+        assert!(json.contains("Ada Lovelace"));
+        assert!(json.contains("run-42.raw"));
+    }
+
+    #[tokio::test]
     async fn private_metadata_is_hidden_without_auth() {
         let test = setup_state().await;
 
         let (_, Json(created)) = create_metadata_document(
             State(test.state.clone()),
             Extension(Some(test.auth.clone())),
-            Json(CreateMetadataRequest {
-                group_id: test.group_id.to_string(),
-                path: "datasets/private-dataset".to_string(),
-                name: "Private Dataset".to_string(),
-                description: "Private metadata".to_string(),
-                date_published: "2026-01-01".to_string(),
-                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
-                public: false,
-            }),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/private-dataset".to_string(),
+                    name: "Private Dataset".to_string(),
+                    description: "Private metadata".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: false,
+                },
+            )),
         )
         .await
         .unwrap();
@@ -1319,6 +1871,42 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(ServerError::Unauthorized)));
+    }
+
+    #[test]
+    fn metadata_openapi_includes_examples_and_public_field_names() {
+        let openapi = serde_json::to_value(MetadataApiDoc::openapi()).unwrap();
+
+        let create_examples = openapi["paths"]["/metadata"]["post"]["requestBody"]["content"]
+            ["application/json"]["examples"]
+            .as_object()
+            .unwrap();
+        assert!(create_examples.contains_key("ScaffoldCreate"));
+        assert!(create_examples.contains_key("RoCrateCreate"));
+
+        let data_entity_examples = openapi["paths"]["/metadata/{document_id}/rocrate/data-entities"]
+            ["post"]["requestBody"]["content"]["application/json"]["examples"]
+            .as_object()
+            .unwrap();
+        assert!(data_entity_examples.contains_key("DataEntity"));
+
+        let contextual_examples = openapi["paths"]
+            ["/metadata/{document_id}/rocrate/contextual-entities"]["post"]["requestBody"]
+            ["content"]["application/json"]["examples"]
+            .as_object()
+            .unwrap();
+        assert!(contextual_examples.contains_key("ContextualEntity"));
+
+        let summary_properties =
+            openapi["components"]["schemas"]["MetadataDocumentSummary"]["properties"]
+                .as_object()
+                .unwrap();
+        assert!(summary_properties.contains_key("replicas"));
+        assert!(summary_properties.contains_key("created_at"));
+        assert!(summary_properties.contains_key("updated_at"));
+        assert!(!summary_properties.contains_key("holder_count"));
+        assert!(!summary_properties.contains_key("created_at_ms"));
+        assert!(!summary_properties.contains_key("updated_at_ms"));
     }
 
     #[test]
