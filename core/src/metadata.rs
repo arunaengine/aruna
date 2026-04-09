@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::structs::{AuthContext, MetadataRegistryRecord};
 use crate::NodeId;
+use crate::structs::{AuthContext, MetadataRegistryRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {

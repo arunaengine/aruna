@@ -74,7 +74,11 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
 
     let expected_holders: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
     assert_eq!(
-        created.holder_node_ids.iter().copied().collect::<HashSet<_>>(),
+        created
+            .holder_node_ids
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>(),
         expected_holders
     );
 
@@ -84,7 +88,8 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-async fn metadata_updates_and_deletes_replicate_to_holders() -> Result<(), Box<dyn std::error::Error>> {
+async fn metadata_updates_and_deletes_replicate_to_holders()
+-> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([42u8; 32]);
     let nodes = build_realm_nodes(&realm_id, 3).await?;
     let group_id = Ulid::new();
@@ -199,8 +204,14 @@ async fn build_realm_nodes(
 
     for i in 0..nodes.len() {
         for j in (i + 1)..nodes.len() {
-            nodes[i].net.add_peer_addr(nodes[j].net.endpoint_addr()).await;
-            nodes[j].net.add_peer_addr(nodes[i].net.endpoint_addr()).await;
+            nodes[i]
+                .net
+                .add_peer_addr(nodes[j].net.endpoint_addr())
+                .await;
+            nodes[j]
+                .net
+                .add_peer_addr(nodes[i].net.endpoint_addr())
+                .await;
         }
     }
 
@@ -269,7 +280,12 @@ async fn wait_for_realm_node_convergence(
     loop {
         let mut converged = true;
         for node in nodes {
-            match drive(GetRealmNodesOperation::new(realm_id.clone()), node.context.as_ref()).await {
+            match drive(
+                GetRealmNodesOperation::new(realm_id.clone()),
+                node.context.as_ref(),
+            )
+            .await
+            {
                 Ok(realm_nodes) if realm_nodes == expected => {}
                 _ => {
                     converged = false;
@@ -294,7 +310,15 @@ async fn wait_for_metadata_convergence(
     document_id: Ulid,
     graph_iri: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    wait_for_metadata_state(nodes, group_id, document_id, graph_iri, nodes.len(), "Bootstrap Dataset").await
+    wait_for_metadata_state(
+        nodes,
+        group_id,
+        document_id,
+        graph_iri,
+        nodes.len(),
+        "Bootstrap Dataset",
+    )
+    .await
 }
 
 async fn wait_for_metadata_state(
@@ -321,9 +345,10 @@ async fn wait_for_metadata_state(
                 Ok(document)
                     if document.record.graph_iri == graph_iri
                         && document.record.holder_node_ids.len() == expected_holder_count
-                        && document.jsonld.contains(expected_text) => {
-                            last_states.push(format!("node={} converged", node.net.node_id()));
-                        }
+                        && document.jsonld.contains(expected_text) =>
+                {
+                    last_states.push(format!("node={} converged", node.net.node_id()));
+                }
                 Ok(document) => {
                     last_states.push(format!(
                         "node={} graph={} holders={} jsonld_contains={}",
@@ -346,7 +371,9 @@ async fn wait_for_metadata_state(
                         }))
                         .await
                     {
-                        Event::Metadata(MetadataEvent::RoCrateExportResult { .. }) => "graph-present",
+                        Event::Metadata(MetadataEvent::RoCrateExportResult { .. }) => {
+                            "graph-present"
+                        }
                         Event::Metadata(MetadataEvent::Error { .. }) => "graph-missing",
                         _ => "graph-unknown",
                     };
@@ -404,14 +431,18 @@ async fn wait_for_metadata_absence(
                         _ => "graph-present",
                     };
                     if graph_state != "graph-missing" {
-                        last_states.push(format!("node={} graph still present", node.net.node_id()));
+                        last_states
+                            .push(format!("node={} graph still present", node.net.node_id()));
                         converged = false;
                         break;
                     }
                     last_states.push(format!("node={} absent", node.net.node_id()));
                 }
                 Ok(_) => {
-                    last_states.push(format!("node={} document still present", node.net.node_id()));
+                    last_states.push(format!(
+                        "node={} document still present",
+                        node.net.node_id()
+                    ));
                     converged = false;
                     break;
                 }

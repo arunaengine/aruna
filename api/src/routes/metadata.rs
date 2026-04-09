@@ -15,7 +15,9 @@ use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
-use aruna_operations::metadata::repository::{parse_registry_read, read_registry_by_document_effect};
+use aruna_operations::metadata::repository::{
+    parse_registry_read, read_registry_by_document_effect,
+};
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentOperation,
 };
@@ -53,7 +55,10 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/metadata/search", get(search_metadata))
         .route("/metadata/sparql/query", post(query_all_metadata))
         .route("/groups/{group_id}/metadata", get(list_metadata_documents))
-        .route("/metadata/{document_id}", get(get_metadata_document).delete(delete_metadata_document))
+        .route(
+            "/metadata/{document_id}",
+            get(get_metadata_document).delete(delete_metadata_document),
+        )
         .route(
             "/metadata/{document_id}/rocrate",
             get(export_metadata_rocrate).put(replace_metadata_rocrate),
@@ -265,9 +270,12 @@ pub async fn list_metadata_documents(
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ListMetadataResponse>)> {
     let group_id = parse_group_id(&group_id)?;
-    let records = drive(ListMetadataDocumentsOperation::new(group_id), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    let records = drive(
+        ListMetadataDocumentsOperation::new(group_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
     let mut visible = Vec::new();
     for record in records {
@@ -276,7 +284,10 @@ pub async fn list_metadata_documents(
         }
     }
 
-    Ok((StatusCode::OK, Json(ListMetadataResponse { documents: visible })))
+    Ok((
+        StatusCode::OK,
+        Json(ListMetadataResponse { documents: visible }),
+    ))
 }
 
 #[utoipa::path(
@@ -444,7 +455,10 @@ pub async fn replace_metadata_rocrate(
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
-    Ok((StatusCode::OK, Json(MetadataDocumentSummary::from(&updated))))
+    Ok((
+        StatusCode::OK,
+        Json(MetadataDocumentSummary::from(&updated)),
+    ))
 }
 
 #[utoipa::path(
@@ -542,10 +556,7 @@ fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
 }
 
-fn require_realm_auth(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-) -> ServerResult<AuthContext> {
+fn require_realm_auth(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
     if auth.realm_id != state.get_realm_id() {
         return Err(ServerError::Forbidden);
@@ -573,7 +584,13 @@ async fn ensure_record_readable(
     let Some(auth) = auth.cloned() else {
         return Err(ServerError::Unauthorized);
     };
-    ensure_permission(state, auth, record.permission_path.clone(), Permission::READ).await
+    ensure_permission(
+        state,
+        auth,
+        record.permission_path.clone(),
+        Permission::READ,
+    )
+    .await
 }
 
 async fn ensure_record_writable(
@@ -791,11 +808,10 @@ fn build_view_id(
 }
 
 fn rewrite_view_jsonld(jsonld: String, graph_iri: &str, view_id: &str) -> ServerResult<String> {
-    let mut value: serde_json::Value =
-        serde_json::from_str(&jsonld).map_err(|_| ServerError::InternalError("invalid jsonld export".to_string()))?;
+    let mut value: serde_json::Value = serde_json::from_str(&jsonld)
+        .map_err(|_| ServerError::InternalError("invalid jsonld export".to_string()))?;
     rewrite_identifier_value(&mut value, None, graph_iri, view_id);
-    serde_json::to_string(&value)
-        .map_err(|err| ServerError::InternalError(err.to_string()))
+    serde_json::to_string(&value).map_err(|err| ServerError::InternalError(err.to_string()))
 }
 
 fn rewrite_identifier_value(
@@ -818,7 +834,12 @@ fn rewrite_identifier_value(
         }
         serde_json::Value::Object(object) => {
             for (child_key, child_value) in object.iter_mut() {
-                rewrite_identifier_value(child_value, Some(child_key), canonical_id, replacement_id);
+                rewrite_identifier_value(
+                    child_value,
+                    Some(child_key),
+                    canonical_id,
+                    replacement_id,
+                );
             }
         }
         _ => {}
@@ -851,9 +872,12 @@ fn map_query_results(results: MetadataQueryResults) -> ServerResult<MetadataQuer
 }
 
 async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
-    let nodes = drive(GetRealmNodesOperation::new(state.get_realm_id()), &state.get_ctx())
-        .await
-        .unwrap_or_default();
+    let nodes = drive(
+        GetRealmNodesOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .unwrap_or_default();
     let mut nodes = nodes.into_iter().collect::<Vec<_>>();
     if !nodes.contains(&state.get_node_id()) {
         nodes.push(state.get_node_id());
@@ -943,7 +967,12 @@ async fn run_search_distributed(
             for node_id in nodes {
                 let result = if node_id == state.get_node_id() {
                     handle
-                        .search_authorized_local(auth.clone(), graph_iris.clone(), query.clone(), limit)
+                        .search_authorized_local(
+                            auth.clone(),
+                            graph_iris.clone(),
+                            query.clone(),
+                            limit,
+                        )
                         .await
                 } else {
                     handle
@@ -971,9 +1000,11 @@ fn aggregate_query_results(
     query_form: QueryForm,
 ) -> ServerResult<MetadataQueryResults> {
     match query_form {
-        QueryForm::Ask => Ok(MetadataQueryResults::Boolean(results.into_iter().any(|result| {
-            matches!(result, MetadataQueryResults::Boolean(true))
-        }))),
+        QueryForm::Ask => {
+            Ok(MetadataQueryResults::Boolean(results.into_iter().any(
+                |result| matches!(result, MetadataQueryResults::Boolean(true)),
+            )))
+        }
         QueryForm::Select => {
             let mut seen = HashSet::new();
             let mut merged = Vec::new();
@@ -994,10 +1025,7 @@ fn aggregate_query_results(
     }
 }
 
-fn deduplicate_search_hits(
-    hits: Vec<MetadataSearchHit>,
-    limit: usize,
-) -> Vec<MetadataSearchHit> {
+fn deduplicate_search_hits(hits: Vec<MetadataSearchHit>, limit: usize) -> Vec<MetadataSearchHit> {
     let mut deduped = HashMap::new();
     for hit in hits {
         let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
@@ -1011,7 +1039,12 @@ fn deduplicate_search_hits(
             .or_insert(hit);
     }
     let mut hits = deduped.into_values().collect::<Vec<_>>();
-    hits.sort_by(|left, right| right.score.partial_cmp(&left.score).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(limit);
     hits
 }
@@ -1046,10 +1079,7 @@ fn query_form(query: &str) -> Option<QueryForm> {
         }
         let upper = trimmed.to_ascii_uppercase();
         if upper.starts_with("PREFIX ") || upper.starts_with("BASE ") {
-            remaining = trimmed
-                .split_once('\n')
-                .map(|(_, tail)| tail)
-                .unwrap_or("");
+            remaining = trimmed.split_once('\n').map(|(_, tail)| tail).unwrap_or("");
             continue;
         }
         if upper.starts_with("SELECT") {
@@ -1069,7 +1099,9 @@ mod tests {
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-    use aruna_core::structs::{Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument};
+    use aruna_core::structs::{
+        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+    };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
     use aruna_storage::storage;
@@ -1177,9 +1209,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(response
-            .jsonld
-            .contains(&format!("https://w3id.org/aruna/{document_id}")));
+        assert!(
+            response
+                .jsonld
+                .contains(&format!("https://w3id.org/aruna/{document_id}"))
+        );
 
         let (_, Json(summary)) = export_metadata_rocrate(
             State(test.state.clone()),
@@ -1295,9 +1329,10 @@ mod tests {
                     BTreeMap::from([(String::from("s"), String::from("<urn:a>"))]),
                     BTreeMap::from([(String::from("s"), String::from("<urn:b>"))]),
                 ]),
-                MetadataQueryResults::Solutions(vec![
-                    BTreeMap::from([(String::from("s"), String::from("<urn:a>"))]),
-                ]),
+                MetadataQueryResults::Solutions(vec![BTreeMap::from([(
+                    String::from("s"),
+                    String::from("<urn:a>"),
+                )])]),
             ],
             QueryForm::Select,
         )
@@ -1349,7 +1384,8 @@ mod tests {
     async fn setup_state() -> TestState {
         let storage_dir = tempfile::tempdir().unwrap();
         let metadata_dir = tempfile::tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
         let realm_id = aruna_core::structs::RealmId([3u8; 32]);
         let user_id = Ulid::new();
@@ -1358,13 +1394,9 @@ mod tests {
             user_id,
             realm_id: realm_id.clone(),
         };
-        let metadata_handle = MetadataHandle::new(
-            metadata_dir.path(),
-            node_id,
-            storage_handle.clone(),
-            None,
-        )
-        .unwrap();
+        let metadata_handle =
+            MetadataHandle::new(metadata_dir.path(), node_id, storage_handle.clone(), None)
+                .unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
@@ -1374,11 +1406,8 @@ mod tests {
             task_handle: None,
         });
         let group_id = Ulid::new();
-        let group_auth = GroupAuthorizationDocument::new_default_group_doc(
-            user_id,
-            realm_id.clone(),
-            group_id,
-        );
+        let group_auth =
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id.clone(), group_id);
         let group = Group {
             display_name: "metadata-group".to_string(),
             group_id,

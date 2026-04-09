@@ -47,6 +47,7 @@ pub enum DhtCmd {
     },
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum DhtEffect {
     IoRequest(Box<DhtIoRequest>),

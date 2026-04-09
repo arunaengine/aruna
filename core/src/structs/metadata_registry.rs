@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+use crate::NodeId;
 use crate::structs::RealmId;
 use crate::types::{GroupId, UserId};
-use crate::NodeId;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetadataRegistryRecord {

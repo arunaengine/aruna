@@ -13,8 +13,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::repository::{
-    parse_registry_read, read_registry_effect, write_audit_effect, write_document_index_effect,
-    write_registry_effect, StorageReadError,
+    StorageReadError, parse_registry_read, read_registry_effect, write_audit_effect,
+    write_document_index_effect, write_registry_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]

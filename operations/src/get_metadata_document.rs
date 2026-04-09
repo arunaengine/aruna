@@ -7,7 +7,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::metadata::repository::{parse_registry_read, read_registry_effect, StorageReadError};
+use crate::metadata::repository::{StorageReadError, parse_registry_read, read_registry_effect};
 
 #[derive(Debug, PartialEq)]
 pub struct GetMetadataDocumentOperation {

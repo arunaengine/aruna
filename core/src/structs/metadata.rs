@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 
-use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use serde::{Deserialize, Serialize};
 
 use crate::errors::ConversionError;
 use crate::structs::Actor;
-use crate::types::{autosurgeon_ulid, GroupId};
+use crate::types::{GroupId, autosurgeon_ulid};
 
 const DEFAULT_CONTEXT_JSON: &str = "\"https://w3id.org/ro/crate/1.2/context\"";
 

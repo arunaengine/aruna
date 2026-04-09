@@ -5,9 +5,7 @@ use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::metadata::repository::{
-    StorageReadError, iter_registry_effect, parse_registry_iter,
-};
+use crate::metadata::repository::{StorageReadError, iter_registry_effect, parse_registry_iter};
 
 #[derive(Debug, PartialEq)]
 pub struct ListMetadataDocumentsOperation {
@@ -151,9 +149,9 @@ mod tests {
                 .await;
             assert!(matches!(
                 event,
-                aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::WriteResult {
-                    ..
-                })
+                aruna_core::events::Event::Storage(
+                    aruna_core::events::StorageEvent::WriteResult { .. }
+                )
             ));
         }
 

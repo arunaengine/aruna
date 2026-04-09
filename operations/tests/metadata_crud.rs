@@ -48,7 +48,10 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
     .await?;
 
     assert_eq!(created.document_id, document_id);
-    assert_eq!(created.graph_iri, format!("https://w3id.org/aruna/{document_id}"));
+    assert_eq!(
+        created.graph_iri,
+        format!("https://w3id.org/aruna/{document_id}")
+    );
     assert_eq!(created.document_path, "datasets/public-dataset");
     assert_eq!(created.holder_node_ids, vec![test.actor.node_id]);
 
@@ -66,7 +69,11 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
     .await?;
     assert_eq!(fetched.record, created);
     assert!(fetched.jsonld.contains("Initial Dataset"));
-    assert!(fetched.jsonld.contains(&format!("https://w3id.org/aruna/{document_id}")));
+    assert!(
+        fetched
+            .jsonld
+            .contains(&format!("https://w3id.org/aruna/{document_id}"))
+    );
 
     let updated_jsonld = format!(
         r#"{{
@@ -110,7 +117,11 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
     .await?;
     assert!(fetched_after_update.record.public);
     assert!(fetched_after_update.jsonld.contains("Updated Dataset"));
-    assert!(fetched_after_update.jsonld.contains("Updated through Craqle"));
+    assert!(
+        fetched_after_update
+            .jsonld
+            .contains("Updated through Craqle")
+    );
 
     drive(
         DeleteMetadataDocumentOperation::new(test.actor.clone(), group_id, document_id),
@@ -123,7 +134,10 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
         test.context.as_ref(),
     )
     .await;
-    assert!(matches!(deleted, Err(GetMetadataDocumentError::DocumentNotFound)));
+    assert!(matches!(
+        deleted,
+        Err(GetMetadataDocumentError::DocumentNotFound)
+    ));
 
     Ok(())
 }
@@ -131,14 +145,11 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
 fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     let storage_dir = tempfile::tempdir()?;
     let metadata_dir = tempfile::tempdir()?;
-    let storage_handle = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
+    let storage_handle =
+        FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
     let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
-    let metadata_handle = MetadataHandle::new(
-        metadata_dir.path(),
-        node_id,
-        storage_handle.clone(),
-        None,
-    )?;
+    let metadata_handle =
+        MetadataHandle::new(metadata_dir.path(), node_id, storage_handle.clone(), None)?;
     let actor = Actor {
         node_id,
         user_id: Ulid::new(),
