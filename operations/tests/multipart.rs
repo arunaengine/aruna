@@ -23,6 +23,7 @@ use aruna_operations::s3::complete_multipart_upload::{
 use aruna_operations::s3::create_multipart_upload::{
     CreateMultipartUploadInput, CreateMultipartUploadOperation,
 };
+use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
 use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation};
 use aruna_storage::storage;
 use base64::Engine;
@@ -508,4 +509,152 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
         panic!("unexpected storage event")
     };
     assert!(value.is_none());
+}
+
+#[tokio::test]
+async fn delete_object_removes_completed_multipart_metadata() {
+    let context = setup_context().await;
+    let created_by = Ulid::new();
+
+    let created = drive(
+        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "delete-me.bin".to_string(),
+            group_id: Ulid::new(),
+            created_by,
+            checksum_hint: None,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let upload_id = created.record.upload_id;
+    let part1 = b"hello ";
+    let part2 = b"world";
+
+    let uploaded_part1 = drive(
+        UploadPartOperation::new(UploadPartInput {
+            bucket: "bucket-a".to_string(),
+            key: "delete-me.bin".to_string(),
+            upload_id,
+            part_number: 1,
+            content_length: Some(part1.len() as u64),
+            body: Some(stream_from_bytes(part1)),
+            created_by,
+            compressed: false,
+            encrypted: false,
+            expected_checksums: vec![],
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let uploaded_part2 = drive(
+        UploadPartOperation::new(UploadPartInput {
+            bucket: "bucket-a".to_string(),
+            key: "delete-me.bin".to_string(),
+            upload_id,
+            part_number: 2,
+            content_length: Some(part2.len() as u64),
+            body: Some(stream_from_bytes(part2)),
+            created_by,
+            compressed: false,
+            encrypted: false,
+            expected_checksums: vec![],
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let complete = drive(
+        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "delete-me.bin".to_string(),
+            upload_id,
+            completed_parts: vec![
+                CompleteMultipartPart {
+                    part_number: 1,
+                    etag: Some(
+                        base64::engine::general_purpose::STANDARD
+                            .encode(uploaded_part1.location.hashes.get("md5").unwrap()),
+                    ),
+                    expected_checksums: vec![],
+                },
+                CompleteMultipartPart {
+                    part_number: 2,
+                    etag: Some(
+                        base64::engine::general_purpose::STANDARD
+                            .encode(uploaded_part2.location.hashes.get("md5").unwrap()),
+                    ),
+                    expected_checksums: vec![],
+                },
+            ],
+            expected_checksums: vec![],
+            checksum_type: MultipartChecksumType::FullObject,
+            object_size: Some((part1.len() + part2.len()) as u64),
+            created_by,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    drive(
+        DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: "bucket-a".to_string(),
+            key: "delete-me.bin".to_string(),
+            version_id: Some(complete.version_id),
+            deleted_by: created_by,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    assert!(
+        read_value(
+            &context.driver,
+            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            MultipartObjectMetadataKey::summary(complete.version_id)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        read_value(
+            &context.driver,
+            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            MultipartObjectMetadataKey::part(complete.version_id, 1)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .is_none()
+    );
+    assert!(
+        read_value(
+            &context.driver,
+            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            MultipartObjectMetadataKey::part(complete.version_id, 2)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .is_none()
+    );
 }
