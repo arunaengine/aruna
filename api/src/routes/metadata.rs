@@ -30,7 +30,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use ulid::Ulid;
@@ -206,7 +206,12 @@ pub struct MetadataSearchResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SparqlQueryRequest {
+    /// SPARQL query string. Only `SELECT` and `ASK` queries are supported.
     pub query: String,
+    /// Query execution scope. Omit to use `distributed`.
+    ///
+    /// `local` runs only against metadata indexed on the current node.
+    /// `distributed` fans out to all known realm nodes and merges the results.
     #[serde(default)]
     pub mode: Option<MetadataQueryMode>,
 }
@@ -214,7 +219,9 @@ pub struct SparqlQueryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MetadataQueryMode {
+    /// Run the query only on the current node.
     Local,
+    /// Run the query across all known realm nodes and merge the results.
     Distributed,
 }
 
@@ -871,7 +878,29 @@ pub async fn add_metadata_contextual_entity(
     path = "/metadata/{document_id}/sparql/query",
     tag = "metadata",
     params(("document_id" = String, Path, description = "Metadata document id")),
-    request_body = SparqlQueryRequest,
+    request_body(
+        content = SparqlQueryRequest,
+        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Omitting `mode` defaults to `distributed`.",
+        examples(
+            (
+                "DocumentAsk" = (
+                    summary = "Check whether the document contains a dataset name",
+                    value = json!({
+                        "query": "ASK WHERE { ?dataset <http://schema.org/name> \"Public Dataset\" }"
+                    })
+                )
+            ),
+            (
+                "DocumentSelectLocal" = (
+                    summary = "Run a document-scoped query only on the current node",
+                    value = json!({
+                        "query": "SELECT ?file ?name WHERE { ?file a <http://schema.org/File> ; <http://schema.org/name> ?name . } LIMIT 10",
+                        "mode": "local"
+                    })
+                )
+            )
+        )
+    ),
     responses(
         (status = 200, description = "SPARQL query result", body = MetadataQueryResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
@@ -903,7 +932,29 @@ pub async fn query_metadata_document(
     post,
     path = "/metadata/sparql/query",
     tag = "metadata",
-    request_body = SparqlQueryRequest,
+    request_body(
+        content = SparqlQueryRequest,
+        description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Omitting `mode` defaults to `distributed`.",
+        examples(
+            (
+                "SelectDatasets" = (
+                    summary = "List dataset names across visible metadata graphs",
+                    value = json!({
+                        "query": "SELECT ?dataset ?name WHERE { ?dataset a <http://schema.org/Dataset> ; <http://schema.org/name> ?name . } LIMIT 25"
+                    })
+                )
+            ),
+            (
+                "SelectDatasetsLocal" = (
+                    summary = "List dataset names from the current node only",
+                    value = json!({
+                        "query": "SELECT ?dataset ?name WHERE { ?dataset a <http://schema.org/Dataset> ; <http://schema.org/name> ?name . } LIMIT 25",
+                        "mode": "local"
+                    })
+                )
+            )
+        )
+    ),
     responses(
         (status = 200, description = "SPARQL query result", body = MetadataQueryResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
