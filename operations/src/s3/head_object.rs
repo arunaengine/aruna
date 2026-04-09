@@ -1,9 +1,14 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
+use aruna_core::keyspaces::{
+    S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
+};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BackendLocation, Location, LookupKey, VersionKey, VersionMetadata};
+use aruna_core::structs::{
+    BackendLocation, Location, LookupKey, MultipartChecksumType, MultipartObjectMetadataKey,
+    MultipartObjectSummary, VersionKey, VersionMetadata,
+};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -15,6 +20,8 @@ pub enum HeadObjectState {
     StartTransaction,
     GetVersion,
     GetLookup,
+    ResolveVersion,
+    ReadMultipartSummary,
     CommitTransaction,
     Finish,
     Error,
@@ -60,6 +67,8 @@ pub struct HeadObjectInput {
 pub struct HeadObjectResult {
     pub location: BackendLocation,
     pub version_id: Option<Ulid>,
+    pub resolved_version_id: Option<Ulid>,
+    pub checksum_type: MultipartChecksumType,
 }
 
 #[derive(Debug, PartialEq)]
@@ -67,6 +76,9 @@ pub struct HeadObjectOperation {
     input: HeadObjectInput,
     state: HeadObjectState,
     txn_id: Option<Ulid>,
+    location: Option<BackendLocation>,
+    resolved_version_id: Option<Ulid>,
+    checksum_type: MultipartChecksumType,
     output: Option<Result<HeadObjectResult, HeadObjectError>>,
 }
 
@@ -76,6 +88,9 @@ impl HeadObjectOperation {
             input,
             state: HeadObjectState::Init,
             txn_id: None,
+            location: None,
+            resolved_version_id: None,
+            checksum_type: MultipartChecksumType::FullObject,
             output: None,
         }
     }
@@ -160,7 +175,7 @@ impl HeadObjectOperation {
             Location::Deleted => return self.emit_error(HeadObjectError::DeleteMarker),
         };
 
-        self.finish_lookup(location)
+        self.read_multipart_summary(location, Some(metadata.version_id))
     }
 
     fn handle_received_lookup(&mut self, event: Event) -> Effects {
@@ -182,18 +197,112 @@ impl HeadObjectOperation {
             Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
         };
 
-        self.finish_lookup(location)
-    }
-
-    fn finish_lookup(&mut self, location: BackendLocation) -> Effects {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(HeadObjectError::NoTransactionFound);
+        };
+        let prefix = match VersionKey::object_prefix(&self.input.bucket, &self.input.key) {
+            Ok(prefix) => prefix.into(),
+            Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
+        };
+
+        self.location = Some(location);
+        self.state = HeadObjectState::ResolveVersion;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: S3_VERSION_KEYSPACE.to_string(),
+            prefix: Some(prefix),
+            start_after: None,
+            limit: 10_000,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_resolved_version(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return self.emit_error(HeadObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+
+        let resolved_version_id = values
+            .into_iter()
+            .filter_map(|(key, value)| {
+                let version_key = VersionKey::from_bytes(key.as_ref()).ok()?;
+                match VersionMetadata::from_bytes(value.as_ref()).ok()?.location {
+                    Location::Real(_) => Some(version_key.version_id),
+                    Location::Deleted => None,
+                }
+            })
+            .max();
+
+        let Some(location) = self.location.clone() else {
+            return self.emit_error(HeadObjectError::HeadObjectFailed);
+        };
+
+        self.read_multipart_summary(location, resolved_version_id)
+    }
+
+    fn read_multipart_summary(
+        &mut self,
+        location: BackendLocation,
+        resolved_version_id: Option<Ulid>,
+    ) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(HeadObjectError::NoTransactionFound);
+        };
+
+        self.location = Some(location);
+        self.resolved_version_id = resolved_version_id;
+
+        let Some(version_id) = resolved_version_id else {
+            return self.finish_lookup();
+        };
+
+        let key = match MultipartObjectMetadataKey::summary(version_id).to_bytes() {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
+        };
+
+        self.state = HeadObjectState::ReadMultipartSummary;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key,
+            txn_id: Some(txn_id),
+        })]
+    }
+
+    fn handle_multipart_summary_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(HeadObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
+        };
+
+        self.checksum_type = value
+            .and_then(|value| MultipartObjectSummary::from_bytes(value.as_ref()).ok())
+            .map(|summary| summary.checksum_type)
+            .unwrap_or(MultipartChecksumType::FullObject);
+
+        self.finish_lookup()
+    }
+
+    fn finish_lookup(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(HeadObjectError::NoTransactionFound);
+        };
+        let Some(location) = self.location.clone() else {
+            return self.emit_error(HeadObjectError::HeadObjectFailed);
         };
 
         self.state = HeadObjectState::CommitTransaction;
         self.output = Some(Ok(HeadObjectResult {
             location,
             version_id: self.input.version_id,
+            resolved_version_id: self.resolved_version_id,
+            checksum_type: self.checksum_type,
         }));
 
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
@@ -231,6 +340,8 @@ impl Operation for HeadObjectOperation {
             HeadObjectState::StartTransaction => self.handle_transaction_started(event),
             HeadObjectState::GetVersion => self.handle_received_version(event),
             HeadObjectState::GetLookup => self.handle_received_lookup(event),
+            HeadObjectState::ResolveVersion => self.handle_resolved_version(event),
+            HeadObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
             HeadObjectState::CommitTransaction => self.handle_transaction_committed(event),
             HeadObjectState::Finish | HeadObjectState::Error => smallvec![],
         }
@@ -304,6 +415,7 @@ mod tests {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
                 max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
                 root: temp_root.to_string(),
                 service_config: HashMap::new(),
             },
@@ -359,6 +471,7 @@ mod tests {
 
         assert_eq!(result.location, location);
         assert_eq!(result.version_id, None);
+        assert_eq!(result.checksum_type, MultipartChecksumType::FullObject);
     }
 
     #[tokio::test]
@@ -374,6 +487,7 @@ mod tests {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
                 max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
                 root: temp_root.to_string(),
                 service_config: HashMap::new(),
             },
@@ -437,5 +551,6 @@ mod tests {
 
         assert_eq!(result.location, location);
         assert_eq!(result.version_id, Some(version_id));
+        assert_eq!(result.checksum_type, MultipartChecksumType::FullObject);
     }
 }

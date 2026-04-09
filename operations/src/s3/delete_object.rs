@@ -1,10 +1,14 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
+use aruna_core::keyspaces::{
+    S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
+};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{Location, LookupKey, VersionKey, VersionMetadata};
-use aruna_core::types::{Effects, UserId};
+use aruna_core::structs::{
+    Location, LookupKey, MultipartObjectMetadataKey, VersionKey, VersionMetadata,
+};
+use aruna_core::types::{Effects, Key, UserId};
 use smallvec::smallvec;
 use std::time::SystemTime;
 use thiserror::Error;
@@ -19,6 +23,9 @@ pub enum DeleteObjectState {
     WriteCurrentLookup,
     DeleteCurrentLookup,
     DeleteTargetVersion,
+    DeleteMultipartSummary,
+    ReadMultipartParts,
+    DeleteMultipartPart,
     WriteTombstone,
     WriteVersion,
     CommitTransaction,
@@ -64,6 +71,8 @@ pub struct DeleteObjectOperation {
     version_id: Option<Ulid>,
     target_version: Option<VersionMetadata>,
     latest_remaining: Option<VersionMetadata>,
+    multipart_part_keys: Vec<Key>,
+    multipart_delete_index: usize,
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
 }
 
@@ -76,6 +85,8 @@ impl DeleteObjectOperation {
             version_id: None,
             target_version: None,
             latest_remaining: None,
+            multipart_part_keys: Vec::new(),
+            multipart_delete_index: 0,
             output: None,
         }
     }
@@ -251,11 +262,84 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(DeleteObjectError::NoTransactionFound);
+        let Some(version_id) = self.input.version_id else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
-        self.state = DeleteObjectState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+
+        self.state = DeleteObjectState::DeleteMultipartSummary;
+        let key = match MultipartObjectMetadataKey::summary(version_id).to_bytes() {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(err.into()),
+        };
+
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_multipart_summary_deleted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+
+        let Some(version_id) = self.input.version_id else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let prefix = match MultipartObjectMetadataKey::part_prefix(version_id) {
+            Ok(prefix) => prefix.into(),
+            Err(err) => return self.emit_error(err.into()),
+        };
+
+        self.state = DeleteObjectState::ReadMultipartParts;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            prefix: Some(prefix),
+            start_after: None,
+            limit: 10_000,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_multipart_parts_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+
+        self.multipart_part_keys = values.into_iter().map(|(key, _)| key).collect();
+        self.multipart_delete_index = 0;
+        self.delete_next_multipart_part()
+    }
+
+    fn delete_next_multipart_part(&mut self) -> Effects {
+        let Some(key) = self
+            .multipart_part_keys
+            .get(self.multipart_delete_index)
+            .cloned()
+        else {
+            let Some(txn_id) = self.txn_id else {
+                return self.emit_error(DeleteObjectError::NoTransactionFound);
+            };
+            self.state = DeleteObjectState::CommitTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        };
+
+        self.state = DeleteObjectState::DeleteMultipartPart;
+        smallvec![Effect::Storage(StorageEffect::Delete {
+            key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_multipart_part_deleted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+
+        self.multipart_delete_index += 1;
+        self.delete_next_multipart_part()
     }
 
     fn write_tombstone(&mut self) -> Effects {
@@ -374,6 +458,11 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::WriteCurrentLookup => self.handle_current_lookup_written(event),
             DeleteObjectState::DeleteCurrentLookup => self.handle_current_lookup_deleted(event),
             DeleteObjectState::DeleteTargetVersion => self.handle_target_version_deleted(event),
+            DeleteObjectState::DeleteMultipartSummary => {
+                self.handle_multipart_summary_deleted(event)
+            }
+            DeleteObjectState::ReadMultipartParts => self.handle_multipart_parts_read(event),
+            DeleteObjectState::DeleteMultipartPart => self.handle_multipart_part_deleted(event),
             DeleteObjectState::WriteTombstone => self.handle_tombstone_written(event),
             DeleteObjectState::WriteVersion => self.handle_version_written(event),
             DeleteObjectState::CommitTransaction => self.handle_transaction_committed(event),
@@ -445,6 +534,7 @@ mod test {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
                 max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
                 root: blob_root,
                 service_config: HashMap::new(),
             },
@@ -582,6 +672,7 @@ mod test {
                 backend_type: Backend::FileSystem,
                 bucket_prefix: Some("aruna_".to_string()),
                 max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
                 root: blob_root,
                 service_config: HashMap::new(),
             },
