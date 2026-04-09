@@ -111,11 +111,6 @@ pub enum MultipartObjectMetadataKey {
     Part { version_id: Ulid, part_number: u16 },
 }
 
-#[derive(Serialize)]
-enum MultipartObjectMetadataPartPrefix {
-    Part { version_id: Ulid },
-}
-
 impl MultipartObjectMetadataKey {
     pub fn summary(version_id: Ulid) -> Self {
         Self::Summary { version_id }
@@ -129,9 +124,13 @@ impl MultipartObjectMetadataKey {
     }
 
     pub fn part_prefix(version_id: Ulid) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(
-            &MultipartObjectMetadataPartPrefix::Part { version_id },
-        )?)
+        let mut prefix = Self::Part {
+            version_id,
+            part_number: 0,
+        }
+        .to_bytes()?;
+        prefix.truncate(prefix.len().saturating_sub(std::mem::size_of::<u16>()));
+        Ok(prefix)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
