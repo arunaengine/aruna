@@ -131,6 +131,7 @@ impl BlobHandler {
             net,
             connections: Arc::new(Mutex::new(HashMap::new())),
         };
+        blob_handler.ensure_multipart_bucket().await?;
         let (blob_handle, rx) = BlobHandle::new(blob_handler.clone());
         tokio::spawn(async move {
             blob_handler.receive_loop(rx).await;
@@ -208,6 +209,29 @@ impl BlobHandler {
         let stream_id = stream_id.unwrap_or_default();
         self.connections.lock().await.insert(stream_id, stream);
         stream_id
+    }
+
+    async fn ensure_multipart_bucket(&self) -> Result<(), BlobLibError> {
+        if self.backend_config.backend_type != Backend::S3 {
+            return Ok(());
+        }
+
+        let Some(bucket) = self.backend_config.multipart_bucket.as_deref() else {
+            return Ok(());
+        };
+
+        make_bucket(bucket, &self.backend_config.service_config)
+            .await
+            .map_err(|err| BlobLibError::IoError(std::io::Error::other(err.to_string())))
+    }
+
+    fn multipart_bucket(&self) -> Result<&str, BlobError> {
+        self.backend_config
+            .multipart_bucket
+            .as_deref()
+            .ok_or_else(|| {
+                BlobError::OperatorCreationFailed("multipart bucket not configured".to_string())
+            })
     }
 
     pub async fn write_blob(
