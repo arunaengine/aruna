@@ -6,7 +6,7 @@ use crate::{
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
     id::NodeId,
     task::TaskEvent,
-    types::{DhtKey, Key, TopicId, TxnId, Value},
+    types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value},
 };
 use bytes::Bytes;
 use ulid::Ulid;
@@ -80,8 +80,14 @@ pub enum StorageEvent {
     WriteResult {
         key: Key,
     },
+    BatchWriteResult {
+        entries: Vec<(KeySpace, Key)>,
+    },
     DeleteResult {
         key: Key,
+    },
+    BatchDeleteResult {
+        entries: Vec<(KeySpace, Key)>,
     },
     /// Result of an iteration request with optional pagination cursor.
     IterResult {

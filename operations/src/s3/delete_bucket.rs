@@ -1,9 +1,11 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
+use aruna_core::keyspaces::{
+    S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE, S3_VERSION_KEYSPACE,
+};
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BucketInfo, LookupKey, VersionKey};
+use aruna_core::structs::{BucketInfo, LookupKey, MultipartUpload, VersionKey};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -15,6 +17,7 @@ pub enum DeleteBucketState {
     ReadBucket,
     CheckCurrentObjects,
     CheckVersions,
+    CheckMultipartUploads,
     DeleteBucket,
     CommitTransaction,
     Finish,
@@ -166,6 +169,34 @@ impl DeleteBucketOperation {
             }
         }
 
+        self.state = DeleteBucketState::CheckMultipartUploads;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            prefix: None,
+            start_after: None,
+            limit: Self::SCAN_LIMIT,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_multipart_uploads_checked(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return self.emit_error(DeleteBucketError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::IterResult)",
+                received: event,
+            });
+        };
+
+        for (_, value) in values {
+            let Ok(upload) = MultipartUpload::from_bytes(value.as_ref()) else {
+                continue;
+            };
+            if upload.bucket == self.bucket {
+                return self.emit_error(DeleteBucketError::NotEmpty);
+            }
+        }
+
         self.state = DeleteBucketState::DeleteBucket;
         smallvec![Effect::Storage(StorageEffect::Delete {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -222,6 +253,9 @@ impl Operation for DeleteBucketOperation {
             DeleteBucketState::ReadBucket => self.handle_bucket_read(event),
             DeleteBucketState::CheckCurrentObjects => self.handle_current_objects_checked(event),
             DeleteBucketState::CheckVersions => self.handle_versions_checked(event),
+            DeleteBucketState::CheckMultipartUploads => {
+                self.handle_multipart_uploads_checked(event)
+            }
             DeleteBucketState::DeleteBucket => self.handle_bucket_deleted(event),
             DeleteBucketState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteBucketState::Finish => smallvec![],

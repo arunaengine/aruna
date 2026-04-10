@@ -24,9 +24,36 @@ enum Txn {
 
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
 
-pub struct FjallStorage {
+struct Store {
     db: OptimisticTxDatabase,
     keyspaces: HashMap<String, OptimisticTxKeyspace>,
+}
+
+impl Store {
+    fn new(db: OptimisticTxDatabase) -> Self {
+        Self {
+            db,
+            keyspaces: HashMap::new(),
+        }
+    }
+
+    fn resolve_keyspace(&mut self, name: &str) -> Result<OptimisticTxKeyspace, StorageError> {
+        if let Some(ks) = self.keyspaces.get(name) {
+            return Ok(ks.clone());
+        }
+
+        match self.db.keyspace(name, KeyspaceCreateOptions::default) {
+            Ok(ks) => {
+                self.keyspaces.insert(name.to_string(), ks.clone());
+                Ok(ks)
+            }
+            Err(_) => Err(StorageError::KeyspaceError),
+        }
+    }
+}
+
+pub struct FjallStorage {
+    store: Store,
     txns: HashMap<Ulid, Txn>,
 }
 
@@ -102,8 +129,7 @@ impl FjallStorage {
 
         thread::spawn(move || {
             let mut storage = FjallStorage {
-                db,
-                keyspaces: HashMap::new(),
+                store: Store::new(db),
                 txns: HashMap::new(),
             };
             storage.receive_loop(receiver);
@@ -132,6 +158,9 @@ impl FjallStorage {
                             value,
                             txn_id,
                         } => self.write(key_space, key, value, txn_id),
+                        StorageEffect::BatchWrite { writes, txn_id } => {
+                            self.batch_write(writes, txn_id)
+                        }
                         StorageEffect::CommitTransaction { txn_id } => {
                             self.commit_transaction(txn_id)
                         }
@@ -140,6 +169,9 @@ impl FjallStorage {
                             key,
                             txn_id,
                         } => self.delete(key_space, key, txn_id),
+                        StorageEffect::BatchDelete { deletes, txn_id } => {
+                            self.batch_delete(deletes, txn_id)
+                        }
                         StorageEffect::Iter {
                             key_space,
                             prefix,
@@ -164,10 +196,10 @@ impl FjallStorage {
         let txn_id = Ulid::new();
 
         if read {
-            let txn = self.db.read_tx();
+            let txn = self.store.db.read_tx();
             self.txns.insert(txn_id, Txn::Read(txn));
         } else {
-            match self.db.write_tx() {
+            match self.store.db.write_tx() {
                 Ok(txn) => {
                     self.txns.insert(txn_id, Txn::Write(Box::new(txn)));
                 }
@@ -196,22 +228,8 @@ impl FjallStorage {
         }
     }
 
-    fn get_or_create_keyspace(&mut self, name: &str) -> Result<OptimisticTxKeyspace, StorageError> {
-        if let Some(ks) = self.keyspaces.get(name) {
-            return Ok(ks.clone());
-        }
-
-        match self.db.keyspace(name, KeyspaceCreateOptions::default) {
-            Ok(ks) => {
-                self.keyspaces.insert(name.to_string(), ks.clone());
-                Ok(ks)
-            }
-            Err(_) => Err(StorageError::KeyspaceError),
-        }
-    }
-
     fn read(&mut self, key_space: String, key: ByteView, txn_id: Option<Ulid>) -> StorageEvent {
-        let keyspace = match self.get_or_create_keyspace(&key_space) {
+        let keyspace = match self.store.resolve_keyspace(&key_space) {
             Ok(ks) => ks,
             Err(e) => return StorageEvent::Error { error: e },
         };
@@ -245,7 +263,7 @@ impl FjallStorage {
             }
         } else {
             // Non-transactional read
-            let snapshot = self.db.read_tx();
+            let snapshot = self.store.db.read_tx();
             match snapshot.get(&keyspace, &key) {
                 Ok(value_opt) => StorageEvent::ReadResult {
                     key,
@@ -265,7 +283,7 @@ impl FjallStorage {
         value: ByteView,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
-        let keyspace = match self.get_or_create_keyspace(&key_space) {
+        let keyspace = match self.store.resolve_keyspace(&key_space) {
             Ok(ks) => ks,
             Err(e) => return StorageEvent::Error { error: e },
         };
@@ -289,6 +307,47 @@ impl FjallStorage {
         }
     }
 
+    fn batch_write(
+        &mut self,
+        writes: Vec<(String, ByteView, ByteView)>,
+        txn_id: Option<Ulid>,
+    ) -> StorageEvent {
+        let mut entries = Vec::with_capacity(writes.len());
+
+        if let Some(txn_id) = txn_id {
+            let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) else {
+                return StorageEvent::Error {
+                    error: StorageError::TransactionNotFound,
+                };
+            };
+
+            for (key_space, key, value) in writes {
+                let keyspace = match self.store.resolve_keyspace(&key_space) {
+                    Ok(ks) => ks,
+                    Err(error) => return StorageEvent::Error { error },
+                };
+                txn.insert(keyspace, key.clone(), value);
+                entries.push((key_space, key));
+            }
+        } else {
+            for (key_space, key, value) in writes {
+                let keyspace = match self.store.resolve_keyspace(&key_space) {
+                    Ok(ks) => ks,
+                    Err(error) => return StorageEvent::Error { error },
+                };
+
+                if keyspace.insert(key.clone(), value).is_err() {
+                    return StorageEvent::Error {
+                        error: StorageError::WriteError,
+                    };
+                }
+                entries.push((key_space, key));
+            }
+        }
+
+        StorageEvent::BatchWriteResult { entries }
+    }
+
     fn commit_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_txn)) => {
@@ -309,7 +368,7 @@ impl FjallStorage {
     }
 
     fn delete(&mut self, key_space: String, key: ByteView, txn_id: Option<Ulid>) -> StorageEvent {
-        let keyspace = match self.get_or_create_keyspace(&key_space) {
+        let keyspace = match self.store.resolve_keyspace(&key_space) {
             Ok(ks) => ks,
             Err(e) => return StorageEvent::Error { error: e },
         };
@@ -333,6 +392,47 @@ impl FjallStorage {
         }
     }
 
+    fn batch_delete(
+        &mut self,
+        deletes: Vec<(String, ByteView)>,
+        txn_id: Option<Ulid>,
+    ) -> StorageEvent {
+        let mut entries = Vec::with_capacity(deletes.len());
+
+        if let Some(txn_id) = txn_id {
+            let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) else {
+                return StorageEvent::Error {
+                    error: StorageError::TransactionNotFound,
+                };
+            };
+
+            for (key_space, key) in deletes {
+                let keyspace = match self.store.resolve_keyspace(&key_space) {
+                    Ok(ks) => ks,
+                    Err(error) => return StorageEvent::Error { error },
+                };
+                txn.remove(keyspace, key.clone());
+                entries.push((key_space, key));
+            }
+        } else {
+            for (key_space, key) in deletes {
+                let keyspace = match self.store.resolve_keyspace(&key_space) {
+                    Ok(ks) => ks,
+                    Err(error) => return StorageEvent::Error { error },
+                };
+
+                if keyspace.remove(key.clone()).is_err() {
+                    return StorageEvent::Error {
+                        error: StorageError::DeleteError,
+                    };
+                }
+                entries.push((key_space, key));
+            }
+        }
+
+        StorageEvent::BatchDeleteResult { entries }
+    }
+
     fn iterate(
         &mut self,
         key_space: String,
@@ -341,7 +441,7 @@ impl FjallStorage {
         limit: usize,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
-        let keyspace = match self.get_or_create_keyspace(&key_space) {
+        let keyspace = match self.store.resolve_keyspace(&key_space) {
             Ok(ks) => ks,
             Err(e) => return StorageEvent::Error { error: e },
         };
@@ -372,7 +472,7 @@ impl FjallStorage {
                 }
             }
         } else {
-            let snapshot = self.db.read_tx();
+            let snapshot = self.store.db.read_tx();
             iterate_page(
                 &snapshot,
                 &keyspace,

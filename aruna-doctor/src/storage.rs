@@ -618,6 +618,7 @@ mod tests {
                     backend_type: Backend::FileSystem,
                     bucket_prefix: config.blob_bucket_prefix.clone(),
                     max_bucket_size: config.blob_max_bucket_size,
+                    multipart_bucket: config.blob_multipart_bucket.clone(),
                     root: config.blob_root.clone(),
                     service_config: std::collections::HashMap::new(),
                 },
@@ -731,6 +732,8 @@ mod tests {
                 PutObjectOperation::new(PutObjectConfig {
                     user_id: realm_admin,
                     group_id: group.0.group_id,
+                    realm_id: config.realm_id.clone(),
+                    node_id: config.node_id,
                     request: PutObjectInput {
                         bucket: bucket_name,
                         key: "hello.txt".to_string(),

@@ -58,6 +58,7 @@ pub struct BackendConfig {
     pub service_config: HashMap<String, String>,
     pub bucket_prefix: Option<String>,
     pub max_bucket_size: Option<u64>,
+    pub multipart_bucket: Option<String>,
 }
 
 #[derive(Clone, Debug)]

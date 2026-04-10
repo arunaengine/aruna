@@ -36,6 +36,20 @@ pub enum BlobEffect {
         created_by: UserId,
         blob: BackendStream<Result<Bytes, StreamError>>,
     },
+    WritePart {
+        upload_id: Ulid,
+        part_number: u16,
+        created_by: UserId,
+        compressed: bool,
+        encrypted: bool,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    Compose {
+        bucket: String,
+        key: String,
+        created_by: UserId,
+        parts: Vec<BackendLocation>,
+    },
     Read {
         location: BackendLocation,
     },
@@ -88,9 +102,17 @@ pub enum StorageEffect {
         value: Value,
         txn_id: Option<TxnId>,
     },
+    BatchWrite {
+        writes: Vec<(KeySpace, Key, Value)>,
+        txn_id: Option<TxnId>,
+    },
     Delete {
         key_space: KeySpace,
         key: Key,
+        txn_id: Option<TxnId>,
+    },
+    BatchDelete {
+        deletes: Vec<(KeySpace, Key)>,
         txn_id: Option<TxnId>,
     },
     AbortTransaction {

@@ -67,6 +67,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             service_config: HashMap::new(),
             bucket_prefix: config.blob_bucket_prefix.clone(),
             max_bucket_size: config.blob_max_bucket_size,
+            multipart_bucket: config.blob_multipart_bucket.clone(),
         },
         storage_handle.clone(),
         net_handle.clone(),
