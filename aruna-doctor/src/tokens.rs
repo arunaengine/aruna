@@ -37,6 +37,7 @@ pub async fn create_token(
         net_handle: None,
         blob_handle: None,
         automerge_handle: None,
+        metadata_handle: None,
         task_handle: None,
     });
 
@@ -77,6 +78,7 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         net_handle: None,
         blob_handle: None,
         automerge_handle: None,
+        metadata_handle: None,
         task_handle: None,
     });
     let persisted_blacklist = load_persisted_state::<HashSet<String, ahash::RandomState>>(
