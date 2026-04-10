@@ -1935,10 +1935,10 @@ mod tests {
             json!("string")
         );
 
-        let export_params = openapi["paths"]["/metadata/{document_id}/rocrate"]["get"]
-            ["parameters"]
-            .as_array()
-            .unwrap();
+        let export_params =
+            openapi["paths"]["/metadata/{document_id}/rocrate"]["get"]["parameters"]
+                .as_array()
+                .unwrap();
         let view_param = export_params
             .iter()
             .find(|param| param["name"] == "view")
