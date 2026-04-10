@@ -40,6 +40,7 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "metadata", description = "Metadata RO-Crate and SPARQL operations")),
+    components(schemas(MetadataRoCrateView)),
     paths(
         create_metadata_document,
         list_metadata_documents,
@@ -1928,6 +1929,24 @@ mod tests {
     #[test]
     fn metadata_openapi_includes_examples_and_public_field_names() {
         let openapi = serde_json::to_value(MetadataApiDoc::openapi()).unwrap();
+
+        assert_eq!(
+            openapi["components"]["schemas"]["MetadataRoCrateView"]["type"],
+            json!("string")
+        );
+
+        let export_params = openapi["paths"]["/metadata/{document_id}/rocrate"]["get"]
+            ["parameters"]
+            .as_array()
+            .unwrap();
+        let view_param = export_params
+            .iter()
+            .find(|param| param["name"] == "view")
+            .unwrap();
+        assert_eq!(
+            view_param["schema"]["$ref"],
+            json!("#/components/schemas/MetadataRoCrateView")
+        );
 
         let create_examples = openapi["paths"]["/metadata"]["post"]["requestBody"]["content"]
             ["application/json"]["examples"]
