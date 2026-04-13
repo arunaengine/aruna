@@ -661,27 +661,26 @@ mod tests {
             .into_iter()
             .map(|entry| entry.name)
             .collect::<Vec<_>>();
-        assert_eq!(
-            missing,
-            vec![
-                API_STATE_KEYSPACE.to_string(),
-                AUTH_KEYSPACE.to_string(),
-                CRAQLE_GRAPHS_KEYSPACE.to_string(),
-                CRAQLE_LOG_KEYSPACE.to_string(),
-                CRAQLE_QUADS_KEYSPACE.to_string(),
-                CRAQLE_TERMS_KEYSPACE.to_string(),
-                DHT_KEYSPACE.to_string(),
-                GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
-                NODE_STATE_KEYSPACE.to_string(),
-                ONBOARDING_KEYSPACE.to_string(),
-                REALM_CONFIG_KEYSPACE.to_string(),
-                REALM_KEYSPACE.to_string(),
-                S3_BUCKET_KEYSPACE.to_string(),
-                S3_LOOKUP_KEYSPACE.to_string(),
-                S3_VERSION_KEYSPACE.to_string(),
-                USER_ACCESS_KEYSPACE.to_string(),
-            ]
-        );
+        let mut expected_missing = vec![
+            API_STATE_KEYSPACE.to_string(),
+            AUTH_KEYSPACE.to_string(),
+            CRAQLE_GRAPHS_KEYSPACE.to_string(),
+            CRAQLE_LOG_KEYSPACE.to_string(),
+            CRAQLE_QUADS_KEYSPACE.to_string(),
+            CRAQLE_TERMS_KEYSPACE.to_string(),
+            DHT_KEYSPACE.to_string(),
+            GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            NODE_STATE_KEYSPACE.to_string(),
+            ONBOARDING_KEYSPACE.to_string(),
+            REALM_CONFIG_KEYSPACE.to_string(),
+            REALM_KEYSPACE.to_string(),
+            S3_BUCKET_KEYSPACE.to_string(),
+            S3_LOOKUP_KEYSPACE.to_string(),
+            S3_VERSION_KEYSPACE.to_string(),
+            USER_ACCESS_KEYSPACE.to_string(),
+        ];
+        expected_missing.sort();
+        assert_eq!(missing, expected_missing);
     }
 
     #[test]

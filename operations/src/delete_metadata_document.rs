@@ -254,7 +254,8 @@ impl Operation for DeleteMetadataDocumentOperation {
                 Event::Net(NetEvent::Gossip(GossipEvent::Unsubscribed { .. }))
                 | Event::Net(NetEvent::Gossip(GossipEvent::Error {
                     error: GossipError::NotSubscribed,
-                })) => {
+                }))
+                | Event::Net(NetEvent::Error(_)) => {
                     self.state = DeleteMetadataDocumentState::Finish;
                     self.output = Some(Ok(()));
                     smallvec![]
