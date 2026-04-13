@@ -1,10 +1,12 @@
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
+use craqle::VectorClock;
 use aruna_core::structs::AuthContext;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_net::streams::BiStream;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
+use ulid::Ulid;
 
 const MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
 
@@ -29,6 +31,14 @@ pub enum MetadataTransportMessage {
     },
     SearchResults {
         hits: Vec<MetadataSearchHit>,
+    },
+    CatchupFrom {
+        document_id: Ulid,
+        known_clock: VectorClock,
+    },
+    CatchupData {
+        record: MetadataRegistryRecord,
+        batches: Vec<MetadataBatch>,
     },
     ApplyBatch {
         batch: MetadataBatch,
