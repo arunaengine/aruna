@@ -3,6 +3,10 @@ pub const GROUP_KEYSPACE: &str = "groups";
 pub const REALM_KEYSPACE: &str = "realms";
 pub const REALM_CONFIG_KEYSPACE: &str = "realm_config";
 pub const METADATA_KEYSPACE: &str = "metadata";
+pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
+pub const METADATA_DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
+pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
+pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
 
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";

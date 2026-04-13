@@ -30,6 +30,7 @@ pub mod inspect_onboarding_secret;
 pub mod list_groups;
 pub mod list_metadata_documents;
 pub mod list_onboarding_secrets;
+pub mod metadata;
 pub mod outgoing_automerge;
 pub mod replicate_automerge_to_realm;
 pub mod replication;

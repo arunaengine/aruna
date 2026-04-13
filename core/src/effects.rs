@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::alpn::Alpn;
 use crate::automerge::AutomergeEffect;
 use crate::id::NodeId;
+use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
 use crate::structs::BackendLocation;
@@ -20,6 +21,7 @@ pub enum Effect {
     Storage(StorageEffect),
     Net(NetEffect),
     Automerge(AutomergeEffect),
+    Metadata(MetadataEffect),
     SubOperation(Box<dyn SubOperation>),
     Task(TaskEffect),
     Search(),

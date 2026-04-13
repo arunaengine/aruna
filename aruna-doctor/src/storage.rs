@@ -634,6 +634,7 @@ mod tests {
                 net_handle: Some(net_handle.clone()),
                 blob_handle: Some(blob_handle.clone()),
                 automerge_handle: Some(automerge_handle.clone()),
+                metadata_handle: None,
                 task_handle: Some(task_handle.clone()),
             });
             initialize_net_incoming(context.clone());

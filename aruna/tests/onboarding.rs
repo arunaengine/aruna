@@ -70,6 +70,7 @@ async fn spawn_seed_node() -> Result<SeedNode, Box<dyn std::error::Error>> {
         net_handle: Some(net.clone()),
         blob_handle: None,
         automerge_handle: Some(automerge_handle),
+        metadata_handle: None,
         task_handle: Some(task_handle.clone()),
     });
     initialize_net_incoming(context.clone());
@@ -272,6 +273,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
         net_handle: Some(joiner_net.clone()),
         blob_handle: None,
         automerge_handle: Some(automerge_handle),
+        metadata_handle: None,
         task_handle: Some(task_handle.clone()),
     });
     initialize_net_incoming(joiner_context.clone());

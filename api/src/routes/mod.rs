@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub mod blobs;
 pub mod credentials;
 pub mod groups;
+pub mod metadata;
 pub mod onboarding;
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
@@ -16,6 +17,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(blobs::router())
         .merge(credentials::router())
         .merge(groups::router())
+        .merge(metadata::router())
         .layer(from_fn_with_state(state.clone(), auth_middleware))
         .layer(from_fn(request_tracing_middleware))
         .with_state(state)

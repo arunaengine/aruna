@@ -26,5 +26,4 @@ futures.workspace = true
 ed25519-dalek = { workspace = true }
 globset = { workspace = true }
 oxrdf = { workspace = true }
-ro-crate-rs = { workspace = true }
 serde_json = { workspace = true }

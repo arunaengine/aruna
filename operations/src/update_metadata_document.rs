@@ -1,39 +1,59 @@
-use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, MetadataDocument};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::metadata::{
+    MetadataApplyRoCrateRequest, MetadataBatch, MetadataEffect, MetadataError, MetadataEvent,
+    MetadataGraphPolicy, MetadataUpsertEntityRequest,
+};
+use aruna_core::operation::Operation;
+use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
+use aruna_core::types::{Effects, GroupId, TxnId};
+use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
-use crate::automerge::repository::{read_effect, write_effect};
-use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
-use aruna_core::types::Effects;
-use aruna_core::types::TxnId;
+use crate::metadata::repository::{
+    StorageReadError, parse_registry_read, read_registry_effect, write_audit_effect,
+    write_document_index_effect, write_registry_effect,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UpdateMetadataDocumentConfig {
-    pub actor: Actor,
-    pub document: MetadataDocument,
+    pub actor: aruna_core::structs::Actor,
+    pub group_id: GroupId,
+    pub document_id: Ulid,
+    pub public: bool,
+    pub mutation: UpdateMetadataDocumentMutation,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UpdateMetadataDocumentMutation {
+    ReplaceRoCrate { jsonld: String },
+    UpsertDataEntity { jsonld: String },
+    UpsertContextualEntity { jsonld: String },
 }
 
 #[derive(Debug, PartialEq)]
 pub struct UpdateMetadataDocumentOperation {
     config: UpdateMetadataDocumentConfig,
     txn_id: Option<TxnId>,
+    record: Option<MetadataRegistryRecord>,
+    batch: Option<MetadataBatch>,
     state: UpdateMetadataDocumentState,
-    output: Option<Result<MetadataDocument, UpdateMetadataDocumentError>>,
+    output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum UpdateMetadataDocumentState {
     Init,
-    StartTransaction,
     ReadCurrent,
-    WriteDocument,
+    ApplyMutation,
+    StartTransaction,
+    WriteRegistry,
+    WriteDocumentIndex,
+    WriteAudit,
     CommitTransaction,
-    Announce,
+    ReplicateGraph,
     Finish,
     Error,
 }
@@ -41,15 +61,15 @@ enum UpdateMetadataDocumentState {
 #[derive(Debug, Error, PartialEq)]
 pub enum UpdateMetadataDocumentError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    StorageError(#[from] aruna_core::errors::StorageError),
     #[error(transparent)]
-    ConversionError(#[from] ConversionError),
+    ConversionError(#[from] aruna_core::errors::ConversionError),
+    #[error(transparent)]
+    MetadataError(#[from] MetadataError),
     #[error("document not found")]
     DocumentNotFound,
     #[error("missing active transaction")]
     MissingTransaction,
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -63,15 +83,87 @@ impl UpdateMetadataDocumentOperation {
         Self {
             config,
             txn_id: None,
+            record: None,
+            batch: None,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
     }
 
-    fn document_ref(&self) -> AutomergeDocumentVariant {
-        AutomergeDocumentVariant::Metadata {
-            group_id: self.config.document.group_id,
-            document_id: self.config.document.document_id,
+    fn current_timestamp_ms() -> u64 {
+        u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
+    }
+
+    fn graph_policy(&self, record: &MetadataRegistryRecord) -> MetadataGraphPolicy {
+        MetadataGraphPolicy {
+            public: self.config.public,
+            permission_paths: vec![record.permission_path.clone()],
+        }
+        .normalized()
+    }
+
+    fn updated_record(&self, mut record: MetadataRegistryRecord) -> MetadataRegistryRecord {
+        record.public = self.config.public;
+        record.updated_at_ms = Self::current_timestamp_ms();
+        record
+    }
+
+    fn audit_record(&self, record: &MetadataRegistryRecord) -> MetadataAuditRecord {
+        let (operation, details) = match &self.config.mutation {
+            UpdateMetadataDocumentMutation::ReplaceRoCrate { .. } => (
+                MetadataAuditOperation::ReplaceRoCrate,
+                "replace ro-crate".to_string(),
+            ),
+            UpdateMetadataDocumentMutation::UpsertDataEntity { .. } => (
+                MetadataAuditOperation::UpsertDataEntity,
+                "upsert data entity".to_string(),
+            ),
+            UpdateMetadataDocumentMutation::UpsertContextualEntity { .. } => (
+                MetadataAuditOperation::UpsertContextualEntity,
+                "upsert contextual entity".to_string(),
+            ),
+        };
+        MetadataAuditRecord {
+            realm_id: record.realm_id.clone(),
+            group_id: record.group_id,
+            document_id: record.document_id,
+            graph_iri: record.graph_iri.clone(),
+            user_id: self.config.actor.user_id,
+            node_id: self.config.actor.node_id,
+            operation,
+            occurred_at_ms: record.updated_at_ms,
+            details: Some(details),
+        }
+    }
+
+    fn mutation_effect(&self, record: &MetadataRegistryRecord) -> Effect {
+        let graph_iri = record.graph_iri.clone();
+        match &self.config.mutation {
+            UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => {
+                Effect::Metadata(MetadataEffect::ApplyRoCrate {
+                    request: MetadataApplyRoCrateRequest {
+                        graph_iri,
+                        jsonld: jsonld.clone(),
+                        policy: self.graph_policy(record),
+                    },
+                })
+            }
+            UpdateMetadataDocumentMutation::UpsertDataEntity { jsonld } => {
+                Effect::Metadata(MetadataEffect::UpsertDataEntity {
+                    request: MetadataUpsertEntityRequest {
+                        graph_iri,
+                        jsonld: jsonld.clone(),
+                    },
+                })
+            }
+            UpdateMetadataDocumentMutation::UpsertContextualEntity { jsonld } => {
+                Effect::Metadata(MetadataEffect::UpsertContextualEntity {
+                    request: MetadataUpsertEntityRequest {
+                        graph_iri,
+                        jsonld: jsonld.clone(),
+                    },
+                })
+            }
         }
     }
 
@@ -93,52 +185,106 @@ impl UpdateMetadataDocumentOperation {
 }
 
 impl Operation for UpdateMetadataDocumentOperation {
-    type Output = MetadataDocument;
+    type Output = MetadataRegistryRecord;
     type Error = UpdateMetadataDocumentError;
 
     fn start(&mut self) -> Effects {
-        self.state = UpdateMetadataDocumentState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        self.state = UpdateMetadataDocumentState::ReadCurrent;
+        smallvec![read_registry_effect(
+            self.config.group_id,
+            self.config.document_id,
+            None
+        )]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
+            UpdateMetadataDocumentState::ReadCurrent => match parse_registry_read(event) {
+                Ok(Some(record)) => {
+                    self.record = Some(record);
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = UpdateMetadataDocumentState::ApplyMutation;
+                    smallvec![self.mutation_effect(record)]
+                }
+                Ok(None) => self.fail(UpdateMetadataDocumentError::DocumentNotFound),
+                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
+            },
+            UpdateMetadataDocumentState::ApplyMutation => match event {
+                Event::Metadata(MetadataEvent::ApplyRoCrateResult { batch, .. })
+                | Event::Metadata(MetadataEvent::EntityUpsertResult { batch, .. }) => {
+                    let Some(record) = self.record.take() else {
+                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.record = Some(self.updated_record(record));
+                    self.batch = Some(batch);
+                    self.state = UpdateMetadataDocumentState::StartTransaction;
+                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                        read: false
+                    })]
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+                other => self.unexpected_event("metadata mutation result", format!("{other:?}")),
+            },
             UpdateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.txn_id = Some(txn_id);
-                    self.state = UpdateMetadataDocumentState::ReadCurrent;
-                    smallvec![read_effect(&self.document_ref(), Some(txn_id))]
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = UpdateMetadataDocumentState::WriteRegistry;
+                    match write_registry_effect(record, Some(txn_id)) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(UpdateMetadataDocumentError::ConversionError(error))
+                        }
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("transaction start result", format!("{other:?}")),
             },
-            UpdateMetadataDocumentState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::ReadResult {
-                    value: Some(value), ..
-                }) => {
-                    let bytes = match self
-                        .config
-                        .document
-                        .reconcile_bytes(Some(value.as_ref()), &self.config.actor)
-                    {
-                        Ok(bytes) => bytes,
-                        Err(error) => return self.fail(error.into()),
-                    };
+            UpdateMetadataDocumentState::WriteRegistry => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
-                    self.state = UpdateMetadataDocumentState::WriteDocument;
-                    smallvec![write_effect(&self.document_ref(), bytes, Some(txn_id))]
-                }
-                Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-                    self.fail(UpdateMetadataDocumentError::DocumentNotFound)
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = UpdateMetadataDocumentState::WriteDocumentIndex;
+                    match write_document_index_effect(record, Some(txn_id)) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(UpdateMetadataDocumentError::ConversionError(error))
+                        }
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage read result", format!("{other:?}")),
+                other => self.unexpected_event("registry write result", format!("{other:?}")),
             },
-            UpdateMetadataDocumentState::WriteDocument => match event {
+            UpdateMetadataDocumentState::WriteDocumentIndex => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = UpdateMetadataDocumentState::WriteAudit;
+                    match write_audit_effect(&self.audit_record(record), Ulid::new(), Some(txn_id))
+                    {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(UpdateMetadataDocumentError::ConversionError(error))
+                        }
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("document index write result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::WriteAudit => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
@@ -147,23 +293,22 @@ impl Operation for UpdateMetadataDocumentOperation {
                     smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
+                other => self.unexpected_event("audit write result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
-                    self.state = UpdateMetadataDocumentState::Announce;
-                    smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceAutomergeDocumentOperation::new(
-                            self.document_ref(),
-                            self.config.actor.node_id,
-                        ),
-                        |result| {
-                            Event::SubOperation(SubOperationEvent::AutomergeStateResult {
-                                result: result.map_err(|error| error.to_string()),
-                            })
-                        },
-                    ))]
+                    let Some(record) = self.record.clone() else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(batch) = self.batch.take() else {
+                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = UpdateMetadataDocumentState::ReplicateGraph;
+                    smallvec![Effect::Metadata(MetadataEffect::ReplicateBatch {
+                        record,
+                        batch,
+                    })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -171,20 +316,17 @@ impl Operation for UpdateMetadataDocumentOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            UpdateMetadataDocumentState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
-                    match result {
-                        Ok(()) => {
-                            self.state = UpdateMetadataDocumentState::Finish;
-                            self.output = Some(Ok(self.config.document.clone()));
-                            smallvec![]
-                        }
-                        Err(error) => self.fail(UpdateMetadataDocumentError::AutomergeState(error)),
-                    }
+            UpdateMetadataDocumentState::ReplicateGraph => match event {
+                Event::Metadata(MetadataEvent::BatchReplicated { .. }) => {
+                    let Some(record) = self.record.clone() else {
+                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = UpdateMetadataDocumentState::Finish;
+                    self.output = Some(Ok(record));
+                    smallvec![]
                 }
-                other => {
-                    self.unexpected_event("automerge announcement result", format!("{other:?}"))
-                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+                other => self.unexpected_event("metadata replication result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::Finish
             | UpdateMetadataDocumentState::Error
@@ -200,7 +342,8 @@ impl Operation for UpdateMetadataDocumentOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(self.config.document))
+        self.output
+            .expect("metadata update operation must set output")
     }
 
     fn abort(&mut self) -> Effects {

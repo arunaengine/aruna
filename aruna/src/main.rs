@@ -23,6 +23,7 @@ use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::startup::RestoreAutomergeSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_tasks::TaskHandle;
@@ -60,6 +61,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let task_handle = TaskHandle::new();
     let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
+    let metadata_handle = MetadataHandle::new(
+        &config.metadata_storage_path,
+        config.node_id,
+        storage_handle.clone(),
+        Some(net_handle.clone()),
+    )?;
     let blob_handle = BlobHandler::new(
         BackendConfig {
             backend_type: FileSystem,
@@ -79,6 +86,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         net_handle: Some(net_handle.clone()),
         blob_handle: Some(blob_handle),
         automerge_handle: Some(automerge_handle),
+        metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });
 

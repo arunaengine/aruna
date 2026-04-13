@@ -9,6 +9,8 @@ pub enum Alpn {
     Bao,
     /// Automerge CRDT sync protocol
     Automerge,
+    /// Metadata bootstrap protocol
+    Metadata,
 }
 
 impl Alpn {
@@ -18,6 +20,7 @@ impl Alpn {
             Alpn::Gossip => iroh_gossip::net::GOSSIP_ALPN,
             Alpn::Bao => b"aruna/bao/1",
             Alpn::Automerge => b"aruna/automerge/1",
+            Alpn::Metadata => b"aruna/metadata/1",
         }
     }
 
@@ -27,6 +30,7 @@ impl Alpn {
             iroh_gossip::net::GOSSIP_ALPN => Some(Alpn::Gossip),
             b"aruna/bao/1" => Some(Alpn::Bao),
             b"aruna/automerge/1" => Some(Alpn::Automerge),
+            b"aruna/metadata/1" => Some(Alpn::Metadata),
             _ => None,
         }
     }
@@ -42,6 +46,7 @@ impl std::fmt::Display for Alpn {
             },
             Alpn::Bao => write!(f, "aruna/bao/1"),
             Alpn::Automerge => write!(f, "aruna/automerge/1"),
+            Alpn::Metadata => write!(f, "aruna/metadata/1"),
         }
     }
 }
@@ -61,6 +66,10 @@ mod tests {
         assert_eq!(
             Alpn::from_bytes(Alpn::Automerge.as_bytes()),
             Some(Alpn::Automerge)
+        );
+        assert_eq!(
+            Alpn::from_bytes(Alpn::Metadata.as_bytes()),
+            Some(Alpn::Metadata)
         );
     }
 

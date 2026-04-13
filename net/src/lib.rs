@@ -114,6 +114,7 @@ impl NetHandle {
                 Alpn::Gossip.as_bytes().to_vec(),
                 Alpn::Bao.as_bytes().to_vec(),
                 Alpn::Automerge.as_bytes().to_vec(),
+                Alpn::Metadata.as_bytes().to_vec(),
             ]);
 
         if config.use_dns_discovery {

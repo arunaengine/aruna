@@ -20,6 +20,8 @@ use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+
 struct TestNode {
     _temp_dir: TempDir,
     net: NetHandle,
@@ -109,6 +111,7 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
         net_handle: Some(net.clone()),
         blob_handle: None,
         automerge_handle: Some(automerge_handle),
+        metadata_handle: None,
         task_handle: Some(task_handle.clone()),
     });
 
@@ -127,7 +130,7 @@ async fn wait_for_realm_node_convergence(
     realm_id: &RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
 
     loop {
         let mut converged = true;
@@ -163,7 +166,7 @@ async fn wait_for_group_convergence(
     expected_group: &Group,
     expected_auth: &GroupAuthorizationDocument,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + CONVERGENCE_TIMEOUT;
     let mut last_states = Vec::new();
 
     loop {

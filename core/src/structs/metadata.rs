@@ -1,19 +1,13 @@
 use std::collections::HashSet;
-use std::str::FromStr;
 
 use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
-use oxrdf::Triple;
-use rocraters::ro_crate::context::RoCrateContext;
-use rocraters::ro_crate::rdf::{
-    ContextResolverBuilder, ConversionOptions, RdfFormat, RdfGraph, rdf_graph_to_rocrate,
-    rocrate_to_rdf_with_options,
-};
-use rocraters::ro_crate::rocrate::RoCrate;
 use serde::{Deserialize, Serialize};
 
 use crate::errors::ConversionError;
 use crate::structs::Actor;
 use crate::types::{GroupId, autosurgeon_ulid};
+
+const DEFAULT_CONTEXT_JSON: &str = "\"https://w3id.org/ro/crate/1.2/context\"";
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
 pub struct MetadataDocument {
@@ -29,14 +23,11 @@ pub struct MetadataDocument {
 
 impl MetadataDocument {
     pub fn new(group_id: GroupId, document_id: GroupId, base_iri: String) -> Self {
-        let context =
-            RoCrateContext::ReferenceContext("https://w3id.org/ro/crate/1.2/context".to_string());
         Self {
             document_id,
             group_id,
             base_iri,
-            context_json: serde_json::to_string(&context)
-                .expect("default RO-Crate context must serialize"),
+            context_json: DEFAULT_CONTEXT_JSON.to_string(),
             triples: HashSet::new(),
         }
     }
@@ -64,88 +55,6 @@ impl MetadataDocument {
         reconcile(&mut doc, self)?;
         Ok(doc.save())
     }
-
-    pub fn from_rocrate(
-        group_id: GroupId,
-        document_id: GroupId,
-        crate_: &RoCrate,
-        base_iri: String,
-    ) -> Result<Self, ConversionError> {
-        let options = if base_iri.is_empty() {
-            ConversionOptions::AllowRelative
-        } else {
-            ConversionOptions::with_base(base_iri.clone())
-        };
-        let graph = rocrate_to_rdf_with_options(crate_, ContextResolverBuilder::default(), options)
-            .map_err(|err| ConversionError::RoCrateError(err.to_string()))?;
-        let mut metadata = Self::from_rdf_graph(group_id, document_id, graph)?;
-        if !base_iri.is_empty() {
-            metadata.base_iri = base_iri;
-        }
-        metadata.context_json = serde_json::to_string(&crate_.context)?;
-        Ok(metadata)
-    }
-
-    pub fn to_rocrate(&self) -> Result<RoCrate, ConversionError> {
-        let graph = self.to_rdf_graph()?;
-        rdf_graph_to_rocrate(graph).map_err(|err| ConversionError::RoCrateError(err.to_string()))
-    }
-
-    pub fn to_rdf_string(&self, format: RdfFormat) -> Result<String, ConversionError> {
-        self.to_rdf_graph()?
-            .to_string(format)
-            .map_err(|err| ConversionError::RoCrateError(err.to_string()))
-    }
-
-    pub fn from_rdf_graph(
-        group_id: GroupId,
-        document_id: GroupId,
-        graph: RdfGraph,
-    ) -> Result<Self, ConversionError> {
-        let context_json = serde_json::to_string(&graph.context.original)?;
-        let base_iri = graph.context.base.clone().unwrap_or_default();
-        let mut triples = HashSet::with_capacity(graph.triples.len());
-        for triple in graph.triples {
-            triples.insert(serialize_triple(&triple)?);
-        }
-
-        Ok(Self {
-            document_id,
-            group_id,
-            base_iri,
-            context_json,
-            triples,
-        })
-    }
-
-    pub fn to_rdf_graph(&self) -> Result<RdfGraph, ConversionError> {
-        let context = self.context()?;
-        let mut resolved = ContextResolverBuilder::default()
-            .resolve(&context)
-            .map_err(|err| ConversionError::RoCrateError(err.to_string()))?;
-        if resolved.base.is_none() && !self.base_iri.is_empty() {
-            resolved.base = Some(self.base_iri.clone());
-        }
-
-        let mut graph = RdfGraph::new(resolved);
-        for triple in &self.triples {
-            graph.insert(parse_triple(triple)?);
-        }
-
-        Ok(graph)
-    }
-
-    pub fn context(&self) -> Result<RoCrateContext, ConversionError> {
-        Ok(serde_json::from_str(&self.context_json)?)
-    }
-}
-
-fn serialize_triple(triple: &Triple) -> Result<String, ConversionError> {
-    Ok(triple.to_string())
-}
-
-fn parse_triple(value: &str) -> Result<Triple, ConversionError> {
-    Triple::from_str(value).map_err(|err| ConversionError::RoCrateError(err.to_string()))
 }
 
 pub mod autosurgeon_triple_set {
@@ -186,10 +95,7 @@ mod tests {
             document_id: GroupId::new(),
             group_id: GroupId::new(),
             base_iri: String::new(),
-            context_json: serde_json::to_string(&RoCrateContext::ReferenceContext(
-                "https://w3id.org/ro/crate/1.2/context".to_string(),
-            ))
-            .unwrap(),
+            context_json: DEFAULT_CONTEXT_JSON.to_string(),
             triples: HashSet::from([
                 "<http://example.org/root> <http://schema.org/name> \"example\"".to_string(),
                 "<http://example.org/root> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://schema.org/Dataset>".to_string(),
@@ -210,16 +116,6 @@ mod tests {
         let bytes = document.to_bytes(&actor).expect("to bytes");
         let restored = MetadataDocument::from_bytes(&bytes).expect("from bytes");
         assert_eq!(document, restored);
-    }
-
-    #[test]
-    fn metadata_document_roundtrip_rdf_graph() {
-        let document = sample_document();
-        let graph = document.to_rdf_graph().expect("to graph");
-        let restored =
-            MetadataDocument::from_rdf_graph(document.group_id, document.document_id, graph)
-                .expect("from graph");
-        assert_eq!(document.triples, restored.triples);
     }
 
     #[test]

@@ -12,6 +12,7 @@ aruna-core = { path = "../core" }
 aruna-storage = { path = "../storage" }
 aruna-net = { path = "../net" }
 aruna-tasks = { path = "../tasks" }
+craqle = { workspace = true }
 async-trait = { workspace = true }
 automerge = { workspace = true }
 autosurgeon = { workspace = true }
@@ -26,6 +27,7 @@ opentelemetry = { workspace = true }
 postcard.workspace = true
 rand.workspace = true
 serde = { workspace = true }
+serde_json = { workspace = true }
 smallvec = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
@@ -33,6 +35,7 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
 ed25519-dalek = { workspace = true }
+oxrdf = { workspace = true }
 
 [dev-dependencies]
 futures-util.workspace = true

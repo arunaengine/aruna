@@ -16,11 +16,13 @@ ahash.workspace = true
 base64.workspace = true
 opentelemetry.workspace = true
 serde.workspace = true
+serde_json = { workspace = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 ulid.workspace = true
+url = "2.5.7"
 
 # REST
 axum = "0.8.8"

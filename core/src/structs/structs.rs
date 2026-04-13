@@ -147,7 +147,7 @@ impl NodeCapabilities {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthContext {
     pub user_id: UserId,
     pub realm_id: RealmId,

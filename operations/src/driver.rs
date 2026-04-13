@@ -14,9 +14,11 @@ use std::pin::Pin;
 use tracing::{Instrument, debug_span, error, trace};
 
 use crate::automerge::AutomergeHandle;
+use crate::metadata::MetadataHandle;
 use aruna_core::automerge::AutomergeEvent;
 use aruna_core::automerge::AutomergeSyncError;
 use aruna_core::events::NetError;
+use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::TaskEvent;
 
 #[derive(Debug)]
@@ -25,6 +27,7 @@ pub struct DriverContext {
     pub net_handle: Option<NetHandle>,
     pub blob_handle: Option<BlobHandle>,
     pub automerge_handle: Option<AutomergeHandle>,
+    pub metadata_handle: Option<MetadataHandle>,
     pub task_handle: Option<TaskHandle>,
 }
 
@@ -70,6 +73,18 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                     sync_id: ulid::Ulid::new(),
                     document: None,
                     error: AutomergeSyncError::Network("automerge handle unavailable".to_string()),
+                })
+            }
+        }
+        Effect::Metadata(metadata_effect) => {
+            if let Some(metadata_handle) = &context.metadata_handle {
+                metadata_handle
+                    .send_effect(Effect::Metadata(metadata_effect))
+                    .await
+            } else {
+                Event::Metadata(MetadataEvent::Error {
+                    graph_iri: None,
+                    error: MetadataError::HandleMissing,
                 })
             }
         }
@@ -212,6 +227,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Storage(_) => "storage",
         Effect::Net(_) => "net",
         Effect::Automerge(_) => "automerge",
+        Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
         Effect::Task(_) => "task",
         Effect::Search() => "search",
@@ -225,6 +241,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::Storage(_) => "storage",
         Event::Net(_) => "net",
         Event::Automerge(_) => "automerge",
+        Event::Metadata(_) => "metadata",
         Event::SubOperation(_) => "suboperation",
         Event::Task(_) => "task",
         Event::Search() => "search",
@@ -344,6 +361,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             automerge_handle: None,
+            metadata_handle: None,
             task_handle: None,
         };
 
@@ -412,6 +430,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             automerge_handle: None,
+            metadata_handle: None,
             task_handle: None,
         };
 
@@ -477,6 +496,7 @@ mod test {
             net_handle: None,
             blob_handle: None,
             automerge_handle: None,
+            metadata_handle: None,
             task_handle: None,
         };
 
