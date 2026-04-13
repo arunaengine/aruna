@@ -2,7 +2,6 @@ pub const AUTH_KEYSPACE: &str = "auth";
 pub const GROUP_KEYSPACE: &str = "groups";
 pub const REALM_KEYSPACE: &str = "realms";
 pub const REALM_CONFIG_KEYSPACE: &str = "realm_config";
-pub const METADATA_KEYSPACE: &str = "metadata";
 pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
 pub const METADATA_DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";

@@ -2,13 +2,13 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::automerge::AutomergeDocumentVariant;
 use crate::id::NodeId;
+use crate::id::TopicId;
 use crate::structs::RealmId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskKey {
-    AutomergeAnnounce(AutomergeDocumentVariant),
+    TopicAnnounce(TopicId),
     RealmPresence { realm_id: RealmId, node_id: NodeId },
 }
 

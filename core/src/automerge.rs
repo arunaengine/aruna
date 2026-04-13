@@ -1,147 +1,66 @@
-use std::collections::BTreeMap;
-
 use automerge::ChangeHash;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::id::{AutomergeTopicId, DhtKeyId, NodeId, TopicId};
+use crate::gossip::TopicMessageKind;
+use crate::id::{NodeId, TopicId};
 use crate::structs::RealmId;
 use crate::task::TaskKey;
 use crate::types::GroupId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AutomergeDocumentVariant {
-    Group {
-        group_id: GroupId,
-    },
-    Metadata {
-        group_id: GroupId,
-        document_id: Ulid,
-    },
-    GroupAuthorization {
-        group_id: GroupId,
-    },
-    RealmAuthorization {
-        realm_id: RealmId,
-    },
-    RealmConfig {
-        realm_id: RealmId,
-    },
+    Group { group_id: GroupId },
+    GroupAuthorization { group_id: GroupId },
+    RealmAuthorization { realm_id: RealmId },
+    RealmConfig { realm_id: RealmId },
 }
 
 impl AutomergeDocumentVariant {
-    pub fn metadata(group_id: GroupId, document_id: Ulid) -> Self {
-        Self::Metadata {
-            group_id,
-            document_id,
-        }
-    }
-
     pub fn topic_id(&self) -> TopicId {
-        TopicId::automerge_document(self.topic_descriptor())
-    }
-
-    pub fn topic_descriptor(&self) -> AutomergeTopicId {
         match self {
-            Self::Group { group_id } => AutomergeTopicId::Group {
-                group_id: *group_id,
-            },
-            Self::Metadata {
-                group_id,
-                document_id,
-            } => AutomergeTopicId::Metadata {
-                group_id: *group_id,
-                document_id: *document_id,
-            },
-            Self::GroupAuthorization { group_id } => AutomergeTopicId::GroupAuthorization {
-                group_id: *group_id,
-            },
-            Self::RealmAuthorization { realm_id } => AutomergeTopicId::RealmAuthorization {
-                realm_id: realm_id.clone(),
-            },
-            Self::RealmConfig { realm_id } => AutomergeTopicId::RealmConfig {
-                realm_id: realm_id.clone(),
-            },
+            Self::Group { group_id } | Self::GroupAuthorization { group_id } => {
+                TopicId::group(*group_id)
+            }
+            Self::RealmAuthorization { realm_id } | Self::RealmConfig { realm_id } => {
+                TopicId::realm(realm_id.clone())
+            }
         }
     }
 
-    pub fn from_topic_id(topic: &TopicId) -> Option<Self> {
-        match topic {
-            TopicId::AutomergeDocument(topic) => match topic {
-                AutomergeTopicId::Group { group_id } => Some(Self::Group {
+    pub fn message_kind(&self) -> TopicMessageKind {
+        match self {
+            Self::Group { .. } => TopicMessageKind::Group,
+            Self::GroupAuthorization { .. } => TopicMessageKind::GroupAuthorization,
+            Self::RealmAuthorization { .. } => TopicMessageKind::RealmAuthorization,
+            Self::RealmConfig { .. } => TopicMessageKind::RealmConfig,
+        }
+    }
+
+    pub fn from_topic_message(topic: &TopicId, kind: &TopicMessageKind) -> Option<Self> {
+        match (topic, kind) {
+            (TopicId::Group(group_id), TopicMessageKind::Group) => Some(Self::Group {
+                group_id: *group_id,
+            }),
+            (TopicId::Group(group_id), TopicMessageKind::GroupAuthorization) => {
+                Some(Self::GroupAuthorization {
                     group_id: *group_id,
-                }),
-                AutomergeTopicId::Metadata {
-                    group_id,
-                    document_id,
-                } => Some(Self::Metadata {
-                    group_id: *group_id,
-                    document_id: *document_id,
-                }),
-                AutomergeTopicId::GroupAuthorization { group_id } => {
-                    Some(Self::GroupAuthorization {
-                        group_id: *group_id,
-                    })
-                }
-                AutomergeTopicId::RealmAuthorization { realm_id } => {
-                    Some(Self::RealmAuthorization {
-                        realm_id: realm_id.clone(),
-                    })
-                }
-                AutomergeTopicId::RealmConfig { realm_id } => Some(Self::RealmConfig {
+                })
+            }
+            (TopicId::Realm(realm_id), TopicMessageKind::RealmAuthorization) => {
+                Some(Self::RealmAuthorization {
                     realm_id: realm_id.clone(),
-                }),
-            },
+                })
+            }
+            (TopicId::Realm(realm_id), TopicMessageKind::RealmConfig) => Some(Self::RealmConfig {
+                realm_id: realm_id.clone(),
+            }),
             _ => None,
         }
     }
 
-    pub fn holder_key(&self) -> DhtKeyId {
-        DhtKeyId::from_data(&self.holder_lookup_bytes())
-    }
-
-    pub fn holder_lookup_bytes(&self) -> Vec<u8> {
-        match self {
-            Self::Group { group_id } => format!("group_{group_id}").into_bytes(),
-            Self::Metadata {
-                group_id,
-                document_id,
-            } => {
-                let mut bytes = Vec::with_capacity(32);
-                bytes.extend_from_slice(&group_id.to_bytes());
-                bytes.extend_from_slice(&document_id.to_bytes());
-                bytes
-            }
-            Self::GroupAuthorization { group_id } => format!("perm_{group_id}").into_bytes(),
-            Self::RealmAuthorization { realm_id } => format!("realm_perm_{realm_id}").into_bytes(),
-            Self::RealmConfig { realm_id } => format!("realm_config_{realm_id}").into_bytes(),
-        }
-    }
-
     pub fn announce_timer_key(&self) -> TaskKey {
-        TaskKey::AutomergeAnnounce(self.clone())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AutomergeDocumentVariant;
-    use ulid::Ulid;
-
-    #[test]
-    fn metadata_documents_with_different_groups_have_distinct_topic_keys() {
-        let document_id = Ulid::from_bytes([7u8; 16]);
-        let left = AutomergeDocumentVariant::Metadata {
-            group_id: Ulid::from_bytes([1u8; 16]),
-            document_id,
-        };
-        let right = AutomergeDocumentVariant::Metadata {
-            group_id: Ulid::from_bytes([2u8; 16]),
-            document_id,
-        };
-
-        assert_ne!(left.holder_key(), right.holder_key());
-        assert_ne!(left.topic_id(), right.topic_id());
+        TaskKey::TopicAnnounce(self.topic_id())
     }
 }
 
@@ -191,44 +110,6 @@ impl AutomergeClock {
         Self {
             heads,
             change_count,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AutomergeState {
-    pub heads: Vec<ChangeHash>,
-    pub change_count: u64,
-    pub node_id: NodeId,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AutomergeAnnouncementEnvelope {
-    pub message_id: Ulid,
-    pub trace_context: BTreeMap<String, String>,
-    pub announcement: AutomergeState,
-}
-
-impl AutomergeAnnouncementEnvelope {
-    pub fn new(
-        message_id: Ulid,
-        announcement: AutomergeState,
-        trace_context: BTreeMap<String, String>,
-    ) -> Self {
-        Self {
-            message_id,
-            trace_context,
-            announcement,
-        }
-    }
-}
-
-impl AutomergeState {
-    pub fn new(heads: Vec<ChangeHash>, change_count: u64, node_id: NodeId) -> Self {
-        Self {
-            heads,
-            change_count,
-            node_id,
         }
     }
 }
@@ -300,4 +181,38 @@ pub enum AutomergeEvent {
     SyncClosed {
         sync_id: Ulid,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AutomergeDocumentVariant;
+    use crate::gossip::TopicMessageKind;
+    use crate::id::TopicId;
+    use crate::structs::RealmId;
+    use crate::types::GroupId;
+
+    #[test]
+    fn resolves_group_message_variant() {
+        let group_id = GroupId::from_bytes([1u8; 16]);
+        let topic = TopicId::group(group_id);
+        let document =
+            AutomergeDocumentVariant::from_topic_message(&topic, &TopicMessageKind::Group)
+                .expect("group document resolves");
+        assert_eq!(document, AutomergeDocumentVariant::Group { group_id });
+    }
+
+    #[test]
+    fn resolves_realm_message_variant() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let topic = TopicId::realm(realm_id.clone());
+        let document = AutomergeDocumentVariant::from_topic_message(
+            &topic,
+            &TopicMessageKind::RealmAuthorization,
+        )
+        .expect("realm document resolves");
+        assert_eq!(
+            document,
+            AutomergeDocumentVariant::RealmAuthorization { realm_id }
+        );
+    }
 }
