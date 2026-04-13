@@ -6,15 +6,13 @@ use aruna_api::server_state::{
 use aruna_core::id::{DhtKeyId, TopicId};
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
-    METADATA_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
-    USER_ACCESS_KEYSPACE,
+    NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
-    BucketInfo, Group, GroupAuthorizationDocument, Location, LookupKey, MetadataDocument, Realm,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
-    VersionMetadata,
+    BucketInfo, Group, GroupAuthorizationDocument, Location, LookupKey, Realm,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey, VersionMetadata,
 };
 use aruna_net::dht::storage::StoredEntry;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -23,6 +21,11 @@ use serde::ser::{SerializeStruct, Serializer};
 use std::collections::HashSet;
 use std::path::Path;
 use ulid::Ulid;
+
+const CRAQLE_TERMS_KEYSPACE: &str = "terms";
+const CRAQLE_QUADS_KEYSPACE: &str = "quads";
+const CRAQLE_GRAPHS_KEYSPACE: &str = "graphs";
+const CRAQLE_LOG_KEYSPACE: &str = "log";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExplorerError {
@@ -95,9 +98,6 @@ enum DecodedValue {
     },
     RealmConfigDocument {
         data: JsonRealmConfigDocument,
-    },
-    MetadataDocument {
-        data: MetadataDocument,
     },
     UserAccess {
         data: JsonUserAccess,
@@ -348,14 +348,17 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 14] {
+fn defined_keyspaces() -> [&'static str; 17] {
     [
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
+        CRAQLE_GRAPHS_KEYSPACE,
+        CRAQLE_LOG_KEYSPACE,
+        CRAQLE_QUADS_KEYSPACE,
+        CRAQLE_TERMS_KEYSPACE,
         DHT_KEYSPACE,
         GOSSIP_SUBSCRIPTIONS_KEYSPACE,
         GROUP_KEYSPACE,
-        METADATA_KEYSPACE,
         NODE_STATE_KEYSPACE,
         ONBOARDING_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
@@ -402,7 +405,7 @@ fn decode_entry(keyspace_name: &str, key: &[u8], value: &[u8]) -> EntryOutput {
 
 fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
     match keyspace_name {
-        GROUP_KEYSPACE | METADATA_KEYSPACE | AUTH_KEYSPACE => decode_ulid_key(key),
+        GROUP_KEYSPACE | AUTH_KEYSPACE => decode_ulid_key(key),
         REALM_KEYSPACE | REALM_CONFIG_KEYSPACE => decode_realm_id_key(key),
         USER_ACCESS_KEYSPACE
         | S3_BUCKET_KEYSPACE
@@ -436,9 +439,6 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
                 }
             })
         }
-        METADATA_KEYSPACE => decode_value_with(value, MetadataDocument::from_bytes, |data| {
-            DecodedValue::MetadataDocument { data }
-        }),
         USER_ACCESS_KEYSPACE => decode_value_with(value, UserAccess::from_bytes, |data| {
             DecodedValue::UserAccess {
                 data: JsonUserAccess(data),
@@ -608,7 +608,9 @@ fn raw_value(value: &[u8], decode_error: Option<String>) -> DecodedValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces, raw_field,
+        CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
+        CRAQLE_TERMS_KEYSPACE, DecodedField, DecodedValue, decode_entry, list_entries,
+        list_keyspaces, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -616,9 +618,9 @@ mod tests {
     use aruna_core::id::{DhtKeyId, TopicId};
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
-        GROUP_KEYSPACE, METADATA_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE,
-        S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
+        GROUP_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
+        USER_ACCESS_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{Actor, Group, Realm, RealmId};
@@ -664,9 +666,12 @@ mod tests {
             vec![
                 API_STATE_KEYSPACE.to_string(),
                 AUTH_KEYSPACE.to_string(),
+                CRAQLE_GRAPHS_KEYSPACE.to_string(),
+                CRAQLE_LOG_KEYSPACE.to_string(),
+                CRAQLE_QUADS_KEYSPACE.to_string(),
+                CRAQLE_TERMS_KEYSPACE.to_string(),
                 DHT_KEYSPACE.to_string(),
                 GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
-                METADATA_KEYSPACE.to_string(),
                 NODE_STATE_KEYSPACE.to_string(),
                 ONBOARDING_KEYSPACE.to_string(),
                 REALM_CONFIG_KEYSPACE.to_string(),
