@@ -73,6 +73,7 @@ enum CreateMetadataDocumentState {
     WriteHolders,
     WriteAudit,
     CommitTransaction,
+    AbortTransaction,
     CleanupGraph,
     Finish,
     Error,
@@ -208,6 +209,11 @@ impl CreateMetadataDocumentOperation {
     fn fail(&mut self, error: CreateMetadataDocumentError) -> Effects {
         if self.record.is_some() {
             self.pending_error = Some(error);
+            let cleanup = self.abort();
+            if !cleanup.is_empty() {
+                self.state = CreateMetadataDocumentState::AbortTransaction;
+                return cleanup;
+            }
             self.state = CreateMetadataDocumentState::CleanupGraph;
             return smallvec![Effect::Metadata(MetadataEffect::DeleteGraph {
                 graph_iri: self.graph_iri(),
@@ -457,6 +463,21 @@ impl Operation for CreateMetadataDocumentOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
+            CreateMetadataDocumentState::AbortTransaction => match event {
+                Event::Storage(StorageEvent::TransactionAborted { .. }) => {
+                    self.state = CreateMetadataDocumentState::CleanupGraph;
+                    smallvec![Effect::Metadata(MetadataEffect::DeleteGraph {
+                        graph_iri: self.graph_iri(),
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { .. }) => {
+                    self.state = CreateMetadataDocumentState::CleanupGraph;
+                    smallvec![Effect::Metadata(MetadataEffect::DeleteGraph {
+                        graph_iri: self.graph_iri(),
+                    })]
+                }
+                other => self.unexpected_event("transaction abort result", format!("{other:?}")),
+            },
             CreateMetadataDocumentState::CleanupGraph => match event {
                 Event::Metadata(MetadataEvent::GraphDeleted { .. })
                 | Event::Metadata(MetadataEvent::Error { .. }) => {
@@ -518,9 +539,20 @@ pub(crate) fn select_metadata_holders(
 
 #[cfg(test)]
 mod tests {
-    use super::select_metadata_holders;
+    use super::{
+        CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
+        CreateMetadataDocumentPayload, select_metadata_holders,
+    };
 
     use std::collections::HashSet;
+
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::metadata::{MetadataBatch, MetadataEvent, MetadataVectorClock};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::{Actor, RealmId};
+    use aruna_core::types::GroupId;
+    use ulid::Ulid;
 
     #[test]
     fn select_metadata_holders_includes_local_node() {
@@ -532,5 +564,126 @@ mod tests {
 
         assert_eq!(holders.len(), 3);
         assert_eq!(holders[0], local);
+    }
+
+    #[test]
+    fn failure_after_starting_transaction_aborts_before_graph_cleanup() {
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            user_id: Ulid::new(),
+            realm_id: RealmId([9u8; 32]),
+        };
+        let group_id = GroupId::new();
+        let document_id = Ulid::new();
+        let mut operation = CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
+            actor: actor.clone(),
+            group_id,
+            document_id,
+            document_path: "datasets/leak-check".to_string(),
+            public: false,
+            payload: CreateMetadataDocumentPayload::Scaffold {
+                name: "Leak Check".to_string(),
+                description: "Ensure cleanup aborts transactions".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+        });
+
+        assert_eq!(operation.start().len(), 1);
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: document_id.to_bytes().to_vec().into(),
+            value: None,
+        }));
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0],
+            crate::automerge::repository::read_effect(
+                &aruna_core::automerge::AutomergeDocumentVariant::RealmConfig {
+                    realm_id: actor.realm_id.clone(),
+                },
+                None,
+            )
+        );
+
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: actor.realm_id.as_bytes().to_vec().into(),
+            value: None,
+        }));
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0],
+            Effect::Net(aruna_core::effects::NetEffect::Dht(
+                aruna_core::effects::DhtEffect::Get {
+                    key: *aruna_core::keys::realm_presence_key(&actor.realm_id).as_bytes(),
+                    realm_filter: Some(actor.realm_id.clone()),
+                },
+            ))
+        );
+
+        let holder_lookup = operation.step(Event::Net(aruna_core::events::NetEvent::Dht(
+            aruna_core::events::DhtEvent::GetResult {
+                key: *aruna_core::keys::realm_presence_key(&actor.realm_id).as_bytes(),
+                values: vec![],
+            },
+        )));
+        assert_eq!(holder_lookup.len(), 1);
+
+        let replicate = operation.step(Event::Metadata(MetadataEvent::CreateCrateResult {
+            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+            batch: MetadataBatch {
+                graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+                actor: [0u8; 32],
+                counter: 1,
+                base_clock: MetadataVectorClock::default(),
+                ops: vec![],
+                timestamp_millis: 0,
+            },
+        }));
+        assert_eq!(replicate.len(), 1);
+
+        let start_txn = operation.step(Event::Metadata(MetadataEvent::BootstrapReplicated {
+            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+            replicated_node_ids: vec![actor.node_id],
+        }));
+        assert_eq!(start_txn.len(), 1);
+        assert_eq!(
+            start_txn[0],
+            Effect::Storage(StorageEffect::StartTransaction { read: false })
+        );
+
+        let txn_id = Ulid::new();
+        let write_registry =
+            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(write_registry.len(), 1);
+
+        let abort = operation.step(Event::Storage(StorageEvent::Error {
+            error: aruna_core::errors::StorageError::WriteError,
+        }));
+        assert_eq!(abort.len(), 1);
+        assert_eq!(
+            abort[0],
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id })
+        );
+
+        let cleanup = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
+        assert_eq!(cleanup.len(), 1);
+        assert_eq!(
+            cleanup[0],
+            Effect::Metadata(aruna_core::metadata::MetadataEffect::DeleteGraph {
+                graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+            })
+        );
+
+        let finish = operation.step(Event::Metadata(MetadataEvent::GraphDeleted {
+            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+        }));
+        assert!(finish.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(CreateMetadataDocumentError::StorageError(
+                aruna_core::errors::StorageError::WriteError,
+            ))
+        );
     }
 }
