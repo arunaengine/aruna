@@ -279,6 +279,7 @@ dependencies = [
  "blake3",
  "bytes",
  "byteview",
+ "craqle",
  "ed25519-dalek 2.2.0",
  "futures",
  "globset",
