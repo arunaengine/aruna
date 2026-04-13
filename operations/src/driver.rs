@@ -253,7 +253,6 @@ fn event_kind(event: &Event) -> &'static str {
 mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::{
-        automerge::AutomergeDocumentVariant,
         effects::{Effect, StorageEffect},
         events::{Event, StorageEvent, SubOperationEvent},
         operation::{Operation, boxed_suboperation},
@@ -390,9 +389,9 @@ mod test {
         fn start(&mut self) -> aruna_core::types::Effects {
             smallvec::smallvec![
                 Effect::Task(TaskEffect::CancelTimer {
-                    key: TaskKey::AutomergeAnnounce(AutomergeDocumentVariant::GroupAuthorization {
-                        group_id: ulid::Ulid::from_bytes([0u8; 16]),
-                    }),
+                    key: TaskKey::TopicAnnounce(aruna_core::TopicId::group(
+                        ulid::Ulid::from_bytes([0u8; 16]),
+                    )),
                 }),
                 Effect::Search()
             ]
