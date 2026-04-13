@@ -372,21 +372,18 @@ impl MetadataHandle {
             };
         };
 
-        let batches = match export_catchup_batches(
-            self.inner.clone(),
-            &graph_iri,
-            VectorClock::default(),
-        )
-        .await
-        {
-            Ok(batches) => batches,
-            Err(error) => {
-                return MetadataEvent::Error {
-                    graph_iri: Some(graph_iri),
-                    error,
-                };
-            }
-        };
+        let batches =
+            match export_catchup_batches(self.inner.clone(), &graph_iri, VectorClock::default())
+                .await
+            {
+                Ok(batches) => batches,
+                Err(error) => {
+                    return MetadataEvent::Error {
+                        graph_iri: Some(graph_iri),
+                        error,
+                    };
+                }
+            };
 
         let mut remote_targets = Vec::new();
         let mut seen = HashSet::new();
@@ -1096,7 +1093,8 @@ async fn fetch_catchup_data(
     document_id: Ulid,
     known_clock: VectorClock,
 ) -> Result<(MetadataRegistryRecord, Vec<MetadataBatch>), MetadataError> {
-    let Some(record) = read_registry_record_by_document(inner.storage_handle.clone(), document_id).await?
+    let Some(record) =
+        read_registry_record_by_document(inner.storage_handle.clone(), document_id).await?
     else {
         return Err(MetadataError::Backend(format!(
             "metadata document not found: {document_id}"
@@ -1113,9 +1111,11 @@ async fn read_registry_record_by_document(
     let event = storage_handle
         .send_effect(read_registry_by_document_effect(document_id, None))
         .await;
-    parse_registry_read(event).map_err(|error| MetadataError::Backend(format!(
-        "metadata registry read by document failed: {error:?}"
-    )))
+    parse_registry_read(event).map_err(|error| {
+        MetadataError::Backend(format!(
+            "metadata registry read by document failed: {error:?}"
+        ))
+    })
 }
 
 fn graph_ids(graph_iris: &[String]) -> Vec<GraphId> {
@@ -1301,10 +1301,7 @@ async fn export_catchup_batches(
     tokio::task::spawn_blocking(move || {
         inner
             .node
-            .catchup_batches(
-                &GraphId::new(&graph_iri),
-                &remote_clock,
-            )
+            .catchup_batches(&GraphId::new(&graph_iri), &remote_clock)
             .map(|batches| {
                 batches
                     .into_iter()

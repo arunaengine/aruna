@@ -12,7 +12,8 @@ use aruna_core::keyspaces::{
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BucketInfo, Group, GroupAuthorizationDocument, Location, LookupKey, Realm,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey, VersionMetadata,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
+    VersionMetadata,
 };
 use aruna_net::dht::storage::StoredEntry;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
@@ -608,9 +609,8 @@ fn raw_value(value: &[u8], decode_error: Option<String>) -> DecodedValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
-        CRAQLE_TERMS_KEYSPACE, DecodedField, DecodedValue, decode_entry, list_entries,
-        list_keyspaces, raw_field,
+        CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE,
+        DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,

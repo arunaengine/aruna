@@ -1,9 +1,9 @@
 use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
-use craqle::VectorClock;
 use aruna_core::structs::AuthContext;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_net::streams::BiStream;
+use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;

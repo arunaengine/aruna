@@ -7,7 +7,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
     REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::{NodeId, TopicId};
 use byteview::ByteView;
 use smallvec::smallvec;

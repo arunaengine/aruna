@@ -4,10 +4,10 @@ use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataBatch, MetadataEffect, MetadataError, MetadataEvent,
     MetadataGraphPolicy, MetadataUpsertEntityRequest,
 };
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, TxnId};
-use aruna_core::{events::SubOperationEvent, TopicId};
+use aruna_core::{TopicId, events::SubOperationEvent};
 use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -15,8 +15,8 @@ use ulid::Ulid;
 
 use crate::automerge_announce::AnnounceTopicOperation;
 use crate::metadata::repository::{
-    parse_registry_read, read_registry_effect, write_audit_effect, write_document_index_effect,
-    write_registry_effect, StorageReadError,
+    StorageReadError, parse_registry_read, read_registry_effect, write_audit_effect,
+    write_document_index_effect, write_registry_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]

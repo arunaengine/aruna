@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::structs::{AuthContext, MetadataRegistryRecord};
 use crate::NodeId;
+use crate::structs::{AuthContext, MetadataRegistryRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
@@ -318,7 +318,7 @@ pub enum MetadataError {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_metadata_clocks, MetadataClockRelation};
+    use super::{MetadataClockRelation, compare_metadata_clocks};
     use craqle::{ActorId, VectorClock};
     use std::collections::BTreeMap;
 

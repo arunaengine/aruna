@@ -4,9 +4,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::gossip::{TopicMessage, TopicMessageVersion};
 use aruna_core::metadata::{
-    compare_metadata_clocks, MetadataClockRelation, MetadataEffect, MetadataEvent,
+    MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
 };
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, TopicId};

@@ -355,7 +355,8 @@ impl AddGroupRoleOperation {
         auth_doc: GroupAuthorizationDocument,
     ) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 self.state.clone(),
                 "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
@@ -390,7 +391,8 @@ impl AddGroupRoleOperation {
         auth_doc: GroupAuthorizationDocument,
     ) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 self.state.clone(),
                 "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",

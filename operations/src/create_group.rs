@@ -238,7 +238,8 @@ impl CreateGroupOperation {
 
     fn handle_announce_group_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 CreateGroupState::AnnounceGroupDoc,
                 "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
@@ -271,7 +272,8 @@ impl CreateGroupOperation {
 
     fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 CreateGroupState::AnnounceAuthDoc,
                 "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",

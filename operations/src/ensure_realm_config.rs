@@ -2,7 +2,7 @@ use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, RealmConfigDocument};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -10,9 +10,9 @@ use thiserror::Error;
 use crate::automerge::repository::{read_effect, write_effect};
 use crate::automerge_announce::AnnounceTopicOperation;
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
+use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
-use aruna_core::NodeId;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsureRealmConfigConfig {

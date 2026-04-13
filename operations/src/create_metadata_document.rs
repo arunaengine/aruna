@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use aruna_core::NodeId;
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
@@ -7,13 +8,12 @@ use aruna_core::keys::realm_presence_key;
 use aruna_core::metadata::{
     MetadataCreateCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
 };
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     Actor, MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
-use aruna_core::NodeId;
-use aruna_core::{events::SubOperationEvent, TopicId};
+use aruna_core::{TopicId, events::SubOperationEvent};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use smallvec::smallvec;
@@ -574,8 +574,8 @@ pub(crate) fn select_metadata_holders(
 #[cfg(test)]
 mod tests {
     use super::{
-        select_metadata_holders, CreateMetadataDocumentConfig, CreateMetadataDocumentError,
-        CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
+        CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
+        CreateMetadataDocumentPayload, select_metadata_holders,
     };
 
     use std::collections::HashSet;

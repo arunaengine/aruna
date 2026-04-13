@@ -254,7 +254,8 @@ impl CreateRealmOperation {
 
     fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 CreateRealmState::AnnounceAuthDoc,
                 "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
@@ -287,7 +288,8 @@ impl CreateRealmOperation {
 
     fn handle_announce_config_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 CreateRealmState::AnnounceConfigDoc,
                 "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
