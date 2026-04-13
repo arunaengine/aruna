@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use aruna_core::NodeId;
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
@@ -8,11 +7,13 @@ use aruna_core::keys::realm_presence_key;
 use aruna_core::metadata::{
     MetadataCreateCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{boxed_suboperation, Operation};
 use aruna_core::structs::{
     Actor, MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::NodeId;
+use aruna_core::{events::SubOperationEvent, TopicId};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use smallvec::smallvec;
@@ -20,6 +21,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::automerge::repository::read_effect;
+use crate::automerge_announce::AnnounceTopicOperation;
 use crate::metadata::repository::{
     read_registry_by_document_effect, write_audit_effect, write_document_index_effect,
     write_holders_effect, write_registry_effect,
@@ -73,6 +75,7 @@ enum CreateMetadataDocumentState {
     WriteHolders,
     WriteAudit,
     CommitTransaction,
+    AnnounceTopic,
     AbortTransaction,
     CleanupGraph,
     Finish,
@@ -91,6 +94,8 @@ pub enum CreateMetadataDocumentError {
     DocumentAlreadyExists,
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -453,15 +458,44 @@ impl Operation for CreateMetadataDocumentOperation {
                         return self
                             .fail_without_cleanup(CreateMetadataDocumentError::MissingTransaction);
                     };
-                    self.state = CreateMetadataDocumentState::Finish;
-                    self.output = Some(Ok(record));
-                    smallvec![]
+                    self.state = CreateMetadataDocumentState::AnnounceTopic;
+                    smallvec![Effect::SubOperation(boxed_suboperation(
+                        AnnounceTopicOperation::new(
+                            TopicId::metadata(record.document_id),
+                            self.config.actor.node_id,
+                        ),
+                        |result| {
+                            Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+                                result: result.map_err(|error| error.to_string()),
+                            })
+                        },
+                    ))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            },
+            CreateMetadataDocumentState::AnnounceTopic => match event {
+                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            let Some(record) = self.record.clone() else {
+                                return self.fail_without_cleanup(
+                                    CreateMetadataDocumentError::MissingTransaction,
+                                );
+                            };
+                            self.state = CreateMetadataDocumentState::Finish;
+                            self.output = Some(Ok(record));
+                            smallvec![]
+                        }
+                        Err(error) => self.fail_without_cleanup(
+                            CreateMetadataDocumentError::TopicAnnouncement(error),
+                        ),
+                    }
+                }
+                other => self.unexpected_event("topic announcement result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::AbortTransaction => match event {
                 Event::Storage(StorageEvent::TransactionAborted { .. }) => {
@@ -540,18 +574,19 @@ pub(crate) fn select_metadata_holders(
 #[cfg(test)]
 mod tests {
     use super::{
-        CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
-        CreateMetadataDocumentPayload, select_metadata_holders,
+        select_metadata_holders, CreateMetadataDocumentConfig, CreateMetadataDocumentError,
+        CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
     };
 
     use std::collections::HashSet;
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::metadata::{MetadataBatch, MetadataEvent, MetadataVectorClock};
+    use aruna_core::metadata::{MetadataBatch, MetadataEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmId};
     use aruna_core::types::GroupId;
+    use craqle::VectorClock;
     use ulid::Ulid;
 
     #[test]
@@ -634,7 +669,7 @@ mod tests {
                 graph_iri: format!("https://w3id.org/aruna/{document_id}"),
                 actor: [0u8; 32],
                 counter: 1,
-                base_clock: MetadataVectorClock::default(),
+                base_clock: VectorClock::default(),
                 ops: vec![],
                 timestamp_millis: 0,
             },

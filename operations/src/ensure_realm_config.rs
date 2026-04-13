@@ -2,17 +2,17 @@ use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{boxed_suboperation, Operation};
 use aruna_core::structs::{Actor, RealmConfigDocument};
 use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::automerge::repository::{read_effect, write_effect};
-use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::automerge_announce::AnnounceTopicOperation;
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
-use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
+use aruna_core::NodeId;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsureRealmConfigConfig {
@@ -51,8 +51,8 @@ pub enum EnsureRealmConfigError {
     ConversionError(#[from] ConversionError),
     #[error("missing active transaction")]
     MissingTransaction,
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("automerge replication failed: {0}")]
     AutomergeSync(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -168,12 +168,12 @@ impl Operation for EnsureRealmConfigOperation {
                     self.txn_id = None;
                     self.state = EnsureRealmConfigState::Announce;
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceAutomergeDocumentOperation::new(
-                            self.document_ref(),
+                        AnnounceTopicOperation::new(
+                            self.document_ref().topic_id(),
                             self.config.actor.node_id,
                         ),
                         |result| {
-                            Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                            Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                                 result: result.map_err(|error| error.to_string()),
                             })
                         },
@@ -186,7 +186,7 @@ impl Operation for EnsureRealmConfigOperation {
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             EnsureRealmConfigState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
+                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
                     match result {
                         Ok(()) => {
                             self.replication_targets = self
@@ -205,7 +205,7 @@ impl Operation for EnsureRealmConfigOperation {
                                 emit_next_replication(&mut self.replication_targets, document)
                             }
                         }
-                        Err(error) => self.fail(EnsureRealmConfigError::AutomergeState(error)),
+                        Err(error) => self.fail(EnsureRealmConfigError::TopicAnnouncement(error)),
                     }
                 }
                 other => {

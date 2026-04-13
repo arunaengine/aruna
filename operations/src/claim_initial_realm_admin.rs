@@ -10,7 +10,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::automerge_announce::AnnounceTopicOperation;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaimInitialRealmAdminInput {
@@ -68,8 +68,8 @@ pub enum ClaimInitialRealmAdminError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("authorization document not found")]
     AuthDocNotFound,
     #[error("realm_admin role not found")]
@@ -218,13 +218,14 @@ impl Operation for ClaimInitialRealmAdminOperation {
                     auth_doc: auth_doc.clone(),
                 };
                 smallvec![Effect::SubOperation(boxed_suboperation(
-                    AnnounceAutomergeDocumentOperation::new(
+                    AnnounceTopicOperation::new(
                         AutomergeDocumentVariant::RealmAuthorization {
                             realm_id: auth_doc.realm_id.clone(),
-                        },
+                        }
+                        .topic_id(),
                         self.input.actor.node_id,
                     ),
-                    |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                    |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                         result: result.map_err(|error| error.to_string()),
                     }),
                 ))]
@@ -241,16 +242,17 @@ impl Operation for ClaimInitialRealmAdminOperation {
             }
             ClaimInitialRealmAdminState::AnnounceAuthDoc { auth_doc } => {
                 let got = format!("{event:?}");
-                let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event
+                let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) =
+                    event
                 else {
                     return self.unexpected_event(
-                        "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                        "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
                         got,
                     );
                 };
 
                 if let Err(error) = result {
-                    return self.fail(ClaimInitialRealmAdminError::AutomergeState(error));
+                    return self.fail(ClaimInitialRealmAdminError::TopicAnnouncement(error));
                 }
 
                 self.state = ClaimInitialRealmAdminState::Finish;

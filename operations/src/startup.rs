@@ -20,17 +20,17 @@ use crate::automerge::repository::{
 use crate::automerge_announce::AnnounceTopicOperation;
 
 #[derive(Debug, PartialEq)]
-pub struct RestoreAutomergeSubscriptionsOperation {
+pub struct RestoreTopicSubscriptionsOperation {
     local_node_id: NodeId,
-    state: RestoreAutomergeSubscriptionsState,
+    state: RestoreTopicSubscriptionsState,
     topics: Vec<TopicId>,
     discovered_topics: HashSet<TopicId>,
     subscriptions: HashSet<TopicId>,
-    output: Option<Result<(), RestoreAutomergeSubscriptionsError>>,
+    output: Option<Result<(), RestoreTopicSubscriptionsError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum RestoreAutomergeSubscriptionsState {
+enum RestoreTopicSubscriptionsState {
     Init,
     ListAuth,
     ListGroups,
@@ -43,13 +43,13 @@ enum RestoreAutomergeSubscriptionsState {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum RestoreAutomergeSubscriptionsError {
+pub enum RestoreTopicSubscriptionsError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("topic announcement failed: {0}")]
-    AutomergeState(String),
+    TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -58,11 +58,11 @@ pub enum RestoreAutomergeSubscriptionsError {
     },
 }
 
-impl RestoreAutomergeSubscriptionsOperation {
+impl RestoreTopicSubscriptionsOperation {
     pub fn new(local_node_id: NodeId) -> Self {
         Self {
             local_node_id,
-            state: RestoreAutomergeSubscriptionsState::Init,
+            state: RestoreTopicSubscriptionsState::Init,
             topics: Vec::new(),
             discovered_topics: HashSet::new(),
             subscriptions: HashSet::new(),
@@ -70,8 +70,8 @@ impl RestoreAutomergeSubscriptionsOperation {
         }
     }
 
-    fn fail(&mut self, error: RestoreAutomergeSubscriptionsError) -> aruna_core::types::Effects {
-        self.state = RestoreAutomergeSubscriptionsState::Error;
+    fn fail(&mut self, error: RestoreTopicSubscriptionsError) -> aruna_core::types::Effects {
+        self.state = RestoreTopicSubscriptionsState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
@@ -82,7 +82,7 @@ impl RestoreAutomergeSubscriptionsOperation {
         got: String,
     ) -> aruna_core::types::Effects {
         let state = format!("{:?}", self.state);
-        self.fail(RestoreAutomergeSubscriptionsError::UnexpectedEvent {
+        self.fail(RestoreTopicSubscriptionsError::UnexpectedEvent {
             state,
             expected,
             got,
@@ -97,35 +97,35 @@ impl RestoreAutomergeSubscriptionsOperation {
 
     fn next_announcement(&mut self) -> aruna_core::types::Effects {
         if let Some(topic) = self.topics.pop() {
-            self.state = RestoreAutomergeSubscriptionsState::WaitAnnouncement;
+            self.state = RestoreTopicSubscriptionsState::WaitAnnouncement;
             smallvec![Effect::SubOperation(boxed_suboperation(
                 AnnounceTopicOperation::new(topic, self.local_node_id),
                 |result| {
-                    Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                    Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                         result: result.map_err(|error| error.to_string()),
                     })
                 },
             ))]
         } else {
-            self.state = RestoreAutomergeSubscriptionsState::Finish;
+            self.state = RestoreTopicSubscriptionsState::Finish;
             self.output = Some(Ok(()));
             smallvec![]
         }
     }
 }
 
-impl Default for RestoreAutomergeSubscriptionsOperation {
+impl Default for RestoreTopicSubscriptionsOperation {
     fn default() -> Self {
         Self::new(iroh::SecretKey::from_bytes(&[0u8; 32]).public())
     }
 }
 
-impl Operation for RestoreAutomergeSubscriptionsOperation {
+impl Operation for RestoreTopicSubscriptionsOperation {
     type Output = ();
-    type Error = RestoreAutomergeSubscriptionsError;
+    type Error = RestoreTopicSubscriptionsError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = RestoreAutomergeSubscriptionsState::ListAuth;
+        self.state = RestoreTopicSubscriptionsState::ListAuth;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: AUTH_KEYSPACE.to_string(),
             prefix: None,
@@ -137,7 +137,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
 
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
         match self.state {
-            RestoreAutomergeSubscriptionsState::ListAuth => match event {
+            RestoreTopicSubscriptionsState::ListAuth => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
                     for (key, _) in values {
                         match parse_auth_document(&key) {
@@ -145,7 +145,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                             Err(error) => return self.fail(error.into()),
                         }
                     }
-                    self.state = RestoreAutomergeSubscriptionsState::ListGroups;
+                    self.state = RestoreTopicSubscriptionsState::ListGroups;
                     smallvec![Effect::Storage(StorageEffect::Iter {
                         key_space: GROUP_KEYSPACE.to_string(),
                         prefix: None,
@@ -157,7 +157,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iteration result", format!("{other:?}")),
             },
-            RestoreAutomergeSubscriptionsState::ListGroups => match event {
+            RestoreTopicSubscriptionsState::ListGroups => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
                     for (key, _) in values {
                         match parse_group_document(&key) {
@@ -165,7 +165,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                             Err(error) => return self.fail(error.into()),
                         }
                     }
-                    self.state = RestoreAutomergeSubscriptionsState::ListRealmConfig;
+                    self.state = RestoreTopicSubscriptionsState::ListRealmConfig;
                     smallvec![Effect::Storage(StorageEffect::Iter {
                         key_space: REALM_CONFIG_KEYSPACE.to_string(),
                         prefix: None,
@@ -177,7 +177,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iteration result", format!("{other:?}")),
             },
-            RestoreAutomergeSubscriptionsState::ListRealmConfig => match event {
+            RestoreTopicSubscriptionsState::ListRealmConfig => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
                     for (key, _) in values {
                         match parse_realm_config_document(&key) {
@@ -185,7 +185,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                             Err(error) => return self.fail(error.into()),
                         }
                     }
-                    self.state = RestoreAutomergeSubscriptionsState::ListMetadata;
+                    self.state = RestoreTopicSubscriptionsState::ListMetadata;
                     smallvec![Effect::Storage(StorageEffect::Iter {
                         key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
                         prefix: None,
@@ -197,7 +197,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iteration result", format!("{other:?}")),
             },
-            RestoreAutomergeSubscriptionsState::ListMetadata => match event {
+            RestoreTopicSubscriptionsState::ListMetadata => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {
                     for (key, _) in values {
                         if key.len() != 16 {
@@ -213,7 +213,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                         document_id.copy_from_slice(&key);
                         self.push_topic(TopicId::metadata(Ulid::from_bytes(document_id)));
                     }
-                    self.state = RestoreAutomergeSubscriptionsState::ReadSubscriptions;
+                    self.state = RestoreTopicSubscriptionsState::ReadSubscriptions;
                     smallvec![Effect::Storage(StorageEffect::Read {
                         key_space: GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
                         key: ByteView::from(b"topics".as_slice()),
@@ -223,7 +223,7 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iteration result", format!("{other:?}")),
             },
-            RestoreAutomergeSubscriptionsState::ReadSubscriptions => match event {
+            RestoreTopicSubscriptionsState::ReadSubscriptions => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     if let Some(value) = value {
                         match postcard::from_bytes::<Vec<TopicId>>(&value) {
@@ -246,12 +246,12 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
             },
-            RestoreAutomergeSubscriptionsState::WaitAnnouncement => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
+            RestoreTopicSubscriptionsState::WaitAnnouncement => match event {
+                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
                     match result {
                         Ok(()) => self.next_announcement(),
                         Err(error) => {
-                            self.fail(RestoreAutomergeSubscriptionsError::AutomergeState(error))
+                            self.fail(RestoreTopicSubscriptionsError::TopicAnnouncement(error))
                         }
                     }
                 }
@@ -259,16 +259,16 @@ impl Operation for RestoreAutomergeSubscriptionsOperation {
                     self.unexpected_event("automerge announcement result", format!("{other:?}"))
                 }
             },
-            RestoreAutomergeSubscriptionsState::Finish
-            | RestoreAutomergeSubscriptionsState::Error
-            | RestoreAutomergeSubscriptionsState::Init => smallvec![],
+            RestoreTopicSubscriptionsState::Finish
+            | RestoreTopicSubscriptionsState::Error
+            | RestoreTopicSubscriptionsState::Init => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            RestoreAutomergeSubscriptionsState::Finish | RestoreAutomergeSubscriptionsState::Error
+            RestoreTopicSubscriptionsState::Finish | RestoreTopicSubscriptionsState::Error
         )
     }
 

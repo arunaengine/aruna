@@ -4,17 +4,19 @@ use aruna_core::metadata::{
     MetadataApplyRoCrateRequest, MetadataBatch, MetadataEffect, MetadataError, MetadataEvent,
     MetadataGraphPolicy, MetadataUpsertEntityRequest,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{boxed_suboperation, Operation};
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::{events::SubOperationEvent, TopicId};
 use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::automerge_announce::AnnounceTopicOperation;
 use crate::metadata::repository::{
-    StorageReadError, parse_registry_read, read_registry_effect, write_audit_effect,
-    write_document_index_effect, write_registry_effect,
+    parse_registry_read, read_registry_effect, write_audit_effect, write_document_index_effect,
+    write_registry_effect, StorageReadError,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +56,7 @@ enum UpdateMetadataDocumentState {
     WriteAudit,
     CommitTransaction,
     ReplicateGraph,
+    AnnounceTopic,
     Finish,
     Error,
 }
@@ -70,6 +73,8 @@ pub enum UpdateMetadataDocumentError {
     DocumentNotFound,
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -321,12 +326,39 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let Some(record) = self.record.clone() else {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
-                    self.state = UpdateMetadataDocumentState::Finish;
-                    self.output = Some(Ok(record));
-                    smallvec![]
+                    self.state = UpdateMetadataDocumentState::AnnounceTopic;
+                    smallvec![Effect::SubOperation(boxed_suboperation(
+                        AnnounceTopicOperation::new(
+                            TopicId::metadata(record.document_id),
+                            self.config.actor.node_id,
+                        ),
+                        |result| {
+                            Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+                                result: result.map_err(|error| error.to_string()),
+                            })
+                        },
+                    ))]
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
                 other => self.unexpected_event("metadata replication result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::AnnounceTopic => match event {
+                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            let Some(record) = self.record.clone() else {
+                                return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                            };
+                            self.state = UpdateMetadataDocumentState::Finish;
+                            self.output = Some(Ok(record));
+                            smallvec![]
+                        }
+                        Err(error) => {
+                            self.fail(UpdateMetadataDocumentError::TopicAnnouncement(error))
+                        }
+                    }
+                }
+                other => self.unexpected_event("topic announcement result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::Finish
             | UpdateMetadataDocumentState::Error

@@ -52,8 +52,8 @@ pub enum IncomingAutomergeError {
     ConversionError(#[from] ConversionError),
     #[error("automerge sync error: {0:?}")]
     Sync(AutomergeSyncError),
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -285,7 +285,7 @@ impl Operation for IncomingAutomergeOperation {
                             self.local_node_id,
                         ),
                         |result| {
-                            Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                            Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                                 result: result.map_err(|error| error.to_string()),
                             })
                         },
@@ -298,14 +298,14 @@ impl Operation for IncomingAutomergeOperation {
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             IncomingAutomergeState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
+                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
                     match result {
                         Ok(()) => {
                             self.state = IncomingAutomergeState::Finish;
                             self.output = Some(Ok(()));
                             smallvec![]
                         }
-                        Err(error) => self.fail(IncomingAutomergeError::AutomergeState(error)),
+                        Err(error) => self.fail(IncomingAutomergeError::TopicAnnouncement(error)),
                     }
                 }
                 other => {

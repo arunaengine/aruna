@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::automerge_announce::AnnounceTopicOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_core::structs::Permission;
 use aruna_core::types::Effects;
@@ -86,8 +86,8 @@ pub enum AddGroupRoleError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unauthorized")]
@@ -335,13 +335,14 @@ impl AddGroupRoleOperation {
             auth_doc: auth_doc.clone(),
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceAutomergeDocumentOperation::new(
+            AnnounceTopicOperation::new(
                 AutomergeDocumentVariant::Group {
                     group_id: group.group_id,
-                },
+                }
+                .topic_id(),
                 self.input.actor.node_id,
             ),
-            |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+            |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                 result: result.map_err(|error| error.to_string()),
             }),
         ))]
@@ -354,28 +355,29 @@ impl AddGroupRoleOperation {
         auth_doc: GroupAuthorizationDocument,
     ) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
-                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
                 got,
             );
         };
         if let Err(error) = result {
-            return self.fail(AddGroupRoleError::AutomergeState(error));
+            return self.fail(AddGroupRoleError::TopicAnnouncement(error));
         }
         self.state = AddGroupRoleState::AnnounceAuthDoc {
             group: group.clone(),
             auth_doc: auth_doc.clone(),
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceAutomergeDocumentOperation::new(
+            AnnounceTopicOperation::new(
                 AutomergeDocumentVariant::GroupAuthorization {
                     group_id: group.group_id,
-                },
+                }
+                .topic_id(),
                 self.input.actor.node_id,
             ),
-            |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+            |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                 result: result.map_err(|error| error.to_string()),
             }),
         ))]
@@ -388,15 +390,15 @@ impl AddGroupRoleOperation {
         auth_doc: GroupAuthorizationDocument,
     ) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
-                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
                 got,
             );
         };
         if let Err(error) = result {
-            return self.fail(AddGroupRoleError::AutomergeState(error));
+            return self.fail(AddGroupRoleError::TopicAnnouncement(error));
         }
         self.state = AddGroupRoleState::Finish;
         self.output = Some(Ok((group, auth_doc)));
@@ -768,7 +770,7 @@ pub mod test {
         );
 
         let effects = add_role_operation.step(Event::SubOperation(
-            SubOperationEvent::AutomergeStateResult { result: Ok(()) },
+            SubOperationEvent::TopicAnnouncementResult { result: Ok(()) },
         ));
         let announce_auth_doc = effects.first().unwrap();
         assert!(matches!(announce_auth_doc, Effect::SubOperation(_)));
@@ -781,7 +783,7 @@ pub mod test {
         );
 
         let effects = add_role_operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::AutomergeStateResult { result: Ok(()) },
+            aruna_core::events::SubOperationEvent::TopicAnnouncementResult { result: Ok(()) },
         ));
         assert!(effects.is_empty());
         assert_eq!(add_role_operation.state, AddGroupRoleState::Finish);
