@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tracing::warn;
 use ulid::Ulid;
 use url::form_urlencoded::Serializer;
 use utoipa::{OpenApi, ToSchema};
@@ -213,6 +214,8 @@ pub struct SparqlQueryRequest {
     ///
     /// `local` runs only against metadata indexed on the current node.
     /// `distributed` fans out to all known realm nodes and merges the results.
+    /// Distributed mode is best-effort and may return partial results if realm
+    /// node discovery or remote requests fail.
     #[serde(default)]
     pub mode: Option<MetadataQueryMode>,
 }
@@ -223,6 +226,8 @@ pub enum MetadataQueryMode {
     /// Run the query only on the current node.
     Local,
     /// Run the query across all known realm nodes and merge the results.
+    /// This is best-effort and may return partial results if discovery or
+    /// remote requests fail.
     Distributed,
 }
 
@@ -881,7 +886,7 @@ pub async fn add_metadata_contextual_entity(
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail. Omitting `mode` defaults to `distributed`.",
         examples(
             (
                 "DocumentAsk" = (
@@ -918,10 +923,12 @@ pub async fn query_metadata_document(
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     let document_id = parse_document_id(&document_id)?;
     ensure_supported_query_form(&request.query)?;
+    let record = load_metadata_record_by_document(&state, document_id).await?;
+    ensure_record_readable(&state, auth.as_ref(), &record).await?;
     let results = run_query_distributed(
         &state,
         auth,
-        Some(vec![MetadataRegistryRecord::graph_iri_for(document_id)]),
+        Some(vec![record.graph_iri.clone()]),
         request.query,
         request.mode,
     )
@@ -935,7 +942,7 @@ pub async fn query_metadata_document(
     tag = "metadata",
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query across all visible metadata. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail. Omitting `mode` defaults to `distributed`.",
         examples(
             (
                 "SelectDatasets" = (
@@ -979,7 +986,7 @@ pub async fn query_all_metadata(
     params(
         ("q" = String, Query, description = "Search query"),
         ("limit" = Option<usize>, Query, description = "Maximum number of hits"),
-        ("mode" = Option<MetadataQueryMode>, Query, description = "Search mode: local or distributed")
+        ("mode" = Option<MetadataQueryMode>, Query, description = "Search mode: local or distributed. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail")
     ),
     responses(
         (status = 200, description = "Metadata search hits", body = MetadataSearchResponse),
@@ -1183,10 +1190,12 @@ async fn load_metadata_record_by_document(
     match parse_registry_read(event) {
         Ok(Some(record)) => Ok(record),
         Ok(None) => Err(ServerError::NotFound),
-        Err(crate::routes::metadata::ReadError::Storage(_)) => unreachable!(),
-        Err(_) => Err(ServerError::InternalError(
-            "failed to read metadata record".to_string(),
-        )),
+        Err(crate::routes::metadata::ReadError::Storage(error)) => {
+            Err(ServerError::InternalError(error.to_string()))
+        }
+        Err(crate::routes::metadata::ReadError::Conversion(error)) => {
+            Err(ServerError::InternalError(error.to_string()))
+        }
     }
 }
 
@@ -1383,12 +1392,21 @@ fn map_query_results(results: MetadataQueryResults) -> ServerResult<MetadataQuer
 }
 
 async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
-    let nodes = drive(
+    let nodes = match drive(
         GetRealmNodesOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
-    .unwrap_or_default();
+    {
+        Ok(nodes) => nodes,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "realm node discovery failed, using best-effort local-only metadata results"
+            );
+            HashSet::new()
+        }
+    };
     let mut nodes = nodes.into_iter().collect::<Vec<_>>();
     if !nodes.contains(&state.get_node_id()) {
         nodes.push(state.get_node_id());
@@ -1438,8 +1456,13 @@ async fn run_query_distributed(
                         )
                         .await
                 };
-                if let Ok(result) = result {
-                    parts.push(result);
+                match result {
+                    Ok(result) => parts.push(result),
+                    Err(error) => warn!(
+                        node_id = ?node_id,
+                        error = %error,
+                        "distributed metadata query skipped failed node result"
+                    ),
                 }
             }
         }
@@ -1496,8 +1519,13 @@ async fn run_search_distributed(
                         )
                         .await
                 };
-                if let Ok(result) = result {
-                    hits.extend(result);
+                match result {
+                    Ok(result) => hits.extend(result),
+                    Err(error) => warn!(
+                        node_id = ?node_id,
+                        error = %error,
+                        "distributed metadata search skipped failed node result"
+                    ),
                 }
             }
         }
@@ -1611,7 +1639,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::structs::{
-        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument, RealmId,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
@@ -1926,6 +1954,45 @@ mod tests {
         assert!(matches!(result, Err(ServerError::Unauthorized)));
     }
 
+    #[tokio::test]
+    async fn query_metadata_document_returns_not_found_for_missing_document() {
+        let test = setup_state().await;
+
+        let result = query_metadata_document(
+            State(test.state),
+            Extension(None),
+            Path(Ulid::new().to_string()),
+            Json(SparqlQueryRequest {
+                query: "ASK WHERE { ?s ?p ?o }".to_string(),
+                mode: None,
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn load_realm_nodes_falls_back_to_local_node_on_discovery_failure() {
+        let state = setup_state_with_closed_storage().await;
+
+        let nodes = load_realm_nodes(state.as_ref()).await.unwrap();
+
+        assert_eq!(nodes, vec![state.get_node_id()]);
+    }
+
+    #[tokio::test]
+    async fn load_metadata_record_by_document_returns_internal_error_on_storage_failure() {
+        let state = setup_state_with_closed_storage().await;
+
+        let result = load_metadata_record_by_document(state.as_ref(), Ulid::new()).await;
+
+        assert!(matches!(
+            result,
+            Err(ServerError::InternalError(message)) if message == "Channel closed"
+        ));
+    }
+
     #[test]
     fn metadata_openapi_includes_examples_and_public_field_names() {
         let openapi = serde_json::to_value(MetadataApiDoc::openapi()).unwrap();
@@ -1954,6 +2021,37 @@ mod tests {
             .unwrap();
         assert!(create_examples.contains_key("ScaffoldCreate"));
         assert!(create_examples.contains_key("RoCrateCreate"));
+
+        let document_query_request =
+            &openapi["paths"]["/metadata/{document_id}/sparql/query"]["post"]["requestBody"];
+        assert!(
+            document_query_request["description"]
+                .as_str()
+                .unwrap()
+                .contains("best-effort")
+        );
+
+        let query_all_request = &openapi["paths"]["/metadata/sparql/query"]["post"]["requestBody"];
+        assert!(
+            query_all_request["description"]
+                .as_str()
+                .unwrap()
+                .contains("best-effort")
+        );
+
+        let search_params = openapi["paths"]["/metadata/search"]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        let search_mode_param = search_params
+            .iter()
+            .find(|param| param["name"] == "mode")
+            .unwrap();
+        assert!(
+            search_mode_param["description"]
+                .as_str()
+                .unwrap()
+                .contains("best-effort")
+        );
 
         let data_entity_examples = openapi["paths"]["/metadata/{document_id}/rocrate/data-entities"]
             ["post"]["requestBody"]["content"]["application/json"]["examples"]
@@ -2120,6 +2218,32 @@ mod tests {
             group_id,
             state,
         }
+    }
+
+    async fn setup_state_with_closed_storage() -> Arc<ServerState> {
+        let (storage_handle, receiver) = storage::StorageHandle::new();
+        drop(receiver);
+
+        let realm_id = RealmId([3u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[14u8; 32]).public();
+        Arc::new(
+            ServerState::new(
+                Arc::new(DriverContext {
+                    storage_handle,
+                    net_handle: None,
+                    blob_handle: None,
+                    automerge_handle: None,
+                    metadata_handle: None,
+                    task_handle: None,
+                }),
+                realm_id.clone(),
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+            )
+            .await,
+        )
     }
 
     async fn write_doc(
