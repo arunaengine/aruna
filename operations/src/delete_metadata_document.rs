@@ -1,17 +1,19 @@
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::effects::{Effect, GossipEffect, NetEffect, StorageEffect};
+use aruna_core::errors::GossipError;
+use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::task::{TaskEffect, TaskEvent};
 use aruna_core::types::Effects;
+use aruna_core::{TaskKey, TopicId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::repository::{
-    StorageReadError, delete_document_index_effect, delete_holders_effect, delete_registry_effect,
-    parse_registry_read, read_registry_effect, write_audit_effect,
+    delete_document_index_effect, delete_holders_effect, delete_registry_effect,
+    parse_registry_read, read_registry_effect, write_audit_effect, StorageReadError,
 };
 
 #[derive(Debug, PartialEq)]
@@ -38,6 +40,7 @@ enum DeleteMetadataDocumentState {
     CommitTransaction,
     ReplicateDelete,
     CancelTimer,
+    Unsubscribe,
     Finish,
     Error,
 }
@@ -231,11 +234,7 @@ impl Operation for DeleteMetadataDocumentOperation {
                 | Event::Metadata(MetadataEvent::Error { .. }) => {
                     self.state = DeleteMetadataDocumentState::CancelTimer;
                     smallvec![Effect::Task(TaskEffect::CancelTimer {
-                        key: aruna_core::automerge::AutomergeDocumentVariant::Metadata {
-                            group_id: self.group_id,
-                            document_id: self.document_id,
-                        }
-                        .announce_timer_key(),
+                        key: TaskKey::TopicAnnounce(TopicId::metadata(self.document_id)),
                     })]
                 }
                 other => self
@@ -244,11 +243,28 @@ impl Operation for DeleteMetadataDocumentOperation {
             DeleteMetadataDocumentState::CancelTimer => match event {
                 Event::Task(TaskEvent::TimerCancelled { .. })
                 | Event::Task(TaskEvent::Error { .. }) => {
+                    self.state = DeleteMetadataDocumentState::Unsubscribe;
+                    smallvec![Effect::Net(NetEffect::Gossip(GossipEffect::Unsubscribe {
+                        topic: TopicId::metadata(self.document_id),
+                    }))]
+                }
+                other => self.unexpected_event("task timer result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::Unsubscribe => match event {
+                Event::Net(NetEvent::Gossip(GossipEvent::Unsubscribed { .. }))
+                | Event::Net(NetEvent::Gossip(GossipEvent::Error {
+                    error: GossipError::NotSubscribed,
+                })) => {
                     self.state = DeleteMetadataDocumentState::Finish;
                     self.output = Some(Ok(()));
                     smallvec![]
                 }
-                other => self.unexpected_event("task timer result", format!("{other:?}")),
+                Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => {
+                    self.fail(DeleteMetadataDocumentError::MetadataError(
+                        MetadataError::Backend(error.to_string()),
+                    ))
+                }
+                other => self.unexpected_event("gossip unsubscribe result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::Finish
             | DeleteMetadataDocumentState::Error
