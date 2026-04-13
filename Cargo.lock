@@ -184,7 +184,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "postcard",
- "reqwest 0.12.28",
+ "reqwest 0.13.2",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -394,10 +394,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "aruna-search"
-version = "3.0.0-alpha.1"
-
-[[package]]
 name = "aruna-storage"
 version = "3.0.0-alpha.1"
 dependencies = [
@@ -501,9 +497,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "automerge"
-version = "0.7.4"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f4f9b5e81602f033fac828dafb4fef91742f6f01adfdb8ee5b8bc804cfac7bb"
+checksum = "2aab56635599ee2e9df28d9ce180c155b8dbcdd96e4c3f62895fc6a44137d328"
 dependencies = [
  "cfg-if",
  "flate2",
@@ -525,9 +521,9 @@ dependencies = [
 
 [[package]]
 name = "autosurgeon"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "87b6547a9a35fbf5e5b1305a56c42196ae2cfb456897f1cab97d4829f1096550"
+checksum = "baa6f26cb5312c04e444a06ff0ef5f2a102ec197db106a76dabdcac1bc8c5549"
 dependencies = [
  "automerge",
  "autosurgeon-derive",
@@ -537,9 +533,9 @@ dependencies = [
 
 [[package]]
 name = "autosurgeon-derive"
-version = "0.10.1"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f99b54090e5aca6915313efcf065f9873c9ca9d39c875cfc956f30523075d49f"
+checksum = "5b970eac48c83d4134f890aa34c3d1ade419f471d5e22ac798734f549722b32b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2968,9 +2964,9 @@ dependencies = [
 
 [[package]]
 name = "hexane"
-version = "0.1.7"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ab946df174dbf65fc07610c1f936b3e40b9ca7cfd09c0f827f9509a62e93a39"
+checksum = "8f4ecba0bb4e14df997df7cab6d1b584c6432d8865cf2adfced814706d715a7b"
 dependencies = [
  "leb128",
  "thiserror 2.0.18",
