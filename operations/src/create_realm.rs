@@ -9,7 +9,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::automerge_announce::AnnounceTopicOperation;
+use crate::announce::AnnounceTopicOperation;
 use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]

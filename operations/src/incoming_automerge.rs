@@ -10,8 +10,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::announce::AnnounceTopicOperation;
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
-use crate::automerge_announce::AnnounceTopicOperation;
 use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;

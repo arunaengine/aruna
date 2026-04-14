@@ -13,7 +13,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::automerge_announce::AnnounceTopicOperation;
+use crate::announce::AnnounceTopicOperation;
 use crate::metadata::repository::{
     StorageReadError, parse_registry_read, read_registry_effect, write_audit_effect,
     write_document_index_effect, write_registry_effect,

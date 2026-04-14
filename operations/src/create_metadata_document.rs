@@ -20,8 +20,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::announce::AnnounceTopicOperation;
 use crate::automerge::repository::read_effect;
-use crate::automerge_announce::AnnounceTopicOperation;
 use crate::metadata::repository::{
     read_registry_by_document_effect, write_audit_effect, write_document_index_effect,
     write_holders_effect, write_registry_effect,

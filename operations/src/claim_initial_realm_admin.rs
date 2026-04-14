@@ -10,7 +10,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::automerge_announce::AnnounceTopicOperation;
+use crate::announce::AnnounceTopicOperation;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClaimInitialRealmAdminInput {

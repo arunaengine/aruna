@@ -7,8 +7,8 @@ use aruna_core::structs::{Actor, RealmConfigDocument};
 use smallvec::smallvec;
 use thiserror::Error;
 
+use crate::announce::AnnounceTopicOperation;
 use crate::automerge::repository::{read_effect, write_effect};
-use crate::automerge_announce::AnnounceTopicOperation;
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
 use aruna_core::NodeId;
 use aruna_core::types::Effects;

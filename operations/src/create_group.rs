@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::automerge_announce::AnnounceTopicOperation;
+use crate::announce::AnnounceTopicOperation;
 use crate::replicate_automerge_to_realm::{
     ReplicateAutomergeDocumentsToRealmConfig, ReplicateAutomergeDocumentsToRealmOperation,
 };

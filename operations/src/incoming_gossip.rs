@@ -16,8 +16,8 @@ use thiserror::Error;
 use tracing::trace;
 use ulid::Ulid;
 
+use crate::announce::{TOPIC_ANNOUNCE_INTERVAL, TOPIC_ANNOUNCE_SHORT_INTERVAL};
 use crate::automerge::repository::{automerge_clock, read_effect};
-use crate::automerge_announce::{TOPIC_ANNOUNCE_INTERVAL, TOPIC_ANNOUNCE_SHORT_INTERVAL};
 use crate::metadata::repository::read_registry_by_document_effect;
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
 

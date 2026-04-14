@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::automerge_announce::AnnounceTopicOperation;
+use crate::announce::AnnounceTopicOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_core::structs::Permission;
 use aruna_core::types::Effects;

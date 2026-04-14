@@ -5,8 +5,8 @@ use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use tracing::error;
 
+use crate::announce::AnnounceTopicOperation;
 use crate::announce_realm_presence::{AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation};
-use crate::automerge_announce::AnnounceTopicOperation;
 use crate::driver::{DriverContext, drive};
 
 #[derive(Debug)]

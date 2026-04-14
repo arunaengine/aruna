@@ -7,7 +7,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::OnboardingSyncTicket;
 use aruna_core::{NodeId, TopicId};
-use aruna_operations::automerge_announce::AnnounceTopicOperation;
+use aruna_operations::announce::AnnounceTopicOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::outgoing_automerge::OutgoingAutomergeOperation;
 use byteview::ByteView;

@@ -14,10 +14,10 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::announce::AnnounceTopicOperation;
 use crate::automerge::repository::{
     parse_auth_document, parse_group_document, parse_realm_config_document,
 };
-use crate::automerge_announce::AnnounceTopicOperation;
 
 #[derive(Debug, PartialEq)]
 pub struct RestoreTopicSubscriptionsOperation {

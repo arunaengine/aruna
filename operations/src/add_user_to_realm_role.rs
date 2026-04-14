@@ -11,7 +11,7 @@ use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::automerge_announce::AnnounceTopicOperation;
+use crate::announce::AnnounceTopicOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_core::types::Effects;
 
