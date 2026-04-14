@@ -22,3 +22,7 @@ pub const API_STATE_KEYSPACE: &str = "api_state";
 pub const NODE_STATE_KEYSPACE: &str = "node_state";
 pub const ONBOARDING_KEYSPACE: &str = "onboarding";
 pub const DHT_KEYSPACE: &str = "dht";
+pub const CRAQLE_TERMS_KEYSPACE: &str = "terms";
+pub const CRAQLE_QUADS_KEYSPACE: &str = "quads";
+pub const CRAQLE_GRAPHS_KEYSPACE: &str = "graphs";
+pub const CRAQLE_LOG_KEYSPACE: &str = "log";
