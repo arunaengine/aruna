@@ -11,7 +11,7 @@ use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::announce::AnnounceTopicOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_core::types::Effects;
 
@@ -68,8 +68,8 @@ pub enum AddUserToRealmRolesError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("Unauthorized")]
@@ -243,13 +243,14 @@ impl AddUserToRealmRolesOperation {
             auth_doc: auth_doc.clone(),
         };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceAutomergeDocumentOperation::new(
+            AnnounceTopicOperation::new(
                 AutomergeDocumentVariant::RealmAuthorization {
                     realm_id: auth_doc.realm_id.clone(),
-                },
+                }
+                .topic_id(),
                 self.input.actor.node_id,
             ),
-            |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+            |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                 result: result.map_err(|error| error.to_string()),
             }),
         ))]
@@ -261,15 +262,16 @@ impl AddUserToRealmRolesOperation {
         auth_doc: RealmAuthorizationDocument,
     ) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 self.state.clone(),
-                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
                 got,
             );
         };
         if let Err(error) = result {
-            return self.fail(AddUserToRealmRolesError::AutomergeState(error));
+            return self.fail(AddUserToRealmRolesError::TopicAnnouncement(error));
         }
         self.state = AddUserToRealmRolesState::Finish;
         self.output = Some(Ok(auth_doc));

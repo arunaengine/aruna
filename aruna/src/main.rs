@@ -24,7 +24,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::startup::RestoreAutomergeSubscriptionsOperation;
+use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
@@ -143,7 +143,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         StartupMode::Provisioned => {
             drive(
-                RestoreAutomergeSubscriptionsOperation::new(config.node_id),
+                RestoreTopicSubscriptionsOperation::new(config.node_id),
                 driver_ctx.as_ref(),
             )
             .await?;

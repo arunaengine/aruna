@@ -4,16 +4,13 @@ use crate::driver::{DriverContext, drive};
 use crate::incoming_automerge::IncomingAutomergeOperation;
 use crate::incoming_gossip::IncomingGossipOperation;
 use crate::replication::incoming_bao::IncomingBaoOperation;
-use crate::telemetry::extract_trace_context;
 use aruna_core::alpn::Alpn;
-use aruna_core::automerge::AutomergeAnnouncementEnvelope;
+use aruna_core::gossip::TopicMessage;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use opentelemetry::trace::TraceContextExt;
 use tracing::{Instrument, error, field, info_span, trace, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -38,26 +35,26 @@ pub fn initialize_net_incoming(context: Arc<DriverContext>) {
 #[async_trait]
 impl InboundEventHandler for OperationsInboundHandler {
     async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>) {
-        let envelope = postcard::from_bytes::<AutomergeAnnouncementEnvelope>(&data).ok();
+        let message = postcard::from_bytes::<TopicMessage>(&data).ok();
         let span = info_span!(
             "gossip.receive",
             topic = %topic,
             sender = %sender,
-            message_id = ?envelope.as_ref().map(|envelope| envelope.message_id),
+            message_id = ?message.as_ref().map(|message| message.message_id),
             trace_id = field::Empty,
         );
-        if let Some(envelope) = envelope.as_ref() {
-            let _ = span.set_parent(extract_trace_context(&envelope.trace_context));
+        if let Some(message) = message.as_ref()
+            && let Some(trace_id) = message.trace_id.as_ref()
+        {
+            span.record("trace_id", field::display(trace_id));
         }
-        let trace_id = span.context().span().span_context().trace_id().to_string();
-        span.record("trace_id", field::display(trace_id));
 
         async move {
             trace!(
                 event = "gossip.received",
                 topic = %topic,
                 sender = %sender,
-                message_id = ?envelope.as_ref().map(|envelope| envelope.message_id),
+                message_id = ?message.as_ref().map(|message| message.message_id),
                 "Received inbound gossip message"
             );
 

@@ -72,9 +72,8 @@ mod tests {
     #[test]
     fn transport_message_roundtrip() {
         let message = AutomergeTransportMessage::Init(AutomergeInit::new(
-            AutomergeDocumentVariant::Metadata {
+            AutomergeDocumentVariant::Group {
                 group_id: Ulid::new(),
-                document_id: Ulid::new(),
             },
             Vec::new(),
         ));

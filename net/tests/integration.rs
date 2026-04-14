@@ -3,12 +3,11 @@ use std::time::Duration;
 
 use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
-use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{DhtEffect, Effect, GossipEffect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
-use aruna_core::keys::automerge_document_holder_key;
+use aruna_core::keys::gossip_peer_key;
 use aruna_core::structs::RealmId;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_net::streams::BiStream;
@@ -294,12 +293,8 @@ async fn test_automerge_topic_subscription_announces_document_holders()
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
-    let document = AutomergeDocumentVariant::Metadata {
-        group_id: Ulid::new(),
-        document_id: Ulid::new(),
-    };
-    let topic = document.topic_id();
-    let holder_key = *automerge_document_holder_key(&document).as_bytes();
+    let topic = TopicId::metadata(Ulid::new());
+    let topic_key = *gossip_peer_key(&topic).as_bytes();
 
     let subscribe = handle_a
         .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
@@ -315,7 +310,7 @@ async fn test_automerge_topic_subscription_announces_document_holders()
     for _ in 0..10 {
         let get = handle_b
             .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
-                key: holder_key,
+                key: topic_key,
                 realm_filter: None,
             })))
             .await;
@@ -332,7 +327,7 @@ async fn test_automerge_topic_subscription_announces_document_holders()
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    assert!(found, "expected automerge holder DHT entry on second node");
+    assert!(found, "expected gossip topic DHT entry on second node");
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;

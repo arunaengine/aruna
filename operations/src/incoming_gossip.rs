@@ -1,20 +1,24 @@
-use aruna_core::AutomergeDocumentVariant;
-use aruna_core::NodeId;
-use aruna_core::TopicId;
-use aruna_core::automerge::{AutomergeAnnouncementEnvelope, AutomergeState};
+use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::Effect;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::gossip::{TopicMessage, TopicMessageVersion};
+use aruna_core::metadata::{
+    MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
+};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::task::{TaskEffect, TaskEvent};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Effects;
+use aruna_core::{NodeId, TopicId};
+use craqle::VectorClock;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::trace;
 use ulid::Ulid;
 
+use crate::announce::{TOPIC_ANNOUNCE_INTERVAL, TOPIC_ANNOUNCE_SHORT_INTERVAL};
 use crate::automerge::repository::{automerge_clock, read_effect};
-use crate::automerge_announce::{AUTOMERGE_ANNOUNCE_INTERVAL, AUTOMERGE_ANNOUNCE_SHORT_INTERVAL};
+use crate::metadata::repository::read_registry_by_document_effect;
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
 
 #[derive(Debug, PartialEq)]
@@ -22,19 +26,22 @@ pub struct IncomingGossipOperation {
     topic: TopicId,
     sender: NodeId,
     data: Vec<u8>,
-    message_id: Option<Ulid>,
-    announcement: Option<AutomergeState>,
-    document: Option<AutomergeDocumentVariant>,
+    message: Option<TopicMessage>,
     state: IncomingGossipState,
+    pending_timer: Option<TaskEffect>,
+    metadata_sync_needs_reannounce: bool,
     output: Option<Result<(), IncomingGossipError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum IncomingGossipState {
     Init,
-    ReadDocument,
+    ReadAutomergeDocument,
+    ReadMetadataRecord,
+    ReadMetadataClock,
     ScheduleTimer,
-    WaitForSync,
+    WaitForAutomergeSync,
+    WaitForMetadataSync,
     Finish,
     Error,
 }
@@ -47,7 +54,9 @@ pub enum IncomingGossipError {
     ConversionError(#[from] ConversionError),
     #[error("automerge sync failed: {0}")]
     AutomergeSync(String),
-    #[error("failed to schedule automerge timer: {0}")]
+    #[error("metadata sync failed: {0}")]
+    MetadataSync(String),
+    #[error("failed to schedule topic timer: {0}")]
     ScheduleFailed(String),
     #[error("invalid gossip announcement")]
     InvalidAnnouncement,
@@ -65,10 +74,10 @@ impl IncomingGossipOperation {
             topic,
             sender,
             data,
-            message_id: None,
-            announcement: None,
-            document: None,
+            message: None,
             state: IncomingGossipState::Init,
+            pending_timer: None,
+            metadata_sync_needs_reannounce: false,
             output: None,
         }
     }
@@ -87,6 +96,44 @@ impl IncomingGossipOperation {
             got,
         })
     }
+
+    fn reset_timer(&mut self, after: std::time::Duration) -> Effects {
+        self.pending_timer = Some(TaskEffect::ResetTimer {
+            key: TaskKey::TopicAnnounce(self.topic.clone()),
+            after,
+        });
+        self.state = IncomingGossipState::ScheduleTimer;
+        smallvec![Effect::Task(
+            self.pending_timer.clone().expect("pending timer set")
+        )]
+    }
+
+    fn shorten_timer(&mut self, after: std::time::Duration) -> Effects {
+        self.pending_timer = Some(TaskEffect::ShortenTimer {
+            key: TaskKey::TopicAnnounce(self.topic.clone()),
+            after,
+        });
+        self.state = IncomingGossipState::ScheduleTimer;
+        smallvec![Effect::Task(
+            self.pending_timer.clone().expect("pending timer set")
+        )]
+    }
+
+    fn metadata_document_id(&self) -> Option<Ulid> {
+        match self.topic {
+            TopicId::Metadata(document_id) => Some(document_id),
+            _ => None,
+        }
+    }
+
+    fn trace_fields(&self) -> (Option<Ulid>, Option<String>) {
+        (
+            self.message.as_ref().map(|message| message.message_id),
+            self.message
+                .as_ref()
+                .and_then(|message| message.trace_id.clone()),
+        )
+    }
 }
 
 impl Operation for IncomingGossipOperation {
@@ -94,95 +141,104 @@ impl Operation for IncomingGossipOperation {
     type Error = IncomingGossipError;
 
     fn start(&mut self) -> Effects {
-        let (announcement, message_id) =
-            match postcard::from_bytes::<AutomergeAnnouncementEnvelope>(&self.data) {
-                Ok(envelope) => (envelope.announcement, Some(envelope.message_id)),
-                Err(_) => match postcard::from_bytes::<AutomergeState>(&self.data) {
-                    Ok(announcement) => (announcement, None),
-                    Err(_) => {
-                        self.state = IncomingGossipState::Finish;
-                        self.output = Some(Ok(()));
-                        return smallvec![];
-                    }
-                },
-            };
-
-        let Some(document) = AutomergeDocumentVariant::from_topic_id(&self.topic) else {
+        let Ok(message) = postcard::from_bytes::<TopicMessage>(&self.data) else {
             self.state = IncomingGossipState::Finish;
             self.output = Some(Ok(()));
             return smallvec![];
         };
 
-        if announcement.node_id != self.sender {
+        if message.node_id != self.sender || !message.is_valid_for(&self.topic) {
             self.state = IncomingGossipState::Finish;
             self.output = Some(Ok(()));
             return smallvec![];
         }
 
-        self.announcement = Some(announcement);
-        self.message_id = message_id;
-        self.document = Some(document.clone());
-        self.state = IncomingGossipState::ReadDocument;
-        smallvec![read_effect(&document, None)]
+        if let Some(document) =
+            AutomergeDocumentVariant::from_topic_message(&self.topic, &message.kind)
+        {
+            self.message = Some(message);
+            self.state = IncomingGossipState::ReadAutomergeDocument;
+            return smallvec![read_effect(&document, None)];
+        }
+
+        if matches!(message.version, TopicMessageVersion::Metadata { .. }) {
+            let Some(document_id) = self.metadata_document_id() else {
+                self.state = IncomingGossipState::Finish;
+                self.output = Some(Ok(()));
+                return smallvec![];
+            };
+            self.message = Some(message);
+            self.state = IncomingGossipState::ReadMetadataRecord;
+            return smallvec![read_registry_by_document_effect(document_id, None)];
+        }
+
+        self.state = IncomingGossipState::Finish;
+        self.output = Some(Ok(()));
+        smallvec![]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            IncomingGossipState::ReadDocument => match event {
+            IncomingGossipState::ReadAutomergeDocument => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let Some(announcement) = self.announcement.as_ref() else {
+                    let Some(message) = self.message.as_ref() else {
                         return self.fail(IncomingGossipError::InvalidAnnouncement);
                     };
-                    let Some(document) = self.document.as_ref() else {
+                    let Some(document) =
+                        AutomergeDocumentVariant::from_topic_message(&self.topic, &message.kind)
+                    else {
+                        self.state = IncomingGossipState::Finish;
+                        self.output = Some(Ok(()));
+                        return smallvec![];
+                    };
+                    let TopicMessageVersion::Automerge {
+                        heads,
+                        change_count,
+                    } = &message.version
+                    else {
                         return self.fail(IncomingGossipError::InvalidAnnouncement);
                     };
-                    let value = value.map(|value| value.to_vec()).unwrap_or_default();
-                    let local_clock = match automerge_clock(&value) {
+
+                    let local_bytes = value.map(|value| value.to_vec()).unwrap_or_default();
+                    let local_clock = match automerge_clock(&local_bytes) {
                         Ok(clock) => clock,
                         Err(error) => return self.fail(error.into()),
                     };
-                    let same_heads = local_clock.heads == announcement.heads;
+                    let same_heads = local_clock.heads == *heads;
+                    let (message_id, _trace_id) = self.trace_fields();
 
-                    if same_heads && local_clock.change_count == announcement.change_count {
+                    if same_heads && local_clock.change_count == *change_count {
                         trace!(
                             event = "gossip.state_matched",
                             topic = %self.topic,
                             sender = %self.sender,
-                            message_id = self.message_id.as_ref().map(Ulid::to_string),
+                            message_id = message_id.as_ref().map(Ulid::to_string),
                             "Received gossip announcement with matching local state"
                         );
-                        self.state = IncomingGossipState::ScheduleTimer;
-                        return smallvec![Effect::Task(TaskEffect::ResetTimer {
-                            key: document.announce_timer_key(),
-                            after: AUTOMERGE_ANNOUNCE_INTERVAL,
-                        })];
+                        return self.reset_timer(TOPIC_ANNOUNCE_INTERVAL);
                     }
 
-                    if announcement.change_count < local_clock.change_count {
+                    if *change_count < local_clock.change_count {
                         trace!(
                             event = "gossip.state_remote_behind",
                             topic = %self.topic,
                             sender = %self.sender,
-                            message_id = self.message_id.as_ref().map(Ulid::to_string),
+                            message_id = message_id.as_ref().map(Ulid::to_string),
                             "Received gossip announcement from peer behind local state"
                         );
-                        self.state = IncomingGossipState::ScheduleTimer;
-                        return smallvec![Effect::Task(TaskEffect::ShortenTimer {
-                            key: document.announce_timer_key(),
-                            after: AUTOMERGE_ANNOUNCE_SHORT_INTERVAL,
-                        })];
+                        return self.shorten_timer(TOPIC_ANNOUNCE_SHORT_INTERVAL);
                     }
 
                     trace!(
                         event = "gossip.sync_requested",
                         topic = %self.topic,
                         sender = %self.sender,
-                        message_id = self.message_id.as_ref().map(Ulid::to_string),
+                        message_id = message_id.as_ref().map(Ulid::to_string),
                         "Received newer gossip announcement and starting sync"
                     );
-                    self.state = IncomingGossipState::WaitForSync;
+                    self.state = IncomingGossipState::WaitForAutomergeSync;
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        OutgoingAutomergeOperation::new(self.sender, document.clone()),
+                        OutgoingAutomergeOperation::new(self.sender, document),
                         |result| {
                             Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
                                 result: result.map_err(|error| error.to_string()),
@@ -192,6 +248,88 @@ impl Operation for IncomingGossipOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
+            },
+            IncomingGossipState::ReadMetadataRecord => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let Some(message) = self.message.as_ref() else {
+                        return self.fail(IncomingGossipError::InvalidAnnouncement);
+                    };
+                    let TopicMessageVersion::Metadata { .. } = &message.version else {
+                        return self.fail(IncomingGossipError::InvalidAnnouncement);
+                    };
+                    let Some(document_id) = self.metadata_document_id() else {
+                        return self.fail(IncomingGossipError::InvalidAnnouncement);
+                    };
+
+                    let Some(value) = value else {
+                        self.metadata_sync_needs_reannounce = false;
+                        self.state = IncomingGossipState::WaitForMetadataSync;
+                        return smallvec![Effect::Metadata(MetadataEffect::SyncFromPeer {
+                            node_id: self.sender,
+                            document_id,
+                            known_clock: VectorClock::default(),
+                        })];
+                    };
+
+                    let record: aruna_core::structs::MetadataRegistryRecord =
+                        match postcard::from_bytes(&value) {
+                            Ok(record) => record,
+                            Err(error) => return self.fail(ConversionError::from(error).into()),
+                        };
+                    self.state = IncomingGossipState::ReadMetadataClock;
+                    smallvec![Effect::Metadata(MetadataEffect::VectorClock {
+                        graph_iri: record.graph_iri,
+                    })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage read result", format!("{other:?}")),
+            },
+            IncomingGossipState::ReadMetadataClock => match event {
+                Event::Metadata(MetadataEvent::VectorClockResult { clock, .. }) => {
+                    let Some(message) = self.message.as_ref() else {
+                        return self.fail(IncomingGossipError::InvalidAnnouncement);
+                    };
+                    let TopicMessageVersion::Metadata {
+                        clock: remote_clock,
+                    } = &message.version
+                    else {
+                        return self.fail(IncomingGossipError::InvalidAnnouncement);
+                    };
+                    let Some(document_id) = self.metadata_document_id() else {
+                        return self.fail(IncomingGossipError::InvalidAnnouncement);
+                    };
+
+                    match compare_metadata_clocks(&clock, remote_clock) {
+                        MetadataClockRelation::Equal => self.reset_timer(TOPIC_ANNOUNCE_INTERVAL),
+                        MetadataClockRelation::LocalAhead => {
+                            self.shorten_timer(TOPIC_ANNOUNCE_SHORT_INTERVAL)
+                        }
+                        MetadataClockRelation::RemoteAhead => {
+                            self.metadata_sync_needs_reannounce = false;
+                            self.state = IncomingGossipState::WaitForMetadataSync;
+                            smallvec![Effect::Metadata(MetadataEffect::SyncFromPeer {
+                                node_id: self.sender,
+                                document_id,
+                                known_clock: clock.clone(),
+                            })]
+                        }
+                        MetadataClockRelation::Concurrent => {
+                            self.metadata_sync_needs_reannounce = true;
+                            self.state = IncomingGossipState::WaitForMetadataSync;
+                            smallvec![Effect::Metadata(MetadataEffect::SyncFromPeer {
+                                node_id: self.sender,
+                                document_id,
+                                known_clock: clock.clone(),
+                            })]
+                        }
+                    }
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    self.fail(IncomingGossipError::MetadataSync(error.to_string()))
+                }
+                other => {
+                    self.unexpected_event("metadata vector clock result", format!("{other:?}"))
+                }
             },
             IncomingGossipState::ScheduleTimer => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
@@ -204,7 +342,7 @@ impl Operation for IncomingGossipOperation {
                 }
                 other => self.unexpected_event("task timer acknowledgement", format!("{other:?}")),
             },
-            IncomingGossipState::WaitForSync => match event {
+            IncomingGossipState::WaitForAutomergeSync => match event {
                 Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) => {
                     match result {
                         Ok(()) => {
@@ -216,6 +354,22 @@ impl Operation for IncomingGossipOperation {
                     }
                 }
                 other => self.unexpected_event("automerge sync result", format!("{other:?}")),
+            },
+            IncomingGossipState::WaitForMetadataSync => match event {
+                Event::Metadata(MetadataEvent::PeerSyncApplied { .. }) => {
+                    if self.metadata_sync_needs_reannounce {
+                        self.metadata_sync_needs_reannounce = false;
+                        self.shorten_timer(TOPIC_ANNOUNCE_SHORT_INTERVAL)
+                    } else {
+                        self.state = IncomingGossipState::Finish;
+                        self.output = Some(Ok(()));
+                        smallvec![]
+                    }
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    self.fail(IncomingGossipError::MetadataSync(error.to_string()))
+                }
+                other => self.unexpected_event("metadata sync result", format!("{other:?}")),
             },
             IncomingGossipState::Finish
             | IncomingGossipState::Error
@@ -243,10 +397,14 @@ impl Operation for IncomingGossipOperation {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use craqle::{ActorId, VectorClock};
+
     use super::*;
-    use aruna_core::automerge::AutomergeClock;
     use aruna_core::events::StorageEvent;
-    use aruna_core::structs::{Actor, MetadataDocument, RealmId};
+    use aruna_core::gossip::{TopicMessage, TopicMessageKind, TopicMessageVersion};
+    use aruna_core::structs::RealmId;
     use aruna_core::types::GroupId;
     use byteview::ByteView;
 
@@ -257,9 +415,8 @@ mod tests {
     }
 
     fn make_document() -> aruna_core::automerge::AutomergeDocumentVariant {
-        aruna_core::automerge::AutomergeDocumentVariant::Metadata {
+        aruna_core::automerge::AutomergeDocumentVariant::Group {
             group_id: GroupId::from_bytes([1u8; 16]),
-            document_id: GroupId::from_bytes([2u8; 16]),
         }
     }
 
@@ -270,26 +427,32 @@ mod tests {
         })
     }
 
-    fn metadata_bytes(seed: u8) -> Vec<u8> {
-        let actor = Actor {
+    fn group_bytes(seed: u8) -> Vec<u8> {
+        let actor = aruna_core::structs::Actor {
             node_id: make_node(seed),
             user_id: GroupId::from_bytes([seed; 16]),
             realm_id: RealmId::from_bytes([seed; 32]),
         };
-        MetadataDocument::new(
-            GroupId::from_bytes([1u8; 16]),
-            GroupId::from_bytes([2u8; 16]),
-            format!("https://example.org/{seed}"),
-        )
+        aruna_core::structs::Group {
+            display_name: format!("group-{seed}"),
+            group_id: GroupId::from_bytes([1u8; 16]),
+            realm_id: RealmId::from_bytes([seed; 32]),
+            roles: std::collections::HashSet::new(),
+        }
         .to_bytes(&actor)
-        .expect("metadata bytes")
+        .expect("group bytes")
     }
 
-    fn announcement(clock: AutomergeClock, node_id: aruna_core::NodeId) -> Vec<u8> {
-        postcard::to_allocvec(&AutomergeState::new(
-            clock.heads,
-            clock.change_count,
+    fn announcement(clock: aruna_core::AutomergeClock, node_id: aruna_core::NodeId) -> Vec<u8> {
+        postcard::to_allocvec(&TopicMessage::new(
+            TopicMessageKind::Group,
+            Ulid::new(),
             node_id,
+            None,
+            TopicMessageVersion::Automerge {
+                heads: clock.heads,
+                change_count: clock.change_count,
+            },
         ))
         .expect("announcement bytes")
     }
@@ -298,7 +461,7 @@ mod tests {
     fn matching_state_resets_normal_timer() {
         let document = make_document();
         let remote_node = make_node(9);
-        let local_bytes = metadata_bytes(3);
+        let local_bytes = group_bytes(3);
         let clock = automerge_clock(&local_bytes).expect("clock");
         let mut op = IncomingGossipOperation::new(
             document.topic_id(),
@@ -313,7 +476,7 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::Task(TaskEffect::ResetTimer { after, .. })]
-            if *after == AUTOMERGE_ANNOUNCE_INTERVAL
+            if *after == TOPIC_ANNOUNCE_INTERVAL
         ));
     }
 
@@ -321,11 +484,11 @@ mod tests {
     fn older_remote_state_shortens_timer() {
         let document = make_document();
         let remote_node = make_node(10);
-        let local_bytes = metadata_bytes(4);
+        let local_bytes = group_bytes(4);
         let mut op = IncomingGossipOperation::new(
             document.topic_id(),
             remote_node,
-            announcement(AutomergeClock::new(Vec::new(), 0), remote_node),
+            announcement(aruna_core::AutomergeClock::new(Vec::new(), 0), remote_node),
         );
 
         let start = op.start();
@@ -335,7 +498,7 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::Task(TaskEffect::ShortenTimer { after, .. })]
-            if *after == AUTOMERGE_ANNOUNCE_SHORT_INTERVAL
+            if *after == TOPIC_ANNOUNCE_SHORT_INTERVAL
         ));
     }
 
@@ -343,7 +506,7 @@ mod tests {
     fn newer_remote_state_starts_sync() {
         let document = make_document();
         let remote_node = make_node(11);
-        let remote_bytes = metadata_bytes(5);
+        let remote_bytes = group_bytes(5);
         let remote_clock = automerge_clock(&remote_bytes).expect("clock");
         let mut op = IncomingGossipOperation::new(
             document.topic_id(),
@@ -363,8 +526,30 @@ mod tests {
         let document = make_document();
         let sender = make_node(12);
         let announced_by = make_node(13);
-        let payload = announcement(AutomergeClock::new(Vec::new(), 0), announced_by);
+        let payload = announcement(aruna_core::AutomergeClock::new(Vec::new(), 0), announced_by);
         let mut op = IncomingGossipOperation::new(document.topic_id(), sender, payload);
+
+        let effects = op.start();
+        assert!(effects.is_empty());
+        assert!(op.is_complete());
+    }
+
+    #[test]
+    fn invalid_metadata_version_is_rejected_for_group_topic() {
+        let message = TopicMessage::new(
+            TopicMessageKind::Metadata,
+            Ulid::new(),
+            make_node(14),
+            None,
+            TopicMessageVersion::Metadata {
+                clock: VectorClock(BTreeMap::<ActorId, u64>::new()),
+            },
+        );
+        let mut op = IncomingGossipOperation::new(
+            TopicId::group(GroupId::from_bytes([1u8; 16])),
+            message.node_id,
+            postcard::to_allocvec(&message).expect("message bytes"),
+        );
 
         let effects = op.start();
         assert!(effects.is_empty());

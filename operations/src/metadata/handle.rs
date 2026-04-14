@@ -11,7 +11,7 @@ use aruna_core::handle::Handle;
 use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
     MetadataEvent, MetadataGraphPolicy, MetadataQuadOp, MetadataQueryResults, MetadataRoCratePage,
-    MetadataSearchHit, MetadataUpsertEntityRequest, MetadataVectorClock,
+    MetadataSearchHit, MetadataUpsertEntityRequest,
 };
 use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission};
 use aruna_net::NetHandle;
@@ -21,18 +21,20 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleNode, CreateCrateRequest,
-    CreateEntityRequest, GraphId, GraphPolicy, QueryResults, RoCrateError, vocab,
+    CreateEntityRequest, GraphId, GraphPolicy, QueryResults, RoCrateError, VectorClock, vocab,
 };
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
 use tokio::time::timeout;
 use tracing::warn;
+use ulid::Ulid;
 
 use super::protocol::{MetadataTransportMessage, read_message, write_message};
 use super::repository::{
     delete_document_index_effect, delete_holders_effect, delete_registry_effect,
-    iter_all_registry_effect, parse_registry_iter, write_document_index_effect,
-    write_holders_effect, write_registry_effect,
+    iter_all_registry_effect, parse_registry_iter, parse_registry_read,
+    read_registry_by_document_effect, write_document_index_effect, write_holders_effect,
+    write_registry_effect,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
@@ -122,6 +124,11 @@ impl MetadataHandle {
             MetadataEffect::ReplicateDelete { record } => {
                 Event::Metadata(self.replicate_delete(record).await)
             }
+            MetadataEffect::SyncFromPeer {
+                node_id,
+                document_id,
+                known_clock,
+            } => Event::Metadata(self.sync_from_peer(node_id, document_id, known_clock).await),
             other => {
                 let inner = self.inner.clone();
                 match tokio::task::spawn_blocking(move || handle_effect(inner, other)).await {
@@ -180,6 +187,13 @@ impl MetadataHandle {
                 Ok(hits) => MetadataTransportMessage::SearchResults { hits },
                 Err(error) => MetadataTransportMessage::Reject(error.to_string()),
             },
+            MetadataTransportMessage::CatchupFrom {
+                document_id,
+                known_clock,
+            } => match fetch_catchup_data(self.inner.clone(), document_id, known_clock).await {
+                Ok((record, batches)) => MetadataTransportMessage::CatchupData { record, batches },
+                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+            },
             MetadataTransportMessage::ApplyBatch { batch } => {
                 match apply_remote_batch(self.inner.clone(), batch).await {
                     Ok(()) => MetadataTransportMessage::Ack,
@@ -194,6 +208,7 @@ impl MetadataHandle {
             }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
+            | MetadataTransportMessage::CatchupData { .. }
             | MetadataTransportMessage::Ack
             | MetadataTransportMessage::Reject(_) => {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
@@ -286,6 +301,67 @@ impl MetadataHandle {
         }
     }
 
+    async fn sync_from_peer(
+        &self,
+        node_id: NodeId,
+        document_id: Ulid,
+        known_clock: VectorClock,
+    ) -> MetadataEvent {
+        let Some(net_handle) = self.inner.net_handle.clone() else {
+            return MetadataEvent::Error {
+                graph_iri: None,
+                error: MetadataError::HandleMissing,
+            };
+        };
+
+        match send_request(
+            &net_handle,
+            node_id,
+            MetadataTransportMessage::CatchupFrom {
+                document_id,
+                known_clock,
+            },
+        )
+        .await
+        {
+            Ok(MetadataTransportMessage::CatchupData { record, batches }) => {
+                let graph_iri = record.graph_iri.clone();
+                if let Err(error) = persist_replica_record(self.inner.clone(), &record).await {
+                    return MetadataEvent::Error {
+                        graph_iri: Some(graph_iri),
+                        error,
+                    };
+                }
+                for batch in batches {
+                    if let Err(error) = apply_remote_batch(self.inner.clone(), batch).await {
+                        return MetadataEvent::Error {
+                            graph_iri: Some(graph_iri.clone()),
+                            error,
+                        };
+                    }
+                }
+                MetadataEvent::PeerSyncApplied {
+                    document_id,
+                    graph_iri,
+                }
+            }
+            Ok(MetadataTransportMessage::Reject(error)) => MetadataEvent::Error {
+                graph_iri: None,
+                error: MetadataError::Backend(error),
+            },
+            Ok(other) => MetadataEvent::Error {
+                graph_iri: None,
+                error: MetadataError::Backend(format!(
+                    "unexpected metadata catchup response: {other:?}"
+                )),
+            },
+            Err(error) => MetadataEvent::Error {
+                graph_iri: None,
+                error,
+            },
+        }
+    }
+
     async fn replicate_bootstrap(&self, mut record: MetadataRegistryRecord) -> MetadataEvent {
         let graph_iri = record.graph_iri.clone();
         let Some(net_handle) = self.inner.net_handle.clone() else {
@@ -296,21 +372,18 @@ impl MetadataHandle {
             };
         };
 
-        let batches = match export_catchup_batches(
-            self.inner.clone(),
-            &graph_iri,
-            MetadataVectorClock::default(),
-        )
-        .await
-        {
-            Ok(batches) => batches,
-            Err(error) => {
-                return MetadataEvent::Error {
-                    graph_iri: Some(graph_iri),
-                    error,
-                };
-            }
-        };
+        let batches =
+            match export_catchup_batches(self.inner.clone(), &graph_iri, VectorClock::default())
+                .await
+            {
+                Ok(batches) => batches,
+                Err(error) => {
+                    return MetadataEvent::Error {
+                        graph_iri: Some(graph_iri),
+                        error,
+                    };
+                }
+            };
 
         let mut remote_targets = Vec::new();
         let mut seen = HashSet::new();
@@ -533,18 +606,12 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             .map(|exists| MetadataEvent::ContainsGraphResult { graph_iri, exists }),
         MetadataEffect::VectorClock { graph_iri } => node
             .vector_clock(&GraphId::new(&graph_iri))
-            .map(|clock| MetadataEvent::VectorClockResult {
-                graph_iri,
-                clock: metadata_vector_clock_from_craqle(clock),
-            }),
+            .map(|clock| MetadataEvent::VectorClockResult { graph_iri, clock }),
         MetadataEffect::CatchupBatches {
             graph_iri,
             remote_clock,
         } => node
-            .catchup_batches(
-                &GraphId::new(&graph_iri),
-                &craqle_vector_clock(remote_clock),
-            )
+            .catchup_batches(&GraphId::new(&graph_iri), &remote_clock)
             .map(|batches| MetadataEvent::CatchupBatchesResult {
                 graph_iri,
                 batches: batches
@@ -554,7 +621,8 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             }),
         MetadataEffect::ReplicateBootstrap { .. }
         | MetadataEffect::ReplicateBatch { .. }
-        | MetadataEffect::ReplicateDelete { .. } => unreachable!("handled asynchronously"),
+        | MetadataEffect::ReplicateDelete { .. }
+        | MetadataEffect::SyncFromPeer { .. } => unreachable!("handled asynchronously"),
         MetadataEffect::ApplyRemoteBatch { batch } => {
             let graph_iri = batch.graph_iri.clone();
             node.apply_remote_batch(craqle_batch(batch))
@@ -1016,8 +1084,38 @@ fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
             .and_then(|graph_iris| graph_iris.first().cloned()),
         MetadataEffect::CatchupBatches { graph_iri, .. } => Some(graph_iri.clone()),
         MetadataEffect::ApplyRemoteBatch { batch } => Some(batch.graph_iri.clone()),
-        MetadataEffect::ListGraphs => None,
+        MetadataEffect::SyncFromPeer { .. } | MetadataEffect::ListGraphs => None,
     }
+}
+
+async fn fetch_catchup_data(
+    inner: Arc<MetadataInner>,
+    document_id: Ulid,
+    known_clock: VectorClock,
+) -> Result<(MetadataRegistryRecord, Vec<MetadataBatch>), MetadataError> {
+    let Some(record) =
+        read_registry_record_by_document(inner.storage_handle.clone(), document_id).await?
+    else {
+        return Err(MetadataError::Backend(format!(
+            "metadata document not found: {document_id}"
+        )));
+    };
+    let batches = export_catchup_batches(inner, &record.graph_iri, known_clock).await?;
+    Ok((record, batches))
+}
+
+async fn read_registry_record_by_document(
+    storage_handle: StorageHandle,
+    document_id: Ulid,
+) -> Result<Option<MetadataRegistryRecord>, MetadataError> {
+    let event = storage_handle
+        .send_effect(read_registry_by_document_effect(document_id, None))
+        .await;
+    parse_registry_read(event).map_err(|error| {
+        MetadataError::Backend(format!(
+            "metadata registry read by document failed: {error:?}"
+        ))
+    })
 }
 
 fn graph_ids(graph_iris: &[String]) -> Vec<GraphId> {
@@ -1073,26 +1171,6 @@ fn metadata_query_results_from_craqle(results: QueryResults) -> MetadataQueryRes
     }
 }
 
-fn metadata_vector_clock_from_craqle(clock: craqle::VectorClock) -> MetadataVectorClock {
-    MetadataVectorClock(
-        clock
-            .0
-            .into_iter()
-            .map(|(actor, counter)| (*actor.as_bytes(), counter))
-            .collect(),
-    )
-}
-
-fn craqle_vector_clock(clock: MetadataVectorClock) -> craqle::VectorClock {
-    craqle::VectorClock(
-        clock
-            .0
-            .into_iter()
-            .map(|(actor, counter)| (ActorId::from_bytes(actor), counter))
-            .collect(),
-    )
-}
-
 fn metadata_dot_from_craqle(dot: craqle::Dot) -> MetadataDot {
     MetadataDot {
         actor: *dot.actor.as_bytes(),
@@ -1112,7 +1190,7 @@ fn metadata_batch_from_craqle(batch: Batch) -> MetadataBatch {
         graph_iri: batch.graph.as_str().to_string(),
         actor: *batch.actor.as_bytes(),
         counter: batch.counter,
-        base_clock: metadata_vector_clock_from_craqle(batch.base_clock),
+        base_clock: batch.base_clock,
         ops: batch
             .ops
             .into_iter()
@@ -1137,7 +1215,7 @@ fn metadata_batch_from_craqle(batch: Batch) -> MetadataBatch {
                     subject: subject.0,
                     predicate: predicate.0,
                     object: object.0,
-                    witnessed: metadata_vector_clock_from_craqle(witnessed),
+                    witnessed,
                 },
             })
             .collect(),
@@ -1150,7 +1228,7 @@ fn craqle_batch(batch: MetadataBatch) -> Batch {
         graph: GraphId::new(&batch.graph_iri),
         actor: ActorId::from_bytes(batch.actor),
         counter: batch.counter,
-        base_clock: craqle_vector_clock(batch.base_clock),
+        base_clock: batch.base_clock,
         ops: batch
             .ops
             .into_iter()
@@ -1175,7 +1253,7 @@ fn craqle_batch(batch: MetadataBatch) -> Batch {
                     subject: craqle::EncodedTerm(subject),
                     predicate: craqle::EncodedTerm(predicate),
                     object: craqle::EncodedTerm(object),
-                    witnessed: craqle_vector_clock(witnessed),
+                    witnessed,
                 },
             })
             .collect(),
@@ -1217,16 +1295,13 @@ fn metadata_search_hit_from_craqle(
 async fn export_catchup_batches(
     inner: Arc<MetadataInner>,
     graph_iri: &str,
-    remote_clock: MetadataVectorClock,
+    remote_clock: VectorClock,
 ) -> Result<Vec<MetadataBatch>, MetadataError> {
     let graph_iri = graph_iri.to_string();
     tokio::task::spawn_blocking(move || {
         inner
             .node
-            .catchup_batches(
-                &GraphId::new(&graph_iri),
-                &craqle_vector_clock(remote_clock),
-            )
+            .catchup_batches(&GraphId::new(&graph_iri), &remote_clock)
             .map(|batches| {
                 batches
                     .into_iter()

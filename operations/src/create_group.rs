@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
+use crate::announce::AnnounceTopicOperation;
 use crate::replicate_automerge_to_realm::{
     ReplicateAutomergeDocumentsToRealmConfig, ReplicateAutomergeDocumentsToRealmOperation,
 };
@@ -220,13 +220,14 @@ impl CreateGroupOperation {
         {
             self.state = CreateGroupState::AnnounceGroupDoc;
             smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceAutomergeDocumentOperation::new(
+                AnnounceTopicOperation::new(
                     AutomergeDocumentVariant::Group {
                         group_id: group.group_id,
-                    },
+                    }
+                    .topic_id(),
                     self.config.actor.node_id,
                 ),
-                |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
             ))]
@@ -237,28 +238,30 @@ impl CreateGroupOperation {
 
     fn handle_announce_group_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 CreateGroupState::AnnounceGroupDoc,
-                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
                 got,
             );
         };
 
         if let Err(error) = result {
-            return self.fail(CreateGroupError::AutomergeState(error));
+            return self.fail(CreateGroupError::TopicAnnouncement(error));
         }
 
         if let Some(group) = &self.group {
             self.state = CreateGroupState::AnnounceAuthDoc;
             smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceAutomergeDocumentOperation::new(
+                AnnounceTopicOperation::new(
                     AutomergeDocumentVariant::GroupAuthorization {
                         group_id: group.group_id,
-                    },
+                    }
+                    .topic_id(),
                     self.config.actor.node_id,
                 ),
-                |result| Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
             ))]
@@ -269,16 +272,17 @@ impl CreateGroupOperation {
 
     fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
             return self.unexpected_event(
                 CreateGroupState::AnnounceAuthDoc,
-                "Event::SubOperation(SubOperationEvent::AutomergeStateResult)",
+                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
                 got,
             );
         };
 
         if let Err(error) = result {
-            return self.fail(CreateGroupError::AutomergeState(error));
+            return self.fail(CreateGroupError::TopicAnnouncement(error));
         }
 
         if let Some(group) = &self.group {
@@ -359,8 +363,8 @@ pub enum CreateGroupError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("automerge replication failed: {0}")]
     AutomergeSync(String),
     #[error("No transaction found")]

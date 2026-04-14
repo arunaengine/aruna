@@ -39,7 +39,7 @@ pub enum SubOperationEvent {
     AutomergeSyncResult {
         result: Result<(), String>,
     },
-    AutomergeStateResult {
+    TopicAnnouncementResult {
         result: Result<(), String>,
     },
 }

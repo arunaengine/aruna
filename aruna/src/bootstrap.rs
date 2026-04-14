@@ -6,8 +6,8 @@ use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::OnboardingSyncTicket;
-use aruna_core::{AutomergeTopicId, NodeId, TopicId};
-use aruna_operations::automerge_announce::AnnounceAutomergeDocumentOperation;
+use aruna_core::{NodeId, TopicId};
+use aruna_operations::announce::AnnounceTopicOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::outgoing_automerge::OutgoingAutomergeOperation;
 use byteview::ByteView;
@@ -43,20 +43,11 @@ pub async fn announce_core_documents(
     node_id: NodeId,
     realm_id: &aruna_core::structs::RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for document in [
-        AutomergeDocumentVariant::RealmAuthorization {
-            realm_id: realm_id.clone(),
-        },
-        AutomergeDocumentVariant::RealmConfig {
-            realm_id: realm_id.clone(),
-        },
-    ] {
-        drive(
-            AnnounceAutomergeDocumentOperation::new(document, node_id),
-            driver_ctx,
-        )
-        .await?;
-    }
+    drive(
+        AnnounceTopicOperation::new(TopicId::realm(realm_id.clone()), node_id),
+        driver_ctx,
+    )
+    .await?;
 
     Ok(())
 }
@@ -77,30 +68,21 @@ pub async fn fetch_core_onboarding_documents(
         .ok_or("missing onboarding sync ticket")?;
     let onboarding_sync_ticket = OnboardingSyncTicket::decode(onboarding_sync_ticket)?;
 
-    for topic in [
-        TopicId::automerge_document(AutomergeTopicId::RealmAuthorization {
-            realm_id: realm_id.clone(),
-        }),
-        TopicId::automerge_document(AutomergeTopicId::RealmConfig {
-            realm_id: realm_id.clone(),
-        }),
-    ] {
-        match net_handle
-            .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-                topic: topic.clone(),
-            })))
-            .await
-        {
-            Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. })) => {}
-            Event::Net(NetEvent::Gossip(GossipEvent::Error {
-                error: GossipError::AlreadySubscribed,
-            })) => {}
-            Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => {
-                return Err(error.to_string().into());
-            }
-            Event::Net(NetEvent::Error(error)) => return Err(format!("{error:?}").into()),
-            other => return Err(format!("unexpected gossip subscribe result: {other:?}").into()),
+    match net_handle
+        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
+            topic: TopicId::realm(realm_id.clone()),
+        })))
+        .await
+    {
+        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. })) => {}
+        Event::Net(NetEvent::Gossip(GossipEvent::Error {
+            error: GossipError::AlreadySubscribed,
+        })) => {}
+        Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => {
+            return Err(error.to_string().into());
         }
+        Event::Net(NetEvent::Error(error)) => return Err(format!("{error:?}").into()),
+        other => return Err(format!("unexpected gossip subscribe result: {other:?}").into()),
     }
 
     for document in [

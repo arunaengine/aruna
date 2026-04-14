@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
+use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{AuthContext, MetadataRegistryRecord};
@@ -74,8 +76,36 @@ pub struct MetadataDot {
     pub counter: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataVectorClock(pub BTreeMap<[u8; 32], u64>);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataClockRelation {
+    Equal,
+    LocalAhead,
+    RemoteAhead,
+    Concurrent,
+}
+
+pub fn compare_metadata_clocks(local: &VectorClock, remote: &VectorClock) -> MetadataClockRelation {
+    let mut local_ahead = false;
+    let mut remote_ahead = false;
+
+    for actor in local.0.keys().chain(remote.0.keys()) {
+        let local = local.0.get(actor).copied().unwrap_or_default();
+        let remote = remote.0.get(actor).copied().unwrap_or_default();
+        if local > remote {
+            local_ahead = true;
+        }
+        if remote > local {
+            remote_ahead = true;
+        }
+    }
+
+    match (local_ahead, remote_ahead) {
+        (false, false) => MetadataClockRelation::Equal,
+        (true, false) => MetadataClockRelation::LocalAhead,
+        (false, true) => MetadataClockRelation::RemoteAhead,
+        (true, true) => MetadataClockRelation::Concurrent,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataQuadOp {
@@ -89,7 +119,7 @@ pub enum MetadataQuadOp {
         subject: String,
         predicate: String,
         object: String,
-        witnessed: MetadataVectorClock,
+        witnessed: VectorClock,
     },
 }
 
@@ -98,7 +128,7 @@ pub struct MetadataBatch {
     pub graph_iri: String,
     pub actor: [u8; 32],
     pub counter: u64,
-    pub base_clock: MetadataVectorClock,
+    pub base_clock: VectorClock,
     pub ops: Vec<MetadataQuadOp>,
     pub timestamp_millis: i64,
 }
@@ -166,7 +196,12 @@ pub enum MetadataEffect {
     },
     CatchupBatches {
         graph_iri: String,
-        remote_clock: MetadataVectorClock,
+        remote_clock: VectorClock,
+    },
+    SyncFromPeer {
+        node_id: NodeId,
+        document_id: Ulid,
+        known_clock: VectorClock,
     },
     ReplicateBootstrap {
         record: MetadataRegistryRecord,
@@ -234,11 +269,15 @@ pub enum MetadataEvent {
     },
     VectorClockResult {
         graph_iri: String,
-        clock: MetadataVectorClock,
+        clock: VectorClock,
     },
     CatchupBatchesResult {
         graph_iri: String,
         batches: Vec<MetadataBatch>,
+    },
+    PeerSyncApplied {
+        document_id: Ulid,
+        graph_iri: String,
     },
     BootstrapReplicated {
         graph_iri: String,
@@ -275,4 +314,36 @@ pub enum MetadataError {
     InvalidInput(String),
     #[error("metadata backend error: {0}")]
     Backend(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MetadataClockRelation, compare_metadata_clocks};
+    use craqle::{ActorId, VectorClock};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn compares_metadata_vector_clocks() {
+        let empty = VectorClock::default();
+        let local = VectorClock(BTreeMap::from([(ActorId::from_bytes([1u8; 32]), 2)]));
+        let remote = VectorClock(BTreeMap::from([(ActorId::from_bytes([1u8; 32]), 1)]));
+        let concurrent = VectorClock(BTreeMap::from([(ActorId::from_bytes([2u8; 32]), 1)]));
+
+        assert_eq!(
+            compare_metadata_clocks(&empty, &empty),
+            MetadataClockRelation::Equal
+        );
+        assert_eq!(
+            compare_metadata_clocks(&local, &remote),
+            MetadataClockRelation::LocalAhead
+        );
+        assert_eq!(
+            compare_metadata_clocks(&remote, &local),
+            MetadataClockRelation::RemoteAhead
+        );
+        assert_eq!(
+            compare_metadata_clocks(&local, &concurrent),
+            MetadataClockRelation::Concurrent
+        );
+    }
 }

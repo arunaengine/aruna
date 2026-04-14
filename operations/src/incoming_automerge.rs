@@ -10,8 +10,8 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
+use crate::announce::AnnounceTopicOperation;
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
-use crate::automerge_announce::AnnounceAutomergeDocumentOperation;
 use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
@@ -52,8 +52,8 @@ pub enum IncomingAutomergeError {
     ConversionError(#[from] ConversionError),
     #[error("automerge sync error: {0:?}")]
     Sync(AutomergeSyncError),
-    #[error("automerge announcement failed: {0}")]
-    AutomergeState(String),
+    #[error("topic announcement failed: {0}")]
+    TopicAnnouncement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -280,12 +280,12 @@ impl Operation for IncomingAutomergeOperation {
                     };
                     self.state = IncomingAutomergeState::Announce;
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceAutomergeDocumentOperation::new(
-                            remote_init.document.clone(),
+                        AnnounceTopicOperation::new(
+                            remote_init.document.topic_id(),
                             self.local_node_id,
                         ),
                         |result| {
-                            Event::SubOperation(SubOperationEvent::AutomergeStateResult {
+                            Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
                                 result: result.map_err(|error| error.to_string()),
                             })
                         },
@@ -298,14 +298,14 @@ impl Operation for IncomingAutomergeOperation {
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             IncomingAutomergeState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeStateResult { result }) => {
+                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
                     match result {
                         Ok(()) => {
                             self.state = IncomingAutomergeState::Finish;
                             self.output = Some(Ok(()));
                             smallvec![]
                         }
-                        Err(error) => self.fail(IncomingAutomergeError::AutomergeState(error)),
+                        Err(error) => self.fail(IncomingAutomergeError::TopicAnnouncement(error)),
                     }
                 }
                 other => {

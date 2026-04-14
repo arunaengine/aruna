@@ -5,6 +5,7 @@ pub mod automerge;
 pub mod effects;
 pub mod errors;
 pub mod events;
+pub mod gossip;
 pub mod handle;
 pub mod id;
 pub mod keys;
@@ -20,9 +21,10 @@ pub mod util;
 
 pub use automerge::{
     AutomergeClock, AutomergeDocumentVariant, AutomergeEffect, AutomergeEvent, AutomergeInit,
-    AutomergeRejectReason, AutomergeState, AutomergeSyncError, AutomergeSyncFeature, InitAuthProof,
+    AutomergeRejectReason, AutomergeSyncError, AutomergeSyncFeature, InitAuthProof,
 };
-pub use id::{AutomergeTopicId, DhtKeyId, NodeId, NodeIdExt, TopicId};
+pub use gossip::{TopicMessage, TopicMessageKind, TopicMessageVersion};
+pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
 pub use keyspaces::*;
 pub use metadata::*;
 pub use onboarding::*;

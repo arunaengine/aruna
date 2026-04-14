@@ -21,9 +21,7 @@ use tracing::{trace, warn};
 
 use crate::DhtHandle;
 use crate::error::{NetError, Result};
-use aruna_core::AutomergeDocumentVariant;
 use aruna_core::DhtKeyId;
-use aruna_core::keys::automerge_document_holder_key;
 use aruna_core::keys::gossip_peer_key;
 
 const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
@@ -420,12 +418,7 @@ async fn lookup_bootstrap_candidates_owned(
     topic: &TopicId,
 ) -> Result<Vec<NodeId>> {
     let topic_key = gossip_peer_key(topic);
-    let mut candidates = lookup_nodes_for_key_owned(dht, &topic_key, local_realm_id).await?;
-    if let Some(document) = AutomergeDocumentVariant::from_topic_id(topic) {
-        let holder_key = automerge_document_holder_key(&document);
-        candidates.extend(lookup_nodes_for_key_owned(dht, &holder_key, local_realm_id).await?);
-    }
-    Ok(candidates)
+    lookup_nodes_for_key_owned(dht, &topic_key, local_realm_id).await
 }
 
 async fn lookup_nodes_for_key_owned(
@@ -482,20 +475,6 @@ async fn announce_topic_subscription(
     )
     .await
     .map_err(|e| NetError::Gossip(format!("Failed to announce gossip topic in DHT: {e}")))?;
-
-    if let Some(document) = AutomergeDocumentVariant::from_topic_id(topic) {
-        let document_key = automerge_document_holder_key(&document);
-        dht.put(
-            &document_key,
-            local_realm_id.clone(),
-            local_node_id.as_bytes().to_vec(),
-            GOSSIP_TOPIC_ANNOUNCE_TTL,
-        )
-        .await
-        .map_err(|e| {
-            NetError::Gossip(format!("Failed to announce automerge document in DHT: {e}"))
-        })?;
-    }
 
     Ok(())
 }

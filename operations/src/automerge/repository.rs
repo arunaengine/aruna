@@ -5,16 +5,13 @@ use aruna_core::automerge::{AutomergeClock, AutomergeDocumentVariant};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_KEYSPACE, REALM_CONFIG_KEYSPACE,
-};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::RealmId;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 
 pub fn storage_keyspace(document: &AutomergeDocumentVariant) -> &'static str {
     match document {
         AutomergeDocumentVariant::Group { .. } => GROUP_KEYSPACE,
-        AutomergeDocumentVariant::Metadata { .. } => METADATA_KEYSPACE,
         AutomergeDocumentVariant::GroupAuthorization { .. }
         | AutomergeDocumentVariant::RealmAuthorization { .. } => AUTH_KEYSPACE,
         AutomergeDocumentVariant::RealmConfig { .. } => REALM_CONFIG_KEYSPACE,
@@ -26,15 +23,6 @@ pub fn storage_key(document: &AutomergeDocumentVariant) -> Key {
         AutomergeDocumentVariant::Group { group_id } => {
             ByteView::from(group_id.to_bytes().to_vec())
         }
-        AutomergeDocumentVariant::Metadata {
-            group_id,
-            document_id,
-        } => {
-            let mut bytes = Vec::with_capacity(32);
-            bytes.extend_from_slice(&group_id.to_bytes());
-            bytes.extend_from_slice(&document_id.to_bytes());
-            ByteView::from(bytes)
-        }
         AutomergeDocumentVariant::GroupAuthorization { group_id } => {
             ByteView::from(group_id.to_bytes().to_vec())
         }
@@ -45,10 +33,6 @@ pub fn storage_key(document: &AutomergeDocumentVariant) -> Key {
             ByteView::from(realm_id.as_bytes().to_vec())
         }
     }
-}
-
-pub fn metadata_prefix(group_id: GroupId) -> Key {
-    ByteView::from(group_id.to_bytes().to_vec())
 }
 
 pub fn read_effect(document: &AutomergeDocumentVariant, txn_id: Option<TxnId>) -> Effect {
@@ -80,21 +64,6 @@ pub fn delete_effect(document: &AutomergeDocumentVariant, txn_id: Option<TxnId>)
     })
 }
 
-pub fn iter_metadata_effect(
-    group_id: GroupId,
-    txn_id: Option<TxnId>,
-    start_after: Option<Key>,
-    limit: usize,
-) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: METADATA_KEYSPACE.to_string(),
-        prefix: Some(metadata_prefix(group_id)),
-        start_after,
-        limit,
-        txn_id,
-    })
-}
-
 pub fn parse_document_bytes(event: Event) -> Result<Option<Vec<u8>>, StorageError> {
     match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => {
@@ -118,34 +87,6 @@ pub fn automerge_clock(bytes: &[u8]) -> Result<AutomergeClock, ConversionError> 
     let heads = doc.get_heads();
     let change_count = doc.get_changes(&[]).len() as u64;
     Ok(AutomergeClock::new(heads, change_count))
-}
-
-pub fn parse_metadata_iter(
-    values: Vec<(Key, ByteView)>,
-) -> Result<Vec<AutomergeDocumentVariant>, ConversionError> {
-    values
-        .into_iter()
-        .map(|(key, _)| parse_metadata_key(&key))
-        .collect()
-}
-
-pub fn parse_metadata_key(key: &[u8]) -> Result<AutomergeDocumentVariant, ConversionError> {
-    if key.len() != 32 {
-        return Err(ConversionError::InvalidLength(format!(
-            "expected 32 metadata key bytes, got {}",
-            key.len()
-        )));
-    }
-
-    let mut group_bytes = [0u8; 16];
-    group_bytes.copy_from_slice(&key[..16]);
-    let mut document_bytes = [0u8; 16];
-    document_bytes.copy_from_slice(&key[16..]);
-
-    Ok(AutomergeDocumentVariant::Metadata {
-        group_id: GroupId::from_bytes(group_bytes),
-        document_id: GroupId::from_bytes(document_bytes),
-    })
 }
 
 pub fn parse_auth_document(key: &[u8]) -> Result<AutomergeDocumentVariant, ConversionError> {
