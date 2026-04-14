@@ -313,6 +313,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "craqle",
  "ed25519-dalek 2.2.0",
  "fjall",
  "hex",

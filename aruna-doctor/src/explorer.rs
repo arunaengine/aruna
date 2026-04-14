@@ -5,9 +5,11 @@ use aruna_api::server_state::{
 };
 use aruna_core::id::{DhtKeyId, TopicId};
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, AUTH_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
-    NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE,
-    S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
+    API_STATE_KEYSPACE, AUTH_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
+    CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
+    GROUP_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
+    USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
@@ -16,17 +18,25 @@ use aruna_core::structs::{
     VersionMetadata,
 };
 use aruna_net::dht::storage::StoredEntry;
+use chrono::{DateTime, Utc};
+use craqle::{
+    ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
+    VectorClock as CraqleVectorClock,
+};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
-use serde::Serialize;
 use serde::ser::{SerializeStruct, Serializer};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use ulid::Ulid;
 
-const CRAQLE_TERMS_KEYSPACE: &str = "terms";
-const CRAQLE_QUADS_KEYSPACE: &str = "quads";
-const CRAQLE_GRAPHS_KEYSPACE: &str = "graphs";
-const CRAQLE_LOG_KEYSPACE: &str = "log";
+const CRAQLE_DOT_ENCODING_TAG: u8 = b'D';
+const CRAQLE_BATCH_LOG_ENCODING_TAG: u8 = b'B';
+const CRAQLE_GRAPH_META_PREFIX: u8 = b'M';
+const CRAQLE_GRAPH_DIRTY_PREFIX: u8 = b'D';
+const CRAQLE_GRAPH_REINDEX_PREFIX: u8 = b'R';
+const CRAQLE_LOG_HEAD_PREFIX: u8 = b'H';
+const CRAQLE_LOG_BATCH_PREFIX: u8 = b'B';
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExplorerError {
@@ -72,6 +82,14 @@ enum DecodedField {
     RealmId { value: String },
     #[serde(rename = "dht_key")]
     DhtKeyId { value: String },
+    #[serde(rename = "craqle_term_id")]
+    CraqleTermId { value: String },
+    #[serde(rename = "craqle_quad_key")]
+    CraqleQuadKey { value: JsonCraqleQuadKey },
+    #[serde(rename = "craqle_graph_key")]
+    CraqleGraphKey { value: JsonCraqleGraphKey },
+    #[serde(rename = "craqle_log_key")]
+    CraqleLogKey { value: JsonCraqleLogKey },
     #[serde(rename = "utf8")]
     Utf8 { value: String },
     #[serde(rename = "lookup_key")]
@@ -133,11 +151,188 @@ enum DecodedValue {
     DhtEntries {
         data: Vec<JsonStoredEntry>,
     },
+    CraqleTerm {
+        data: String,
+    },
+    CraqleQuadDots {
+        data: Vec<JsonCraqleDot>,
+    },
+    CraqleGraphMeta {
+        data: JsonCraqleGraphMeta,
+    },
+    CraqleGraphDirtyToken {
+        data: u64,
+    },
+    CraqleGraphReindexToken {
+        data: u64,
+    },
+    CraqleLogHead {
+        data: u64,
+    },
+    CraqleLogBatch {
+        data: JsonCraqleStoredBatch,
+    },
     Raw {
         hex: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         decode_error: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct CraqleTermId(u128);
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct CraqleStoredGraphMeta {
+    policy: CraqleGraphPolicy,
+    clock: CraqleVectorClock,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum CraqleStoredQuadOp {
+    Add {
+        subject: CraqleTermId,
+        predicate: CraqleTermId,
+        object: CraqleTermId,
+        dot: CraqleDot,
+    },
+    Remove {
+        subject: CraqleTermId,
+        predicate: CraqleTermId,
+        object: CraqleTermId,
+        witnessed: CraqleVectorClock,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct CraqleStoredBatch {
+    actor: CraqleActorId,
+    counter: u64,
+    base_clock: CraqleVectorClock,
+    ops: Vec<CraqleStoredQuadOp>,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CraqleQuadKeyParts {
+    graph: CraqleTermId,
+    subject: CraqleTermId,
+    predicate: CraqleTermId,
+    object: CraqleTermId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CraqleGraphKeyParts {
+    Meta {
+        graph: CraqleTermId,
+    },
+    Dirty {
+        graph: CraqleTermId,
+        subject: CraqleTermId,
+    },
+    Reindex {
+        graph: CraqleTermId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CraqleLogKeyParts {
+    Head {
+        graph: CraqleTermId,
+        actor: CraqleActorId,
+    },
+    Batch {
+        graph: CraqleTermId,
+        actor: CraqleActorId,
+        counter: u64,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleQuadKey {
+    graph: String,
+    subject: String,
+    predicate: String,
+    object: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum JsonCraqleGraphKey {
+    Meta { graph: String },
+    Dirty { graph: String, subject: String },
+    Reindex { graph: String },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum JsonCraqleLogKey {
+    Head {
+        graph: String,
+        actor: String,
+    },
+    Batch {
+        graph: String,
+        actor: String,
+        counter: u64,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleClockEntry {
+    actor: String,
+    counter: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleVectorClock {
+    entries: Vec<JsonCraqleClockEntry>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleDot {
+    actor: String,
+    counter: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleGraphPolicy {
+    public: bool,
+    permission_paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleGraphMeta {
+    graph: String,
+    policy: JsonCraqleGraphPolicy,
+    clock: JsonCraqleVectorClock,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum JsonCraqleStoredBatchOp {
+    Add {
+        subject: String,
+        predicate: String,
+        object: String,
+        dot: JsonCraqleDot,
+    },
+    Remove {
+        subject: String,
+        predicate: String,
+        object: String,
+        witnessed: JsonCraqleVectorClock,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleStoredBatch {
+    graph: String,
+    actor: String,
+    counter: u64,
+    base_clock: JsonCraqleVectorClock,
+    ops: Vec<JsonCraqleStoredBatchOp>,
+    timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -295,6 +490,283 @@ impl Serialize for JsonUserIdentity<'_> {
     }
 }
 
+fn craqle_term_id_string(id: CraqleTermId) -> String {
+    format!("{:032x}", id.0)
+}
+
+fn decode_craqle_term_id(bytes: &[u8], context: &'static str) -> Result<CraqleTermId, String> {
+    let raw: [u8; 16] = bytes.try_into().map_err(|_| {
+        format!(
+            "invalid {context}: expected 16 bytes, found {}",
+            bytes.len()
+        )
+    })?;
+    Ok(CraqleTermId(u128::from_be_bytes(raw)))
+}
+
+fn decode_craqle_u64(bytes: &[u8], context: &'static str) -> Result<u64, String> {
+    let raw: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| format!("invalid {context}: expected 8 bytes, found {}", bytes.len()))?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn json_craqle_quad_key(parts: CraqleQuadKeyParts) -> JsonCraqleQuadKey {
+    JsonCraqleQuadKey {
+        graph: craqle_term_id_string(parts.graph),
+        subject: craqle_term_id_string(parts.subject),
+        predicate: craqle_term_id_string(parts.predicate),
+        object: craqle_term_id_string(parts.object),
+    }
+}
+
+fn json_craqle_graph_key(parts: CraqleGraphKeyParts) -> JsonCraqleGraphKey {
+    match parts {
+        CraqleGraphKeyParts::Meta { graph } => JsonCraqleGraphKey::Meta {
+            graph: craqle_term_id_string(graph),
+        },
+        CraqleGraphKeyParts::Dirty { graph, subject } => JsonCraqleGraphKey::Dirty {
+            graph: craqle_term_id_string(graph),
+            subject: craqle_term_id_string(subject),
+        },
+        CraqleGraphKeyParts::Reindex { graph } => JsonCraqleGraphKey::Reindex {
+            graph: craqle_term_id_string(graph),
+        },
+    }
+}
+
+fn json_craqle_log_key(parts: CraqleLogKeyParts) -> JsonCraqleLogKey {
+    match parts {
+        CraqleLogKeyParts::Head { graph, actor } => JsonCraqleLogKey::Head {
+            graph: craqle_term_id_string(graph),
+            actor: actor.to_string(),
+        },
+        CraqleLogKeyParts::Batch {
+            graph,
+            actor,
+            counter,
+        } => JsonCraqleLogKey::Batch {
+            graph: craqle_term_id_string(graph),
+            actor: actor.to_string(),
+            counter,
+        },
+    }
+}
+
+fn json_craqle_dot(dot: CraqleDot) -> JsonCraqleDot {
+    JsonCraqleDot {
+        actor: dot.actor.to_string(),
+        counter: dot.counter,
+    }
+}
+
+fn json_craqle_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
+    JsonCraqleVectorClock {
+        entries: clock
+            .0
+            .into_iter()
+            .map(|(actor, counter)| JsonCraqleClockEntry {
+                actor: actor.to_string(),
+                counter,
+            })
+            .collect(),
+    }
+}
+
+fn json_craqle_graph_policy(policy: CraqleGraphPolicy) -> JsonCraqleGraphPolicy {
+    let mut permission_paths = policy.permission_paths;
+    permission_paths.sort();
+    permission_paths.dedup();
+    JsonCraqleGraphPolicy {
+        public: policy.public,
+        permission_paths,
+    }
+}
+
+fn json_craqle_graph_meta(graph: CraqleTermId, meta: CraqleStoredGraphMeta) -> JsonCraqleGraphMeta {
+    JsonCraqleGraphMeta {
+        graph: craqle_term_id_string(graph),
+        policy: json_craqle_graph_policy(meta.policy),
+        clock: json_craqle_vector_clock(meta.clock),
+    }
+}
+
+fn json_craqle_stored_batch(
+    graph: CraqleTermId,
+    batch: CraqleStoredBatch,
+) -> JsonCraqleStoredBatch {
+    JsonCraqleStoredBatch {
+        graph: craqle_term_id_string(graph),
+        actor: batch.actor.to_string(),
+        counter: batch.counter,
+        base_clock: json_craqle_vector_clock(batch.base_clock),
+        ops: batch
+            .ops
+            .into_iter()
+            .map(|op| match op {
+                CraqleStoredQuadOp::Add {
+                    subject,
+                    predicate,
+                    object,
+                    dot,
+                } => JsonCraqleStoredBatchOp::Add {
+                    subject: craqle_term_id_string(subject),
+                    predicate: craqle_term_id_string(predicate),
+                    object: craqle_term_id_string(object),
+                    dot: json_craqle_dot(dot),
+                },
+                CraqleStoredQuadOp::Remove {
+                    subject,
+                    predicate,
+                    object,
+                    witnessed,
+                } => JsonCraqleStoredBatchOp::Remove {
+                    subject: craqle_term_id_string(subject),
+                    predicate: craqle_term_id_string(predicate),
+                    object: craqle_term_id_string(object),
+                    witnessed: json_craqle_vector_clock(witnessed),
+                },
+            })
+            .collect(),
+        timestamp: batch.timestamp,
+    }
+}
+
+fn decode_craqle_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
+    if key.len() != 64 {
+        return Err(format!(
+            "invalid craqle quad key: expected 64 bytes, found {}",
+            key.len()
+        ));
+    }
+    Ok(CraqleQuadKeyParts {
+        graph: decode_craqle_term_id(&key[0..16], "craqle quad graph")?,
+        subject: decode_craqle_term_id(&key[16..32], "craqle quad subject")?,
+        predicate: decode_craqle_term_id(&key[32..48], "craqle quad predicate")?,
+        object: decode_craqle_term_id(&key[48..64], "craqle quad object")?,
+    })
+}
+
+fn decode_craqle_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
+    match key.first().copied() {
+        Some(CRAQLE_GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Meta {
+            graph: decode_craqle_term_id(&key[1..17], "craqle graph meta graph")?,
+        }),
+        Some(CRAQLE_GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphKeyParts::Dirty {
+            graph: decode_craqle_term_id(&key[1..17], "craqle graph dirty graph")?,
+            subject: decode_craqle_term_id(&key[17..33], "craqle graph dirty subject")?,
+        }),
+        Some(CRAQLE_GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Reindex {
+            graph: decode_craqle_term_id(&key[1..17], "craqle graph reindex graph")?,
+        }),
+        Some(prefix) => Err(format!(
+            "invalid craqle graph key prefix `{}` with length {}",
+            prefix as char,
+            key.len()
+        )),
+        None => Err("invalid craqle graph key: empty key".to_string()),
+    }
+}
+
+fn decode_craqle_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
+    match key.first().copied() {
+        Some(CRAQLE_LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogKeyParts::Head {
+            graph: decode_craqle_term_id(&key[1..17], "craqle log head graph")?,
+            actor: CraqleActorId::from_bytes(
+                key[17..49]
+                    .try_into()
+                    .map_err(|_| "invalid craqle log head actor".to_string())?,
+            ),
+        }),
+        Some(CRAQLE_LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogKeyParts::Batch {
+            graph: decode_craqle_term_id(&key[1..17], "craqle log batch graph")?,
+            actor: CraqleActorId::from_bytes(
+                key[17..49]
+                    .try_into()
+                    .map_err(|_| "invalid craqle log batch actor".to_string())?,
+            ),
+            counter: decode_craqle_u64(&key[49..57], "craqle log batch counter")?,
+        }),
+        Some(prefix) => Err(format!(
+            "invalid craqle log key prefix `{}` with length {}",
+            prefix as char,
+            key.len()
+        )),
+        None => Err("invalid craqle log key: empty key".to_string()),
+    }
+}
+
+fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
+    let dots = if value.first().copied() == Some(CRAQLE_DOT_ENCODING_TAG) {
+        if !(value.len() - 1).is_multiple_of(40) {
+            return Err(format!("invalid craqle dot payload length {}", value.len()));
+        }
+        value[1..]
+            .chunks_exact(40)
+            .map(|chunk| {
+                Ok(CraqleDot {
+                    actor: CraqleActorId::from_bytes(chunk[0..32].try_into().unwrap()),
+                    counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        postcard::from_bytes::<Vec<CraqleDot>>(value).map_err(|error| error.to_string())?
+    };
+    Ok(dots.into_iter().map(json_craqle_dot).collect())
+}
+
+fn decode_craqle_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match decode_craqle_graph_key(key) {
+        Ok(CraqleGraphKeyParts::Meta { graph }) => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<CraqleStoredGraphMeta>(bytes),
+            |data| DecodedValue::CraqleGraphMeta {
+                data: json_craqle_graph_meta(graph, data),
+            },
+        ),
+        Ok(CraqleGraphKeyParts::Dirty { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle graph dirty token"),
+            |data| DecodedValue::CraqleGraphDirtyToken { data },
+        ),
+        Ok(CraqleGraphKeyParts::Reindex { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle graph reindex token"),
+            |data| DecodedValue::CraqleGraphReindexToken { data },
+        ),
+        Err(error) => raw_value(value, Some(error)),
+    }
+}
+
+fn decode_craqle_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredBatch, String> {
+    let CraqleLogKeyParts::Batch { graph, .. } = decode_craqle_log_key(key)? else {
+        return Err("craqle log batch value requires a batch key".to_string());
+    };
+    if value.first().copied() != Some(CRAQLE_BATCH_LOG_ENCODING_TAG) {
+        return Err("unsupported craqle log batch encoding".to_string());
+    }
+    let batch = postcard::from_bytes::<CraqleStoredBatch>(&value[1..])
+        .map_err(|error| error.to_string())?;
+    Ok(json_craqle_stored_batch(graph, batch))
+}
+
+fn decode_craqle_log_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match decode_craqle_log_key(key) {
+        Ok(CraqleLogKeyParts::Head { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle log head"),
+            |data| DecodedValue::CraqleLogHead { data },
+        ),
+        Ok(CraqleLogKeyParts::Batch { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_log_batch(key, bytes),
+            |data| DecodedValue::CraqleLogBatch { data },
+        ),
+        Err(error) => raw_value(value, Some(error)),
+    }
+}
+
 pub async fn explore_keyspaces(database_path: String) -> Result<(), CliError> {
     let output = tokio::task::spawn_blocking({
         let database_path = database_path.clone();
@@ -408,6 +880,26 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
     match keyspace_name {
         GROUP_KEYSPACE | AUTH_KEYSPACE => decode_ulid_key(key),
         REALM_KEYSPACE | REALM_CONFIG_KEYSPACE => decode_realm_id_key(key),
+        CRAQLE_TERMS_KEYSPACE => decode_craqle_term_id(key, "craqle term key")
+            .map(|value| DecodedField::CraqleTermId {
+                value: craqle_term_id_string(value),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        CRAQLE_QUADS_KEYSPACE => decode_craqle_quad_key(key)
+            .map(|value| DecodedField::CraqleQuadKey {
+                value: json_craqle_quad_key(value),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        CRAQLE_GRAPHS_KEYSPACE => decode_craqle_graph_key(key)
+            .map(|value| DecodedField::CraqleGraphKey {
+                value: json_craqle_graph_key(value),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        CRAQLE_LOG_KEYSPACE => decode_craqle_log_key(key)
+            .map(|value| DecodedField::CraqleLogKey {
+                value: json_craqle_log_key(value),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
         USER_ACCESS_KEYSPACE
         | S3_BUCKET_KEYSPACE
         | API_STATE_KEYSPACE
@@ -469,6 +961,16 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             |bytes| postcard::from_bytes::<OnboardingSecretRecord>(bytes),
             |data| DecodedValue::OnboardingSecretRecord { data },
         ),
+        CRAQLE_TERMS_KEYSPACE => decode_value_with(
+            value,
+            |bytes| String::from_utf8(bytes.to_vec()),
+            |data| DecodedValue::CraqleTerm { data },
+        ),
+        CRAQLE_QUADS_KEYSPACE => decode_value_with(value, decode_craqle_dots, |data| {
+            DecodedValue::CraqleQuadDots { data }
+        }),
+        CRAQLE_GRAPHS_KEYSPACE => decode_craqle_graph_value(key, value),
+        CRAQLE_LOG_KEYSPACE => decode_craqle_log_value(key, value),
         DHT_KEYSPACE => decode_value_with(value, decode_dht_entries, |data| {
             DecodedValue::DhtEntries { data }
         }),
@@ -609,8 +1111,11 @@ fn raw_value(value: &[u8], decode_error: Option<String>) -> DecodedValue {
 #[cfg(test)]
 mod tests {
     use super::{
-        CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE,
-        DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces, raw_field,
+        CRAQLE_BATCH_LOG_ENCODING_TAG, CRAQLE_DOT_ENCODING_TAG, CRAQLE_GRAPH_META_PREFIX,
+        CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
+        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
+        CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
+        raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -625,7 +1130,13 @@ mod tests {
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{Actor, Group, Realm, RealmId};
     use aruna_net::dht::storage::StoredEntry;
+    use chrono::{DateTime, Utc};
+    use craqle::{
+        ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
+        VectorClock as CraqleVectorClock,
+    };
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -896,6 +1407,177 @@ mod tests {
                 assert_eq!(data[0].0.value, vec![1, 2, 3, 4]);
             }
             other => panic!("expected dht entries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_craqle_term_entry() {
+        let term_id = 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10_u128;
+        let decoded = decode_entry(
+            CRAQLE_TERMS_KEYSPACE,
+            &term_id.to_be_bytes(),
+            b"<https://example.org/dataset>",
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::CraqleTermId {
+                value: format!("{term_id:032x}")
+            }
+        );
+        match decoded.value {
+            DecodedValue::CraqleTerm { data } => {
+                assert_eq!(data, "<https://example.org/dataset>")
+            }
+            other => panic!("expected craqle term, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_craqle_quad_entry() {
+        let graph = 1_u128;
+        let subject = 2_u128;
+        let predicate = 3_u128;
+        let object = 4_u128;
+        let actor = CraqleActorId::from_bytes([8_u8; 32]);
+
+        let mut key = Vec::new();
+        key.extend_from_slice(&graph.to_be_bytes());
+        key.extend_from_slice(&subject.to_be_bytes());
+        key.extend_from_slice(&predicate.to_be_bytes());
+        key.extend_from_slice(&object.to_be_bytes());
+
+        let mut value = vec![CRAQLE_DOT_ENCODING_TAG];
+        value.extend_from_slice(actor.as_bytes());
+        value.extend_from_slice(&7_u64.to_be_bytes());
+
+        let decoded = decode_entry(CRAQLE_QUADS_KEYSPACE, &key, &value);
+        assert_eq!(
+            decoded.key,
+            DecodedField::CraqleQuadKey {
+                value: super::JsonCraqleQuadKey {
+                    graph: format!("{graph:032x}"),
+                    subject: format!("{subject:032x}"),
+                    predicate: format!("{predicate:032x}"),
+                    object: format!("{object:032x}"),
+                }
+            }
+        );
+        match decoded.value {
+            DecodedValue::CraqleQuadDots { data } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0].actor, actor.to_string());
+                assert_eq!(data[0].counter, 7);
+            }
+            other => panic!("expected craqle quad dots, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_craqle_graph_meta_entry() {
+        let graph = 9_u128;
+        let actor = CraqleActorId::from_bytes([5_u8; 32]);
+        let mut key = vec![CRAQLE_GRAPH_META_PREFIX];
+        key.extend_from_slice(&graph.to_be_bytes());
+
+        let value = postcard::to_allocvec(&CraqleStoredGraphMeta {
+            policy: CraqleGraphPolicy {
+                public: true,
+                permission_paths: vec!["/b".to_string(), "/a".to_string(), "/a".to_string()],
+            },
+            clock: CraqleVectorClock(BTreeMap::from([(actor, 11_u64)])),
+        })
+        .unwrap();
+
+        let decoded = decode_entry(CRAQLE_GRAPHS_KEYSPACE, &key, &value);
+        match decoded.key {
+            DecodedField::CraqleGraphKey { value } => assert_eq!(
+                value,
+                super::JsonCraqleGraphKey::Meta {
+                    graph: format!("{graph:032x}")
+                }
+            ),
+            other => panic!("expected craqle graph key, got {other:?}"),
+        }
+        match decoded.value {
+            DecodedValue::CraqleGraphMeta { data } => {
+                assert_eq!(data.graph, format!("{graph:032x}"));
+                assert!(data.policy.public);
+                assert_eq!(data.policy.permission_paths, vec!["/a", "/b"]);
+                assert_eq!(data.clock.entries.len(), 1);
+                assert_eq!(data.clock.entries[0].actor, actor.to_string());
+                assert_eq!(data.clock.entries[0].counter, 11);
+            }
+            other => panic!("expected craqle graph meta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_craqle_log_batch_entry() {
+        let graph = 12_u128;
+        let subject = 13_u128;
+        let predicate = 14_u128;
+        let object = 15_u128;
+        let actor = CraqleActorId::from_bytes([3_u8; 32]);
+
+        let mut key = vec![CRAQLE_LOG_BATCH_PREFIX];
+        key.extend_from_slice(&graph.to_be_bytes());
+        key.extend_from_slice(actor.as_bytes());
+        key.extend_from_slice(&17_u64.to_be_bytes());
+
+        let batch = CraqleStoredBatch {
+            actor,
+            counter: 17,
+            base_clock: CraqleVectorClock(BTreeMap::from([(actor, 16_u64)])),
+            ops: vec![CraqleStoredQuadOp::Add {
+                subject: super::CraqleTermId(subject),
+                predicate: super::CraqleTermId(predicate),
+                object: super::CraqleTermId(object),
+                dot: CraqleDot { actor, counter: 17 },
+            }],
+            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+
+        let mut value = vec![CRAQLE_BATCH_LOG_ENCODING_TAG];
+        value.extend_from_slice(&postcard::to_allocvec(&batch).unwrap());
+
+        let decoded = decode_entry(CRAQLE_LOG_KEYSPACE, &key, &value);
+        match decoded.key {
+            DecodedField::CraqleLogKey { value } => assert_eq!(
+                value,
+                super::JsonCraqleLogKey::Batch {
+                    graph: format!("{graph:032x}"),
+                    actor: actor.to_string(),
+                    counter: 17,
+                }
+            ),
+            other => panic!("expected craqle log key, got {other:?}"),
+        }
+        match decoded.value {
+            DecodedValue::CraqleLogBatch { data } => {
+                assert_eq!(data.graph, format!("{graph:032x}"));
+                assert_eq!(data.actor, actor.to_string());
+                assert_eq!(data.counter, 17);
+                assert_eq!(data.base_clock.entries.len(), 1);
+                assert_eq!(data.base_clock.entries[0].counter, 16);
+                assert_eq!(data.ops.len(), 1);
+                match &data.ops[0] {
+                    super::JsonCraqleStoredBatchOp::Add {
+                        subject: got_subject,
+                        predicate: got_predicate,
+                        object: got_object,
+                        dot,
+                    } => {
+                        assert_eq!(got_subject, &format!("{subject:032x}"));
+                        assert_eq!(got_predicate, &format!("{predicate:032x}"));
+                        assert_eq!(got_object, &format!("{object:032x}"));
+                        assert_eq!(dot.actor, actor.to_string());
+                        assert_eq!(dot.counter, 17);
+                    }
+                    other => panic!("expected add op, got {other:?}"),
+                }
+            }
+            other => panic!("expected craqle log batch, got {other:?}"),
         }
     }
 
