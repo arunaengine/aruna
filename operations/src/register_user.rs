@@ -43,7 +43,7 @@ pub enum RegisterUserState {
     StartTxn,
     CreateUser { txn_id: TxnId, user: User },
     CommitTxn { user: User },
-    AnnounceUser,
+    AnnounceUser { user: User },
     Finish,
     Error,
 }
@@ -64,7 +64,7 @@ pub enum RegisterUserError {
     Unauthorized,
     #[error(transparent)]
     CheckPermissionsError(#[from] AuthorizationError),
-    #[error("Adding user to group did not finish")]
+    #[error("Register user did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
@@ -75,7 +75,7 @@ pub enum RegisterUserError {
 }
 
 impl RegisterUserOperation {
-    fn new(input: RegisterUserInput) -> Self {
+    pub fn new(input: RegisterUserInput) -> Self {
         RegisterUserOperation {
             input,
             state: RegisterUserState::Init,
@@ -131,7 +131,7 @@ impl RegisterUserOperation {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return self.unexpected_event(
-                RegisterUserState::Auth,
+                self.state.clone(),
                 "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
                 got,
             );
@@ -161,7 +161,7 @@ impl RegisterUserOperation {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
             return self.unexpected_event(
-                RegisterUserState::Auth,
+                self.state.clone(),
                 "Event::Storage(StorageEvent::TransactionStarted)",
                 got,
             );
@@ -193,52 +193,48 @@ impl RegisterUserOperation {
         })])
     }
 
-    fn handle_create_user(&mut self, event: Event) -> Effects {
+    fn handle_create_user(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
-                RegisterUserState::Auth,
+                self.state.clone(),
                 "Event::Storage(StorageEvent::WriteResult { .. })",
                 got,
             );
         };
 
-        match self.emit_commit_txn() {
+        match self.emit_commit_txn(txn_id, user) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_commit_txn(&mut self) -> Result<Effects, RegisterUserError> {
-        let RegisterUserState::CreateUser { txn_id, ref user } = self.state else {
-            return Err(RegisterUserError::NoTransactionFound);
-        };
-
-        self.state = RegisterUserState::CommitTxn { user: user.clone() };
+    fn emit_commit_txn(&mut self, txn_id: TxnId, user: User) -> Result<Effects, RegisterUserError> {
+        self.state = RegisterUserState::CommitTxn { user };
 
         Ok(smallvec![Effect::Storage(
             StorageEffect::CommitTransaction { txn_id }
         )])
     }
 
-    fn handle_commit_txn(&mut self, event: Event) -> Effects {
+    fn handle_commit_txn(&mut self, event: Event, user: User) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
             return self.unexpected_event(
-                RegisterUserState::Auth,
+                self.state.clone(),
                 "Event::Storage(StorageEvent::TransactionCommitted { .. })",
                 got,
             );
         };
 
-        match self.emit_announce_user() {
+        match self.emit_announce_user(user) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_announce_user(&mut self) -> Result<Effects, RegisterUserError> {
-        self.state = RegisterUserState::AnnounceUser;
+    fn emit_announce_user(&mut self, user: User) -> Result<Effects, RegisterUserError> {
+        self.state = RegisterUserState::AnnounceUser { user };
 
         let suboperation = boxed_suboperation(
             AnnounceTopicOperation::new(
@@ -257,19 +253,19 @@ impl RegisterUserOperation {
         Ok(smallvec![Effect::SubOperation(suboperation)])
     }
 
-    fn handle_announce_user(&mut self, event: Event) -> Effects {
+    fn handle_announce_user(&mut self, event: Event, user: User) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
         else {
             return self.unexpected_event(
-                RegisterUserState::Auth,
+                self.state.clone(),
                 "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result })",
                 got,
             );
         };
 
         self.state = RegisterUserState::Finish;
-
+        self.output = Some(Ok(user));
         match result {
             Ok(_) => smallvec![],
             Err(err) => self.fail(RegisterUserError::AnnouncementError(err)),
@@ -305,12 +301,14 @@ impl Operation for RegisterUserOperation {
             Err(effects) => return effects,
         };
 
-        match self.state {
+        match self.state.clone() {
             RegisterUserState::Auth => self.handle_authorization(event),
             RegisterUserState::StartTxn => self.handle_start_txn(event),
-            RegisterUserState::CreateUser { .. } => self.handle_create_user(event),
-            RegisterUserState::CommitTxn { .. } => self.handle_commit_txn(event),
-            RegisterUserState::AnnounceUser { .. } => self.handle_announce_user(event),
+            RegisterUserState::CreateUser { txn_id, user } => {
+                self.handle_create_user(event, txn_id, user)
+            }
+            RegisterUserState::CommitTxn { user } => self.handle_commit_txn(event, user),
+            RegisterUserState::AnnounceUser { user } => self.handle_announce_user(event, user),
             RegisterUserState::Init | RegisterUserState::Finish | RegisterUserState::Error => {
                 smallvec![]
             }
@@ -340,6 +338,128 @@ impl Operation for RegisterUserOperation {
 
 #[cfg(test)]
 mod test {
+    use crate::register_user::{RegisterUserInput, RegisterUserOperation, RegisterUserState};
+    use aruna_core::effects::Effect;
+    use aruna_core::events::{Event, SubOperationEvent};
+    use aruna_core::keyspaces::USER_KEYSPACE;
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::{Actor, User};
+    use aruna_core::types::TxnId;
+    use ulid::Ulid;
+
     #[tokio::test]
-    pub async fn test_user_registration() {}
+    pub async fn test_user_registration() {
+        //
+        // Inputs
+        //
+        let actor_user_id = Ulid::new();
+        let registered_user_id = Ulid::new();
+        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let actor = Actor {
+            node_id,
+            user_id: actor_user_id,
+            realm_id: realm_id.clone(),
+        };
+        let register_user_input = RegisterUserInput {
+            actor: actor.clone(),
+            user_id: registered_user_id,
+            name: "test_user".to_string(),
+            subject_ids: vec!["sub-1".to_string(), "sub-2".to_string()],
+        };
+        let expected_user = User {
+            user_id: registered_user_id,
+            name: register_user_input.name.clone(),
+            subject_ids: register_user_input.subject_ids.clone(),
+        };
+
+        //
+        // Steps
+        //
+        let mut register_user_operation = RegisterUserOperation::new(register_user_input.clone());
+        assert_eq!(register_user_operation.state, RegisterUserState::Init);
+
+        let effects = register_user_operation.start();
+        let auth_effect = effects.first().unwrap();
+        assert!(matches!(auth_effect, Effect::SubOperation(_)));
+        assert_eq!(register_user_operation.state, RegisterUserState::Auth);
+
+        let effects = register_user_operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        let txn_effect = effects.first().unwrap();
+        assert_eq!(
+            txn_effect,
+            &Effect::Storage(aruna_core::effects::StorageEffect::StartTransaction { read: false })
+        );
+        assert_eq!(register_user_operation.state, RegisterUserState::StartTxn);
+
+        let txn_id = TxnId::new();
+        let effects = register_user_operation.step(Event::Storage(
+            aruna_core::events::StorageEvent::TransactionStarted { txn_id },
+        ));
+        let create_user_effect = effects.first().unwrap();
+        match create_user_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(key_space, USER_KEYSPACE);
+                assert_eq!(key, &registered_user_id.to_bytes().into());
+                assert_eq!(effect_txn_id, &Some(txn_id));
+                let stored_user = User::from_bytes(value).unwrap();
+                assert_eq!(stored_user, expected_user);
+            }
+            other => panic!("unexpected create user effect: {other:?}"),
+        }
+        assert_eq!(
+            register_user_operation.state,
+            RegisterUserState::CreateUser {
+                txn_id,
+                user: expected_user.clone(),
+            }
+        );
+
+        let effects = register_user_operation.step(Event::Storage(
+            aruna_core::events::StorageEvent::WriteResult {
+                key: registered_user_id.to_bytes().into(),
+            },
+        ));
+        let commit_transaction_effect = effects.first().unwrap();
+        match commit_transaction_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::CommitTransaction {
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(effect_txn_id, &txn_id);
+            }
+            other => panic!("unexpected commit transaction effect: {other:?}"),
+        }
+        assert_eq!(
+            register_user_operation.state,
+            RegisterUserState::CommitTxn {
+                user: expected_user.clone(),
+            }
+        );
+
+        let effects = register_user_operation.step(Event::Storage(
+            aruna_core::events::StorageEvent::TransactionCommitted { txn_id },
+        ));
+        let announce_user_effect = effects.first().unwrap();
+        assert!(matches!(announce_user_effect, Effect::SubOperation(_)));
+        assert_eq!(
+            register_user_operation.state,
+            RegisterUserState::AnnounceUser {
+                user: expected_user.clone(),
+            }
+        );
+
+        let effects = register_user_operation.step(Event::SubOperation(
+            SubOperationEvent::TopicAnnouncementResult { result: Ok(()) },
+        ));
+        assert!(effects.is_empty());
+        assert_eq!(register_user_operation.state, RegisterUserState::Finish);
+        assert_eq!(register_user_operation.finalize().unwrap(), expected_user);
+    }
 }
