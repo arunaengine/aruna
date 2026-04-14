@@ -1,7 +1,7 @@
 use crate::errors::ConversionError;
-use crate::structs::Actor;
 use crate::structs::group::autosurgeon_role_map;
 use crate::structs::structs::{Permission, Role};
+use crate::structs::{Actor, User};
 use crate::types::{GroupId, RoleId, autosurgeon_ulid};
 use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use core::fmt;
@@ -169,6 +169,7 @@ pub struct RealmConfigDocument {
     #[autosurgeon(with = "autosurgeon_realm_id")]
     pub realm_id: RealmId,
     pub metadata_replication: MetadataReplicationConfig,
+    pub users: Vec<User>,
 }
 
 impl RealmConfigDocument {
@@ -176,6 +177,7 @@ impl RealmConfigDocument {
         Self {
             realm_id,
             metadata_replication: MetadataReplicationConfig::new(default_replication_factor),
+            users: Vec::new(),
         }
     }
 
@@ -353,7 +355,7 @@ pub mod autosurgeon_operation_map {
 mod test {
     use crate::structs::{
         Actor, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        RealmAuthorizationDocument, RealmConfigDocument, RealmId, User,
     };
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
@@ -394,6 +396,11 @@ mod test {
                     replication_factor: 7,
                 }],
             },
+            users: vec![User {
+                user_id: Ulid::new(),
+                name: "a_name".to_string(),
+                subject_ids: vec!["id1".to_string(), "id2".to_string()],
+            }],
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -432,6 +439,11 @@ mod test {
                     },
                 ],
             },
+            users: vec![User {
+                user_id: Ulid::new(),
+                name: "b_name".to_string(),
+                subject_ids: vec!["id3".to_string(), "id4".to_string()],
+            }],
         };
 
         assert_eq!(

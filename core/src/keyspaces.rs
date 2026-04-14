@@ -7,6 +7,7 @@ pub const METADATA_DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
+pub const USER_KEYSPACE: &str = "users";
 
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
