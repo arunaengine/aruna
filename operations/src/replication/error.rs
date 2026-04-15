@@ -1,5 +1,3 @@
-use crate::replication::incoming_bao::IncomingBaoError;
-use crate::replication::outgoing_bao::OutgoingBaoError;
 use aruna_core::errors::ConversionError;
 use thiserror::Error;
 
@@ -7,10 +5,6 @@ use thiserror::Error;
 pub enum ReplicationError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error(transparent)]
-    IncomingBaoError(#[from] IncomingBaoError),
-    #[error(transparent)]
-    OutgoingBaoError(#[from] OutgoingBaoError),
     #[error("The specified key does not exist")]
     NoSuchKey,
     #[error("Connection to receiving node is missing")]
