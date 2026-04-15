@@ -621,6 +621,7 @@ mod tests {
                     multipart_bucket: config.blob_multipart_bucket.clone(),
                     root: config.blob_root.clone(),
                     service_config: std::collections::HashMap::new(),
+                    timeouts: config.blob_timeout_config(),
                 },
                 storage_handle.clone(),
                 net_handle.clone(),

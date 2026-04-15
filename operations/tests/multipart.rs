@@ -56,6 +56,7 @@ async fn setup_context() -> TestContext {
             bucket_prefix: Some("aruna_".to_string()),
             max_bucket_size: Some(100_000),
             multipart_bucket: Some("uploaded-parts".to_string()),
+            timeouts: Default::default(),
         },
         storage_handle.clone(),
         net_handle.clone(),
