@@ -12,6 +12,7 @@ pub const USER_SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";
 
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
+pub const S3_BUCKET_REPLICATION_KEYSPACE: &str = "s3_bucket_replication";
 pub const S3_LOOKUP_KEYSPACE: &str = "s3_lookup";
 pub const S3_MULTIPART_OBJECT_METADATA_KEYSPACE: &str = "s3_multipart_object_metadata";
 pub const S3_MULTIPART_UPLOAD_KEYSPACE: &str = "s3_multipart_uploads";
