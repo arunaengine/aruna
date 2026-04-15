@@ -3,7 +3,7 @@ use crate::errors::ConversionError;
 use crate::structs::realm::RealmId;
 use crate::types::autosurgeon_ulid;
 use crate::types::{RoleId, UserId};
-use autosurgeon::{Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use core::fmt;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -234,6 +234,27 @@ pub mod autosurgeon_ulid_set {
             map.put(&id, "")?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct User {
+    #[autosurgeon(with = "autosurgeon_ulid")]
+    pub user_id: UserId,
+    pub name: String,
+    pub subject_ids: Vec<String>,
+}
+
+impl User {
+    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        let actor = postcard::to_allocvec(actor)?;
+        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
+        reconcile(&mut doc, self)?;
+        Ok(doc.save())
+    }
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        let doc = automerge::AutoCommit::load(bytes)?;
+        Ok(hydrate(&doc)?)
     }
 }
 
