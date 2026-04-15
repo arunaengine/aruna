@@ -2,12 +2,15 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, AuthContext, Permission, User};
+use aruna_core::structs::{Actor, AuthContext, Permission, RealmConfigDocument, User};
 use aruna_core::types::{Effects, TxnId, UserId};
-use aruna_core::{AutomergeDocumentVariant, USER_KEYSPACE};
+use aruna_core::{AutomergeDocumentVariant, USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+use byteview::ByteView;
 use smallvec::smallvec;
+use std::collections::VecDeque;
 use thiserror::Error;
 
+use crate::automerge::repository::{read_effect, write_effect};
 use crate::announce::AnnounceTopicOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
@@ -22,6 +25,7 @@ pub struct RegisterUserInput {
 #[derive(PartialEq)]
 pub struct RegisterUserOperation {
     input: RegisterUserInput,
+    pending_subject_ids: VecDeque<String>,
     state: RegisterUserState,
     output: Option<Result<User, RegisterUserError>>,
 }
@@ -42,6 +46,13 @@ pub enum RegisterUserState {
     Auth,
     StartTxn,
     CreateUser { txn_id: TxnId, user: User },
+    WriteSubjectIndex {
+        txn_id: TxnId,
+        user: User,
+        subject_id: String,
+    },
+    ReadRealmConfig { txn_id: TxnId, user: User },
+    WriteRealmConfig { txn_id: TxnId, user: User },
     CommitTxn { user: User },
     AnnounceUser { user: User },
     Finish,
@@ -78,6 +89,7 @@ impl RegisterUserOperation {
     pub fn new(input: RegisterUserInput) -> Self {
         RegisterUserOperation {
             input,
+            pending_subject_ids: VecDeque::new(),
             state: RegisterUserState::Init,
             output: None,
         }
@@ -179,6 +191,7 @@ impl RegisterUserOperation {
             name: self.input.name.clone(),
             subject_ids: self.input.subject_ids.clone(),
         };
+        self.pending_subject_ids = self.input.subject_ids.iter().cloned().collect();
 
         let key = self.input.user_id.to_bytes().into();
         let value = user.to_bytes(&self.input.actor)?.into();
@@ -193,7 +206,111 @@ impl RegisterUserOperation {
         })])
     }
 
+    fn emit_write_subject_index(
+        &mut self,
+        txn_id: TxnId,
+        user: User,
+    ) -> Option<Effects> {
+        let subject_id = self.pending_subject_ids.pop_front()?;
+        self.state = RegisterUserState::WriteSubjectIndex {
+            txn_id,
+            user: user.clone(),
+            subject_id: subject_id.clone(),
+        };
+        Some(smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+            key: ByteView::from(subject_id.into_bytes()),
+            value: ByteView::from(user.user_id.to_string().into_bytes()),
+            txn_id: Some(txn_id),
+        })])
+    }
+
+    fn realm_config_ref(&self) -> AutomergeDocumentVariant {
+        AutomergeDocumentVariant::RealmConfig {
+            realm_id: self.input.actor.realm_id.clone(),
+        }
+    }
+
     fn handle_create_user(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::Storage(StorageEvent::WriteResult { .. })",
+                got,
+            );
+        };
+
+        if let Some(effects) = self.emit_write_subject_index(txn_id, user.clone()) {
+            effects
+        } else {
+            self.state = RegisterUserState::ReadRealmConfig {
+                txn_id,
+                user: user.clone(),
+            };
+            smallvec![read_effect(&self.realm_config_ref(), Some(txn_id))]
+        }
+    }
+
+    fn handle_write_subject_index(
+        &mut self,
+        event: Event,
+        txn_id: TxnId,
+        user: User,
+    ) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::Storage(StorageEvent::WriteResult { .. })",
+                got,
+            );
+        };
+
+        if let Some(effects) = self.emit_write_subject_index(txn_id, user.clone()) {
+            effects
+        } else {
+            self.state = RegisterUserState::ReadRealmConfig {
+                txn_id,
+                user: user.clone(),
+            };
+            smallvec![read_effect(&self.realm_config_ref(), Some(txn_id))]
+        }
+    }
+
+    fn handle_read_realm_config(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected_event(
+                self.state.clone(),
+                "Event::Storage(StorageEvent::ReadResult { .. })",
+                got,
+            );
+        };
+
+        let mut document = match value.as_deref() {
+            Some(bytes) => match RealmConfigDocument::from_bytes(bytes) {
+                Ok(document) => document,
+                Err(err) => return self.fail(err.into()),
+            },
+            None => RealmConfigDocument::default_for_realm(self.input.actor.realm_id.clone()),
+        };
+        if !document.users.iter().any(|existing| existing.user_id == user.user_id) {
+            document.users.push(user.clone());
+        }
+        let bytes = match document.to_bytes(&self.input.actor) {
+            Ok(bytes) => bytes,
+            Err(err) => return self.fail(err.into()),
+        };
+
+        self.state = RegisterUserState::WriteRealmConfig {
+            txn_id,
+            user: user.clone(),
+        };
+        smallvec![write_effect(&self.realm_config_ref(), bytes, Some(txn_id))]
+    }
+
+    fn handle_write_realm_config(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -307,6 +424,15 @@ impl Operation for RegisterUserOperation {
             RegisterUserState::CreateUser { txn_id, user } => {
                 self.handle_create_user(event, txn_id, user)
             }
+            RegisterUserState::WriteSubjectIndex { txn_id, user, .. } => {
+                self.handle_write_subject_index(event, txn_id, user)
+            }
+            RegisterUserState::ReadRealmConfig { txn_id, user } => {
+                self.handle_read_realm_config(event, txn_id, user)
+            }
+            RegisterUserState::WriteRealmConfig { txn_id, user } => {
+                self.handle_write_realm_config(event, txn_id, user)
+            }
             RegisterUserState::CommitTxn { user } => self.handle_commit_txn(event, user),
             RegisterUserState::AnnounceUser { user } => self.handle_announce_user(event, user),
             RegisterUserState::Init | RegisterUserState::Finish | RegisterUserState::Error => {
@@ -328,7 +454,10 @@ impl Operation for RegisterUserOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            RegisterUserState::CreateUser { txn_id, .. } => {
+            RegisterUserState::CreateUser { txn_id, .. }
+            | RegisterUserState::WriteSubjectIndex { txn_id, .. }
+            | RegisterUserState::ReadRealmConfig { txn_id, .. }
+            | RegisterUserState::WriteRealmConfig { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
             _ => smallvec![],
@@ -340,11 +469,12 @@ impl Operation for RegisterUserOperation {
 mod test {
     use crate::register_user::{RegisterUserInput, RegisterUserOperation, RegisterUserState};
     use aruna_core::effects::Effect;
-    use aruna_core::events::{Event, SubOperationEvent};
-    use aruna_core::keyspaces::USER_KEYSPACE;
+    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
     use aruna_core::operation::Operation;
-    use aruna_core::structs::{Actor, User};
+    use aruna_core::structs::{Actor, RealmConfigDocument, User};
     use aruna_core::types::TxnId;
+    use byteview::ByteView;
     use ulid::Ulid;
 
     #[tokio::test]
@@ -423,8 +553,82 @@ mod test {
         );
 
         let effects = register_user_operation.step(Event::Storage(
-            aruna_core::events::StorageEvent::WriteResult {
+            StorageEvent::WriteResult {
                 key: registered_user_id.to_bytes().into(),
+            },
+        ));
+        let write_subject_index_effect = effects.first().unwrap();
+        match write_subject_index_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(key_space, USER_SUBJECT_INDEX_KEYSPACE);
+                assert_eq!(key.as_ref(), b"sub-1");
+                assert_eq!(value.as_ref(), registered_user_id.to_string().as_bytes());
+                assert_eq!(effect_txn_id, &Some(txn_id));
+            }
+            other => panic!("unexpected write subject index effect: {other:?}"),
+        }
+        assert_eq!(
+            register_user_operation.state,
+            RegisterUserState::WriteSubjectIndex {
+                txn_id,
+                user: expected_user.clone(),
+                subject_id: "sub-1".to_string(),
+            }
+        );
+
+        let effects = register_user_operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: ByteView::from("sub-1".as_bytes().to_vec()),
+        }));
+        let second_subject_index_effect = effects.first().unwrap();
+        match second_subject_index_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: effect_txn_id,
+            }) => {
+                assert_eq!(key_space, USER_SUBJECT_INDEX_KEYSPACE);
+                assert_eq!(key.as_ref(), b"sub-2");
+                assert_eq!(value.as_ref(), registered_user_id.to_string().as_bytes());
+                assert_eq!(effect_txn_id, &Some(txn_id));
+            }
+            other => panic!("unexpected second subject index effect: {other:?}"),
+        }
+
+        let effects = register_user_operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: ByteView::from("sub-2".as_bytes().to_vec()),
+        }));
+        let read_realm_config_effect = effects.first().unwrap();
+        match read_realm_config_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::Read { txn_id: effect_txn_id, .. }) => {
+                assert_eq!(effect_txn_id, &Some(txn_id));
+            }
+            other => panic!("unexpected read realm config effect: {other:?}"),
+        }
+
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id.clone());
+        let effects = register_user_operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: realm_id.as_bytes().to_vec().into(),
+            value: Some(realm_config.to_bytes(&actor).unwrap().into()),
+        }));
+        let write_realm_config_effect = effects.first().unwrap();
+        match write_realm_config_effect {
+            Effect::Storage(aruna_core::effects::StorageEffect::Write { value, txn_id: effect_txn_id, .. }) => {
+                assert_eq!(effect_txn_id, &Some(txn_id));
+                let stored_config = RealmConfigDocument::from_bytes(value).unwrap();
+                assert_eq!(stored_config.users, vec![expected_user.clone()]);
+            }
+            other => panic!("unexpected write realm config effect: {other:?}"),
+        }
+
+        let effects = register_user_operation.step(Event::Storage(
+            StorageEvent::WriteResult {
+                key: realm_id.as_bytes().to_vec().into(),
             },
         ));
         let commit_transaction_effect = effects.first().unwrap();
@@ -443,17 +647,11 @@ mod test {
             }
         );
 
-        let effects = register_user_operation.step(Event::Storage(
-            aruna_core::events::StorageEvent::TransactionCommitted { txn_id },
-        ));
+        let effects = register_user_operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
         let announce_user_effect = effects.first().unwrap();
         assert!(matches!(announce_user_effect, Effect::SubOperation(_)));
-        assert_eq!(
-            register_user_operation.state,
-            RegisterUserState::AnnounceUser {
-                user: expected_user.clone(),
-            }
-        );
 
         let effects = register_user_operation.step(Event::SubOperation(
             SubOperationEvent::TopicAnnouncementResult { result: Ok(()) },
@@ -461,5 +659,64 @@ mod test {
         assert!(effects.is_empty());
         assert_eq!(register_user_operation.state, RegisterUserState::Finish);
         assert_eq!(register_user_operation.finalize().unwrap(), expected_user);
+    }
+
+    #[tokio::test]
+    pub async fn test_user_inserted_once_into_realm_config() {
+        let actor_user_id = Ulid::new();
+        let registered_user_id = Ulid::new();
+        let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let actor = Actor {
+            node_id,
+            user_id: actor_user_id,
+            realm_id: realm_id.clone(),
+        };
+        let expected_user = User {
+            user_id: registered_user_id,
+            name: "existing".to_string(),
+            subject_ids: vec!["sub".to_string()],
+        };
+        let mut operation = RegisterUserOperation::new(RegisterUserInput {
+            actor: actor.clone(),
+            user_id: registered_user_id,
+            name: expected_user.name.clone(),
+            subject_ids: expected_user.subject_ids.clone(),
+        });
+
+        operation.start();
+        operation.step(Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(true) }));
+        let txn_id = TxnId::new();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: registered_user_id.to_bytes().into(),
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: ByteView::from("sub".as_bytes().to_vec()),
+        }));
+        assert!(matches!(
+            effects.first().unwrap(),
+            Effect::Storage(aruna_core::effects::StorageEffect::Read { .. })
+        ));
+
+        let existing_config = RealmConfigDocument {
+            realm_id: realm_id.clone(),
+            metadata_replication: RealmConfigDocument::default_for_realm(realm_id.clone())
+                .metadata_replication,
+            oidc_providers: vec![],
+            users: vec![expected_user.clone()],
+        };
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: realm_id.as_bytes().to_vec().into(),
+            value: Some(existing_config.to_bytes(&actor).unwrap().into()),
+        }));
+
+        match effects.first().unwrap() {
+            Effect::Storage(aruna_core::effects::StorageEffect::Write { value, .. }) => {
+                let stored_config = RealmConfigDocument::from_bytes(value).unwrap();
+                assert_eq!(stored_config.users, vec![expected_user]);
+            }
+            other => panic!("unexpected realm config write effect: {other:?}"),
+        }
     }
 }
