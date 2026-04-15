@@ -84,6 +84,8 @@ pub enum RegisterUserError {
     AutomergeState(String),
     #[error("No transaction found")]
     NoTransactionFound,
+    #[error("No realm config found")]
+    NoRealmConfigFound,
     #[error("Unauthorized")]
     Unauthorized,
     #[error(transparent)]
@@ -292,13 +294,21 @@ impl RegisterUserOperation {
             );
         };
 
-        let mut document = match value.as_deref() {
-            Some(bytes) => match RealmConfigDocument::from_bytes(bytes) {
-                Ok(document) => document,
-                Err(err) => return self.fail(err.into()),
-            },
-            None => RealmConfigDocument::default_for_realm(self.input.actor.realm_id.clone()),
-        };
+        match self.emit_write_realm_config(txn_id, user, value) {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn emit_write_realm_config(
+        &mut self,
+        txn_id: TxnId,
+        user: User,
+        value: Option<ByteView>,
+    ) -> Result<Effects, RegisterUserError> {
+        let mut document = RealmConfigDocument::from_bytes(
+            &value.ok_or_else(|| RegisterUserError::NoTransactionFound)?,
+        )?;
         if !document
             .users
             .iter()
@@ -306,16 +316,18 @@ impl RegisterUserOperation {
         {
             document.users.push(user.clone());
         }
-        let bytes = match document.to_bytes(&self.input.actor) {
-            Ok(bytes) => bytes,
-            Err(err) => return self.fail(err.into()),
-        };
+
+        let bytes = document.to_bytes(&self.input.actor)?;
 
         self.state = RegisterUserState::WriteRealmConfig {
             txn_id,
             user: user.clone(),
         };
-        smallvec![write_effect(&self.realm_config_ref(), bytes, Some(txn_id))]
+        Ok(smallvec![write_effect(
+            &self.realm_config_ref(),
+            bytes,
+            Some(txn_id)
+        )])
     }
 
     fn handle_write_realm_config(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
