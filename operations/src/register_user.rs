@@ -307,7 +307,7 @@ impl RegisterUserOperation {
         value: Option<ByteView>,
     ) -> Result<Effects, RegisterUserError> {
         let mut document = RealmConfigDocument::from_bytes(
-            &value.ok_or_else(|| RegisterUserError::NoTransactionFound)?,
+            &value.ok_or_else(|| RegisterUserError::NoRealmConfigFound)?,
         )?;
         if !document
             .users
