@@ -10,8 +10,8 @@ use smallvec::smallvec;
 use std::collections::VecDeque;
 use thiserror::Error;
 
-use crate::automerge::repository::{read_effect, write_effect};
 use crate::announce::AnnounceTopicOperation;
+use crate::automerge::repository::{read_effect, write_effect};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -45,16 +45,29 @@ pub enum RegisterUserState {
     Init,
     Auth,
     StartTxn,
-    CreateUser { txn_id: TxnId, user: User },
+    CreateUser {
+        txn_id: TxnId,
+        user: User,
+    },
     WriteSubjectIndex {
         txn_id: TxnId,
         user: User,
         subject_id: String,
     },
-    ReadRealmConfig { txn_id: TxnId, user: User },
-    WriteRealmConfig { txn_id: TxnId, user: User },
-    CommitTxn { user: User },
-    AnnounceUser { user: User },
+    ReadRealmConfig {
+        txn_id: TxnId,
+        user: User,
+    },
+    WriteRealmConfig {
+        txn_id: TxnId,
+        user: User,
+    },
+    CommitTxn {
+        user: User,
+    },
+    AnnounceUser {
+        user: User,
+    },
     Finish,
     Error,
 }
@@ -206,11 +219,7 @@ impl RegisterUserOperation {
         })])
     }
 
-    fn emit_write_subject_index(
-        &mut self,
-        txn_id: TxnId,
-        user: User,
-    ) -> Option<Effects> {
+    fn emit_write_subject_index(&mut self, txn_id: TxnId, user: User) -> Option<Effects> {
         let subject_id = self.pending_subject_ids.pop_front()?;
         self.state = RegisterUserState::WriteSubjectIndex {
             txn_id,
@@ -252,12 +261,7 @@ impl RegisterUserOperation {
         }
     }
 
-    fn handle_write_subject_index(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        user: User,
-    ) -> Effects {
+    fn handle_write_subject_index(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
@@ -295,7 +299,11 @@ impl RegisterUserOperation {
             },
             None => RealmConfigDocument::default_for_realm(self.input.actor.realm_id.clone()),
         };
-        if !document.users.iter().any(|existing| existing.user_id == user.user_id) {
+        if !document
+            .users
+            .iter()
+            .any(|existing| existing.user_id == user.user_id)
+        {
             document.users.push(user.clone());
         }
         let bytes = match document.to_bytes(&self.input.actor) {
@@ -552,11 +560,9 @@ mod test {
             }
         );
 
-        let effects = register_user_operation.step(Event::Storage(
-            StorageEvent::WriteResult {
-                key: registered_user_id.to_bytes().into(),
-            },
-        ));
+        let effects = register_user_operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: registered_user_id.to_bytes().into(),
+        }));
         let write_subject_index_effect = effects.first().unwrap();
         match write_subject_index_effect {
             Effect::Storage(aruna_core::effects::StorageEffect::Write {
@@ -605,7 +611,10 @@ mod test {
         }));
         let read_realm_config_effect = effects.first().unwrap();
         match read_realm_config_effect {
-            Effect::Storage(aruna_core::effects::StorageEffect::Read { txn_id: effect_txn_id, .. }) => {
+            Effect::Storage(aruna_core::effects::StorageEffect::Read {
+                txn_id: effect_txn_id,
+                ..
+            }) => {
                 assert_eq!(effect_txn_id, &Some(txn_id));
             }
             other => panic!("unexpected read realm config effect: {other:?}"),
@@ -618,7 +627,11 @@ mod test {
         }));
         let write_realm_config_effect = effects.first().unwrap();
         match write_realm_config_effect {
-            Effect::Storage(aruna_core::effects::StorageEffect::Write { value, txn_id: effect_txn_id, .. }) => {
+            Effect::Storage(aruna_core::effects::StorageEffect::Write {
+                value,
+                txn_id: effect_txn_id,
+                ..
+            }) => {
                 assert_eq!(effect_txn_id, &Some(txn_id));
                 let stored_config = RealmConfigDocument::from_bytes(value).unwrap();
                 assert_eq!(stored_config.users, vec![expected_user.clone()]);
@@ -626,11 +639,9 @@ mod test {
             other => panic!("unexpected write realm config effect: {other:?}"),
         }
 
-        let effects = register_user_operation.step(Event::Storage(
-            StorageEvent::WriteResult {
-                key: realm_id.as_bytes().to_vec().into(),
-            },
-        ));
+        let effects = register_user_operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: realm_id.as_bytes().to_vec().into(),
+        }));
         let commit_transaction_effect = effects.first().unwrap();
         match commit_transaction_effect {
             Effect::Storage(aruna_core::effects::StorageEffect::CommitTransaction {
@@ -647,9 +658,10 @@ mod test {
             }
         );
 
-        let effects = register_user_operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
+        let effects =
+            register_user_operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id,
+            }));
         let announce_user_effect = effects.first().unwrap();
         assert!(matches!(announce_user_effect, Effect::SubOperation(_)));
 
@@ -685,7 +697,9 @@ mod test {
         });
 
         operation.start();
-        operation.step(Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(true) }));
+        operation.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
         let txn_id = TxnId::new();
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -703,7 +717,6 @@ mod test {
             realm_id: realm_id.clone(),
             metadata_replication: RealmConfigDocument::default_for_realm(realm_id.clone())
                 .metadata_replication,
-            oidc_providers: vec![],
             users: vec![expected_user.clone()],
         };
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
