@@ -1,20 +1,27 @@
 use crate::s3::checksum::{
-    ApplyChecksums, ChecksumSelection, checksum_mismatch_error, checksum_mode_enabled,
-    encode_checksums, parse_upload_checksum_request,
+    checksum_mismatch_error, checksum_mode_enabled, encode_checksums, parse_upload_checksum_request,
+    ApplyChecksums, ChecksumSelection,
 };
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
     s3_checksum_type_from_multipart, to_base64,
 };
-use aruna_core::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
+use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess, UserIdentity};
+use aruna_core::NodeId;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{drive, DriverContext};
+use aruna_operations::replication::version_replication::{
+    ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
+};
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadError, AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
+};
+use aruna_operations::s3::bucket_replication::{
+    DeleteBucketReplicationOperation, GetBucketReplicationError, GetBucketReplicationOperation,
+    PutBucketReplicationOperation,
 };
 use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartUploadError, CompleteMultipartUploadInput as CMUI,
@@ -41,16 +48,19 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CompleteMultipartUploadInput,
     CompleteMultipartUploadOutput, CreateBucketInput, CreateBucketOutput,
     CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteObjectInput, DeleteObjectOutput, ETag, GetObjectAttributesInput,
+    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerReplication,
+    DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
+    GetBucketReplicationInput, GetBucketReplicationOutput, GetObjectAttributesInput,
     GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    ListBucketsInput, ListBucketsOutput, PutObjectInput, PutObjectOutput, StreamingBlob,
-    UploadPartInput, UploadPartOutput,
+    ListBucketsInput, ListBucketsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
+    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
+    ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
-use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{s3_error, S3ErrorCode, S3Request, S3Response, S3Result, S3};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, Instrument};
 
 #[derive(Clone)]
 pub struct ArunaS3Service {
@@ -99,6 +109,222 @@ impl ArunaS3Service {
         )
         .await
         .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))
+    }
+
+    fn parse_replication_targets(
+        &self,
+        bucket: &str,
+        configuration: &ReplicationConfiguration,
+    ) -> S3Result<Vec<aruna_core::structs::BucketReplicationTarget>> {
+        let mut targets = Vec::new();
+
+        for rule in &configuration.rules {
+            if rule.status.as_str() != ReplicationRuleStatus::ENABLED {
+                continue;
+            }
+            let arn = aruna_core::structs::ArunaArn::parse(&rule.destination.bucket)
+                .map_err(|err| s3_error!(InvalidArgument, "{}", err.to_string()))?;
+            if arn.resource_type != aruna_core::structs::ArunaArnType::S3 {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "Replication target ARN must use s3 type"
+                ));
+            }
+            if arn.realm_id != self.realm_id {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "Replication target must be in same realm"
+                ));
+            }
+            if arn.path != bucket {
+                return Err(s3_error!(
+                    InvalidArgument,
+                    "Replication target bucket must equal source bucket"
+                ));
+            }
+            let replicate_delete_markers = rule
+                .delete_marker_replication
+                .as_ref()
+                .and_then(|replication| replication.status.as_ref())
+                .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED);
+            targets.push(aruna_core::structs::BucketReplicationTarget {
+                node_id: arn.node_id,
+                realm_id: arn.realm_id.clone(),
+                bucket: bucket.to_string(),
+                arn: arn.to_string(),
+                replicate_delete_markers,
+            });
+        }
+
+        if targets.is_empty() {
+            return Err(s3_error!(
+                InvalidArgument,
+                "Replication requires at least one enabled target"
+            ));
+        }
+
+        Ok(targets)
+    }
+
+    fn build_replication_configuration(
+        &self,
+        config: &aruna_core::structs::BucketReplicationConfig,
+    ) -> ReplicationConfiguration {
+        let rules = config
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(index, target)| ReplicationRule {
+                delete_marker_replication: Some(DeleteMarkerReplication {
+                    status: Some(DeleteMarkerReplicationStatus::from_static(
+                        if target.replicate_delete_markers {
+                            DeleteMarkerReplicationStatus::ENABLED
+                        } else {
+                            DeleteMarkerReplicationStatus::DISABLED
+                        },
+                    )),
+                }),
+                destination: Destination {
+                    access_control_translation: None,
+                    account: None,
+                    bucket: aruna_core::structs::ArunaArn::s3_bucket(
+                        target.realm_id.clone(),
+                        target.node_id,
+                        target.bucket.clone(),
+                    )
+                    .expect("bucket replication targets have valid bucket names")
+                    .to_string(),
+                    encryption_configuration: None,
+                    metrics: None,
+                    replication_time: None,
+                    storage_class: None,
+                },
+                existing_object_replication: None,
+                filter: None,
+                id: Some(format!("aruna-target-{}", index + 1)),
+                prefix: None,
+                priority: Some((index + 1) as i32),
+                source_selection_criteria: None,
+                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            })
+            .collect();
+
+        ReplicationConfiguration {
+            role: "arn:aruna:replication-role".to_string(),
+            rules,
+        }
+    }
+
+    async fn trigger_version_replication(
+        &self,
+        user_identity: UserIdentity,
+        bucket: &str,
+        key: &str,
+        version_id: ulid::Ulid,
+        delete_marker: bool,
+    ) {
+        let config = match drive(
+            GetBucketReplicationOperation::new(bucket.to_string()),
+            &self.state,
+        )
+        .await
+        {
+            Ok(Some(Ok(config))) => config,
+            Ok(Some(Err(GetBucketReplicationError::NotFound)))
+            | Err(GetBucketReplicationError::NotFound)
+            | Ok(None) => return,
+            Ok(Some(Err(err))) | Err(err) => {
+                warn!(bucket, key, version_id = %version_id, error = %err, "Failed to load bucket replication config");
+                return;
+            }
+        };
+
+        for target in config.targets {
+            if target.node_id == self.node_id {
+                continue;
+            }
+            if delete_marker && !target.replicate_delete_markers {
+                continue;
+            }
+
+            let input = ReplicateScopeInput {
+                bucket: bucket.to_string(),
+                target: ReplicateScopeTarget::Version {
+                    key: key.to_string(),
+                    version_id,
+                },
+                target_node_id: target.node_id,
+                user_identity: user_identity.clone(),
+                replicate_delete_markers: target.replicate_delete_markers,
+            };
+
+            match drive(ReplicateScopeOperation::new(input), &self.state).await {
+                Ok(Some(Ok(result))) if result.failed == 0 => {}
+                Ok(Some(Ok(result))) => {
+                    warn!(
+                        bucket,
+                        key,
+                        version_id = %version_id,
+                        target_node = %target.node_id,
+                        replicated = result.replicated,
+                        skipped = result.skipped,
+                        failed = result.failed,
+                        "Version replication completed with failures"
+                    );
+                }
+                Ok(Some(Err(err))) | Err(err) => {
+                    warn!(
+                        bucket,
+                        key,
+                        version_id = %version_id,
+                        target_node = %target.node_id,
+                        error = %err,
+                        "Failed to trigger version replication"
+                    );
+                }
+                Ok(None) => {
+                    warn!(
+                        bucket,
+                        key,
+                        version_id = %version_id,
+                        target_node = %target.node_id,
+                        "Version replication produced no result"
+                    );
+                }
+            }
+        }
+    }
+
+    fn spawn_version_replication(
+        &self,
+        user_identity: UserIdentity,
+        bucket: String,
+        key: String,
+        version_id: ulid::Ulid,
+        delete_marker: bool,
+    ) {
+        let service = self.clone();
+        let span = tracing::info_span!(
+            "s3.live_replication",
+            bucket = %bucket,
+            key = %key,
+            version_id = %version_id,
+            delete_marker,
+        );
+        tokio::spawn(
+            async move {
+                service
+                    .trigger_version_replication(
+                        user_identity,
+                        &bucket,
+                        &key,
+                        version_id,
+                        delete_marker,
+                    )
+                    .await;
+            }
+            .instrument(span),
+        );
     }
 }
 
@@ -204,6 +430,9 @@ impl S3 for ArunaS3Service {
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
+        let replication_user = user_access.user_identity.clone();
+        let replication_bucket = req.input.bucket.clone();
+        let replication_key = req.input.key.clone();
 
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
@@ -240,6 +469,13 @@ impl S3 for ArunaS3Service {
                     ChecksumSelection::Requested(checksum_request.response_algorithm),
                     checksum_request.checksum_type,
                 ));
+                self.spawn_version_replication(
+                    replication_user,
+                    replication_bucket,
+                    replication_key,
+                    result.version_id,
+                    false,
+                );
                 Ok(S3Response::new(output))
             }
             Ok(Some(Err(PutObjectError::ChecksumMismatch(algorithm))))
@@ -391,6 +627,9 @@ impl S3 for ArunaS3Service {
         })?;
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
+        let replication_user = user_access.user_identity.clone();
+        let replication_bucket = req.input.bucket.clone();
+        let replication_key = req.input.key.clone();
         let completed_parts = req
             .input
             .multipart_upload
@@ -436,6 +675,13 @@ impl S3 for ArunaS3Service {
                     ChecksumSelection::Requested(checksum_request.response_algorithm),
                     s3_checksum_type_from_multipart(result.checksum_type),
                 ));
+                self.spawn_version_replication(
+                    replication_user,
+                    replication_bucket,
+                    replication_key,
+                    result.version_id,
+                    false,
+                );
                 Ok(S3Response::new(output))
             }
             Ok(Some(Err(CompleteMultipartUploadError::NoSuchUpload)))
@@ -656,6 +902,9 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let version_id = parse_version_id(req.input.version_id)?;
+        let replication_user = user_access.user_identity.clone();
+        let replication_bucket = req.input.bucket.clone();
+        let replication_key = req.input.key.clone();
 
         let operation = DeleteObjectOperation::new(DOI {
             bucket: req.input.bucket,
@@ -668,11 +917,23 @@ impl S3 for ArunaS3Service {
             .await
             .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
         {
-            Some(Ok(result)) => Ok(S3Response::new(DeleteObjectOutput {
-                delete_marker: Some(result.delete_marker),
-                version_id: Some(result.version_id.to_string()),
-                ..Default::default()
-            })),
+            Some(Ok(result)) => {
+                if version_id.is_none() {
+                    self.spawn_version_replication(
+                        replication_user,
+                        replication_bucket,
+                        replication_key,
+                        result.version_id,
+                        result.delete_marker,
+                    );
+                }
+
+                Ok(S3Response::new(DeleteObjectOutput {
+                    delete_marker: Some(result.delete_marker),
+                    version_id: Some(result.version_id.to_string()),
+                    ..Default::default()
+                }))
+            }
             Some(Err(err @ DeleteObjectError::NoSuchVersion)) => {
                 Err(s3_error!(NoSuchVersion, "{}", err))
             }
@@ -701,6 +962,90 @@ impl S3 for ArunaS3Service {
             }
             Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err)),
             Ok(None) => Err(s3_error!(InternalError, "Failed to delete bucket")),
+        }
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn put_bucket_replication(
+        &self,
+        req: S3Request<PutBucketReplicationInput>,
+    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let targets = self
+            .parse_replication_targets(&req.input.bucket, &req.input.replication_configuration)?;
+
+        match drive(
+            PutBucketReplicationOperation::new(req.input.bucket, targets),
+            &self.state,
+        )
+        .await
+        {
+            Ok(Some(Ok(_))) => Ok(S3Response::new(PutBucketReplicationOutput::default())),
+            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
+            Ok(None) => Err(s3_error!(
+                InternalError,
+                "Failed to store bucket replication config"
+            )),
+        }
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn get_bucket_replication(
+        &self,
+        req: S3Request<GetBucketReplicationInput>,
+    ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        match drive(
+            GetBucketReplicationOperation::new(req.input.bucket),
+            &self.state,
+        )
+        .await
+        {
+            Ok(Some(Ok(config))) => Ok(S3Response::new(GetBucketReplicationOutput {
+                replication_configuration: Some(self.build_replication_configuration(&config)),
+            })),
+            Ok(Some(Err(GetBucketReplicationError::NotFound)))
+            | Err(GetBucketReplicationError::NotFound) => Err(s3_error!(
+                ReplicationConfigurationNotFoundError,
+                "Replication configuration not found"
+            )),
+            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
+            Ok(None) => Err(s3_error!(
+                InternalError,
+                "Failed to load bucket replication config"
+            )),
+        }
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn delete_bucket_replication(
+        &self,
+        req: S3Request<DeleteBucketReplicationInput>,
+    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        let _user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+
+        match drive(
+            DeleteBucketReplicationOperation::new(req.input.bucket),
+            &self.state,
+        )
+        .await
+        {
+            Ok(Some(Ok(()))) => Ok(S3Response::new(DeleteBucketReplicationOutput::default())),
+            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
+            Ok(None) => Err(s3_error!(
+                InternalError,
+                "Failed to delete bucket replication config"
+            )),
         }
     }
 }
