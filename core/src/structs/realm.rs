@@ -169,7 +169,16 @@ pub struct RealmConfigDocument {
     #[autosurgeon(with = "autosurgeon_realm_id")]
     pub realm_id: RealmId,
     pub metadata_replication: MetadataReplicationConfig,
+    pub oidc_providers: Vec<OidcProviderConfig>,
     pub users: Vec<User>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct OidcProviderConfig {
+    pub id: String,
+    pub issuer: String,
+    pub audience: String,
+    pub discovery_url: String,
 }
 
 impl RealmConfigDocument {
@@ -177,6 +186,7 @@ impl RealmConfigDocument {
         Self {
             realm_id,
             metadata_replication: MetadataReplicationConfig::new(default_replication_factor),
+            oidc_providers: Vec::new(),
             users: Vec::new(),
         }
     }
@@ -355,7 +365,7 @@ pub mod autosurgeon_operation_map {
 mod test {
     use crate::structs::{
         Actor, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
-        RealmAuthorizationDocument, RealmConfigDocument, RealmId, User,
+        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId, User,
     };
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
@@ -396,6 +406,13 @@ mod test {
                     replication_factor: 7,
                 }],
             },
+            oidc_providers: vec![OidcProviderConfig {
+                id: "main".to_string(),
+                issuer: "https://issuer.example".to_string(),
+                audience: "aruna-api".to_string(),
+                discovery_url: "https://issuer.example/.well-known/openid-configuration"
+                    .to_string(),
+            }],
             users: vec![User {
                 user_id: Ulid::new(),
                 name: "a_name".to_string(),
@@ -439,6 +456,7 @@ mod test {
                     },
                 ],
             },
+            oidc_providers: vec![],
             users: vec![User {
                 user_id: Ulid::new(),
                 name: "b_name".to_string(),

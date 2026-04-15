@@ -5,6 +5,7 @@ use aruna::bootstrap::{
 };
 use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
+use aruna_api::auth::OidcValidator;
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
@@ -117,6 +118,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
 
+            drive(
+                EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
+                    actor: Actor {
+                        node_id: config.node_id,
+                        user_id: Ulid::from_bytes([0u8; 16]),
+                        realm_id: config.realm_id.clone(),
+                    },
+                    bootstrap_peers: config.bootstrap_nodes.clone(),
+                    default_metadata_replication_factor: config.default_metadata_replication_factor,
+                    oidc_providers: config.oidc_providers.clone(),
+                }),
+                driver_ctx.as_ref(),
+            )
+            .await?;
+
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }
         StartupMode::JoinRealm { phase } => {
@@ -162,6 +178,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         bootstrap_peers: config.bootstrap_nodes.clone(),
                         default_metadata_replication_factor: config
                             .default_metadata_replication_factor,
+                        oidc_providers: config.oidc_providers.clone(),
                     }),
                     driver_ctx.as_ref(),
                 )
@@ -189,7 +206,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.node_id,
             config.node_capabilities,
             is_initial_node,
-            None,
+            Some(Arc::new(OidcValidator::new())),
         )
         .await,
     );

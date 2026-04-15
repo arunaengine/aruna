@@ -1,5 +1,5 @@
 use crate::auth::OidcValidator;
-use crate::error::TokenError;
+use crate::error::{OidcError, TokenError};
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
 use aruna_core::automerge::AutomergeDocumentVariant;
@@ -9,12 +9,13 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::API_STATE_KEYSPACE;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
-use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId};
+use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use base64::Engine;
 use byteview::ByteView;
 use ed25519_dalek::Signer;
@@ -55,7 +56,7 @@ pub struct ServerState {
     // Realm membership
     node_id: NodeId,
     // TODO: OIDC handling
-    _oidc_validator: Option<Arc<OidcValidator>>,
+    oidc_validator: Option<Arc<OidcValidator>>,
 }
 
 impl ServerState {
@@ -93,7 +94,7 @@ impl ServerState {
             driver_ctx,
             realm_id,
             node_id,
-            _oidc_validator: oidc_validator,
+            oidc_validator,
             node_capabilities,
             token_revocation_list: Arc::new(RwLock::new(token_revocation_list)),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
@@ -128,6 +129,33 @@ impl ServerState {
 
     pub fn get_node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    pub fn node_capabilities(&self) -> &NodeCapabilities {
+        &self.node_capabilities
+    }
+
+    pub fn oidc_validator(&self) -> Result<&OidcValidator, OidcError> {
+        self.oidc_validator
+            .as_deref()
+            .ok_or(OidcError::NotConfigured)
+    }
+
+    pub async fn get_oidc_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<OidcProviderConfig, OidcError> {
+        let config = drive(
+            GetRealmConfigOperation::new(self.realm_id.clone()),
+            &self.driver_ctx,
+        )
+        .await
+        .map_err(|error| OidcError::Internal(error.to_string()))?;
+        config
+            .oidc_providers
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or(OidcError::ProviderNotFound)
     }
 
     pub fn is_management_node(&self) -> bool {

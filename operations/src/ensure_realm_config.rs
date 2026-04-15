@@ -2,23 +2,24 @@ use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, RealmConfigDocument};
+use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::structs::{Actor, OidcProviderConfig, RealmConfigDocument};
 use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::automerge::repository::{read_effect, write_effect};
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
-use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
+use aruna_core::NodeId;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsureRealmConfigConfig {
     pub actor: Actor,
     pub bootstrap_peers: Vec<NodeId>,
     pub default_metadata_replication_factor: u32,
+    pub oidc_providers: Vec<OidcProviderConfig>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -123,20 +124,37 @@ impl Operation for EnsureRealmConfigOperation {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => match value.as_deref() {
                     Some(value) => match RealmConfigDocument::from_bytes(value) {
                         Ok(document) => {
-                            self.output = Some(Ok(document));
+                            let mut document = document;
+                            // TODO: Treat configured OIDC providers as authoritative.
+                            // The current append-only merge leaves stale provider updates/removals in place.
+                            for provider in &self.config.oidc_providers {
+                                if !document
+                                    .oidc_providers
+                                    .iter()
+                                    .any(|existing| existing.id == provider.id)
+                                {
+                                    document.oidc_providers.push(provider.clone());
+                                }
+                            }
                             let Some(txn_id) = self.txn_id else {
                                 return self.fail(EnsureRealmConfigError::MissingTransaction);
                             };
-                            self.state = EnsureRealmConfigState::CommitTransaction;
-                            smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                            let bytes = match document.to_bytes(&self.config.actor) {
+                                Ok(bytes) => bytes,
+                                Err(error) => return self.fail(error.into()),
+                            };
+                            self.output = Some(Ok(document));
+                            self.state = EnsureRealmConfigState::WriteDocument;
+                            smallvec![write_effect(&self.document_ref(), bytes, Some(txn_id))]
                         }
                         Err(error) => self.fail(error.into()),
                     },
                     None => {
-                        let document = RealmConfigDocument::new(
+                        let mut document = RealmConfigDocument::new(
                             self.config.actor.realm_id.clone(),
                             self.config.default_metadata_replication_factor,
                         );
+                        document.oidc_providers = self.config.oidc_providers.clone();
                         let bytes = match document.to_bytes(&self.config.actor) {
                             Ok(bytes) => bytes,
                             Err(error) => return self.fail(error.into()),

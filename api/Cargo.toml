@@ -23,6 +23,7 @@ tracing.workspace = true
 tracing-opentelemetry.workspace = true
 ulid.workspace = true
 url = "2.5.7"
+reqwest.workspace = true
 
 # REST
 axum = "0.8.8"

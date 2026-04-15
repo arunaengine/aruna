@@ -1,17 +1,33 @@
-use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::realm::RealmId;
 use crate::types::autosurgeon_ulid;
 use crate::types::{RoleId, UserId};
-use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
+use crate::NodeId;
+use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
 use core::fmt;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
+
+#[derive(Debug, Serialize)]
+struct OidcSubjectKey<'a> {
+    kind: &'static str,
+    issuer: &'a str,
+    sub: &'a str,
+}
+
+pub fn oidc_subject_key(issuer: &str, subject_id: &str) -> String {
+    serde_json::to_string(&OidcSubjectKey {
+        kind: "oidc",
+        issuer,
+        sub: subject_id,
+    })
+    .expect("OIDC subject key serialization should not fail")
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
 pub enum Permission {
@@ -243,6 +259,27 @@ pub struct User {
     pub user_id: UserId,
     pub name: String,
     pub subject_ids: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::oidc_subject_key;
+
+    #[test]
+    fn oidc_subject_key_uses_structured_encoding() {
+        assert_eq!(
+            oidc_subject_key("https://issuer.example", "subject-1"),
+            r#"{"kind":"oidc","issuer":"https://issuer.example","sub":"subject-1"}"#
+        );
+    }
+
+    #[test]
+    fn oidc_subject_key_avoids_delimiter_collisions() {
+        let first = oidc_subject_key("a:b", "c");
+        let second = oidc_subject_key("a", "b:c");
+
+        assert_ne!(first, second);
+    }
 }
 
 impl User {

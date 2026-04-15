@@ -729,6 +729,7 @@ mod test {
             realm_id: realm_id.clone(),
             metadata_replication: RealmConfigDocument::default_for_realm(realm_id.clone())
                 .metadata_replication,
+            oidc_providers: vec![],
             users: vec![expected_user.clone()],
         };
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {

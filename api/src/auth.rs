@@ -1,8 +1,8 @@
-use crate::error::TokenError;
+use crate::error::{OidcError, TokenError};
 use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
+use aruna_core::structs::{AuthContext, OidcProviderConfig, RealmId, TokenClaims};
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -10,14 +10,213 @@ use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use http::HeaderMap;
 use jsonwebtoken::dangerous::insecure_decode;
-use jsonwebtoken::{Validation, decode};
+use jsonwebtoken::jwk::JwkSet;
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use s3s::header;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::RwLock;
 use tracing::warn;
 
+const OIDC_HTTP_TIMEOUT_SECS: u64 = 5;
+const OIDC_HTTP_CONNECT_TIMEOUT_SECS: u64 = 2;
+
 #[derive(Debug)]
-pub struct OidcValidator {}
+pub struct OidcValidator {
+    client: reqwest::Client,
+    provider_metadata_cache: RwLock<HashMap<String, CachedOidcProviderMetadata>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedOidcProviderMetadata {
+    issuer: String,
+    jwks: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcIdentity {
+    pub issuer: String,
+    pub subject_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OidcDiscoveryDocument {
+    issuer: String,
+    jwks_uri: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct OidcClaims {
+    sub: String,
+    iss: String,
+    exp: u64,
+    #[serde(default)]
+    nbf: Option<u64>,
+    aud: OidcAudience,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum OidcAudience {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl OidcValidator {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(OIDC_HTTP_TIMEOUT_SECS))
+                .connect_timeout(Duration::from_secs(OIDC_HTTP_CONNECT_TIMEOUT_SECS))
+                .build()
+                .expect("OIDC HTTP client construction should not fail"),
+            provider_metadata_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    async fn get_provider_metadata(
+        &self,
+        provider: &OidcProviderConfig,
+    ) -> Result<CachedOidcProviderMetadata, OidcError> {
+        if let Some(metadata) = self
+            .provider_metadata_cache
+            .read()
+            .await
+            .get(&provider.discovery_url)
+            .cloned()
+        {
+            return Ok(metadata);
+        }
+
+        let discovery = self
+            .client
+            .get(&provider.discovery_url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<OidcDiscoveryDocument>()
+            .await?;
+        if discovery.issuer != provider.issuer {
+            return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidIssuer,
+            )));
+        }
+        let jwks = self
+            .client
+            .get(&discovery.jwks_uri)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<Value>()
+            .await?;
+        let metadata = CachedOidcProviderMetadata {
+            issuer: discovery.issuer,
+            jwks,
+        };
+        self.provider_metadata_cache
+            .write()
+            .await
+            .insert(provider.discovery_url.clone(), metadata.clone());
+        Ok(metadata)
+    }
+
+    async fn decoding_key_for(
+        &self,
+        provider: &OidcProviderConfig,
+        kid: &str,
+    ) -> Result<DecodingKey, OidcError> {
+        let metadata = self.get_provider_metadata(provider).await?;
+        if metadata.issuer != provider.issuer {
+            return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidIssuer,
+            )));
+        }
+        let jwks = serde_json::from_value::<JwkSet>(metadata.jwks.clone())?;
+        let jwk = jwks.find(kid).ok_or(OidcError::SigningKeyNotFound)?;
+        DecodingKey::from_jwk(jwk).map_err(Into::into)
+    }
+
+    pub async fn validate(
+        &self,
+        provider: &OidcProviderConfig,
+        token: &str,
+    ) -> Result<OidcIdentity, OidcError> {
+        let header = decode_header(token)?;
+        let kid = header.kid.ok_or(OidcError::MissingKeyId)?;
+        let algorithm = header.alg;
+        if !is_supported_oidc_algorithm(algorithm) {
+            return Err(OidcError::UnsupportedAlgorithm);
+        }
+        let decoding_key = self.decoding_key_for(provider, &kid).await?;
+
+        let mut validation = Validation::new(algorithm);
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        validation.set_issuer(&[provider.issuer.as_str()]);
+        validation.set_audience(&[provider.audience.as_str()]);
+        validation.validate_nbf = true;
+
+        let claims = decode::<OidcClaims>(token, &decoding_key, &validation)?.claims;
+        if !matches_audience(&claims.aud, &provider.audience) {
+            return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidAudience,
+            )));
+        }
+        if claims.iss != provider.issuer {
+            return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidIssuer,
+            )));
+        }
+        if claims.sub.is_empty() {
+            return Err(OidcError::MissingSubject);
+        }
+        let _ = claims.exp;
+        let _ = claims.nbf;
+
+        Ok(OidcIdentity {
+            issuer: claims.iss,
+            subject_id: claims.sub,
+        })
+    }
+}
+
+impl Default for OidcValidator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn matches_audience(aud: &OidcAudience, expected: &str) -> bool {
+    match aud {
+        OidcAudience::Single(value) => value == expected,
+        OidcAudience::Multiple(values) => values.iter().any(|value| value == expected),
+    }
+}
+
+fn is_supported_oidc_algorithm(algorithm: Algorithm) -> bool {
+    matches!(
+        algorithm,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512
+            | Algorithm::ES256
+            | Algorithm::ES384
+            | Algorithm::EdDSA
+    )
+}
+
+pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
 
 #[derive(Debug, Error)]
 pub enum AuthorizationError {
@@ -30,10 +229,7 @@ pub enum AuthorizationError {
 }
 
 async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Option<AuthContext> {
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))?;
+    let token = bearer_token(headers)?;
 
     let token = handle_token(state, token).await.ok()?;
     let auth_context: AuthContext = token.try_into().ok()?;
@@ -130,12 +326,13 @@ pub async fn auth_middleware(
 
 #[cfg(test)]
 mod test {
-    use crate::auth::extract_auth_context;
+    use crate::auth::{OidcValidator, extract_auth_context};
     use crate::server::ServerState;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::structs::OidcProviderConfig;
     use aruna_core::structs::{Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
@@ -143,15 +340,135 @@ mod test {
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use axum::Json;
     use axum::http::{HeaderMap, header};
+    use axum::routing::get;
+    use axum::{Router, extract::State};
     use base64::Engine;
     use byteview::ByteView;
     use chrono::Days;
     use ed25519_dalek::SigningKey;
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
     use jsonwebtoken::signature::SignerMut;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde::{Deserialize, Serialize};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::env::temp_dir;
+    use tokio::net::TcpListener;
     use ulid::Ulid;
+
+    #[derive(Clone)]
+    struct OidcTestServerState {
+        issuer: String,
+        jwks_uri: String,
+        jwks: serde_json::Value,
+        discovery_requests: Arc<AtomicUsize>,
+        jwks_requests: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct OidcTestServerMetrics {
+        discovery_requests: Arc<AtomicUsize>,
+        jwks_requests: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct TestOidcClaims {
+        sub: String,
+        iss: String,
+        aud: String,
+        exp: u64,
+    }
+
+    async fn oidc_discovery(State(state): State<OidcTestServerState>) -> Json<serde_json::Value> {
+        state.discovery_requests.fetch_add(1, Ordering::Relaxed);
+        Json(serde_json::json!({
+            "issuer": state.issuer,
+            "jwks_uri": state.jwks_uri,
+        }))
+    }
+
+    async fn oidc_jwks(State(state): State<OidcTestServerState>) -> Json<serde_json::Value> {
+        state.jwks_requests.fetch_add(1, Ordering::Relaxed);
+        Json(state.jwks)
+    }
+
+    async fn spawn_oidc_provider(
+        issuer: &str,
+        kid: &str,
+        jwks: serde_json::Value,
+    ) -> (String, String, OidcTestServerMetrics, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let discovery_url = format!("http://{addr}/.well-known/openid-configuration");
+        let jwks_uri = format!("http://{addr}/jwks/{kid}.json");
+        let discovery_requests = Arc::new(AtomicUsize::new(0));
+        let jwks_requests = Arc::new(AtomicUsize::new(0));
+        let state = OidcTestServerState {
+            issuer: issuer.to_string(),
+            jwks_uri: jwks_uri.clone(),
+            jwks,
+            discovery_requests: discovery_requests.clone(),
+            jwks_requests: jwks_requests.clone(),
+        };
+        let router = Router::new()
+            .route("/.well-known/openid-configuration", get(oidc_discovery))
+            .route(&format!("/jwks/{kid}.json"), get(oidc_jwks))
+            .with_state(state);
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (
+            discovery_url,
+            jwks_uri,
+            OidcTestServerMetrics {
+                discovery_requests,
+                jwks_requests,
+            },
+            task,
+        )
+    }
+
+    fn eddsa_jwk(kid: &str, signing_key: &SigningKey) -> serde_json::Value {
+        serde_json::json!({
+            "keys": [{
+                "kty": "OKP",
+                "alg": "EdDSA",
+                "use": "sig",
+                "kid": kid,
+                "crv": "Ed25519",
+                "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
+            }]
+        })
+    }
+
+    fn sign_oidc_token(
+        issuer: &str,
+        audience: &str,
+        subject: &str,
+        kid: &str,
+        signing_key: &SigningKey,
+        algorithm: Algorithm,
+    ) -> String {
+        let mut header = Header::new(algorithm);
+        header.kid = Some(kid.to_string());
+        let claims = TestOidcClaims {
+            sub: subject.to_string(),
+            iss: issuer.to_string(),
+            aud: audience.to_string(),
+            exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
+        };
+        let der = signing_key
+            .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+            .unwrap();
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ed_pem(der.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
 
     async fn read_auth_doc(
         driver_ctx: &DriverContext,
@@ -171,6 +488,171 @@ mod test {
             }) => RealmAuthorizationDocument::from_bytes(&bytes).unwrap(),
             other => panic!("unexpected auth doc read result: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn oidc_validator_accepts_valid_eddsa_token() {
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let jwks = eddsa_jwk(kid, &signing_key);
+        let (discovery_url, _jwks_uri, _metrics, task) =
+            spawn_oidc_provider(issuer, kid, jwks).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let token = sign_oidc_token(
+            issuer,
+            audience,
+            "subject-1",
+            kid,
+            &signing_key,
+            Algorithm::EdDSA,
+        );
+
+        let validator = OidcValidator::new();
+        let identity = validator.validate(&provider, &token).await.unwrap();
+        assert_eq!(identity.issuer, issuer);
+        assert_eq!(identity.subject_id, "subject-1");
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oidc_validator_rejects_hs256_tokens() {
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "symm-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let jwks = eddsa_jwk(kid, &signing_key);
+        let (discovery_url, _jwks_uri, _metrics, task) =
+            spawn_oidc_provider(issuer, kid, jwks).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(kid.to_string());
+        let claims = TestOidcClaims {
+            sub: "subject-1".to_string(),
+            iss: issuer.to_string(),
+            aud: audience.to_string(),
+            exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
+        };
+        let token = encode(&header, &claims, &EncodingKey::from_secret(b"super-secret")).unwrap();
+
+        let validator = OidcValidator::new();
+        let error = validator.validate(&provider, &token).await.unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::OidcError::UnsupportedAlgorithm
+        ));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oidc_validator_rejects_wrong_audience() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let jwks = eddsa_jwk(kid, &signing_key);
+        let (discovery_url, _jwks_uri, _metrics, task) =
+            spawn_oidc_provider(issuer, kid, jwks).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: "aruna-api".to_string(),
+            discovery_url,
+        };
+        let token = sign_oidc_token(
+            issuer,
+            "different-audience",
+            "subject-1",
+            kid,
+            &signing_key,
+            Algorithm::EdDSA,
+        );
+
+        let validator = OidcValidator::new();
+        assert!(validator.validate(&provider, &token).await.is_err());
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oidc_validator_caches_provider_metadata_between_requests() {
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let jwks = eddsa_jwk(kid, &signing_key);
+        let (discovery_url, _jwks_uri, metrics, task) =
+            spawn_oidc_provider(issuer, kid, jwks).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let token = sign_oidc_token(
+            issuer,
+            audience,
+            "subject-1",
+            kid,
+            &signing_key,
+            Algorithm::EdDSA,
+        );
+
+        let validator = OidcValidator::new();
+        validator.validate(&provider, &token).await.unwrap();
+        validator.validate(&provider, &token).await.unwrap();
+
+        assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 1);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oidc_validator_rejects_discovery_issuer_mismatch() {
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let jwks = eddsa_jwk(kid, &signing_key);
+        let (discovery_url, _jwks_uri, _metrics, task) =
+            spawn_oidc_provider("https://different-issuer.example", kid, jwks).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let token = sign_oidc_token(
+            issuer,
+            audience,
+            "subject-1",
+            kid,
+            &signing_key,
+            Algorithm::EdDSA,
+        );
+
+        let validator = OidcValidator::new();
+        let error = validator.validate(&provider, &token).await.unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::OidcError::Jwt(jsonwebtoken::errors::Error { .. })
+        ));
+
+        task.abort();
     }
 
     #[tokio::test]
