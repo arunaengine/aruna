@@ -42,18 +42,18 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
 
 #[cfg(test)]
 mod tests {
-    use super::{get_info, InfoResponse};
+    use super::{InfoResponse, get_info};
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
+    use axum::Json;
     use axum::extract::State;
     use axum::http::StatusCode;
-    use axum::Json;
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
-    use tempfile::{tempdir, TempDir};
+    use tempfile::{TempDir, tempdir};
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
         let tempdir = tempdir().unwrap();

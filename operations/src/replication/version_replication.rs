@@ -398,10 +398,10 @@ impl Operation for ReplicateScopeOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ReplicateScopeState::Error {
-            if let Some(Err(err)) = self.output {
-                return Err(err);
-            }
+        if self.state == ReplicateScopeState::Error
+            && let Some(Err(err)) = self.output
+        {
+            return Err(err);
         }
         Ok(self.output)
     }

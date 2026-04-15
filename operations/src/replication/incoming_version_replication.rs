@@ -746,10 +746,10 @@ impl Operation for IncomingVersionReplicationOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == IncomingVersionReplicationState::Error {
-            if let Some(Err(err)) = self.output {
-                return Err(err);
-            }
+        if self.state == IncomingVersionReplicationState::Error
+            && let Some(Err(err)) = self.output
+        {
+            return Err(err);
         }
         Ok(self.output.unwrap_or(Ok(())))
     }

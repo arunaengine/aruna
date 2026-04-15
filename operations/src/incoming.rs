@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::driver::{drive, DriverContext};
+use crate::driver::{DriverContext, drive};
 use crate::incoming_automerge::IncomingAutomergeOperation;
 use crate::incoming_gossip::IncomingGossipOperation;
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
@@ -10,10 +10,10 @@ use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::gossip::TopicMessage;
 use aruna_core::id::{NodeId, TopicId};
-use aruna_net::streams::BiStream;
 use aruna_net::InboundEventHandler;
+use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use tracing::{error, field, info_span, trace, warn, Instrument};
+use tracing::{Instrument, error, field, info_span, trace, warn};
 
 #[derive(Debug)]
 struct OperationsInboundHandler {

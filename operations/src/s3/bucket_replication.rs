@@ -151,10 +151,10 @@ impl Operation for PutBucketReplicationOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == PutBucketReplicationState::Error {
-            if let Some(Err(err)) = self.output {
-                return Err(err);
-            }
+        if self.state == PutBucketReplicationState::Error
+            && let Some(Err(err)) = self.output
+        {
+            return Err(err);
         }
         Ok(self.output)
     }
@@ -268,10 +268,10 @@ impl Operation for GetBucketReplicationOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == GetBucketReplicationState::Error {
-            if let Some(Err(err)) = self.output {
-                return Err(err);
-            }
+        if self.state == GetBucketReplicationState::Error
+            && let Some(Err(err)) = self.output
+        {
+            return Err(err);
         }
         Ok(self.output)
     }
@@ -411,10 +411,10 @@ impl Operation for DeleteBucketReplicationOperation {
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == DeleteBucketReplicationState::Error {
-            if let Some(Err(err)) = self.output {
-                return Err(err);
-            }
+        if self.state == DeleteBucketReplicationState::Error
+            && let Some(Err(err)) = self.output
+        {
+            return Err(err);
         }
         Ok(self.output)
     }
@@ -432,7 +432,7 @@ mod tests {
         DeleteBucketReplicationOperation, GetBucketReplicationOperation,
         PutBucketReplicationOperation,
     };
-    use crate::driver::{drive, DriverContext};
+    use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_REPLICATION_KEYSPACE;
