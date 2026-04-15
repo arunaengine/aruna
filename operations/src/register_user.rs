@@ -175,7 +175,7 @@ impl RegisterUserOperation {
 
     fn emit_create_user(&mut self, txn_id: TxnId) -> Result<Effects, RegisterUserError> {
         let user = User {
-            user_id: self.input.user_id.clone(),
+            user_id: self.input.user_id,
             name: self.input.name.clone(),
             subject_ids: self.input.subject_ids.clone(),
         };
