@@ -19,10 +19,6 @@ use aruna_operations::replication::version_replication::{
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadError, AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
 };
-use aruna_operations::s3::bucket_replication::{
-    DeleteBucketReplicationOperation, GetBucketReplicationError, GetBucketReplicationOperation,
-    PutBucketReplicationOperation,
-};
 use aruna_operations::s3::complete_multipart_upload::{
     CompleteMultipartUploadError, CompleteMultipartUploadInput as CMUI,
     CompleteMultipartUploadOperation,
@@ -40,6 +36,10 @@ use aruna_operations::s3::head_object::{
     HeadObjectError, HeadObjectInput as HOI, HeadObjectOperation,
 };
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
+use aruna_operations::s3::put_bucket_replication::{
+    DeleteBucketReplicationOperation, GetBucketReplicationError, GetBucketReplicationOperation,
+    PutBucketReplicationOperation,
+};
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectOperation};
 use aruna_operations::s3::upload_part::{
     UploadPartError, UploadPartInput as UPI, UploadPartOperation,
