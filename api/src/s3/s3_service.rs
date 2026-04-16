@@ -1,18 +1,18 @@
 use crate::s3::checksum::{
-    ApplyChecksums, ChecksumSelection, checksum_mismatch_error, checksum_mode_enabled,
-    encode_checksums, parse_upload_checksum_request,
+    checksum_mismatch_error, checksum_mode_enabled, encode_checksums, parse_upload_checksum_request,
+    ApplyChecksums, ChecksumSelection,
 };
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
     s3_checksum_type_from_multipart, to_base64,
 };
-use aruna_core::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
+use aruna_core::NodeId;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::driver::{drive, DriverContext};
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
 };
@@ -56,11 +56,11 @@ use s3s::dto::{
     PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
     ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
-use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use s3s::{s3_error, S3ErrorCode, S3Request, S3Response, S3Result, S3};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{Instrument, debug, error, warn};
+use tracing::{debug, error, warn, Instrument};
 
 #[derive(Clone)]
 pub struct ArunaS3Service {
@@ -164,6 +164,24 @@ impl ArunaS3Service {
         }
 
         Ok(targets)
+    }
+
+    fn validate_replication_configuration(
+        &self,
+        configuration: &ReplicationConfiguration,
+    ) -> S3Result<()> {
+        if configuration
+            .rules
+            .iter()
+            .any(|rule| rule.filter.is_some() || rule.prefix.is_some())
+        {
+            return Err(s3_error!(
+                NotImplemented,
+                "Bucket replication rules with filter or prefix are not yet supported"
+            ));
+        }
+
+        Ok(())
     }
 
     fn build_replication_configuration(
@@ -986,6 +1004,8 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+
+        self.validate_replication_configuration(&req.input.replication_configuration)?;
 
         let targets = self
             .parse_replication_targets(&req.input.bucket, &req.input.replication_configuration)?;
