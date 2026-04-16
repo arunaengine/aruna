@@ -78,20 +78,10 @@ impl OidcValidator {
         }
     }
 
-    async fn get_provider_metadata(
+    async fn fetch_provider_metadata(
         &self,
         provider: &OidcProviderConfig,
     ) -> Result<CachedOidcProviderMetadata, OidcError> {
-        if let Some(metadata) = self
-            .provider_metadata_cache
-            .read()
-            .await
-            .get(&provider.discovery_url)
-            .cloned()
-        {
-            return Ok(metadata);
-        }
-
         let discovery = self
             .client
             .get(&provider.discovery_url)
@@ -113,10 +103,31 @@ impl OidcValidator {
             .error_for_status()?
             .json::<Value>()
             .await?;
-        let metadata = CachedOidcProviderMetadata {
+
+        Ok(CachedOidcProviderMetadata {
             issuer: discovery.issuer,
             jwks,
-        };
+        })
+    }
+
+    async fn get_provider_metadata(
+        &self,
+        provider: &OidcProviderConfig,
+        refresh: bool,
+    ) -> Result<CachedOidcProviderMetadata, OidcError> {
+        if !refresh {
+            if let Some(metadata) = self
+                .provider_metadata_cache
+                .read()
+                .await
+                .get(&provider.discovery_url)
+                .cloned()
+            {
+                return Ok(metadata);
+            }
+        }
+
+        let metadata = self.fetch_provider_metadata(provider).await?;
         self.provider_metadata_cache
             .write()
             .await
@@ -129,15 +140,20 @@ impl OidcValidator {
         provider: &OidcProviderConfig,
         kid: &str,
     ) -> Result<DecodingKey, OidcError> {
-        let metadata = self.get_provider_metadata(provider).await?;
-        if metadata.issuer != provider.issuer {
-            return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
-                jsonwebtoken::errors::ErrorKind::InvalidIssuer,
-            )));
+        for refresh in [false, true] {
+            let metadata = self.get_provider_metadata(provider, refresh).await?;
+            if metadata.issuer != provider.issuer {
+                return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
+                    jsonwebtoken::errors::ErrorKind::InvalidIssuer,
+                )));
+            }
+            let jwks = serde_json::from_value::<JwkSet>(metadata.jwks.clone())?;
+            if let Some(jwk) = jwks.find(kid) {
+                return DecodingKey::from_jwk(jwk).map_err(Into::into);
+            }
         }
-        let jwks = serde_json::from_value::<JwkSet>(metadata.jwks.clone())?;
-        let jwk = jwks.find(kid).ok_or(OidcError::SigningKeyNotFound)?;
-        DecodingKey::from_jwk(jwk).map_err(Into::into)
+
+        Err(OidcError::SigningKeyNotFound)
     }
 
     pub async fn validate(
@@ -356,13 +372,14 @@ mod test {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::env::temp_dir;
     use tokio::net::TcpListener;
+    use tokio::sync::RwLock;
     use ulid::Ulid;
 
     #[derive(Clone)]
     struct OidcTestServerState {
         issuer: String,
         jwks_uri: String,
-        jwks: serde_json::Value,
+        jwks: Arc<RwLock<serde_json::Value>>,
         discovery_requests: Arc<AtomicUsize>,
         jwks_requests: Arc<AtomicUsize>,
     }
@@ -371,6 +388,7 @@ mod test {
     struct OidcTestServerMetrics {
         discovery_requests: Arc<AtomicUsize>,
         jwks_requests: Arc<AtomicUsize>,
+        jwks: Arc<RwLock<serde_json::Value>>,
     }
 
     #[derive(Clone, Serialize, Deserialize)]
@@ -391,7 +409,7 @@ mod test {
 
     async fn oidc_jwks(State(state): State<OidcTestServerState>) -> Json<serde_json::Value> {
         state.jwks_requests.fetch_add(1, Ordering::Relaxed);
-        Json(state.jwks)
+        Json(state.jwks.read().await.clone())
     }
 
     async fn spawn_oidc_provider(
@@ -405,10 +423,11 @@ mod test {
         let jwks_uri = format!("http://{addr}/jwks/{kid}.json");
         let discovery_requests = Arc::new(AtomicUsize::new(0));
         let jwks_requests = Arc::new(AtomicUsize::new(0));
+        let jwks = Arc::new(RwLock::new(jwks));
         let state = OidcTestServerState {
             issuer: issuer.to_string(),
             jwks_uri: jwks_uri.clone(),
-            jwks,
+            jwks: jwks.clone(),
             discovery_requests: discovery_requests.clone(),
             jwks_requests: jwks_requests.clone(),
         };
@@ -425,6 +444,7 @@ mod test {
             OidcTestServerMetrics {
                 discovery_requests,
                 jwks_requests,
+                jwks,
             },
             task,
         )
@@ -617,6 +637,54 @@ mod test {
 
         assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 1);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oidc_validator_refreshes_jwks_when_kid_is_rotated() {
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let old_kid = "old-key";
+        let new_kid = "new-key";
+        let old_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let new_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let (discovery_url, _jwks_uri, metrics, task) =
+            spawn_oidc_provider(issuer, old_kid, eddsa_jwk(old_kid, &old_signing_key)).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let validator = OidcValidator::new();
+
+        let old_token = sign_oidc_token(
+            issuer,
+            audience,
+            "subject-1",
+            old_kid,
+            &old_signing_key,
+            Algorithm::EdDSA,
+        );
+        validator.validate(&provider, &old_token).await.unwrap();
+
+        *metrics.jwks.write().await = eddsa_jwk(new_kid, &new_signing_key);
+
+        let new_token = sign_oidc_token(
+            issuer,
+            audience,
+            "subject-2",
+            new_kid,
+            &new_signing_key,
+            Algorithm::EdDSA,
+        );
+        let identity = validator.validate(&provider, &new_token).await.unwrap();
+
+        assert_eq!(identity.issuer, issuer);
+        assert_eq!(identity.subject_id, "subject-2");
+        assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 2);
 
         task.abort();
     }
