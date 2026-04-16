@@ -1,7 +1,7 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::NodeId;
 use aruna_core::structs::{AuthContext, Permission, UserIdentity};
+use aruna_core::NodeId;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::replication::version_replication::{
@@ -15,7 +15,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{Instrument, info, warn};
+use tracing::{info, warn, Instrument};
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
@@ -48,7 +48,7 @@ pub struct ReplicateBlobResponse {}
     tag = "blobs",
     request_body = ReplicateBlobRequest,
     responses(
-        (status = 202, description = "Blob replication accepted for background execution", body = ReplicateBlobResponse),
+        (status = 202, description = "Replication accepted", body = ReplicateBlobResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse)
@@ -60,25 +60,9 @@ pub async fn replicate_blob(
     Extension(auth): Extension<Option<AuthContext>>,
     Json(request): Json<ReplicateBlobRequest>,
 ) -> ServerResult<(StatusCode, Json<ReplicateBlobResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
+    let (auth, bucket_info) = require_auth_and_bucket(&state, auth, &request.bucket).await?;
 
-    let bucket_info = match drive(
-        GetBucketInfoOperation::new(request.bucket.clone()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(Some(Ok(bucket_info))) => bucket_info,
-        Ok(Some(Err(GetBucketInfoError::NotFound))) | Err(GetBucketInfoError::NotFound) => {
-            return Err(ServerError::NotFound);
-        }
-        Ok(Some(Err(err))) | Err(err) => return Err(ServerError::InternalError(err.to_string())),
-        Ok(None) => return Err(ServerError::NotFound),
-    };
-
+    // Check permissions
     let mut permission_path = format!(
         "/{}/g/{}/data/{}/{}",
         state.get_realm_id(),
@@ -90,7 +74,6 @@ pub async fn replicate_blob(
         permission_path.push('/');
         permission_path.push_str(path);
     }
-
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: auth.clone(),
@@ -106,50 +89,36 @@ pub async fn replicate_blob(
     }
 
     let node_id = NodeId::from_str(&request.node_id).map_err(|_| ServerError::BadRequest)?;
-    let user_identity = UserIdentity {
-        user_id: auth.user_id,
-        realm_key: auth.realm_id,
-    };
-    let target = match (request.path.as_deref(), request.version_id.as_deref()) {
+    let path = request.path.clone();
+    let version_id = request.version_id.clone();
+    let target = match (path.as_deref(), version_id.as_deref()) {
         (None, None) => ReplicateScopeTarget::Bucket,
         (None, Some(_)) => return Err(ServerError::BadRequest),
-        (Some(path), None) => ReplicateScopeTarget::Object {
-            key: path.to_string(),
-        },
-        (Some(path), Some(version_id)) => ReplicateScopeTarget::Version {
-            key: path.to_string(),
-            version_id: ulid::Ulid::from_string(version_id).map_err(|_| ServerError::BadRequest)?,
+        (Some(p), None) => ReplicateScopeTarget::Object { key: p.to_string() },
+        (Some(p), Some(v)) => ReplicateScopeTarget::Version {
+            key: p.to_string(),
+            version_id: ulid::Ulid::from_string(v).map_err(|_| ServerError::BadRequest)?,
         },
     };
 
-    let path = match &target {
-        ReplicateScopeTarget::Bucket => None,
-        ReplicateScopeTarget::Prefix(prefix) => Some(prefix.clone()),
-        ReplicateScopeTarget::Object { key } | ReplicateScopeTarget::Version { key, .. } => {
-            Some(key.clone())
-        }
-    };
-    let version_id = match &target {
-        ReplicateScopeTarget::Version { version_id, .. } => Some(version_id.to_string()),
-        _ => None,
-    };
+    let bucket = request.bucket.clone();
     let input = ReplicateScopeInput {
         bucket: request.bucket,
         target,
         target_node_id: node_id,
-        user_identity,
+        user_identity: UserIdentity {
+            user_id: auth.user_id,
+            realm_key: auth.realm_id,
+        },
         replicate_delete_markers: true,
     };
-    let bucket = input.bucket.clone();
-    let path_for_span = path.clone();
-    let version_id_for_span = version_id.clone();
     let target_node_id = input.target_node_id;
     let ctx = state.get_ctx();
     let span = tracing::info_span!(
         "api.manual_replication",
         bucket = %bucket,
-        path = ?path_for_span,
-        version_id = ?version_id_for_span,
+        path = ?path,
+        version_id = ?version_id,
         target_node = %target_node_id,
     );
 
@@ -201,4 +170,30 @@ pub async fn replicate_blob(
     );
 
     Ok((StatusCode::ACCEPTED, Json(ReplicateBlobResponse {})))
+}
+
+async fn require_auth_and_bucket(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+    bucket: &str,
+) -> ServerResult<(AuthContext, aruna_core::structs::BucketInfo)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    let bucket_info = drive(
+        GetBucketInfoOperation::new(bucket.to_owned()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|e| match e {
+        GetBucketInfoError::NotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?
+    .ok_or(ServerError::NotFound)?
+    .map_err(|e| match e {
+        GetBucketInfoError::NotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+    Ok((auth, bucket_info))
 }
