@@ -12,9 +12,9 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    BucketInfo, Location, LookupKey, MultipartObjectMetadataKey, MultipartObjectPart,
+    AuthContext, BucketInfo, Location, LookupKey, MultipartObjectMetadataKey, MultipartObjectPart,
     MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
-    ReplicationSuboperationResult, UserIdentity, VersionKey, VersionMetadata,
+    ReplicationSuboperationResult, VersionKey, VersionMetadata,
 };
 use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
@@ -36,7 +36,7 @@ pub struct ReplicateScopeInput {
     pub bucket: String,
     pub target: ReplicateScopeTarget,
     pub target_node_id: NodeId,
-    pub user_identity: UserIdentity,
+    pub auth_context: AuthContext,
     pub replicate_delete_markers: bool,
 }
 
@@ -83,7 +83,6 @@ enum ReplicateScopeState {
 pub struct ReplicateScopeOperation {
     input: ReplicateScopeInput,
     state: ReplicateScopeState,
-    bucket_info: Option<BucketInfo>,
     exact_object_exists: bool,
     iteration_prefix: Option<String>,
     next_start_after: Option<Key>,
@@ -97,7 +96,6 @@ impl ReplicateScopeOperation {
         Self {
             input,
             state: ReplicateScopeState::Init,
-            bucket_info: None,
             exact_object_exists: false,
             iteration_prefix: None,
             next_start_after: None,
@@ -201,10 +199,6 @@ impl ReplicateScopeOperation {
     }
 
     fn enqueue_version_request(&mut self, version_key: VersionKey) {
-        let Some(bucket_info) = self.bucket_info.clone() else {
-            return;
-        };
-
         if self.pending_versions.iter().any(|request| {
             request.bucket == version_key.bucket
                 && request.key == version_key.key
@@ -218,8 +212,7 @@ impl ReplicateScopeOperation {
             key: version_key.key,
             version_id: version_key.version_id,
             target_node_id: self.input.target_node_id,
-            bucket_info,
-            user_identity: self.input.user_identity.clone(),
+            auth_context: self.input.auth_context.clone(),
         });
     }
 
@@ -272,7 +265,7 @@ impl Operation for ReplicateScopeOperation {
                     Ok(bucket_info) => bucket_info,
                     Err(err) => return self.fail(err.into()),
                 };
-                self.bucket_info = Some(bucket_info);
+                let _bucket_info = bucket_info;
                 self.resolve_target()
             }
             ReplicateScopeState::ResolveObjectTarget => {
@@ -631,11 +624,10 @@ impl ReplicateObjectVersionOperation {
             } else {
                 ReplicationItemKind::DeleteMarker
             },
-            bucket_info: self.request.bucket_info.clone(),
             created_at: metadata.created_at,
             created_by: metadata.created_by,
             current_version,
-            user_identity: self.request.user_identity.clone(),
+            auth_context: self.request.auth_context.clone(),
             blob,
             multipart,
         });
@@ -955,9 +947,9 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        BackendLocation, BucketInfo, Location, MultipartChecksumType, MultipartObjectMetadataKey,
-        MultipartObjectPart, MultipartObjectSummary, RealmId, UserIdentity, VersionKey,
-        VersionMetadata,
+        AuthContext, BackendLocation, BucketInfo, Location, MultipartChecksumType,
+        MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, RealmId,
+        VersionKey, VersionMetadata,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -971,10 +963,11 @@ mod tests {
         }
     }
 
-    fn user_identity() -> UserIdentity {
-        UserIdentity {
+    fn auth_context() -> AuthContext {
+        AuthContext {
             user_id: Ulid::new(),
-            realm_key: RealmId::from_bytes([7u8; 32]),
+            realm_id: RealmId::from_bytes([7u8; 32]),
+            path_restrictions: None,
         }
     }
 
@@ -983,7 +976,7 @@ mod tests {
             bucket: "bucket".to_string(),
             target,
             target_node_id: iroh::SecretKey::generate(&mut rand::rng()).public(),
-            user_identity: user_identity(),
+            auth_context: auth_context(),
             replicate_delete_markers: true,
         }
     }
@@ -1031,8 +1024,7 @@ mod tests {
             key: "dir/file.txt".to_string(),
             version_id,
             target_node_id: iroh::SecretKey::generate(&mut rand::rng()).public(),
-            bucket_info: bucket_info(),
-            user_identity: user_identity(),
+            auth_context: auth_context(),
         }
     }
 

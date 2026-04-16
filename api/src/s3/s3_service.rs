@@ -10,7 +10,7 @@ use crate::s3::util::{
 use aruna_core::NodeId;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess, UserIdentity};
+use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::replication::version_replication::{
@@ -217,7 +217,7 @@ impl ArunaS3Service {
 
     async fn trigger_version_replication(
         &self,
-        user_identity: UserIdentity,
+        auth_context: AuthContext,
         bucket: &str,
         key: &str,
         version_id: ulid::Ulid,
@@ -254,7 +254,7 @@ impl ArunaS3Service {
                     version_id,
                 },
                 target_node_id: target.node_id,
-                user_identity: user_identity.clone(),
+                auth_context: auth_context.clone(),
                 replicate_delete_markers: target.replicate_delete_markers,
             };
 
@@ -297,7 +297,7 @@ impl ArunaS3Service {
 
     fn spawn_version_replication(
         &self,
-        user_identity: UserIdentity,
+        auth_context: AuthContext,
         bucket: String,
         key: String,
         version_id: ulid::Ulid,
@@ -315,7 +315,7 @@ impl ArunaS3Service {
             async move {
                 service
                     .trigger_version_replication(
-                        user_identity,
+                        auth_context,
                         &bucket,
                         &key,
                         version_id,
@@ -430,7 +430,11 @@ impl S3 for ArunaS3Service {
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
-        let replication_user = user_access.user_identity.clone();
+        let replication_auth = AuthContext {
+            user_id: user_access.user_identity.user_id,
+            realm_id: user_access.user_identity.realm_key.clone(),
+            path_restrictions: user_access.path_restrictions.clone(),
+        };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
 
@@ -470,7 +474,7 @@ impl S3 for ArunaS3Service {
                     checksum_request.checksum_type,
                 ));
                 self.spawn_version_replication(
-                    replication_user,
+                    replication_auth,
                     replication_bucket,
                     replication_key,
                     result.version_id,
@@ -627,7 +631,11 @@ impl S3 for ArunaS3Service {
         })?;
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
-        let replication_user = user_access.user_identity.clone();
+        let replication_auth = AuthContext {
+            user_id: user_access.user_identity.user_id,
+            realm_id: user_access.user_identity.realm_key.clone(),
+            path_restrictions: user_access.path_restrictions.clone(),
+        };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
         let completed_parts = req
@@ -676,7 +684,7 @@ impl S3 for ArunaS3Service {
                     s3_checksum_type_from_multipart(result.checksum_type),
                 ));
                 self.spawn_version_replication(
-                    replication_user,
+                    replication_auth,
                     replication_bucket,
                     replication_key,
                     result.version_id,
@@ -902,7 +910,11 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let version_id = parse_version_id(req.input.version_id)?;
-        let replication_user = user_access.user_identity.clone();
+        let replication_auth = AuthContext {
+            user_id: user_access.user_identity.user_id,
+            realm_id: user_access.user_identity.realm_key.clone(),
+            path_restrictions: user_access.path_restrictions.clone(),
+        };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
 
@@ -920,7 +932,7 @@ impl S3 for ArunaS3Service {
             Some(Ok(result)) => {
                 if version_id.is_none() {
                     self.spawn_version_replication(
-                        replication_user,
+                        replication_auth,
                         replication_bucket,
                         replication_key,
                         result.version_id,
@@ -974,6 +986,7 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
+
         let targets = self
             .parse_replication_targets(&req.input.bucket, &req.input.replication_configuration)?;
 

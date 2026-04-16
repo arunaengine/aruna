@@ -1,7 +1,7 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::structs::{AuthContext, Permission, UserIdentity};
 use aruna_core::NodeId;
+use aruna_core::structs::{AuthContext, Permission};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::replication::version_replication::{
@@ -15,7 +15,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{info, warn, Instrument};
+use tracing::{Instrument, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
@@ -106,10 +106,6 @@ pub async fn replicate_blob(
     }
 
     let node_id = NodeId::from_str(&request.node_id).map_err(|_| ServerError::BadRequest)?;
-    let user_identity = UserIdentity {
-        user_id: auth.user_id,
-        realm_key: auth.realm_id,
-    };
     let target = match (request.path.as_deref(), request.version_id.as_deref()) {
         (None, None) => ReplicateScopeTarget::Bucket,
         (None, Some(_)) => return Err(ServerError::BadRequest),
@@ -137,7 +133,7 @@ pub async fn replicate_blob(
         bucket: request.bucket,
         target,
         target_node_id: node_id,
-        user_identity,
+        auth_context: auth,
         replicate_delete_markers: true,
     };
     let bucket = input.bucket.clone();

@@ -1,8 +1,8 @@
 use aruna_core::errors::ConversionError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::{
-    BackendLocation, BucketInfo, MultipartChecksumType, MultipartObjectPart,
-    MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult, UserIdentity,
+    AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
+    MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
 };
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -15,11 +15,10 @@ pub struct VersionReplicationManifest {
     pub key: String,
     pub version_id: Ulid,
     pub kind: ReplicationItemKind,
-    pub bucket_info: BucketInfo,
     pub created_at: std::time::SystemTime,
     pub created_by: aruna_core::types::UserId,
     pub current_version: bool,
-    pub user_identity: UserIdentity,
+    pub auth_context: AuthContext,
     pub blob: Option<MaterializedBlobInfo>,
     pub multipart: Option<MultipartObjectReplicationMetadata>,
 }
@@ -73,15 +72,14 @@ pub struct LiveReplicationRequest {
     pub key: String,
     pub version_id: Ulid,
     pub target_node_id: NodeId,
-    pub bucket_info: BucketInfo,
-    pub user_identity: UserIdentity,
+    pub auth_context: AuthContext,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{VersionReplicationManifest, VersionReplicationMessage};
     use aruna_core::errors::ConversionError;
-    use aruna_core::structs::{BucketInfo, RealmId, ReplicationItemKind, UserIdentity};
+    use aruna_core::structs::{AuthContext, RealmId, ReplicationItemKind};
     use std::time::SystemTime;
     use ulid::Ulid;
 
@@ -91,17 +89,13 @@ mod tests {
             key: "path/file.txt".to_string(),
             version_id: Ulid::new(),
             kind: ReplicationItemKind::DeleteMarker,
-            bucket_info: BucketInfo {
-                group_id: Ulid::new(),
-                created_at: SystemTime::now(),
-                created_by: Ulid::new(),
-            },
             created_at: SystemTime::now(),
             created_by: Ulid::new(),
             current_version: true,
-            user_identity: UserIdentity {
+            auth_context: AuthContext {
                 user_id: Ulid::new(),
-                realm_key: RealmId::from_bytes([7u8; 32]),
+                realm_id: RealmId::from_bytes([7u8; 32]),
+                path_restrictions: None,
             },
             blob: None,
             multipart: None,

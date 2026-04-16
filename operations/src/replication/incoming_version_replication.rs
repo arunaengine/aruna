@@ -1,17 +1,19 @@
+use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
 use crate::replication::util::{dht_registration_effect, hash_lookup_write_effect};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
     S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
     S3_VERSION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    BackendLocation, Location, LookupKey, MultipartObjectMetadataKey, RealmId, ReplicationItemKind,
-    ReplicationNegotiationResult, VersionKey, VersionMetadata,
+    AuthContext, BackendLocation, BucketInfo, Location, LookupKey, MultipartObjectMetadataKey,
+    Permission, RealmId, ReplicationItemKind, ReplicationNegotiationResult, VersionKey,
+    VersionMetadata,
 };
 use aruna_core::types::{Effects, NodeId};
 use smallvec::smallvec;
@@ -21,13 +23,13 @@ use ulid::Ulid;
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum IncomingVersionReplicationState {
     Init,
+    ReadDestinationBucket,
+    CheckPermissions,
     ReadExistingVersion,
     ReadExistingBlob,
     SendNegotiation,
     ReceiveBlob,
     StartTransaction,
-    EnsureBucket,
-    WriteBucket,
     WriteHashLookup,
     WriteObjectLookup,
     WriteVersion,
@@ -50,9 +52,15 @@ pub enum IncomingVersionReplicationError {
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error(transparent)]
+    AuthorizationError(#[from] AuthorizationError),
+    #[error(transparent)]
     ReplicationError(#[from] ReplicationError),
     #[error("Replication is only allowed within the same realm")]
     RealmMismatch,
+    #[error("Destination bucket not found")]
+    DestinationBucketNotFound,
+    #[error("Replication requires WRITE permission on the destination path")]
+    WritePermissionDenied,
     #[error("Materialized replication manifest is missing blob info")]
     MissingBlobInfo,
     #[error("Materialized replication manifest is missing local blob location")]
@@ -107,13 +115,13 @@ impl IncomingVersionReplicationOperation {
     fn state_name(&self) -> &'static str {
         match self.state {
             IncomingVersionReplicationState::Init => "Init",
+            IncomingVersionReplicationState::ReadDestinationBucket => "ReadDestinationBucket",
+            IncomingVersionReplicationState::CheckPermissions => "CheckPermissions",
             IncomingVersionReplicationState::ReadExistingVersion => "ReadExistingVersion",
             IncomingVersionReplicationState::ReadExistingBlob => "ReadExistingBlob",
             IncomingVersionReplicationState::SendNegotiation => "SendNegotiation",
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
-            IncomingVersionReplicationState::EnsureBucket => "EnsureBucket",
-            IncomingVersionReplicationState::WriteBucket => "WriteBucket",
             IncomingVersionReplicationState::WriteHashLookup => "WriteHashLookup",
             IncomingVersionReplicationState::WriteObjectLookup => "WriteObjectLookup",
             IncomingVersionReplicationState::WriteVersion => "WriteVersion",
@@ -128,6 +136,12 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::Finish => "Finish",
             IncomingVersionReplicationState::Error => "Error",
         }
+    }
+
+    fn reject_negotiation(&mut self, err: IncomingVersionReplicationError) -> Effects {
+        let reason = err.to_string();
+        self.output = Some(Ok(()));
+        self.send_negotiation(ReplicationNegotiationResult::Rejected(reason))
     }
 
     fn fail(&mut self, err: IncomingVersionReplicationError) -> Effects {
@@ -162,6 +176,45 @@ impl IncomingVersionReplicationOperation {
             self.manifest.version_id,
         )
         .to_bytes()
+    }
+
+    fn auth_context(&self) -> AuthContext {
+        self.manifest.auth_context.clone()
+    }
+
+    fn target_authorization_path(&self, group_id: Ulid) -> String {
+        let mut path = format!(
+            "/{}/g/{}/data/{}/{}",
+            self.local_realm_id, group_id, self.local_node_id, self.manifest.bucket
+        );
+        if !self.manifest.key.is_empty() {
+            path.push('/');
+            path.push_str(&self.manifest.key);
+        }
+        path
+    }
+
+    fn read_destination_bucket(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::ReadDestinationBucket;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_BUCKET_KEYSPACE.to_string(),
+            key: self.manifest.bucket.as_bytes().to_vec().into(),
+            txn_id: None,
+        })]
+    }
+
+    fn check_write_permission(&mut self, group_id: Ulid) -> Effects {
+        self.state = IncomingVersionReplicationState::CheckPermissions;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: self.auth_context(),
+                path: self.target_authorization_path(group_id),
+                required_permission: Permission::WRITE,
+            }),
+            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
+                allowed: result
+            }),
+        ))]
     }
 
     fn read_existing_version(&mut self) -> Effects {
@@ -220,29 +273,6 @@ impl IncomingVersionReplicationOperation {
         self.state = IncomingVersionReplicationState::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: false,
-        })]
-    }
-
-    fn ensure_bucket(&mut self) -> Effects {
-        self.state = IncomingVersionReplicationState::EnsureBucket;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.manifest.bucket.as_bytes().to_vec().into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn write_bucket(&mut self) -> Effects {
-        self.state = IncomingVersionReplicationState::WriteBucket;
-        let value = match self.manifest.bucket_info.to_bytes() {
-            Ok(value) => value,
-            Err(err) => return self.fail(err.into()),
-        };
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.manifest.bucket.as_bytes().to_vec().into(),
-            value: value.into(),
-            txn_id: self.txn_id,
         })]
     }
 
@@ -487,18 +517,54 @@ impl Operation for IncomingVersionReplicationOperation {
     type Error = IncomingVersionReplicationError;
 
     fn start(&mut self) -> Effects {
-        if self.manifest.user_identity.realm_key != self.local_realm_id {
-            return self.send_negotiation(ReplicationNegotiationResult::Rejected(
-                IncomingVersionReplicationError::RealmMismatch.to_string(),
-            ));
+        if self.manifest.auth_context.realm_id != self.local_realm_id {
+            return self.reject_negotiation(IncomingVersionReplicationError::RealmMismatch);
         }
 
-        self.read_existing_version()
+        self.read_destination_bucket()
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             IncomingVersionReplicationState::Init => self.start(),
+            IncomingVersionReplicationState::ReadDestinationBucket => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+
+                let Some(value) = value else {
+                    return self.reject_negotiation(
+                        IncomingVersionReplicationError::DestinationBucketNotFound,
+                    );
+                };
+                let bucket_info = match BucketInfo::from_bytes(value.as_ref()) {
+                    Ok(bucket_info) => bucket_info,
+                    Err(err) => return self.fail(err.into()),
+                };
+
+                self.check_write_permission(bucket_info.group_id)
+            }
+            IncomingVersionReplicationState::CheckPermissions => {
+                let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event
+                else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
+                        received: event,
+                    });
+                };
+
+                match allowed {
+                    Ok(true) => self.read_existing_version(),
+                    Ok(false) => self
+                        .reject_negotiation(IncomingVersionReplicationError::WritePermissionDenied),
+                    Err(err) => self.reject_negotiation(err.into()),
+                }
+            }
             IncomingVersionReplicationState::ReadExistingVersion => {
                 let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
@@ -583,30 +649,6 @@ impl Operation for IncomingVersionReplicationOperation {
                     });
                 };
                 self.txn_id = Some(txn_id);
-                self.ensure_bucket()
-            }
-            IncomingVersionReplicationState::EnsureBucket => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
-                    });
-                };
-                if value.is_some() {
-                    self.write_hash_lookup_or_continue()
-                } else {
-                    self.write_bucket()
-                }
-            }
-            IncomingVersionReplicationState::WriteBucket => {
-                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::WriteResult)",
-                        received: event,
-                    });
-                };
                 self.write_hash_lookup_or_continue()
             }
             IncomingVersionReplicationState::WriteHashLookup => {
@@ -773,16 +815,20 @@ impl Operation for IncomingVersionReplicationOperation {
 
 #[cfg(test)]
 mod tests {
-    use super::{IncomingVersionReplicationOperation, IncomingVersionReplicationState};
+    use super::{
+        IncomingVersionReplicationError, IncomingVersionReplicationOperation,
+        IncomingVersionReplicationState,
+    };
     use crate::replication::protocol::{
         MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
     };
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::errors::AuthorizationError;
+    use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        BackendLocation, BucketInfo, Location, RealmId, ReplicationItemKind, UserIdentity,
-        VersionMetadata,
+        AuthContext, BackendLocation, BucketInfo, Location, RealmId, ReplicationItemKind,
+        ReplicationNegotiationResult, VersionMetadata,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -807,6 +853,14 @@ mod tests {
         }
     }
 
+    fn make_bucket_info(group_id: Ulid) -> BucketInfo {
+        BucketInfo {
+            group_id,
+            created_at: SystemTime::now(),
+            created_by: Ulid::new(),
+        }
+    }
+
     fn make_manifest(kind: ReplicationItemKind) -> VersionReplicationManifest {
         let blob = match kind {
             ReplicationItemKind::Materialized => {
@@ -827,17 +881,13 @@ mod tests {
             key: "dir/file.txt".to_string(),
             version_id: Ulid::new(),
             kind,
-            bucket_info: BucketInfo {
-                group_id: Ulid::new(),
-                created_at: SystemTime::now(),
-                created_by: Ulid::new(),
-            },
             created_at: SystemTime::now(),
             created_by: Ulid::new(),
             current_version: true,
-            user_identity: UserIdentity {
+            auth_context: AuthContext {
                 user_id: Ulid::new(),
-                realm_key: RealmId::from_bytes([7u8; 32]),
+                realm_id: RealmId::from_bytes([7u8; 32]),
+                path_restrictions: None,
             },
             blob,
             multipart: None,
@@ -851,6 +901,47 @@ mod tests {
         VersionReplicationMessage::from_bytes(payload).unwrap()
     }
 
+    fn expect_rejected_negotiation(effect: &Effect, expected_reason: &str) {
+        match message_from_effect(effect) {
+            VersionReplicationMessage::VersionNegotiationResponse(
+                ReplicationNegotiationResult::Rejected(reason),
+            ) => assert_eq!(reason, expected_reason),
+            other => panic!("expected rejected negotiation response, got {other:?}"),
+        }
+    }
+
+    fn advance_to_version_lookup(
+        op: &mut IncomingVersionReplicationOperation,
+        group_id: Ulid,
+    ) -> Effect {
+        let effects = op.start();
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReadDestinationBucket
+        );
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Read { .. })
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(make_bucket_info(group_id).to_bytes().unwrap().into()),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
+        assert!(matches!(effects[0], Effect::SubOperation(_)));
+
+        let mut effects = op.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        ));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReadExistingVersion
+        );
+        assert_eq!(effects.len(), 1);
+        effects.remove(0)
+    }
+
     #[test]
     fn existing_version_short_circuits_with_already_replicated_response() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
@@ -861,12 +952,7 @@ mod tests {
             manifest.clone(),
         );
 
-        let effects = op.start();
-        assert_eq!(
-            op.state,
-            IncomingVersionReplicationState::ReadExistingVersion
-        );
-        assert_eq!(effects.len(), 1);
+        let _effects = advance_to_version_lookup(&mut op, Ulid::new());
 
         let version = VersionMetadata {
             version_id: manifest.version_id,
@@ -889,7 +975,86 @@ mod tests {
     }
 
     #[test]
-    fn delete_marker_requests_version_only() {
+    fn missing_destination_bucket_is_rejected_during_negotiation() {
+        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        let stream_id = Ulid::new();
+        let mut op = IncomingVersionReplicationOperation::new(
+            stream_id,
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+
+        let effects = op.start();
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::ReadDestinationBucket
+        );
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Read { .. })
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        expect_rejected_negotiation(
+            &effects[0],
+            IncomingVersionReplicationError::DestinationBucketNotFound
+                .to_string()
+                .as_str(),
+        );
+
+        let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+        assert!(matches!(
+            effects[0],
+            Effect::Blob(BlobEffect::CloseConnection { .. })
+        ));
+    }
+
+    #[test]
+    fn denied_write_permission_is_rejected_during_negotiation() {
+        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        let stream_id = Ulid::new();
+        let mut op = IncomingVersionReplicationOperation::new(
+            stream_id,
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+
+        op.start();
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(make_bucket_info(Ulid::new()).to_bytes().unwrap().into()),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CheckPermissions);
+        assert!(matches!(effects[0], Effect::SubOperation(_)));
+
+        let effects = op.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+        ));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        expect_rejected_negotiation(
+            &effects[0],
+            IncomingVersionReplicationError::WritePermissionDenied
+                .to_string()
+                .as_str(),
+        );
+
+        let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
+        assert!(matches!(
+            effects[0],
+            Effect::Blob(BlobEffect::CloseConnection { .. })
+        ));
+    }
+
+    #[test]
+    fn authorization_errors_are_rejected_during_negotiation() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
@@ -899,6 +1064,34 @@ mod tests {
         );
 
         op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(make_bucket_info(Ulid::new()).to_bytes().unwrap().into()),
+        }));
+
+        let effects = op.step(Event::SubOperation(
+            SubOperationEvent::AuthorizationResult {
+                allowed: Err(AuthorizationError::AuthDocNotFound),
+            },
+        ));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        expect_rejected_negotiation(
+            &effects[0],
+            AuthorizationError::AuthDocNotFound.to_string().as_str(),
+        );
+    }
+
+    #[test]
+    fn delete_marker_requests_version_only() {
+        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+
+        let _effects = advance_to_version_lookup(&mut op, Ulid::new());
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -923,7 +1116,7 @@ mod tests {
             manifest,
         );
 
-        op.start();
+        let _effects = advance_to_version_lookup(&mut op, Ulid::new());
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: None,
@@ -948,52 +1141,10 @@ mod tests {
     }
 
     #[test]
-    fn missing_bucket_is_created_during_apply() {
-        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
-        let stream_id = Ulid::new();
-        let mut op = IncomingVersionReplicationOperation::new(
-            stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
-            RealmId::from_bytes([7u8; 32]),
-            manifest,
-        );
-
-        op.start();
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: None,
-        }));
-        let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-        assert_eq!(op.state, IncomingVersionReplicationState::StartTransaction);
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::StartTransaction { read: false })
-        ));
-
-        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::new(),
-        }));
-        assert_eq!(op.state, IncomingVersionReplicationState::EnsureBucket);
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
-
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: None,
-        }));
-        assert_eq!(op.state, IncomingVersionReplicationState::WriteBucket);
-        assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Write { .. })
-        ));
-    }
-
-    #[test]
     fn apply_failures_send_explicit_rejection_before_abort() {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let stream_id = Ulid::new();
+        let txn_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
             iroh::SecretKey::generate(&mut rand::rng()).public(),
@@ -1001,15 +1152,9 @@ mod tests {
             manifest,
         );
 
-        op.start();
-        op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0u8; 4].into(),
-            value: None,
-        }));
-        op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-        op.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::new(),
-        }));
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
+        op.state = IncomingVersionReplicationState::WriteObjectLookup;
+        op.txn_id = Some(txn_id);
 
         let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
         assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
@@ -1020,14 +1165,12 @@ mod tests {
 
         let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
         assert_eq!(op.state, IncomingVersionReplicationState::AbortTransaction);
-        assert!(matches!(
+        assert_eq!(
             effects[0],
-            Effect::Storage(StorageEffect::AbortTransaction { .. })
-        ));
+            Effect::Storage(StorageEffect::AbortTransaction { txn_id })
+        );
 
-        let effects = op.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: Ulid::new(),
-        }));
+        let effects = op.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
         assert_eq!(op.state, IncomingVersionReplicationState::CloseConnection);
         assert!(matches!(
             effects[0],
@@ -1049,7 +1192,7 @@ mod tests {
         );
         op.negotiation_result =
             Some(aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion);
-        op.state = IncomingVersionReplicationState::EnsureBucket;
+        op.state = IncomingVersionReplicationState::WriteHashLookup;
         op.txn_id = Some(txn_id);
         op.received_blob_location = Some(received.clone());
         op.cleanup_blob_location = Some(received.clone());
@@ -1099,7 +1242,7 @@ mod tests {
         );
         op.negotiation_result =
             Some(aruna_core::structs::ReplicationNegotiationResult::NeedVersionOnly);
-        op.state = IncomingVersionReplicationState::EnsureBucket;
+        op.state = IncomingVersionReplicationState::WriteObjectLookup;
         op.txn_id = Some(txn_id);
 
         let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
