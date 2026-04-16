@@ -1,5 +1,4 @@
 pub mod abort_multipart_upload;
-pub mod bucket_replication;
 pub mod complete_multipart_upload;
 pub mod create_bucket;
 pub mod create_multipart_upload;
@@ -11,6 +10,7 @@ pub mod get_object;
 pub mod get_user_access;
 pub mod head_object;
 pub mod list_buckets;
+pub mod put_bucket_replication;
 pub mod put_object;
 pub mod revoke_user_access;
 pub mod upload_part;
