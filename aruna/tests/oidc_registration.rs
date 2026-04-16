@@ -52,6 +52,8 @@ struct TestOidcClaims {
     iss: String,
     aud: String,
     exp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 struct TestNode {
@@ -116,7 +118,13 @@ async fn spawn_oidc_provider(
     )
 }
 
-fn sign_oidc_token(issuer: &str, kid: &str, signing_key: &SigningKey, subject: &str) -> String {
+fn sign_oidc_token(
+    issuer: &str,
+    kid: &str,
+    signing_key: &SigningKey,
+    subject: &str,
+    name: Option<&str>,
+) -> String {
     let mut header = Header::new(Algorithm::EdDSA);
     header.kid = Some(kid.to_string());
     let claims = TestOidcClaims {
@@ -124,6 +132,7 @@ fn sign_oidc_token(issuer: &str, kid: &str, signing_key: &SigningKey, subject: &
         iss: issuer.to_string(),
         aud: "aruna-api".to_string(),
         exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
+        name: name.map(str::to_string),
     };
     let key_pem = signing_key
         .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
@@ -322,12 +331,11 @@ async fn oidc_registration_route_creates_user_indexes_and_token() {
     let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
     let node = spawn_test_node(provider).await;
 
-    let token = sign_oidc_token(issuer, kid, &signing_key, "subject-123");
+    let token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", Some("Alice OIDC"));
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/user/oidc", node.base_url))
+        .post(format!("{}/api/v1/users/oidc", node.base_url))
         .bearer_auth(token.clone())
         .json(&serde_json::json!({
-            "provider_id": "main",
             "name": "Alice",
         }))
         .send()
@@ -360,17 +368,16 @@ async fn oidc_registration_route_creates_user_indexes_and_token() {
     );
 
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/user/oidc", node.base_url))
+        .post(format!("{}/api/v1/users/oidc", node.base_url))
         .bearer_auth(token)
-        .json(&serde_json::json!({
-            "provider_id": "main",
-        }))
+        .json(&serde_json::json!({}))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let repeated: RegisterOidcUserResponse = response.json().await.unwrap();
     assert_eq!(repeated.user.id, body.user.id);
+    assert_eq!(repeated.user.name, "Alice");
 
     node.server_task.abort();
     node.net.shutdown().await;

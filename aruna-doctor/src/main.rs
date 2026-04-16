@@ -2,7 +2,7 @@ use crate::error::CliError;
 use crate::explorer::{explore_entries, explore_keyspaces};
 use crate::storage::{import, snapshot};
 use crate::tokens::{create_token, view_token};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 mod error;
 mod explorer;
@@ -20,10 +20,7 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Name of the person to greet
-    CreateToken {
-        user_id: Option<String>,
-        expiry: Option<u64>,
-    },
+    CreateToken(CreateTokenArgs),
     ViewToken {
         token: String,
     },
@@ -39,6 +36,24 @@ pub enum Commands {
         snapshot_path: String,
         target_path: String,
     },
+}
+
+#[derive(Args, Debug)]
+pub struct CreateTokenArgs {
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long)]
+    unsafe_arbitrary_user_id: bool,
+    user_id: Option<String>,
+    expiry: Option<u64>,
+    #[arg(long)]
+    oidc_username: Option<String>,
+    #[arg(long)]
+    oidc_password: Option<String>,
+    #[arg(long)]
+    oidc_name: Option<String>,
+    #[arg(long, default_value = "openid")]
+    oidc_scope: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -57,8 +72,18 @@ pub async fn main() -> Result<(), CliError> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::CreateToken { user_id, expiry } => {
-            let token = create_token(user_id, expiry).await?;
+        Commands::CreateToken(args) => {
+            let token = create_token(
+                args.name,
+                args.unsafe_arbitrary_user_id,
+                args.user_id,
+                args.expiry,
+                args.oidc_username,
+                args.oidc_password,
+                args.oidc_name,
+                args.oidc_scope,
+            )
+            .await?;
             println!("TOKEN: {token}");
         }
         Commands::ViewToken { token } => {

@@ -1,18 +1,16 @@
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::Effect;
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, AuthContext, Permission, RealmConfigDocument, User};
-use aruna_core::types::{Effects, TxnId, UserId};
-use aruna_core::{AutomergeDocumentVariant, USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
-use byteview::ByteView;
+use aruna_core::structs::{Actor, AuthContext, Permission, User};
+use aruna_core::types::{Effects, UserId};
 use smallvec::smallvec;
-use std::collections::VecDeque;
 use thiserror::Error;
 
-use crate::announce::AnnounceTopicOperation;
-use crate::automerge::repository::{read_effect, write_effect};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::create_user_record::{
+    CreateUserRecordError, CreateUserRecordInput, CreateUserRecordOperation,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterUserInput {
@@ -25,7 +23,7 @@ pub struct RegisterUserInput {
 #[derive(PartialEq)]
 pub struct RegisterUserOperation {
     input: RegisterUserInput,
-    pending_subject_ids: VecDeque<String>,
+    create_user: CreateUserRecordOperation,
     state: RegisterUserState,
     output: Option<Result<User, RegisterUserError>>,
 }
@@ -44,30 +42,7 @@ impl std::fmt::Debug for RegisterUserOperation {
 pub enum RegisterUserState {
     Init,
     Auth,
-    StartTxn,
-    CreateUser {
-        txn_id: TxnId,
-        user: User,
-    },
-    WriteSubjectIndex {
-        txn_id: TxnId,
-        user: User,
-        subject_id: String,
-    },
-    ReadRealmConfig {
-        txn_id: TxnId,
-        user: User,
-    },
-    WriteRealmConfig {
-        txn_id: TxnId,
-        user: User,
-    },
-    CommitTxn {
-        user: User,
-    },
-    AnnounceUser {
-        user: User,
-    },
+    CreateUser,
     Finish,
     Error,
 }
@@ -90,6 +65,8 @@ pub enum RegisterUserError {
     Unauthorized,
     #[error(transparent)]
     CheckPermissionsError(#[from] AuthorizationError),
+    #[error(transparent)]
+    CreateUserRecordError(#[from] CreateUserRecordError),
     #[error("Register user did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -103,8 +80,13 @@ pub enum RegisterUserError {
 impl RegisterUserOperation {
     pub fn new(input: RegisterUserInput) -> Self {
         RegisterUserOperation {
+            create_user: CreateUserRecordOperation::new(CreateUserRecordInput {
+                actor: input.actor.clone(),
+                user_id: input.user_id,
+                name: input.name.clone(),
+                subject_ids: input.subject_ids.clone(),
+            }),
             input,
-            pending_subject_ids: VecDeque::new(),
             state: RegisterUserState::Init,
             output: None,
         }
@@ -164,248 +146,21 @@ impl RegisterUserOperation {
             );
         };
 
-        match self.emit_start_transaction(allowed) {
+        match self.emit_create_user(allowed) {
             Ok(effects) => effects,
             Err(err) => self.fail(err),
         }
     }
 
-    fn emit_start_transaction(
+    fn emit_create_user(
         &mut self,
         auth_result: Result<bool, AuthorizationError>,
     ) -> Result<Effects, RegisterUserError> {
         if auth_result? {
-            self.state = RegisterUserState::StartTxn;
-            Ok(smallvec![Effect::Storage(
-                StorageEffect::StartTransaction { read: false }
-            )])
+            self.state = RegisterUserState::CreateUser;
+            Ok(self.create_user.start())
         } else {
             Err(RegisterUserError::Unauthorized)
-        }
-    }
-
-    fn handle_start_txn(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::TransactionStarted)",
-                got,
-            );
-        };
-
-        match self.emit_create_user(txn_id) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_create_user(&mut self, txn_id: TxnId) -> Result<Effects, RegisterUserError> {
-        let user = User {
-            user_id: self.input.user_id,
-            name: self.input.name.clone(),
-            subject_ids: self.input.subject_ids.clone(),
-        };
-        self.pending_subject_ids = self.input.subject_ids.iter().cloned().collect();
-
-        let key = self.input.user_id.to_bytes().into();
-        let value = user.to_bytes(&self.input.actor)?.into();
-
-        self.state = RegisterUserState::CreateUser { txn_id, user };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: USER_KEYSPACE.to_string(),
-            key,
-            value,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn emit_write_subject_index(&mut self, txn_id: TxnId, user: User) -> Option<Effects> {
-        let subject_id = self.pending_subject_ids.pop_front()?;
-        self.state = RegisterUserState::WriteSubjectIndex {
-            txn_id,
-            user: user.clone(),
-            subject_id: subject_id.clone(),
-        };
-        Some(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-            key: ByteView::from(subject_id.into_bytes()),
-            value: ByteView::from(user.user_id.to_string().into_bytes()),
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn realm_config_ref(&self) -> AutomergeDocumentVariant {
-        AutomergeDocumentVariant::RealmConfig {
-            realm_id: self.input.actor.realm_id.clone(),
-        }
-    }
-
-    fn handle_create_user(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::WriteResult { .. })",
-                got,
-            );
-        };
-
-        if let Some(effects) = self.emit_write_subject_index(txn_id, user.clone()) {
-            effects
-        } else {
-            self.state = RegisterUserState::ReadRealmConfig {
-                txn_id,
-                user: user.clone(),
-            };
-            smallvec![read_effect(&self.realm_config_ref(), Some(txn_id))]
-        }
-    }
-
-    fn handle_write_subject_index(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::WriteResult { .. })",
-                got,
-            );
-        };
-
-        if let Some(effects) = self.emit_write_subject_index(txn_id, user.clone()) {
-            effects
-        } else {
-            self.state = RegisterUserState::ReadRealmConfig {
-                txn_id,
-                user: user.clone(),
-            };
-            smallvec![read_effect(&self.realm_config_ref(), Some(txn_id))]
-        }
-    }
-
-    fn handle_read_realm_config(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::ReadResult { .. })",
-                got,
-            );
-        };
-
-        match self.emit_write_realm_config(txn_id, user, value) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_write_realm_config(
-        &mut self,
-        txn_id: TxnId,
-        user: User,
-        value: Option<ByteView>,
-    ) -> Result<Effects, RegisterUserError> {
-        let mut document = RealmConfigDocument::from_bytes(
-            &value.ok_or_else(|| RegisterUserError::NoRealmConfigFound)?,
-        )?;
-        if !document
-            .users
-            .iter()
-            .any(|existing| existing.user_id == user.user_id)
-        {
-            document.users.push(user.clone());
-        }
-
-        let bytes = document.to_bytes(&self.input.actor)?;
-
-        self.state = RegisterUserState::WriteRealmConfig {
-            txn_id,
-            user: user.clone(),
-        };
-        Ok(smallvec![write_effect(
-            &self.realm_config_ref(),
-            bytes,
-            Some(txn_id)
-        )])
-    }
-
-    fn handle_write_realm_config(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::WriteResult { .. })",
-                got,
-            );
-        };
-
-        match self.emit_commit_txn(txn_id, user) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_commit_txn(&mut self, txn_id: TxnId, user: User) -> Result<Effects, RegisterUserError> {
-        self.state = RegisterUserState::CommitTxn { user };
-
-        Ok(smallvec![Effect::Storage(
-            StorageEffect::CommitTransaction { txn_id }
-        )])
-    }
-
-    fn handle_commit_txn(&mut self, event: Event, user: User) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::TransactionCommitted { .. })",
-                got,
-            );
-        };
-
-        match self.emit_announce_user(user) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn emit_announce_user(&mut self, user: User) -> Result<Effects, RegisterUserError> {
-        self.state = RegisterUserState::AnnounceUser { user };
-
-        let suboperation = boxed_suboperation(
-            AnnounceTopicOperation::new(
-                AutomergeDocumentVariant::RealmConfig {
-                    realm_id: self.input.actor.realm_id.clone(),
-                }
-                .topic_id(),
-                self.input.actor.node_id,
-            ),
-            |result| {
-                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
-                    result: result.map_err(|error| error.to_string()),
-                })
-            },
-        );
-        Ok(smallvec![Effect::SubOperation(suboperation)])
-    }
-
-    fn handle_announce_user(&mut self, event: Event, user: User) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
-        else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result })",
-                got,
-            );
-        };
-
-        self.state = RegisterUserState::Finish;
-        self.output = Some(Ok(user));
-        match result {
-            Ok(_) => smallvec![],
-            Err(err) => self.fail(RegisterUserError::AnnouncementError(err)),
         }
     }
 }
@@ -440,21 +195,29 @@ impl Operation for RegisterUserOperation {
 
         match self.state.clone() {
             RegisterUserState::Auth => self.handle_authorization(event),
-            RegisterUserState::StartTxn => self.handle_start_txn(event),
-            RegisterUserState::CreateUser { txn_id, user } => {
-                self.handle_create_user(event, txn_id, user)
+            RegisterUserState::CreateUser => {
+                let effects = self.create_user.step(event);
+                if self.create_user.is_complete() {
+                    let finalized = std::mem::replace(
+                        &mut self.create_user,
+                        CreateUserRecordOperation::new(CreateUserRecordInput {
+                            actor: self.input.actor.clone(),
+                            user_id: self.input.user_id,
+                            name: self.input.name.clone(),
+                            subject_ids: self.input.subject_ids.clone(),
+                        }),
+                    )
+                    .finalize();
+                    match finalized {
+                        Ok(user) => {
+                            self.state = RegisterUserState::Finish;
+                            self.output = Some(Ok(user));
+                        }
+                        Err(err) => return self.fail(err.into()),
+                    }
+                }
+                effects
             }
-            RegisterUserState::WriteSubjectIndex { txn_id, user, .. } => {
-                self.handle_write_subject_index(event, txn_id, user)
-            }
-            RegisterUserState::ReadRealmConfig { txn_id, user } => {
-                self.handle_read_realm_config(event, txn_id, user)
-            }
-            RegisterUserState::WriteRealmConfig { txn_id, user } => {
-                self.handle_write_realm_config(event, txn_id, user)
-            }
-            RegisterUserState::CommitTxn { user } => self.handle_commit_txn(event, user),
-            RegisterUserState::AnnounceUser { user } => self.handle_announce_user(event, user),
             RegisterUserState::Init | RegisterUserState::Finish | RegisterUserState::Error => {
                 smallvec![]
             }
@@ -474,12 +237,7 @@ impl Operation for RegisterUserOperation {
 
     fn abort(&mut self) -> Effects {
         match self.state {
-            RegisterUserState::CreateUser { txn_id, .. }
-            | RegisterUserState::WriteSubjectIndex { txn_id, .. }
-            | RegisterUserState::ReadRealmConfig { txn_id, .. }
-            | RegisterUserState::WriteRealmConfig { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
+            RegisterUserState::CreateUser => self.create_user.abort(),
             _ => smallvec![],
         }
     }
@@ -490,7 +248,7 @@ mod test {
     use crate::register_user::{RegisterUserInput, RegisterUserOperation, RegisterUserState};
     use aruna_core::effects::Effect;
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-    use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+    use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmConfigDocument, User};
     use aruna_core::types::TxnId;
@@ -542,7 +300,7 @@ mod test {
             txn_effect,
             &Effect::Storage(aruna_core::effects::StorageEffect::StartTransaction { read: false })
         );
-        assert_eq!(register_user_operation.state, RegisterUserState::StartTxn);
+        assert_eq!(register_user_operation.state, RegisterUserState::CreateUser);
 
         let txn_id = TxnId::new();
         let effects = register_user_operation.step(Event::Storage(
@@ -566,10 +324,7 @@ mod test {
         }
         assert_eq!(
             register_user_operation.state,
-            RegisterUserState::CreateUser {
-                txn_id,
-                user: expected_user.clone(),
-            }
+            RegisterUserState::CreateUser
         );
 
         let effects = register_user_operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -592,11 +347,7 @@ mod test {
         }
         assert_eq!(
             register_user_operation.state,
-            RegisterUserState::WriteSubjectIndex {
-                txn_id,
-                user: expected_user.clone(),
-                subject_id: "sub-1".to_string(),
-            }
+            RegisterUserState::CreateUser
         );
 
         let effects = register_user_operation.step(Event::Storage(StorageEvent::WriteResult {
@@ -624,9 +375,11 @@ mod test {
         let read_realm_config_effect = effects.first().unwrap();
         match read_realm_config_effect {
             Effect::Storage(aruna_core::effects::StorageEffect::Read {
+                key_space,
                 txn_id: effect_txn_id,
                 ..
             }) => {
+                assert_eq!(key_space, REALM_CONFIG_KEYSPACE);
                 assert_eq!(effect_txn_id, &Some(txn_id));
             }
             other => panic!("unexpected read realm config effect: {other:?}"),
@@ -640,10 +393,12 @@ mod test {
         let write_realm_config_effect = effects.first().unwrap();
         match write_realm_config_effect {
             Effect::Storage(aruna_core::effects::StorageEffect::Write {
+                key_space,
                 value,
                 txn_id: effect_txn_id,
                 ..
             }) => {
+                assert_eq!(key_space, REALM_CONFIG_KEYSPACE);
                 assert_eq!(effect_txn_id, &Some(txn_id));
                 let stored_config = RealmConfigDocument::from_bytes(value).unwrap();
                 assert_eq!(stored_config.users, vec![expected_user.clone()]);
@@ -665,9 +420,7 @@ mod test {
         }
         assert_eq!(
             register_user_operation.state,
-            RegisterUserState::CommitTxn {
-                user: expected_user.clone(),
-            }
+            RegisterUserState::CreateUser
         );
 
         let effects =

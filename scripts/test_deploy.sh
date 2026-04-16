@@ -8,8 +8,27 @@ ARUNA_DOCTOR_BIN="$ROOT_DIR/target/release/aruna-doctor"
 READY_TIMEOUT_SECS="${ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS:-90}"
 EXIT_AFTER_READY="${ARUNA_TEST_DEPLOY_EXIT_AFTER_READY:-0}"
 BASE_PORT="${ARUNA_TEST_DEPLOY_BASE_PORT:-43000}"
+KEYCLOAK_HTTP_PORT="${ARUNA_TEST_DEPLOY_KEYCLOAK_PORT:-$((BASE_PORT + 31))}"
+KEYCLOAK_PROJECT_NAME="${ARUNA_TEST_DEPLOY_KEYCLOAK_PROJECT:-aruna-test-deploy-oidc}"
+KEYCLOAK_ADMIN_USER="${ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_USER:-admin}"
+KEYCLOAK_ADMIN_PASSWORD="${ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_PASSWORD:-admin}"
+KEYCLOAK_REALM="${ARUNA_TEST_DEPLOY_KEYCLOAK_REALM:-aruna}"
+KEYCLOAK_CLIENT_ID="${ARUNA_TEST_DEPLOY_KEYCLOAK_CLIENT_ID:-aruna-api}"
+WITH_KEYCLOAK=0
 PIDS=()
 STARTED_PID=""
+
+while (($# > 0)); do
+  case "$1" in
+    --with-keycloak)
+      WITH_KEYCLOAK=1
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
 
 log() {
   printf '==> %s\n' "$*"
@@ -34,6 +53,13 @@ cleanup() {
     for pid in "${PIDS[@]}"; do
       wait "$pid" 2>/dev/null || true
     done
+  fi
+
+  if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+    docker compose \
+      --project-name "$KEYCLOAK_PROJECT_NAME" \
+      --file "$ROOT_DIR/scripts/keycloak/docker-compose.yml" \
+      down --volumes >/dev/null 2>&1 || true
   fi
 
   if [[ $status -ne 0 && $status -ne 130 ]]; then
@@ -95,6 +121,12 @@ write_node_env() {
     printf 'S3_ADDRESS=127.0.0.1\n'
     printf 'REALM_DESCRIPTION=Test_Deploy_Realm\n'
     printf 'METADATA_REPLICATION_FACTOR=3\n'
+    if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+      printf 'OIDC_PROVIDER_IDS=main\n'
+      printf 'OIDC_MAIN_ISSUER=%s\n' "$KEYCLOAK_ISSUER"
+      printf 'OIDC_MAIN_AUDIENCE=%s\n' "$KEYCLOAK_CLIENT_ID"
+      printf 'OIDC_MAIN_DISCOVERY_URL=%s\n' "$KEYCLOAK_DISCOVERY_URL"
+    fi
     if [[ -n "$onboarding_secret" ]]; then
       printf 'ONBOARDING_SECRET=%s\n' "$onboarding_secret"
     fi
@@ -135,6 +167,32 @@ wait_for_http() {
     fi
     sleep 1
   done
+}
+
+wait_for_keycloak() {
+  local discovery_url=$1
+  local deadline=$((SECONDS + READY_TIMEOUT_SECS))
+
+  until curl --silent --fail --output /dev/null "$discovery_url"
+  do
+    if ((SECONDS >= deadline)); then
+      die "timed out waiting for Keycloak at $discovery_url"
+    fi
+    sleep 1
+  done
+}
+
+start_keycloak() {
+  log "Starting Keycloak with realm import"
+  docker compose \
+    --project-name "$KEYCLOAK_PROJECT_NAME" \
+    --file "$ROOT_DIR/scripts/keycloak/docker-compose.yml" \
+    up --detach
+
+  KEYCLOAK_BASE_URL="http://127.0.0.1:$KEYCLOAK_HTTP_PORT"
+  KEYCLOAK_ISSUER="$KEYCLOAK_BASE_URL/realms/$KEYCLOAK_REALM"
+  KEYCLOAK_DISCOVERY_URL="$KEYCLOAK_ISSUER/.well-known/openid-configuration"
+  wait_for_keycloak "$KEYCLOAK_DISCOVERY_URL"
 }
 
 create_onboarding_secret() {
@@ -208,6 +266,13 @@ write_summary() {
   done
 }
 
+append_summary_line() {
+  local summary_file=$1
+  local line=$2
+
+  printf '%s\n' "$line" >>"$summary_file"
+}
+
 monitor_nodes() {
   local names=("node-1" "node-2" "node-3")
 
@@ -229,6 +294,10 @@ trap handle_signal INT TERM
 require_command cargo
 require_command curl
 require_command ss
+
+if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+  require_command docker
+fi
 
 mkdir -p "$ROOT_DIR/target"
 rm -rf "$DEPLOY_ROOT"
@@ -264,9 +333,17 @@ do
   assert_port_free "$port"
 done
 
+if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+  assert_port_free "$KEYCLOAK_HTTP_PORT"
+fi
+
 NODE_1_BASE_URL="http://127.0.0.1:$NODE_1_HTTP_PORT"
 NODE_2_BASE_URL="http://127.0.0.1:$NODE_2_HTTP_PORT"
 NODE_3_BASE_URL="http://127.0.0.1:$NODE_3_HTTP_PORT"
+
+if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+  start_keycloak
+fi
 
 write_node_env "$NODE_1_DIR" "$NODE_1_HTTP_PORT" "$NODE_1_P2P_PORT" "$NODE_1_S3_PORT"
 
@@ -291,6 +368,12 @@ write_summary \
   "node-1 http=$NODE_1_BASE_URL s3=127.0.0.1:$NODE_1_S3_PORT dir=$NODE_1_DIR log=$NODE_1_DIR/node-1.log" \
   "node-2 http=$NODE_2_BASE_URL s3=127.0.0.1:$NODE_2_S3_PORT dir=$NODE_2_DIR log=$NODE_2_DIR/node-2.log" \
   "node-3 http=$NODE_3_BASE_URL s3=127.0.0.1:$NODE_3_S3_PORT dir=$NODE_3_DIR log=$NODE_3_DIR/node-3.log"
+
+if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+  append_summary_line \
+    "$DEPLOY_ROOT/summary.txt" \
+    "keycloak issuer=$KEYCLOAK_ISSUER discovery=$KEYCLOAK_DISCOVERY_URL admin=$KEYCLOAK_ADMIN_USER/$KEYCLOAK_ADMIN_PASSWORD"
+fi
 
 log "Three aruna nodes are up"
 log "Deployment summary:"

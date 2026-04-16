@@ -1,16 +1,23 @@
 use crate::config::PersistedNodeState;
+use aruna_api::server_state::{
+    INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_persisted_state,
+};
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, GossipEffect, NetEffect, StorageEffect};
 use aruna_core::errors::GossipError;
 use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::onboarding::OnboardingSyncTicket;
+use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
 use aruna_core::{NodeId, TopicId};
+use aruna_operations::create_onboarding_secret::{
+    CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
+};
 use aruna_operations::announce::AnnounceTopicOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::outgoing_automerge::OutgoingAutomergeOperation;
 use byteview::ByteView;
+use rand::RngCore;
 
 pub async fn realm_bootstrap_exists(
     driver_ctx: &DriverContext,
@@ -105,4 +112,44 @@ pub async fn fetch_core_onboarding_documents(
     }
 
     Ok(())
+}
+
+pub async fn ensure_initial_local_onboarding_secret(
+    driver_ctx: &DriverContext,
+    seed_url: String,
+) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
+    if let Some(secret) =
+        load_persisted_state::<OnboardingSecret>(driver_ctx, INITIAL_LOCAL_ONBOARDING_SECRET_KEY).await
+    {
+        return Ok(secret);
+    }
+
+    let mut secret_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut secret_bytes);
+    let onboarding_secret = OnboardingSecret {
+        seed_url,
+        enrollment_id: ulid::Ulid::new(),
+        secret: secret_bytes,
+        mode: OnboardingMode::Local,
+    };
+    let record = aruna_core::onboarding::OnboardingSecretRecord {
+        enrollment_id: onboarding_secret.enrollment_id,
+        secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
+        mode: OnboardingMode::Local,
+        expires_at: u64::MAX,
+        consumed: false,
+    };
+
+    drive(
+        CreateOnboardingSecretOperation::new(CreateOnboardingSecretInput { record }),
+        driver_ctx,
+    )
+    .await?;
+    persist_persisted_state(
+        driver_ctx,
+        INITIAL_LOCAL_ONBOARDING_SECRET_KEY,
+        &onboarding_secret,
+    )
+    .await;
+    Ok(onboarding_secret)
 }

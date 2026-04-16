@@ -1,7 +1,8 @@
 #![allow(clippy::result_large_err)]
 
 use aruna::bootstrap::{
-    announce_core_documents, fetch_core_onboarding_documents, realm_bootstrap_exists,
+    announce_core_documents, ensure_initial_local_onboarding_secret,
+    fetch_core_onboarding_documents, realm_bootstrap_exists,
 };
 use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
@@ -30,7 +31,7 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use ulid::Ulid;
 
 #[tokio::main]
@@ -132,6 +133,28 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 driver_ctx.as_ref(),
             )
             .await?;
+
+            if config.is_initial_node() {
+                match ensure_initial_local_onboarding_secret(
+                    driver_ctx.as_ref(),
+                    format!("http://{}", config.http_socket_addr),
+                )
+                .await
+                {
+                    Ok(secret) => warn!(
+                        onboarding_secret = %secret
+                            .encode()
+                            .expect("initial onboarding secret encoding should succeed"),
+                        "Created initial local onboarding secret for first user registration"
+                    ),
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to create initial local onboarding secret: {error}"
+                        )
+                        .into());
+                    }
+                }
+            }
 
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
         }

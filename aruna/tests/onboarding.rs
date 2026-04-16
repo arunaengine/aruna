@@ -21,6 +21,7 @@ use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
+use aruna_operations::register_user::{RegisterUserInput, RegisterUserOperation};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -154,6 +155,20 @@ async fn create_onboarding_secret_via_http(
     seed: &SeedNode,
     mode: OnboardingMode,
 ) -> Result<String, Box<dyn std::error::Error>> {
+    let _user = drive(
+        RegisterUserOperation::new(RegisterUserInput {
+            actor: Actor {
+                node_id: seed.net.node_id(),
+                user_id: seed.user_id,
+                realm_id: seed.realm_id.clone(),
+            },
+            user_id: seed.user_id,
+            name: format!("{}-ADMIN", seed.base_url),
+            subject_ids: Vec::new(),
+        }),
+        &seed.context,
+    )
+    .await?;
     let token = drive(
         CreateTokenOperation::new(CreateTokenConfig {
             time: std::time::SystemTime::now()

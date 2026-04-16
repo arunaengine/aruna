@@ -15,6 +15,7 @@ pub mod create_metadata_document;
 pub mod create_onboarding_secret;
 pub mod create_realm;
 pub mod create_token;
+pub mod create_user_record;
 pub mod delete_metadata_document;
 pub mod delete_onboarding_secret;
 pub mod driver;

@@ -1,4 +1,4 @@
-use crate::auth::OidcValidator;
+use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::{OidcError, TokenError};
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
@@ -7,7 +7,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::API_STATE_KEYSPACE;
+use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
 use aruna_operations::claim_initial_realm_admin::{
@@ -36,6 +36,7 @@ use utoipa_swagger_ui::SwaggerUi;
 pub const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
 pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
+pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
 
 #[derive(Clone, Debug)]
@@ -141,9 +142,9 @@ impl ServerState {
             .ok_or(OidcError::NotConfigured)
     }
 
-    pub async fn get_oidc_provider(
+    pub async fn get_oidc_provider_by_token(
         &self,
-        provider_id: &str,
+        selector: &OidcTokenSelector,
     ) -> Result<OidcProviderConfig, OidcError> {
         let config = drive(
             GetRealmConfigOperation::new(self.realm_id.clone()),
@@ -154,7 +155,9 @@ impl ServerState {
         config
             .oidc_providers
             .into_iter()
-            .find(|provider| provider.id == provider_id)
+            .find(|provider| {
+                provider.issuer == selector.issuer && selector.matches_audience(&provider.audience)
+            })
             .ok_or(OidcError::ProviderNotFound)
     }
 
@@ -263,6 +266,23 @@ impl ServerState {
             .await
             .get(realm_id)
             .is_some()
+    }
+
+    pub async fn user_exists(&self, user_id: ulid::Ulid) -> Result<bool, StorageError> {
+        match self
+            .driver_ctx
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: USER_KEYSPACE.to_string(),
+                key: ByteView::from(user_id.to_bytes()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+            Event::Storage(StorageEvent::Error { error }) => Err(error),
+            _ => Err(StorageError::InvalidEffect),
+        }
     }
 
     pub async fn claim_initial_realm_admin(
@@ -380,6 +400,13 @@ where
         }
         _ => None,
     }
+}
+
+pub async fn persist_persisted_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
+where
+    T: Serialize,
+{
+    persist_state(driver_ctx, key, value).await;
 }
 
 async fn persist_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)

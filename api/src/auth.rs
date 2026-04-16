@@ -41,6 +41,19 @@ struct CachedOidcProviderMetadata {
 pub struct OidcIdentity {
     pub issuer: String,
     pub subject_id: String,
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OidcTokenSelector {
+    pub issuer: String,
+    pub audience: Vec<String>,
+}
+
+impl OidcTokenSelector {
+    pub fn matches_audience(&self, expected: &str) -> bool {
+        self.audience.iter().any(|value| value == expected)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -57,6 +70,16 @@ struct OidcClaims {
     #[serde(default)]
     nbf: Option<u64>,
     aud: OidcAudience,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    preferred_username: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    given_name: Option<String>,
+    #[serde(default)]
+    family_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,6 +99,23 @@ impl OidcValidator {
                 .expect("OIDC HTTP client construction should not fail"),
             provider_metadata_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn token_selector(&self, token: &str) -> Result<OidcTokenSelector, OidcError> {
+        let claims = insecure_decode::<OidcClaims>(token)?.claims;
+        if claims.iss.is_empty() {
+            return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
+                jsonwebtoken::errors::ErrorKind::InvalidIssuer,
+            )));
+        }
+
+        Ok(OidcTokenSelector {
+            issuer: claims.iss,
+            audience: match claims.aud {
+                OidcAudience::Single(value) => vec![value],
+                OidcAudience::Multiple(values) => values,
+            },
+        })
     }
 
     async fn fetch_provider_metadata(
@@ -191,10 +231,12 @@ impl OidcValidator {
         }
         let _ = claims.exp;
         let _ = claims.nbf;
+        let display_name = oidc_display_name(&claims);
 
         Ok(OidcIdentity {
             issuer: claims.iss,
             subject_id: claims.sub,
+            display_name,
         })
     }
 }
@@ -210,6 +252,41 @@ fn matches_audience(aud: &OidcAudience, expected: &str) -> bool {
         OidcAudience::Single(value) => value == expected,
         OidcAudience::Multiple(values) => values.iter().any(|value| value == expected),
     }
+}
+
+fn oidc_display_name(claims: &OidcClaims) -> Option<String> {
+    claims
+        .name
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .or_else(|| {
+            claims
+                .preferred_username
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
+        .or_else(|| {
+            match (
+                claims.given_name.as_deref().map(str::trim),
+                claims.family_name.as_deref().map(str::trim),
+            ) {
+                (Some(given), Some(family)) if !given.is_empty() && !family.is_empty() => {
+                    Some(format!("{given} {family}"))
+                }
+                (Some(given), _) if !given.is_empty() => Some(given.to_string()),
+                (_, Some(family)) if !family.is_empty() => Some(family.to_string()),
+                _ => None,
+            }
+        })
+        .or_else(|| {
+            claims
+                .email
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .cloned()
+        })
 }
 
 fn is_supported_oidc_algorithm(algorithm: Algorithm) -> bool {
@@ -249,8 +326,9 @@ async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Optio
 
     let token = handle_token(state, token).await.ok()?;
     let auth_context: AuthContext = token.try_into().ok()?;
-    if let Err(error) = state.claim_initial_realm_admin(&auth_context).await {
-        warn!(error = %error, "Failed to claim initial realm admin");
+    if !state.user_exists(auth_context.user_id).await.ok()? {
+        warn!(user_id = %auth_context.user_id, "Rejecting token for unknown user");
+        return None;
     }
     Some(auth_context)
 }
@@ -353,6 +431,7 @@ mod test {
     use aruna_net::{NetConfig, NetHandle};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_operations::create_user_record::{CreateUserRecordInput, CreateUserRecordOperation};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -397,6 +476,8 @@ mod test {
         iss: String,
         aud: String,
         exp: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     }
 
     async fn oidc_discovery(State(state): State<OidcTestServerState>) -> Json<serde_json::Value> {
@@ -470,6 +551,7 @@ mod test {
         kid: &str,
         signing_key: &SigningKey,
         algorithm: Algorithm,
+        name: Option<&str>,
     ) -> String {
         let mut header = Header::new(algorithm);
         header.kid = Some(kid.to_string());
@@ -478,6 +560,7 @@ mod test {
             iss: issuer.to_string(),
             aud: audience.to_string(),
             exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
+            name: name.map(str::to_string),
         };
         let der = signing_key
             .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
@@ -532,12 +615,14 @@ mod test {
             kid,
             &signing_key,
             Algorithm::EdDSA,
+            Some("Alice OIDC"),
         );
 
         let validator = OidcValidator::new();
         let identity = validator.validate(&provider, &token).await.unwrap();
         assert_eq!(identity.issuer, issuer);
         assert_eq!(identity.subject_id, "subject-1");
+        assert_eq!(identity.display_name.as_deref(), Some("Alice OIDC"));
 
         task.abort();
     }
@@ -565,6 +650,7 @@ mod test {
             iss: issuer.to_string(),
             aud: audience.to_string(),
             exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
+            name: None,
         };
         let token = encode(&header, &claims, &EncodingKey::from_secret(b"super-secret")).unwrap();
 
@@ -599,6 +685,7 @@ mod test {
             kid,
             &signing_key,
             Algorithm::EdDSA,
+            None,
         );
 
         let validator = OidcValidator::new();
@@ -629,6 +716,7 @@ mod test {
             kid,
             &signing_key,
             Algorithm::EdDSA,
+            None,
         );
 
         let validator = OidcValidator::new();
@@ -666,6 +754,7 @@ mod test {
             old_kid,
             &old_signing_key,
             Algorithm::EdDSA,
+            None,
         );
         validator.validate(&provider, &old_token).await.unwrap();
 
@@ -678,6 +767,7 @@ mod test {
             new_kid,
             &new_signing_key,
             Algorithm::EdDSA,
+            None,
         );
         let identity = validator.validate(&provider, &new_token).await.unwrap();
 
@@ -711,6 +801,7 @@ mod test {
             kid,
             &signing_key,
             Algorithm::EdDSA,
+            None,
         );
 
         let validator = OidcValidator::new();
@@ -746,9 +837,39 @@ mod test {
         let node_id =
             iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes()).unwrap();
 
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: Ulid::from_bytes([0u8; 16]),
+                    realm_id: realm_id.clone(),
+                },
+                realm_description: "Realm".to_string(),
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
         let time = chrono::Utc::now().timestamp() as u64;
         let expiry = None;
         let user_id = Ulid::new();
+
+        drive(
+            CreateUserRecordOperation::new(CreateUserRecordInput {
+                actor: Actor {
+                    node_id,
+                    user_id: Ulid::from_bytes([0u8; 16]),
+                    realm_id: realm_id.clone(),
+                },
+                user_id,
+                name: "capabilities-user".to_string(),
+                subject_ids: vec![],
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
 
         //
         // Test Management Nodes
@@ -862,7 +983,7 @@ mod test {
     }
 
     #[tokio::test]
-    pub async fn test_first_local_user_claims_initial_realm_admin() {
+    pub async fn test_unknown_token_user_is_rejected() {
         let mut tempdir = temp_dir();
         tempdir.push(Ulid::new().to_string());
         let storage_handle = storage::FjallStorage::open(tempdir.to_str().unwrap()).unwrap();
@@ -908,6 +1029,20 @@ mod test {
         .await
         .unwrap();
 
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: Ulid::from_bytes([0u8; 16]),
+                    realm_id: realm_id.clone(),
+                },
+                realm_description: "Realm".to_string(),
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
@@ -920,12 +1055,12 @@ mod test {
         .await;
 
         let time = chrono::Utc::now().timestamp() as u64;
-        let first_user = Ulid::new();
-        let first_token = drive(
+        let unknown_user = Ulid::new();
+        let token = drive(
             CreateTokenOperation::new(CreateTokenConfig {
                 time,
                 expiry: None,
-                user_id: first_user,
+                user_id: unknown_user,
                 realm_id: realm_id.clone(),
                 node_capabilities: capabilities.clone(),
             })
@@ -938,38 +1073,9 @@ mod test {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            axum::http::HeaderValue::from_str(&format!("Bearer {}", first_token)).unwrap(),
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
         );
-        let auth_context = extract_auth_context(&state, &headers).await.unwrap();
-        assert_eq!(auth_context.user_id, first_user);
-
-        let auth_doc = read_auth_doc(&driver_ctx, &realm_id).await;
-        assert!(auth_doc.roles.values().any(|role| {
-            role.name == "realm_admin" && role.assigned_users.contains(&first_user)
-        }));
-
-        let second_user = Ulid::new();
-        let second_token = drive(
-            CreateTokenOperation::new(CreateTokenConfig {
-                time,
-                expiry: None,
-                user_id: second_user,
-                realm_id: realm_id.clone(),
-                node_capabilities: capabilities,
-            })
-            .unwrap(),
-            &driver_ctx,
-        )
-        .await
-        .unwrap();
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            axum::http::HeaderValue::from_str(&format!("Bearer {}", second_token)).unwrap(),
-        );
-        let auth_context = extract_auth_context(&state, &headers).await.unwrap();
-        assert_eq!(auth_context.user_id, second_user);
+        assert!(extract_auth_context(&state, &headers).await.is_none());
 
         let auth_doc = read_auth_doc(&driver_ctx, &realm_id).await;
         let realm_admin = auth_doc
@@ -977,8 +1083,7 @@ mod test {
             .values()
             .find(|role| role.name == "realm_admin")
             .unwrap();
-        assert!(realm_admin.assigned_users.contains(&first_user));
-        assert!(!realm_admin.assigned_users.contains(&second_user));
+        assert!(realm_admin.assigned_users.is_empty());
 
         net_handle.shutdown().await;
     }
@@ -1006,6 +1111,20 @@ mod test {
         let node_id =
             iroh::PublicKey::from_bytes(node_signing_key.verifying_key().as_bytes()).unwrap();
 
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: Actor {
+                    node_id,
+                    user_id: Ulid::from_bytes([0u8; 16]),
+                    realm_id: realm_id.clone(),
+                },
+                realm_description: "Realm".to_string(),
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
+
         let time = chrono::Utc::now().timestamp() as u64;
         let expiry = Some(
             chrono::Utc::now()
@@ -1014,6 +1133,22 @@ mod test {
                 .timestamp() as u64,
         );
         let user_id = Ulid::new();
+
+        drive(
+            CreateUserRecordOperation::new(CreateUserRecordInput {
+                actor: Actor {
+                    node_id,
+                    user_id: Ulid::from_bytes([0u8; 16]),
+                    realm_id: realm_id.clone(),
+                },
+                user_id,
+                name: "validation-user".to_string(),
+                subject_ids: vec![],
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap();
 
         let capabilities = NodeCapabilities::management_node(realm_signing_key.clone()).unwrap();
         let state = ServerState::new(
