@@ -113,31 +113,28 @@ impl AuthProvider {
     #[tracing::instrument(level = "trace", skip(self))]
     async fn query_user_access(&self, access_key_id: &str) -> S3Result<UserAccess> {
         let operation = GetUserAccessOperation::new(access_key_id.to_string());
-        match drive(operation, self.driver_ctx.as_ref()).await {
-            Ok(Some(Ok(user_access))) => Ok(user_access),
-            Ok(None) => Err(s3_error!(
+        match drive(operation, self.driver_ctx.as_ref())
+            .await
+            .and_then(|result| result.transpose())
+        {
+            Ok(Some(user_access)) => Ok(user_access),
+            Ok(None) | Err(GetUserAccessError::NotFound) => Err(s3_error!(
                 InvalidAccessKeyId,
                 "The Access Key Id you provided does not exist in our records."
             )),
-            Ok(Some(Err(err))) | Err(err) => match err {
-                GetUserAccessError::NotFound => Err(s3_error!(
-                    InvalidAccessKeyId,
-                    "The Access Key Id you provided does not exist in our records."
-                )),
-                _ => Err(s3_error!(InternalError, "Failed to query user access")),
-            },
+            Err(_) => Err(s3_error!(InternalError, "Failed to query user access")),
         }
     }
 
     async fn find_bucket_info(&self, bucket: &str) -> S3Result<Option<BucketInfo>> {
         let operation = GetBucketInfoOperation::new(bucket.to_string());
-        match drive(operation, self.driver_ctx.as_ref()).await {
-            Ok(Some(Ok(bucket_info))) => Ok(Some(bucket_info)),
-            Ok(None) => Ok(None),
-            Ok(Some(Err(GetBucketInfoError::NotFound))) | Err(GetBucketInfoError::NotFound) => {
-                Ok(None)
-            }
-            Ok(Some(Err(_))) | Err(_) => Err(s3_error!(InternalError, "Failed to query bucket")),
+        match drive(operation, self.driver_ctx.as_ref())
+            .await
+            .and_then(|result| result.transpose())
+        {
+            Ok(Some(bucket_info)) => Ok(Some(bucket_info)),
+            Ok(None) | Err(GetBucketInfoError::NotFound) => Ok(None),
+            Err(_) => Err(s3_error!(InternalError, "Failed to query bucket")),
         }
     }
 

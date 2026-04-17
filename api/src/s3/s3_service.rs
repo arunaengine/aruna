@@ -1,7 +1,8 @@
 use crate::s3::checksum::{
-    ApplyChecksums, ChecksumSelection, checksum_mismatch_error, checksum_mode_enabled,
+    ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_upload_checksum_request,
 };
+use crate::s3::error::IntoS3Error;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
@@ -17,33 +18,29 @@ use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
 };
 use aruna_operations::s3::abort_multipart_upload::{
-    AbortMultipartUploadError, AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
+    AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
 };
 use aruna_operations::s3::complete_multipart_upload::{
-    CompleteMultipartUploadError, CompleteMultipartUploadInput as CMUI,
-    CompleteMultipartUploadOperation,
+    CompleteMultipartUploadInput as CMUI, CompleteMultipartUploadOperation,
+    CompleteMultipartUploadResult,
 };
-use aruna_operations::s3::create_bucket::{CreateBucketError, CreateBucketOperation};
+use aruna_operations::s3::create_bucket::CreateBucketOperation;
 use aruna_operations::s3::create_multipart_upload::{
     CreateMultipartUploadInput as CMPI, CreateMultipartUploadOperation,
 };
-use aruna_operations::s3::delete_bucket::{DeleteBucketError, DeleteBucketOperation};
+use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
-    DeleteObjectError, DeleteObjectInput as DOI, DeleteObjectOperation,
+    DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
 };
-use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput as GOI, GetObjectOperation};
-use aruna_operations::s3::head_object::{
-    HeadObjectError, HeadObjectInput as HOI, HeadObjectOperation,
-};
+use aruna_operations::s3::get_object::{GetObjectInput as GOI, GetObjectOperation};
+use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
 use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationError, GetBucketReplicationOperation,
     PutBucketReplicationOperation,
 };
-use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectError, PutObjectOperation};
-use aruna_operations::s3::upload_part::{
-    UploadPartError, UploadPartInput as UPI, UploadPartOperation,
-};
+use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
+use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CompleteMultipartUploadInput,
     CompleteMultipartUploadOutput, CreateBucketInput, CreateBucketOutput,
@@ -60,7 +57,7 @@ use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{Instrument, debug, error, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 #[derive(Clone)]
 pub struct ArunaS3Service {
@@ -166,24 +163,6 @@ impl ArunaS3Service {
         Ok(targets)
     }
 
-    fn validate_replication_configuration(
-        &self,
-        configuration: &ReplicationConfiguration,
-    ) -> S3Result<()> {
-        if configuration
-            .rules
-            .iter()
-            .any(|rule| rule.filter.is_some() || rule.prefix.is_some())
-        {
-            return Err(s3_error!(
-                NotImplemented,
-                "Bucket replication rules with filter or prefix are not yet supported"
-            ));
-        }
-
-        Ok(())
-    }
-
     fn build_replication_configuration(
         &self,
         config: &aruna_core::structs::BucketReplicationConfig,
@@ -246,12 +225,11 @@ impl ArunaS3Service {
             &self.state,
         )
         .await
+        .and_then(|result| result.transpose())
         {
-            Ok(Some(Ok(config))) => config,
-            Ok(Some(Err(GetBucketReplicationError::NotFound)))
-            | Err(GetBucketReplicationError::NotFound)
-            | Ok(None) => return,
-            Ok(Some(Err(err))) | Err(err) => {
+            Ok(Some(config)) => config,
+            Ok(None) | Err(GetBucketReplicationError::NotFound) => return,
+            Err(err) => {
                 warn!(bucket, key, version_id = %version_id, error = %err, "Failed to load bucket replication config");
                 return;
             }
@@ -276,9 +254,20 @@ impl ArunaS3Service {
                 replicate_delete_markers: target.replicate_delete_markers,
             };
 
-            match drive(ReplicateScopeOperation::new(input), &self.state).await {
-                Ok(Some(Ok(result))) if result.failed == 0 => {}
-                Ok(Some(Ok(result))) => {
+            match drive(ReplicateScopeOperation::new(input), &self.state)
+                .await
+                .and_then(|result| result.transpose())
+            {
+                Ok(Some(result)) if result.failed == 0 => {
+                    info!(
+                        bucket,
+                        key,
+                        version_id = ?version_id,
+                        target_node = %target.node_id,
+                        "Version replication succeeded"
+                    );
+                }
+                Ok(Some(result)) => {
                     warn!(
                         bucket,
                         key,
@@ -290,7 +279,7 @@ impl ArunaS3Service {
                         "Version replication completed with failures"
                     );
                 }
-                Ok(Some(Err(err))) | Err(err) => {
+                Err(err) => {
                     warn!(
                         bucket,
                         key,
@@ -344,6 +333,105 @@ impl ArunaS3Service {
             .instrument(span),
         );
     }
+
+    fn complete_multipart_upload_response(
+        &self,
+        bucket: String,
+        key: String,
+        checksum_request: &UploadChecksumRequest,
+        replication_auth: AuthContext,
+        replication_bucket: String,
+        replication_key: String,
+        result: CompleteMultipartUploadResult,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let mut output = CompleteMultipartUploadOutput {
+            bucket: Some(bucket),
+            key: Some(key),
+            e_tag: result
+                .location
+                .hashes
+                .get(HASH_MD5)
+                .map(|value| ETag::Strong(to_base64(value))),
+            version_id: Some(result.version_id.to_string()),
+            ..Default::default()
+        };
+
+        output.apply_checksums(encode_checksums(
+            &result.response_hashes,
+            ChecksumSelection::Requested(checksum_request.response_algorithm),
+            s3_checksum_type_from_multipart(result.checksum_type),
+        ));
+
+        self.spawn_version_replication(
+            replication_auth,
+            replication_bucket,
+            replication_key,
+            result.version_id,
+            false,
+        );
+
+        Ok(S3Response::new(output))
+    }
+
+    fn put_object_response(
+        &self,
+        checksum_request: &UploadChecksumRequest,
+        replication_auth: AuthContext,
+        replication_bucket: String,
+        replication_key: String,
+        result: PutObjectResult,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let mut output = PutObjectOutput {
+            e_tag: Some(ETag::Strong(to_base64(
+                result.location.hashes.get(HASH_MD5).ok_or_else(|| {
+                    error!(error = "Missing MD5 hash");
+                    s3_error!(InternalError, "Missing MD5 hash")
+                })?,
+            ))),
+            size: Some(result.location.blob_size as i64),
+            version_id: Some(result.version_id.to_string()),
+            ..Default::default()
+        };
+        output.apply_checksums(encode_checksums(
+            &result.location.hashes,
+            ChecksumSelection::Requested(checksum_request.response_algorithm),
+            checksum_request.checksum_type.clone(),
+        ));
+        self.spawn_version_replication(
+            replication_auth,
+            replication_bucket,
+            replication_key,
+            result.version_id,
+            false,
+        );
+
+        Ok(S3Response::new(output))
+    }
+
+    fn delete_object_response(
+        &self,
+        replication_auth: AuthContext,
+        replication_bucket: String,
+        replication_key: String,
+        replicate_latest_delete: bool,
+        result: DeleteObjectResult,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
+        if replicate_latest_delete {
+            self.spawn_version_replication(
+                replication_auth,
+                replication_bucket,
+                replication_key,
+                result.version_id,
+                result.delete_marker,
+            );
+        }
+
+        Ok(S3Response::new(DeleteObjectOutput {
+            delete_marker: Some(result.delete_marker),
+            version_id: Some(result.version_id.to_string()),
+            ..Default::default()
+        }))
+    }
 }
 
 #[async_trait::async_trait]
@@ -369,15 +457,13 @@ impl S3 for ArunaS3Service {
             },
         );
 
-        match drive(operation, &self.state).await {
-            Ok(Some(Ok(_))) => Ok(S3Response::new(CreateBucketOutput::default())),
-            Ok(Some(Err(CreateBucketError::BucketAlreadyExists)))
-            | Err(CreateBucketError::BucketAlreadyExists) => {
-                Err(s3_error!(BucketAlreadyOwnedByYou, "Bucket already exists"))
-            }
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(InternalError, "Failed to create bucket")),
-        }
+        drive(operation, &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to create bucket"))?;
+
+        Ok(S3Response::new(CreateBucketOutput::default()))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -405,32 +491,30 @@ impl S3 for ArunaS3Service {
             &self.state,
         )
         .await
-        .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to list buckets"))?;
 
-        if let Some(Ok(result)) = result {
-            let mut buckets = Vec::new();
-            for (bucket, bucket_info) in result.buckets {
-                if self
-                    .can_access_bucket(&user_access, &bucket, &bucket_info)
-                    .await?
-                {
-                    buckets.push(Bucket {
-                        bucket_region: None,
-                        creation_date: Some(bucket_info.created_at.into()),
-                        name: Some(bucket),
-                    });
-                }
+        let mut buckets = Vec::new();
+        for (bucket, bucket_info) in result.buckets {
+            if self
+                .can_access_bucket(&user_access, &bucket, &bucket_info)
+                .await?
+            {
+                buckets.push(Bucket {
+                    bucket_region: None,
+                    creation_date: Some(bucket_info.created_at.into()),
+                    name: Some(bucket),
+                });
             }
-
-            Ok(S3Response::new(ListBucketsOutput {
-                buckets: Some(buckets),
-                continuation_token: result.continuation_token,
-                owner: None,
-                prefix: req.input.prefix,
-            }))
-        } else {
-            Err(s3_error!(InternalError, "Failed to list buckets"))
         }
+
+        Ok(S3Response::new(ListBucketsOutput {
+            buckets: Some(buckets),
+            continuation_token: result.continuation_token,
+            owner: None,
+            prefix: req.input.prefix,
+        }))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -466,53 +550,25 @@ impl S3 for ArunaS3Service {
             realm_id: self.realm_id.clone(),
             node_id: self.node_id,
             request: input,
-            expected_checksums: checksum_request.expected,
+            expected_checksums: checksum_request.expected.clone(),
             checksum_type: Some(checksum_request.checksum_type.as_str().to_string()),
             exists: false,
         };
         let operation = PutObjectOperation::new(config);
 
-        match drive(operation, &self.state).await {
-            Ok(Some(Ok(result))) => {
-                debug!(?result);
-                let mut output = PutObjectOutput {
-                    e_tag: Some(ETag::Strong(to_base64(
-                        result.location.hashes.get(HASH_MD5).ok_or_else(|| {
-                            error!(error = "Missing MD5 hash");
-                            s3_error!(InternalError, "Missing MD5 hash")
-                        })?,
-                    ))),
-                    size: Some(result.location.blob_size as i64),
-                    version_id: Some(result.version_id.to_string()),
-                    ..Default::default()
-                };
-                output.apply_checksums(encode_checksums(
-                    &result.location.hashes,
-                    ChecksumSelection::Requested(checksum_request.response_algorithm),
-                    checksum_request.checksum_type,
-                ));
-                self.spawn_version_replication(
-                    replication_auth,
-                    replication_bucket,
-                    replication_key,
-                    result.version_id,
-                    false,
-                );
-                Ok(S3Response::new(output))
-            }
-            Ok(Some(Err(PutObjectError::ChecksumMismatch(algorithm))))
-            | Err(PutObjectError::ChecksumMismatch(algorithm)) => {
-                warn!(algorithm, "Checksum mismatch during PutObject");
-                Err(checksum_mismatch_error())
-            }
-            Ok(Some(Err(PutObjectError::MissingExpectedChecksum(algorithm))))
-            | Err(PutObjectError::MissingExpectedChecksum(algorithm)) => {
-                warn!(algorithm, "Missing checksum during PutObject");
-                Err(s3_error!(InternalError, "Missing stored checksum"))
-            }
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(InternalError, "Failed to process PUT request")),
-        }
+        let result = drive(operation, &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to process PUT request"))?;
+
+        self.put_object_response(
+            &checksum_request,
+            replication_auth,
+            replication_bucket,
+            replication_key,
+            result,
+        )
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -541,22 +597,21 @@ impl S3 for ArunaS3Service {
             checksum_hint: checksum_hint.clone(),
         });
 
-        match drive(operation, &self.state).await {
-            Ok(Some(Ok(result))) => Ok(S3Response::new(CreateMultipartUploadOutput {
-                bucket: Some(req.input.bucket),
-                key: Some(req.input.key),
-                upload_id: Some(result.record.upload_id.to_string()),
-                checksum_algorithm: req.input.checksum_algorithm,
-                checksum_type: checksum_hint
-                    .map(|hint| s3_checksum_type_from_multipart(hint.checksum_type)),
-                ..Default::default()
-            })),
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(
-                InternalError,
-                "Failed to create multipart upload"
-            )),
-        }
+        let result = drive(operation, &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to create multipart upload"))?;
+
+        Ok(S3Response::new(CreateMultipartUploadOutput {
+            bucket: Some(req.input.bucket),
+            key: Some(req.input.key),
+            upload_id: Some(result.record.upload_id.to_string()),
+            checksum_algorithm: req.input.checksum_algorithm,
+            checksum_type: checksum_hint
+                .map(|hint| s3_checksum_type_from_multipart(hint.checksum_type)),
+            ..Default::default()
+        }))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -597,42 +652,27 @@ impl S3 for ArunaS3Service {
             expected_checksums: checksum_request.expected.clone(),
         });
 
-        match drive(operation, &self.state).await {
-            Ok(Some(Ok(result))) => {
-                let mut output = UploadPartOutput {
-                    e_tag: result
-                        .location
-                        .hashes
-                        .get(HASH_MD5)
-                        .map(|value| ETag::Strong(to_base64(value))),
-                    ..Default::default()
-                };
-                output.apply_checksums(encode_checksums(
-                    &result.location.hashes,
-                    ChecksumSelection::Requested(checksum_request.response_algorithm),
-                    checksum_request.checksum_type,
-                ));
-                Ok(S3Response::new(output))
-            }
-            Ok(Some(Err(UploadPartError::NoSuchUpload))) | Err(UploadPartError::NoSuchUpload) => {
-                Err(s3_error!(
-                    NoSuchUpload,
-                    "The specified upload does not exist."
-                ))
-            }
-            Ok(Some(Err(UploadPartError::UploadTargetMismatch)))
-            | Err(UploadPartError::UploadTargetMismatch) => Err(s3_error!(
-                NoSuchUpload,
-                "The specified upload does not exist."
-            )),
-            Ok(Some(Err(UploadPartError::ChecksumMismatch(algorithm))))
-            | Err(UploadPartError::ChecksumMismatch(algorithm)) => {
-                warn!(algorithm, "Checksum mismatch during UploadPart");
-                Err(checksum_mismatch_error())
-            }
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(InternalError, "Failed to upload part")),
-        }
+        let result = drive(operation, &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to upload part"))?;
+
+        let mut output = UploadPartOutput {
+            e_tag: result
+                .location
+                .hashes
+                .get(HASH_MD5)
+                .map(|value| ETag::Strong(to_base64(value))),
+            ..Default::default()
+        };
+        output.apply_checksums(encode_checksums(
+            &result.location.hashes,
+            ChecksumSelection::Requested(checksum_request.response_algorithm),
+            checksum_request.checksum_type,
+        ));
+
+        Ok(S3Response::new(output))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -683,69 +723,21 @@ impl S3 for ArunaS3Service {
             created_by: user_access.user_identity.user_id,
         });
 
-        match drive(operation, &self.state).await {
-            Ok(Some(Ok(result))) => {
-                let mut output = CompleteMultipartUploadOutput {
-                    bucket: Some(req.input.bucket),
-                    key: Some(req.input.key),
-                    e_tag: result
-                        .location
-                        .hashes
-                        .get(HASH_MD5)
-                        .map(|value| ETag::Strong(to_base64(value))),
-                    version_id: Some(result.version_id.to_string()),
-                    ..Default::default()
-                };
-                output.apply_checksums(encode_checksums(
-                    &result.response_hashes,
-                    ChecksumSelection::Requested(checksum_request.response_algorithm),
-                    s3_checksum_type_from_multipart(result.checksum_type),
-                ));
-                self.spawn_version_replication(
-                    replication_auth,
-                    replication_bucket,
-                    replication_key,
-                    result.version_id,
-                    false,
-                );
-                Ok(S3Response::new(output))
-            }
-            Ok(Some(Err(CompleteMultipartUploadError::NoSuchUpload)))
-            | Err(CompleteMultipartUploadError::NoSuchUpload)
-            | Ok(Some(Err(CompleteMultipartUploadError::UploadTargetMismatch)))
-            | Err(CompleteMultipartUploadError::UploadTargetMismatch) => Err(s3_error!(
-                NoSuchUpload,
-                "The specified upload does not exist."
-            )),
-            Ok(Some(Err(CompleteMultipartUploadError::InvalidPart)))
-            | Err(CompleteMultipartUploadError::InvalidPart) => Err(s3_error!(
-                InvalidPart,
-                "One or more of the specified parts could not be found."
-            )),
-            Ok(Some(Err(CompleteMultipartUploadError::InvalidPartOrder)))
-            | Err(CompleteMultipartUploadError::InvalidPartOrder) => Err(s3_error!(
-                InvalidPartOrder,
-                "The list of parts was not in ascending order."
-            )),
-            Ok(Some(Err(CompleteMultipartUploadError::ChecksumMismatch(algorithm))))
-            | Err(CompleteMultipartUploadError::ChecksumMismatch(algorithm)) => {
-                warn!(
-                    algorithm,
-                    "Checksum mismatch during CompleteMultipartUpload"
-                );
-                Err(checksum_mismatch_error())
-            }
-            Ok(Some(Err(CompleteMultipartUploadError::PartEtagMismatch)))
-            | Err(CompleteMultipartUploadError::PartEtagMismatch) => Err(s3_error!(
-                InvalidPart,
-                "The part ETag did not match the uploaded part."
-            )),
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(
-                InternalError,
-                "Failed to complete multipart upload"
-            )),
-        }
+        let result = drive(operation, &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to complete multipart upload"))?;
+
+        self.complete_multipart_upload_response(
+            req.input.bucket,
+            req.input.key,
+            &checksum_request,
+            replication_auth,
+            replication_bucket,
+            replication_key,
+            result,
+        )
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -767,18 +759,13 @@ impl S3 for ArunaS3Service {
             upload_id,
         });
 
-        match drive(operation, &self.state).await {
-            Ok(Some(Ok(()))) => Ok(S3Response::new(AbortMultipartUploadOutput::default())),
-            Ok(Some(Err(AbortMultipartUploadError::NoSuchUpload)))
-            | Err(AbortMultipartUploadError::NoSuchUpload)
-            | Ok(Some(Err(AbortMultipartUploadError::UploadTargetMismatch)))
-            | Err(AbortMultipartUploadError::UploadTargetMismatch) => Err(s3_error!(
-                NoSuchUpload,
-                "The specified upload does not exist."
-            )),
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(InternalError, "Failed to abort multipart upload")),
-        }
+        drive(operation, &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to abort multipart upload"))?;
+
+        Ok(S3Response::new(AbortMultipartUploadOutput::default()))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -809,44 +796,29 @@ impl S3 for ArunaS3Service {
             user_identity: user_access.user_identity,
         });
 
-        match drive(operation, &self.state).await {
-            Ok(Some(Ok(result))) => {
-                let version_id = result.version_id;
-                let hashes = result.location.hashes.clone();
-                let content = StreamingBlob::wrap(result.blob);
-                let mut output = GetObjectOutput {
-                    body: Some(content),
-                    version_id: version_id.map(|version_id| version_id.to_string()),
-                    ..Default::default()
-                };
-                if checksum_mode_enabled(&req.headers) {
-                    output.apply_checksums(encode_checksums(
-                        &hashes,
-                        ChecksumSelection::AllStored,
-                        s3_checksum_type_from_multipart(result.checksum_type),
-                    ));
-                }
+        let result = drive(operation, &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to process GET request"))?;
 
-                Ok(S3Response::new(output))
-            }
-            Ok(Some(Err(GetObjectError::NoSuchVersion))) | Err(GetObjectError::NoSuchVersion) => {
-                Err(s3_error!(
-                    NoSuchVersion,
-                    "The specified version does not exist."
-                ))
-            }
-            Ok(Some(Err(GetObjectError::DeleteMarker))) | Err(GetObjectError::DeleteMarker) => {
-                Err(s3_error!(
-                    MethodNotAllowed,
-                    "The specified version is a delete marker."
-                ))
-            }
-            Ok(Some(Err(GetObjectError::NoSuchKey))) | Err(GetObjectError::NoSuchKey) => {
-                Err(s3_error!(NoSuchKey, "The specified key does not exist."))
-            }
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err)),
-            Ok(None) => Err(s3_error!(InternalError, "Failed to process GET request")),
+        let version_id = result.version_id;
+        let hashes = result.location.hashes.clone();
+        let content = StreamingBlob::wrap(result.blob);
+        let mut output = GetObjectOutput {
+            body: Some(content),
+            version_id: version_id.map(|version_id| version_id.to_string()),
+            ..Default::default()
+        };
+        if checksum_mode_enabled(&req.headers) {
+            output.apply_checksums(encode_checksums(
+                &hashes,
+                ChecksumSelection::AllStored,
+                s3_checksum_type_from_multipart(result.checksum_type),
+            ));
         }
+
+        Ok(S3Response::new(output))
     }
 
     #[tracing::instrument(err, skip(self, _req))]
@@ -876,44 +848,33 @@ impl S3 for ArunaS3Service {
             version_id,
         });
 
-        match drive(operation, &self.state).await {
-            Ok(Some(Ok(result))) => {
-                let mut output = HeadObjectOutput {
-                    content_length: Some(result.location.blob_size as i64),
-                    e_tag: result
-                        .location
-                        .hashes
-                        .get(HASH_MD5)
-                        .map(|value| ETag::Strong(to_base64(value))),
-                    version_id: result.version_id.map(|version_id| version_id.to_string()),
-                    last_modified: Some(result.location.created_at.into()),
-                    ..Default::default()
-                };
+        let result = drive(operation, &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to process HEAD request"))?;
 
-                if checksum_mode_enabled(&req.headers) {
-                    output.apply_checksums(encode_checksums(
-                        &result.location.hashes,
-                        ChecksumSelection::AllStored,
-                        s3_checksum_type_from_multipart(result.checksum_type),
-                    ));
-                }
+        let mut output = HeadObjectOutput {
+            content_length: Some(result.location.blob_size as i64),
+            e_tag: result
+                .location
+                .hashes
+                .get(HASH_MD5)
+                .map(|value| ETag::Strong(to_base64(value))),
+            version_id: result.version_id.map(|version_id| version_id.to_string()),
+            last_modified: Some(result.location.created_at.into()),
+            ..Default::default()
+        };
 
-                Ok(S3Response::new(output))
-            }
-            Err(HeadObjectError::NoSuchVersion) => Err(s3_error!(
-                NoSuchVersion,
-                "The specified version does not exist."
-            )),
-            Err(HeadObjectError::DeleteMarker) => Err(s3_error!(
-                MethodNotAllowed,
-                "The specified version is a delete marker."
-            )),
-            Err(HeadObjectError::NoSuchKey) => {
-                Err(s3_error!(NoSuchKey, "The specified key does not exist."))
-            }
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err)),
-            Ok(None) => Err(s3_error!(InternalError, "Failed to process HEAD request")),
+        if checksum_mode_enabled(&req.headers) {
+            output.apply_checksums(encode_checksums(
+                &result.location.hashes,
+                ChecksumSelection::AllStored,
+                s3_checksum_type_from_multipart(result.checksum_type),
+            ));
         }
+
+        Ok(S3Response::new(output))
     }
 
     #[tracing::instrument(err)]
@@ -935,6 +896,7 @@ impl S3 for ArunaS3Service {
         };
         let replication_bucket = req.input.bucket.clone();
         let replication_key = req.input.key.clone();
+        let replicate_latest_delete = version_id.is_none();
 
         let operation = DeleteObjectOperation::new(DOI {
             bucket: req.input.bucket,
@@ -943,33 +905,19 @@ impl S3 for ArunaS3Service {
             deleted_by: user_access.user_identity.user_id,
         });
 
-        match drive(operation, &self.state)
+        let result = drive(operation, &self.state)
             .await
-            .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?
-        {
-            Some(Ok(result)) => {
-                if version_id.is_none() {
-                    self.spawn_version_replication(
-                        replication_auth,
-                        replication_bucket,
-                        replication_key,
-                        result.version_id,
-                        result.delete_marker,
-                    );
-                }
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to process DELETE request"))?;
 
-                Ok(S3Response::new(DeleteObjectOutput {
-                    delete_marker: Some(result.delete_marker),
-                    version_id: Some(result.version_id.to_string()),
-                    ..Default::default()
-                }))
-            }
-            Some(Err(err @ DeleteObjectError::NoSuchVersion)) => {
-                Err(s3_error!(NoSuchVersion, "{}", err))
-            }
-            Some(Err(err)) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            None => Err(s3_error!(InternalError, "Failed to process DELETE request")),
-        }
+        self.delete_object_response(
+            replication_auth,
+            replication_bucket,
+            replication_key,
+            replicate_latest_delete,
+            result,
+        )
     }
 
     #[tracing::instrument(err)]
@@ -979,20 +927,13 @@ impl S3 for ArunaS3Service {
     ) -> S3Result<S3Response<DeleteBucketOutput>> {
         debug!("Received DELETE BUCKET Request: {:#?}", req);
 
-        match drive(DeleteBucketOperation::new(req.input.bucket), &self.state).await {
-            Ok(Some(Ok(()))) => Ok(S3Response::new(DeleteBucketOutput::default())),
-            Ok(Some(Err(DeleteBucketError::NotFound))) | Err(DeleteBucketError::NotFound) => Err(
-                s3_error!(NoSuchBucket, "The specified bucket does not exist."),
-            ),
-            Ok(Some(Err(DeleteBucketError::NotEmpty))) | Err(DeleteBucketError::NotEmpty) => {
-                Err(s3_error!(
-                    BucketNotEmpty,
-                    "The bucket you tried to delete is not empty."
-                ))
-            }
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err)),
-            Ok(None) => Err(s3_error!(InternalError, "Failed to delete bucket")),
-        }
+        drive(DeleteBucketOperation::new(req.input.bucket), &self.state)
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to delete bucket"))?;
+
+        Ok(S3Response::new(DeleteBucketOutput::default()))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1004,25 +945,19 @@ impl S3 for ArunaS3Service {
             error!(error = "Missing user context");
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
-
-        self.validate_replication_configuration(&req.input.replication_configuration)?;
-
         let targets = self
             .parse_replication_targets(&req.input.bucket, &req.input.replication_configuration)?;
 
-        match drive(
+        drive(
             PutBucketReplicationOperation::new(req.input.bucket, targets),
             &self.state,
         )
         .await
-        {
-            Ok(Some(Ok(_))) => Ok(S3Response::new(PutBucketReplicationOutput::default())),
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(
-                InternalError,
-                "Failed to store bucket replication config"
-            )),
-        }
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to store bucket replication config"))?;
+
+        Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1035,26 +970,18 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
 
-        match drive(
+        let config = drive(
             GetBucketReplicationOperation::new(req.input.bucket),
             &self.state,
         )
         .await
-        {
-            Ok(Some(Ok(config))) => Ok(S3Response::new(GetBucketReplicationOutput {
-                replication_configuration: Some(self.build_replication_configuration(&config)),
-            })),
-            Ok(Some(Err(GetBucketReplicationError::NotFound)))
-            | Err(GetBucketReplicationError::NotFound) => Err(s3_error!(
-                ReplicationConfigurationNotFoundError,
-                "Replication configuration not found"
-            )),
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(
-                InternalError,
-                "Failed to load bucket replication config"
-            )),
-        }
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to load bucket replication config"))?;
+
+        Ok(S3Response::new(GetBucketReplicationOutput {
+            replication_configuration: Some(self.build_replication_configuration(&config)),
+        }))
     }
 
     #[tracing::instrument(err, skip(self, req))]
@@ -1067,18 +994,15 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
 
-        match drive(
+        drive(
             DeleteBucketReplicationOperation::new(req.input.bucket),
             &self.state,
         )
         .await
-        {
-            Ok(Some(Ok(()))) => Ok(S3Response::new(DeleteBucketReplicationOutput::default())),
-            Ok(Some(Err(err))) | Err(err) => Err(s3_error!(InternalError, "{}", err.to_string())),
-            Ok(None) => Err(s3_error!(
-                InternalError,
-                "Failed to delete bucket replication config"
-            )),
-        }
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to delete bucket replication config"))?;
+
+        Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 }
