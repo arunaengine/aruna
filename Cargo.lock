@@ -172,6 +172,7 @@ dependencies = [
  "aruna-operations",
  "aruna-storage",
  "aruna-tasks",
+ "aws-sdk-s3",
  "axum",
  "base64",
  "byteview",

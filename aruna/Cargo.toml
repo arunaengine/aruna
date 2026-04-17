@@ -39,4 +39,5 @@ byteview.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+aws-sdk-s3 = "1.124.0"
 tempfile.workspace = true

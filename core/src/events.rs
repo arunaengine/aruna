@@ -1,7 +1,7 @@
 use crate::errors::BlobError;
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::{BackendLocation, NegotiationResult, RealmId};
+use crate::structs::{BackendLocation, RealmId, ReplicationSuboperationResult};
 use crate::{
     automerge::AutomergeEvent,
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
@@ -42,6 +42,15 @@ pub enum SubOperationEvent {
     TopicAnnouncementResult {
         result: Result<(), String>,
     },
+    ReplicationItemResult {
+        result: Result<ReplicationSuboperationResult, String>,
+    },
+    ReplicationTransferResult {
+        result: Result<(), String>,
+    },
+    ReplicationApplyResult {
+        result: Result<(), String>,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -57,7 +66,16 @@ pub enum BlobEvent {
     ConnectionEstablished {
         stream_id: Ulid,
     },
-    NegotiationFinished(NegotiationResult),
+    ConnectionClosed {
+        stream_id: Ulid,
+    },
+    MessageReceived {
+        stream_id: Ulid,
+        payload: Vec<u8>,
+    },
+    MessageSent {
+        stream_id: Ulid,
+    },
     ReplicationFinished {
         location: BackendLocation,
     },
