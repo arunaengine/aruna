@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err)]
+
 use crate::s3::checksum::{
     ApplyChecksums, ChecksumSelection, UploadChecksumRequest, checksum_mode_enabled,
     encode_checksums, parse_upload_checksum_request,
@@ -340,10 +342,10 @@ impl ArunaS3Service {
         key: String,
         checksum_request: &UploadChecksumRequest,
         replication_auth: AuthContext,
-        replication_bucket: String,
-        replication_key: String,
         result: CompleteMultipartUploadResult,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let replication_bucket = bucket.clone();
+        let replication_key = key.clone();
         let mut output = CompleteMultipartUploadOutput {
             bucket: Some(bucket),
             key: Some(key),
@@ -694,8 +696,6 @@ impl S3 for ArunaS3Service {
             realm_id: user_access.user_identity.realm_key.clone(),
             path_restrictions: user_access.path_restrictions.clone(),
         };
-        let replication_bucket = req.input.bucket.clone();
-        let replication_key = req.input.key.clone();
         let completed_parts = req
             .input
             .multipart_upload
@@ -734,8 +734,6 @@ impl S3 for ArunaS3Service {
             req.input.key,
             &checksum_request,
             replication_auth,
-            replication_bucket,
-            replication_key,
             result,
         )
     }
