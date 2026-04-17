@@ -404,6 +404,7 @@ mod test {
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
+    use aruna_core::UserId;
 
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
     use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};
@@ -467,15 +468,15 @@ mod test {
             task_handle: Some(task_handle),
         };
 
-        let admin_id = Ulid::new();
         let realm_id = RealmId([0u8; 32]);
+        let admin_id = UserId::local(Ulid::new(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 
         let realm_config = CreateRealmConfig {
             actor: aruna_core::structs::Actor {
                 node_id,
                 user_id: admin_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             realm_description: "A description".to_string(),
         };
@@ -491,13 +492,13 @@ mod test {
         .await
         .unwrap();
 
-        let user_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
 
         let group_config = CreateGroupConfig {
             actor: aruna_core::structs::Actor {
                 node_id,
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             display_name: "Test group".to_string(),
         };
@@ -512,7 +513,7 @@ mod test {
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
             path: format!(
@@ -532,8 +533,8 @@ mod test {
         //
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
-                user_id: Ulid::new(),
-                realm_id: realm_id.clone(),
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
                 path_restrictions: None,
             },
             path: format!(
@@ -554,7 +555,7 @@ mod test {
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
             path: format!(
@@ -571,12 +572,12 @@ mod test {
         //
         // User is in group and has not sufficient permissions
         //
-        let reader = Ulid::new();
+        let reader = UserId::local(Ulid::new(), realm_id);
         let add_user_input = AddUserToGroupInput {
             actor: Actor {
                 node_id,
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             group_id,
             user_id: reader,
@@ -593,7 +594,7 @@ mod test {
         let mut perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: reader,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
             path: format!(
@@ -617,18 +618,18 @@ mod test {
         //
         // Test DENY roles
         //
-        let denied_user = Ulid::new();
+        let denied_user = UserId::local(Ulid::new(), realm_id);
         let add_role_input = AddGroupRoleConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
-            realm_id: realm_id.clone(),
+            realm_id,
             actor: Actor {
                 node_id,
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             group_id,
             role: aruna_core::structs::Role {
@@ -648,7 +649,7 @@ mod test {
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: denied_user,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
             path: format!(
@@ -668,7 +669,7 @@ mod test {
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: denied_user,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
             path: format!("/{}/admin/roles/{}", realm_id, Ulid::new().to_string()),
@@ -683,7 +684,7 @@ mod test {
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: admin_id,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
             path: format!("/{}/admin/roles/{}", realm_id, Ulid::new().to_string()),
@@ -706,15 +707,15 @@ mod test {
                 }
             })
             .collect();
-        let new_admin = Ulid::new();
+        let new_admin = UserId::local(Ulid::new(), realm_id);
 
         let add_user_input = AddUserToRealmRolesInput {
             actor: Actor {
                 node_id,
                 user_id: admin_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
-            realm_id: realm_id.clone(),
+            realm_id,
             user_id: new_admin,
             role_ids: admin_role,
         };
@@ -725,7 +726,7 @@ mod test {
         let perm_config = CheckPermissionsConfig {
             auth_context: aruna_core::structs::AuthContext {
                 user_id: new_admin,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
             path: format!("/{}/admin/roles/{}", realm_id, Ulid::new().to_string()),

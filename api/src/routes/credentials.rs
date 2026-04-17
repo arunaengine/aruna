@@ -82,7 +82,6 @@ pub async fn create_s3_credentials(
 
     let user_identity = UserIdentity {
         user_id: auth.user_id,
-        realm_key: auth.realm_id.clone(),
     };
     let group_id = Ulid::from_str(&request.group_id).map_err(|_| ServerError::BadRequest)?;
     let allowed = drive(

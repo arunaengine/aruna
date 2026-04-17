@@ -180,7 +180,7 @@ impl Operation for RevokeUserAccessOperation {
 mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
-    use aruna_core::structs::{RealmId, UserAccess, UserIdentity};
+    use aruna_core::structs::{UserAccess, UserIdentity};
     use aruna_storage::storage;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -204,8 +204,7 @@ mod tests {
         let user_access = UserAccess {
             access_key: access_key.clone(),
             user_identity: UserIdentity {
-                user_id: Ulid::new(),
-                realm_key: RealmId([0u8; 32]),
+                user_id: Default::default(),
             },
             group_id: Ulid::new(),
             secret: "secret".to_string(),

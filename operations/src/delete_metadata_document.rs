@@ -12,8 +12,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::repository::{
-    StorageReadError, delete_document_index_effect, delete_holders_effect, delete_registry_effect,
-    parse_registry_read, read_registry_effect, write_audit_effect,
+    delete_document_index_effect, delete_holders_effect, delete_registry_effect,
+    parse_registry_read, read_registry_effect, write_audit_effect, StorageReadError,
 };
 
 #[derive(Debug, PartialEq)]
@@ -80,7 +80,7 @@ impl DeleteMetadataDocumentOperation {
 
     fn audit_record(&self, record: &MetadataRegistryRecord) -> MetadataAuditRecord {
         MetadataAuditRecord {
-            realm_id: record.realm_id.clone(),
+            realm_id: record.realm_id,
             group_id: record.group_id,
             document_id: record.document_id,
             graph_iri: record.graph_iri.clone(),

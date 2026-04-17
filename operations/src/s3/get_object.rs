@@ -405,7 +405,7 @@ mod test {
     use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, Location, LookupKey, MultipartChecksumType,
-        RealmId, UserIdentity,
+        UserIdentity,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -521,7 +521,6 @@ mod test {
                 group_id: Ulid::new(),
                 user_identity: UserIdentity {
                     user_id: Default::default(),
-                    realm_key: RealmId([0u8; 32]),
                 },
             },
             state: GetObjectState::Init,
@@ -650,7 +649,6 @@ mod test {
             group_id: Ulid::new(),
             user_identity: UserIdentity {
                 user_id: Default::default(),
-                realm_key: RealmId([0u8; 32]),
             },
         });
 

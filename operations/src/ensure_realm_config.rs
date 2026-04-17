@@ -77,7 +77,7 @@ impl EnsureRealmConfigOperation {
 
     fn document_ref(&self) -> AutomergeDocumentVariant {
         AutomergeDocumentVariant::RealmConfig {
-            realm_id: self.config.actor.realm_id.clone(),
+            realm_id: self.config.actor.realm_id,
         }
     }
 
@@ -151,7 +151,7 @@ impl Operation for EnsureRealmConfigOperation {
                     },
                     None => {
                         let mut document = RealmConfigDocument::new(
-                            self.config.actor.realm_id.clone(),
+                            self.config.actor.realm_id,
                             self.config.default_metadata_replication_factor,
                         );
                         document.oidc_providers = self.config.oidc_providers.clone();

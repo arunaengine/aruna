@@ -553,7 +553,7 @@ mod test {
             task_handle: None,
         };
 
-        let user_id = Ulid::new();
+        let user_id = aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]));
         let put_result = drive(
             PutObjectOperation::new(PutObjectConfig {
                 user_id,
@@ -650,7 +650,6 @@ mod test {
                 group_id: Ulid::new(),
                 user_identity: UserIdentity {
                     user_id,
-                    realm_key: RealmId([0u8; 32]),
                 },
             }),
             &context,
@@ -694,7 +693,7 @@ mod test {
             task_handle: None,
         };
 
-        let user_id = Ulid::new();
+        let user_id = aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]));
         let put_result = drive(
             PutObjectOperation::new(PutObjectConfig {
                 user_id,
@@ -759,7 +758,6 @@ mod test {
                 group_id: Ulid::new(),
                 user_identity: UserIdentity {
                     user_id,
-                    realm_key: RealmId([0u8; 32]),
                 },
             }),
             &context,
@@ -796,7 +794,6 @@ mod test {
                 group_id: Ulid::new(),
                 user_identity: UserIdentity {
                     user_id,
-                    realm_key: RealmId([0u8; 32]),
                 },
             }),
             &context,

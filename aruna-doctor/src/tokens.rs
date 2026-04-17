@@ -9,6 +9,7 @@ use aruna_api::server_state::{
     INITIAL_LOCAL_ONBOARDING_SECRET_KEY, TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY,
     load_persisted_state,
 };
+use aruna_core::UserId;
 use aruna_core::onboarding::OnboardingSecret;
 use aruna_core::structs::{OidcProviderConfig, RealmId, TokenClaims};
 use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
@@ -68,6 +69,7 @@ fn oidc_password_grant_body(
     .join("&")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn create_token(
     name: Option<String>,
     unsafe_arbitrary_user_id: bool,
@@ -118,8 +120,8 @@ async fn create_unsafe_token(user_id: Ulid, expiry: Option<u64>) -> Result<Strin
     let token_config = CreateTokenConfig {
         time: chrono::Utc::now().timestamp() as u64,
         expiry,
-        user_id,
-        realm_id: config.realm_id.clone(),
+        user_id: UserId::local(user_id, config.realm_id),
+        realm_id: config.realm_id,
         node_capabilities: config.node_capabilities,
     };
     let token_operation = CreateTokenOperation::new(token_config.clone())?;

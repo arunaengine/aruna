@@ -605,7 +605,7 @@ mod tests {
                 NetConfig {
                     bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
                     secret_key: Some(config.net_secret_key.clone()),
-                    realm_id: config.realm_id.clone(),
+                    realm_id: config.realm_id,
                     bootstrap_nodes: Vec::new(),
                     use_dns_discovery: false,
                 },
@@ -642,7 +642,7 @@ mod tests {
 
             let server_state = ServerState::new(
                 context.clone(),
-                config.realm_id.clone(),
+                config.realm_id,
                 config.node_id,
                 config.node_capabilities.clone(),
                 false,
@@ -650,13 +650,13 @@ mod tests {
             )
             .await;
 
-            let realm_admin = Ulid::new();
+            let realm_admin = aruna_core::UserId::local(Ulid::new(), config.realm_id);
             drive(
                 CreateRealmOperation::new(CreateRealmConfig {
                     actor: Actor {
                         node_id: config.node_id,
                         user_id: realm_admin,
-                        realm_id: config.realm_id.clone(),
+                        realm_id: config.realm_id,
                     },
                     realm_description: "Snapshot Test Realm".to_string(),
                 }),
@@ -670,7 +670,7 @@ mod tests {
                     actor: Actor {
                         node_id: config.node_id,
                         user_id: realm_admin,
-                        realm_id: config.realm_id.clone(),
+                        realm_id: config.realm_id,
                     },
                 }),
                 context.as_ref(),
@@ -683,7 +683,7 @@ mod tests {
                     actor: Actor {
                         node_id: config.node_id,
                         user_id: realm_admin,
-                        realm_id: config.realm_id.clone(),
+                        realm_id: config.realm_id,
                     },
                     display_name: "Snapshot Test Group".to_string(),
                 }),
@@ -696,7 +696,6 @@ mod tests {
                 CreateUserAccessOperation::new(CreateUserAccessConfig {
                     user_identity: UserIdentity {
                         user_id: realm_admin,
-                        realm_key: config.realm_id.clone(),
                     },
                     group_id: group.0.group_id,
                     expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
@@ -733,7 +732,7 @@ mod tests {
                 PutObjectOperation::new(PutObjectConfig {
                     user_id: realm_admin,
                     group_id: group.0.group_id,
-                    realm_id: config.realm_id.clone(),
+                    realm_id: config.realm_id,
                     node_id: config.node_id,
                     request: PutObjectInput {
                         bucket: bucket_name,

@@ -1,6 +1,7 @@
-use crate::auth::bearer_token;
-use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::auth::{bearer_token, handle_token};
+use crate::error::{ErrorResponse, ServerError, ServerResult, TokenError};
 use crate::server_state::ServerState;
+use aruna_core::UserId;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret};
 use aruna_core::structs::{Actor, AuthContext, User};
 use aruna_operations::create_user_record::{CreateUserRecordInput, CreateUserRecordOperation};
@@ -31,6 +32,7 @@ use utoipa::{OpenApi, ToSchema};
     tags((name = "users", description = "User operations")),
     paths(
         register_bootstrap_user,
+        register_foreign_user,
         register_user,
         register_oidc_user,
         get_user,
@@ -42,6 +44,7 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/users", post(register_user))
         .route("/users/bootstrap", post(register_bootstrap_user))
+        .route("/users/foreign", post(register_foreign_user))
         .route("/users/oidc", post(register_oidc_user))
         .route("/users", get(get_user))
 }
@@ -124,9 +127,38 @@ fn map_inspect_onboarding_error(error: InspectOnboardingSecretError) -> ServerEr
     }
 }
 
+fn map_token_error(error: TokenError) -> ServerError {
+    match error {
+        TokenError::RealmNotTrusted => ServerError::Forbidden,
+        TokenError::Expired
+        | TokenError::InvalidIssuerKey
+        | TokenError::InvalidServerToken
+        | TokenError::TokenBlacklisted
+        | TokenError::PublicKeyError(_)
+        | TokenError::FromSliceError(_)
+        | TokenError::PublicKeyConversionError(_)
+        | TokenError::PrivateKeyConversionError(_)
+        | TokenError::JWTError(_)
+        | TokenError::Base64Error(_) => ServerError::Unauthorized,
+    }
+}
+
+async fn authenticate_foreign_user(
+    state: &Arc<ServerState>,
+    headers: &HeaderMap,
+) -> ServerResult<AuthContext> {
+    let token = bearer_token(headers).ok_or(ServerError::Unauthorized)?;
+    let claims = handle_token(state, token).await.map_err(map_token_error)?;
+    let auth = AuthContext::try_from(claims).map_err(|_| ServerError::Unauthorized)?;
+    if auth.realm_id == state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    Ok(auth)
+}
+
 async fn issue_user_token(
     state: &Arc<ServerState>,
-    user_id: Ulid,
+    user_id: UserId,
 ) -> ServerResult<String> {
     drive(
         CreateTokenOperation::new(CreateTokenConfig {
@@ -143,7 +175,7 @@ async fn issue_user_token(
     .map_err(|err| ServerError::InternalError(err.to_string()))
 }
 
-async fn try_claim_initial_admin(state: &Arc<ServerState>, user_id: Ulid) {
+async fn try_claim_initial_admin(state: &Arc<ServerState>, user_id: UserId) {
     let auth_context = AuthContext {
         user_id,
         realm_id: state.get_realm_id(),
@@ -202,10 +234,10 @@ async fn register_bootstrap_user(
         CreateUserRecordOperation::new(CreateUserRecordInput {
             actor: Actor {
                 node_id: state.get_node_id(),
-                user_id: Ulid::from_bytes([0u8; 16]),
+                user_id: UserId::nil(state.get_realm_id()),
                 realm_id: state.get_realm_id(),
             },
-            user_id: Ulid::new(),
+            user_id: UserId::local(Ulid::new(), state.get_realm_id()),
             name: request.name,
             subject_ids: vec![],
         }),
@@ -224,6 +256,54 @@ async fn register_bootstrap_user(
             token,
         }),
     ))
+}
+
+#[utoipa::path(
+    post,
+    path = "/users/foreign",
+    tag = "users",
+    request_body = RegisterUserRequest,
+    responses(
+        (status = 201, description = "Trusted foreign user joined the realm", body = RegisterUserResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn register_foreign_user(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(request): Json<RegisterUserRequest>,
+) -> ServerResult<(StatusCode, Json<RegisterUserResponse>)> {
+    let auth = authenticate_foreign_user(&state, &headers).await?;
+    let realm_id = state.get_realm_id();
+
+    let user = drive(
+        CreateUserRecordOperation::new(CreateUserRecordInput {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: auth.user_id,
+                realm_id,
+            },
+            user_id: auth.user_id,
+            name: request.name,
+            subject_ids: vec![],
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    trace!(
+        event = "request.user.foreign_join.completed",
+        realm_id = %realm_id,
+        user_id = %auth.user_id,
+        user_name = %user.name,
+        "Completed foreign user join request"
+    );
+
+    Ok((StatusCode::CREATED, Json(user.into())))
 }
 
 #[utoipa::path(
@@ -269,13 +349,13 @@ async fn register_oidc_user(
         RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: Actor {
                 node_id: state.get_node_id(),
-                user_id: Ulid::from_bytes([0u8; 16]),
-                realm_id: realm_id.clone(),
+                user_id: UserId::nil(realm_id),
+                realm_id,
             },
             issuer: oidc_identity.issuer,
             subject_id: oidc_identity.subject_id,
             name,
-            user_id: Ulid::new(),
+            user_id: UserId::local(Ulid::new(), realm_id),
         }),
         &state.get_ctx(),
     )
@@ -323,9 +403,9 @@ async fn register_user(
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
-            user_id: Ulid::new(),
+            user_id: UserId::local(Ulid::new(), realm_id),
             name: request.name,
             subject_ids: vec![],
         }),
@@ -368,25 +448,31 @@ async fn get_user(
 
 #[cfg(test)]
 mod tests {
-    use super::{RegisterBootstrapUserRequest, register_bootstrap_user};
+    use super::{
+        RegisterBootstrapUserRequest, RegisterUserRequest, authenticate_foreign_user,
+        register_bootstrap_user, register_foreign_user,
+    };
+    use crate::error::ServerError;
     use crate::server_state::ServerState;
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, USER_KEYSPACE};
     use aruna_core::onboarding::OnboardingSecret;
-    use aruna_core::structs::{Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId};
+    use aruna_core::structs::{Actor, NodeCapabilities, RealmAuthorizationDocument, RealmId, User};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_operations::create_onboarding_secret::{
         CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
     };
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
     use aruna_operations::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::Json;
     use axum::extract::State;
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, StatusCode, header};
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
     use std::sync::Arc;
@@ -410,6 +496,23 @@ mod tests {
                 value: Some(bytes), ..
             }) => RealmAuthorizationDocument::from_bytes(&bytes).unwrap(),
             other => panic!("unexpected auth doc read result: {other:?}"),
+        }
+    }
+
+    async fn read_user(driver_ctx: &DriverContext, user_id: UserId) -> User {
+        match driver_ctx
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: USER_KEYSPACE.to_string(),
+                key: ByteView::from(user_id.to_bytes()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => User::from_bytes(&bytes).unwrap(),
+            other => panic!("unexpected user read result: {other:?}"),
         }
     }
 
@@ -443,8 +546,7 @@ mod tests {
             task_handle: Some(TaskHandle::new()),
         });
 
-        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
-        let realm_signing_key = SigningKey::generate(&mut csprng);
+        let realm_signing_key = SigningKey::from_bytes(&[17u8; 32]);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = net_handle.node_id();
 
@@ -452,8 +554,8 @@ mod tests {
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
                     node_id,
-                    user_id: Ulid::from_bytes([0u8; 16]),
-                    realm_id: realm_id.clone(),
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
                 },
                 realm_description: "Realm".to_string(),
             }),
@@ -486,7 +588,7 @@ mod tests {
         let state = Arc::new(
             ServerState::new(
                 driver_ctx.clone(),
-                realm_id.clone(),
+                realm_id,
                 node_id,
                 NodeCapabilities::management_node(realm_signing_key).unwrap(),
                 true,
@@ -525,8 +627,117 @@ mod tests {
             .unwrap();
         assert!(realm_admin
             .assigned_users
-            .contains(&Ulid::from_string(&response.user.id).unwrap()));
+            .contains(&UserId::from_string(&response.user.id).unwrap()));
 
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn foreign_registration_preserves_home_realm_user_id() {
+        let (state, driver_ctx, realm_id, _onboarding_secret, net_handle, _tempdir) =
+            setup_initial_state().await;
+
+        let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
+        let foreign_realm_signing_key = SigningKey::generate(&mut csprng);
+        let foreign_realm_id =
+            RealmId::from_bytes(foreign_realm_signing_key.verifying_key().to_bytes());
+        state.add_trusted_realm(foreign_realm_id).await;
+
+        let foreign_user_id = UserId::local(Ulid::new(), foreign_realm_id);
+        let token = drive(
+            CreateTokenOperation::new(CreateTokenConfig {
+                time: super::now_timestamp(),
+                expiry: None,
+                user_id: foreign_user_id,
+                realm_id: foreign_realm_id,
+                node_capabilities: NodeCapabilities::management_node(foreign_realm_signing_key)
+                    .unwrap(),
+            })
+            .unwrap(),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+        );
+        let auth = authenticate_foreign_user(&state, &headers).await;
+
+        let (status, Json(response)) = register_foreign_user(
+            State(state.clone()),
+            headers,
+            Json(RegisterUserRequest {
+                name: "Foreign Alice".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(auth.is_ok());
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(response.id, foreign_user_id.to_string());
+
+        let stored_user = read_user(driver_ctx.as_ref(), foreign_user_id).await;
+        assert_eq!(stored_user.user_id, foreign_user_id);
+        assert_eq!(stored_user.name, "Foreign Alice");
+
+        let auth_doc = read_auth_doc(driver_ctx.as_ref(), &realm_id).await;
+        let realm_admin = auth_doc
+            .roles
+            .values()
+            .find(|role| role.name == "realm_admin")
+            .unwrap();
+        assert!(realm_admin.assigned_users.is_empty());
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn foreign_registration_rejects_local_realm_token() {
+        let (state, driver_ctx, realm_id, _onboarding_secret, net_handle, _tempdir) =
+            setup_initial_state().await;
+        let local_user_id = UserId::local(Ulid::new(), realm_id);
+
+        let local_realm_signing_key = SigningKey::from_bytes(&[17u8; 32]);
+        let local_realm_id =
+            RealmId::from_bytes(local_realm_signing_key.verifying_key().to_bytes());
+        assert_eq!(local_realm_id, realm_id);
+        let token = drive(
+            CreateTokenOperation::new(CreateTokenConfig {
+                time: super::now_timestamp(),
+                expiry: None,
+                user_id: local_user_id,
+                realm_id,
+                node_capabilities: NodeCapabilities::management_node(local_realm_signing_key)
+                    .unwrap(),
+            })
+            .unwrap(),
+            driver_ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            axum::http::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
+        );
+        let auth = authenticate_foreign_user(&state, &headers).await;
+
+        let result = register_foreign_user(
+            State(state),
+            headers,
+            Json(RegisterUserRequest {
+                name: "Local Alice".to_string(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(auth, Err(ServerError::Forbidden)));
+        assert!(matches!(result, Err(ServerError::Forbidden)));
         net_handle.shutdown().await;
     }
 }

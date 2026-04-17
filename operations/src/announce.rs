@@ -113,12 +113,12 @@ impl AnnounceTopicOperation {
             TopicId::Realm(realm_id) => {
                 self.pending.push_back(PendingTopicAnnouncement::Automerge(
                     AutomergeDocumentVariant::RealmAuthorization {
-                        realm_id: realm_id.clone(),
+                        realm_id: *realm_id,
                     },
                 ));
                 self.pending.push_back(PendingTopicAnnouncement::Automerge(
                     AutomergeDocumentVariant::RealmConfig {
-                        realm_id: realm_id.clone(),
+                        realm_id: *realm_id,
                     },
                 ));
             }

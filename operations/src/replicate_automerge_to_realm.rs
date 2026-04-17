@@ -1,9 +1,9 @@
-use aruna_core::NodeId;
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{boxed_suboperation, Operation};
 use aruna_core::structs::RealmId;
 use aruna_core::types::Effects;
+use aruna_core::NodeId;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{trace, warn};
@@ -171,7 +171,7 @@ impl Operation for ReplicateAutomergeDocumentsToRealmOperation {
         self.state = ReplicateAutomergeDocumentsToRealmState::LoadRealmNodes;
         smallvec![aruna_core::effects::Effect::SubOperation(
             boxed_suboperation(
-                GetRealmNodesOperation::new(self.config.realm_id.clone()),
+                GetRealmNodesOperation::new(self.config.realm_id),
                 |result| Event::SubOperation(SubOperationEvent::RealmNodesResult {
                     result: result
                         .map(|nodes| {

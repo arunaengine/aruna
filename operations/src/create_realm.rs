@@ -56,7 +56,7 @@ impl CreateRealmOperation {
     }
     fn emit_create_realm(&mut self) -> Result<Effects, CreateRealmError> {
         let realm = Realm {
-            realm_id: self.config.actor.realm_id.clone(),
+            realm_id: self.config.actor.realm_id,
             description: self.config.realm_description.clone(),
         };
 
@@ -78,10 +78,9 @@ impl CreateRealmOperation {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
-        let realm_id = self.config.actor.realm_id.clone();
+        let realm_id = self.config.actor.realm_id;
 
-        let auth_doc =
-            RealmAuthorizationDocument::new_default_realm_doc(self.config.actor.realm_id.clone());
+        let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(self.config.actor.realm_id);
 
         self.auth_doc = Some(auth_doc.clone());
 
@@ -99,8 +98,8 @@ impl CreateRealmOperation {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
-        let realm_id = self.config.actor.realm_id.clone();
-        let config_doc = RealmConfigDocument::default_for_realm(realm_id.clone());
+        let realm_id = self.config.actor.realm_id;
+        let config_doc = RealmConfigDocument::default_for_realm(realm_id);
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
@@ -238,7 +237,7 @@ impl CreateRealmOperation {
             smallvec![Effect::SubOperation(boxed_suboperation(
                 AnnounceTopicOperation::new(
                     AutomergeDocumentVariant::RealmAuthorization {
-                        realm_id: realm.realm_id.clone(),
+                        realm_id: realm.realm_id,
                     }
                     .topic_id(),
                     self.config.actor.node_id,
@@ -272,7 +271,7 @@ impl CreateRealmOperation {
             smallvec![Effect::SubOperation(boxed_suboperation(
                 AnnounceTopicOperation::new(
                     AutomergeDocumentVariant::RealmConfig {
-                        realm_id: realm.realm_id.clone(),
+                        realm_id: realm.realm_id,
                     }
                     .topic_id(),
                     self.config.actor.node_id,
@@ -407,6 +406,7 @@ mod test {
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use aruna_core::UserId;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -445,7 +445,7 @@ mod test {
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let realm_admin = Ulid::new();
+        let realm_admin = UserId::local(Ulid::new(), realm_id);
 
         let realm_config = CreateRealmConfig {
             actor: Actor {

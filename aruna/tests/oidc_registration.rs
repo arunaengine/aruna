@@ -2,6 +2,7 @@ use aruna_api::auth::OidcValidator;
 use aruna_api::routes::users::RegisterOidcUserResponse;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -145,7 +146,7 @@ fn sign_oidc_token(
     .unwrap()
 }
 
-async fn read_user(context: &DriverContext, user_id: Ulid) -> User {
+async fn read_user(context: &DriverContext, user_id: UserId) -> User {
     match context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
@@ -228,13 +229,13 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
     let realm_id =
         aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let bootstrap_user = Ulid::new();
+    let bootstrap_user = UserId::local(Ulid::new(), realm_id);
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id: bootstrap_user,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             realm_description: "Test Realm".to_string(),
         }),
@@ -247,7 +248,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id: bootstrap_user,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
         }),
         context.as_ref(),
@@ -256,7 +257,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     .unwrap();
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: realm_id.clone(),
+            realm_id,
             node_id: net.node_id(),
             schedule_refresh: false,
         }),
@@ -276,8 +277,8 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
                 config
                     .to_bytes(&Actor {
                         node_id: net.node_id(),
-                        user_id: Ulid::from_bytes([0u8; 16]),
-                        realm_id: realm_id.clone(),
+                        user_id: UserId::nil(realm_id),
+                        realm_id,
                     })
                     .unwrap(),
             ),
@@ -292,7 +293,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     let state = Arc::new(
         ServerState::new(
             context.clone(),
-            realm_id.clone(),
+            realm_id,
             net.node_id(),
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
@@ -348,7 +349,7 @@ async fn oidc_registration_route_creates_user_indexes_and_token() {
 
     let stored_user = read_user(
         node.context.as_ref(),
-        Ulid::from_string(&body.user.id).unwrap(),
+        UserId::from_string(&body.user.id).unwrap(),
     )
     .await;
     assert_eq!(stored_user.name, "Alice");

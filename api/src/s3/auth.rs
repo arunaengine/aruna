@@ -89,7 +89,7 @@ impl S3Access for AuthProvider {
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: AuthContext {
                     user_id: user_access.user_identity.user_id,
-                    realm_id: user_access.user_identity.realm_key.clone(),
+                    realm_id: user_access.user_identity.user_id.realm_id,
                     path_restrictions: user_access.path_restrictions.clone(),
                 },
                 path,

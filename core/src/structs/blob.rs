@@ -1,6 +1,6 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
-use crate::structs::{PathRestriction, RealmId};
+use crate::structs::PathRestriction;
 use crate::types::UserId;
 use byteview::ByteView;
 use core::fmt;
@@ -227,6 +227,7 @@ impl VersionKey {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Location {
     Real(BackendLocation),
@@ -277,12 +278,11 @@ pub enum NegotiationResult {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserIdentity {
     pub user_id: UserId,
-    pub realm_key: RealmId,
 }
 
 impl Display for UserIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}", self.user_id, self.realm_key)
+        write!(f, "{}", self.user_id)
     }
 }
 

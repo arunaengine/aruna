@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RealmId(pub [u8; 32]);
 
 impl RealmId {
@@ -367,6 +367,7 @@ mod test {
         Actor, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
         OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId, User,
     };
+    use crate::UserId;
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
 
@@ -414,14 +415,14 @@ mod test {
                     .to_string(),
             }],
             users: vec![User {
-                user_id: Ulid::new(),
+                user_id: UserId::new(Ulid::new(), RealmId([4u8; 32])),
                 name: "a_name".to_string(),
                 subject_ids: vec!["id1".to_string(), "id2".to_string()],
             }],
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
-            user_id: Ulid::new(),
+            user_id: UserId::new(Ulid::new(), RealmId([4u8; 32])),
             realm_id: RealmId([4u8; 32]),
         };
 
@@ -458,7 +459,7 @@ mod test {
             },
             oidc_providers: vec![],
             users: vec![User {
-                user_id: Ulid::new(),
+                user_id: UserId::new(Ulid::new(), RealmId([5u8; 32])),
                 name: "b_name".to_string(),
                 subject_ids: vec!["id3".to_string(), "id4".to_string()],
             }],

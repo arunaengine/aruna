@@ -155,7 +155,7 @@ impl NetHandle {
                 endpoint.clone(),
                 storage.clone(),
                 dht.clone(),
-                config.realm_id.clone(),
+                config.realm_id,
                 config.bootstrap_nodes.clone(),
                 shutdown.child_token(),
                 gossip_msg_tx.clone(),

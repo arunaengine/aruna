@@ -360,7 +360,7 @@ impl PutObjectOperation {
         self.state = PutObjectState::RegisterBlobInDht;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
             key,
-            realm_id: self.config.realm_id.clone(),
+            realm_id: self.config.realm_id,
             value: self.config.node_id.as_bytes().to_vec(),
             ttl: Default::default(),
         }))]
@@ -574,9 +574,9 @@ mod test {
         let stream = tokio_util::io::ReaderStream::new(&data[..]);
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let put_config = PutObjectConfig {
-            user_id: Ulid::new(),
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
             group_id: Ulid::new(),
-            realm_id: realm_id.clone(),
+            realm_id,
             node_id: net_handle.node_id(),
             request: PutObjectInput {
                 bucket: "mybucket".to_string(),
@@ -741,7 +741,7 @@ mod test {
 
         let first = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: Ulid::new(),
+                user_id: aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32])),
                 group_id: Ulid::new(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 node_id: context.net_handle.as_ref().unwrap().node_id(),
@@ -766,7 +766,7 @@ mod test {
 
         let second = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: Ulid::new(),
+                user_id: aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32])),
                 group_id: Ulid::new(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 node_id: context.net_handle.as_ref().unwrap().node_id(),
@@ -853,7 +853,7 @@ mod test {
         let data = b"hello, world!";
         let err = drive(
             PutObjectOperation::new(PutObjectConfig {
-                user_id: Ulid::new(),
+                user_id: aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32])),
                 group_id: Ulid::new(),
                 realm_id: RealmId::from_bytes([1u8; 32]),
                 node_id: context.net_handle.as_ref().unwrap().node_id(),

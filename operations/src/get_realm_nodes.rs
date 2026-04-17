@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use aruna_core::NodeId;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::errors::DhtError;
 use aruna_core::events::{DhtEvent, Event, NetEvent};
@@ -8,6 +7,7 @@ use aruna_core::keys::realm_presence_key;
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
 use aruna_core::types::Effects;
+use aruna_core::NodeId;
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -71,7 +71,7 @@ impl Operation for GetRealmNodesOperation {
         self.state = GetRealmNodesState::ReadDocument;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
             key: *realm_presence_key(&self.realm_id).as_bytes(),
-            realm_filter: Some(self.realm_id.clone()),
+            realm_filter: Some(self.realm_id),
         }))]
     }
 

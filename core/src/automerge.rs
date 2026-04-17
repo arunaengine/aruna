@@ -23,7 +23,7 @@ impl AutomergeDocumentVariant {
                 TopicId::group(*group_id)
             }
             Self::RealmAuthorization { realm_id } | Self::RealmConfig { realm_id } => {
-                TopicId::realm(realm_id.clone())
+                TopicId::realm(*realm_id)
             }
         }
     }
@@ -49,11 +49,11 @@ impl AutomergeDocumentVariant {
             }
             (TopicId::Realm(realm_id), TopicMessageKind::RealmAuthorization) => {
                 Some(Self::RealmAuthorization {
-                    realm_id: realm_id.clone(),
+                    realm_id: *realm_id,
                 })
             }
             (TopicId::Realm(realm_id), TopicMessageKind::RealmConfig) => Some(Self::RealmConfig {
-                realm_id: realm_id.clone(),
+                realm_id: *realm_id,
             }),
             _ => None,
         }
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn resolves_realm_message_variant() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
-        let topic = TopicId::realm(realm_id.clone());
+        let topic = TopicId::realm(realm_id);
         let document = AutomergeDocumentVariant::from_topic_message(
             &topic,
             &TopicMessageKind::RealmAuthorization,

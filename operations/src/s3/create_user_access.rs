@@ -6,7 +6,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{PathRestriction, UserAccess, UserIdentity};
 use aruna_core::types::{Effects, GroupId};
 use rand::distr::Alphanumeric;
-use rand::{Rng, rng};
+use rand::{rng, Rng};
 use smallvec::smallvec;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -197,7 +197,7 @@ impl Operation for CreateUserAccessOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::{RealmId, UserIdentity};
+    use aruna_core::structs::UserIdentity;
 
     fn make_config(user_identity: UserIdentity, group_id: GroupId) -> CreateUserAccessConfig {
         CreateUserAccessConfig {
@@ -211,8 +211,7 @@ mod tests {
 
     fn make_user_identity() -> UserIdentity {
         UserIdentity {
-            user_id: Ulid::new(),
-            realm_key: RealmId([0u8; 32]),
+            user_id: Default::default(),
         }
     }
 

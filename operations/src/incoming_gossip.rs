@@ -4,9 +4,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::gossip::{TopicMessage, TopicMessageVersion};
 use aruna_core::metadata::{
-    MetadataClockRelation, MetadataEffect, MetadataEvent, compare_metadata_clocks,
+    compare_metadata_clocks, MetadataClockRelation, MetadataEffect, MetadataEvent,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{boxed_suboperation, Operation};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Effects;
 use aruna_core::{NodeId, TopicId};
@@ -430,7 +430,10 @@ mod tests {
     fn group_bytes(seed: u8) -> Vec<u8> {
         let actor = aruna_core::structs::Actor {
             node_id: make_node(seed),
-            user_id: GroupId::from_bytes([seed; 16]),
+            user_id: aruna_core::UserId::local(
+                GroupId::from_bytes([seed; 16]),
+                RealmId::from_bytes([seed; 32]),
+            ),
             realm_id: RealmId::from_bytes([seed; 32]),
         };
         aruna_core::structs::Group {

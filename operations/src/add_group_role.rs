@@ -543,6 +543,7 @@ pub mod test {
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, Permission, Role};
+    use aruna_core::UserId;
     use aruna_core::types::TxnId;
     use ulid::Ulid;
 
@@ -551,32 +552,32 @@ pub mod test {
         //
         // Inputs
         //
-        let user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let user_id = UserId::local(Ulid::new(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let group_id = Ulid::new();
         let auth_doc =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id.clone(), group_id);
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {
             display_name: "test".to_string(),
             group_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             roles: auth_doc.roles.keys().copied().collect(),
         };
         let auth_context = aruna_core::structs::AuthContext {
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             path_restrictions: None,
         };
         let actor = Actor {
             node_id,
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
         };
         let add_role_input = AddGroupRoleConfig {
             auth_context: auth_context.clone(),
             actor: actor.clone(),
-            realm_id: realm_id.clone(),
+            realm_id,
             group_id,
             role: Role {
                 role_id: Ulid::new(),

@@ -16,6 +16,7 @@ use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
+use aruna_core::UserId;
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -32,7 +33,6 @@ use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{error, info, warn};
-use ulid::Ulid;
 
 #[tokio::main]
 async fn main() {
@@ -54,7 +54,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NetConfig {
             bind_addr: config.p2p_socket_addr,
             secret_key: Some(config.net_secret_key.clone()),
-            realm_id: config.realm_id.clone(),
+            realm_id: config.realm_id,
             bootstrap_nodes: config.bootstrap_nodes.clone(),
             use_dns_discovery: false,
         },
@@ -109,8 +109,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     CreateRealmOperation::new(CreateRealmConfig {
                         actor: Actor {
                             node_id: config.node_id,
-                            user_id: Ulid::from_bytes([0u8; 16]),
-                            realm_id: config.realm_id.clone(),
+                            user_id: UserId::nil(config.realm_id),
+                            realm_id: config.realm_id,
                         },
                         realm_description: realm_description.clone(),
                     }),
@@ -123,8 +123,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
                     actor: Actor {
                         node_id: config.node_id,
-                        user_id: Ulid::from_bytes([0u8; 16]),
-                        realm_id: config.realm_id.clone(),
+                        user_id: UserId::nil(config.realm_id),
+                        realm_id: config.realm_id,
                     },
                     bootstrap_peers: config.bootstrap_nodes.clone(),
                     default_metadata_replication_factor: config.default_metadata_replication_factor,
@@ -195,8 +195,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
                         actor: Actor {
                             node_id: config.node_id,
-                            user_id: Ulid::from_bytes([0u8; 16]),
-                            realm_id: config.realm_id.clone(),
+                            user_id: UserId::nil(config.realm_id),
+                            realm_id: config.realm_id,
                         },
                         bootstrap_peers: config.bootstrap_nodes.clone(),
                         default_metadata_replication_factor: config
@@ -212,7 +212,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: config.realm_id.clone(),
+            realm_id: config.realm_id,
             node_id: config.node_id,
             schedule_refresh: true,
         }),
@@ -225,7 +225,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
-            config.realm_id.clone(),
+            config.realm_id,
             config.node_id,
             config.node_capabilities,
             is_initial_node,
@@ -246,7 +246,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &s3_address,
         &s3_host,
         driver_ctx,
-        config.realm_id.clone(),
+        config.realm_id,
         config.node_id,
     )
     .await

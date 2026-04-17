@@ -155,16 +155,15 @@ impl OidcValidator {
         provider: &OidcProviderConfig,
         refresh: bool,
     ) -> Result<CachedOidcProviderMetadata, OidcError> {
-        if !refresh {
-            if let Some(metadata) = self
+        if !refresh
+            && let Some(metadata) = self
                 .provider_metadata_cache
                 .read()
                 .await
                 .get(&provider.discovery_url)
                 .cloned()
-            {
-                return Ok(metadata);
-            }
+        {
+            return Ok(metadata);
         }
 
         let metadata = self.fetch_provider_metadata(provider).await?;
@@ -422,6 +421,7 @@ pub async fn auth_middleware(
 mod test {
     use crate::auth::{OidcValidator, extract_auth_context};
     use crate::server::ServerState;
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -841,8 +841,8 @@ mod test {
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
                     node_id,
-                    user_id: Ulid::from_bytes([0u8; 16]),
-                    realm_id: realm_id.clone(),
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
                 },
                 realm_description: "Realm".to_string(),
             }),
@@ -853,14 +853,14 @@ mod test {
 
         let time = chrono::Utc::now().timestamp() as u64;
         let expiry = None;
-        let user_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
 
         drive(
             CreateUserRecordOperation::new(CreateUserRecordInput {
                 actor: Actor {
                     node_id,
-                    user_id: Ulid::from_bytes([0u8; 16]),
-                    realm_id: realm_id.clone(),
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
                 },
                 user_id,
                 name: "capabilities-user".to_string(),
@@ -877,7 +877,7 @@ mod test {
         let capabilities = NodeCapabilities::management_node(realm_signing_key.clone()).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
-            realm_id.clone(),
+            realm_id,
             node_id,
             capabilities.clone(),
             false,
@@ -889,7 +889,7 @@ mod test {
             time,
             expiry,
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             node_capabilities: capabilities,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
@@ -915,11 +915,11 @@ mod test {
         let delegation_signature = realm_signing_key.sign(message.as_bytes()).to_string();
 
         let capabilities =
-            NodeCapabilities::server_node(issuer_key, realm_id.clone(), delegation_signature)
+            NodeCapabilities::server_node(issuer_key, realm_id, delegation_signature)
                 .unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
-            realm_id.clone(),
+            realm_id,
             node_id,
             capabilities.clone(),
             false,
@@ -931,7 +931,7 @@ mod test {
             time,
             expiry,
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             node_capabilities: capabilities,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
@@ -950,10 +950,10 @@ mod test {
         //
         // Test Local Nodes
         //
-        let capabilities = NodeCapabilities::local_node(realm_id.clone()).unwrap();
+        let capabilities = NodeCapabilities::local_node(realm_id).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
-            realm_id.clone(),
+            realm_id,
             node_id,
             capabilities.clone(),
             false,
@@ -1019,8 +1019,8 @@ mod test {
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
                     node_id,
-                    user_id: Ulid::from_bytes([0u8; 16]),
-                    realm_id: realm_id.clone(),
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
                 },
                 realm_description: "Realm".to_string(),
             }),
@@ -1033,8 +1033,8 @@ mod test {
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
                     node_id,
-                    user_id: Ulid::from_bytes([0u8; 16]),
-                    realm_id: realm_id.clone(),
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
                 },
                 realm_description: "Realm".to_string(),
             }),
@@ -1046,7 +1046,7 @@ mod test {
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
-            realm_id.clone(),
+            realm_id,
             node_id,
             capabilities.clone(),
             true,
@@ -1055,13 +1055,13 @@ mod test {
         .await;
 
         let time = chrono::Utc::now().timestamp() as u64;
-        let unknown_user = Ulid::new();
+        let unknown_user = UserId::local(Ulid::new(), realm_id);
         let token = drive(
             CreateTokenOperation::new(CreateTokenConfig {
                 time,
                 expiry: None,
                 user_id: unknown_user,
-                realm_id: realm_id.clone(),
+                realm_id,
                 node_capabilities: capabilities.clone(),
             })
             .unwrap(),
@@ -1115,8 +1115,8 @@ mod test {
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: Actor {
                     node_id,
-                    user_id: Ulid::from_bytes([0u8; 16]),
-                    realm_id: realm_id.clone(),
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
                 },
                 realm_description: "Realm".to_string(),
             }),
@@ -1132,14 +1132,14 @@ mod test {
                 .unwrap()
                 .timestamp() as u64,
         );
-        let user_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
 
         drive(
             CreateUserRecordOperation::new(CreateUserRecordInput {
                 actor: Actor {
                     node_id,
-                    user_id: Ulid::from_bytes([0u8; 16]),
-                    realm_id: realm_id.clone(),
+                    user_id: UserId::nil(realm_id),
+                    realm_id,
                 },
                 user_id,
                 name: "validation-user".to_string(),
@@ -1153,7 +1153,7 @@ mod test {
         let capabilities = NodeCapabilities::management_node(realm_signing_key.clone()).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
-            realm_id.clone(),
+            realm_id,
             node_id,
             capabilities.clone(),
             false,
@@ -1168,7 +1168,7 @@ mod test {
             time,
             expiry,
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             node_capabilities: capabilities.clone(),
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
@@ -1197,7 +1197,7 @@ mod test {
             time: old_time,
             expiry: expired,
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             node_capabilities: capabilities,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
@@ -1221,13 +1221,13 @@ mod test {
 
         let capabilities = NodeCapabilities::server_node(
             issuer_key.clone(),
-            realm_id.clone(),
+            realm_id,
             delegation_signature.clone(),
         )
         .unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
-            realm_id.clone(),
+            realm_id,
             node_id,
             capabilities.clone(),
             false,
@@ -1245,7 +1245,7 @@ mod test {
             time: old_time,
             expiry: expired,
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             node_capabilities: capabilities,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
@@ -1264,11 +1264,11 @@ mod test {
         //
         let invalid_signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
         let capabilities =
-            NodeCapabilities::server_node(issuer_key.clone(), realm_id.clone(), invalid_signature)
+            NodeCapabilities::server_node(issuer_key.clone(), realm_id, invalid_signature)
                 .unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
-            realm_id.clone(),
+            realm_id,
             node_id,
             capabilities.clone(),
             false,
@@ -1280,7 +1280,7 @@ mod test {
             time,
             expiry,
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             node_capabilities: capabilities,
         };
         let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
@@ -1298,13 +1298,13 @@ mod test {
         //
         let capabilities = NodeCapabilities::server_node(
             issuer_key,
-            realm_id.clone(),
+            realm_id,
             delegation_signature.clone(),
         )
         .unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
-            realm_id.clone(),
+            realm_id,
             node_id,
             capabilities.clone(),
             false,

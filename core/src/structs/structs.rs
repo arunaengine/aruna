@@ -1,6 +1,6 @@
 use crate::errors::ConversionError;
 use crate::structs::realm::RealmId;
-use crate::types::autosurgeon_ulid;
+use crate::types::{autosurgeon_ulid, autosurgeon_user_id};
 use crate::types::{RoleId, UserId};
 use crate::NodeId;
 use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
@@ -11,7 +11,6 @@ use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use ulid::Ulid;
 
 #[derive(Debug, Serialize)]
 struct OidcSubjectKey<'a> {
@@ -56,7 +55,7 @@ pub struct Role {
     pub role_id: RoleId,
     pub name: String,
     pub permissions: HashMap<String, Permission>,
-    #[autosurgeon(with = "autosurgeon_ulid_set")]
+    #[autosurgeon(with = "autosurgeon_user_id_set")]
     pub assigned_users: HashSet<UserId>,
 }
 
@@ -174,12 +173,11 @@ impl TryFrom<TokenClaims> for AuthContext {
     type Error = ConversionError;
 
     fn try_from(value: TokenClaims) -> Result<Self, Self::Error> {
-        let (user, realm) = value
-            .sub
-            .split_once('@')
-            .ok_or_else(|| ConversionError::InvalidUserId)?;
-        let user_id = Ulid::from_string(user)?;
-        let realm_id = RealmId::from_base64(realm)?;
+        let user_id = UserId::from_string(&value.sub)?;
+        let realm_id = RealmId::from_base64(&value.iss)?;
+        if user_id.realm_id != realm_id {
+            return Err(ConversionError::InvalidUserId);
+        }
         let path_restrictions = value.restrictions;
 
         Ok(Self {
@@ -213,12 +211,11 @@ impl TryFrom<&Actor> for Vec<u8> {
     }
 }
 
-pub mod autosurgeon_ulid_set {
+pub mod autosurgeon_user_id_set {
     use std::collections::{HashMap, HashSet};
 
     use autosurgeon::reconcile::MapReconciler;
     use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
-    use ulid::Ulid;
 
     use crate::types::UserId;
     pub fn hydrate<'a, D: ReadDoc>(
@@ -229,10 +226,10 @@ pub mod autosurgeon_ulid_set {
         let inner: HashMap<String, String> = HashMap::hydrate(doc, obj, prop)?;
         let role_set = inner
             .keys()
-            .map(|k| Ulid::from_string(k))
-            .collect::<Result<HashSet<UserId>, ulid::DecodeError>>()
+            .map(|k| UserId::from_string(k))
+            .collect::<Result<HashSet<UserId>, crate::errors::ConversionError>>()
             .map_err(|e| {
-                HydrateError::unexpected("valid Ulid string", format!("Invalid Ulid {}", e))
+                HydrateError::unexpected("valid UserId string", format!("Invalid UserId {}", e))
             })?;
         Ok(role_set)
     }
@@ -242,7 +239,7 @@ pub mod autosurgeon_ulid_set {
     ) -> Result<(), R::Error> {
         let mut map = reconciler.map()?;
         map.retain(|id, _| {
-            Ulid::from_string(id)
+            UserId::from_string(id)
                 .ok()
                 .is_some_and(|id| ulid.contains(&id))
         })?;
@@ -255,7 +252,7 @@ pub mod autosurgeon_ulid_set {
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
 pub struct User {
-    #[autosurgeon(with = "autosurgeon_ulid")]
+    #[autosurgeon(with = "autosurgeon_user_id")]
     pub user_id: UserId,
     pub name: String,
     pub subject_ids: Vec<String>,
@@ -298,6 +295,7 @@ impl User {
 #[cfg(test)]
 mod test {
     use crate::structs::{Permission, RealmId, Role};
+    use crate::UserId;
     use autosurgeon::{hydrate, reconcile};
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
@@ -311,7 +309,7 @@ mod test {
                 format!("/{}/g/{}/**", RealmId([0u8; 32]), Ulid::new().to_string()),
                 Permission::WRITE,
             )]),
-            assigned_users: HashSet::from([Ulid::new()]),
+            assigned_users: HashSet::from([UserId::new(Ulid::new(), RealmId([1u8; 32]))]),
         };
 
         let mut automerge_doc = automerge::AutoCommit::new();

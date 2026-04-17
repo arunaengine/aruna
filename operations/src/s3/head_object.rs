@@ -394,7 +394,7 @@ mod tests {
             compressed: false,
             encrypted: false,
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: Default::default(),
             staging: false,
             partial: false,
             blob_size: 5,
@@ -513,7 +513,7 @@ mod tests {
             version_id,
             location: Location::Real(location.clone()),
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: Default::default(),
         };
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle

@@ -198,7 +198,7 @@ impl CreateUserRecordOperation {
 
     fn realm_config_ref(&self) -> AutomergeDocumentVariant {
         AutomergeDocumentVariant::RealmConfig {
-            realm_id: self.input.actor.realm_id.clone(),
+            realm_id: self.input.actor.realm_id,
         }
     }
 
@@ -318,7 +318,7 @@ impl CreateUserRecordOperation {
         let suboperation = boxed_suboperation(
             AnnounceTopicOperation::new(
                 AutomergeDocumentVariant::RealmConfig {
-                    realm_id: self.input.actor.realm_id.clone(),
+                    realm_id: self.input.actor.realm_id,
                 }
                 .topic_id(),
                 self.input.actor.node_id,

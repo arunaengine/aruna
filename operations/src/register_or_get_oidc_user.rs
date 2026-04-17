@@ -143,7 +143,7 @@ impl RegisterOrGetOidcUserOperation {
 
     fn realm_config_ref(&self) -> AutomergeDocumentVariant {
         AutomergeDocumentVariant::RealmConfig {
-            realm_id: self.input.actor.realm_id.clone(),
+            realm_id: self.input.actor.realm_id,
         }
     }
 
@@ -173,7 +173,7 @@ impl RegisterOrGetOidcUserOperation {
         smallvec![Effect::SubOperation(boxed_suboperation(
             AnnounceTopicOperation::new(
                 AutomergeDocumentVariant::RealmConfig {
-                    realm_id: self.input.actor.realm_id.clone(),
+                    realm_id: self.input.actor.realm_id,
                 }
                 .topic_id(),
                 self.input.actor.node_id,
@@ -268,7 +268,7 @@ impl Operation for RegisterOrGetOidcUserOperation {
                             Err(error) => return self.fail(error.into()),
                         },
                         None => RealmConfigDocument::default_for_realm(
-                            self.input.actor.realm_id.clone(),
+                            self.input.actor.realm_id,
                         ),
                     };
                     if !document
@@ -364,6 +364,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmConfigDocument, User, oidc_subject_key};
+    use aruna_core::UserId;
     use aruna_core::types::TxnId;
     use ulid::Ulid;
 
@@ -372,10 +373,10 @@ mod tests {
         let realm_id = aruna_core::structs::RealmId([3u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
-            user_id: Ulid::from_bytes([0u8; 16]),
-            realm_id: realm_id.clone(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
         };
-        let user_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
         let mut operation = RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: actor.clone(),
             issuer: "https://issuer.example".to_string(),
@@ -443,7 +444,7 @@ mod tests {
             Effect::Storage(StorageEffect::Read { .. })
         ));
 
-        let realm_config = RealmConfigDocument::default_for_realm(realm_id.clone());
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id);
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: realm_id.as_bytes().to_vec().into(),
             value: Some(realm_config.to_bytes(&actor).unwrap().into()),
@@ -479,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn existing_user_is_returned_without_duplicate_realm_config_entry() {
         let realm_id = aruna_core::structs::RealmId([5u8; 32]);
-        let user_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
         let existing_user = User {
             user_id,
             name: "bob".to_string(),
@@ -488,13 +489,13 @@ mod tests {
         let mut operation = RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: Actor {
                 node_id: iroh::SecretKey::from_bytes(&[6u8; 32]).public(),
-                user_id: Ulid::from_bytes([0u8; 16]),
+                user_id: UserId::nil(realm_id),
                 realm_id,
             },
             issuer: "https://issuer.example".to_string(),
             subject_id: "subject-2".to_string(),
             name: "ignored".to_string(),
-            user_id: Ulid::new(),
+            user_id: UserId::local(Ulid::new(), realm_id),
         });
 
         operation.start();
@@ -517,7 +518,7 @@ mod tests {
                 existing_user
                     .to_bytes(&Actor {
                         node_id: iroh::SecretKey::from_bytes(&[6u8; 32]).public(),
-                        user_id: Ulid::from_bytes([0u8; 16]),
+                        user_id: UserId::nil(aruna_core::structs::RealmId([5u8; 32])),
                         realm_id: aruna_core::structs::RealmId([5u8; 32]),
                     })
                     .unwrap()

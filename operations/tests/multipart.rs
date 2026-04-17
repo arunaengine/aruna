@@ -1,5 +1,6 @@
 use aruna_blob::blob::BlobHandler;
 use aruna_blob::hash::Hasher;
+use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -115,8 +116,8 @@ fn composite_sha256(parts: &[&[u8]]) -> Vec<u8> {
 #[tokio::test]
 async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let context = setup_context().await;
-    let created_by = Ulid::new();
     let realm_id = RealmId::from_bytes([7u8; 32]);
+    let created_by = UserId::local(Ulid::new(), realm_id);
 
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
@@ -185,7 +186,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
             bucket: "bucket-a".to_string(),
             key: "big.bin".to_string(),
             upload_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             node_id: context.driver.net_handle.as_ref().unwrap().node_id(),
             completed_parts: vec![
                 CompleteMultipartPart {
@@ -341,7 +342,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
 #[tokio::test]
 async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
     let context = setup_context().await;
-    let created_by = Ulid::new();
+    let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
     let upload_id = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
@@ -407,7 +408,7 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
 #[tokio::test]
 async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
     let context = setup_context().await;
-    let created_by = Ulid::new();
+    let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
@@ -483,7 +484,7 @@ async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
 #[tokio::test]
 async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
     let context = setup_context().await;
-    let created_by = Ulid::new();
+    let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
     let upload_id = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
@@ -548,7 +549,7 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
 #[tokio::test]
 async fn delete_object_removes_completed_multipart_metadata() {
     let context = setup_context().await;
-    let created_by = Ulid::new();
+    let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
 
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {

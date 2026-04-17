@@ -63,7 +63,7 @@ impl CreateGroupOperation {
             roles: HashSet::new(),
             display_name: self.config.display_name.clone(),
             group_id,
-            realm_id: self.config.actor.realm_id.clone(),
+            realm_id: self.config.actor.realm_id,
         };
 
         self.group = Some(group.clone());
@@ -99,7 +99,7 @@ impl CreateGroupOperation {
 
         let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
             self.config.actor.user_id,
-            self.config.actor.realm_id.clone(),
+            self.config.actor.realm_id,
             group_id,
         );
 
@@ -288,11 +288,11 @@ impl CreateGroupOperation {
         if let Some(group) = &self.group {
             self.state = CreateGroupState::ReplicateDocuments;
             smallvec![Effect::SubOperation(boxed_suboperation(
-                ReplicateAutomergeDocumentsToRealmOperation::new(
-                    ReplicateAutomergeDocumentsToRealmConfig {
-                        realm_id: self.config.actor.realm_id.clone(),
-                        local_node_id: self.config.actor.node_id,
-                        documents: vec![
+                    ReplicateAutomergeDocumentsToRealmOperation::new(
+                        ReplicateAutomergeDocumentsToRealmConfig {
+                            realm_id: self.config.actor.realm_id,
+                            local_node_id: self.config.actor.node_id,
+                            documents: vec![
                             AutomergeDocumentVariant::Group {
                                 group_id: group.group_id,
                             },
@@ -441,6 +441,7 @@ mod test {
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use aruna_core::UserId;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -470,8 +471,8 @@ mod test {
             task_handle: Some(task_handle),
         };
 
-        let user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let user_id = UserId::local(Ulid::new(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let group_config = CreateGroupConfig {
             actor: Actor {

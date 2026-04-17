@@ -94,7 +94,7 @@ impl RegisterUserOperation {
     fn auth_context(&self) -> AuthContext {
         AuthContext {
             user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id.clone(),
+            realm_id: self.input.actor.realm_id,
             path_restrictions: None,
         }
     }
@@ -251,6 +251,7 @@ mod test {
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmConfigDocument, User};
+    use aruna_core::UserId;
     use aruna_core::types::TxnId;
     use byteview::ByteView;
     use ulid::Ulid;
@@ -260,14 +261,14 @@ mod test {
         //
         // Inputs
         //
-        let actor_user_id = Ulid::new();
-        let registered_user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let actor_user_id = UserId::local(Ulid::new(), realm_id);
+        let registered_user_id = UserId::local(Ulid::new(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let actor = Actor {
             node_id,
             user_id: actor_user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
         };
         let register_user_input = RegisterUserInput {
             actor: actor.clone(),
@@ -385,7 +386,7 @@ mod test {
             other => panic!("unexpected read realm config effect: {other:?}"),
         }
 
-        let realm_config = RealmConfigDocument::default_for_realm(realm_id.clone());
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id);
         let effects = register_user_operation.step(Event::Storage(StorageEvent::ReadResult {
             key: realm_id.as_bytes().to_vec().into(),
             value: Some(realm_config.to_bytes(&actor).unwrap().into()),
@@ -440,14 +441,14 @@ mod test {
 
     #[tokio::test]
     pub async fn test_user_inserted_once_into_realm_config() {
-        let actor_user_id = Ulid::new();
-        let registered_user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([1u8; 32]);
+        let actor_user_id = UserId::local(Ulid::new(), realm_id);
+        let registered_user_id = UserId::local(Ulid::new(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
         let actor = Actor {
             node_id,
             user_id: actor_user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
         };
         let expected_user = User {
             user_id: registered_user_id,
@@ -479,8 +480,8 @@ mod test {
         ));
 
         let existing_config = RealmConfigDocument {
-            realm_id: realm_id.clone(),
-            metadata_replication: RealmConfigDocument::default_for_realm(realm_id.clone())
+            realm_id,
+            metadata_replication: RealmConfigDocument::default_for_realm(realm_id)
                 .metadata_replication,
             oidc_providers: vec![],
             users: vec![expected_user.clone()],

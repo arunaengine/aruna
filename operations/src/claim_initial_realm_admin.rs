@@ -220,7 +220,7 @@ impl Operation for ClaimInitialRealmAdminOperation {
                 smallvec![Effect::SubOperation(boxed_suboperation(
                     AnnounceTopicOperation::new(
                         AutomergeDocumentVariant::RealmAuthorization {
-                            realm_id: auth_doc.realm_id.clone(),
+                            realm_id: auth_doc.realm_id,
                         }
                         .topic_id(),
                         self.input.actor.node_id,
@@ -299,6 +299,7 @@ mod tests {
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use aruna_core::UserId;
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
@@ -336,8 +337,8 @@ mod tests {
         let realm_config = CreateRealmConfig {
             actor: Actor {
                 node_id,
-                user_id: Ulid::from_bytes([0u8; 16]),
-                realm_id: realm_id.clone(),
+                user_id: UserId::nil(realm_id),
+                realm_id,
             },
             realm_description: "Realm".to_string(),
         };
@@ -351,13 +352,13 @@ mod tests {
     #[tokio::test]
     async fn claims_initial_realm_admin_once() {
         let (context, net_handle, realm_id, node_id, _temp_dir) = setup_context().await;
-        let user_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
         let result = drive(
             ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
                 actor: Actor {
                     node_id,
                     user_id,
-                    realm_id: realm_id.clone(),
+                    realm_id,
                 },
             }),
             &context,
@@ -378,7 +379,7 @@ mod tests {
             ClaimInitialRealmAdminOperation::new(ClaimInitialRealmAdminInput {
                 actor: Actor {
                     node_id,
-                    user_id: Ulid::new(),
+                    user_id: UserId::local(Ulid::new(), realm_id),
                     realm_id,
                 },
             }),

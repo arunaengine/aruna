@@ -51,7 +51,7 @@ pub async fn announce_core_documents(
     realm_id: &aruna_core::structs::RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     drive(
-        AnnounceTopicOperation::new(TopicId::realm(realm_id.clone()), node_id),
+        AnnounceTopicOperation::new(TopicId::realm(*realm_id), node_id),
         driver_ctx,
     )
     .await?;
@@ -77,7 +77,7 @@ pub async fn fetch_core_onboarding_documents(
 
     match net_handle
         .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-            topic: TopicId::realm(realm_id.clone()),
+            topic: TopicId::realm(*realm_id),
         })))
         .await
     {
@@ -94,10 +94,10 @@ pub async fn fetch_core_onboarding_documents(
 
     for document in [
         AutomergeDocumentVariant::RealmAuthorization {
-            realm_id: realm_id.clone(),
+            realm_id: *realm_id,
         },
         AutomergeDocumentVariant::RealmConfig {
-            realm_id: realm_id.clone(),
+            realm_id: *realm_id,
         },
     ] {
         drive(

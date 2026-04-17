@@ -90,7 +90,7 @@ impl ServerState {
         } else {
             None
         };
-        trusted_realms.insert(realm_id.clone());
+        trusted_realms.insert(realm_id);
         let state = Self {
             driver_ctx,
             realm_id,
@@ -125,7 +125,7 @@ impl ServerState {
     }
 
     pub fn get_realm_id(&self) -> RealmId {
-        self.realm_id.clone()
+        self.realm_id
     }
 
     pub fn get_node_id(&self) -> NodeId {
@@ -147,7 +147,7 @@ impl ServerState {
         selector: &OidcTokenSelector,
     ) -> Result<OidcProviderConfig, OidcError> {
         let config = drive(
-            GetRealmConfigOperation::new(self.realm_id.clone()),
+            GetRealmConfigOperation::new(self.realm_id),
             &self.driver_ctx,
         )
         .await
@@ -211,10 +211,10 @@ impl ServerState {
                 chrono::Utc::now().timestamp().max(0) as u64 + ONBOARDING_SYNC_TICKET_TTL_SECS,
                 vec![
                     AutomergeDocumentVariant::RealmAuthorization {
-                        realm_id: self.realm_id.clone(),
+                        realm_id: self.realm_id,
                     },
                     AutomergeDocumentVariant::RealmConfig {
-                        realm_id: self.realm_id.clone(),
+                        realm_id: self.realm_id,
                     },
                 ],
             ),
@@ -268,7 +268,7 @@ impl ServerState {
             .is_some()
     }
 
-    pub async fn user_exists(&self, user_id: ulid::Ulid) -> Result<bool, StorageError> {
+    pub async fn user_exists(&self, user_id: aruna_core::UserId) -> Result<bool, StorageError> {
         match self
             .driver_ctx
             .storage_handle
@@ -307,7 +307,7 @@ impl ServerState {
                     actor: Actor {
                         node_id: self.node_id,
                         user_id: auth.user_id,
-                        realm_id: auth.realm_id.clone(),
+                        realm_id: auth.realm_id,
                     },
                 }),
                 &self.driver_ctx,

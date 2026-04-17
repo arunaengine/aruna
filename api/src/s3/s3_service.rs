@@ -86,7 +86,7 @@ impl ArunaS3Service {
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: AuthContext {
                     user_id: user_access.user_identity.user_id,
-                    realm_id: user_access.user_identity.realm_key.clone(),
+                    realm_id: user_access.user_identity.user_id.realm_id,
                     path_restrictions: None,
                 },
                 path: format!(
@@ -212,7 +212,7 @@ impl S3 for ArunaS3Service {
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
                 .unwrap_or(user_access.group_id),
-            realm_id: self.realm_id.clone(),
+            realm_id: self.realm_id,
             node_id: self.node_id,
             request: input,
             expected_checksums: checksum_request.expected,
@@ -409,7 +409,7 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             upload_id,
-            realm_id: self.realm_id.clone(),
+            realm_id: self.realm_id,
             node_id: self.node_id,
             completed_parts,
             expected_checksums: checksum_request.expected.clone(),

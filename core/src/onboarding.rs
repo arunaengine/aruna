@@ -1,6 +1,6 @@
-use crate::NodeId;
 use crate::automerge::{AutomergeDocumentVariant, InitAuthProof};
 use crate::structs::RealmId;
+use crate::NodeId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointAddr;
@@ -245,9 +245,7 @@ mod tests {
         let node_signing_key = SigningKey::from_bytes(&[4u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&node_signing_key.to_bytes()).public();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let document = AutomergeDocumentVariant::RealmAuthorization {
-            realm_id: realm_id.clone(),
-        };
+        let document = AutomergeDocumentVariant::RealmAuthorization { realm_id };
 
         let ticket = OnboardingSyncTicket::issue(
             &realm_signing_key,

@@ -385,7 +385,7 @@ pub mod test {
             ulid,
             compressed: false,
             encrypted: false,
-            created_by: Ulid::new(),
+            created_by: Default::default(),
             created_at: SystemTime::now(),
             staging: false,
             partial: false,

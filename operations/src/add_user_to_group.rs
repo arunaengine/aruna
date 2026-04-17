@@ -117,7 +117,7 @@ impl AddUserToGroupOperation {
     fn auth_context(&self) -> AuthContext {
         AuthContext {
             user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id.clone(),
+            realm_id: self.input.actor.realm_id,
             path_restrictions: None,
         }
     }
@@ -396,6 +396,7 @@ pub mod test {
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use aruna_core::UserId;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -430,15 +431,15 @@ pub mod test {
             blob_handle: None,
         };
 
-        let user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let user_id = UserId::local(Ulid::new(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
 
         let realm_config = CreateRealmConfig {
             actor: Actor {
                 node_id,
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             realm_description: "Test realm".to_string(),
         };
@@ -449,7 +450,7 @@ pub mod test {
             actor: Actor {
                 node_id,
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             display_name: "Test group".to_string(),
         };
@@ -466,10 +467,10 @@ pub mod test {
             actor: Actor {
                 node_id,
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             group_id: group.group_id,
-            user_id: Ulid::new(),
+            user_id: UserId::local(Ulid::new(), realm_id),
             role_ids: reader_writer_roles,
         };
 

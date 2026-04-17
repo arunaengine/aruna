@@ -4,6 +4,7 @@ use aruna::bootstrap::{
 use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
+use aruna_core::UserId;
 use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
@@ -41,7 +42,7 @@ struct SeedNode {
     net: NetHandle,
     context: Arc<DriverContext>,
     realm_id: RealmId,
-    user_id: Ulid,
+    user_id: UserId,
     capabilities: NodeCapabilities,
     base_url: String,
     server_task: JoinHandle<()>,
@@ -79,13 +80,13 @@ async fn spawn_seed_node() -> Result<SeedNode, Box<dyn std::error::Error>> {
 
     let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = Ulid::new();
+    let user_id = UserId::local(Ulid::new(), realm_id);
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             realm_description: "Test Realm".to_string(),
         }),
@@ -98,7 +99,7 @@ async fn spawn_seed_node() -> Result<SeedNode, Box<dyn std::error::Error>> {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
         }),
         context.as_ref(),
@@ -106,7 +107,7 @@ async fn spawn_seed_node() -> Result<SeedNode, Box<dyn std::error::Error>> {
     .await?;
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: realm_id.clone(),
+            realm_id,
             node_id: net.node_id(),
             schedule_refresh: false,
         }),
@@ -118,7 +119,7 @@ async fn spawn_seed_node() -> Result<SeedNode, Box<dyn std::error::Error>> {
     let state = Arc::new(
         ServerState::new(
             context.clone(),
-            realm_id.clone(),
+            realm_id,
             net.node_id(),
             capabilities.clone(),
             false,
@@ -160,7 +161,7 @@ async fn create_onboarding_secret_via_http(
             actor: Actor {
                 node_id: seed.net.node_id(),
                 user_id: seed.user_id,
-                realm_id: seed.realm_id.clone(),
+                realm_id: seed.realm_id,
             },
             user_id: seed.user_id,
             name: format!("{}-ADMIN", seed.base_url),
@@ -176,7 +177,7 @@ async fn create_onboarding_secret_via_http(
                 .as_secs(),
             expiry: None,
             user_id: seed.user_id,
-            realm_id: seed.realm_id.clone(),
+            realm_id: seed.realm_id,
             node_capabilities: seed.capabilities.clone(),
         })?,
         seed.context.as_ref(),
@@ -207,7 +208,7 @@ async fn wait_for_realm_nodes(
     loop {
         let mut done = true;
         for context in contexts {
-            match drive(GetRealmNodesOperation::new(realm_id.clone()), context).await {
+            match drive(GetRealmNodesOperation::new(*realm_id), context).await {
                 Ok(nodes) if nodes.len() == expected => {}
                 _ => {
                     done = false;
@@ -274,7 +275,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
         NetConfig {
             bind_addr: config.p2p_socket_addr,
             secret_key: Some(config.net_secret_key.clone()),
-            realm_id: config.realm_id.clone(),
+            realm_id: config.realm_id,
             bootstrap_nodes: config.bootstrap_nodes.clone(),
             use_dns_discovery: false,
         },
@@ -299,7 +300,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
     seed.net.add_peer_addr(joiner_net.endpoint_addr()).await;
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: seed.realm_id.clone(),
+            realm_id: seed.realm_id,
             node_id: seed.net.node_id(),
             schedule_refresh: false,
         }),
@@ -328,7 +329,7 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
     mark_node_state_complete(&joiner_context.storage_handle, &config.node_state).await?;
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: config.realm_id.clone(),
+            realm_id: config.realm_id,
             node_id: config.node_id,
             schedule_refresh: false,
         }),

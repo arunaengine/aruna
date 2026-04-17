@@ -14,7 +14,7 @@ use aruna_core::keyspaces::BUCKET_STATS_DB;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::NegotiationResult::{Accepted, Rejected};
 use aruna_core::structs::{
-    Backend, BackendBucket, BackendConfig, BackendLocation, RealmId, UserIdentity,
+    Backend, BackendBucket, BackendConfig, BackendLocation, UserIdentity,
 };
 use aruna_core::types::UserId;
 use aruna_net::NetHandle;
@@ -615,7 +615,6 @@ impl BlobHandler {
                     user_id: UserIdentity {
                         //TODO
                         user_id: Default::default(),
-                        realm_key: RealmId([0u8; 32]),
                     },
                     group_id: Default::default(),
                     size: location.blob_size,
@@ -1165,12 +1164,12 @@ mod tests {
 
         let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
             .blob_handle
-            .send_blob_effect(BlobEffect::Write {
-                bucket: "bucket-a".to_string(),
-                key: "one.bin".to_string(),
-                created_by: Ulid::new(),
-                blob: stream_from_bytes(b"one"),
-            })
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket-a".to_string(),
+                    key: "one.bin".to_string(),
+                    created_by: Default::default(),
+                    blob: stream_from_bytes(b"one"),
+                })
             .await
         else {
             panic!("first write failed")
@@ -1178,12 +1177,12 @@ mod tests {
 
         let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
             .blob_handle
-            .send_blob_effect(BlobEffect::Write {
-                bucket: "bucket-a".to_string(),
-                key: "two.bin".to_string(),
-                created_by: Ulid::new(),
-                blob: stream_from_bytes(b"two"),
-            })
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket-a".to_string(),
+                    key: "two.bin".to_string(),
+                    created_by: Default::default(),
+                    blob: stream_from_bytes(b"two"),
+                })
             .await
         else {
             panic!("second write failed")
@@ -1203,12 +1202,12 @@ mod tests {
 
         let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
             .blob_handle
-            .send_blob_effect(BlobEffect::Write {
-                bucket: "bucket-a".to_string(),
-                key: "one.bin".to_string(),
-                created_by: Ulid::new(),
-                blob: stream_from_bytes(b"one"),
-            })
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket-a".to_string(),
+                    key: "one.bin".to_string(),
+                    created_by: Default::default(),
+                    blob: stream_from_bytes(b"one"),
+                })
             .await
         else {
             panic!("first write failed")
@@ -1216,12 +1215,12 @@ mod tests {
 
         let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
             .blob_handle
-            .send_blob_effect(BlobEffect::Write {
-                bucket: "bucket-a".to_string(),
-                key: "two.bin".to_string(),
-                created_by: Ulid::new(),
-                blob: stream_from_bytes(b"two"),
-            })
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket-a".to_string(),
+                    key: "two.bin".to_string(),
+                    created_by: Default::default(),
+                    blob: stream_from_bytes(b"two"),
+                })
             .await
         else {
             panic!("second write failed")
@@ -1244,12 +1243,12 @@ mod tests {
 
         let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
             .blob_handle
-            .send_blob_effect(BlobEffect::Write {
-                bucket: "bucket-a".to_string(),
-                key: "one.bin".to_string(),
-                created_by: Ulid::new(),
-                blob: stream_from_bytes(b"one"),
-            })
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket-a".to_string(),
+                    key: "one.bin".to_string(),
+                    created_by: Default::default(),
+                    blob: stream_from_bytes(b"one"),
+                })
             .await
         else {
             panic!("write failed")
@@ -1272,12 +1271,12 @@ mod tests {
 
         let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
             .blob_handle
-            .send_blob_effect(BlobEffect::Write {
-                bucket: "bucket-a".to_string(),
-                key: "two.bin".to_string(),
-                created_by: Ulid::new(),
-                blob: stream_from_bytes(b"two"),
-            })
+                .send_blob_effect(BlobEffect::Write {
+                    bucket: "bucket-a".to_string(),
+                    key: "two.bin".to_string(),
+                    created_by: Default::default(),
+                    blob: stream_from_bytes(b"two"),
+                })
             .await
         else {
             panic!("second write failed")
@@ -1296,13 +1295,13 @@ mod tests {
 
         let Event::Blob(BlobEvent::WriteFinished { location }) = context
             .blob_handle
-            .send_blob_effect(BlobEffect::WritePart {
-                upload_id: Ulid::new(),
-                part_number: 1,
-                created_by: Ulid::new(),
-                compressed: false,
-                encrypted: false,
-                blob: stream_from_bytes(b"part"),
+                .send_blob_effect(BlobEffect::WritePart {
+                    upload_id: Ulid::new(),
+                    part_number: 1,
+                    created_by: Default::default(),
+                    compressed: false,
+                    encrypted: false,
+                    blob: stream_from_bytes(b"part"),
             })
             .await
         else {

@@ -17,6 +17,7 @@ pub mod stream;
 pub mod structs;
 pub mod task;
 pub mod types;
+pub mod user_id;
 pub mod util;
 
 pub use automerge::{
@@ -29,3 +30,4 @@ pub use keyspaces::*;
 pub use metadata::*;
 pub use onboarding::*;
 pub use task::{TaskEffect, TaskEvent, TaskKey};
+pub use user_id::UserId;

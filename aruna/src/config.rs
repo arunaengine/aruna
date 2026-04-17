@@ -340,16 +340,16 @@ fn node_capabilities_from_state(
             issuer_private_key_pem,
             delegation_signature,
         } => Ok((
-            node_state.realm_id.clone(),
+            node_state.realm_id,
             NodeCapabilities::server_node(
                 SigningKey::from_pkcs8_pem(issuer_private_key_pem)?,
-                node_state.realm_id.clone(),
+                node_state.realm_id,
                 delegation_signature.clone(),
             )?,
         )),
         PersistedNodeIdentity::Local => Ok((
-            node_state.realm_id.clone(),
-            NodeCapabilities::local_node(node_state.realm_id.clone())?,
+            node_state.realm_id,
+            NodeCapabilities::local_node(node_state.realm_id)?,
         )),
     }
 }

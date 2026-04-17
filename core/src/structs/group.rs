@@ -1,10 +1,10 @@
 use crate::errors::ConversionError;
-use crate::structs::Actor;
-use crate::structs::realm::{RealmId, autosurgeon_realm_id};
+use crate::structs::realm::{autosurgeon_realm_id, RealmId};
 use crate::structs::structs::{Permission, Role};
+use crate::structs::Actor;
 use crate::types::autosurgeon_ulid;
 use crate::types::{GroupId, RoleId, UserId};
-use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
+use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
@@ -208,6 +208,7 @@ mod test {
     use std::collections::HashSet;
 
     use crate::structs::{Group, GroupAuthorizationDocument, RealmId};
+    use crate::UserId;
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
 
@@ -233,7 +234,7 @@ mod test {
     #[test]
     pub fn test_group_auth_doc_conversion() {
         let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
-            Ulid::new(),
+            UserId::local(Ulid::new(), RealmId([0u8; 32])),
             RealmId([0u8; 32]),
             Ulid::new(),
         );
