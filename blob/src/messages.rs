@@ -1,7 +1,8 @@
 use crate::error::BlobLibError;
+use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
-use aruna_core::structs::{BackendLocation, NegotiationResult, UserIdentity};
+use aruna_core::structs::{BackendLocation, NegotiationResult};
 use iroh_quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,7 +11,7 @@ use ulid::Ulid;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum MessageType {
     NegotiationRequest {
-        user_id: UserIdentity, // Necessary?
+        user_id: UserId, // Necessary?
         group_id: Ulid,
         size: u64,
     },

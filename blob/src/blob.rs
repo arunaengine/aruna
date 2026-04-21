@@ -14,7 +14,7 @@ use aruna_core::keyspaces::BUCKET_STATS_DB;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::NegotiationResult::{Accepted, Rejected};
 use aruna_core::structs::{
-    Backend, BackendBucket, BackendConfig, BackendLocation, UserIdentity,
+    Backend, BackendBucket, BackendConfig, BackendLocation,
 };
 use aruna_core::types::UserId;
 use aruna_net::NetHandle;
@@ -612,10 +612,7 @@ impl BlobHandler {
             if let Err(err) = ReplicationMessage::new(
                 replication_id,
                 MessageType::NegotiationRequest {
-                    user_id: UserIdentity {
-                        //TODO
-                        user_id: Default::default(),
-                    },
+                    user_id: Default::default(),
                     group_id: Default::default(),
                     size: location.blob_size,
                 },

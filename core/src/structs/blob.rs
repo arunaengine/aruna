@@ -227,7 +227,6 @@ impl VersionKey {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Location {
     Real(BackendLocation),
@@ -276,20 +275,9 @@ pub enum NegotiationResult {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UserIdentity {
-    pub user_id: UserId,
-}
-
-impl Display for UserIdentity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.user_id)
-    }
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UserAccess {
     pub access_key: String,
-    pub user_identity: UserIdentity,
+    pub user_identity: UserId,
     pub group_id: Ulid,
     pub secret: String,
     pub expiry: SystemTime,
@@ -300,7 +288,7 @@ pub struct UserAccess {
 
 impl UserAccess {
     pub fn build_access_key(
-        user_identity: &UserIdentity,
+        user_identity: &UserId,
         key_id: &str,
     ) -> Result<String, ConversionError> {
         let access_key = format!("{user_identity}:{key_id}");

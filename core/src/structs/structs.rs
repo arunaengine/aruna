@@ -1,14 +1,14 @@
+use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::realm::RealmId;
-use crate::types::{autosurgeon_ulid, autosurgeon_user_id};
 use crate::types::{RoleId, UserId};
-use crate::NodeId;
-use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
+use crate::types::{autosurgeon_ulid, autosurgeon_user_id};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use core::fmt;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -19,13 +19,12 @@ struct OidcSubjectKey<'a> {
     sub: &'a str,
 }
 
-pub fn oidc_subject_key(issuer: &str, subject_id: &str) -> String {
-    serde_json::to_string(&OidcSubjectKey {
+pub fn oidc_subject_key(issuer: &str, subject_id: &str) -> Result<String, ConversionError> {
+    Ok(serde_json::to_string(&OidcSubjectKey {
         kind: "oidc",
         issuer,
         sub: subject_id,
-    })
-    .expect("OIDC subject key serialization should not fail")
+    })?)
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
@@ -265,7 +264,7 @@ mod tests {
     #[test]
     fn oidc_subject_key_uses_structured_encoding() {
         assert_eq!(
-            oidc_subject_key("https://issuer.example", "subject-1"),
+            oidc_subject_key("https://issuer.example", "subject-1").unwrap(),
             r#"{"kind":"oidc","issuer":"https://issuer.example","sub":"subject-1"}"#
         );
     }
@@ -294,8 +293,8 @@ impl User {
 
 #[cfg(test)]
 mod test {
-    use crate::structs::{Permission, RealmId, Role};
     use crate::UserId;
+    use crate::structs::{Permission, RealmId, Role};
     use autosurgeon::{hydrate, reconcile};
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
