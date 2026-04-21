@@ -9,6 +9,7 @@ pub mod announce_realm_presence;
 pub mod automerge;
 pub mod check_permissions;
 pub mod claim_initial_realm_admin;
+pub mod connectors;
 pub mod consume_onboarding_secret;
 pub mod create_group;
 pub mod create_metadata_document;
