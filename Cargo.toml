@@ -52,6 +52,7 @@ opendal = { version = "0.55", features = [
     "services-fs",
     "services-s3",
     "services-http",
+    "services-webdav"
 ] }
 oxrdf = "0.3"
 tokio-util = "0.7"
