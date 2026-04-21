@@ -1,3 +1,4 @@
+// TODO: Unify with RegisterUserOperation
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};

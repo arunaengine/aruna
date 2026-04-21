@@ -43,6 +43,21 @@
   ],
   "users": [
     {
+      "username": "admin",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Admin",
+      "lastName": "",
+      "email": "admin@example.com",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin",
+          "temporary": true
+        }
+      ]
+    },
+    {
       "username": "alice",
       "enabled": true,
       "emailVerified": true,

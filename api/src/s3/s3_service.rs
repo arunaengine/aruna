@@ -85,8 +85,8 @@ impl ArunaS3Service {
         drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: AuthContext {
-                    user_id: user_access.user_identity.user_id,
-                    realm_id: user_access.user_identity.user_id.realm_id,
+                    user_id: user_access.user_identity,
+                    realm_id: user_access.user_identity.realm_id,
                     path_restrictions: None,
                 },
                 path: format!(
@@ -121,7 +121,7 @@ impl S3 for ArunaS3Service {
             BucketInfo {
                 group_id: user_access.group_id,
                 created_at: SystemTime::now(),
-                created_by: user_access.user_identity.user_id,
+                created_by: user_access.user_identity,
             },
         );
 
@@ -207,7 +207,7 @@ impl S3 for ArunaS3Service {
 
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
-            user_id: user_access.user_identity.user_id,
+            user_id: user_access.user_identity,
             group_id: bucket_info
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
@@ -279,7 +279,7 @@ impl S3 for ArunaS3Service {
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
                 .unwrap_or(user_access.group_id),
-            created_by: user_access.user_identity.user_id,
+            created_by: user_access.user_identity,
             checksum_hint: checksum_hint.clone(),
         });
 
@@ -331,7 +331,7 @@ impl S3 for ArunaS3Service {
             )?,
             content_length: req.input.content_length.map(|length| length as u64),
             body: Some(body),
-            created_by: user_access.user_identity.user_id,
+            created_by: user_access.user_identity,
             compressed: false,
             encrypted: req.input.sse_customer_algorithm.is_some()
                 || req.input.sse_customer_key.is_some()
@@ -415,7 +415,7 @@ impl S3 for ArunaS3Service {
             expected_checksums: checksum_request.expected.clone(),
             checksum_type: multipart_checksum_type_from_s3(&checksum_request.checksum_type),
             object_size: req.input.mpu_object_size.map(|size| size as u64),
-            created_by: user_access.user_identity.user_id,
+            created_by: user_access.user_identity,
         });
 
         match drive(operation, &self.state).await {
@@ -661,7 +661,7 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket,
             key: req.input.key,
             version_id,
-            deleted_by: user_access.user_identity.user_id,
+            deleted_by: user_access.user_identity,
         });
 
         match drive(operation, &self.state)

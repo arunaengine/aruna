@@ -19,6 +19,7 @@ aruna-api = { path = "../api" }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+byteview = { workspace = true }
 chrono = { workspace = true }
 clap = { version ="4.6.0", features = ["derive"]}
 craqle = { workspace = true }

@@ -139,7 +139,6 @@ mod test {
     use crate::s3::get_user_access::UserAccess;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
-    use aruna_core::structs::UserIdentity;
     use aruna_storage::storage;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -150,9 +149,7 @@ mod test {
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
 
-        let user_identity = UserIdentity {
-            user_id: Default::default(),
-        };
+        let user_identity = Default::default();
         let access_key_id =
             UserAccess::build_access_key(&user_identity, &Ulid::new().to_string()).unwrap();
         let user_access = UserAccess {

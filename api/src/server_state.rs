@@ -56,7 +56,7 @@ pub struct ServerState {
     realm_id: RealmId,
     // Realm membership
     node_id: NodeId,
-    // TODO: OIDC handling
+    // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
 }
 
@@ -402,6 +402,7 @@ where
     }
 }
 
+// TODO: Why?
 pub async fn persist_persisted_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
 where
     T: Serialize,

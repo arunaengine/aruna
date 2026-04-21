@@ -507,8 +507,7 @@ mod test {
     use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        Backend, BackendConfig, Location, LookupKey, RealmId, UserIdentity, VersionKey,
-        VersionMetadata,
+        Backend, BackendConfig, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -648,9 +647,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id,
-                },
+                user_identity: user_id,
             }),
             &context,
         )
@@ -756,9 +753,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id,
-                },
+                user_identity: user_id,
             }),
             &context,
         )
@@ -792,9 +787,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id,
-                },
+                user_identity: user_id,
             }),
             &context,
         )

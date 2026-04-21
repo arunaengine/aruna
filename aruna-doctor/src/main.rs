@@ -1,8 +1,8 @@
 use crate::error::CliError;
 use crate::explorer::{explore_entries, explore_keyspaces};
 use crate::storage::{import, snapshot};
-use crate::tokens::{create_token, view_token};
-use clap::{Args, Parser, Subcommand};
+use crate::tokens::{create_local_bootstrap_token, create_oidc_token, view_token};
+use clap::{Parser, Subcommand};
 
 mod error;
 mod explorer;
@@ -19,8 +19,18 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Name of the person to greet
-    CreateToken(CreateTokenArgs),
+    CreateToken {
+        #[arg(long)]
+        oidc_username: String,
+        #[arg(long)]
+        oidc_password: String,
+        #[arg(long, default_value = "openid")]
+        oidc_scope: String,
+        #[arg(short = 'e', long)]
+        oidc_only: bool,
+        #[arg(short = 'b', long)]
+        bootstrap_secret: Option<String>,
+    },
     ViewToken {
         token: String,
     },
@@ -36,24 +46,6 @@ pub enum Commands {
         snapshot_path: String,
         target_path: String,
     },
-}
-
-#[derive(Args, Debug)]
-pub struct CreateTokenArgs {
-    #[arg(long)]
-    name: Option<String>,
-    #[arg(long)]
-    unsafe_arbitrary_user_id: bool,
-    user_id: Option<String>,
-    expiry: Option<u64>,
-    #[arg(long)]
-    oidc_username: Option<String>,
-    #[arg(long)]
-    oidc_password: Option<String>,
-    #[arg(long)]
-    oidc_name: Option<String>,
-    #[arg(long, default_value = "openid")]
-    oidc_scope: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -72,19 +64,26 @@ pub async fn main() -> Result<(), CliError> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::CreateToken(args) => {
-            let token = create_token(
-                args.name,
-                args.unsafe_arbitrary_user_id,
-                args.user_id,
-                args.expiry,
-                args.oidc_username,
-                args.oidc_password,
-                args.oidc_name,
-                args.oidc_scope,
-            )
-            .await?;
-            println!("TOKEN: {token}");
+        Commands::CreateToken {
+            oidc_username,
+            oidc_password,
+            oidc_scope,
+            oidc_only,
+            bootstrap_secret,
+        } => {
+            let token = if let Some(secret) = bootstrap_secret {
+                create_local_bootstrap_token(oidc_username, oidc_password, oidc_scope, secret)
+                    .await?
+            } else {
+                create_oidc_token(
+                    oidc_username,
+                    oidc_password,
+                    oidc_scope,
+                    oidc_only,
+                )
+                .await?
+            };
+            println!("{}", token)
         }
         Commands::ViewToken { token } => {
             let token = view_token(token).await?;

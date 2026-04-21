@@ -119,6 +119,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
 
+            // TODO: Merge CreateRealm and EnsureRealm?
             drive(
                 EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
                     actor: Actor {
@@ -229,7 +230,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             config.node_id,
             config.node_capabilities,
             is_initial_node,
-            Some(Arc::new(OidcValidator::new())),
+            Some(Arc::new(OidcValidator::new()?)),
         )
         .await,
     );

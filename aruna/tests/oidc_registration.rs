@@ -1,5 +1,5 @@
 use aruna_api::auth::OidcValidator;
-use aruna_api::routes::users::RegisterOidcUserResponse;
+use aruna_api::routes::users::RegisterUserResponse;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_core::UserId;
@@ -297,7 +297,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
             net.node_id(),
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
-            Some(Arc::new(OidcValidator::new())),
+            Some(Arc::new(OidcValidator::new().unwrap())),
         )
         .await,
     );
@@ -332,53 +332,52 @@ async fn oidc_registration_route_creates_user_indexes_and_token() {
     let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
     let node = spawn_test_node(provider).await;
 
-    let token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", Some("Alice OIDC"));
+    let token = sign_oidc_token(issuer, kid, &signing_key, "subject-123", Some("Alice"));
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/users/oidc", node.base_url))
+        .post(format!("{}/api/v1/users/register", node.base_url))
         .bearer_auth(token.clone())
         .json(&serde_json::json!({
-            "name": "Alice",
+            // "name": "Alice",
         }))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body: RegisterOidcUserResponse = response.json().await.unwrap();
-    assert_eq!(body.user.name, "Alice");
-    assert!(!body.token.is_empty());
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body: RegisterUserResponse = response.json().await.unwrap();
+    assert_eq!(body.name, "Alice");
 
     let stored_user = read_user(
         node.context.as_ref(),
-        UserId::from_string(&body.user.id).unwrap(),
+        UserId::from_string(&body.id).unwrap(),
     )
     .await;
     assert_eq!(stored_user.name, "Alice");
-    let subject_key = oidc_subject_key(issuer, "subject-123");
+    let subject_key = oidc_subject_key(issuer, "subject-123").unwrap();
     assert_eq!(
         read_subject_index(node.context.as_ref(), &subject_key).await,
-        body.user.id
+        body.id
     );
     let realm_config = read_realm_config(node.context.as_ref(), &node.realm_id).await;
     assert_eq!(
         realm_config
             .users
             .iter()
-            .filter(|user| user.user_id.to_string() == body.user.id)
+            .filter(|user| user.user_id.to_string() == body.id)
             .count(),
         1
     );
 
     let response = reqwest::Client::new()
-        .post(format!("{}/api/v1/users/oidc", node.base_url))
+        .post(format!("{}/api/v1/users/register", node.base_url))
         .bearer_auth(token)
         .json(&serde_json::json!({}))
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let repeated: RegisterOidcUserResponse = response.json().await.unwrap();
-    assert_eq!(repeated.user.id, body.user.id);
-    assert_eq!(repeated.user.name, "Alice");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let repeated: RegisterUserResponse = response.json().await.unwrap();
+    assert_eq!(repeated.id, body.id);
+    assert_eq!(repeated.name, body.name);
 
     node.server_task.abort();
     node.net.shutdown().await;

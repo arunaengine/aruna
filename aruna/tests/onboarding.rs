@@ -22,7 +22,9 @@ use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::register_user::{RegisterUserInput, RegisterUserOperation};
+use aruna_operations::register_or_get_oidc_user::{
+    RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
+};
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
@@ -157,7 +159,7 @@ async fn create_onboarding_secret_via_http(
     mode: OnboardingMode,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let _user = drive(
-        RegisterUserOperation::new(RegisterUserInput {
+        RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: Actor {
                 node_id: seed.net.node_id(),
                 user_id: seed.user_id,
@@ -165,7 +167,8 @@ async fn create_onboarding_secret_via_http(
             },
             user_id: seed.user_id,
             name: format!("{}-ADMIN", seed.base_url),
-            subject_ids: Vec::new(),
+            subject_id: seed.user_id.to_string(),
+            issuer: format!("issuer_of_{}", seed.user_id.to_string()),
         }),
         &seed.context,
     )

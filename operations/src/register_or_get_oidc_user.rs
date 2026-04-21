@@ -61,6 +61,8 @@ pub enum RegisterOrGetOidcUserError {
     },
     #[error("registration did not finish")]
     NotFinished,
+    #[error("{0} not found")]
+    NotFound(String),
 }
 
 impl RegisterOrGetOidcUserOperation {
@@ -72,8 +74,18 @@ impl RegisterOrGetOidcUserOperation {
         }
     }
 
-    fn subject_key(&self) -> String {
-        oidc_subject_key(&self.input.issuer, &self.input.subject_id)
+    fn subject_key(&self) -> Result<String, RegisterOrGetOidcUserError> {
+        Ok(oidc_subject_key(
+            &self.input.issuer,
+            &self.input.subject_id,
+        )?)
+    }
+
+    fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
+        if let Event::Storage(StorageEvent::Error { error }) = event {
+            return Err(self.fail(error.into()));
+        }
+        Ok(event)
     }
 
     fn fail(&mut self, error: RegisterOrGetOidcUserError) -> Effects {
@@ -91,20 +103,57 @@ impl RegisterOrGetOidcUserOperation {
         })
     }
 
-    fn emit_read_subject_index(&mut self, txn_id: TxnId) -> Effects {
-        self.state = RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-            key: ByteView::from(self.subject_key().into_bytes()),
-            txn_id: Some(txn_id),
-        })]
+    fn handle_start_txn(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
+            return self.unexpected_event(
+                "Event::Storage(StorageEvent::TransactionStarted { txn_id })",
+                got,
+            );
+        };
+
+        match self.emit_read_subject_index(txn_id) {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
     }
 
-    fn emit_read_existing_user(&mut self, txn_id: TxnId, user_id: UserId) -> Effects {
+    fn emit_read_subject_index(
+        &mut self,
+        txn_id: TxnId,
+    ) -> Result<Effects, RegisterOrGetOidcUserError> {
+        self.state = RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id };
+        let key = ByteView::from(self.subject_key()?.into_bytes());
+        Ok(smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+            key,
+            txn_id: Some(txn_id),
+        })])
+    }
+
+    fn handle_read_subject_index(&mut self, event: Event, txn_id: TxnId) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected_event(
+                "Event::Storage(StorageEvent::TransactionStarted { txn_id })",
+                got,
+            );
+        };
+
+        match value {
+            Some(value) => self.emit_read_existing_user(txn_id, value),
+            None => match self.emit_create_user(txn_id) {
+                Ok(effects) => effects,
+                Err(err) => self.fail(err),
+            },
+        }
+    }
+
+    fn emit_read_existing_user(&mut self, txn_id: TxnId, user_id: ByteView) -> Effects {
         self.state = RegisterOrGetOidcUserState::ReadExistingUser { txn_id };
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(user_id.to_bytes()),
+            key: user_id,
             txn_id: Some(txn_id),
         })]
     }
@@ -113,7 +162,7 @@ impl RegisterOrGetOidcUserOperation {
         let user = User {
             user_id: self.input.user_id,
             name: self.input.name.clone(),
-            subject_ids: vec![self.subject_key()],
+            subject_ids: vec![self.subject_key()?],
         };
 
         self.state = RegisterOrGetOidcUserState::WriteUser {
@@ -128,17 +177,46 @@ impl RegisterOrGetOidcUserOperation {
         })])
     }
 
-    fn emit_write_subject_index(&mut self, txn_id: TxnId, user: User) -> Effects {
+    fn handle_write_user(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.unexpected_event(
+                "Event::Storage(StorageEvent::ReadResult { value, .. })",
+                got,
+            );
+        };
+
+        match self.emit_write_subject_index(txn_id, user) {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn emit_write_subject_index(
+        &mut self,
+        txn_id: TxnId,
+        user: User,
+    ) -> Result<Effects, RegisterOrGetOidcUserError> {
         self.state = RegisterOrGetOidcUserState::WriteSubjectIndex {
             txn_id,
             user: user.clone(),
         };
-        smallvec![Effect::Storage(StorageEffect::Write {
+        let key = ByteView::from(self.subject_key()?.into_bytes());
+        Ok(smallvec![Effect::Storage(StorageEffect::Write {
             key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-            key: ByteView::from(self.subject_key().into_bytes()),
+            key,
             value: ByteView::from(user.user_id.to_string().into_bytes()),
             txn_id: Some(txn_id),
-        })]
+        })])
+    }
+
+    fn handle_write_subject_index(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.unexpected_event("Event::Storage(StorageEvent::WriteResult { .. })", got);
+        };
+
+        self.emit_read_realm_config(txn_id, user)
     }
 
     fn realm_config_ref(&self) -> AutomergeDocumentVariant {
@@ -155,17 +233,104 @@ impl RegisterOrGetOidcUserOperation {
         smallvec![read_effect(&self.realm_config_ref(), Some(txn_id))]
     }
 
-    fn emit_write_realm_config(&mut self, txn_id: TxnId, user: User, bytes: Vec<u8>) -> Effects {
+    fn handle_read_realm_config(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected_event(
+                "Event::Storage(StorageEvent::ReadResult { value, .. })",
+                got,
+            );
+        };
+
+        match self.emit_write_realm_config(txn_id, user, value) {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn emit_write_realm_config(
+        &mut self,
+        txn_id: TxnId,
+        user: User,
+        value: Option<ByteView>,
+    ) -> Result<Effects, RegisterOrGetOidcUserError> {
+        let mut document = RealmConfigDocument::from_bytes(
+            &value
+                .ok_or_else(|| RegisterOrGetOidcUserError::NotFound("RealmConfig".to_string()))?,
+        )?;
+        if !document
+            .users
+            .iter()
+            .any(|existing| existing.user_id == user.user_id)
+        {
+            document.users.push(user.clone());
+        }
+        let bytes = document.to_bytes(&self.input.actor)?;
         self.state = RegisterOrGetOidcUserState::WriteRealmConfig {
             txn_id,
             user: user.clone(),
         };
-        smallvec![write_effect(&self.realm_config_ref(), bytes, Some(txn_id))]
+
+        Ok(smallvec![write_effect(
+            &self.realm_config_ref(),
+            bytes,
+            Some(txn_id)
+        )])
+    }
+
+    fn handle_write_realm_config(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.unexpected_event("Event::Storage(StorageEvent::WriteResult { .. })", got);
+        };
+        self.emit_commit(txn_id, user, true)
+    }
+
+    fn handle_read_existing_user(&mut self, event: Event, txn_id: TxnId) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.unexpected_event(
+                "Event::Storage(StorageEvent::ReadResult { value, .. })",
+                got,
+            );
+        };
+
+        match self.emit_parsed_user_and_commit(txn_id, value) {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn emit_parsed_user_and_commit(
+        &mut self,
+        txn_id: TxnId,
+        value: Option<ByteView>,
+    ) -> Result<Effects, RegisterOrGetOidcUserError> {
+        let user = User::from_bytes(
+            &value.ok_or_else(|| RegisterOrGetOidcUserError::NotFound("User".to_string()))?,
+        )?;
+        Ok(self.emit_commit(txn_id, user, false))
     }
 
     fn emit_commit(&mut self, txn_id: TxnId, user: User, announce: bool) -> Effects {
         self.state = RegisterOrGetOidcUserState::CommitTransaction { user, announce };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+    }
+
+    fn handle_commit_txn(&mut self, event: Event, user: User, announce: bool) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
+            return self.unexpected_event(
+                "Event::Storage(StorageEvent::TransactionCommitted { .. })",
+                got,
+            );
+        };
+
+        if announce {
+            self.emit_announce(user)
+        } else {
+            self.emit_finish(user)
+        }
     }
 
     fn emit_announce(&mut self, user: User) -> Effects {
@@ -183,6 +348,28 @@ impl RegisterOrGetOidcUserOperation {
             }),
         ))]
     }
+
+    fn handle_announce_user(&mut self, event: Event, user: User) -> Effects {
+        let got = format!("{event:?}");
+        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
+        else {
+            return self.unexpected_event(
+                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result })",
+                got,
+            );
+        };
+
+        match result {
+            Ok(_) => self.emit_finish(user),
+            Err(err) => self.fail(RegisterOrGetOidcUserError::TopicAnnouncement(err)),
+        }
+    }
+
+    fn emit_finish(&mut self, user: User) -> Effects {
+        self.state = RegisterOrGetOidcUserState::Finish;
+        self.output = Some(Ok(user));
+        smallvec![]
+    }
 }
 
 impl Operation for RegisterOrGetOidcUserOperation {
@@ -197,132 +384,37 @@ impl Operation for RegisterOrGetOidcUserOperation {
     }
 
     fn step(&mut self, event: Event) -> Effects {
+        let event = match self.fail_on_storage_error(event) {
+            Ok(event) => event,
+            Err(effects) => return effects,
+        };
+
         match self.state.clone() {
-            RegisterOrGetOidcUserState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_subject_index(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
-            },
-            RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => match value {
-                    Some(value) => {
-                        let Some(user_id) = std::str::from_utf8(value.as_ref())
-                            .ok()
-                            .and_then(|value| UserId::from_string(value).ok())
-                        else {
-                            return self.fail(RegisterOrGetOidcUserError::ConversionError(
-                                ConversionError::InvalidUserId,
-                            ));
-                        };
-
-                        self.emit_read_existing_user(txn_id, user_id)
-                    }
-                    None => match self.emit_create_user(txn_id) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    },
-                },
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("subject index read result", format!("{other:?}")),
-            },
-            RegisterOrGetOidcUserState::ReadExistingUser { txn_id } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let Some(value) = value else {
-                        return match self.emit_create_user(txn_id) {
-                            Ok(effects) => effects,
-                            Err(error) => self.fail(error),
-                        };
-                    };
-
-                    let user = match User::from_bytes(&value) {
-                        Ok(user) => user,
-                        Err(error) => return self.fail(error.into()),
-                    };
-
-                    self.emit_commit(txn_id, user, false)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("existing user read result", format!("{other:?}")),
-            },
-            RegisterOrGetOidcUserState::WriteUser { txn_id, user } => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    self.emit_write_subject_index(txn_id, user)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("user write result", format!("{other:?}")),
-            },
-            RegisterOrGetOidcUserState::WriteSubjectIndex { txn_id, user } => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    self.emit_read_realm_config(txn_id, user)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("subject index write result", format!("{other:?}")),
-            },
-            RegisterOrGetOidcUserState::ReadRealmConfig { txn_id, user } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let mut document = match value.as_deref() {
-                        Some(bytes) => match RealmConfigDocument::from_bytes(bytes) {
-                            Ok(document) => document,
-                            Err(error) => return self.fail(error.into()),
-                        },
-                        None => RealmConfigDocument::default_for_realm(
-                            self.input.actor.realm_id,
-                        ),
-                    };
-                    if !document
-                        .users
-                        .iter()
-                        .any(|existing| existing.user_id == user.user_id)
-                    {
-                        document.users.push(user.clone());
-                    }
-                    let bytes = match document.to_bytes(&self.input.actor) {
-                        Ok(bytes) => bytes,
-                        Err(error) => return self.fail(error.into()),
-                    };
-
-                    self.emit_write_realm_config(txn_id, user, bytes)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("realm config read result", format!("{other:?}")),
-            },
-            RegisterOrGetOidcUserState::WriteRealmConfig { txn_id, user } => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    self.emit_commit(txn_id, user, true)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("realm config write result", format!("{other:?}")),
-            },
-            RegisterOrGetOidcUserState::CommitTransaction { user, announce } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    if announce {
-                        self.emit_announce(user)
-                    } else {
-                        self.state = RegisterOrGetOidcUserState::Finish;
-                        self.output = Some(Ok(user));
-                        smallvec![]
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
-            RegisterOrGetOidcUserState::AnnounceUser { user } => match event {
-                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
-                    match result {
-                        Ok(()) => {
-                            self.state = RegisterOrGetOidcUserState::Finish;
-                            self.output = Some(Ok(user));
-                            smallvec![]
-                        }
-                        Err(error) => {
-                            self.fail(RegisterOrGetOidcUserError::TopicAnnouncement(error))
-                        }
-                    }
-                }
-                other => self.unexpected_event("topic announcement result", format!("{other:?}")),
-            },
+            RegisterOrGetOidcUserState::StartTransaction => self.handle_start_txn(event),
+            RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id } => {
+                self.handle_read_subject_index(event, txn_id)
+            }
+            RegisterOrGetOidcUserState::WriteUser { txn_id, user } => {
+                self.handle_write_user(event, txn_id, user)
+            }
+            RegisterOrGetOidcUserState::WriteSubjectIndex { txn_id, user } => {
+                self.handle_write_subject_index(event, txn_id, user)
+            }
+            RegisterOrGetOidcUserState::ReadRealmConfig { txn_id, user } => {
+                self.handle_read_realm_config(event, txn_id, user)
+            }
+            RegisterOrGetOidcUserState::WriteRealmConfig { txn_id, user } => {
+                self.handle_write_realm_config(event, txn_id, user)
+            }
+            RegisterOrGetOidcUserState::ReadExistingUser { txn_id } => {
+                self.handle_read_existing_user(event, txn_id)
+            }
+            RegisterOrGetOidcUserState::CommitTransaction { user, announce } => {
+                self.handle_commit_txn(event, user, announce)
+            }
+            RegisterOrGetOidcUserState::AnnounceUser { user } => {
+                self.handle_announce_user(event, user)
+            }
             RegisterOrGetOidcUserState::Init
             | RegisterOrGetOidcUserState::Finish
             | RegisterOrGetOidcUserState::Error => smallvec![],
@@ -360,11 +452,11 @@ mod tests {
     use super::{
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation, RegisterOrGetOidcUserState,
     };
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmConfigDocument, User, oidc_subject_key};
-    use aruna_core::UserId;
     use aruna_core::types::TxnId;
     use ulid::Ulid;
 
@@ -387,7 +479,7 @@ mod tests {
         let expected_user = User {
             user_id,
             name: "alice".to_string(),
-            subject_ids: vec![oidc_subject_key("https://issuer.example", "subject-1")],
+            subject_ids: vec![oidc_subject_key("https://issuer.example", "subject-1").unwrap()],
         };
 
         let effects = operation.start();
@@ -409,6 +501,7 @@ mod tests {
 
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: oidc_subject_key("https://issuer.example", "subject-1")
+                .unwrap()
                 .into_bytes()
                 .into(),
             value: None,
@@ -436,6 +529,7 @@ mod tests {
 
         let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
             key: oidc_subject_key("https://issuer.example", "subject-1")
+                .unwrap()
                 .into_bytes()
                 .into(),
         }));
@@ -484,7 +578,7 @@ mod tests {
         let existing_user = User {
             user_id,
             name: "bob".to_string(),
-            subject_ids: vec![oidc_subject_key("https://issuer.example", "subject-2")],
+            subject_ids: vec![oidc_subject_key("https://issuer.example", "subject-2").unwrap()],
         };
         let mut operation = RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: Actor {
@@ -503,6 +597,7 @@ mod tests {
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: oidc_subject_key("https://issuer.example", "subject-2")
+                .unwrap()
                 .into_bytes()
                 .into(),
             value: Some(user_id.to_string().into_bytes().into()),

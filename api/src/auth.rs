@@ -90,15 +90,14 @@ enum OidcAudience {
 }
 
 impl OidcValidator {
-    pub fn new() -> Self {
-        Self {
+    pub fn new() -> Result<Self, AuthorizationError> {
+        Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(OIDC_HTTP_TIMEOUT_SECS))
                 .connect_timeout(Duration::from_secs(OIDC_HTTP_CONNECT_TIMEOUT_SECS))
-                .build()
-                .expect("OIDC HTTP client construction should not fail"),
+                .build()?,
             provider_metadata_cache: RwLock::new(HashMap::new()),
-        }
+        })
     }
 
     pub fn token_selector(&self, token: &str) -> Result<OidcTokenSelector, OidcError> {
@@ -240,12 +239,6 @@ impl OidcValidator {
     }
 }
 
-impl Default for OidcValidator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 fn matches_audience(aud: &OidcAudience, expected: &str) -> bool {
     match aud {
         OidcAudience::Single(value) => value == expected,
@@ -318,6 +311,8 @@ pub enum AuthorizationError {
     IntoUlid(#[from] ulid::DecodeError),
     #[error(transparent)]
     IntoRealmId(#[from] ConversionError),
+    #[error(transparent)]
+    ReqwestError(#[from] reqwest::Error),
 }
 
 async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Option<AuthContext> {
@@ -431,8 +426,10 @@ mod test {
     use aruna_net::{NetConfig, NetHandle};
     use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_operations::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_operations::create_user_record::{CreateUserRecordInput, CreateUserRecordOperation};
     use aruna_operations::driver::{DriverContext, drive};
+    use aruna_operations::register_or_get_oidc_user::{
+        RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
+    };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use axum::Json;
@@ -497,7 +494,12 @@ mod test {
         issuer: &str,
         kid: &str,
         jwks: serde_json::Value,
-    ) -> (String, String, OidcTestServerMetrics, tokio::task::JoinHandle<()>) {
+    ) -> (
+        String,
+        String,
+        OidcTestServerMetrics,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let discovery_url = format!("http://{addr}/.well-known/openid-configuration");
@@ -618,7 +620,7 @@ mod test {
             Some("Alice OIDC"),
         );
 
-        let validator = OidcValidator::new();
+        let validator = OidcValidator::new().unwrap();
         let identity = validator.validate(&provider, &token).await.unwrap();
         assert_eq!(identity.issuer, issuer);
         assert_eq!(identity.subject_id, "subject-1");
@@ -654,7 +656,7 @@ mod test {
         };
         let token = encode(&header, &claims, &EncodingKey::from_secret(b"super-secret")).unwrap();
 
-        let validator = OidcValidator::new();
+        let validator = OidcValidator::new().unwrap();
         let error = validator.validate(&provider, &token).await.unwrap_err();
         assert!(matches!(
             error,
@@ -688,7 +690,7 @@ mod test {
             None,
         );
 
-        let validator = OidcValidator::new();
+        let validator = OidcValidator::new().unwrap();
         assert!(validator.validate(&provider, &token).await.is_err());
 
         task.abort();
@@ -719,7 +721,7 @@ mod test {
             None,
         );
 
-        let validator = OidcValidator::new();
+        let validator = OidcValidator::new().unwrap();
         validator.validate(&provider, &token).await.unwrap();
         validator.validate(&provider, &token).await.unwrap();
 
@@ -745,7 +747,7 @@ mod test {
             audience: audience.to_string(),
             discovery_url,
         };
-        let validator = OidcValidator::new();
+        let validator = OidcValidator::new().unwrap();
 
         let old_token = sign_oidc_token(
             issuer,
@@ -804,7 +806,7 @@ mod test {
             None,
         );
 
-        let validator = OidcValidator::new();
+        let validator = OidcValidator::new().unwrap();
         let error = validator.validate(&provider, &token).await.unwrap_err();
         assert!(matches!(
             error,
@@ -856,7 +858,7 @@ mod test {
         let user_id = UserId::local(Ulid::new(), realm_id);
 
         drive(
-            CreateUserRecordOperation::new(CreateUserRecordInput {
+            RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
                 actor: Actor {
                     node_id,
                     user_id: UserId::nil(realm_id),
@@ -864,7 +866,8 @@ mod test {
                 },
                 user_id,
                 name: "capabilities-user".to_string(),
-                subject_ids: vec![],
+                subject_id: "a-random-subject-id".to_string(),
+                issuer: "issuer_id".to_string(),
             }),
             &driver_ctx,
         )
@@ -915,8 +918,7 @@ mod test {
         let delegation_signature = realm_signing_key.sign(message.as_bytes()).to_string();
 
         let capabilities =
-            NodeCapabilities::server_node(issuer_key, realm_id, delegation_signature)
-                .unwrap();
+            NodeCapabilities::server_node(issuer_key, realm_id, delegation_signature).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id,
@@ -1135,7 +1137,7 @@ mod test {
         let user_id = UserId::local(Ulid::new(), realm_id);
 
         drive(
-            CreateUserRecordOperation::new(CreateUserRecordInput {
+            RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
                 actor: Actor {
                     node_id,
                     user_id: UserId::nil(realm_id),
@@ -1143,7 +1145,8 @@ mod test {
                 },
                 user_id,
                 name: "validation-user".to_string(),
-                subject_ids: vec![],
+                subject_id: "validation-user-subject_id".to_string(),
+                issuer: "validation-user-issuer-id".to_string(),
             }),
             &driver_ctx,
         )
@@ -1264,8 +1267,7 @@ mod test {
         //
         let invalid_signature = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 32]);
         let capabilities =
-            NodeCapabilities::server_node(issuer_key.clone(), realm_id, invalid_signature)
-                .unwrap();
+            NodeCapabilities::server_node(issuer_key.clone(), realm_id, invalid_signature).unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id,
@@ -1296,12 +1298,9 @@ mod test {
         //
         // Invalid realm key
         //
-        let capabilities = NodeCapabilities::server_node(
-            issuer_key,
-            realm_id,
-            delegation_signature.clone(),
-        )
-        .unwrap();
+        let capabilities =
+            NodeCapabilities::server_node(issuer_key, realm_id, delegation_signature.clone())
+                .unwrap();
         let state = ServerState::new(
             driver_ctx.clone(),
             realm_id,

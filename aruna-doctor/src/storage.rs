@@ -506,7 +506,7 @@ mod tests {
         S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo, UserIdentity};
+    use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_operations::automerge::AutomergeHandle;
     use aruna_operations::claim_initial_realm_admin::{
@@ -694,9 +694,7 @@ mod tests {
 
             let credentials = drive(
                 CreateUserAccessOperation::new(CreateUserAccessConfig {
-                    user_identity: UserIdentity {
-                        user_id: realm_admin,
-                    },
+                    user_identity: realm_admin,
                     group_id: group.0.group_id,
                     expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
                     path_restrictions: None,

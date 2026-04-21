@@ -1,9 +1,10 @@
+use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::{PathRestriction, UserAccess, UserIdentity};
+use aruna_core::structs::{PathRestriction, UserAccess};
 use aruna_core::types::{Effects, GroupId};
 use rand::distr::Alphanumeric;
 use rand::{rng, Rng};
@@ -51,7 +52,7 @@ pub enum CreateUserAccessError {
 
 #[derive(Debug, PartialEq)]
 pub struct CreateUserAccessConfig {
-    pub user_identity: UserIdentity,
+    pub user_identity: UserId,
     pub group_id: GroupId,
     pub expiry: SystemTime,
     pub path_restrictions: Option<Vec<PathRestriction>>,
@@ -197,9 +198,8 @@ impl Operation for CreateUserAccessOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::UserIdentity;
 
-    fn make_config(user_identity: UserIdentity, group_id: GroupId) -> CreateUserAccessConfig {
+    fn make_config(user_identity: UserId, group_id: GroupId) -> CreateUserAccessConfig {
         CreateUserAccessConfig {
             user_identity,
             group_id,
@@ -209,10 +209,8 @@ mod tests {
         }
     }
 
-    fn make_user_identity() -> UserIdentity {
-        UserIdentity {
-            user_id: Default::default(),
-        }
+    fn make_user_identity() -> UserId {
+            UserId::default()
     }
 
     #[test]

@@ -408,7 +408,7 @@ impl Serialize for JsonUserAccess {
     {
         let mut state = serializer.serialize_struct("UserAccess", 8)?;
         state.serialize_field("access_key", &self.0.access_key)?;
-        state.serialize_field("user_identity", &JsonUserIdentity(&self.0.user_identity))?;
+        state.serialize_field("user_identity", &self.0.user_identity)?;
         state.serialize_field("group_id", &self.0.group_id.to_string())?;
         state.serialize_field("secret", &self.0.secret)?;
         state.serialize_field("expiry", &self.0.expiry)?;
@@ -472,20 +472,6 @@ impl Serialize for JsonStoredEntry {
         )?;
         state.serialize_field("value_len", &self.0.value.len())?;
         state.serialize_field("value_hex", &hex::encode(&self.0.value))?;
-        state.end()
-    }
-}
-
-struct JsonUserIdentity<'a>(&'a aruna_core::structs::UserIdentity);
-
-impl Serialize for JsonUserIdentity<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("UserIdentity", 2)?;
-        state.serialize_field("user_id", &self.0.user_id.to_string())?;
-        state.serialize_field("realm_key", &self.0.user_id.realm_id.to_string())?;
         state.end()
     }
 }

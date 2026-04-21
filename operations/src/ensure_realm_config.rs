@@ -2,7 +2,7 @@ use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, OidcProviderConfig, RealmConfigDocument};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -10,9 +10,9 @@ use thiserror::Error;
 use crate::announce::AnnounceTopicOperation;
 use crate::automerge::repository::{read_effect, write_effect};
 use crate::outgoing_automerge::OutgoingAutomergeOperation;
+use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
-use aruna_core::NodeId;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsureRealmConfigConfig {
@@ -125,8 +125,11 @@ impl Operation for EnsureRealmConfigOperation {
                     Some(value) => match RealmConfigDocument::from_bytes(value) {
                         Ok(document) => {
                             let mut document = document;
-                            // TODO: Treat configured OIDC providers as authoritative.
-                            // The current append-only merge leaves stale provider updates/removals in place.
+                            // TODO: The configured OIDC providers are treated as the source of
+                            // truth. The current append-only merge leaves
+                            // stale provider updates/removals in place.
+                            // This is generally an open question: Who can initiate oidc_provider
+                            // changes and what is the official source of truth?
                             for provider in &self.config.oidc_providers {
                                 if !document
                                     .oidc_providers

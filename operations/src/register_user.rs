@@ -12,6 +12,8 @@ use crate::create_user_record::{
     CreateUserRecordError, CreateUserRecordInput, CreateUserRecordOperation,
 };
 
+// TODO: Restore and replace CreateUserRecordOperation
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterUserInput {
     pub actor: Actor,
