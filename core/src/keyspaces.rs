@@ -19,6 +19,9 @@ pub const S3_MULTIPART_UPLOAD_KEYSPACE: &str = "s3_multipart_uploads";
 pub const S3_MULTIPART_UPLOAD_PART_KEYSPACE: &str = "s3_multipart_upload_parts";
 pub const S3_VERSION_KEYSPACE: &str = "s3_versions";
 
+pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
+pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
+
 pub const BUCKET_STATS_DB: &str = "bucket_stats";
 
 pub const API_STATE_KEYSPACE: &str = "api_state";
