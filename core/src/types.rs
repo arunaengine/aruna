@@ -3,7 +3,7 @@ use smallvec::SmallVec;
 use ulid::Ulid;
 
 use crate::effects::Effect;
-pub use crate::user_id::{autosurgeon_user_id, UserId};
+pub use crate::user_id::{UserId, autosurgeon_user_id};
 
 /// Event(s)->Operation->Effect(s)
 pub type Effects = SmallVec<[Effect; 4]>;

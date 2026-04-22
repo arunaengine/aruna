@@ -1,6 +1,6 @@
+use crate::NodeId;
 use crate::automerge::{AutomergeDocumentVariant, InitAuthProof};
 use crate::structs::RealmId;
-use crate::NodeId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh::EndpointAddr;

@@ -582,10 +582,7 @@ impl DhtStateMachine {
                     if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
                         continue;
                     }
-                    if op
-                        .seen_publishers
-                        .insert((entry.publisher, entry.realm_id))
-                    {
+                    if op.seen_publishers.insert((entry.publisher, entry.realm_id)) {
                         op.values.push(DhtEntry {
                             node_id: entry.publisher,
                             realm_id: entry.realm_id,
@@ -851,10 +848,7 @@ impl DhtStateMachine {
                     if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
                         continue;
                     }
-                    if op
-                        .seen_publishers
-                        .insert((entry.publisher, entry.realm_id))
-                    {
+                    if op.seen_publishers.insert((entry.publisher, entry.realm_id)) {
                         op.values.push(DhtEntry {
                             node_id: entry.publisher,
                             realm_id: entry.realm_id,

@@ -80,7 +80,8 @@ impl CreateRealmOperation {
 
         let realm_id = self.config.actor.realm_id;
 
-        let auth_doc = RealmAuthorizationDocument::new_default_realm_doc(self.config.actor.realm_id);
+        let auth_doc =
+            RealmAuthorizationDocument::new_default_realm_doc(self.config.actor.realm_id);
 
         self.auth_doc = Some(auth_doc.clone());
 
@@ -402,11 +403,11 @@ impl Operation for CreateRealmOperation {
 
 #[cfg(test)]
 mod test {
+    use aruna_core::UserId;
     use aruna_core::structs::{Actor, RealmId};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
-    use aruna_core::UserId;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;

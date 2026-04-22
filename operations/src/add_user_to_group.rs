@@ -392,11 +392,11 @@ impl Operation for AddUserToGroupOperation {
 
 #[cfg(test)]
 pub mod test {
+    use aruna_core::UserId;
     use aruna_core::structs::Actor;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
-    use aruna_core::UserId;
     use tempfile::tempdir;
     use ulid::Ulid;
 

@@ -397,6 +397,7 @@ impl Operation for CheckPermissionsOperation {
 mod test {
     use std::collections::{HashMap, HashSet};
 
+    use aruna_core::UserId;
     use aruna_core::structs::{Actor, Permission, RealmId};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -404,7 +405,6 @@ mod test {
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
-    use aruna_core::UserId;
 
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation};
     use crate::add_user_to_group::{AddUserToGroupInput, AddUserToGroupOperation};

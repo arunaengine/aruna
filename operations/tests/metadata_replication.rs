@@ -2,11 +2,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::UserId;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
-use aruna_core::UserId;
 use aruna_core::structs::{Actor, RealmId};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{

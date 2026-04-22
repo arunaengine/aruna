@@ -288,11 +288,11 @@ impl CreateGroupOperation {
         if let Some(group) = &self.group {
             self.state = CreateGroupState::ReplicateDocuments;
             smallvec![Effect::SubOperation(boxed_suboperation(
-                    ReplicateAutomergeDocumentsToRealmOperation::new(
-                        ReplicateAutomergeDocumentsToRealmConfig {
-                            realm_id: self.config.actor.realm_id,
-                            local_node_id: self.config.actor.node_id,
-                            documents: vec![
+                ReplicateAutomergeDocumentsToRealmOperation::new(
+                    ReplicateAutomergeDocumentsToRealmConfig {
+                        realm_id: self.config.actor.realm_id,
+                        local_node_id: self.config.actor.node_id,
+                        documents: vec![
                             AutomergeDocumentVariant::Group {
                                 group_id: group.group_id,
                             },
@@ -437,11 +437,11 @@ impl Operation for CreateGroupOperation {
 mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
+    use aruna_core::UserId;
     use aruna_core::structs::Actor;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
-    use aruna_core::UserId;
     use tempfile::tempdir;
     use ulid::Ulid;
 

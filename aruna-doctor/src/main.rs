@@ -75,13 +75,7 @@ pub async fn main() -> Result<(), CliError> {
                 create_local_bootstrap_token(oidc_username, oidc_password, oidc_scope, secret)
                     .await?
             } else {
-                create_oidc_token(
-                    oidc_username,
-                    oidc_password,
-                    oidc_scope,
-                    oidc_only,
-                )
-                .await?
+                create_oidc_token(oidc_username, oidc_password, oidc_scope, oidc_only).await?
             };
             println!("{}", token)
         }

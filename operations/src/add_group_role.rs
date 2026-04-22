@@ -538,12 +538,12 @@ pub mod test {
     use std::collections::{HashMap, HashSet};
 
     use crate::add_group_role::{AddGroupRoleConfig, AddGroupRoleOperation, AddGroupRoleState};
+    use aruna_core::UserId;
     use aruna_core::effects::Effect;
     use aruna_core::events::{Event, SubOperationEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, Permission, Role};
-    use aruna_core::UserId;
     use aruna_core::types::TxnId;
     use ulid::Ulid;
 

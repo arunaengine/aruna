@@ -7,7 +7,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::{PathRestriction, UserAccess};
 use aruna_core::types::{Effects, GroupId};
 use rand::distr::Alphanumeric;
-use rand::{rng, Rng};
+use rand::{Rng, rng};
 use smallvec::smallvec;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
@@ -210,7 +210,7 @@ mod tests {
     }
 
     fn make_user_identity() -> UserId {
-            UserId::default()
+        UserId::default()
     }
 
     #[test]

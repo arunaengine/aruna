@@ -210,9 +210,11 @@ mod tests {
                     &decoded_value,
                     decoded_ttl,
                 );
-                assert!(decoded_publisher
-                    .verify(&verify_data, &decoded_signature)
-                    .is_ok());
+                assert!(
+                    decoded_publisher
+                        .verify(&verify_data, &decoded_signature)
+                        .is_ok()
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }

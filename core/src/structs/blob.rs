@@ -1,6 +1,6 @@
 use crate::errors::{BlobError, ConversionError};
-use crate::structs::checksum::HASH_BLAKE3;
 use crate::structs::PathRestriction;
+use crate::structs::checksum::HASH_BLAKE3;
 use crate::types::UserId;
 use byteview::ByteView;
 use core::fmt;

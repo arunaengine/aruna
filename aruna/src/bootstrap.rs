@@ -10,10 +10,10 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
 use aruna_core::{NodeId, TopicId};
+use aruna_operations::announce::AnnounceTopicOperation;
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
-use aruna_operations::announce::AnnounceTopicOperation;
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::outgoing_automerge::OutgoingAutomergeOperation;
 use byteview::ByteView;
@@ -119,7 +119,8 @@ pub async fn ensure_initial_local_onboarding_secret(
     seed_url: String,
 ) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
     if let Some(secret) =
-        load_persisted_state::<OnboardingSecret>(driver_ctx, INITIAL_LOCAL_ONBOARDING_SECRET_KEY).await
+        load_persisted_state::<OnboardingSecret>(driver_ctx, INITIAL_LOCAL_ONBOARDING_SECRET_KEY)
+            .await
     {
         return Ok(secret);
     }

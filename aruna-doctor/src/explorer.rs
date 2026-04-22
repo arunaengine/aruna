@@ -1291,11 +1291,9 @@ mod tests {
     fn decodes_gossip_subscriptions_value() {
         let realm_id = RealmId::from_bytes([8_u8; 32]);
         let group_id = Ulid::new();
-        let value = postcard::to_allocvec(&vec![
-            TopicId::group(group_id),
-            TopicId::realm(realm_id),
-        ])
-        .unwrap();
+        let value =
+            postcard::to_allocvec(&vec![TopicId::group(group_id), TopicId::realm(realm_id)])
+                .unwrap();
 
         let decoded = decode_entry(GOSSIP_SUBSCRIPTIONS_KEYSPACE, b"topics", &value);
         assert_eq!(

@@ -1,9 +1,9 @@
+use aruna_core::NodeId;
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::events::{Event, SubOperationEvent};
-use aruna_core::operation::{boxed_suboperation, Operation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::RealmId;
 use aruna_core::types::Effects;
-use aruna_core::NodeId;
 use smallvec::smallvec;
 use thiserror::Error;
 use tracing::{trace, warn};

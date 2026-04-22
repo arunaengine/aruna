@@ -1,10 +1,10 @@
 use crate::errors::ConversionError;
-use crate::structs::realm::{autosurgeon_realm_id, RealmId};
-use crate::structs::structs::{Permission, Role};
 use crate::structs::Actor;
+use crate::structs::realm::{RealmId, autosurgeon_realm_id};
+use crate::structs::structs::{Permission, Role};
 use crate::types::autosurgeon_ulid;
 use crate::types::{GroupId, RoleId, UserId};
-use autosurgeon::{hydrate, reconcile, Hydrate, Reconcile};
+use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
@@ -207,8 +207,8 @@ pub mod autosurgeon_role_set {
 mod test {
     use std::collections::HashSet;
 
-    use crate::structs::{Group, GroupAuthorizationDocument, RealmId};
     use crate::UserId;
+    use crate::structs::{Group, GroupAuthorizationDocument, RealmId};
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
 

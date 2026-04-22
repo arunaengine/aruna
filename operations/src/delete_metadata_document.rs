@@ -12,8 +12,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::metadata::repository::{
-    delete_document_index_effect, delete_holders_effect, delete_registry_effect,
-    parse_registry_read, read_registry_effect, write_audit_effect, StorageReadError,
+    StorageReadError, delete_document_index_effect, delete_holders_effect, delete_registry_effect,
+    parse_registry_read, read_registry_effect, write_audit_effect,
 };
 
 #[derive(Debug, PartialEq)]

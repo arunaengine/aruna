@@ -363,11 +363,11 @@ pub mod autosurgeon_operation_map {
 
 #[cfg(test)]
 mod test {
+    use crate::UserId;
     use crate::structs::{
         Actor, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
         OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId, User,
     };
-    use crate::UserId;
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
 
