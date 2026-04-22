@@ -14,6 +14,8 @@ KEYCLOAK_ADMIN_USER="${ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_USER:-admin}"
 KEYCLOAK_ADMIN_PASSWORD="${ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_PASSWORD:-admin}"
 KEYCLOAK_REALM="${ARUNA_TEST_DEPLOY_KEYCLOAK_REALM:-aruna}"
 KEYCLOAK_CLIENT_ID="${ARUNA_TEST_DEPLOY_KEYCLOAK_CLIENT_ID:-aruna-api}"
+KEYCLOAK_OIDC_USERNAME="${ARUNA_TEST_DEPLOY_OIDC_USERNAME:-aruna-admin}"
+KEYCLOAK_OIDC_PASSWORD="${ARUNA_TEST_DEPLOY_OIDC_PASSWORD:-aruna-admin}"
 WITH_KEYCLOAK=0
 PIDS=()
 STARTED_PID=""
@@ -135,20 +137,67 @@ write_node_env() {
 
 generate_test_token() {
   local node_dir=$1
+  local bootstrap_secret=$2
   local raw_output
 
   raw_output="$(
     cd "$node_dir"
-    env -i PATH="$PATH" "$ARUNA_DOCTOR_BIN" create-token
+    env -i PATH="$PATH" "$ARUNA_DOCTOR_BIN" create-token \
+      --oidc-username "$KEYCLOAK_OIDC_USERNAME" \
+      --oidc-password "$KEYCLOAK_OIDC_PASSWORD" \
+      --bootstrap-secret "$bootstrap_secret"
   )"
 
-  local token="${raw_output##*TOKEN: }"
-  [[ -n "$token" && "$token" != "$raw_output" ]] || {
+  raw_output="${raw_output%$'\n'}"
+  local token="${raw_output##*$'\n'}"
+  [[ -n "$token" ]] || {
     printf 'unexpected token output:\n%s\n' "$raw_output" >&2
     return 1
   }
 
   printf '%s\n' "$token"
+}
+
+extract_onboarding_secret_from_log() {
+  local log_file=$1
+  local line
+  local secret=""
+
+  [[ -f "$log_file" ]] || return 0
+
+  while IFS= read -r line; do
+    case "$line" in
+      *onboarding_secret=*)
+        secret="${line#*onboarding_secret=}"
+        secret="${secret%%[[:space:]]*}"
+        ;;
+    esac
+  done <"$log_file"
+
+  printf '%s\n' "$secret"
+}
+
+wait_for_initial_onboarding_secret() {
+  local log_file=$1
+  local pid=$2
+  local deadline=$((SECONDS + READY_TIMEOUT_SECS))
+  local secret
+
+  while true; do
+    secret="$(extract_onboarding_secret_from_log "$log_file")"
+    if [[ -n "$secret" ]]; then
+      printf '%s\n' "$secret"
+      return 0
+    fi
+
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      die "node-1 exited before it logged the initial onboarding secret; inspect $log_file"
+    fi
+    if ((SECONDS >= deadline)); then
+      die "timed out waiting for the initial onboarding secret in $log_file"
+    fi
+    sleep 1
+  done
 }
 
 wait_for_http() {
@@ -347,13 +396,16 @@ fi
 
 write_node_env "$NODE_1_DIR" "$NODE_1_HTTP_PORT" "$NODE_1_P2P_PORT" "$NODE_1_S3_PORT"
 
-log "Generating the bootstrap admin token from node-1"
-INITIAL_ADMIN_TOKEN="$(generate_test_token "$NODE_1_DIR")"
-printf 'ADMIN_TOKEN=%s\n' "$INITIAL_ADMIN_TOKEN"
-
 start_node "node-1" "$NODE_1_DIR"
 NODE_1_PID="$STARTED_PID"
 wait_for_http "node-1" "$NODE_1_BASE_URL" "$NODE_1_PID"
+
+log "Reading the initial onboarding secret from node-1"
+INITIAL_LOCAL_ONBOARDING_SECRET="$(wait_for_initial_onboarding_secret "$NODE_1_DIR/node-1.log" "$NODE_1_PID")"
+
+log "Generating the bootstrap admin token from node-1"
+INITIAL_ADMIN_TOKEN="$(generate_test_token "$NODE_1_DIR" "$INITIAL_LOCAL_ONBOARDING_SECRET")"
+printf 'ADMIN_TOKEN=%s\n' "$INITIAL_ADMIN_TOKEN"
 
 log "Onboarding node-2"
 onboard_server_node "node-2" "$NODE_2_DIR" "$NODE_2_HTTP_PORT" "$NODE_2_P2P_PORT" "$NODE_2_S3_PORT" "$NODE_2_BASE_URL"

@@ -120,20 +120,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             }
 
-            drive(
-                EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
-                    actor: Actor {
-                        node_id: config.node_id,
-                        user_id: UserId::nil(config.realm_id),
-                        realm_id: config.realm_id,
-                    },
-                    bootstrap_peers: config.bootstrap_nodes.clone(),
-                    default_metadata_replication_factor: config.default_metadata_replication_factor,
-                }),
-                driver_ctx.as_ref(),
-            )
-            .await?;
-
             if config.is_initial_node() {
                 match ensure_initial_local_onboarding_secret(
                     driver_ctx.as_ref(),

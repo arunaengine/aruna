@@ -320,10 +320,11 @@ async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Optio
 
     let token = handle_token(state, token).await.ok()?;
     let auth_context: AuthContext = token.try_into().ok()?;
-    if !state.user_exists(auth_context.user_id).await.ok()? {
-        warn!(user_id = %auth_context.user_id, "Rejecting token for unknown user");
-        return None;
-    }
+    // TODO: Remove or at least start a lookup
+    // if !state.user_exists(auth_context.user_id).await.ok()? {
+    //     warn!(user_id = %auth_context.user_id, "Rejecting token for unknown user");
+    //     return None;
+    // }
     Some(auth_context)
 }
 
