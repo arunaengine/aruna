@@ -847,6 +847,7 @@ mod test {
                     realm_id,
                 },
                 realm_description: "Realm".to_string(),
+                oidc_providers: vec![],
             }),
             &driver_ctx,
         )
@@ -1025,6 +1026,7 @@ mod test {
                     realm_id,
                 },
                 realm_description: "Realm".to_string(),
+                oidc_providers: Vec::new(),
             }),
             &driver_ctx,
         )
@@ -1039,6 +1041,7 @@ mod test {
                     realm_id,
                 },
                 realm_description: "Realm".to_string(),
+                oidc_providers: Vec::new(),
             }),
             &driver_ctx,
         )
@@ -1121,6 +1124,7 @@ mod test {
                     realm_id,
                 },
                 realm_description: "Realm".to_string(),
+                oidc_providers: Vec::new(),
             }),
             &driver_ctx,
         )

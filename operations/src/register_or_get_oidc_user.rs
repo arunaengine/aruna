@@ -538,7 +538,7 @@ mod tests {
             Effect::Storage(StorageEffect::Read { .. })
         ));
 
-        let realm_config = RealmConfigDocument::default_for_realm(realm_id);
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id, vec![]);
         let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: realm_id.as_bytes().to_vec().into(),
             value: Some(realm_config.to_bytes(&actor).unwrap().into()),

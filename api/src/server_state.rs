@@ -402,15 +402,7 @@ where
     }
 }
 
-// TODO: Why?
-pub async fn persist_persisted_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
-where
-    T: Serialize,
-{
-    persist_state(driver_ctx, key, value).await;
-}
-
-async fn persist_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
+pub async fn persist_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
 where
     T: Serialize,
 {

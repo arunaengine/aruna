@@ -479,6 +479,7 @@ mod test {
                 realm_id,
             },
             realm_description: "A description".to_string(),
+            oidc_providers: Vec::new(),
         };
 
         let realm_operation = CreateRealmOperation::new(realm_config.clone());

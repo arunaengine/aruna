@@ -659,6 +659,7 @@ mod tests {
                         realm_id: config.realm_id,
                     },
                     realm_description: "Snapshot Test Realm".to_string(),
+                    oidc_providers: Vec::new(),
                 }),
                 context.as_ref(),
             )

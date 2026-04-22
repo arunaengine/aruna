@@ -341,6 +341,7 @@ mod tests {
                 realm_id,
             },
             realm_description: "Realm".to_string(),
+            oidc_providers: Vec::new(),
         };
         drive(CreateRealmOperation::new(realm_config), &context)
             .await

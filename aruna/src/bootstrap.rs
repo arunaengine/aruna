@@ -1,7 +1,5 @@
 use crate::config::PersistedNodeState;
-use aruna_api::server_state::{
-    INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_persisted_state,
-};
+use aruna_api::server_state::{INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_state};
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, GossipEffect, NetEffect, StorageEffect};
 use aruna_core::errors::GossipError;
@@ -146,7 +144,7 @@ pub async fn ensure_initial_local_onboarding_secret(
         driver_ctx,
     )
     .await?;
-    persist_persisted_state(
+    persist_state(
         driver_ctx,
         INITIAL_LOCAL_ONBOARDING_SECRET_KEY,
         &onboarding_secret,

@@ -238,6 +238,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
                 realm_id,
             },
             realm_description: "Test Realm".to_string(),
+            oidc_providers: vec![provider.clone()],
         }),
         context.as_ref(),
     )
@@ -265,30 +266,6 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     )
     .await
     .unwrap();
-
-    let mut config = read_realm_config(context.as_ref(), &realm_id).await;
-    config.oidc_providers.push(provider);
-    match context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(realm_id.as_bytes().to_vec()),
-            value: ByteView::from(
-                config
-                    .to_bytes(&Actor {
-                        node_id: net.node_id(),
-                        user_id: UserId::nil(realm_id),
-                        realm_id,
-                    })
-                    .unwrap(),
-            ),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected realm config write result: {other:?}"),
-    }
 
     let state = Arc::new(
         ServerState::new(

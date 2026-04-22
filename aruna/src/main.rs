@@ -113,13 +113,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             realm_id: config.realm_id,
                         },
                         realm_description: realm_description.clone(),
+                        oidc_providers: config.oidc_providers.clone(),
                     }),
                     driver_ctx.as_ref(),
                 )
                 .await?;
             }
 
-            // TODO: Merge CreateRealm and EnsureRealm?
             drive(
                 EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
                     actor: Actor {
@@ -129,7 +129,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     },
                     bootstrap_peers: config.bootstrap_nodes.clone(),
                     default_metadata_replication_factor: config.default_metadata_replication_factor,
-                    oidc_providers: config.oidc_providers.clone(),
                 }),
                 driver_ctx.as_ref(),
             )
@@ -202,7 +201,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         bootstrap_peers: config.bootstrap_nodes.clone(),
                         default_metadata_replication_factor: config
                             .default_metadata_replication_factor,
-                        oidc_providers: config.oidc_providers.clone(),
                     }),
                     driver_ctx.as_ref(),
                 )

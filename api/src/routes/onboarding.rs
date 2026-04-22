@@ -618,6 +618,7 @@ mod tests {
                     realm_id,
                 },
                 realm_description: "Realm".to_string(),
+                oidc_providers: vec![],
             }),
             &driver_ctx,
         )

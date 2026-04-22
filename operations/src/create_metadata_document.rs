@@ -280,10 +280,16 @@ impl Operation for CreateMetadataDocumentOperation {
                     let realm_config = match value.as_deref() {
                         Some(bytes) => {
                             RealmConfigDocument::from_bytes(bytes).unwrap_or_else(|_| {
-                                RealmConfigDocument::default_for_realm(self.config.actor.realm_id)
+                                RealmConfigDocument::default_for_realm(
+                                    self.config.actor.realm_id,
+                                    vec![],
+                                )
                             })
                         }
-                        None => RealmConfigDocument::default_for_realm(self.config.actor.realm_id),
+                        None => RealmConfigDocument::default_for_realm(
+                            self.config.actor.realm_id,
+                            vec![],
+                        ),
                     };
                     self.selected_replication_factor =
                         realm_config.metadata_replication_factor_for(self.config.group_id, None);
@@ -295,7 +301,7 @@ impl Operation for CreateMetadataDocumentOperation {
                 }
                 Event::Storage(StorageEvent::Error { .. }) => {
                     self.selected_replication_factor =
-                        RealmConfigDocument::default_for_realm(self.config.actor.realm_id)
+                        RealmConfigDocument::default_for_realm(self.config.actor.realm_id, vec![])
                             .metadata_replication_factor_for(self.config.group_id, None);
                     self.state = CreateMetadataDocumentState::LoadReplicationTargets;
                     smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {

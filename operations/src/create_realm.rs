@@ -4,7 +4,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, Realm, RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::structs::{
+    Actor, OidcProviderConfig, Realm, RealmAuthorizationDocument, RealmConfigDocument,
+};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -16,6 +18,7 @@ use aruna_core::types::Effects;
 pub struct CreateRealmConfig {
     pub actor: Actor,
     pub realm_description: String,
+    pub oidc_providers: Vec<OidcProviderConfig>,
 }
 
 #[derive(PartialEq)]
@@ -100,7 +103,8 @@ impl CreateRealmOperation {
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
         let realm_id = self.config.actor.realm_id;
-        let config_doc = RealmConfigDocument::default_for_realm(realm_id);
+        let config_doc =
+            RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
@@ -455,6 +459,7 @@ mod test {
                 realm_id,
             },
             realm_description: "A realm description".to_string(),
+            oidc_providers: Vec::new(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let result = drive(realm_operation, &context).await.unwrap();

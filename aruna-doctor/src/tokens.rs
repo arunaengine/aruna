@@ -691,6 +691,7 @@ mod tests {
                     realm_id,
                 },
                 realm_description: "Test Realm".to_string(),
+                oidc_providers: Vec::new(),
             }),
             context.as_ref(),
         )

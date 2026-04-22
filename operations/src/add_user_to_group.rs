@@ -442,6 +442,7 @@ pub mod test {
                 realm_id,
             },
             realm_description: "Test realm".to_string(),
+            oidc_providers: Vec::new(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config);
         let _ = drive(realm_operation, &context).await.unwrap();

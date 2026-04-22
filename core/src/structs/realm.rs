@@ -182,17 +182,25 @@ pub struct OidcProviderConfig {
 }
 
 impl RealmConfigDocument {
-    pub fn new(realm_id: RealmId, default_replication_factor: u32) -> Self {
+    pub fn new(
+        realm_id: RealmId,
+        oidc_providers: Vec<OidcProviderConfig>,
+        default_replication_factor: u32,
+    ) -> Self {
         Self {
             realm_id,
             metadata_replication: MetadataReplicationConfig::new(default_replication_factor),
-            oidc_providers: Vec::new(),
+            oidc_providers,
             users: Vec::new(),
         }
     }
 
-    pub fn default_for_realm(realm_id: RealmId) -> Self {
-        Self::new(realm_id, DEFAULT_METADATA_REPLICATION_FACTOR)
+    pub fn default_for_realm(realm_id: RealmId, oidc_providers: Vec<OidcProviderConfig>) -> Self {
+        Self::new(
+            realm_id,
+            oidc_providers,
+            DEFAULT_METADATA_REPLICATION_FACTOR,
+        )
     }
 
     pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {

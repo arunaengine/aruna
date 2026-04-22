@@ -91,6 +91,7 @@ async fn spawn_seed_node() -> Result<SeedNode, Box<dyn std::error::Error>> {
                 realm_id,
             },
             realm_description: "Test Realm".to_string(),
+            oidc_providers: Vec::new(),
         }),
         context.as_ref(),
     )
