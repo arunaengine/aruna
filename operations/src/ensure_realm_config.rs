@@ -133,6 +133,8 @@ impl Operation for EnsureRealmConfigOperation {
                         Err(error) => self.fail(error.into()),
                     },
                     None => {
+                        // The RealmConfig is only created to create an empty automerge document
+                        // for syncing here
                         let document = RealmConfigDocument::new(
                             self.config.actor.realm_id,
                             Vec::new(),
