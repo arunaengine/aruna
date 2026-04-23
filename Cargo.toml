@@ -50,6 +50,7 @@ jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
 opendal = { version = "0.55", features = [
     "services-postgresql",
     "services-fs",
+    "services-ftp",
     "services-s3",
     "services-http",
     "services-webdav"

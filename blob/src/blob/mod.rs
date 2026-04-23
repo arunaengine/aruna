@@ -16,6 +16,7 @@ mod control_plane;
 mod io;
 mod replication;
 mod runtime;
+mod source;
 
 #[cfg(test)]
 mod tests;
