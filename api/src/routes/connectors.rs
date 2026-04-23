@@ -68,6 +68,7 @@ pub enum ApiSourceConnectorKind {
     Http,
     S3,
     Webdav,
+    Ftp,
     ArunaNative,
 }
 
@@ -77,6 +78,7 @@ impl From<ApiSourceConnectorKind> for SourceConnectorKind {
             ApiSourceConnectorKind::Http => SourceConnectorKind::Http,
             ApiSourceConnectorKind::S3 => SourceConnectorKind::S3,
             ApiSourceConnectorKind::Webdav => SourceConnectorKind::Webdav,
+            ApiSourceConnectorKind::Ftp => SourceConnectorKind::Ftp,
             ApiSourceConnectorKind::ArunaNative => SourceConnectorKind::ArunaNative,
         }
     }
@@ -88,6 +90,7 @@ impl From<SourceConnectorKind> for ApiSourceConnectorKind {
             SourceConnectorKind::Http => ApiSourceConnectorKind::Http,
             SourceConnectorKind::S3 => ApiSourceConnectorKind::S3,
             SourceConnectorKind::Webdav => ApiSourceConnectorKind::Webdav,
+            SourceConnectorKind::Ftp => ApiSourceConnectorKind::Ftp,
             SourceConnectorKind::ArunaNative => ApiSourceConnectorKind::ArunaNative,
         }
     }

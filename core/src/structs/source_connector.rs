@@ -11,6 +11,7 @@ pub enum SourceConnectorKind {
     Http,
     S3,
     Webdav,
+    Ftp,
     ArunaNative,
 }
 
@@ -20,6 +21,7 @@ impl SourceConnectorKind {
             Self::Http => "http",
             Self::S3 => "s3",
             Self::Webdav => "webdav",
+            Self::Ftp => "ftp",
             Self::ArunaNative => "aruna_native",
         }
     }

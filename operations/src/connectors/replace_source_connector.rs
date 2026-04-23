@@ -306,7 +306,7 @@ mod tests {
                     "endpoint".to_string(),
                     "https://example.org".to_string(),
                 )]),
-                secret_config: HashMap::from([("bearer_token".to_string(), "secret".to_string())]),
+                secret_config: HashMap::from([("token".to_string(), "secret".to_string())]),
             }),
             &context,
         )

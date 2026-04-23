@@ -96,17 +96,22 @@ pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorValidat
         SourceConnectorKind::Http => SourceConnectorValidationRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
-            allowed_secret_keys: &["username", "password", "bearer_token"],
+            allowed_secret_keys: &["username", "password", "token"],
         },
         SourceConnectorKind::S3 => SourceConnectorValidationRules {
             required_public_keys: &["bucket", "endpoint"],
             allowed_public_keys: &["bucket", "endpoint", "region", "root"],
-            allowed_secret_keys: &["access_key_id", "secret_access_key", "session_token"],
+            allowed_secret_keys: &["access_key_id", "secret_access_key"],
         },
         SourceConnectorKind::Webdav => SourceConnectorValidationRules {
             required_public_keys: &["endpoint"],
             allowed_public_keys: &["endpoint", "root"],
             allowed_secret_keys: &["username", "password", "token"],
+        },
+        SourceConnectorKind::Ftp => SourceConnectorValidationRules {
+            required_public_keys: &["endpoint"],
+            allowed_public_keys: &["endpoint", "root"],
+            allowed_secret_keys: &["user", "password"],
         },
         SourceConnectorKind::ArunaNative => SourceConnectorValidationRules {
             required_public_keys: &["endpoint"],
@@ -194,6 +199,26 @@ mod tests {
                 key: "session_token".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn accepts_valid_ftp_config() {
+        validate_connector_input(
+            "ftp",
+            SourceConnectorKind::Ftp,
+            &HashMap::from([
+                (
+                    "endpoint".to_string(),
+                    "ftp://ftp.example.org:21".to_string(),
+                ),
+                ("root".to_string(), "/datasets".to_string()),
+            ]),
+            &HashMap::from([
+                ("user".to_string(), "alice".to_string()),
+                ("password".to_string(), "secret".to_string()),
+            ]),
+        )
+        .unwrap();
     }
 
     #[test]
