@@ -227,6 +227,7 @@ impl VersionKey {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Location {
     Real(BackendLocation),

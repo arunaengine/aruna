@@ -139,7 +139,7 @@ impl GetOidcUserOperation {
         txn_id: TxnId,
         value: Option<ByteView>,
     ) -> Result<Effects, GetOidcUserError> {
-        let user_id = UserId::from_string(&std::str::from_utf8(
+        let user_id = UserId::from_string(std::str::from_utf8(
             value
                 .ok_or_else(|| GetOidcUserError::UserNotFound)?
                 .as_ref(),

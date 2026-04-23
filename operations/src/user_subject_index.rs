@@ -1,8 +1,8 @@
+use aruna_core::USER_SUBJECT_INDEX_KEYSPACE;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::User;
 use aruna_core::types::{Effects, TxnId};
-use aruna_core::USER_SUBJECT_INDEX_KEYSPACE;
 use byteview::ByteView;
 use smallvec::smallvec;
 

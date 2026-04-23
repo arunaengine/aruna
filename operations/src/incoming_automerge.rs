@@ -150,7 +150,9 @@ impl IncomingAutomergeOperation {
     ) -> Result<Effects, IncomingAutomergeError> {
         if !matches!(document, AutomergeDocumentVariant::User { .. }) {
             self.state = IncomingAutomergeState::CommitPersist;
-            return Ok(smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]);
+            return Ok(smallvec![Effect::Storage(
+                StorageEffect::CommitTransaction { txn_id }
+            )]);
         }
 
         let previous_user = match self.local_document.as_deref() {
@@ -288,7 +290,9 @@ impl Operation for IncomingAutomergeOperation {
             },
             IncomingAutomergeState::Persist => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    let Some(document) = self.remote_init.as_ref().map(|init| init.document.clone()) else {
+                    let Some(document) =
+                        self.remote_init.as_ref().map(|init| init.document.clone())
+                    else {
                         return self.fail(IncomingAutomergeError::Sync(
                             AutomergeSyncError::InvalidInit,
                         ));
@@ -363,7 +367,9 @@ impl Operation for IncomingAutomergeOperation {
                     self.unexpected_event("automerge announcement result", format!("{other:?}"))
                 }
             },
-            IncomingAutomergeState::Finish | IncomingAutomergeState::Error | IncomingAutomergeState::Init => {
+            IncomingAutomergeState::Finish
+            | IncomingAutomergeState::Error
+            | IncomingAutomergeState::Init => {
                 smallvec![]
             }
         }

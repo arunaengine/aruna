@@ -244,9 +244,9 @@ async fn read_user(context: &DriverContext, user_id: UserId) -> Option<User> {
         }))
         .await
     {
-        Event::Storage(StorageEvent::ReadResult { value: Some(bytes), .. }) => {
-            Some(User::from_bytes(&bytes).unwrap())
-        }
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => Some(User::from_bytes(&bytes).unwrap()),
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => None,
         other => panic!("unexpected user read result: {other:?}"),
     }

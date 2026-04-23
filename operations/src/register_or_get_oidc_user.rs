@@ -237,11 +237,11 @@ impl RegisterOrGetOidcUserOperation {
         txn_id: TxnId,
         value: Option<ByteView>,
     ) -> Result<Effects, RegisterOrGetOidcUserError> {
-        let user = User::from_bytes(
-            &value.ok_or_else(|| RegisterOrGetOidcUserError::ConversionError(
-                ConversionError::FromStrError("missing user value".to_string()),
-            ))?,
-        )?;
+        let user = User::from_bytes(&value.ok_or_else(|| {
+            RegisterOrGetOidcUserError::ConversionError(ConversionError::FromStrError(
+                "missing user value".to_string(),
+            ))
+        })?)?;
         Ok(self.emit_commit(txn_id, user, false))
     }
 
@@ -444,7 +444,10 @@ mod tests {
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => {
                 assert_eq!(writes.len(), 1);
-                assert_eq!(String::from_utf8(writes[0].2.to_vec()).unwrap(), user_id.to_string());
+                assert_eq!(
+                    String::from_utf8(writes[0].2.to_vec()).unwrap(),
+                    user_id.to_string()
+                );
             }
             other => panic!("unexpected subject index write effect: {other:?}"),
         }

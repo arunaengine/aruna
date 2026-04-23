@@ -85,7 +85,7 @@ impl CreateUserAccessOperation {
             };
             let access = UserAccess {
                 access_key: access_key.clone(),
-                user_identity: self.config.user_identity.clone(),
+                user_identity: self.config.user_identity,
                 group_id: self.config.group_id,
                 secret: rng()
                     .sample_iter(&Alphanumeric)
@@ -217,7 +217,7 @@ mod tests {
     fn test_create_user_access_happy_path() {
         let user_identity = make_user_identity();
         let group_id = Ulid::new();
-        let mut op = CreateUserAccessOperation::new(make_config(user_identity.clone(), group_id));
+        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
 
         // 1. Start -> Should transition to CreateUserAccess and emit Storage::Write
         let effects = op.start();
@@ -274,7 +274,7 @@ mod tests {
         let group_id = Ulid::new();
 
         // 1. Invalid state: start twice -> second start calls abort since state is not Init
-        let mut op = CreateUserAccessOperation::new(make_config(user_identity.clone(), group_id));
+        let mut op = CreateUserAccessOperation::new(make_config(user_identity, group_id));
         op.start();
         // State is now CreateUserAccess; calling start again calls handle_init which calls abort.
         // abort returns empty effects (output is still Err since WriteResult not yet received).
