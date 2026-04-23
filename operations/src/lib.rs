@@ -37,6 +37,7 @@ pub mod register_user;
 pub mod replicate_automerge_to_realm;
 pub mod replication;
 pub mod s3;
+pub mod staging;
 pub mod startup;
 pub mod task_incoming;
 pub mod telemetry;

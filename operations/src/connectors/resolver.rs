@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Component, Path};
 
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
-use aruna_core::operation::Operation;
-use aruna_core::structs::{ResolvedSourceAccess, SourceConnector, SourceConnectorKind};
+use aruna_core::effects::Effect;
+use aruna_core::errors::SourceConnectorResolutionError;
+use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::{
+    ResolvedSourceAccess, ResolvedSourceConnector, SourceConnector, SourceConnectorKind,
+};
 use aruna_core::types::{Effects, GroupId};
 use smallvec::smallvec;
-use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
@@ -22,12 +24,6 @@ pub struct ResolveSourceConnectorInput {
     pub source_path: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolveSourceConnectorResult {
-    pub connector: SourceConnector,
-    pub access: ResolvedSourceAccess,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ResolveSourceConnectorState {
     Init,
@@ -37,23 +33,7 @@ enum ResolveSourceConnectorState {
     Error,
 }
 
-#[derive(Debug, Error, PartialEq)]
-pub enum ResolveSourceConnectorError {
-    #[error(transparent)]
-    StorageError(#[from] StorageError),
-    #[error(transparent)]
-    ConversionError(#[from] ConversionError),
-    #[error("Connector not found")]
-    NotFound,
-    #[error("Connector kind `{0}` is not supported in Phase 3")]
-    UnsupportedConnectorKind(SourceConnectorKind),
-    #[error("Source path must be relative to connector root")]
-    InvalidSourcePath,
-    #[error("ResolveSourceConnector failed")]
-    ResolveSourceConnectorFailed,
-}
-
-impl From<StorageReadError> for ResolveSourceConnectorError {
+impl From<StorageReadError> for SourceConnectorResolutionError {
     fn from(value: StorageReadError) -> Self {
         match value {
             StorageReadError::Storage(error) => Self::StorageError(error),
@@ -67,7 +47,7 @@ pub struct ResolveSourceConnectorOperation {
     input: ResolveSourceConnectorInput,
     state: ResolveSourceConnectorState,
     connector: Option<SourceConnector>,
-    output: Option<Result<ResolveSourceConnectorResult, ResolveSourceConnectorError>>,
+    output: Option<Result<ResolvedSourceConnector, SourceConnectorResolutionError>>,
 }
 
 impl ResolveSourceConnectorOperation {
@@ -80,7 +60,7 @@ impl ResolveSourceConnectorOperation {
         }
     }
 
-    fn emit_error(&mut self, error: ResolveSourceConnectorError) -> Effects {
+    fn emit_error(&mut self, error: SourceConnectorResolutionError) -> Effects {
         self.state = ResolveSourceConnectorState::Error;
         self.output = Some(Err(error));
         smallvec![]
@@ -88,7 +68,7 @@ impl ResolveSourceConnectorOperation {
 
     fn handle_init(&mut self) -> Effects {
         if !is_valid_relative_source_path(&self.input.source_path) {
-            return self.emit_error(ResolveSourceConnectorError::InvalidSourcePath);
+            return self.emit_error(SourceConnectorResolutionError::InvalidSourcePath);
         }
 
         self.state = ResolveSourceConnectorState::ReadConnector;
@@ -106,7 +86,7 @@ impl ResolveSourceConnectorOperation {
                 self.state = ResolveSourceConnectorState::ReadSecret;
                 smallvec![read_connector_secret_effect(self.input.connector_id, None)]
             }
-            Ok(None) => self.emit_error(ResolveSourceConnectorError::NotFound),
+            Ok(None) => self.emit_error(SourceConnectorResolutionError::NotFound),
             Err(error) => self.emit_error(error.into()),
         }
     }
@@ -118,7 +98,7 @@ impl ResolveSourceConnectorOperation {
         };
 
         let Some(connector) = self.connector.clone() else {
-            return self.emit_error(ResolveSourceConnectorError::ResolveSourceConnectorFailed);
+            return self.emit_error(SourceConnectorResolutionError::ResolveFailed);
         };
 
         let access = match resolve_access(
@@ -131,14 +111,14 @@ impl ResolveSourceConnectorOperation {
         };
 
         self.state = ResolveSourceConnectorState::Finish;
-        self.output = Some(Ok(ResolveSourceConnectorResult { connector, access }));
+        self.output = Some(Ok(ResolvedSourceConnector { connector, access }));
         smallvec![]
     }
 }
 
 impl Operation for ResolveSourceConnectorOperation {
-    type Output = ResolveSourceConnectorResult;
-    type Error = ResolveSourceConnectorError;
+    type Output = ResolvedSourceConnector;
+    type Error = SourceConnectorResolutionError;
 
     fn start(&mut self) -> Effects {
         self.handle_init()
@@ -166,11 +146,11 @@ impl Operation for ResolveSourceConnectorOperation {
             if let Some(Err(error)) = self.output {
                 return Err(error);
             }
-            return Err(ResolveSourceConnectorError::ResolveSourceConnectorFailed);
+            return Err(SourceConnectorResolutionError::ResolveFailed);
         }
 
         self.output
-            .ok_or(ResolveSourceConnectorError::ResolveSourceConnectorFailed)?
+            .ok_or(SourceConnectorResolutionError::ResolveFailed)?
     }
 
     fn abort(&mut self) -> Effects {
@@ -178,13 +158,20 @@ impl Operation for ResolveSourceConnectorOperation {
     }
 }
 
+pub fn resolve_source_connector_suboperation(input: ResolveSourceConnectorInput) -> Effect {
+    Effect::SubOperation(boxed_suboperation(
+        ResolveSourceConnectorOperation::new(input),
+        |result| Event::SubOperation(SubOperationEvent::SourceConnectorResolved { result }),
+    ))
+}
+
 fn resolve_access(
     connector: &SourceConnector,
     secret_config: Option<HashMap<String, String>>,
     source_path: &str,
-) -> Result<ResolvedSourceAccess, ResolveSourceConnectorError> {
+) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
     if connector.kind == SourceConnectorKind::ArunaNative {
-        return Err(ResolveSourceConnectorError::UnsupportedConnectorKind(
+        return Err(SourceConnectorResolutionError::UnsupportedConnectorKind(
             SourceConnectorKind::ArunaNative,
         ));
     }
@@ -320,7 +307,9 @@ mod tests {
         let error = resolve_access(&connector, None, "bucket/key").unwrap_err();
         assert_eq!(
             error,
-            ResolveSourceConnectorError::UnsupportedConnectorKind(SourceConnectorKind::ArunaNative)
+            SourceConnectorResolutionError::UnsupportedConnectorKind(
+                SourceConnectorKind::ArunaNative
+            )
         );
     }
 }
