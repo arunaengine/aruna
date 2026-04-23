@@ -18,6 +18,7 @@ use s3s::host::SingleDomain;
 use s3s::service::S3Service;
 use s3s::service::S3ServiceBuilder;
 use s3s::validation::AwsNameValidation;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
@@ -65,10 +66,11 @@ impl S3Server {
             s3service: service,
         })
     }
-    #[tracing::instrument(level = "trace", skip(self))]
-    pub async fn run(self) -> Result<JoinHandle<()>, S3ServerError> {
-        // Run server
-        let listener = TcpListener::bind(&self.address).await?;
+
+    pub fn run_with_listener(
+        self,
+        listener: TcpListener,
+    ) -> Result<(SocketAddr, JoinHandle<()>), S3ServerError> {
         let local_addr = listener.local_addr()?;
         let service = WrappingService {
             shared: self.s3service,
@@ -95,6 +97,13 @@ impl S3Server {
         let task = tokio::spawn(server);
         info!("server is running at http://{local_addr}");
 
+        Ok((local_addr, task))
+    }
+
+    #[tracing::instrument(level = "trace", skip(self))]
+    pub async fn run(self) -> Result<JoinHandle<()>, S3ServerError> {
+        let listener = TcpListener::bind(&self.address).await?;
+        let (_, task) = self.run_with_listener(listener)?;
         Ok(task)
     }
 }

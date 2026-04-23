@@ -8,7 +8,7 @@ use aruna_core::onboarding::{
     OnboardingSecret, OnboardingSecretError, bootstrap_issuer_proof_message,
     bootstrap_node_proof_message,
 };
-use aruna_core::structs::{NodeCapabilities, OidcProviderConfig, RealmId};
+use aruna_core::structs::{BlobTimeoutConfig, NodeCapabilities, OidcProviderConfig, RealmId};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
 use byteview::ByteView;
@@ -37,6 +37,9 @@ pub struct Config {
     pub blob_bucket_prefix: Option<String>,
     pub blob_max_bucket_size: Option<u64>,
     pub blob_multipart_bucket: Option<String>,
+    pub blob_control_plane_connect_timeout_secs: u64,
+    pub blob_control_plane_io_timeout_secs: u64,
+    pub blob_transfer_idle_timeout_secs: u64,
     pub http_socket_addr: SocketAddr,
     pub p2p_socket_addr: SocketAddr,
     pub node_capabilities: NodeCapabilities,
@@ -147,6 +150,20 @@ impl Config {
     pub fn is_initial_node(&self) -> bool {
         matches!(self.node_state.boot_origin, BootOrigin::InitializedRealm)
     }
+
+    pub fn blob_timeout_config(&self) -> BlobTimeoutConfig {
+        BlobTimeoutConfig {
+            control_plane_connect_timeout: std::time::Duration::from_secs(
+                self.blob_control_plane_connect_timeout_secs,
+            ),
+            control_plane_io_timeout: std::time::Duration::from_secs(
+                self.blob_control_plane_io_timeout_secs,
+            ),
+            transfer_idle_timeout: std::time::Duration::from_secs(
+                self.blob_transfer_idle_timeout_secs,
+            ),
+        }
+    }
 }
 
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
@@ -165,6 +182,22 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .or(Some("uploaded-parts".to_string()));
+    let blob_control_plane_connect_timeout_secs =
+        dotenvy::var("BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .map(|value| value.parse::<u64>())
+            .transpose()?
+            .unwrap_or(30);
+    let blob_control_plane_io_timeout_secs = dotenvy::var("BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or(30);
+    let blob_transfer_idle_timeout_secs = dotenvy::var("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()?
+        .unwrap_or(30 * 60);
     let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
@@ -241,6 +274,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             blob_bucket_prefix,
             blob_max_bucket_size,
             blob_multipart_bucket,
+            blob_control_plane_connect_timeout_secs,
+            blob_control_plane_io_timeout_secs,
+            blob_transfer_idle_timeout_secs,
             http_socket_addr,
             p2p_socket_addr,
             node_capabilities,

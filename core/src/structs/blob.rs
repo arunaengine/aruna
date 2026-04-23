@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use ulid::Ulid;
 
 const ACCESS_KEY_MAX_LEN: usize = 128;
@@ -51,6 +51,23 @@ impl Display for Backend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlobTimeoutConfig {
+    pub control_plane_connect_timeout: Duration,
+    pub control_plane_io_timeout: Duration,
+    pub transfer_idle_timeout: Duration,
+}
+
+impl Default for BlobTimeoutConfig {
+    fn default() -> Self {
+        Self {
+            control_plane_connect_timeout: Duration::from_secs(30),
+            control_plane_io_timeout: Duration::from_secs(30),
+            transfer_idle_timeout: Duration::from_secs(30 * 60),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
     pub backend_type: Backend,
@@ -59,6 +76,7 @@ pub struct BackendConfig {
     pub bucket_prefix: Option<String>,
     pub max_bucket_size: Option<u64>,
     pub multipart_bucket: Option<String>,
+    pub timeouts: BlobTimeoutConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -205,6 +223,11 @@ struct VersionKeyPrefix<'a> {
     key: &'a str,
 }
 
+#[derive(Serialize)]
+struct BucketVersionKeyPrefix<'a> {
+    bucket: &'a str,
+}
+
 impl VersionKey {
     pub fn new(bucket: impl Into<String>, key: impl Into<String>, version_id: Ulid) -> Self {
         Self {
@@ -216,6 +239,10 @@ impl VersionKey {
 
     pub fn object_prefix(bucket: &str, key: &str) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(&VersionKeyPrefix { bucket, key })?)
+    }
+
+    pub fn bucket_prefix(bucket: &str) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&BucketVersionKeyPrefix { bucket })?)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -267,12 +294,6 @@ pub enum MaterializationStrategy {
     Reference,
     Snapshot,
     Sync,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum NegotiationResult {
-    Accepted(Ulid),
-    Rejected(String),
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

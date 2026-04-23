@@ -215,7 +215,7 @@ async fn register_admin(
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
-    try_claim_initial_admin(&state, user.user_id).await;
+    try_claim_initial_admin(state, user.user_id).await;
     Ok(user)
 }
 
@@ -251,7 +251,7 @@ async fn register_user(
         }
         None => {
             let realm_id = state.get_realm_id();
-            let user = drive(
+            drive(
                 RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
                     actor: Actor {
                         node_id: state.get_node_id(),
@@ -266,9 +266,7 @@ async fn register_user(
                 &state.get_ctx(),
             )
             .await
-            .map_err(|err| ServerError::InternalError(err.to_string()))?;
-
-            user
+            .map_err(|err| ServerError::InternalError(err.to_string()))?
         }
     };
     Ok((

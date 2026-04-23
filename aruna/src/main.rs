@@ -77,6 +77,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             bucket_prefix: config.blob_bucket_prefix.clone(),
             max_bucket_size: config.blob_max_bucket_size,
             multipart_bucket: config.blob_multipart_bucket.clone(),
+            timeouts: config.blob_timeout_config(),
         },
         storage_handle.clone(),
         net_handle.clone(),

@@ -496,6 +496,7 @@ fn ensure_reader_exhausted(reader: &mut BufReader<File>) -> Result<(), SnapshotE
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::env_lock;
     use super::{SnapshotError, import_snapshot_into_new_database, snapshot_database};
     use aruna::config::load;
     use aruna_api::server_state::ServerState;
@@ -525,17 +526,11 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use std::time::SystemTime;
     use tempfile::tempdir;
-    use tokio::sync::Mutex;
     use tokio_util::io::ReaderStream;
     use ulid::Ulid;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct TestEnvGuard {
         previous: Vec<(String, Option<String>)>,
@@ -596,6 +591,7 @@ mod tests {
             ("S3_PORT", "0".to_string()),
             ("S3_HOST", "localhost".to_string()),
             ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("OIDC_PROVIDER_IDS", "".to_string()),
         ]);
 
         {
@@ -621,6 +617,7 @@ mod tests {
                     multipart_bucket: config.blob_multipart_bucket.clone(),
                     root: config.blob_root.clone(),
                     service_config: std::collections::HashMap::new(),
+                    timeouts: config.blob_timeout_config(),
                 },
                 storage_handle.clone(),
                 net_handle.clone(),

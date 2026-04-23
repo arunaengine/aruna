@@ -3,8 +3,11 @@ use std::sync::Arc;
 use crate::driver::{DriverContext, drive};
 use crate::incoming_automerge::IncomingAutomergeOperation;
 use crate::incoming_gossip::IncomingGossipOperation;
-use crate::replication::incoming_bao::IncomingBaoOperation;
+use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
+use crate::replication::protocol::VersionReplicationMessage;
 use aruna_core::alpn::Alpn;
+use aruna_core::effects::BlobEffect;
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::gossip::TopicMessage;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_net::InboundEventHandler;
@@ -76,9 +79,49 @@ impl InboundEventHandler for OperationsInboundHandler {
                 Alpn::Bao => {
                     if let Some(mut blob_handle) = self.context.blob_handle.clone() {
                         let stream_id = blob_handle.store_connection(stream).await;
-                        let op = IncomingBaoOperation::new(stream_id, node_id);
-                        if let Err(err) = drive(op, self.context.as_ref()).await {
-                            error!(error = ?err, "Failed to process inbound bao stream");
+                        let Some(net_handle) = self.context.net_handle.as_ref() else {
+                            error!(peer = %node_id, "Cannot handle incoming bao stream without net handle");
+                            return;
+                        };
+                        let first_event = blob_handle
+                            .send_blob_effect(BlobEffect::ReadMessage { stream_id })
+                            .await;
+
+                        match first_event {
+                            Event::Blob(BlobEvent::MessageReceived { payload, .. }) => {
+                                match VersionReplicationMessage::from_bytes(&payload) {
+                                    Ok(VersionReplicationMessage::VersionManifest(manifest)) => {
+                                        let op = IncomingVersionReplicationOperation::new(
+                                            stream_id,
+                                            net_handle.node_id(),
+                                            *net_handle.realm_id(),
+                                            manifest,
+                                        );
+                                        if let Err(err) = drive(op, self.context.as_ref()).await {
+                                            error!(error = ?err, "Failed to process inbound version replication stream");
+                                        }
+                                    }
+                                    _ => {
+                                        error!(
+                                            peer = %node_id,
+                                            stream_id = %stream_id,
+                                            "Unsupported inbound bao payload; legacy raw bao replication is no longer supported"
+                                        );
+                                        let close_event = blob_handle
+                                            .send_blob_effect(BlobEffect::CloseConnection { stream_id })
+                                            .await;
+                                        if let Event::Blob(BlobEvent::Error(err)) = close_event {
+                                            error!(error = ?err, "Failed to close unsupported inbound bao stream");
+                                        }
+                                    }
+                                }
+                            }
+                            Event::Blob(BlobEvent::Error(err)) => {
+                                error!(error = ?err, "Failed to read initial inbound bao payload");
+                            }
+                            other => {
+                                error!(event = ?other, "Unexpected first event for inbound bao stream");
+                            }
                         }
                     } else {
                         error!("Cannot handle incoming bao stream without blob handle");

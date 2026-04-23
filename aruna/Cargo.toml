@@ -41,6 +41,7 @@ rand.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+aws-sdk-s3 = "1.124.0"
 tempfile.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

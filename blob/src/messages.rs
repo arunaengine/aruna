@@ -1,22 +1,15 @@
 use crate::error::BlobLibError;
-use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
-use aruna_core::structs::{BackendLocation, NegotiationResult};
+use aruna_core::structs::BackendLocation;
 use iroh_quinn::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum MessageType {
-    NegotiationRequest {
-        user_id: UserId, // Necessary?
-        group_id: Ulid,
-        size: u64,
-    },
-    NegotiationResponse(NegotiationResult),
-    SomeTest(NegotiationResult),
     BaoTreeInfo {
         root: blake3::Hash,
         location: BackendLocation,
@@ -43,16 +36,7 @@ impl ReplicationMessage {
         Ok(())
     }
 
-    pub async fn read(receiver: &mut RecvStream) -> Result<Self, BlobLibError> {
-        let msg_len = receiver.read_u32().await?;
-        let mut buf = vec![0; msg_len as usize];
-        receiver.read_exact(&mut buf).await?;
-
-        let message = postcard::from_bytes::<ReplicationMessage>(&buf)?;
-        Ok(message)
-    }
-
-    pub async fn read2(receiver: &mut RecvStream) -> Result<Self, BlobEvent> {
+    pub async fn read(receiver: &mut RecvStream) -> Result<Self, BlobEvent> {
         let msg_len = match receiver.read_u32().await {
             Ok(len) => len,
             Err(err) => return Err(BlobEvent::Error(BlobError::ReadError(err.to_string()))),

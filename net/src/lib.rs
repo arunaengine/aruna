@@ -81,6 +81,7 @@ pub struct NetHandle {
 struct NetInner {
     effect_tx: mpsc::Sender<EffectHandle>,
     node_id: NodeId,
+    realm_id: RealmId,
     endpoint: Endpoint,
     address_lookup: MemoryLookup,
     dht: Arc<DhtHandle>,
@@ -315,6 +316,7 @@ impl NetHandle {
         let inner = Arc::new(NetInner {
             effect_tx,
             node_id,
+            realm_id: config.realm_id,
             endpoint,
             address_lookup,
             dht,
@@ -330,6 +332,10 @@ impl NetHandle {
 
     pub fn node_id(&self) -> NodeId {
         self.inner.node_id
+    }
+
+    pub fn realm_id(&self) -> &RealmId {
+        &self.inner.realm_id
     }
 
     pub fn endpoint_addr(&self) -> EndpointAddr {

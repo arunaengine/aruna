@@ -6,8 +6,7 @@ use crate::id::NodeId;
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::BackendLocation;
-use crate::structs::RealmId;
+use crate::structs::{BackendLocation, RealmId};
 use crate::task::TaskEffect;
 use crate::types::UserId;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
@@ -66,22 +65,26 @@ pub enum BlobEffect {
     OpenConnection {
         node_id: NodeId,
     },
-    NegotiateIncoming {
+    SendMessage {
+        stream_id: Ulid,
+        payload: Vec<u8>,
+    },
+    ReadMessage {
         stream_id: Ulid,
     },
-    NegotiateOutgoing {
-        replication_id: Ulid,
+    CloseConnection {
         stream_id: Ulid,
-        location: BackendLocation,
     },
     Replicate {
         replication_id: Ulid,
         stream_id: Ulid,
         location: BackendLocation,
+        keep_alive: bool,
     },
     HandleReplication {
-        replication_id: Ulid,
+        replication_id: Option<Ulid>,
         stream_id: Ulid,
+        keep_alive: bool,
     },
 }
 

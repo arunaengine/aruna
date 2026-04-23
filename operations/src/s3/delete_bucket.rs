@@ -2,7 +2,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE, S3_VERSION_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE, S3_LOOKUP_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_VERSION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{BucketInfo, LookupKey, MultipartUpload, VersionKey};
@@ -198,18 +199,26 @@ impl DeleteBucketOperation {
         }
 
         self.state = DeleteBucketState::DeleteBucket;
-        smallvec![Effect::Storage(StorageEffect::Delete {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.bucket.as_bytes().into(),
+        smallvec![Effect::Storage(StorageEffect::BatchDelete {
+            deletes: vec![
+                (
+                    S3_BUCKET_KEYSPACE.to_string(),
+                    self.bucket.as_bytes().to_vec().into(),
+                ),
+                (
+                    S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                    self.bucket.as_bytes().to_vec().into(),
+                ),
+            ],
             txn_id: self.txn_id,
         })]
     }
 
     fn handle_bucket_deleted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
             return self.emit_error(DeleteBucketError::InvalidStateEvent {
                 state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::DeleteResult)",
+                expected: "Event::Storage(StorageEvent::BatchDeleteResult)",
                 received: event,
             });
         };
@@ -293,12 +302,32 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::structs::{BackendLocation, Location, VersionMetadata};
+    use aruna_core::keyspaces::S3_BUCKET_REPLICATION_KEYSPACE;
+    use aruna_core::structs::{
+        BackendLocation, BucketReplicationConfig, BucketReplicationTarget, Location, RealmId,
+        VersionMetadata,
+    };
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn make_replication_target(bucket: &str) -> BucketReplicationTarget {
+        let mut rng = rand::rng();
+        let node_id = iroh::SecretKey::generate(&mut rng).public();
+        BucketReplicationTarget {
+            node_id,
+            realm_id: RealmId::from_bytes([9u8; 32]),
+            bucket: bucket.to_string(),
+            arn: format!(
+                "arn:aruna:{}:{}:s3/{bucket}",
+                RealmId::from_bytes([9u8; 32]),
+                node_id
+            ),
+            replicate_delete_markers: true,
+        }
+    }
 
     #[tokio::test]
     async fn test_delete_bucket() {
@@ -346,6 +375,93 @@ mod test {
             .await
         else {
             panic!("missing read result");
+        };
+        assert!(value.is_none());
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                key: b"bucket-a".to_vec().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing replication config read result");
+        };
+        assert!(value.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_removes_replication_config() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let bucket = "bucket-a".to_string();
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.clone().into(),
+                value: BucketInfo {
+                    group_id: Ulid::new(),
+                    created_at: SystemTime::now(),
+                    created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: None,
+            })
+            .await;
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                key: bucket.clone().into(),
+                value: BucketReplicationConfig {
+                    targets: vec![make_replication_target(&bucket)],
+                }
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: None,
+            })
+            .await;
+
+        let result = drive(DeleteBucketOperation::new(bucket.clone()), &driver_ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Ok(()));
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.clone().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing bucket read result");
+        };
+        assert!(value.is_none());
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+                key: bucket.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing replication config read result");
         };
         assert!(value.is_none());
     }

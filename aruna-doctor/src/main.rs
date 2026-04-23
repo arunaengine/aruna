@@ -7,6 +7,8 @@ use clap::{Parser, Subcommand};
 mod error;
 mod explorer;
 mod storage;
+#[cfg(test)]
+mod test_support;
 mod tokens;
 
 /// Simple program to greet a person

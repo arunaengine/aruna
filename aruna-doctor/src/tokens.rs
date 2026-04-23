@@ -377,6 +377,7 @@ async fn validate(
 
 #[cfg(test)]
 mod tests {
+    use crate::test_support::env_lock;
     use super::{
         create_local_bootstrap_token, create_oidc_token, load_oidc_providers_from_env,
         oidc_password_grant_body, request_oidc_token,
@@ -421,16 +422,10 @@ mod tests {
     use std::collections::HashMap;
     use std::error::Error;
     use std::sync::Arc;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
     use ulid::Ulid;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn restore_env(previous: Vec<(String, Option<String>)>) {
         for (key, value) in previous {
@@ -943,9 +938,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn loads_oidc_providers_from_environment() {
-        let _guard = env_lock().lock().unwrap();
+    #[tokio::test]
+    async fn loads_oidc_providers_from_environment() {
+        let _guard = env_lock().lock().await;
         let vars = [
             ("OIDC_PROVIDER_IDS", "main".to_string()),
             ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
@@ -975,7 +970,7 @@ mod tests {
     #[tokio::test]
     async fn create_oidc_token_registers_user_and_returns_aruna_token() -> Result<(), Box<dyn Error>>
     {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
@@ -1009,7 +1004,7 @@ mod tests {
     #[tokio::test]
     async fn create_local_bootstrap_token_claims_initial_admin_and_returns_aruna_token()
     -> Result<(), Box<dyn Error>> {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let issuer = "https://issuer.example";
         let kid = "main-key";
         let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
