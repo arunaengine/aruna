@@ -5,6 +5,7 @@ mod metadata_registry;
 mod multipart;
 mod realm;
 mod replication;
+mod source_access;
 mod source_connector;
 #[allow(clippy::module_inception)]
 mod structs;
@@ -15,5 +16,6 @@ pub use metadata_registry::*;
 pub use multipart::*;
 pub use realm::*;
 pub use replication::*;
+pub use source_access::*;
 pub use source_connector::*;
 pub use structs::*;
