@@ -3,7 +3,6 @@
 use aruna::bootstrap::{
     announce_core_documents, fetch_core_onboarding_documents, realm_bootstrap_exists,
 };
-use aruna_core::UserId;
 use aruna::config::{Config, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna_api::routes::credentials::{
     CreateS3CredentialsRequest, CreateS3CredentialsResponse, CreateS3PathRestriction,
@@ -13,6 +12,7 @@ use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
+use aruna_core::UserId;
 use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
@@ -231,16 +231,16 @@ pub(crate) async fn wait_for_realm_nodes(
 ) -> TestResult<()> {
     wait_until(
         "realm node convergence",
-            Duration::from_secs(10),
-            Duration::from_millis(100),
-            || async {
-                for context in contexts {
-                    match drive(GetRealmNodesOperation::new(*realm_id), context).await {
-                        Ok(nodes) if nodes.len() == expected => {}
-                        _ => return false,
-                    }
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        || async {
+            for context in contexts {
+                match drive(GetRealmNodesOperation::new(*realm_id), context).await {
+                    Ok(nodes) if nodes.len() == expected => {}
+                    _ => return false,
                 }
-                true
+            }
+            true
         },
     )
     .await
@@ -508,8 +508,13 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
     announce_realm_presence(context.as_ref(), &realm_id, net.node_id()).await?;
 
     let capabilities = NodeCapabilities::management_node(realm_signing_key)?;
-    let (base_url, server_task) =
-        spawn_rest_server(context.clone(), realm_id, net.node_id(), capabilities.clone()).await?;
+    let (base_url, server_task) = spawn_rest_server(
+        context.clone(),
+        realm_id,
+        net.node_id(),
+        capabilities.clone(),
+    )
+    .await?;
     let (s3, s3_task) =
         spawn_optional_s3_server(mode, context.clone(), realm_id, net.node_id()).await?;
 

@@ -377,11 +377,11 @@ async fn validate(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::env_lock;
     use super::{
         create_local_bootstrap_token, create_oidc_token, load_oidc_providers_from_env,
         oidc_password_grant_body, request_oidc_token,
     };
+    use crate::test_support::env_lock;
     use aruna::bootstrap::ensure_initial_local_onboarding_secret;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListOnboardingSecretsResponse;

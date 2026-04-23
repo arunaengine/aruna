@@ -496,8 +496,8 @@ fn ensure_reader_exhausted(reader: &mut BufReader<File>) -> Result<(), SnapshotE
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::env_lock;
     use super::{SnapshotError, import_snapshot_into_new_database, snapshot_database};
+    use crate::test_support::env_lock;
     use aruna::config::load;
     use aruna_api::server_state::ServerState;
     use aruna_blob::blob::BlobHandler;
