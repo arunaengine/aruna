@@ -50,6 +50,17 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                 Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
             }
         }
+        Effect::StagingSource(staging_source_effect) => {
+            if let Some(blob_handle) = &context.blob_handle {
+                blob_handle
+                    .send_staging_source_effect(staging_source_effect)
+                    .await
+            } else {
+                Event::StagingSource(aruna_core::events::StagingSourceEvent::Error {
+                    error: aruna_core::errors::StagingSourceError::HandleMissing,
+                })
+            }
+        }
         Effect::Storage(storage_effect) => {
             context
                 .storage_handle
@@ -224,6 +235,7 @@ pub async fn drive<O: Operation>(
 fn effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Blob(_) => "blob",
+        Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
         Effect::Net(_) => "net",
         Effect::Automerge(_) => "automerge",
@@ -238,6 +250,7 @@ fn effect_kind(effect: &Effect) -> &'static str {
 fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::Blob(_) => "blob",
+        Event::StagingSource(_) => "staging_source",
         Event::Storage(_) => "storage",
         Event::Net(_) => "net",
         Event::Automerge(_) => "automerge",
@@ -253,9 +266,10 @@ fn event_kind(event: &Event) -> &'static str {
 mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::{
-        effects::{Effect, StorageEffect},
-        events::{Event, StorageEvent, SubOperationEvent},
+        effects::{Effect, StagingSourceEffect, StorageEffect},
+        events::{Event, StagingSourceEvent, StorageEvent, SubOperationEvent},
         operation::{Operation, boxed_suboperation},
+        structs::{ResolvedSourceAccess, SourceConnectorKind},
         task::{TaskEffect, TaskKey},
     };
     use aruna_storage::storage;
@@ -438,6 +452,99 @@ mod test {
             .await
             .expect("drive should succeed");
         assert_eq!(observed, vec!["task", "search"]);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct StagingSourceDispatchOperation {
+        observed_staging_source: bool,
+    }
+
+    impl StagingSourceDispatchOperation {
+        fn new() -> Self {
+            Self {
+                observed_staging_source: false,
+            }
+        }
+    }
+
+    impl Operation for StagingSourceDispatchOperation {
+        type Output = bool;
+        type Error = ();
+
+        fn start(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![Effect::StagingSource(StagingSourceEffect::Head {
+                access: ResolvedSourceAccess::OpenDal {
+                    kind: SourceConnectorKind::Http,
+                    config: std::collections::HashMap::from([(
+                        "endpoint".to_string(),
+                        "https://missing.example.org".to_string(),
+                    )]),
+                    path: "file.txt".to_string(),
+                },
+            })]
+        }
+
+        fn step(&mut self, event: Event) -> aruna_core::types::Effects {
+            self.observed_staging_source = matches!(
+                event,
+                Event::StagingSource(StagingSourceEvent::Error { .. })
+            );
+            smallvec::smallvec![]
+        }
+
+        fn is_complete(&self) -> bool {
+            self.observed_staging_source
+        }
+
+        fn finalize(self) -> Result<Self::Output, Self::Error> {
+            Ok(self.observed_staging_source)
+        }
+
+        fn abort(&mut self) -> aruna_core::types::Effects {
+            smallvec::smallvec![]
+        }
+    }
+
+    #[tokio::test]
+    async fn test_driver_dispatches_staging_source_effect_via_blob_handle() {
+        let temp_dir = tempdir().unwrap();
+        let temp_root = temp_dir.path().to_str().unwrap().to_string();
+        let blob_root = format!("{temp_root}/blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+        let storage_handle = storage::FjallStorage::open(&temp_root).unwrap();
+        let net_handle =
+            aruna_net::NetHandle::new(aruna_net::NetConfig::default(), storage_handle.clone())
+                .await
+                .unwrap();
+        let blob_handle = aruna_blob::blob::BlobHandler::new(
+            aruna_core::structs::BackendConfig {
+                backend_type: aruna_core::structs::Backend::FileSystem,
+                root: blob_root,
+                service_config: std::collections::HashMap::new(),
+                bucket_prefix: Some("aruna-test-".to_string()),
+                max_bucket_size: Some(1),
+                multipart_bucket: Some("uploaded-parts".to_string()),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle,
+        )
+        .await
+        .unwrap();
+
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: Some(blob_handle),
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let observed = drive(StagingSourceDispatchOperation::new(), &context)
+            .await
+            .expect("staging source effect should be dispatched");
+        assert!(observed);
     }
 
     #[derive(Debug, PartialEq)]

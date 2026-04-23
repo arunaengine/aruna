@@ -6,7 +6,7 @@ use crate::id::NodeId;
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::{BackendLocation, RealmId};
+use crate::structs::{BackendLocation, RealmId, ResolvedSourceAccess};
 use crate::task::TaskEffect;
 use crate::types::UserId;
 use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
@@ -17,6 +17,7 @@ use ulid::Ulid;
 #[derive(Debug, PartialEq)]
 pub enum Effect {
     Blob(BlobEffect),
+    StagingSource(StagingSourceEffect),
     Storage(StorageEffect),
     Net(NetEffect),
     Automerge(AutomergeEffect),
@@ -85,6 +86,17 @@ pub enum BlobEffect {
         replication_id: Option<Ulid>,
         stream_id: Ulid,
         keep_alive: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagingSourceEffect {
+    Head {
+        access: ResolvedSourceAccess,
+    },
+    Read {
+        access: ResolvedSourceAccess,
+        range: Option<Range<u64>>,
     },
 }
 

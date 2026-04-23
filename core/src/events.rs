@@ -1,7 +1,7 @@
-use crate::errors::BlobError;
+use crate::errors::{BlobError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::{BackendLocation, RealmId, ReplicationSuboperationResult};
+use crate::structs::{BackendLocation, RealmId, ReplicationSuboperationResult, SourceMetadata};
 use crate::{
     automerge::AutomergeEvent,
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
@@ -15,6 +15,7 @@ use ulid::Ulid;
 #[derive(Debug, PartialEq)]
 pub enum Event {
     Blob(BlobEvent),
+    StagingSource(StagingSourceEvent),
     Storage(StorageEvent),
     Net(NetEvent),
     Automerge(AutomergeEvent),
@@ -80,6 +81,20 @@ pub enum BlobEvent {
         location: BackendLocation,
     },
     Error(BlobError),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StagingSourceEvent {
+    HeadResult {
+        metadata: SourceMetadata,
+    },
+    ReadResult {
+        metadata: SourceMetadata,
+        stream: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    Error {
+        error: StagingSourceError,
+    },
 }
 
 #[derive(Debug, PartialEq)]

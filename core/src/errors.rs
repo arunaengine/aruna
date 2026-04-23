@@ -65,6 +65,26 @@ pub enum BlobError {
 }
 
 #[derive(Debug, Error, PartialEq)]
+pub enum StagingSourceError {
+    #[error("Channel closed")]
+    ChannelClosed,
+    #[error("Invalid effect type")]
+    InvalidEffect,
+    #[error("Staging source handle missing")]
+    HandleMissing,
+    #[error("Staging source not found")]
+    NotFound,
+    #[error("Unsupported staging source kind `{0}`")]
+    UnsupportedKind(String),
+    #[error("Operator creation failed: {0}")]
+    OperatorCreationFailed(String),
+    #[error("Stat error: {0}")]
+    StatError(String),
+    #[error("Read error: {0}")]
+    ReadError(String),
+}
+
+#[derive(Debug, Error, PartialEq)]
 pub enum StorageError {
     #[error("Key not found")]
     KeyNotFound,
