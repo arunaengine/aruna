@@ -1,3 +1,4 @@
+use crate::structs::SourceConnectorKind;
 use automerge::AutomergeError;
 use std::array::TryFromSliceError;
 use thiserror::Error;
@@ -82,6 +83,22 @@ pub enum StagingSourceError {
     StatError(String),
     #[error("Read error: {0}")]
     ReadError(String),
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum SourceConnectorResolutionError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error("Connector not found")]
+    NotFound,
+    #[error("Connector kind `{0}` is not supported in Phase 3")]
+    UnsupportedConnectorKind(SourceConnectorKind),
+    #[error("Source path must be relative to connector root")]
+    InvalidSourcePath,
+    #[error("Source connector resolution failed")]
+    ResolveFailed,
 }
 
 #[derive(Debug, Error, PartialEq)]

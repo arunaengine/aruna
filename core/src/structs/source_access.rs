@@ -1,4 +1,4 @@
-use super::source_connector::SourceConnectorKind;
+use super::source_connector::{SourceConnector, SourceConnectorKind};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -9,6 +9,12 @@ pub enum ResolvedSourceAccess {
         config: HashMap<String, String>,
         path: String,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedSourceConnector {
+    pub connector: SourceConnector,
+    pub access: ResolvedSourceAccess,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

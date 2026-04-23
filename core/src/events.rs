@@ -1,7 +1,10 @@
-use crate::errors::{BlobError, StagingSourceError};
+use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::{BackendLocation, RealmId, ReplicationSuboperationResult, SourceMetadata};
+use crate::structs::{
+    BackendLocation, RealmId, ReplicationSuboperationResult, ResolvedSourceConnector,
+    SourceMetadata,
+};
 use crate::{
     automerge::AutomergeEvent,
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
@@ -42,6 +45,9 @@ pub enum SubOperationEvent {
     },
     TopicAnnouncementResult {
         result: Result<(), String>,
+    },
+    SourceConnectorResolved {
+        result: Result<ResolvedSourceConnector, SourceConnectorResolutionError>,
     },
     ReplicationItemResult {
         result: Result<ReplicationSuboperationResult, String>,
