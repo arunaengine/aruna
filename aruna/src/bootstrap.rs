@@ -1,6 +1,5 @@
 use crate::config::PersistedNodeState;
 use aruna_api::server_state::{INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_state};
-use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, GossipEffect, NetEffect, StorageEffect};
 use aruna_core::errors::GossipError;
 use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
@@ -90,14 +89,7 @@ pub async fn fetch_core_onboarding_documents(
         other => return Err(format!("unexpected gossip subscribe result: {other:?}").into()),
     }
 
-    for document in [
-        AutomergeDocumentVariant::RealmAuthorization {
-            realm_id: *realm_id,
-        },
-        AutomergeDocumentVariant::RealmConfig {
-            realm_id: *realm_id,
-        },
-    ] {
+    for document in onboarding_sync_ticket.payload.documents.clone() {
         drive(
             OutgoingAutomergeOperation::new_with_auth(
                 bootstrap_peer,

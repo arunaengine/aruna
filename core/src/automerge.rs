@@ -6,7 +6,7 @@ use crate::gossip::TopicMessageKind;
 use crate::id::{NodeId, TopicId};
 use crate::structs::RealmId;
 use crate::task::TaskKey;
-use crate::types::GroupId;
+use crate::types::{GroupId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AutomergeDocumentVariant {
@@ -14,6 +14,7 @@ pub enum AutomergeDocumentVariant {
     GroupAuthorization { group_id: GroupId },
     RealmAuthorization { realm_id: RealmId },
     RealmConfig { realm_id: RealmId },
+    User { user_id: UserId },
 }
 
 impl AutomergeDocumentVariant {
@@ -25,6 +26,7 @@ impl AutomergeDocumentVariant {
             Self::RealmAuthorization { realm_id } | Self::RealmConfig { realm_id } => {
                 TopicId::realm(*realm_id)
             }
+            Self::User { user_id } => TopicId::realm(user_id.realm_id),
         }
     }
 
@@ -34,6 +36,7 @@ impl AutomergeDocumentVariant {
             Self::GroupAuthorization { .. } => TopicMessageKind::GroupAuthorization,
             Self::RealmAuthorization { .. } => TopicMessageKind::RealmAuthorization,
             Self::RealmConfig { .. } => TopicMessageKind::RealmConfig,
+            Self::User { user_id } => TopicMessageKind::User { user_id: *user_id },
         }
     }
 
@@ -55,6 +58,11 @@ impl AutomergeDocumentVariant {
             (TopicId::Realm(realm_id), TopicMessageKind::RealmConfig) => Some(Self::RealmConfig {
                 realm_id: *realm_id,
             }),
+            (TopicId::Realm(realm_id), TopicMessageKind::User { user_id })
+                if user_id.realm_id == *realm_id =>
+            {
+                Some(Self::User { user_id: *user_id })
+            }
             _ => None,
         }
     }
@@ -189,7 +197,8 @@ mod tests {
     use crate::gossip::TopicMessageKind;
     use crate::id::TopicId;
     use crate::structs::RealmId;
-    use crate::types::GroupId;
+    use crate::types::{GroupId, UserId};
+    use ulid::Ulid;
 
     #[test]
     fn resolves_group_message_variant() {
@@ -214,5 +223,18 @@ mod tests {
             document,
             AutomergeDocumentVariant::RealmAuthorization { realm_id }
         );
+    }
+
+    #[test]
+    fn resolves_user_message_variant() {
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let user_id = UserId::new(Ulid::from_bytes([4u8; 16]), realm_id);
+        let topic = TopicId::realm(realm_id);
+        let document = AutomergeDocumentVariant::from_topic_message(
+            &topic,
+            &TopicMessageKind::User { user_id },
+        )
+        .expect("user document resolves");
+        assert_eq!(document, AutomergeDocumentVariant::User { user_id });
     }
 }

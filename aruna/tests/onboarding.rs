@@ -5,10 +5,13 @@ use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_core::UserId;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
-use aruna_core::structs::{Actor, NodeCapabilities, RealmId};
+use aruna_core::structs::{Actor, NodeCapabilities, RealmId, User};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -28,6 +31,7 @@ use aruna_operations::register_or_get_oidc_user::{
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use reqwest::StatusCode;
 use std::sync::{Arc, OnceLock};
@@ -230,6 +234,24 @@ async fn wait_for_realm_nodes(
     }
 }
 
+async fn read_user(context: &DriverContext, user_id: UserId) -> Option<User> {
+    match context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: aruna_core::USER_KEYSPACE.to_string(),
+            key: ByteView::from(user_id.to_bytes()),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value: Some(bytes), .. }) => {
+            Some(User::from_bytes(&bytes).unwrap())
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => None,
+        other => panic!("unexpected user read result: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -237,6 +259,9 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
     let seed = spawn_seed_node().await?;
     sleep(Duration::from_millis(50)).await;
     let onboarding_secret = create_onboarding_secret_via_http(&seed, OnboardingMode::Local).await?;
+    let expected_user = read_user(seed.context.as_ref(), seed.user_id)
+        .await
+        .expect("seed user should exist");
 
     let joiner_dir = tempfile::tempdir()?;
     let vars = [
@@ -323,6 +348,12 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents()
     )
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);
+    assert_eq!(
+        read_user(joiner_context.as_ref(), seed.user_id)
+            .await
+            .expect("joiner user should be bootstrapped"),
+        expected_user
+    );
     mark_onboarding_phase(
         &joiner_context.storage_handle,
         &config.node_state,

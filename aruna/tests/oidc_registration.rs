@@ -6,10 +6,8 @@ use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
-use aruna_core::structs::{
-    Actor, NodeCapabilities, OidcProviderConfig, RealmConfigDocument, User, oidc_subject_key,
-};
+use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
+use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, User, oidc_subject_key};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -61,7 +59,6 @@ struct TestNode {
     _temp_dir: TempDir,
     context: Arc<DriverContext>,
     base_url: String,
-    realm_id: aruna_core::structs::RealmId,
     net: NetHandle,
     server_task: JoinHandle<()>,
 }
@@ -180,26 +177,6 @@ async fn read_subject_index(context: &DriverContext, subject_key: &str) -> Strin
     }
 }
 
-async fn read_realm_config(
-    context: &DriverContext,
-    realm_id: &aruna_core::structs::RealmId,
-) -> RealmConfigDocument {
-    match context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(realm_id.as_bytes().to_vec()),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => RealmConfigDocument::from_bytes(&bytes).unwrap(),
-        other => panic!("unexpected realm config read result: {other:?}"),
-    }
-}
-
 async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     let temp_dir = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
@@ -295,7 +272,6 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         _temp_dir: temp_dir,
         context,
         base_url: format!("http://{addr}"),
-        realm_id,
         net,
         server_task,
     }
@@ -334,16 +310,6 @@ async fn oidc_registration_route_creates_user_indexes_and_token() {
         read_subject_index(node.context.as_ref(), &subject_key).await,
         body.id
     );
-    let realm_config = read_realm_config(node.context.as_ref(), &node.realm_id).await;
-    assert_eq!(
-        realm_config
-            .users
-            .iter()
-            .filter(|user| user.user_id.to_string() == body.id)
-            .count(),
-        1
-    );
-
     let response = reqwest::Client::new()
         .post(format!("{}/api/v1/users/register", node.base_url))
         .bearer_auth(token)

@@ -32,6 +32,7 @@ enum PendingTopicAnnouncement {
 pub struct AnnounceTopicOperation {
     topic: TopicId,
     local_node_id: NodeId,
+    document: Option<AutomergeDocumentVariant>,
     state: AnnounceTopicState,
     pending: VecDeque<PendingTopicAnnouncement>,
     current: Option<PendingTopicAnnouncement>,
@@ -72,9 +73,18 @@ pub enum AnnounceTopicError {
 
 impl AnnounceTopicOperation {
     pub fn new(topic: TopicId, local_node_id: NodeId) -> Self {
+        Self::new_for_document(topic, local_node_id, None)
+    }
+
+    pub fn new_for_document(
+        topic: TopicId,
+        local_node_id: NodeId,
+        document: Option<AutomergeDocumentVariant>,
+    ) -> Self {
         Self {
             topic,
             local_node_id,
+            document,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
@@ -106,6 +116,12 @@ impl AnnounceTopicOperation {
 
     fn queue_topic_documents(&mut self) {
         if !self.pending.is_empty() {
+            return;
+        }
+
+        if let Some(document) = self.document.clone() {
+            self.pending
+                .push_back(PendingTopicAnnouncement::Automerge(document));
             return;
         }
 

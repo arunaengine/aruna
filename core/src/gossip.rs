@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::id::{NodeId, TopicId};
+use crate::types::UserId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicMessage {
@@ -40,6 +41,7 @@ impl TopicMessage {
 pub enum TopicMessageKind {
     RealmAuthorization,
     RealmConfig,
+    User { user_id: UserId },
     Group,
     GroupAuthorization,
     Metadata,
@@ -51,7 +53,7 @@ impl TopicMessageKind {
             (topic, self),
             (
                 TopicId::Realm(_),
-                Self::RealmAuthorization | Self::RealmConfig
+                Self::RealmAuthorization | Self::RealmConfig | Self::User { .. }
             ) | (TopicId::Group(_), Self::Group | Self::GroupAuthorization)
                 | (TopicId::Metadata(_), Self::Metadata)
         )
@@ -76,6 +78,7 @@ impl TopicMessageVersion {
             (
                 TopicMessageKind::RealmAuthorization
                     | TopicMessageKind::RealmConfig
+                    | TopicMessageKind::User { .. }
                     | TopicMessageKind::Group
                     | TopicMessageKind::GroupAuthorization,
                 Self::Automerge { .. }
@@ -92,7 +95,7 @@ mod tests {
 
     use super::*;
     use crate::structs::RealmId;
-    use crate::types::GroupId;
+    use crate::types::{GroupId, UserId};
 
     fn make_node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -116,6 +119,21 @@ mod tests {
         );
         assert!(automerge.is_valid_for(&realm));
         assert!(!automerge.is_valid_for(&group));
+
+        let user_message = TopicMessage::new(
+            TopicMessageKind::User {
+                user_id: UserId::new(Ulid::from_bytes([6u8; 16]), RealmId::from_bytes([1u8; 32])),
+            },
+            Ulid::new(),
+            make_node(6),
+            None,
+            TopicMessageVersion::Automerge {
+                heads: Vec::new(),
+                change_count: 0,
+            },
+        );
+        assert!(user_message.is_valid_for(&realm));
+        assert!(!user_message.is_valid_for(&group));
 
         let metadata_message = TopicMessage::new(
             TopicMessageKind::Metadata,

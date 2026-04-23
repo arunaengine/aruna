@@ -5,7 +5,7 @@ use aruna_core::automerge::{AutomergeClock, AutomergeDocumentVariant};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
 use aruna_core::structs::RealmId;
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 
@@ -15,6 +15,7 @@ pub fn storage_keyspace(document: &AutomergeDocumentVariant) -> &'static str {
         AutomergeDocumentVariant::GroupAuthorization { .. }
         | AutomergeDocumentVariant::RealmAuthorization { .. } => AUTH_KEYSPACE,
         AutomergeDocumentVariant::RealmConfig { .. } => REALM_CONFIG_KEYSPACE,
+        AutomergeDocumentVariant::User { .. } => USER_KEYSPACE,
     }
 }
 
@@ -32,6 +33,7 @@ pub fn storage_key(document: &AutomergeDocumentVariant) -> Key {
         AutomergeDocumentVariant::RealmConfig { realm_id } => {
             ByteView::from(realm_id.as_bytes().to_vec())
         }
+        AutomergeDocumentVariant::User { user_id } => ByteView::from(user_id.to_bytes()),
     }
 }
 

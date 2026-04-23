@@ -368,6 +368,7 @@ pub async fn bootstrap_onboarding(
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
     let onboarding_sync_ticket = state
         .issue_onboarding_sync_ticket(node_id)
+        .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?
         .encode()
         .map_err(|err| ServerError::InternalError(err.to_string()))?;

@@ -1,7 +1,7 @@
 use crate::errors::ConversionError;
 use crate::structs::group::autosurgeon_role_map;
 use crate::structs::structs::{Permission, Role};
-use crate::structs::{Actor, User};
+use crate::structs::Actor;
 use crate::types::{GroupId, RoleId, autosurgeon_ulid};
 use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use core::fmt;
@@ -170,7 +170,6 @@ pub struct RealmConfigDocument {
     pub realm_id: RealmId,
     pub metadata_replication: MetadataReplicationConfig,
     pub oidc_providers: Vec<OidcProviderConfig>,
-    pub users: Vec<User>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
@@ -191,7 +190,6 @@ impl RealmConfigDocument {
             realm_id,
             metadata_replication: MetadataReplicationConfig::new(default_replication_factor),
             oidc_providers,
-            users: Vec::new(),
         }
     }
 
@@ -371,10 +369,9 @@ pub mod autosurgeon_operation_map {
 
 #[cfg(test)]
 mod test {
-    use crate::UserId;
     use crate::structs::{
         Actor, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
-        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId, User,
+        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
     };
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
@@ -422,15 +419,10 @@ mod test {
                 discovery_url: "https://issuer.example/.well-known/openid-configuration"
                     .to_string(),
             }],
-            users: vec![User {
-                user_id: UserId::new(Ulid::new(), RealmId([4u8; 32])),
-                name: "a_name".to_string(),
-                subject_ids: vec!["id1".to_string(), "id2".to_string()],
-            }],
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
-            user_id: UserId::new(Ulid::new(), RealmId([4u8; 32])),
+            user_id: crate::UserId::new(Ulid::new(), RealmId([4u8; 32])),
             realm_id: RealmId([4u8; 32]),
         };
 
@@ -466,11 +458,6 @@ mod test {
                 ],
             },
             oidc_providers: vec![],
-            users: vec![User {
-                user_id: UserId::new(Ulid::new(), RealmId([5u8; 32])),
-                name: "b_name".to_string(),
-                subject_ids: vec!["id3".to_string(), "id4".to_string()],
-            }],
         };
 
         assert_eq!(

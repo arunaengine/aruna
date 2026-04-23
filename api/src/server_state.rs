@@ -197,27 +197,57 @@ impl ServerState {
         }
     }
 
-    pub fn issue_onboarding_sync_ticket(
+    pub async fn issue_onboarding_sync_ticket(
         &self,
         node_id: NodeId,
     ) -> Result<OnboardingSyncTicket, OnboardingSecretError> {
         match &self.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
-            } => OnboardingSyncTicket::issue(
-                realm_signing_key,
-                &self.realm_id,
-                node_id,
-                chrono::Utc::now().timestamp().max(0) as u64 + ONBOARDING_SYNC_TICKET_TTL_SECS,
-                vec![
+            } => {
+                let mut documents = vec![
                     AutomergeDocumentVariant::RealmAuthorization {
                         realm_id: self.realm_id,
                     },
                     AutomergeDocumentVariant::RealmConfig {
                         realm_id: self.realm_id,
                     },
-                ],
-            ),
+                ];
+
+                let user_documents = match self
+                    .driver_ctx
+                    .storage_handle
+                    .send_effect(Effect::Storage(StorageEffect::Iter {
+                        key_space: USER_KEYSPACE.to_string(),
+                        prefix: None,
+                        start_after: None,
+                        limit: 10_000,
+                        txn_id: None,
+                    }))
+                    .await
+                {
+                    Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+                    Event::Storage(StorageEvent::Error { .. }) => {
+                        return Err(OnboardingSecretError::InvalidSecret);
+                    }
+                    _ => return Err(OnboardingSecretError::InvalidSecret),
+                };
+
+                documents.extend(user_documents.into_iter().filter_map(|(key, _)| {
+                    aruna_core::UserId::from_string(std::str::from_utf8(key.as_ref()).ok()?)
+                        .ok()
+                        .filter(|user_id| user_id.realm_id == self.realm_id)
+                        .map(|user_id| AutomergeDocumentVariant::User { user_id })
+                }));
+
+                OnboardingSyncTicket::issue(
+                    realm_signing_key,
+                    &self.realm_id,
+                    node_id,
+                    chrono::Utc::now().timestamp().max(0) as u64 + ONBOARDING_SYNC_TICKET_TTL_SECS,
+                    documents,
+                )
+            }
             _ => Err(OnboardingSecretError::InvalidSecret),
         }
     }

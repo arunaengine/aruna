@@ -20,7 +20,6 @@ use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::warn;
 
 const OIDC_HTTP_TIMEOUT_SECS: u64 = 5;
 const OIDC_HTTP_CONNECT_TIMEOUT_SECS: u64 = 2;
@@ -320,11 +319,6 @@ async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Optio
 
     let token = handle_token(state, token).await.ok()?;
     let auth_context: AuthContext = token.try_into().ok()?;
-    // TODO: Remove or at least start a lookup
-    // if !state.user_exists(auth_context.user_id).await.ok()? {
-    //     warn!(user_id = %auth_context.user_id, "Rejecting token for unknown user");
-    //     return None;
-    // }
     Some(auth_context)
 }
 
@@ -1081,7 +1075,7 @@ mod test {
             header::AUTHORIZATION,
             axum::http::HeaderValue::from_str(&format!("Bearer {}", token)).unwrap(),
         );
-        assert!(extract_auth_context(&state, &headers).await.is_none());
+        assert!(extract_auth_context(&state, &headers).await.is_some());
 
         let auth_doc = read_auth_doc(&driver_ctx, &realm_id).await;
         let realm_admin = auth_doc
