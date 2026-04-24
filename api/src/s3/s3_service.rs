@@ -5,6 +5,7 @@ use crate::s3::checksum::{
     encode_checksums, parse_upload_checksum_request,
 };
 use crate::s3::error::IntoS3Error;
+use crate::s3::replication::spawn_version_replication;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
@@ -16,9 +17,6 @@ use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::replication::version_replication::{
-    ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
-};
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
 };
@@ -38,8 +36,7 @@ use aruna_operations::s3::get_object::{GetObjectInput as GOI, GetObjectOperation
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
 use aruna_operations::s3::put_bucket_replication::{
-    DeleteBucketReplicationOperation, GetBucketReplicationError, GetBucketReplicationOperation,
-    PutBucketReplicationOperation,
+    DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
@@ -59,7 +56,7 @@ use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{Instrument, debug, error, info, warn};
+use tracing::{debug, error};
 
 #[derive(Clone)]
 pub struct ArunaS3Service {
@@ -214,128 +211,6 @@ impl ArunaS3Service {
         }
     }
 
-    async fn trigger_version_replication(
-        &self,
-        auth_context: AuthContext,
-        bucket: &str,
-        key: &str,
-        version_id: ulid::Ulid,
-        delete_marker: bool,
-    ) {
-        let config = match drive(
-            GetBucketReplicationOperation::new(bucket.to_string()),
-            &self.state,
-        )
-        .await
-        .and_then(|result| result.transpose())
-        {
-            Ok(Some(config)) => config,
-            Ok(None) | Err(GetBucketReplicationError::NotFound) => return,
-            Err(err) => {
-                warn!(bucket, key, version_id = %version_id, error = %err, "Failed to load bucket replication config");
-                return;
-            }
-        };
-
-        for target in config.targets {
-            if target.node_id == self.node_id {
-                continue;
-            }
-            if delete_marker && !target.replicate_delete_markers {
-                continue;
-            }
-
-            let input = ReplicateScopeInput {
-                bucket: bucket.to_string(),
-                target: ReplicateScopeTarget::Version {
-                    key: key.to_string(),
-                    version_id,
-                },
-                target_node_id: target.node_id,
-                auth_context: auth_context.clone(),
-                replicate_delete_markers: target.replicate_delete_markers,
-            };
-
-            match drive(ReplicateScopeOperation::new(input), &self.state)
-                .await
-                .and_then(|result| result.transpose())
-            {
-                Ok(Some(result)) if result.failed == 0 => {
-                    info!(
-                        bucket,
-                        key,
-                        version_id = ?version_id,
-                        target_node = %target.node_id,
-                        "Version replication succeeded"
-                    );
-                }
-                Ok(Some(result)) => {
-                    warn!(
-                        bucket,
-                        key,
-                        version_id = %version_id,
-                        target_node = %target.node_id,
-                        replicated = result.replicated,
-                        skipped = result.skipped,
-                        failed = result.failed,
-                        "Version replication completed with failures"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        bucket,
-                        key,
-                        version_id = %version_id,
-                        target_node = %target.node_id,
-                        error = %err,
-                        "Failed to trigger version replication"
-                    );
-                }
-                Ok(None) => {
-                    warn!(
-                        bucket,
-                        key,
-                        version_id = %version_id,
-                        target_node = %target.node_id,
-                        "Version replication produced no result"
-                    );
-                }
-            }
-        }
-    }
-
-    fn spawn_version_replication(
-        &self,
-        auth_context: AuthContext,
-        bucket: String,
-        key: String,
-        version_id: ulid::Ulid,
-        delete_marker: bool,
-    ) {
-        let service = self.clone();
-        let span = tracing::info_span!(
-            "s3.live_replication",
-            bucket = %bucket,
-            key = %key,
-            version_id = %version_id,
-            delete_marker,
-        );
-        tokio::spawn(
-            async move {
-                service
-                    .trigger_version_replication(
-                        auth_context,
-                        &bucket,
-                        &key,
-                        version_id,
-                        delete_marker,
-                    )
-                    .await;
-            }
-            .instrument(span),
-        );
-    }
-
     fn complete_multipart_upload_response(
         &self,
         bucket: String,
@@ -364,7 +239,10 @@ impl ArunaS3Service {
             s3_checksum_type_from_multipart(result.checksum_type),
         ));
 
-        self.spawn_version_replication(
+        spawn_version_replication(
+            self.state.clone(),
+            self.realm_id.clone(),
+            self.node_id,
             replication_auth,
             replication_bucket,
             replication_key,
@@ -399,7 +277,10 @@ impl ArunaS3Service {
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type.clone(),
         ));
-        self.spawn_version_replication(
+        spawn_version_replication(
+            self.state.clone(),
+            self.realm_id.clone(),
+            self.node_id,
             replication_auth,
             replication_bucket,
             replication_key,
@@ -419,7 +300,10 @@ impl ArunaS3Service {
         result: DeleteObjectResult,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         if replicate_latest_delete {
-            self.spawn_version_replication(
+            spawn_version_replication(
+                self.state.clone(),
+                self.realm_id.clone(),
+                self.node_id,
                 replication_auth,
                 replication_bucket,
                 replication_key,
@@ -554,6 +438,7 @@ impl S3 for ArunaS3Service {
             request: input,
             expected_checksums: checksum_request.expected.clone(),
             checksum_type: Some(checksum_request.checksum_type.as_str().to_string()),
+            version_source: None,
             exists: false,
         };
         let operation = PutObjectOperation::new(config);
