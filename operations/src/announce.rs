@@ -155,6 +155,7 @@ impl AnnounceTopicOperation {
                     document_id: *document_id,
                 });
             }
+            TopicId::Users(_) => {}
             TopicId::Node(_) => {}
         }
     }
