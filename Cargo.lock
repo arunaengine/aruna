@@ -369,6 +369,7 @@ dependencies = [
  "async-trait",
  "automerge",
  "autosurgeon",
+ "axum",
  "base64",
  "bytes",
  "byteview",

@@ -8,6 +8,7 @@ pub mod resolver;
 pub mod validation;
 
 pub use resolver::{
-    ResolveSourceConnectorInput, ResolveSourceConnectorOperation,
-    resolve_source_connector_suboperation,
+    ResolveSourceConnectorInput, ResolveSourceConnectorOperation, ResolveVersionSourceBindingInput,
+    ResolveVersionSourceBindingOperation, resolve_source_connector_suboperation,
+    resolve_version_source_binding_suboperation,
 };
