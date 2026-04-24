@@ -32,6 +32,7 @@ pub mod inspect_onboarding_secret;
 pub mod list_groups;
 pub mod list_metadata_documents;
 pub mod list_onboarding_secrets;
+pub mod list_users;
 pub mod metadata;
 pub mod outgoing_automerge;
 pub mod register_or_get_oidc_user;
