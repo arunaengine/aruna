@@ -193,6 +193,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             }
+
+            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
         }
     }
 

@@ -49,13 +49,35 @@ pub async fn announce_core_documents(
     node_id: NodeId,
     realm_id: &aruna_core::structs::RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    drive(
-        AnnounceTopicOperation::new(TopicId::realm(*realm_id), node_id),
-        driver_ctx,
-    )
-    .await?;
+    for topic in [TopicId::realm(*realm_id), TopicId::users(*realm_id)] {
+        drive(AnnounceTopicOperation::new(topic, node_id), driver_ctx).await?;
+    }
 
     Ok(())
+}
+
+async fn subscribe_topic(
+    driver_ctx: &DriverContext,
+    topic: TopicId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
+        return Err("net handle unavailable".into());
+    };
+
+    match net_handle
+        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
+            topic,
+        })))
+        .await
+    {
+        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. })) => Ok(()),
+        Event::Net(NetEvent::Gossip(GossipEvent::Error {
+            error: GossipError::AlreadySubscribed,
+        })) => Ok(()),
+        Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => Err(error.to_string().into()),
+        Event::Net(NetEvent::Error(error)) => Err(format!("{error:?}").into()),
+        other => Err(format!("unexpected gossip subscribe result: {other:?}").into()),
+    }
 }
 
 pub async fn fetch_core_onboarding_documents(
@@ -64,9 +86,6 @@ pub async fn fetch_core_onboarding_documents(
     realm_id: &aruna_core::structs::RealmId,
     bootstrap_peer: Option<NodeId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
-        return Err("net handle unavailable".into());
-    };
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
     let onboarding_sync_ticket = node_state
         .onboarding_sync_ticket
@@ -74,21 +93,8 @@ pub async fn fetch_core_onboarding_documents(
         .ok_or("missing onboarding sync ticket")?;
     let onboarding_sync_ticket = OnboardingSyncTicket::decode(onboarding_sync_ticket)?;
 
-    match net_handle
-        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-            topic: TopicId::realm(*realm_id),
-        })))
-        .await
-    {
-        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. })) => {}
-        Event::Net(NetEvent::Gossip(GossipEvent::Error {
-            error: GossipError::AlreadySubscribed,
-        })) => {}
-        Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => {
-            return Err(error.to_string().into());
-        }
-        Event::Net(NetEvent::Error(error)) => return Err(format!("{error:?}").into()),
-        other => return Err(format!("unexpected gossip subscribe result: {other:?}").into()),
+    for topic in [TopicId::realm(*realm_id), TopicId::users(*realm_id)] {
+        subscribe_topic(driver_ctx, topic).await?;
     }
 
     for document in onboarding_sync_ticket.payload.documents.clone() {
