@@ -17,12 +17,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
 const OIDC_HTTP_TIMEOUT_SECS: u64 = 5;
 const OIDC_HTTP_CONNECT_TIMEOUT_SECS: u64 = 2;
+const OIDC_PROVIDER_METADATA_CACHE_TTL_SECS: u64 = 300;
 
 #[derive(Debug)]
 pub struct OidcValidator {
@@ -34,6 +35,7 @@ pub struct OidcValidator {
 struct CachedOidcProviderMetadata {
     issuer: String,
     jwks: Value,
+    fetched_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +71,8 @@ struct OidcClaims {
     #[serde(default)]
     nbf: Option<u64>,
     aud: OidcAudience,
+    #[serde(default)]
+    azp: Option<String>,
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -145,6 +149,7 @@ impl OidcValidator {
         Ok(CachedOidcProviderMetadata {
             issuer: discovery.issuer,
             jwks,
+            fetched_at: Instant::now(),
         })
     }
 
@@ -153,15 +158,18 @@ impl OidcValidator {
         provider: &OidcProviderConfig,
         refresh: bool,
     ) -> Result<CachedOidcProviderMetadata, OidcError> {
-        if !refresh
-            && let Some(metadata) = self
+        if !refresh {
+            let ttl = Duration::from_secs(OIDC_PROVIDER_METADATA_CACHE_TTL_SECS);
+            if let Some(metadata) = self
                 .provider_metadata_cache
                 .read()
                 .await
                 .get(&provider.discovery_url)
+                .filter(|metadata| metadata.fetched_at.elapsed() < ttl)
                 .cloned()
-        {
-            return Ok(metadata);
+            {
+                return Ok(metadata);
+            }
         }
 
         let metadata = self.fetch_provider_metadata(provider).await?;
@@ -218,6 +226,7 @@ impl OidcValidator {
                 jsonwebtoken::errors::ErrorKind::InvalidAudience,
             )));
         }
+        validate_authorized_party(&claims.aud, claims.azp.as_deref(), &provider.audience)?;
         if claims.iss != provider.issuer {
             return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
                 jsonwebtoken::errors::ErrorKind::InvalidIssuer,
@@ -243,6 +252,22 @@ fn matches_audience(aud: &OidcAudience, expected: &str) -> bool {
         OidcAudience::Single(value) => value == expected,
         OidcAudience::Multiple(values) => values.iter().any(|value| value == expected),
     }
+}
+
+fn validate_authorized_party(
+    aud: &OidcAudience,
+    azp: Option<&str>,
+    expected: &str,
+) -> Result<(), OidcError> {
+    if let OidcAudience::Multiple(values) = aud
+        && values.len() > 1
+        && azp != Some(expected)
+    {
+        return Err(OidcError::Jwt(jsonwebtoken::errors::Error::from(
+            jsonwebtoken::errors::ErrorKind::InvalidAudience,
+        )));
+    }
+    Ok(())
 }
 
 fn oidc_display_name(claims: &OidcClaims) -> Option<String> {
@@ -409,7 +434,7 @@ pub async fn auth_middleware(
 
 #[cfg(test)]
 mod test {
-    use crate::auth::{OidcValidator, extract_auth_context};
+    use crate::auth::{OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, extract_auth_context};
     use crate::server::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -441,6 +466,7 @@ mod test {
     use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
     use tempfile::env::temp_dir;
     use tokio::net::TcpListener;
     use tokio::sync::RwLock;
@@ -467,6 +493,18 @@ mod test {
         sub: String,
         iss: String,
         aud: String,
+        exp: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    }
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct TestMultiAudienceOidcClaims {
+        sub: String,
+        iss: String,
+        aud: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        azp: Option<String>,
         exp: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         name: Option<String>,
@@ -558,6 +596,38 @@ mod test {
             aud: audience.to_string(),
             exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
             name: name.map(str::to_string),
+        };
+        let der = signing_key
+            .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
+            .unwrap();
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_ed_pem(der.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn sign_multi_audience_oidc_token(
+        issuer: &str,
+        audiences: &[&str],
+        azp: Option<&str>,
+        subject: &str,
+        kid: &str,
+        signing_key: &SigningKey,
+    ) -> String {
+        let mut header = Header::new(Algorithm::EdDSA);
+        header.kid = Some(kid.to_string());
+        let claims = TestMultiAudienceOidcClaims {
+            sub: subject.to_string(),
+            iss: issuer.to_string(),
+            aud: audiences
+                .iter()
+                .map(|audience| audience.to_string())
+                .collect(),
+            azp: azp.map(str::to_string),
+            exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
+            name: None,
         };
         let der = signing_key
             .to_pkcs8_pem(ed25519_dalek::pkcs8::spki::der::pem::LineEnding::LF)
@@ -722,6 +792,104 @@ mod test {
 
         assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 1);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oidc_validator_refreshes_expired_provider_metadata() {
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let jwks = eddsa_jwk(kid, &signing_key);
+        let (discovery_url, _jwks_uri, metrics, task) =
+            spawn_oidc_provider(issuer, kid, jwks).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let token = sign_oidc_token(
+            issuer,
+            audience,
+            "subject-1",
+            kid,
+            &signing_key,
+            Algorithm::EdDSA,
+            None,
+        );
+        let validator = OidcValidator::new().unwrap();
+
+        validator.validate(&provider, &token).await.unwrap();
+        let expired_at = Instant::now()
+            .checked_sub(Duration::from_secs(
+                OIDC_PROVIDER_METADATA_CACHE_TTL_SECS + 1,
+            ))
+            .unwrap();
+        validator
+            .provider_metadata_cache
+            .write()
+            .await
+            .get_mut(&provider.discovery_url)
+            .unwrap()
+            .fetched_at = expired_at;
+        validator.validate(&provider, &token).await.unwrap();
+
+        assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 2);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oidc_validator_requires_azp_for_multi_audience_token() {
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let jwks = eddsa_jwk(kid, &signing_key);
+        let (discovery_url, _jwks_uri, _metrics, task) =
+            spawn_oidc_provider(issuer, kid, jwks).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let validator = OidcValidator::new().unwrap();
+
+        let missing_azp = sign_multi_audience_oidc_token(
+            issuer,
+            &[audience, "other-client"],
+            None,
+            "subject-1",
+            kid,
+            &signing_key,
+        );
+        assert!(validator.validate(&provider, &missing_azp).await.is_err());
+
+        let wrong_azp = sign_multi_audience_oidc_token(
+            issuer,
+            &[audience, "other-client"],
+            Some("other-client"),
+            "subject-1",
+            kid,
+            &signing_key,
+        );
+        assert!(validator.validate(&provider, &wrong_azp).await.is_err());
+
+        let valid = sign_multi_audience_oidc_token(
+            issuer,
+            &[audience, "other-client"],
+            Some(audience),
+            "subject-1",
+            kid,
+            &signing_key,
+        );
+        let identity = validator.validate(&provider, &valid).await.unwrap();
+        assert_eq!(identity.subject_id, "subject-1");
 
         task.abort();
     }
