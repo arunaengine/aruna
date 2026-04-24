@@ -1,8 +1,12 @@
+pub mod descriptor;
 pub mod head_source;
 pub mod read_source;
+pub mod snapshot;
 
+pub use descriptor::*;
 pub use head_source::*;
 pub use read_source::*;
+pub use snapshot::*;
 
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 
