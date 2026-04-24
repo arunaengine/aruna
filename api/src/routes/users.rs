@@ -14,10 +14,11 @@ use aruna_operations::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
+use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use http::{HeaderMap, StatusCode};
@@ -33,6 +34,7 @@ use utoipa::{OpenApi, ToSchema};
     paths(
         register_user,
         get_token,
+        list_users,
         get_user,
     )
 )]
@@ -42,6 +44,7 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/users/register", post(register_user))
         .route("/users/token", get(get_token))
+        .route("/users", get(list_users))
         .route("/users/{id}", get(get_user))
 }
 
@@ -67,6 +70,21 @@ pub struct GetUserResponse {
     pub name: String,
     pub subject_ids: Vec<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListUsersQuery {
+    pub limit: Option<usize>,
+    pub start_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListUsersResponse {
+    pub users: Vec<GetUserResponse>,
+    pub next_start_after: Option<String>,
+}
+
+const DEFAULT_LIST_USERS_LIMIT: usize = 100;
+const MAX_LIST_USERS_LIMIT: usize = 1_000;
 
 impl From<User> for GetUserResponse {
     fn from(value: User) -> Self {
@@ -318,6 +336,65 @@ async fn get_token(
     let token = issue_user_token(&state, user_id, expiry).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/users",
+    tag = "users",
+    params(
+        ("limit" = Option<usize>, Query, description = "Maximum users to return"),
+        ("start_after" = Option<String>, Query, description = "Exclusive user id cursor")
+    ),
+    responses(
+        (status = 200, description = "Users listed", body = ListUsersResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_users(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<ListUsersQuery>,
+) -> ServerResult<(StatusCode, Json<ListUsersResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+    if auth.realm_id != realm_id {
+        return Err(ServerError::Forbidden);
+    }
+
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_LIST_USERS_LIMIT)
+        .clamp(1, MAX_LIST_USERS_LIMIT);
+    let output = drive(
+        ListUsersOperation::new(ListUsersInput {
+            auth_context: auth,
+            self_realm_id: realm_id,
+            limit,
+            start_after: query.start_after,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        aruna_operations::list_users::ListUsersError::Unauthorized => ServerError::Forbidden,
+        aruna_operations::list_users::ListUsersError::ConversionError(_) => ServerError::BadRequest,
+        aruna_operations::list_users::ListUsersError::AuthorizationError(_) => {
+            ServerError::Forbidden
+        }
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ListUsersResponse {
+            users: output.users.into_iter().map(Into::into).collect(),
+            next_start_after: output.next_start_after,
+        }),
+    ))
 }
 
 #[utoipa::path(
