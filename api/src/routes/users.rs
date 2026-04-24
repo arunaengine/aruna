@@ -23,6 +23,7 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::trace;
 use ulid::Ulid;
@@ -69,6 +70,7 @@ pub struct GetUserResponse {
     pub user_id: String,
     pub name: String,
     pub subject_ids: Vec<String>,
+    pub attributes: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -92,6 +94,7 @@ impl From<User> for GetUserResponse {
             name: value.name,
             user_id: value.user_id.to_string(),
             subject_ids: value.subject_ids,
+            attributes: value.attributes,
         }
     }
 }
@@ -974,6 +977,7 @@ mod tests {
                         user_id: foreign_user_id,
                         name: "Foreign User".to_string(),
                         subject_ids: Vec::new(),
+                        attributes: Default::default(),
                     }
                     .to_bytes(&Actor {
                         node_id: node.net.node_id(),

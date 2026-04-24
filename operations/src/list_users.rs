@@ -265,6 +265,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([seed; 16]), realm_id),
             name: name.to_string(),
             subject_ids: Vec::new(),
+            attributes: Default::default(),
         }
     }
 

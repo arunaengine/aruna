@@ -158,6 +158,7 @@ impl RegisterOrGetOidcUserOperation {
             user_id: self.input.user_id,
             name: self.input.name.clone(),
             subject_ids: vec![self.subject_key()?],
+            attributes: Default::default(),
         };
 
         self.state = RegisterOrGetOidcUserState::WriteUser {
@@ -404,6 +405,7 @@ mod tests {
             user_id,
             name: "alice".to_string(),
             subject_ids: vec![oidc_subject_key("https://issuer.example", "subject-1").unwrap()],
+            attributes: Default::default(),
         };
 
         let effects = operation.start();
@@ -486,6 +488,7 @@ mod tests {
             user_id,
             name: "bob".to_string(),
             subject_ids: vec![oidc_subject_key("https://issuer.example", "subject-2").unwrap()],
+            attributes: Default::default(),
         };
         let mut operation = RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
             actor: Actor {

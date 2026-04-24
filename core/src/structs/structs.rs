@@ -255,6 +255,9 @@ pub struct User {
     pub user_id: UserId,
     pub name: String,
     pub subject_ids: Vec<String>,
+    #[serde(default)]
+    #[autosurgeon(missing = "Default::default")]
+    pub attributes: HashMap<String, String>,
 }
 
 #[cfg(test)]
@@ -294,7 +297,7 @@ impl User {
 #[cfg(test)]
 mod test {
     use crate::UserId;
-    use crate::structs::{Permission, RealmId, Role};
+    use crate::structs::{Actor, Permission, RealmId, Role, User};
     use autosurgeon::{hydrate, reconcile};
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
@@ -320,5 +323,27 @@ mod test {
         let hydrated_role: Role = hydrate(&stored_automerge_doc).unwrap();
 
         assert_eq!(role, hydrated_role);
+    }
+
+    #[test]
+    pub fn test_user_attributes_roundtrip() {
+        let realm_id = RealmId([2u8; 32]);
+        let user_id = UserId::new(Ulid::new(), realm_id);
+        let user = User {
+            user_id,
+            name: "alice".to_string(),
+            subject_ids: Vec::new(),
+            attributes: HashMap::from([("orcid".to_string(), "0000-0002-1825-0097".to_string())]),
+        };
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+
+        let bytes = user.to_bytes(&actor).unwrap();
+        let hydrated_user = User::from_bytes(&bytes).unwrap();
+
+        assert_eq!(user, hydrated_user);
     }
 }
