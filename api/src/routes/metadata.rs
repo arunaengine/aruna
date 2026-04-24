@@ -1,3 +1,4 @@
+use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::effects::Effect;
@@ -1012,10 +1013,6 @@ pub async fn search_metadata(
     ))
 }
 
-fn parse_group_id(group_id: &str) -> ServerResult<Ulid> {
-    Ulid::from_string(group_id).map_err(|_| ServerError::BadRequest)
-}
-
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
 }
@@ -1069,14 +1066,6 @@ fn map_metadata_error(error: MetadataError) -> ServerError {
         MetadataError::InvalidInput(_) => ServerError::BadRequest,
         other => ServerError::InternalError(other.to_string()),
     }
-}
-
-fn require_realm_auth(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
-    Ok(auth)
 }
 
 async fn ensure_metadata_write_scope(

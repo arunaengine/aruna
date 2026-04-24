@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
@@ -359,20 +360,8 @@ pub async fn delete_source_connector(
     Ok(StatusCode::NO_CONTENT)
 }
 
-fn parse_group_id(group_id: &str) -> ServerResult<Ulid> {
-    Ulid::from_str(group_id).map_err(|_| ServerError::BadRequest)
-}
-
 fn parse_connector_id(connector_id: &str) -> ServerResult<Ulid> {
     Ulid::from_str(connector_id).map_err(|_| ServerError::BadRequest)
-}
-
-fn require_realm_auth(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
-    if auth.realm_id != state.get_realm_id() {
-        return Err(ServerError::Forbidden);
-    }
-    Ok(auth)
 }
 
 async fn ensure_group_data_permission(

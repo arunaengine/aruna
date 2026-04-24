@@ -1,8 +1,10 @@
-use crate::error::TokenError;
+use crate::error::{ServerError, ServerResult, TokenError};
 use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{AuthContext, RealmId, TokenClaims};
+use aruna_core::structs::{AuthContext, Permission, RealmId, TokenClaims};
+use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use aruna_operations::driver::drive;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
@@ -15,6 +17,7 @@ use s3s::header;
 use std::str::FromStr;
 use thiserror::Error;
 use tracing::warn;
+use ulid::Ulid;
 
 #[derive(Debug)]
 pub struct OidcValidator {}
@@ -126,6 +129,62 @@ pub async fn auth_middleware(
 
     // Always continue to handler
     next.run(request).await
+}
+
+pub(crate) fn parse_group_id(group_id: &str) -> ServerResult<Ulid> {
+    Ulid::from_str(group_id).map_err(|_| ServerError::BadRequest)
+}
+
+pub(crate) fn parse_source_connector_id(connector_id: &str) -> ServerResult<Ulid> {
+    Ulid::from_str(connector_id).map_err(|_| ServerError::BadRequest)
+}
+
+pub(crate) fn require_realm_auth(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> ServerResult<AuthContext> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+    Ok(auth)
+}
+
+pub(crate) async fn ensure_permission(
+    state: &ServerState,
+    auth: &AuthContext,
+    path: String,
+    required_permission: Permission,
+) -> ServerResult<()> {
+    let allowed = drive(
+        CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: auth.clone(),
+            path,
+            required_permission,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(ServerError::Forbidden)
+    }
+}
+
+pub(crate) fn bucket_blob_permission_path(
+    state: &ServerState,
+    group_id: Ulid,
+    bucket: &str,
+    key: &str,
+) -> String {
+    format!(
+        "/{}/g/{group_id}/data/{}/{bucket}/{key}",
+        state.get_realm_id(),
+        state.get_node_id(),
+    )
 }
 
 #[cfg(test)]
