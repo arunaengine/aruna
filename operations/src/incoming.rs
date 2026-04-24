@@ -137,7 +137,12 @@ impl InboundEventHandler for OperationsInboundHandler {
                         return;
                     };
                     let sync_id = automerge_handle.register_inbound_stream(stream, node_id).await;
-                    let op = IncomingAutomergeOperation::new(sync_id, node_id, net_handle.node_id());
+                    let op = IncomingAutomergeOperation::new(
+                        sync_id,
+                        node_id,
+                        net_handle.node_id(),
+                        *net_handle.realm_id(),
+                    );
                     if let Err(err) = drive(op, self.context.as_ref()).await {
                         error!(error = ?err, "Failed to process inbound automerge stream event");
                     }
