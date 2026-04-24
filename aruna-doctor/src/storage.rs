@@ -744,6 +744,7 @@ mod tests {
                     },
                     expected_checksums: vec![],
                     checksum_type: None,
+                    version_source: None,
                     exists: false,
                 }),
                 context.as_ref(),
