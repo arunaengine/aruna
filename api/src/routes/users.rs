@@ -336,7 +336,7 @@ async fn register_admin(
     tag = "users",
     request_body = RegisterUserRequest,
     responses(
-        (status = 201, description = "User registered via onboarding secret", body = RegisterUserResponse),
+        (status = 201, description = "User registered", body = RegisterUserResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse)
@@ -394,7 +394,7 @@ async fn register_user(
     path = "/users/token",
     tag = "users",
     responses(
-        (status = 201, description = "Group created", body = GetTokenResponse),
+        (status = 200, description = "Token issued", body = GetTokenResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
         (status = 403, description = "Forbidden", body = ErrorResponse)
@@ -430,7 +430,6 @@ async fn get_token(
         }
     };
 
-    // TODO: expiry
     let expiry = None;
     let token = issue_user_token(&state, user_id, expiry).await?;
 
@@ -502,10 +501,11 @@ async fn list_users(
     tag = "users",
     params(("id" = String, Path, description = "User id")),
     responses(
-        (status = 201, description = "Group created", body = GetUserResponse),
+        (status = 200, description = "User fetched", body = GetUserResponse),
         (status = 400, description = "Invalid request", body = ErrorResponse),
         (status = 401, description = "Unauthorized", body = ErrorResponse),
-        (status = 403, description = "Forbidden", body = ErrorResponse)
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
