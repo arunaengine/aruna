@@ -1,6 +1,6 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
-use crate::structs::{PathRestriction, RealmId};
+use crate::structs::{PathRestriction, RealmId, VersionSourceBinding, VersionState};
 use crate::types::UserId;
 use byteview::ByteView;
 use core::fmt;
@@ -104,7 +104,7 @@ impl From<(String, u64)> for BackendBucket {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendLocation {
     pub root: String,
     pub storage_bucket: String,
@@ -254,7 +254,7 @@ impl VersionKey {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Location {
     Real(BackendLocation),
     Deleted,
@@ -270,15 +270,39 @@ impl Location {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VersionMetadata {
     pub version_id: Ulid,
-    pub location: Location,
+    pub state: VersionState,
     pub created_at: SystemTime,
     pub created_by: UserId,
 }
 
 impl VersionMetadata {
+    pub fn materialized(
+        version_id: Ulid,
+        location: BackendLocation,
+        created_at: SystemTime,
+        created_by: UserId,
+        source: Option<VersionSourceBinding>,
+    ) -> Self {
+        Self {
+            version_id,
+            state: VersionState::Materialized { location, source },
+            created_at,
+            created_by,
+        }
+    }
+
+    pub fn deleted(version_id: Ulid, created_at: SystemTime, created_by: UserId) -> Self {
+        Self {
+            version_id,
+            state: VersionState::Deleted,
+            created_at,
+            created_by,
+        }
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(&self)?)
     }
@@ -286,13 +310,26 @@ impl VersionMetadata {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
-}
 
-pub enum MaterializationStrategy {
-    Local,
-    Reference,
-    Snapshot,
-    Sync,
+    pub fn materialized_location(&self) -> Option<&BackendLocation> {
+        self.state.materialized_location()
+    }
+
+    pub fn lookup_location(&self) -> Option<Location> {
+        self.state.lookup_location()
+    }
+
+    pub fn source_binding(&self) -> Option<&VersionSourceBinding> {
+        self.state.source_binding()
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.state.is_deleted()
+    }
+
+    pub fn is_materialized(&self) -> bool {
+        self.state.is_materialized()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]

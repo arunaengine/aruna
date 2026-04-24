@@ -7,6 +7,7 @@ mod realm;
 mod replication;
 mod source_access;
 mod source_connector;
+mod staging;
 #[allow(clippy::module_inception)]
 mod structs;
 
@@ -18,4 +19,5 @@ pub use realm::*;
 pub use replication::*;
 pub use source_access::*;
 pub use source_connector::*;
+pub use staging::*;
 pub use structs::*;

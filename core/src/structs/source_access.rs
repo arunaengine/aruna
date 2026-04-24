@@ -1,4 +1,5 @@
 use super::source_connector::{SourceConnector, SourceConnectorKind};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -17,7 +18,7 @@ pub struct ResolvedSourceConnector {
     pub access: ResolvedSourceAccess,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceMetadata {
     pub content_length: u64,
     pub content_type: Option<String>,
