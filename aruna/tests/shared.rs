@@ -464,9 +464,13 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         .to_str()
         .ok_or_else(|| std::io::Error::other("invalid temp path"))?;
     let storage = FjallStorage::open(storage_path)?;
+    let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+    let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+    let user_id = UserId::new(Ulid::new(), realm_id);
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            realm_id,
             use_dns_discovery: false,
             ..NetConfig::default()
         },
@@ -477,9 +481,6 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::for_temp_dir(&temp_dir));
     let context = initialize_context(storage, net.clone(), full_storage_config.as_ref()).await?;
 
-    let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
-    let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = UserId::new(Ulid::new(), realm_id);
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
             actor: Actor {
