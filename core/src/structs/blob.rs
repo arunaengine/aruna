@@ -1,6 +1,8 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
-use crate::structs::{PathRestriction, RealmId, VersionSourceBinding, VersionState};
+use crate::structs::{
+    PathRestriction, RealmId, SourceMetadata, VersionSourceBinding, VersionState,
+};
 use crate::types::UserId;
 use byteview::ByteView;
 use core::fmt;
@@ -271,6 +273,25 @@ impl Location {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CurrentVersionPointer {
+    pub version_id: Ulid,
+}
+
+impl CurrentVersionPointer {
+    pub fn new(version_id: Ulid) -> Self {
+        Self { version_id }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VersionMetadata {
     pub version_id: Ulid,
     pub state: VersionState,
@@ -298,6 +319,26 @@ impl VersionMetadata {
         Self {
             version_id,
             state: VersionState::Deleted,
+            created_at,
+            created_by,
+        }
+    }
+
+    pub fn reference(
+        version_id: Ulid,
+        source: VersionSourceBinding,
+        cached_metadata: SourceMetadata,
+        created_at: SystemTime,
+        created_by: UserId,
+        last_refresh: SystemTime,
+    ) -> Self {
+        Self {
+            version_id,
+            state: VersionState::Reference {
+                source,
+                cached_metadata,
+                last_refresh,
+            },
             created_at,
             created_by,
         }
@@ -384,5 +425,20 @@ impl UserAccess {
 
     pub fn is_revoked(&self) -> bool {
         self.revoked_at.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CurrentVersionPointer;
+    use ulid::Ulid;
+
+    #[test]
+    fn current_version_pointer_roundtrip_preserves_version_id() {
+        let pointer = CurrentVersionPointer::new(Ulid::from_bytes([7u8; 16]));
+
+        let restored = CurrentVersionPointer::from_bytes(&pointer.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(pointer, restored);
     }
 }

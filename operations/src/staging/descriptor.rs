@@ -2,6 +2,7 @@ use aruna_core::NodeId;
 use aruna_core::structs::{
     PortableSourceDescriptor, SourceConnector, StagingStrategy, VersionSourceBinding,
 };
+use ulid::Ulid;
 
 pub fn build_portable_source_descriptor(
     connector: &SourceConnector,
@@ -23,10 +24,12 @@ pub fn build_version_source_binding(
     connector: &SourceConnector,
     source_path: String,
     origin_node_id: Option<NodeId>,
+    connector_id: Option<Ulid>,
 ) -> VersionSourceBinding {
     VersionSourceBinding {
         strategy,
         descriptor: build_portable_source_descriptor(connector, source_path, origin_node_id),
+        connector_id,
     }
 }
 
@@ -78,9 +81,11 @@ mod tests {
             &sample_connector(),
             "folder/blob.bin".to_string(),
             None,
+            Some(Ulid::from_bytes([9u8; 16])),
         );
 
         assert_eq!(binding.strategy, StagingStrategy::Snapshot);
         assert_eq!(binding.descriptor.source_path, "folder/blob.bin");
+        assert_eq!(binding.connector_id, Some(Ulid::from_bytes([9u8; 16])));
     }
 }

@@ -2,6 +2,7 @@ use crate::id::NodeId;
 use crate::structs::{SourceConnectorKind, SourceMetadata};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +26,7 @@ pub struct PortableSourceDescriptor {
 pub struct VersionSourceBinding {
     pub strategy: StagingStrategy,
     pub descriptor: PortableSourceDescriptor,
+    pub connector_id: Option<Ulid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -106,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn version_source_binding_roundtrip_preserves_strategy() {
+    fn version_source_binding_roundtrip_preserves_strategy_and_connector_id() {
         let binding = VersionSourceBinding {
             strategy: StagingStrategy::Snapshot,
             descriptor: PortableSourceDescriptor {
@@ -120,6 +122,7 @@ mod tests {
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
+            connector_id: Some(Ulid::from_bytes([4u8; 16])),
         };
 
         let restored: VersionSourceBinding =
@@ -172,6 +175,7 @@ mod tests {
                 capabilities: vec!["head".to_string()],
                 origin_node_id: None,
             },
+            connector_id: None,
         };
         let state = VersionState::Reference {
             source: binding.clone(),

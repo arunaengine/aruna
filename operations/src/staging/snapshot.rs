@@ -62,6 +62,7 @@ pub async fn materialize_snapshot(
         &read_result.connector,
         input.source_path,
         Some(input.node_id),
+        Some(read_result.connector.connector_id),
     );
     let put_result = drive(
         PutObjectOperation::new(PutObjectConfig {
