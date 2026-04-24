@@ -1,4 +1,5 @@
 use crate::s3::checksum::checksum_mismatch_error;
+use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_operations::s3::abort_multipart_upload::AbortMultipartUploadError;
 use aruna_operations::s3::complete_multipart_upload::CompleteMultipartUploadError;
 use aruna_operations::s3::create_bucket::CreateBucketError;
@@ -172,6 +173,22 @@ impl IntoS3Error for GetObjectError {
             GetObjectError::NoSuchVersion => no_such_version_error(),
             GetObjectError::DeleteMarker => delete_marker_error(),
             GetObjectError::NoSuchKey => no_such_key_error(),
+            GetObjectError::ResolveReferenceError(error) => match error {
+                SourceConnectorResolutionError::ResolveFailed
+                | SourceConnectorResolutionError::NotFound => {
+                    s3_error!(
+                        ServiceUnavailable,
+                        "Reference source is currently unavailable"
+                    )
+                }
+                err => internal_error(err),
+            },
+            GetObjectError::StagingSourceError(error) => match error {
+                StagingSourceError::NotFound => {
+                    s3_error!(NoSuchKey, "The referenced source object does not exist.")
+                }
+                err => s3_error!(ServiceUnavailable, "{}", err),
+            },
             err => internal_error(err),
         }
     }

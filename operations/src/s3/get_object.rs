@@ -1,19 +1,26 @@
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use crate::connectors::{
+    ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
+};
+use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::errors::{
+    ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
+};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
+    S3_CURRENT_VERSION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, Location, LookupKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, UserIdentity, VersionKey, VersionMetadata, VersionState,
+    BackendLocation, CurrentVersionPointer, LookupKey, MultipartChecksumType,
+    MultipartObjectMetadataKey, MultipartObjectSummary, ResolvedSourceAccess, SourceMetadata,
+    UserIdentity, VersionKey, VersionMetadata, VersionState,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
 use smallvec::{SmallVec, smallvec};
 use std::ops::Range;
+use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -22,11 +29,17 @@ pub enum GetObjectState {
     Init,
     StartTransaction,
     GetVersion,
-    GetLookup,
-    ResolveVersion,
+    GetCurrentVersion,
+    ResolveReferenceAccess,
     ReadMultipartSummary,
     CommitTransaction,
     GetBlob,
+    ReadReferenceSource,
+    StartRefreshTransaction,
+    ReadRefreshVersion,
+    WriteRefreshedReferenceVersion,
+    CommitRefreshTransaction,
+    AbortRefreshTransaction,
     Finish,
     Error,
 }
@@ -56,8 +69,10 @@ pub enum GetObjectError {
     NoSuchVersion,
     #[error("The specified version is a delete marker.")]
     DeleteMarker,
-    #[error("Reference-bearing versions are not supported yet")]
-    UnsupportedVersionState,
+    #[error(transparent)]
+    ResolveReferenceError(#[from] SourceConnectorResolutionError),
+    #[error(transparent)]
+    StagingSourceError(#[from] StagingSourceError),
     #[error("GetObject failed (miserably)")]
     GetObjectFailed,
 }
@@ -75,7 +90,9 @@ pub struct GetObjectInput {
 #[derive(Debug, PartialEq)]
 pub struct GetObjectResult {
     pub blob: BackendStream<Result<Bytes, StreamError>>,
-    pub location: BackendLocation,
+    pub location: Option<BackendLocation>,
+    pub source_metadata: Option<SourceMetadata>,
+    pub last_refresh: Option<SystemTime>,
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
@@ -87,6 +104,10 @@ pub struct GetObjectOperation {
     state: GetObjectState,
     txn_id: Option<Ulid>,
     location: Option<BackendLocation>,
+    reference_access: Option<ResolvedSourceAccess>,
+    reference_stream: Option<BackendStream<Result<Bytes, StreamError>>>,
+    source_metadata: Option<SourceMetadata>,
+    last_refresh: Option<SystemTime>,
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
     output: Option<Result<GetObjectResult, GetObjectError>>,
@@ -99,6 +120,10 @@ impl GetObjectOperation {
             state: GetObjectState::Init,
             txn_id: None,
             location: None,
+            reference_access: None,
+            reference_stream: None,
+            source_metadata: None,
+            last_refresh: None,
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
             output: None,
@@ -142,14 +167,14 @@ impl GetObjectOperation {
                     txn_id: self.txn_id,
                 })]
             } else {
-                self.state = GetObjectState::GetLookup;
+                self.state = GetObjectState::GetCurrentVersion;
 
                 let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
                     Ok(key) => key.into(),
                     Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
                 };
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                     key,
                     txn_id: self.txn_id,
                 })]
@@ -173,7 +198,11 @@ impl GetObjectOperation {
         };
 
         let Some(val) = value else {
-            return self.emit_error(GetObjectError::NoSuchVersion);
+            return self.emit_error(if self.input.version_id.is_some() {
+                GetObjectError::NoSuchVersion
+            } else {
+                GetObjectError::NoSuchKey
+            });
         };
 
         let metadata = match VersionMetadata::from_bytes(val.as_ref()) {
@@ -181,18 +210,10 @@ impl GetObjectOperation {
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
-        let location = match metadata.state {
-            VersionState::Materialized { location, .. } => location,
-            VersionState::Deleted => return self.emit_error(GetObjectError::DeleteMarker),
-            VersionState::Reference { .. } => {
-                return self.emit_error(GetObjectError::UnsupportedVersionState);
-            }
-        };
-
-        self.read_multipart_summary(location, Some(metadata.version_id))
+        self.read_version(metadata, self.input.version_id.is_some())
     }
 
-    pub fn handle_received_lookup(&mut self, event: Event) -> Effects {
+    fn handle_received_current_version(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -205,54 +226,77 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::NoSuchKey);
         };
 
-        let location = match Location::from_bytes(val.as_ref()) {
-            Ok(Location::Real(location)) => location,
-            Ok(Location::Deleted) => return self.emit_error(GetObjectError::NoSuchKey),
+        let pointer = match CurrentVersionPointer::from_bytes(val.as_ref()) {
+            Ok(pointer) => pointer,
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectError::NoTransactionFound);
-        };
-        let prefix = match VersionKey::object_prefix(&self.input.bucket, &self.input.key) {
-            Ok(prefix) => prefix.into(),
+        let key = match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
+            .to_bytes()
+        {
+            Ok(key) => key.into(),
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
-        self.location = Some(location);
-        self.state = GetObjectState::ResolveVersion;
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        self.resolved_version_id = Some(pointer.version_id);
+        self.state = GetObjectState::GetVersion;
+        smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_VERSION_KEYSPACE.to_string(),
-            prefix: Some(prefix),
-            start_after: None,
-            limit: 10_000,
-            txn_id: Some(txn_id),
+            key,
+            txn_id: self.txn_id,
         })]
     }
 
-    pub fn handle_resolved_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
+    fn read_version(
+        &mut self,
+        metadata: VersionMetadata,
+        explicit_version_request: bool,
+    ) -> Effects {
+        let version_id = metadata.version_id;
+
+        let location = match metadata.state {
+            VersionState::Materialized { location, .. } => location,
+            VersionState::Deleted => {
+                return self.emit_error(if explicit_version_request {
+                    GetObjectError::DeleteMarker
+                } else {
+                    GetObjectError::NoSuchKey
+                });
+            }
+            VersionState::Reference { source, .. } => {
+                self.location = None;
+                self.reference_access = None;
+                self.reference_stream = None;
+                self.source_metadata = None;
+                self.last_refresh = None;
+                self.resolved_version_id = Some(version_id);
+                self.state = GetObjectState::ResolveReferenceAccess;
+                return smallvec![resolve_version_source_binding_suboperation(
+                    ResolveVersionSourceBindingInput { source },
+                )];
+            }
+        };
+
+        self.read_multipart_summary(location, Some(version_id))
+    }
+
+    fn handle_resolved_reference_access(&mut self, event: Event) -> Effects {
+        match event {
+            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                result: Ok(access),
+            }) => {
+                self.reference_access = Some(access);
+                self.commit_and_read_reference()
+            }
+            Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
+                result: Err(error),
+            }) => self.emit_error(error.into()),
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
                 state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
-            });
-        };
-
-        let resolved_version_id = values
-            .into_iter()
-            .filter_map(|(key, value)| {
-                let version_key = VersionKey::from_bytes(key.as_ref()).ok()?;
-                let metadata = VersionMetadata::from_bytes(value.as_ref()).ok()?;
-                metadata.is_materialized().then_some(version_key.version_id)
-            })
-            .max();
-
-        let Some(location) = self.location.clone() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-
-        self.read_multipart_summary(location, resolved_version_id)
+                expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
+                received: other,
+            }),
+        }
     }
 
     fn read_multipart_summary(
@@ -316,9 +360,32 @@ impl GetObjectOperation {
         ]
     }
 
+    fn commit_and_read_reference(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(GetObjectError::NoTransactionFound);
+        };
+        let Some(access) = self.reference_access.clone() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+
+        self.state = GetObjectState::CommitTransaction;
+        smallvec![
+            Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
+            Effect::StagingSource(StagingSourceEffect::Read {
+                access,
+                range: self.input.range.clone(),
+            })
+        ]
+    }
+
     pub fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
-            self.state = GetObjectState::GetBlob;
+            self.txn_id = None;
+            self.state = if self.reference_access.is_some() {
+                GetObjectState::ReadReferenceSource
+            } else {
+                GetObjectState::GetBlob
+            };
             smallvec![]
         } else {
             self.emit_error(GetObjectError::InvalidStateEvent {
@@ -337,8 +404,10 @@ impl GetObjectOperation {
             self.state = GetObjectState::Finish;
             self.output = Some(Ok(GetObjectResult {
                 blob,
-                location,
-                version_id: self.input.version_id,
+                location: Some(location),
+                source_metadata: None,
+                last_refresh: None,
+                version_id: self.resolved_version_id.or(self.input.version_id),
                 resolved_version_id: self.resolved_version_id,
                 checksum_type: self.checksum_type,
             }));
@@ -350,6 +419,194 @@ impl GetObjectOperation {
                 received: event,
             })
         }
+    }
+
+    pub fn handle_received_reference_source(&mut self, event: Event) -> Effects {
+        match event {
+            Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
+                self.last_refresh = Some(SystemTime::now());
+                self.source_metadata = Some(metadata);
+                self.reference_stream = Some(stream);
+                self.state = GetObjectState::StartRefreshTransaction;
+                smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                    read: false
+                })]
+            }
+            Event::StagingSource(StagingSourceEvent::Error { error }) => {
+                self.emit_error(error.into())
+            }
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::StagingSource(StagingSourceEvent::ReadResult)",
+                received: other,
+            }),
+        }
+    }
+
+    fn handle_refresh_transaction_started(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
+                let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
+                    return self.finish_reference_output();
+                };
+
+                let key = match VersionKey::new(&self.input.bucket, &self.input.key, version_id)
+                    .to_bytes()
+                {
+                    Ok(key) => key.into(),
+                    Err(_) => return self.finish_reference_output(),
+                };
+
+                self.txn_id = Some(txn_id);
+                self.state = GetObjectState::ReadRefreshVersion;
+                smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: S3_VERSION_KEYSPACE.to_string(),
+                    key,
+                    txn_id: Some(txn_id),
+                })]
+            }
+            Event::Storage(StorageEvent::Error { .. }) => self.finish_reference_output(),
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionStarted)",
+                received: other,
+            }),
+        }
+    }
+
+    fn handle_refresh_version_read(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                let Some(value) = value else {
+                    return self.abort_refresh_or_finish();
+                };
+                let Ok(metadata) = VersionMetadata::from_bytes(value.as_ref()) else {
+                    return self.abort_refresh_or_finish();
+                };
+                let VersionState::Reference { source, .. } = metadata.state else {
+                    return self.abort_refresh_or_finish();
+                };
+                let Some(source_metadata) = self.source_metadata.clone() else {
+                    return self.abort_refresh_or_finish();
+                };
+                let Some(txn_id) = self.txn_id else {
+                    return self.finish_reference_output();
+                };
+                let key =
+                    match VersionKey::new(&self.input.bucket, &self.input.key, metadata.version_id)
+                        .to_bytes()
+                    {
+                        Ok(key) => key.into(),
+                        Err(_) => return self.abort_refresh_or_finish(),
+                    };
+                let value = match VersionMetadata::reference(
+                    metadata.version_id,
+                    source,
+                    source_metadata,
+                    metadata.created_at,
+                    metadata.created_by,
+                    self.last_refresh.unwrap_or_else(SystemTime::now),
+                )
+                .to_bytes()
+                {
+                    Ok(value) => value.into(),
+                    Err(_) => return self.abort_refresh_or_finish(),
+                };
+
+                self.state = GetObjectState::WriteRefreshedReferenceVersion;
+                smallvec![Effect::Storage(StorageEffect::Write {
+                    key_space: S3_VERSION_KEYSPACE.to_string(),
+                    key,
+                    value,
+                    txn_id: Some(txn_id),
+                })]
+            }
+            Event::Storage(StorageEvent::Error { .. }) => self.abort_refresh_or_finish(),
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: other,
+            }),
+        }
+    }
+
+    fn handle_refreshed_reference_version_written(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {
+                let Some(txn_id) = self.txn_id else {
+                    return self.finish_reference_output();
+                };
+
+                self.state = GetObjectState::CommitRefreshTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Event::Storage(StorageEvent::Error { .. }) => self.abort_refresh_or_finish(),
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::WriteResult)",
+                received: other,
+            }),
+        }
+    }
+
+    fn handle_refresh_transaction_committed(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionCommitted { .. })
+            | Event::Storage(StorageEvent::Error { .. }) => {
+                self.txn_id = None;
+                self.finish_reference_output()
+            }
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
+                received: other,
+            }),
+        }
+    }
+
+    fn handle_refresh_transaction_aborted(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Storage(StorageEvent::TransactionAborted { .. })
+            | Event::Storage(StorageEvent::Error { .. }) => {
+                self.txn_id = None;
+                self.finish_reference_output()
+            }
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::TransactionAborted)",
+                received: other,
+            }),
+        }
+    }
+
+    fn abort_refresh_or_finish(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id.take() else {
+            return self.finish_reference_output();
+        };
+
+        self.state = GetObjectState::AbortRefreshTransaction;
+        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    }
+
+    fn finish_reference_output(&mut self) -> Effects {
+        let Some(blob) = self.reference_stream.take() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+        let Some(source_metadata) = self.source_metadata.clone() else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+
+        self.state = GetObjectState::Finish;
+        self.output = Some(Ok(GetObjectResult {
+            blob,
+            location: None,
+            source_metadata: Some(source_metadata),
+            last_refresh: self.last_refresh,
+            version_id: self.resolved_version_id.or(self.input.version_id),
+            resolved_version_id: self.resolved_version_id,
+            checksum_type: self.checksum_type,
+        }));
+        smallvec![]
     }
 }
 
@@ -366,11 +623,25 @@ impl Operation for GetObjectOperation {
             GetObjectState::Init => self.handle_init(),
             GetObjectState::StartTransaction => self.handle_transaction_started(event),
             GetObjectState::GetVersion => self.handle_received_version(event),
-            GetObjectState::GetLookup => self.handle_received_lookup(event),
-            GetObjectState::ResolveVersion => self.handle_resolved_version(event),
+            GetObjectState::GetCurrentVersion => self.handle_received_current_version(event),
+            GetObjectState::ResolveReferenceAccess => self.handle_resolved_reference_access(event),
             GetObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
+            GetObjectState::ReadReferenceSource => self.handle_received_reference_source(event),
+            GetObjectState::StartRefreshTransaction => {
+                self.handle_refresh_transaction_started(event)
+            }
+            GetObjectState::ReadRefreshVersion => self.handle_refresh_version_read(event),
+            GetObjectState::WriteRefreshedReferenceVersion => {
+                self.handle_refreshed_reference_version_written(event)
+            }
+            GetObjectState::CommitRefreshTransaction => {
+                self.handle_refresh_transaction_committed(event)
+            }
+            GetObjectState::AbortRefreshTransaction => {
+                self.handle_refresh_transaction_aborted(event)
+            }
             GetObjectState::Finish => smallvec![],
             GetObjectState::Error => self.abort(),
         }
@@ -400,24 +671,46 @@ impl Operation for GetObjectOperation {
 #[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
-    use crate::s3::get_object::{GetObjectInput, GetObjectOperation, GetObjectState};
+    use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
+    use aruna_core::keyspaces::{
+        S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
+    };
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, Location, LookupKey, MultipartChecksumType,
-        RealmId, UserIdentity,
+        Backend, BackendConfig, BackendLocation, CurrentVersionPointer, Location, LookupKey,
+        MultipartChecksumType, PortableSourceDescriptor, RealmId, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, UserIdentity, VersionKey, VersionMetadata,
+        VersionSourceBinding, VersionState,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
+    use axum::{Router, routing::get};
     use futures_util::StreamExt;
     use std::collections::HashMap;
     use std::path::Path;
     use std::time::SystemTime;
     use tempfile::tempdir;
+    use tokio::net::TcpListener;
     use ulid::Ulid;
+
+    async fn spawn_reference_server(body: &'static [u8]) -> String {
+        let app =
+            Router::new().route(
+                "/folder/file.txt",
+                get(move || async move {
+                    ([("content-type", "text/plain"), ("etag", "etag-123")], body)
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{}", addr)
+    }
 
     #[tokio::test]
     pub async fn test_get_object() {
@@ -491,11 +784,36 @@ mod test {
                 .await;
 
             let object_lookup_key = LookupKey::object(&bucket, &key).to_bytes().unwrap();
+            let version_id = Ulid::new();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                     key: object_lookup_key.into(),
-                    value: Location::Real(location.clone()).to_bytes().unwrap().into(),
+                    value: CurrentVersionPointer::new(version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    txn_id: None,
+                })
+                .await;
+
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: S3_VERSION_KEYSPACE.to_string(),
+                    key: VersionKey::new(&bucket, &key, version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    value: VersionMetadata::materialized(
+                        version_id,
+                        location.clone(),
+                        location.created_at,
+                        location.created_by,
+                        None,
+                    )
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
                     txn_id: None,
                 })
                 .await;
@@ -516,32 +834,29 @@ mod test {
             metadata_handle: None,
             task_handle: None,
         };
-        let operation = GetObjectOperation {
-            input: GetObjectInput {
-                bucket,
-                key,
-                version_id: None,
-                range: None,
-                group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id: Default::default(),
-                    realm_key: RealmId([0u8; 32]),
-                },
+        let operation = GetObjectOperation::new(GetObjectInput {
+            bucket,
+            key,
+            version_id: None,
+            range: None,
+            group_id: Ulid::new(),
+            user_identity: UserIdentity {
+                user_id: Default::default(),
+                realm_key: RealmId([0u8; 32]),
             },
-            state: GetObjectState::Init,
-            txn_id: None,
-            location: None,
-            resolved_version_id: None,
-            checksum_type: MultipartChecksumType::FullObject,
-            output: None,
-        };
+        });
 
         let blob_result = drive(operation, &driver_ctx)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(blob_result.location.hashes, location.hashes);
+        assert_eq!(
+            blob_result.location.as_ref().unwrap().hashes,
+            location.hashes
+        );
+        assert!(blob_result.source_metadata.is_none());
+        assert!(blob_result.last_refresh.is_none());
         assert_eq!(blob_result.checksum_type, MultipartChecksumType::FullObject);
         let mut blob_stream = blob_result.blob;
         let mut read_buffer = Vec::new();
@@ -623,11 +938,36 @@ mod test {
                 .await;
 
             let object_lookup_key = LookupKey::object(&bucket, &key).to_bytes().unwrap();
+            let version_id = Ulid::new();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                     key: object_lookup_key.into(),
-                    value: Location::Real(location.clone()).to_bytes().unwrap().into(),
+                    value: CurrentVersionPointer::new(version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    txn_id: None,
+                })
+                .await;
+
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: S3_VERSION_KEYSPACE.to_string(),
+                    key: VersionKey::new(&bucket, &key, version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    value: VersionMetadata::materialized(
+                        version_id,
+                        location.clone(),
+                        location.created_at,
+                        location.created_by,
+                        None,
+                    )
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
                     txn_id: None,
                 })
                 .await;
@@ -680,5 +1020,320 @@ mod test {
         assert_eq!(read_buffer, tampered.as_bytes());
         assert!(read_error.is_some());
         assert!(read_error.unwrap().contains("Integrity check failed"));
+    }
+
+    #[tokio::test]
+    async fn test_get_reference_object_uses_exact_bound_connector() {
+        let endpoint = spawn_reference_server(b"hello reference").await;
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let blob_handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some("aruna_".to_string()),
+                max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
+                root: temp_root.to_string(),
+                service_config: HashMap::new(),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle.clone(),
+        )
+        .await
+        .unwrap();
+
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let bucket = "s3test".to_string();
+        let key = "test.txt".to_string();
+        let version_id = Ulid::new();
+        let connector_id = Ulid::new();
+        let cached_metadata = SourceMetadata {
+            content_length: 15,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("etag-123".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+        };
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(connector_id),
+        };
+
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("Failed to start transaction");
+        };
+
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+                key: LookupKey::object(&bucket, &key).to_bytes().unwrap().into(),
+                value: CurrentVersionPointer::new(version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: VersionKey::new(&bucket, &key, version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: VersionMetadata::reference(
+                    version_id,
+                    source,
+                    cached_metadata,
+                    SystemTime::UNIX_EPOCH,
+                    Ulid::new(),
+                    SystemTime::UNIX_EPOCH,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+
+        let result = drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket,
+                key,
+                version_id: None,
+                range: None,
+                group_id: Ulid::new(),
+                user_identity: UserIdentity {
+                    user_id: Ulid::new(),
+                    realm_key: RealmId([0u8; 32]),
+                },
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(result.location.is_none());
+        assert_eq!(
+            result
+                .source_metadata
+                .as_ref()
+                .and_then(|m| m.content_type.clone()),
+            Some("text/plain".to_string())
+        );
+        assert!(result.last_refresh.is_some());
+        let mut stream = result.blob;
+        let mut read_buffer = Vec::new();
+        while let Some(Ok(bytes)) = stream.next().await {
+            read_buffer.extend_from_slice(&bytes);
+        }
+        assert_eq!(read_buffer, b"hello reference");
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: VersionKey::new("s3test", "test.txt", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing refreshed version metadata");
+        };
+        let metadata = VersionMetadata::from_bytes(value.unwrap().as_ref()).unwrap();
+        let VersionState::Reference {
+            cached_metadata,
+            last_refresh,
+            ..
+        } = metadata.state
+        else {
+            panic!("expected reference metadata");
+        };
+        assert_eq!(cached_metadata.content_type.as_deref(), Some("text/plain"));
+        assert!(last_refresh > SystemTime::UNIX_EPOCH);
+    }
+
+    #[tokio::test]
+    async fn test_get_reference_object_refreshes_cached_metadata() {
+        let endpoint = spawn_reference_server(b"hello reference").await;
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let blob_handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some("aruna_".to_string()),
+                max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
+                root: temp_root.to_string(),
+                service_config: HashMap::new(),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle.clone(),
+        )
+        .await
+        .unwrap();
+
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let version_id = Ulid::new();
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([("endpoint".to_string(), endpoint)]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::new()),
+        };
+
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("Failed to start transaction");
+        };
+
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+                key: LookupKey::object("s3test", "refresh.txt")
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: CurrentVersionPointer::new(version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: VersionKey::new("s3test", "refresh.txt", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: VersionMetadata::reference(
+                    version_id,
+                    source,
+                    SourceMetadata {
+                        content_length: 1,
+                        content_type: Some("application/octet-stream".to_string()),
+                        etag: Some("stale-etag".to_string()),
+                        last_modified: None,
+                    },
+                    SystemTime::UNIX_EPOCH,
+                    Ulid::new(),
+                    SystemTime::UNIX_EPOCH,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+
+        let result = drive(
+            GetObjectOperation::new(GetObjectInput {
+                bucket: "s3test".to_string(),
+                key: "refresh.txt".to_string(),
+                version_id: None,
+                range: None,
+                group_id: Ulid::new(),
+                user_identity: UserIdentity {
+                    user_id: Ulid::new(),
+                    realm_key: RealmId([0u8; 32]),
+                },
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        let mut stream = result.blob;
+        assert!(result.last_refresh.is_some());
+        while let Some(Ok(_)) = stream.next().await {}
+
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: VersionKey::new("s3test", "refresh.txt", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("missing refreshed version metadata");
+        };
+        let metadata = VersionMetadata::from_bytes(value.unwrap().as_ref()).unwrap();
+        let VersionState::Reference {
+            cached_metadata,
+            last_refresh,
+            ..
+        } = metadata.state
+        else {
+            panic!("expected reference metadata");
+        };
+        assert_eq!(cached_metadata.content_length, 15);
+        assert_eq!(cached_metadata.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(cached_metadata.etag.as_deref(), Some("etag-123"));
+        assert!(last_refresh > SystemTime::UNIX_EPOCH);
     }
 }

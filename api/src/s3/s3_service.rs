@@ -48,15 +48,25 @@ use s3s::dto::{
     DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
     GetBucketReplicationInput, GetBucketReplicationOutput, GetObjectAttributesInput,
     GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    ListBucketsInput, ListBucketsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
+    LastModified, ListBucketsInput, ListBucketsOutput, PutBucketReplicationInput,
+    PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
+    ReplicationRule, ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, error};
+
+#[derive(Debug)]
+struct ObjectResponseFields {
+    content_length: Option<i64>,
+    content_type: Option<String>,
+    e_tag: Option<ETag>,
+    last_modified: Option<LastModified>,
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
 
 #[derive(Clone)]
 pub struct ArunaS3Service {
@@ -317,6 +327,74 @@ impl ArunaS3Service {
             version_id: Some(result.version_id.to_string()),
             ..Default::default()
         }))
+    }
+
+    fn source_metadata_headers(
+        &self,
+        metadata: &aruna_core::structs::SourceMetadata,
+        last_refresh: Option<SystemTime>,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        let mut headers = std::collections::HashMap::new();
+
+        if let Some(content_type) = &metadata.content_type {
+            headers.insert(
+                "aruna-source-content-type".to_string(),
+                content_type.clone(),
+            );
+        }
+        if let Some(etag) = &metadata.etag {
+            headers.insert("aruna-source-etag".to_string(), etag.clone());
+        }
+        if let Some(last_modified) = metadata.last_modified {
+            headers.insert(
+                "aruna-source-last-modified".to_string(),
+                chrono::DateTime::<chrono::Utc>::from(last_modified).to_rfc3339(),
+            );
+        }
+        if let Some(last_refresh) = last_refresh {
+            headers.insert(
+                "aruna-last-refresh".to_string(),
+                chrono::DateTime::<chrono::Utc>::from(last_refresh).to_rfc3339(),
+            );
+        }
+
+        (!headers.is_empty()).then_some(headers)
+    }
+
+    fn build_object_response_fields(
+        &self,
+        location: Option<&aruna_core::structs::BackendLocation>,
+        source_metadata: Option<&aruna_core::structs::SourceMetadata>,
+        last_refresh: Option<SystemTime>,
+    ) -> ObjectResponseFields {
+        ObjectResponseFields {
+            content_length: location
+                .map(|location| location.blob_size as i64)
+                .or_else(|| source_metadata.map(|metadata| metadata.content_length as i64)),
+            content_type: source_metadata.and_then(|metadata| metadata.content_type.clone()),
+            e_tag: location
+                .and_then(|location| {
+                    location
+                        .hashes
+                        .get(HASH_MD5)
+                        .map(|value| ETag::Strong(to_base64(value)))
+                })
+                .or_else(|| {
+                    source_metadata.and_then(|metadata| {
+                        metadata
+                            .etag
+                            .as_deref()
+                            .and_then(|etag| ETag::from_str(etag).ok())
+                    })
+                }),
+            last_modified: location
+                .map(|location| location.created_at.into())
+                .or_else(|| {
+                    source_metadata.and_then(|metadata| metadata.last_modified.map(Into::into))
+                }),
+            metadata: source_metadata
+                .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh)),
+        }
     }
 }
 
@@ -686,16 +764,27 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InternalError, "Failed to process GET request"))?;
 
         let version_id = result.version_id;
-        let hashes = result.location.hashes.clone();
+        let response_fields = self.build_object_response_fields(
+            result.location.as_ref(),
+            result.source_metadata.as_ref(),
+            result.last_refresh,
+        );
         let content = StreamingBlob::wrap(result.blob);
         let mut output = GetObjectOutput {
             body: Some(content),
+            content_length: response_fields.content_length,
+            content_type: response_fields.content_type,
+            e_tag: response_fields.e_tag,
+            last_modified: response_fields.last_modified,
+            metadata: response_fields.metadata,
             version_id: version_id.map(|version_id| version_id.to_string()),
             ..Default::default()
         };
-        if checksum_mode_enabled(&req.headers) {
+        if checksum_mode_enabled(&req.headers)
+            && let Some(location) = result.location.as_ref()
+        {
             output.apply_checksums(encode_checksums(
-                &hashes,
+                &location.hashes,
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
             ));
@@ -737,21 +826,26 @@ impl S3 for ArunaS3Service {
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to process HEAD request"))?;
 
+        let response_fields = self.build_object_response_fields(
+            result.location.as_ref(),
+            result.source_metadata.as_ref(),
+            result.last_refresh,
+        );
         let mut output = HeadObjectOutput {
-            content_length: Some(result.location.blob_size as i64),
-            e_tag: result
-                .location
-                .hashes
-                .get(HASH_MD5)
-                .map(|value| ETag::Strong(to_base64(value))),
+            content_length: response_fields.content_length,
+            content_type: response_fields.content_type,
+            e_tag: response_fields.e_tag,
             version_id: result.version_id.map(|version_id| version_id.to_string()),
-            last_modified: Some(result.location.created_at.into()),
+            last_modified: response_fields.last_modified,
+            metadata: response_fields.metadata,
             ..Default::default()
         };
 
-        if checksum_mode_enabled(&req.headers) {
+        if checksum_mode_enabled(&req.headers)
+            && let Some(location) = result.location.as_ref()
+        {
             output.apply_checksums(encode_checksums(
-                &result.location.hashes,
+                &location.hashes,
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
             ));

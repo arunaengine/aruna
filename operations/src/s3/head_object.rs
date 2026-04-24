@@ -2,15 +2,17 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
+    S3_CURRENT_VERSION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    BackendLocation, Location, LookupKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, VersionKey, VersionMetadata, VersionState,
+    BackendLocation, CurrentVersionPointer, LookupKey, MultipartChecksumType,
+    MultipartObjectMetadataKey, MultipartObjectSummary, SourceMetadata, VersionKey,
+    VersionMetadata, VersionState,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
+use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -19,8 +21,7 @@ pub enum HeadObjectState {
     Init,
     StartTransaction,
     GetVersion,
-    GetLookup,
-    ResolveVersion,
+    GetCurrentVersion,
     ReadMultipartSummary,
     CommitTransaction,
     Finish,
@@ -52,8 +53,6 @@ pub enum HeadObjectError {
     NoSuchVersion,
     #[error("The specified version is a delete marker.")]
     DeleteMarker,
-    #[error("Reference-bearing versions are not supported yet")]
-    UnsupportedVersionState,
     #[error("HeadObject failed")]
     HeadObjectFailed,
 }
@@ -67,7 +66,9 @@ pub struct HeadObjectInput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeadObjectResult {
-    pub location: BackendLocation,
+    pub location: Option<BackendLocation>,
+    pub source_metadata: Option<SourceMetadata>,
+    pub last_refresh: Option<SystemTime>,
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
@@ -79,6 +80,8 @@ pub struct HeadObjectOperation {
     state: HeadObjectState,
     txn_id: Option<Ulid>,
     location: Option<BackendLocation>,
+    source_metadata: Option<SourceMetadata>,
+    last_refresh: Option<SystemTime>,
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
     output: Option<Result<HeadObjectResult, HeadObjectError>>,
@@ -91,6 +94,8 @@ impl HeadObjectOperation {
             state: HeadObjectState::Init,
             txn_id: None,
             location: None,
+            source_metadata: None,
+            last_refresh: None,
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
             output: None,
@@ -134,13 +139,13 @@ impl HeadObjectOperation {
                     txn_id: self.txn_id,
                 })]
             } else {
-                self.state = HeadObjectState::GetLookup;
+                self.state = HeadObjectState::GetCurrentVersion;
                 let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
                     Ok(key) => key.into(),
                     Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
                 };
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                     key,
                     txn_id: self.txn_id,
                 })]
@@ -164,7 +169,11 @@ impl HeadObjectOperation {
         };
 
         let Some(val) = value else {
-            return self.emit_error(HeadObjectError::NoSuchVersion);
+            return self.emit_error(if self.input.version_id.is_some() {
+                HeadObjectError::NoSuchVersion
+            } else {
+                HeadObjectError::NoSuchKey
+            });
         };
 
         let metadata = match VersionMetadata::from_bytes(val.as_ref()) {
@@ -172,18 +181,10 @@ impl HeadObjectOperation {
             Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
         };
 
-        let location = match metadata.state {
-            VersionState::Materialized { location, .. } => location,
-            VersionState::Deleted => return self.emit_error(HeadObjectError::DeleteMarker),
-            VersionState::Reference { .. } => {
-                return self.emit_error(HeadObjectError::UnsupportedVersionState);
-            }
-        };
-
-        self.read_multipart_summary(location, Some(metadata.version_id))
+        self.read_version(metadata, self.input.version_id.is_some())
     }
 
-    fn handle_received_lookup(&mut self, event: Event) -> Effects {
+    fn handle_received_current_version(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
             return self.emit_error(HeadObjectError::InvalidStateEvent {
                 state: self.state.clone(),
@@ -196,54 +197,60 @@ impl HeadObjectOperation {
             return self.emit_error(HeadObjectError::NoSuchKey);
         };
 
-        let location = match Location::from_bytes(val.as_ref()) {
-            Ok(Location::Real(location)) => location,
-            Ok(Location::Deleted) => return self.emit_error(HeadObjectError::NoSuchKey),
+        let pointer = match CurrentVersionPointer::from_bytes(val.as_ref()) {
+            Ok(pointer) => pointer,
             Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
         };
 
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(HeadObjectError::NoTransactionFound);
-        };
-        let prefix = match VersionKey::object_prefix(&self.input.bucket, &self.input.key) {
-            Ok(prefix) => prefix.into(),
+        let key = match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
+            .to_bytes()
+        {
+            Ok(key) => key.into(),
             Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
         };
 
-        self.location = Some(location);
-        self.state = HeadObjectState::ResolveVersion;
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        self.resolved_version_id = Some(pointer.version_id);
+        self.state = HeadObjectState::GetVersion;
+        smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_VERSION_KEYSPACE.to_string(),
-            prefix: Some(prefix),
-            start_after: None,
-            limit: 10_000,
-            txn_id: Some(txn_id),
+            key,
+            txn_id: self.txn_id,
         })]
     }
 
-    fn handle_resolved_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(HeadObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
-            });
+    fn read_version(
+        &mut self,
+        metadata: VersionMetadata,
+        explicit_version_request: bool,
+    ) -> Effects {
+        let version_id = metadata.version_id;
+
+        let location = match metadata.state {
+            VersionState::Materialized { location, .. } => location,
+            VersionState::Deleted => {
+                return self.emit_error(if explicit_version_request {
+                    HeadObjectError::DeleteMarker
+                } else {
+                    HeadObjectError::NoSuchKey
+                });
+            }
+            VersionState::Reference {
+                cached_metadata,
+                last_refresh,
+                ..
+            } => {
+                self.location = None;
+                self.source_metadata = Some(cached_metadata);
+                self.last_refresh = Some(last_refresh);
+                self.resolved_version_id = Some(metadata.version_id);
+                return self.finish_lookup();
+            }
         };
 
-        let resolved_version_id = values
-            .into_iter()
-            .filter_map(|(key, value)| {
-                let version_key = VersionKey::from_bytes(key.as_ref()).ok()?;
-                let metadata = VersionMetadata::from_bytes(value.as_ref()).ok()?;
-                metadata.is_materialized().then_some(version_key.version_id)
-            })
-            .max();
+        self.source_metadata = None;
+        self.last_refresh = None;
 
-        let Some(location) = self.location.clone() else {
-            return self.emit_error(HeadObjectError::HeadObjectFailed);
-        };
-
-        self.read_multipart_summary(location, resolved_version_id)
+        self.read_multipart_summary(location, Some(version_id))
     }
 
     fn read_multipart_summary(
@@ -296,14 +303,16 @@ impl HeadObjectOperation {
         let Some(txn_id) = self.txn_id else {
             return self.emit_error(HeadObjectError::NoTransactionFound);
         };
-        let Some(location) = self.location.clone() else {
+        if self.location.is_none() && self.source_metadata.is_none() {
             return self.emit_error(HeadObjectError::HeadObjectFailed);
-        };
+        }
 
         self.state = HeadObjectState::CommitTransaction;
         self.output = Some(Ok(HeadObjectResult {
-            location,
-            version_id: self.input.version_id,
+            location: self.location.clone(),
+            source_metadata: self.source_metadata.clone(),
+            last_refresh: self.last_refresh,
+            version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
             checksum_type: self.checksum_type,
         }));
@@ -342,8 +351,7 @@ impl Operation for HeadObjectOperation {
             HeadObjectState::Init => self.handle_init(),
             HeadObjectState::StartTransaction => self.handle_transaction_started(event),
             HeadObjectState::GetVersion => self.handle_received_version(event),
-            HeadObjectState::GetLookup => self.handle_received_lookup(event),
-            HeadObjectState::ResolveVersion => self.handle_resolved_version(event),
+            HeadObjectState::GetCurrentVersion => self.handle_received_current_version(event),
             HeadObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
             HeadObjectState::CommitTransaction => self.handle_transaction_committed(event),
             HeadObjectState::Finish | HeadObjectState::Error => smallvec![],
@@ -377,10 +385,16 @@ mod tests {
     use super::*;
     use crate::driver::{DriverContext, drive};
     use aruna_blob::blob::BlobHandler;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{S3_CURRENT_VERSION_KEYSPACE, S3_VERSION_KEYSPACE};
     use aruna_core::structs::BackendConfig;
     use aruna_core::structs::BackendLocation;
     use aruna_core::structs::checksum::HASH_MD5;
-    use aruna_core::structs::{Backend, VersionMetadata};
+    use aruna_core::structs::{
+        Backend, CurrentVersionPointer, LookupKey, PortableSourceDescriptor, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
+    };
     use aruna_net::{NetConfig, NetHandle};
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -406,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn head_object_reads_lookup_location() {
+    async fn head_object_reads_current_version_pointer() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
@@ -439,6 +453,7 @@ mod tests {
         };
 
         let location = location_with_hash();
+        let version_id = Ulid::new();
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
@@ -451,9 +466,32 @@ mod tests {
             .unwrap();
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                 key: key.into(),
-                value: Location::Real(location.clone()).to_bytes().unwrap().into(),
+                value: CurrentVersionPointer::new(version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: VersionKey::new("mybucket", "hello.txt", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: VersionMetadata::materialized(
+                    version_id,
+                    location.clone(),
+                    location.created_at,
+                    location.created_by,
+                    None,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
                 txn_id: Some(txn_id),
             })
             .await;
@@ -474,8 +512,10 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(result.location, location);
-        assert_eq!(result.version_id, None);
+        assert_eq!(result.location, Some(location));
+        assert!(result.source_metadata.is_none());
+        assert!(result.last_refresh.is_none());
+        assert_eq!(result.version_id, Some(version_id));
         assert_eq!(result.checksum_type, MultipartChecksumType::FullObject);
     }
 
@@ -557,8 +597,132 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(result.location, location);
+        assert_eq!(result.location, Some(location));
+        assert!(result.source_metadata.is_none());
+        assert!(result.last_refresh.is_none());
         assert_eq!(result.version_id, Some(version_id));
         assert_eq!(result.checksum_type, MultipartChecksumType::FullObject);
+    }
+
+    #[tokio::test]
+    async fn head_object_returns_cached_reference_metadata() {
+        let temp_handle = tempdir().unwrap();
+        let temp_root = temp_handle.path().to_str().unwrap();
+        let storage_handle = aruna_storage::FjallStorage::open(temp_root).unwrap();
+        let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+            .await
+            .unwrap();
+        let blob_handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some("aruna_".to_string()),
+                max_bucket_size: Some(100000),
+                multipart_bucket: Some("multipart".to_string()),
+                root: temp_root.to_string(),
+                service_config: HashMap::new(),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle.clone(),
+        )
+        .await
+        .unwrap();
+
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let version_id = Ulid::new();
+        let cached_metadata = SourceMetadata {
+            content_length: 11,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("etag-123".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+        };
+        let last_refresh = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(17);
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://example.org".to_string(),
+                )]),
+                source_path: "folder/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::new()),
+        };
+
+        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        else {
+            panic!("failed to start transaction");
+        };
+
+        let key = LookupKey::object("mybucket", "hello.txt")
+            .to_bytes()
+            .unwrap();
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+                key: key.into(),
+                value: CurrentVersionPointer::new(version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: VersionKey::new("mybucket", "hello.txt", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: VersionMetadata::reference(
+                    version_id,
+                    source,
+                    cached_metadata.clone(),
+                    SystemTime::UNIX_EPOCH,
+                    Ulid::new(),
+                    last_refresh,
+                )
+                .to_bytes()
+                .unwrap()
+                .into(),
+                txn_id: Some(txn_id),
+            })
+            .await;
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await;
+
+        let result = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "hello.txt".to_string(),
+                version_id: None,
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(result.location.is_none());
+        assert_eq!(result.source_metadata, Some(cached_metadata));
+        assert_eq!(result.last_refresh, Some(last_refresh));
+        assert_eq!(result.version_id, Some(version_id));
     }
 }
