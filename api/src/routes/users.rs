@@ -18,6 +18,7 @@ use aruna_operations::list_users::{ListUsersInput, ListUsersOperation};
 use aruna_operations::register_or_get_oidc_user::{
     RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation,
 };
+use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
@@ -37,6 +38,7 @@ use utoipa::{OpenApi, ToSchema};
         get_token,
         list_users,
         get_user,
+        update_user,
     )
 )]
 pub struct UsersApiDoc;
@@ -46,7 +48,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/users/register", post(register_user))
         .route("/users/token", get(get_token))
         .route("/users", get(list_users))
-        .route("/users/{id}", get(get_user))
+        .route("/users/{id}", get(get_user).patch(update_user))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -83,6 +85,15 @@ pub struct ListUsersQuery {
 pub struct ListUsersResponse {
     pub users: Vec<GetUserResponse>,
     pub next_start_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UpdateUserRequest {
+    pub name: Option<String>,
+    #[serde(default)]
+    pub set_attributes: HashMap<String, String>,
+    #[serde(default)]
+    pub remove_attributes: Vec<String>,
 }
 
 const DEFAULT_LIST_USERS_LIMIT: usize = 100;
@@ -436,6 +447,69 @@ async fn get_user(
     .map_err(|err| match err {
         aruna_operations::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
         aruna_operations::get_user::GetUserError::UserNotFound => ServerError::NotFound,
+        other => ServerError::InternalError(other.to_string()),
+    })?;
+
+    Ok((StatusCode::OK, Json(user.into())))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/users/{id}",
+    tag = "users",
+    params(("id" = String, Path, description = "User id")),
+    request_body = UpdateUserRequest,
+    responses(
+        (status = 200, description = "User updated", body = GetUserResponse),
+        (status = 400, description = "Invalid request", body = ErrorResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse),
+        (status = 404, description = "User not found", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_user(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(user_id): Path<String>,
+    Json(request): Json<UpdateUserRequest>,
+) -> ServerResult<(StatusCode, Json<GetUserResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let realm_id = state.get_realm_id();
+    if auth.realm_id != realm_id {
+        return Err(ServerError::Forbidden);
+    }
+
+    let user = drive(
+        UpdateUserOperation::new(UpdateUserInput {
+            actor: Actor {
+                node_id: state.get_node_id(),
+                user_id: auth.user_id,
+                realm_id,
+            },
+            auth_context: auth,
+            self_realm_id: realm_id,
+            user_id,
+            name: request.name,
+            set_attributes: request.set_attributes,
+            remove_attributes: request.remove_attributes,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        aruna_operations::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
+        aruna_operations::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
+        aruna_operations::update_user::UpdateUserError::InvalidUserName
+        | aruna_operations::update_user::UpdateUserError::InvalidAttributeKey(_)
+        | aruna_operations::update_user::UpdateUserError::InvalidAttributeValue(_)
+        | aruna_operations::update_user::UpdateUserError::TooManyAttributes
+        | aruna_operations::update_user::UpdateUserError::ConversionError(_) => {
+            ServerError::BadRequest
+        }
+        aruna_operations::update_user::UpdateUserError::AuthorizationError(_) => {
+            ServerError::Forbidden
+        }
         other => ServerError::InternalError(other.to_string()),
     })?;
 
