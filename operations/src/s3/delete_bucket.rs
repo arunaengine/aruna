@@ -2,7 +2,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE, S3_LOOKUP_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE,
     S3_MULTIPART_UPLOAD_KEYSPACE, S3_VERSION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
@@ -116,7 +116,7 @@ impl DeleteBucketOperation {
 
         self.state = DeleteBucketState::CheckCurrentObjects;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
             prefix: None,
             start_after: None,
             limit: Self::SCAN_LIMIT,
@@ -304,8 +304,7 @@ mod test {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::S3_BUCKET_REPLICATION_KEYSPACE;
     use aruna_core::structs::{
-        BackendLocation, BucketReplicationConfig, BucketReplicationTarget, Location, RealmId,
-        VersionMetadata,
+        BackendLocation, BucketReplicationConfig, BucketReplicationTarget, RealmId, VersionMetadata,
     };
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -513,9 +512,12 @@ mod test {
         };
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                 key: LookupKey::object(&bucket, "key").to_bytes().unwrap().into(),
-                value: Location::Real(location.clone()).to_bytes().unwrap().into(),
+                value: aruna_core::structs::CurrentVersionPointer::new(Ulid::new())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
                 txn_id: None,
             })
             .await;

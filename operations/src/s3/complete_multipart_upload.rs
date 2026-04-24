@@ -3,15 +3,16 @@ use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffec
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE, S3_VERSION_KEYSPACE,
+    S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE, S3_VERSION_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
-    BackendLocation, Location, LookupKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectPart, MultipartObjectSummary, MultipartUpload, MultipartUploadPart,
-    MultipartUploadPartKey, MultipartUploadStatus, RealmId, VersionKey, VersionMetadata,
+    BackendLocation, CurrentVersionPointer, Location, LookupKey, MultipartChecksumType,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
+    MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId, VersionKey,
+    VersionMetadata,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use base64::Engine;
@@ -406,22 +407,23 @@ impl CompleteMultipartUploadOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
-        let Some(location) = self.final_location.clone() else {
+        let Some(_location) = self.final_location.clone() else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
+        let version_id = *self.version_id.get_or_insert_with(Ulid::new);
         let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.schedule_error(err.into()),
         };
-        let value = match Location::Real(location).to_bytes() {
+        let value = match CurrentVersionPointer::new(version_id).to_bytes() {
             Ok(value) => value,
             Err(err) => return self.schedule_error(err.into()),
         };
 
         self.state = CompleteMultipartUploadState::WriteObjectLookup;
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
             key: key.into(),
             value: value.into(),
             txn_id: self.txn_id,
@@ -436,7 +438,10 @@ impl CompleteMultipartUploadOperation {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        let version_id = Ulid::new();
+        let Some(version_id) = self.version_id else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
         let key = match VersionKey::new(&self.input.bucket, &self.input.key, version_id).to_bytes()
         {
             Ok(key) => key,
@@ -455,7 +460,6 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.version_id = Some(version_id);
         self.state = CompleteMultipartUploadState::WriteVersionRecord;
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: S3_VERSION_KEYSPACE.to_string(),

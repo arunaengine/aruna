@@ -1,13 +1,13 @@
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
+use aruna_core::keyspaces::{S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    BackendLocation, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
-    VersionSourceBinding,
+    BackendLocation, CurrentVersionPointer, Location, LookupKey, RealmId, VersionKey,
+    VersionMetadata, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -248,9 +248,10 @@ impl PutObjectOperation {
     }
 
     fn create_object_lookup(&mut self) -> Effects {
-        let Some(output) = self.get_output().cloned() else {
+        let Some(_output) = self.get_output().cloned() else {
             return self.emit_error(PutObjectError::MissingOutput);
         };
+        let version_id = *self.version_id.get_or_insert_with(Ulid::new);
 
         self.state = PutObjectState::CreateObjectLookup;
         let key = match LookupKey::object(
@@ -262,13 +263,13 @@ impl PutObjectOperation {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
-        let value = match Location::Real(output).to_bytes() {
+        let value = match CurrentVersionPointer::new(version_id).to_bytes() {
             Ok(bytes) => bytes.into(),
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
 
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
             key,
             value,
             txn_id: self.txn_id,
@@ -288,8 +289,9 @@ impl PutObjectOperation {
             let Some(output) = self.get_output().cloned() else {
                 return self.emit_error(PutObjectError::MissingOutput);
             };
-            let version_id = Ulid::new();
-            self.version_id = Some(version_id);
+            let Some(version_id) = self.version_id else {
+                return self.emit_error(PutObjectError::PutObjectFailed);
+            };
             self.state = PutObjectState::CreateVersionRecord;
 
             let key = match VersionKey::new(
@@ -525,11 +527,14 @@ mod test {
     use aruna_blob::blob::BlobHandler;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{DHT_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
+    use aruna_core::keyspaces::{
+        DHT_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
+    };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
-        Backend, BackendConfig, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
+        Backend, BackendConfig, CurrentVersionPointer, Location, LookupKey, RealmId, VersionKey,
+        VersionMetadata,
     };
     use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
@@ -648,7 +653,7 @@ mod test {
         }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                 key: object_lookup_key.into(),
                 txn_id: None,
             })
@@ -657,8 +662,8 @@ mod test {
             panic!("missing object lookup entry");
         };
         assert_eq!(
-            Location::from_bytes(object_lookup_value.as_ref()).unwrap(),
-            Location::Real(result.location.clone())
+            CurrentVersionPointer::from_bytes(object_lookup_value.as_ref()).unwrap(),
+            CurrentVersionPointer::new(result.version_id)
         );
 
         let version_prefix = VersionKey::object_prefix("mybucket", "some-file.txt").unwrap();
@@ -811,7 +816,7 @@ mod test {
             }) = context
                 .storage_handle
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                     key: object_lookup_key.into(),
                     txn_id: None,
                 })
@@ -820,9 +825,15 @@ mod test {
                 panic!("missing object lookup entry for duplicate test");
             };
 
+            let expected_version_id = if key == "first.txt" {
+                first.version_id
+            } else {
+                second.version_id
+            };
+
             assert_eq!(
-                Location::from_bytes(object_lookup_value.as_ref()).unwrap(),
-                Location::Real(first.location.clone())
+                CurrentVersionPointer::from_bytes(object_lookup_value.as_ref()).unwrap(),
+                CurrentVersionPointer::new(expected_version_id)
             );
         }
     }

@@ -7,13 +7,13 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
     S3_VERSION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Location, LookupKey, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
+    AuthContext, BucketInfo, CurrentVersionPointer, LookupKey, MultipartObjectMetadataKey,
+    MultipartObjectPart, MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
     ReplicationSuboperationResult, VersionKey, VersionMetadata,
 };
 use aruna_core::types::{Effects, Key, NodeId};
@@ -148,7 +148,7 @@ impl ReplicateScopeOperation {
                     Err(err) => return self.fail(err.into()),
                 };
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                     key: lookup.into(),
                     txn_id: None,
                 })]
@@ -571,7 +571,7 @@ impl ReplicateObjectVersionOperation {
         };
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: None,
         })]
@@ -579,7 +579,7 @@ impl ReplicateObjectVersionOperation {
 
     fn build_manifest(
         &mut self,
-        current_lookup: Option<Location>,
+        current_lookup: Option<CurrentVersionPointer>,
     ) -> Result<(), ReplicateObjectVersionError> {
         self.validate_multipart_parts_complete()?;
 
@@ -587,7 +587,8 @@ impl ReplicateObjectVersionOperation {
             .version_metadata
             .clone()
             .ok_or(ReplicateObjectVersionError::VersionNotFound)?;
-        let current_version = current_lookup == metadata.lookup_location();
+        let current_version =
+            current_lookup.is_some_and(|pointer| pointer.version_id == metadata.version_id);
         let blob = if let Some(location) = metadata.materialized_location().cloned() {
             let hash = location
                 .get_blake3()
@@ -772,7 +773,7 @@ impl Operation for ReplicateObjectVersionOperation {
                 };
                 let current_lookup = value
                     .as_ref()
-                    .and_then(|value| Location::from_bytes(value.as_ref()).ok());
+                    .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
                 if let Err(err) = self.build_manifest(current_lookup) {
                     return self.fail(err);
                 }
@@ -946,7 +947,7 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BucketInfo, Location, MultipartChecksumType,
+        AuthContext, BackendLocation, BucketInfo, MultipartChecksumType,
         MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, RealmId,
         VersionKey, VersionMetadata,
     };

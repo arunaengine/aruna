@@ -6,14 +6,14 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-    S3_VERSION_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BucketInfo, Location, LookupKey, MultipartObjectMetadataKey,
-    Permission, RealmId, ReplicationItemKind, ReplicationNegotiationResult, VersionKey,
-    VersionMetadata,
+    AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, Location, LookupKey,
+    MultipartObjectMetadataKey, Permission, RealmId, ReplicationItemKind,
+    ReplicationNegotiationResult, VersionKey, VersionMetadata,
 };
 use aruna_core::types::{Effects, NodeId};
 use smallvec::smallvec;
@@ -330,7 +330,7 @@ impl IncomingVersionReplicationOperation {
             Err(err) => return self.fail(err.into()),
         };
         let value = match self.version_location() {
-            Ok(location) => match location.to_bytes() {
+            Ok(_) => match CurrentVersionPointer::new(self.manifest.version_id).to_bytes() {
                 Ok(bytes) => bytes,
                 Err(err) => return self.fail(err.into()),
             },
@@ -338,7 +338,7 @@ impl IncomingVersionReplicationOperation {
         };
 
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
             key: key.into(),
             value: value.into(),
             txn_id: self.txn_id,
@@ -833,7 +833,7 @@ mod tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BucketInfo, Location, RealmId, ReplicationItemKind,
+        AuthContext, BackendLocation, BucketInfo, RealmId, ReplicationItemKind,
         ReplicationNegotiationResult, VersionMetadata,
     };
     use std::collections::HashMap;
