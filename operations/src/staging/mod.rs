@@ -1,11 +1,13 @@
 pub mod descriptor;
 pub mod head_source;
 pub mod read_source;
+pub mod reference;
 pub mod snapshot;
 
 pub use descriptor::*;
 pub use head_source::*;
 pub use read_source::*;
+pub use reference::*;
 pub use snapshot::*;
 
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
@@ -46,6 +48,9 @@ pub(crate) fn describe_event(event: &Event) -> String {
             }
             SubOperationEvent::SourceConnectorResolved { .. } => {
                 "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)".to_string()
+            }
+            SubOperationEvent::VersionSourceAccessResolved { .. } => {
+                "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)".to_string()
             }
             SubOperationEvent::ReplicationItemResult { .. } => {
                 "Event::SubOperation(SubOperationEvent::ReplicationItemResult)".to_string()

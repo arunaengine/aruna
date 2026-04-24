@@ -9,7 +9,11 @@ use aruna_core::errors::{SourceConnectorResolutionError, StagingSourceError};
 use aruna_core::structs::{AuthContext, BucketInfo, Permission};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
+use aruna_operations::staging::head_source::HeadStagingSourceError;
 use aruna_operations::staging::read_source::ReadStagingSourceError;
+use aruna_operations::staging::reference::{
+    MaterializeReferenceError, MaterializeReferenceInput, materialize_reference,
+};
 use aruna_operations::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, materialize_snapshot,
 };
@@ -97,9 +101,8 @@ pub async fn stage_blob(
 
     match request {
         StageBlobRequest::Snapshot(request) => snapshot_blob(state, auth, request).await,
-        StageBlobRequest::Reference(_) | StageBlobRequest::Sync(_) => {
-            Err(ServerError::Unimplemented)
-        }
+        StageBlobRequest::Reference(request) => reference_blob(state, auth, request).await,
+        StageBlobRequest::Sync(_) => Err(ServerError::Unimplemented),
     }
 }
 
@@ -165,6 +168,57 @@ async fn snapshot_blob(
     ))
 }
 
+async fn reference_blob(
+    state: Arc<ServerState>,
+    auth: AuthContext,
+    request: StageBlobTargetRequest,
+) -> ServerResult<(StatusCode, Json<StageBlobResponse>)> {
+    let group_id = parse_group_id(&request.group_id)?;
+    let connector_id = parse_source_connector_id(&request.connector_id)?;
+    let bucket_info = load_bucket_info(&state, &request.bucket).await?;
+    if bucket_info.group_id != group_id {
+        return Err(ServerError::NotFound);
+    }
+
+    ensure_permission(
+        &state,
+        &auth,
+        bucket_blob_permission_path(&state, group_id, &request.bucket, &request.key),
+        Permission::WRITE,
+    )
+    .await?;
+
+    let result = materialize_reference(
+        &state.get_ctx(),
+        MaterializeReferenceInput {
+            group_id,
+            user_id: auth.user_id,
+            realm_id: state.get_realm_id(),
+            node_id: state.get_node_id(),
+            connector_id,
+            source_path: request.source_path,
+            bucket: request.bucket.clone(),
+            key: request.key.clone(),
+        },
+    )
+    .await
+    .map_err(map_reference_error)?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(StageBlobResponse {
+            strategy: ApiStagingStrategy::Reference,
+            bucket: request.bucket,
+            key: request.key,
+            version_id: result.version_id.to_string(),
+            size: result.source_metadata.content_length,
+            content_type: result.source_metadata.content_type,
+            etag: result.source_metadata.etag,
+            last_modified: result.source_metadata.last_modified.map(format_system_time),
+        }),
+    ))
+}
+
 async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<BucketInfo> {
     match drive(
         GetBucketInfoOperation::new(bucket.to_string()),
@@ -181,22 +235,50 @@ async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<Buc
 
 fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
     match error {
-        MaterializeSnapshotError::Read(error) => match error {
-            ReadStagingSourceError::Resolve(error) => match error {
-                SourceConnectorResolutionError::NotFound => ServerError::NotFound,
-                SourceConnectorResolutionError::InvalidSourcePath
-                | SourceConnectorResolutionError::UnsupportedConnectorKind(_) => {
-                    ServerError::BadRequest
-                }
-                _ => ServerError::InternalError(error.to_string()),
-            },
-            ReadStagingSourceError::Staging(error) => match error {
-                StagingSourceError::NotFound => ServerError::NotFound,
-                _ => ServerError::BadGateway,
-            },
-            _ => ServerError::InternalError(error.to_string()),
-        },
+        MaterializeSnapshotError::Read(error) => map_read_staging_error(error),
         MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
+    match error {
+        MaterializeReferenceError::Head(error) => map_head_staging_error(error),
+        MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.to_string()),
+        MaterializeReferenceError::Conversion(error) => {
+            ServerError::InternalError(error.to_string())
+        }
+    }
+}
+
+fn map_head_staging_error(error: HeadStagingSourceError) -> ServerError {
+    match error {
+        HeadStagingSourceError::Resolve(error) => map_connector_resolution_error(error),
+        HeadStagingSourceError::Staging(error) => map_staging_source_error(error),
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_read_staging_error(error: ReadStagingSourceError) -> ServerError {
+    match error {
+        ReadStagingSourceError::Resolve(error) => map_connector_resolution_error(error),
+        ReadStagingSourceError::Staging(error) => map_staging_source_error(error),
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_connector_resolution_error(error: SourceConnectorResolutionError) -> ServerError {
+    match error {
+        SourceConnectorResolutionError::NotFound => ServerError::NotFound,
+        SourceConnectorResolutionError::InvalidSourcePath
+        | SourceConnectorResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
+        _ => ServerError::InternalError(error.to_string()),
+    }
+}
+
+fn map_staging_source_error(error: StagingSourceError) -> ServerError {
+    match error {
+        StagingSourceError::NotFound => ServerError::NotFound,
+        _ => ServerError::BadGateway,
     }
 }
 
