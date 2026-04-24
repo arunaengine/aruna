@@ -12,12 +12,14 @@ pub mod groups;
 pub mod info;
 pub mod metadata;
 pub mod onboarding;
+pub mod staging;
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
     Router::new()
         .merge(info::router())
         .merge(onboarding::router())
         .merge(blobs::router())
+        .merge(staging::router())
         .merge(connectors::router())
         .merge(credentials::router())
         .merge(groups::router())
