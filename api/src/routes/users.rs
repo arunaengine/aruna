@@ -328,7 +328,12 @@ async fn get_token(
     Extension(auth): Extension<Option<AuthContext>>,
 ) -> ServerResult<(StatusCode, Json<GetTokenResponse>)> {
     let user_id = match auth {
-        Some(aruna_ctx) => aruna_ctx.user_id,
+        Some(aruna_ctx) => {
+            if aruna_ctx.path_restrictions.is_some() {
+                return Err(ServerError::Forbidden);
+            }
+            aruna_ctx.user_id
+        }
         None => {
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
             let oidc_identity = validate_oidc_token(&state, token).await?;
@@ -531,7 +536,8 @@ mod tests {
     use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSecretRecord};
     use aruna_core::structs::{
-        Actor, NodeCapabilities, OidcProviderConfig, RealmConfigDocument, RealmId, User,
+        Actor, NodeCapabilities, OidcProviderConfig, PathRestriction, Permission,
+        RealmConfigDocument, RealmId, TokenClaims, User,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_operations::announce_realm_presence::{
@@ -672,6 +678,35 @@ mod tests {
             &header,
             &claims,
             &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn sign_scoped_aruna_token(node: &TestNode, user_id: UserId) -> String {
+        let now = super::now_timestamp();
+        let claims = TokenClaims {
+            sub: user_id.to_string(),
+            iss: node.realm_id.to_string(),
+            iat: now,
+            exp: now + 600,
+            jti: Ulid::new().to_string(),
+            restrictions: Some(vec![PathRestriction {
+                pattern: format!("/{}/admin/u/**", node.realm_id),
+                permission: Permission::READ,
+            }]),
+            issuer_pubkey: None,
+            delegation_signature: None,
+        };
+        let NodeCapabilities::Management {
+            realm_encoding_key, ..
+        } = node.state.node_capabilities()
+        else {
+            panic!("test node must use management capabilities");
+        };
+        encode(
+            &Header::new(Algorithm::EdDSA),
+            &claims,
+            &EncodingKey::from_ed_pem(realm_encoding_key).unwrap(),
         )
         .unwrap()
     }
@@ -1129,6 +1164,41 @@ mod tests {
         assert_eq!(token_response.status(), StatusCode::OK);
         let body: GetTokenResponse = token_response.json().await.unwrap();
         assert!(!body.token.is_empty());
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
+    async fn get_token_rejects_scoped_aruna_token() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+
+        let (registered, _aruna_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "subject-123",
+            "Alice",
+            None,
+        )
+        .await;
+        let scoped_token =
+            sign_scoped_aruna_token(&node, UserId::from_string(&registered.id).unwrap());
+
+        let token_response = reqwest::Client::new()
+            .get(format!("{}/api/v1/users/token", node.base_url))
+            .bearer_auth(&scoped_token)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(token_response.status(), StatusCode::FORBIDDEN);
 
         node.server_task.abort();
         node.net.shutdown().await;
