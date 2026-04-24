@@ -217,7 +217,7 @@ impl ReplicateScopeOperation {
     }
 
     fn should_enqueue_version(&self, metadata: &VersionMetadata) -> bool {
-        self.input.replicate_delete_markers || !matches!(metadata.location, Location::Deleted)
+        self.input.replicate_delete_markers || !metadata.is_deleted()
     }
 
     fn run_next_replication(&mut self) -> Effects {
@@ -587,23 +587,22 @@ impl ReplicateObjectVersionOperation {
             .version_metadata
             .clone()
             .ok_or(ReplicateObjectVersionError::VersionNotFound)?;
-        let current_version = current_lookup == Some(metadata.location.clone());
-        let blob = match metadata.location.clone() {
-            Location::Real(location) => {
-                let hash = location
-                    .get_blake3()
-                    .ok_or(ReplicateObjectVersionError::MissingBlobHash)?
-                    .try_into()
-                    .map_err(|_| ReplicateObjectVersionError::MissingBlobHash)?;
-                Some(MaterializedBlobInfo {
-                    hash,
-                    size: location.blob_size,
-                    compressed: location.compressed,
-                    encrypted: location.encrypted,
-                    location,
-                })
-            }
-            Location::Deleted => None,
+        let current_version = current_lookup == metadata.lookup_location();
+        let blob = if let Some(location) = metadata.materialized_location().cloned() {
+            let hash = location
+                .get_blake3()
+                .ok_or(ReplicateObjectVersionError::MissingBlobHash)?
+                .try_into()
+                .map_err(|_| ReplicateObjectVersionError::MissingBlobHash)?;
+            Some(MaterializedBlobInfo {
+                hash,
+                size: location.blob_size,
+                compressed: location.compressed,
+                encrypted: location.encrypted,
+                location,
+            })
+        } else {
+            None
         };
 
         let multipart =
@@ -702,7 +701,7 @@ impl Operation for ReplicateObjectVersionOperation {
                     Ok(metadata) => metadata,
                     Err(err) => return self.fail(err.into()),
                 };
-                let materialized = matches!(metadata.location, Location::Real(_));
+                let materialized = metadata.is_materialized();
                 self.version_metadata = Some(metadata);
                 if materialized {
                     self.read_multipart_summary()
@@ -988,14 +987,9 @@ mod tests {
         let key_bytes = VersionKey::new("bucket", key, version_id)
             .to_bytes()
             .unwrap();
-        let value_bytes = VersionMetadata {
-            version_id,
-            location: Location::Deleted,
-            created_at: SystemTime::now(),
-            created_by: Ulid::new(),
-        }
-        .to_bytes()
-        .unwrap();
+        let value_bytes = VersionMetadata::deleted(version_id, SystemTime::now(), Ulid::new())
+            .to_bytes()
+            .unwrap();
         (key_bytes.into(), value_bytes.into())
     }
 
@@ -1133,12 +1127,13 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
             value: Some(
-                VersionMetadata {
+                VersionMetadata::materialized(
                     version_id,
-                    location: Location::Real(materialized_location()),
-                    created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
-                }
+                    materialized_location(),
+                    SystemTime::now(),
+                    Ulid::new(),
+                    None,
+                )
                 .to_bytes()
                 .unwrap()
                 .into(),
@@ -1202,12 +1197,13 @@ mod tests {
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
             value: Some(
-                VersionMetadata {
+                VersionMetadata::materialized(
                     version_id,
-                    location: Location::Real(materialized_location()),
-                    created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
-                }
+                    materialized_location(),
+                    SystemTime::now(),
+                    Ulid::new(),
+                    None,
+                )
                 .to_bytes()
                 .unwrap()
                 .into(),

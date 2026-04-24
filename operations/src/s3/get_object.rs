@@ -8,7 +8,7 @@ use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, Location, LookupKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, UserIdentity, VersionKey, VersionMetadata,
+    MultipartObjectSummary, UserIdentity, VersionKey, VersionMetadata, VersionState,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
@@ -56,6 +56,8 @@ pub enum GetObjectError {
     NoSuchVersion,
     #[error("The specified version is a delete marker.")]
     DeleteMarker,
+    #[error("Reference-bearing versions are not supported yet")]
+    UnsupportedVersionState,
     #[error("GetObject failed (miserably)")]
     GetObjectFailed,
 }
@@ -179,9 +181,12 @@ impl GetObjectOperation {
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
-        let location = match metadata.location {
-            Location::Real(location) => location,
-            Location::Deleted => return self.emit_error(GetObjectError::DeleteMarker),
+        let location = match metadata.state {
+            VersionState::Materialized { location, .. } => location,
+            VersionState::Deleted => return self.emit_error(GetObjectError::DeleteMarker),
+            VersionState::Reference { .. } => {
+                return self.emit_error(GetObjectError::UnsupportedVersionState);
+            }
         };
 
         self.read_multipart_summary(location, Some(metadata.version_id))
@@ -238,10 +243,8 @@ impl GetObjectOperation {
             .into_iter()
             .filter_map(|(key, value)| {
                 let version_key = VersionKey::from_bytes(key.as_ref()).ok()?;
-                match VersionMetadata::from_bytes(value.as_ref()).ok()?.location {
-                    Location::Real(_) => Some(version_key.version_id),
-                    Location::Deleted => None,
-                }
+                let metadata = VersionMetadata::from_bytes(value.as_ref()).ok()?;
+                metadata.is_materialized().then_some(version_key.version_id)
             })
             .max();
 

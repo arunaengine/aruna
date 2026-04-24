@@ -7,7 +7,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
     BackendLocation, Location, LookupKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, VersionKey, VersionMetadata,
+    MultipartObjectSummary, VersionKey, VersionMetadata, VersionState,
 };
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -52,6 +52,8 @@ pub enum HeadObjectError {
     NoSuchVersion,
     #[error("The specified version is a delete marker.")]
     DeleteMarker,
+    #[error("Reference-bearing versions are not supported yet")]
+    UnsupportedVersionState,
     #[error("HeadObject failed")]
     HeadObjectFailed,
 }
@@ -170,9 +172,12 @@ impl HeadObjectOperation {
             Err(err) => return self.emit_error(HeadObjectError::ConversionError(err)),
         };
 
-        let location = match metadata.location {
-            Location::Real(location) => location,
-            Location::Deleted => return self.emit_error(HeadObjectError::DeleteMarker),
+        let location = match metadata.state {
+            VersionState::Materialized { location, .. } => location,
+            VersionState::Deleted => return self.emit_error(HeadObjectError::DeleteMarker),
+            VersionState::Reference { .. } => {
+                return self.emit_error(HeadObjectError::UnsupportedVersionState);
+            }
         };
 
         self.read_multipart_summary(location, Some(metadata.version_id))
@@ -229,10 +234,8 @@ impl HeadObjectOperation {
             .into_iter()
             .filter_map(|(key, value)| {
                 let version_key = VersionKey::from_bytes(key.as_ref()).ok()?;
-                match VersionMetadata::from_bytes(value.as_ref()).ok()?.location {
-                    Location::Real(_) => Some(version_key.version_id),
-                    Location::Deleted => None,
-                }
+                let metadata = VersionMetadata::from_bytes(value.as_ref()).ok()?;
+                metadata.is_materialized().then_some(version_key.version_id)
             })
             .max();
 
@@ -511,12 +514,13 @@ mod tests {
 
         let location = location_with_hash();
         let version_id = Ulid::new();
-        let metadata = VersionMetadata {
+        let metadata = VersionMetadata::materialized(
             version_id,
-            location: Location::Real(location.clone()),
-            created_at: SystemTime::now(),
-            created_by: Ulid::new(),
-        };
+            location.clone(),
+            SystemTime::now(),
+            Ulid::new(),
+            None,
+        );
 
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage_handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })

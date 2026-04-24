@@ -183,8 +183,12 @@ impl DeleteObjectOperation {
             .max_by_key(|(version_id, _)| *version_id)
             .map(|(_, metadata)| metadata);
 
-        match self.latest_remaining.clone() {
-            Some(metadata) => self.write_current_lookup(metadata.location),
+        match self
+            .latest_remaining
+            .clone()
+            .and_then(|metadata| metadata.lookup_location())
+        {
+            Some(location) => self.write_current_lookup(location),
             None => self.delete_current_lookup(),
         }
     }
@@ -375,17 +379,13 @@ impl DeleteObjectOperation {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(err.into()),
         };
-        let value = match (VersionMetadata {
-            version_id,
-            location: Location::Deleted,
-            created_at: SystemTime::now(),
-            created_by: self.input.deleted_by,
-        })
-        .to_bytes()
-        {
-            Ok(value) => value.into(),
-            Err(err) => return self.emit_error(err.into()),
-        };
+        let value =
+            match VersionMetadata::deleted(version_id, SystemTime::now(), self.input.deleted_by)
+                .to_bytes()
+            {
+                Ok(value) => value.into(),
+                Err(err) => return self.emit_error(err.into()),
+            };
 
         smallvec![Effect::Storage(StorageEffect::Write {
             key_space: S3_VERSION_KEYSPACE.to_string(),
@@ -417,7 +417,7 @@ impl DeleteObjectOperation {
                 let delete_marker = self
                     .target_version
                     .as_ref()
-                    .is_some_and(|metadata| metadata.location == Location::Deleted);
+                    .is_some_and(VersionMetadata::is_deleted);
                 self.txn_id = None;
                 self.state = DeleteObjectState::Finish;
                 self.output = Some(Ok(DeleteObjectResult {
@@ -572,6 +572,7 @@ mod test {
                 expected_checksums: vec![],
                 checksum_type: None,
                 exists: false,
+                version_source: None,
             }),
             &context,
         )
@@ -636,10 +637,10 @@ mod test {
         let tombstone = values
             .iter()
             .map(|(_, value)| VersionMetadata::from_bytes(value.as_ref()).unwrap())
-            .find(|metadata| metadata.location == Location::Deleted)
+            .find(VersionMetadata::is_deleted)
             .expect("missing tombstone version metadata");
         assert_eq!(tombstone.version_id, delete_result.version_id);
-        assert_eq!(tombstone.location, Location::Deleted);
+        assert!(tombstone.is_deleted());
         assert_eq!(tombstone.created_by, user_id);
 
         let get_result = drive(
@@ -714,6 +715,7 @@ mod test {
                 expected_checksums: vec![],
                 checksum_type: None,
                 exists: false,
+                version_source: None,
             }),
             &context,
         )

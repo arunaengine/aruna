@@ -7,6 +7,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     BackendLocation, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
+    VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -75,6 +76,7 @@ pub struct PutObjectConfig {
     pub expected_checksums: Vec<ExpectedChecksum>,
     pub checksum_type: Option<String>,
     pub exists: bool, //Note: For version shenanigans which will be implemented later
+    pub version_source: Option<VersionSourceBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -300,12 +302,13 @@ impl PutObjectOperation {
                 Ok(key) => key.into(),
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
             };
-            let value = match (VersionMetadata {
+            let value = match VersionMetadata::materialized(
                 version_id,
-                location: Location::Real(output.clone()),
-                created_at: output.created_at,
-                created_by: output.created_by,
-            })
+                output.clone(),
+                output.created_at,
+                output.created_by,
+                self.config.version_source.clone(),
+            )
             .to_bytes()
             {
                 Ok(bytes) => bytes.into(),
@@ -588,6 +591,7 @@ mod test {
             expected_checksums: vec![],
             checksum_type: None,
             exists: false,
+            version_source: None,
         };
         let put_operation = PutObjectOperation::new(put_config);
 
@@ -674,7 +678,10 @@ mod test {
         assert_eq!(values.len(), 1);
         let version = VersionMetadata::from_bytes(values[0].1.as_ref()).unwrap();
         assert_eq!(version.version_id, result.version_id);
-        assert_eq!(version.location, Location::Real(result.location.clone()));
+        assert_eq!(
+            version.lookup_location(),
+            Some(Location::Real(result.location.clone()))
+        );
 
         let Event::Storage(StorageEvent::ReadResult {
             value: Some(dht_value),
@@ -758,6 +765,7 @@ mod test {
                 expected_checksums: vec![],
                 checksum_type: None,
                 exists: false,
+                version_source: None,
             }),
             &context,
         )
@@ -783,6 +791,7 @@ mod test {
                 expected_checksums: vec![],
                 checksum_type: None,
                 exists: false,
+                version_source: None,
             }),
             &context,
         )
@@ -874,6 +883,7 @@ mod test {
                 }],
                 checksum_type: None,
                 exists: false,
+                version_source: None,
             }),
             &context,
         )

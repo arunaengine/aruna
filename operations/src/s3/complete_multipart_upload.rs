@@ -442,12 +442,13 @@ impl CompleteMultipartUploadOperation {
             Ok(key) => key,
             Err(err) => return self.schedule_error(err.into()),
         };
-        let value = match (VersionMetadata {
+        let value = match VersionMetadata::materialized(
             version_id,
-            location: Location::Real(location),
-            created_at: SystemTime::now(),
-            created_by: self.input.created_by,
-        })
+            location,
+            SystemTime::now(),
+            self.input.created_by,
+            None,
+        )
         .to_bytes()
         {
             Ok(value) => value,

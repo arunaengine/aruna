@@ -351,17 +351,23 @@ impl IncomingVersionReplicationOperation {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
-        let value = match (VersionMetadata {
-            version_id: self.manifest.version_id,
-            location: match self.version_location() {
-                Ok(location) => location,
-                Err(err) => return self.fail(err),
-            },
-            created_at: self.manifest.created_at,
-            created_by: self.manifest.created_by,
-        })
-        .to_bytes()
-        {
+        let value = match match self.version_location() {
+            Ok(Location::Real(location)) => VersionMetadata::materialized(
+                self.manifest.version_id,
+                location,
+                self.manifest.created_at,
+                self.manifest.created_by,
+                None,
+            )
+            .to_bytes(),
+            Ok(Location::Deleted) => VersionMetadata::deleted(
+                self.manifest.version_id,
+                self.manifest.created_at,
+                self.manifest.created_by,
+            )
+            .to_bytes(),
+            Err(err) => return self.fail(err),
+        } {
             Ok(value) => value,
             Err(err) => return self.fail(err.into()),
         };
@@ -954,12 +960,13 @@ mod tests {
 
         let _effects = advance_to_version_lookup(&mut op, Ulid::new());
 
-        let version = VersionMetadata {
-            version_id: manifest.version_id,
-            location: Location::Real(make_location()),
-            created_at: manifest.created_at,
-            created_by: manifest.created_by,
-        };
+        let version = VersionMetadata::materialized(
+            manifest.version_id,
+            make_location(),
+            manifest.created_at,
+            manifest.created_by,
+            None,
+        );
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(version.to_bytes().unwrap().into()),

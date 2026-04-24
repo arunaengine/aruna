@@ -526,12 +526,13 @@ mod test {
                     .to_bytes()
                     .unwrap()
                     .into(),
-                value: VersionMetadata {
-                    version_id: Ulid::new(),
-                    location: Location::Real(location),
-                    created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
-                }
+                value: VersionMetadata::materialized(
+                    Ulid::new(),
+                    location,
+                    SystemTime::now(),
+                    Ulid::new(),
+                    None,
+                )
                 .to_bytes()
                 .unwrap()
                 .into(),
