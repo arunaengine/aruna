@@ -119,10 +119,25 @@ impl UpdateUserOperation {
 
     fn start_auth(&mut self) -> Result<Effects, UpdateUserError> {
         let target_user_id = UserId::from_string(&self.input.user_id)?;
-        if target_user_id.realm_id != self.input.self_realm_id {
+        if target_user_id.realm_id != self.input.self_realm_id
+            || self.input.auth_context.realm_id != self.input.self_realm_id
+            || self.input.actor.realm_id != self.input.self_realm_id
+            || self.input.actor.user_id != self.input.auth_context.user_id
+        {
             return Err(UpdateUserError::Unauthorized);
         }
         self.target_user_id = Some(target_user_id);
+
+        if self.input.auth_context.user_id == target_user_id {
+            if self.input.auth_context.path_restrictions.is_some() {
+                return Err(UpdateUserError::Unauthorized);
+            }
+            self.state = UpdateUserState::StartTransaction;
+            return Ok(smallvec![Effect::Storage(
+                StorageEffect::StartTransaction { read: false }
+            )]);
+        }
+
         self.state = UpdateUserState::Auth;
         Ok(smallvec![Effect::SubOperation(boxed_suboperation(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
@@ -392,10 +407,10 @@ mod tests {
         }
     }
 
-    fn input(realm_id: RealmId, user_id: UserId) -> UpdateUserInput {
+    fn input(realm_id: RealmId, caller_id: UserId, user_id: UserId) -> UpdateUserInput {
         UpdateUserInput {
-            actor: actor(realm_id, user_id),
-            auth_context: auth_context(realm_id, user_id),
+            actor: actor(realm_id, caller_id),
+            auth_context: auth_context(realm_id, caller_id),
             self_realm_id: realm_id,
             user_id: user_id.to_string(),
             name: Some("Alice Updated".to_string()),
@@ -424,17 +439,10 @@ mod tests {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
         let original = stored_user(user_id);
-        let mut operation = UpdateUserOperation::new(input(realm_id, user_id));
+        let mut operation = UpdateUserOperation::new(input(realm_id, user_id, user_id));
 
         assert!(matches!(
             operation.start().first(),
-            Some(Effect::SubOperation(_))
-        ));
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        assert!(matches!(
-            effects.first(),
             Some(Effect::Storage(StorageEffect::StartTransaction {
                 read: false
             }))
@@ -489,13 +497,28 @@ mod tests {
     #[test]
     fn unauthorized_update_fails() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
+        let caller_id = UserId::local(Ulid::from_bytes([4u8; 16]), realm_id);
         let user_id = UserId::local(Ulid::from_bytes([5u8; 16]), realm_id);
-        let mut operation = UpdateUserOperation::new(input(realm_id, user_id));
+        let mut operation = UpdateUserOperation::new(input(realm_id, caller_id, user_id));
         operation.start();
 
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
         ));
+
+        assert!(effects.is_empty());
+        assert!(operation.finalize().is_err());
+    }
+
+    #[test]
+    fn scoped_self_update_fails() {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([7u8; 16]), realm_id);
+        let mut input = input(realm_id, user_id, user_id);
+        input.auth_context.path_restrictions = Some(Vec::new());
+        let mut operation = UpdateUserOperation::new(input);
+
+        let effects = operation.start();
 
         assert!(effects.is_empty());
         assert!(operation.finalize().is_err());
