@@ -427,6 +427,7 @@ mod tests {
             user_id,
             name: "Alice".to_string(),
             subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
             attributes: HashMap::from([
                 ("old".to_string(), "remove-me".to_string()),
                 ("department".to_string(), "physics".to_string()),

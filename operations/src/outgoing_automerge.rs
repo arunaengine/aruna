@@ -4,20 +4,23 @@ use aruna_core::automerge::{
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::operation::Operation;
-use aruna_core::structs::User;
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::structs::Actor;
 use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
-use crate::user_subject_index::rewrite_subject_index_effects;
+use crate::user_subject_index::{
+    ResolveUserSubjectConflictsInput, ResolveUserSubjectConflictsOperation,
+};
 
 #[derive(Debug, PartialEq)]
 pub struct OutgoingAutomergeOperation {
     peer: aruna_core::NodeId,
     document: AutomergeDocumentVariant,
     auth_proof: Option<InitAuthProof>,
+    local_node_id: Option<aruna_core::NodeId>,
     state: OutgoingAutomergeState,
     local_document: Option<Vec<u8>>,
     persist_txn_id: Option<aruna_core::types::TxnId>,
@@ -33,8 +36,8 @@ enum OutgoingAutomergeState {
     RunSync,
     StartPersistTransaction,
     ReconcileRead,
+    ResolveUserConflicts,
     Persist,
-    UpdateDerivedState,
     CommitPersist,
     Finish,
     Error,
@@ -62,6 +65,7 @@ impl OutgoingAutomergeOperation {
             peer,
             document,
             auth_proof: None,
+            local_node_id: None,
             state: OutgoingAutomergeState::Init,
             local_document: None,
             persist_txn_id: None,
@@ -79,12 +83,34 @@ impl OutgoingAutomergeOperation {
             peer,
             document,
             auth_proof,
+            local_node_id: None,
             state: OutgoingAutomergeState::Init,
             local_document: None,
             persist_txn_id: None,
             synced_document: None,
             output: None,
         }
+    }
+
+    pub fn new_with_auth_and_local_node(
+        peer: aruna_core::NodeId,
+        document: AutomergeDocumentVariant,
+        auth_proof: Option<InitAuthProof>,
+        local_node_id: aruna_core::NodeId,
+    ) -> Self {
+        let mut operation = Self::new_with_auth(peer, document, auth_proof);
+        operation.local_node_id = Some(local_node_id);
+        operation
+    }
+
+    pub fn new_with_local_node(
+        peer: aruna_core::NodeId,
+        document: AutomergeDocumentVariant,
+        local_node_id: aruna_core::NodeId,
+    ) -> Self {
+        let mut operation = Self::new(peer, document);
+        operation.local_node_id = Some(local_node_id);
+        operation
     }
 
     fn fail(&mut self, error: OutgoingAutomergeError) -> aruna_core::types::Effects {
@@ -107,32 +133,43 @@ impl OutgoingAutomergeOperation {
         })
     }
 
-    fn emit_derived_user_updates(
+    fn resolve_user_conflicts_effects(
         &mut self,
+        previous_bytes: Vec<u8>,
+        current_bytes: Vec<u8>,
         txn_id: aruna_core::types::TxnId,
-    ) -> Result<aruna_core::types::Effects, OutgoingAutomergeError> {
-        if !matches!(self.document, AutomergeDocumentVariant::User { .. }) {
-            self.state = OutgoingAutomergeState::CommitPersist;
-            return Ok(smallvec![Effect::Storage(
-                StorageEffect::CommitTransaction { txn_id }
-            )]);
-        }
-
-        let previous_user = match self.local_document.as_deref() {
-            Some(bytes) if !bytes.is_empty() => Some(User::from_bytes(bytes)?),
-            _ => None,
+    ) -> aruna_core::types::Effects {
+        let AutomergeDocumentVariant::User { user_id } = self.document.clone() else {
+            self.state = OutgoingAutomergeState::Persist;
+            return smallvec![write_effect(&self.document, current_bytes, Some(txn_id))];
         };
-        let current_user = User::from_bytes(self.synced_document.as_deref().unwrap_or_default())?;
-        let effects = rewrite_subject_index_effects(previous_user.as_ref(), &current_user, txn_id)?;
-        if effects.is_empty() {
-            self.state = OutgoingAutomergeState::CommitPersist;
-            Ok(smallvec![Effect::Storage(
-                StorageEffect::CommitTransaction { txn_id }
-            )])
-        } else {
-            self.state = OutgoingAutomergeState::UpdateDerivedState;
-            Ok(effects)
-        }
+        let Some(local_node_id) = self.local_node_id else {
+            return self.fail(OutgoingAutomergeError::Sync(AutomergeSyncError::Storage(
+                "local node id required for user conflict resolution".to_string(),
+            )));
+        };
+
+        self.state = OutgoingAutomergeState::ResolveUserConflicts;
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            ResolveUserSubjectConflictsOperation::new(ResolveUserSubjectConflictsInput {
+                txn_id,
+                actor: Actor {
+                    node_id: local_node_id,
+                    user_id: aruna_core::UserId::nil(user_id.realm_id),
+                    realm_id: user_id.realm_id,
+                },
+                document_user_id: user_id,
+                previous_bytes: if previous_bytes.is_empty() {
+                    None
+                } else {
+                    Some(previous_bytes)
+                },
+                current_bytes,
+            }),
+            |result| Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
+                result: result.map_err(|error| error.to_string()),
+            }),
+        ))]
     }
 }
 
@@ -234,32 +271,36 @@ impl Operation for OutgoingAutomergeOperation {
                             StorageError::TransactionNotFound,
                         ));
                     };
-                    self.local_document = Some(current);
+                    self.local_document = Some(current.clone());
                     self.synced_document = Some(merged.clone());
-                    self.state = OutgoingAutomergeState::Persist;
-                    smallvec![write_effect(&self.document, merged, Some(txn_id))]
+                    self.resolve_user_conflicts_effects(current, merged, txn_id)
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
             },
-            OutgoingAutomergeState::Persist => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    let Some(txn_id) = self.persist_txn_id else {
-                        return self.fail(OutgoingAutomergeError::StorageError(
-                            StorageError::TransactionNotFound,
-                        ));
-                    };
-                    match self.emit_derived_user_updates(txn_id) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
+            OutgoingAutomergeState::ResolveUserConflicts => match event {
+                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) => {
+                    match result {
+                        Ok(()) => {
+                            let Some(txn_id) = self.persist_txn_id else {
+                                return self.fail(OutgoingAutomergeError::StorageError(
+                                    StorageError::TransactionNotFound,
+                                ));
+                            };
+                            self.state = OutgoingAutomergeState::CommitPersist;
+                            smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                        }
+                        Err(error) => self.fail(OutgoingAutomergeError::Sync(
+                            AutomergeSyncError::Storage(error),
+                        )),
                     }
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("user conflict resolution result", format!("{other:?}"))
+                }
             },
-            OutgoingAutomergeState::UpdateDerivedState => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. })
-                | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+            OutgoingAutomergeState::Persist => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
                     let Some(txn_id) = self.persist_txn_id else {
                         return self.fail(OutgoingAutomergeError::StorageError(
                             StorageError::TransactionNotFound,
@@ -269,7 +310,7 @@ impl Operation for OutgoingAutomergeOperation {
                     smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("subject index update result", format!("{other:?}")),
+                other => self.unexpected_event("storage write result", format!("{other:?}")),
             },
             OutgoingAutomergeState::CommitPersist => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -328,12 +369,12 @@ fn reconcile_documents(current: &[u8], session: Option<&[u8]>) -> Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::OutgoingAutomergeOperation;
+    use aruna_core::UserId;
     use aruna_core::automerge::{AutomergeDocumentVariant, AutomergeEvent, AutomergeInit};
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, RealmId, User, oidc_subject_key};
-    use aruna_core::{USER_SUBJECT_INDEX_KEYSPACE, UserId};
     use byteview::ByteView;
     use ulid::Ulid;
 
@@ -346,6 +387,7 @@ mod tests {
             user_id,
             name: "Alice".to_string(),
             subject_ids,
+            alias_user_ids: Default::default(),
             attributes: Default::default(),
         }
         .to_bytes(&Actor {
@@ -365,7 +407,11 @@ mod tests {
         let document = AutomergeDocumentVariant::User { user_id };
         let bytes = user_bytes(user_id, vec![subject_key.clone()]);
         let txn_id = Ulid::new();
-        let mut operation = OutgoingAutomergeOperation::new(node_id(4), document.clone());
+        let mut operation = OutgoingAutomergeOperation::new_with_local_node(
+            node_id(4),
+            document.clone(),
+            node_id(5),
+        );
 
         operation.start();
         operation.step(Event::Storage(StorageEvent::ReadResult {
@@ -386,32 +432,15 @@ mod tests {
             changed: true,
         }));
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
             key: ByteView::from(user_id.to_bytes()),
             value: None,
         }));
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: ByteView::from(user_id.to_bytes()),
-        }));
+        assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
 
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
-                assert_eq!(id, &Some(txn_id));
-                assert_eq!(writes.len(), 1);
-                let (key_space, key, value) = &writes[0];
-                assert_eq!(key_space, USER_SUBJECT_INDEX_KEYSPACE);
-                assert_eq!(key.as_ref(), subject_key.as_bytes());
-                assert_eq!(value.as_ref(), user_id.to_string().as_bytes());
-            }
-            other => panic!("unexpected effect: {other:?}"),
-        }
-
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: vec![(
-                USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                ByteView::from(subject_key.into_bytes()),
-            )],
-        }));
+        let effects = operation.step(Event::SubOperation(
+            SubOperationEvent::AutomergeSyncResult { result: Ok(()) },
+        ));
         assert!(matches!(
             effects.first(),
             Some(Effect::Storage(StorageEffect::CommitTransaction { txn_id: id }))

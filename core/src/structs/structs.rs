@@ -256,6 +256,9 @@ pub struct User {
     pub name: String,
     pub subject_ids: Vec<String>,
     #[serde(default)]
+    #[autosurgeon(with = "autosurgeon_user_id_set", missing = "Default::default")]
+    pub alias_user_ids: HashSet<UserId>,
+    #[serde(default)]
     #[autosurgeon(missing = "Default::default")]
     pub attributes: HashMap<String, String>,
 }
@@ -349,6 +352,7 @@ mod test {
             user_id,
             name: "alice".to_string(),
             subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
             attributes: HashMap::from([("orcid".to_string(), "0000-0002-1825-0097".to_string())]),
         };
         let actor = Actor {

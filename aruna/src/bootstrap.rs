@@ -92,6 +92,7 @@ pub async fn fetch_core_onboarding_documents(
         .as_deref()
         .ok_or("missing onboarding sync ticket")?;
     let onboarding_sync_ticket = OnboardingSyncTicket::decode(onboarding_sync_ticket)?;
+    let local_node_id = iroh::SecretKey::from_bytes(&node_state.net_secret_key).public();
 
     for topic in [TopicId::realm(*realm_id), TopicId::users(*realm_id)] {
         subscribe_topic(driver_ctx, topic).await?;
@@ -99,10 +100,11 @@ pub async fn fetch_core_onboarding_documents(
 
     for document in onboarding_sync_ticket.payload.documents.clone() {
         drive(
-            OutgoingAutomergeOperation::new_with_auth(
+            OutgoingAutomergeOperation::new_with_auth_and_local_node(
                 bootstrap_peer,
                 document,
                 Some(onboarding_sync_ticket.clone().into_auth_proof()),
+                local_node_id,
             ),
             driver_ctx,
         )

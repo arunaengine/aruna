@@ -61,7 +61,13 @@ impl InboundEventHandler for OperationsInboundHandler {
                 "Received inbound gossip message"
             );
 
-            let op = IncomingGossipOperation::new(topic, sender, data);
+            let local_node_id = self
+                .context
+                .net_handle
+                .as_ref()
+                .map(|net_handle| net_handle.node_id())
+                .unwrap_or(sender);
+            let op = IncomingGossipOperation::new(topic, sender, local_node_id, data);
             if let Err(err) = drive(op, self.context.as_ref()).await {
                 error!(error = ?err, "Failed to process inbound gossip event");
             }

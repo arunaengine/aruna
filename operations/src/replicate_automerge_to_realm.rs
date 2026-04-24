@@ -154,7 +154,11 @@ impl ReplicateAutomergeDocumentsToRealmOperation {
         self.state = ReplicateAutomergeDocumentsToRealmState::Replicate;
         smallvec![aruna_core::effects::Effect::SubOperation(
             boxed_suboperation(
-                OutgoingAutomergeOperation::new(target, document),
+                OutgoingAutomergeOperation::new_with_local_node(
+                    target,
+                    document,
+                    self.config.local_node_id,
+                ),
                 |result| Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
                     result: result.map_err(|error| error.to_string()),
                 }),

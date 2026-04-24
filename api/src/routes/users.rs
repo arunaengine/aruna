@@ -1,9 +1,12 @@
 use crate::auth::{OidcIdentity, bearer_token};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
-use aruna_core::UserId;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret};
 use aruna_core::structs::{Actor, AuthContext, User};
+use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE, UserId};
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
 };
@@ -22,6 +25,7 @@ use aruna_operations::update_user::{UpdateUserInput, UpdateUserOperation};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
+use byteview::ByteView;
 use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -161,6 +165,81 @@ async fn issue_user_token(
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))
+}
+
+async fn ensure_canonical_user_token_subject(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+) -> ServerResult<()> {
+    let ctx = state.get_ctx();
+    let user = match ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: USER_KEYSPACE.to_string(),
+            key: ByteView::from(user_id.to_bytes()),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => User::from_bytes(&bytes)
+            .map_err(|error| ServerError::InternalError(error.to_string()))?,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            return Err(ServerError::Unauthorized);
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(ServerError::InternalError(error.to_string()));
+        }
+        other => {
+            return Err(ServerError::InternalError(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    };
+
+    if user.user_id != user_id {
+        return Err(ServerError::Unauthorized);
+    }
+
+    for subject_id in &user.subject_ids {
+        match ctx
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                key: ByteView::from(subject_id.as_bytes().to_vec()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => {
+                let indexed_user_id = std::str::from_utf8(&bytes)
+                    .map_err(|error| ServerError::InternalError(error.to_string()))
+                    .and_then(|value| {
+                        UserId::from_string(value)
+                            .map_err(|error| ServerError::InternalError(error.to_string()))
+                    })?;
+                if indexed_user_id != user_id {
+                    return Err(ServerError::Forbidden);
+                }
+            }
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+                return Err(ServerError::Forbidden);
+            }
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(ServerError::InternalError(error.to_string()));
+            }
+            other => {
+                return Err(ServerError::InternalError(format!(
+                    "unexpected storage event: {other:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn try_claim_initial_admin(state: &Arc<ServerState>, user_id: UserId) {
@@ -332,6 +411,7 @@ async fn get_token(
             if aruna_ctx.path_restrictions.is_some() {
                 return Err(ServerError::Forbidden);
             }
+            ensure_canonical_user_token_subject(&state, aruna_ctx.user_id).await?;
             aruna_ctx.user_id
         }
         None => {
@@ -537,7 +617,7 @@ mod tests {
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSecretRecord};
     use aruna_core::structs::{
         Actor, NodeCapabilities, OidcProviderConfig, PathRestriction, Permission,
-        RealmConfigDocument, RealmId, TokenClaims, User,
+        RealmConfigDocument, RealmId, TokenClaims, User, oidc_subject_key,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_operations::announce_realm_presence::{
@@ -683,6 +763,21 @@ mod tests {
     }
 
     fn sign_scoped_aruna_token(node: &TestNode, user_id: UserId) -> String {
+        sign_aruna_token(
+            node,
+            user_id,
+            Some(vec![PathRestriction {
+                pattern: format!("/{}/admin/u/**", node.realm_id),
+                permission: Permission::READ,
+            }]),
+        )
+    }
+
+    fn sign_aruna_token(
+        node: &TestNode,
+        user_id: UserId,
+        restrictions: Option<Vec<PathRestriction>>,
+    ) -> String {
         let now = super::now_timestamp();
         let claims = TokenClaims {
             sub: user_id.to_string(),
@@ -690,10 +785,7 @@ mod tests {
             iat: now,
             exp: now + 600,
             jti: Ulid::new().to_string(),
-            restrictions: Some(vec![PathRestriction {
-                pattern: format!("/{}/admin/u/**", node.realm_id),
-                permission: Permission::READ,
-            }]),
+            restrictions,
             issuer_pubkey: None,
             delegation_signature: None,
         };
@@ -1086,6 +1178,7 @@ mod tests {
                         user_id: foreign_user_id,
                         name: "Foreign User".to_string(),
                         subject_ids: Vec::new(),
+                        alias_user_ids: Default::default(),
                         attributes: Default::default(),
                     }
                     .to_bytes(&Actor {
@@ -1194,6 +1287,71 @@ mod tests {
         let token_response = reqwest::Client::new()
             .get(format!("{}/api/v1/users/token", node.base_url))
             .bearer_auth(&scoped_token)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(token_response.status(), StatusCode::FORBIDDEN);
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
+    async fn get_token_rejects_alias_aruna_token() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+
+        let (registered, _aruna_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "subject-123",
+            "Alice",
+            None,
+        )
+        .await;
+        let canonical_user_id = UserId::from_string(&registered.id).unwrap();
+        let alias_user_id = UserId::local(Ulid::from_bytes([9u8; 16]), node.realm_id);
+        let subject_key = oidc_subject_key(issuer, "subject-123").unwrap();
+        match node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: USER_KEYSPACE.to_string(),
+                key: ByteView::from(alias_user_id.to_bytes()),
+                value: ByteView::from(
+                    User {
+                        user_id: alias_user_id,
+                        name: "Alias Alice".to_string(),
+                        subject_ids: vec![subject_key],
+                        alias_user_ids: Default::default(),
+                        attributes: Default::default(),
+                    }
+                    .to_bytes(&Actor {
+                        node_id: node.net.node_id(),
+                        user_id: canonical_user_id,
+                        realm_id: node.realm_id,
+                    })
+                    .unwrap(),
+                ),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected alias user write result: {other:?}"),
+        }
+        let alias_token = sign_aruna_token(&node, alias_user_id, None);
+
+        let token_response = reqwest::Client::new()
+            .get(format!("{}/api/v1/users/token", node.base_url))
+            .bearer_auth(&alias_token)
             .send()
             .await
             .unwrap();

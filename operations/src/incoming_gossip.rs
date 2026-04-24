@@ -25,6 +25,7 @@ use crate::outgoing_automerge::OutgoingAutomergeOperation;
 pub struct IncomingGossipOperation {
     topic: TopicId,
     sender: NodeId,
+    local_node_id: NodeId,
     data: Vec<u8>,
     message: Option<TopicMessage>,
     state: IncomingGossipState,
@@ -69,10 +70,11 @@ pub enum IncomingGossipError {
 }
 
 impl IncomingGossipOperation {
-    pub fn new(topic: TopicId, sender: NodeId, data: Vec<u8>) -> Self {
+    pub fn new(topic: TopicId, sender: NodeId, local_node_id: NodeId, data: Vec<u8>) -> Self {
         Self {
             topic,
             sender,
+            local_node_id,
             data,
             message: None,
             state: IncomingGossipState::Init,
@@ -238,7 +240,11 @@ impl Operation for IncomingGossipOperation {
                     );
                     self.state = IncomingGossipState::WaitForAutomergeSync;
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        OutgoingAutomergeOperation::new(self.sender, document),
+                        OutgoingAutomergeOperation::new_with_local_node(
+                            self.sender,
+                            document,
+                            self.local_node_id,
+                        ),
                         |result| {
                             Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
                                 result: result.map_err(|error| error.to_string()),
@@ -469,6 +475,7 @@ mod tests {
         let mut op = IncomingGossipOperation::new(
             document.topic_id(),
             remote_node,
+            make_node(1),
             announcement(clock, remote_node),
         );
 
@@ -491,6 +498,7 @@ mod tests {
         let mut op = IncomingGossipOperation::new(
             document.topic_id(),
             remote_node,
+            make_node(1),
             announcement(aruna_core::AutomergeClock::new(Vec::new(), 0), remote_node),
         );
 
@@ -514,6 +522,7 @@ mod tests {
         let mut op = IncomingGossipOperation::new(
             document.topic_id(),
             remote_node,
+            make_node(1),
             announcement(remote_clock, remote_node),
         );
 
@@ -530,7 +539,8 @@ mod tests {
         let sender = make_node(12);
         let announced_by = make_node(13);
         let payload = announcement(aruna_core::AutomergeClock::new(Vec::new(), 0), announced_by);
-        let mut op = IncomingGossipOperation::new(document.topic_id(), sender, payload);
+        let mut op =
+            IncomingGossipOperation::new(document.topic_id(), sender, make_node(1), payload);
 
         let effects = op.start();
         assert!(effects.is_empty());
@@ -551,6 +561,7 @@ mod tests {
         let mut op = IncomingGossipOperation::new(
             TopicId::group(GroupId::from_bytes([1u8; 16])),
             message.node_id,
+            make_node(1),
             postcard::to_allocvec(&message).expect("message bytes"),
         );
 
