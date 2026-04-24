@@ -6,10 +6,12 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
+use aruna_core::structs::User;
 use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
+use crate::user_subject_index::rewrite_subject_index_effects;
 
 #[derive(Debug, PartialEq)]
 pub struct OutgoingAutomergeOperation {
@@ -32,6 +34,7 @@ enum OutgoingAutomergeState {
     StartPersistTransaction,
     ReconcileRead,
     Persist,
+    UpdateDerivedState,
     CommitPersist,
     Finish,
     Error,
@@ -102,6 +105,34 @@ impl OutgoingAutomergeOperation {
             expected,
             got,
         })
+    }
+
+    fn emit_derived_user_updates(
+        &mut self,
+        txn_id: aruna_core::types::TxnId,
+    ) -> Result<aruna_core::types::Effects, OutgoingAutomergeError> {
+        if !matches!(self.document, AutomergeDocumentVariant::User { .. }) {
+            self.state = OutgoingAutomergeState::CommitPersist;
+            return Ok(smallvec![Effect::Storage(
+                StorageEffect::CommitTransaction { txn_id }
+            )]);
+        }
+
+        let previous_user = match self.local_document.as_deref() {
+            Some(bytes) if !bytes.is_empty() => Some(User::from_bytes(bytes)?),
+            _ => None,
+        };
+        let current_user = User::from_bytes(self.synced_document.as_deref().unwrap_or_default())?;
+        let effects = rewrite_subject_index_effects(previous_user.as_ref(), &current_user, txn_id)?;
+        if effects.is_empty() {
+            self.state = OutgoingAutomergeState::CommitPersist;
+            Ok(smallvec![Effect::Storage(
+                StorageEffect::CommitTransaction { txn_id }
+            )])
+        } else {
+            self.state = OutgoingAutomergeState::UpdateDerivedState;
+            Ok(effects)
+        }
     }
 }
 
@@ -203,6 +234,8 @@ impl Operation for OutgoingAutomergeOperation {
                             StorageError::TransactionNotFound,
                         ));
                     };
+                    self.local_document = Some(current);
+                    self.synced_document = Some(merged.clone());
                     self.state = OutgoingAutomergeState::Persist;
                     smallvec![write_effect(&self.document, merged, Some(txn_id))]
                 }
@@ -216,11 +249,27 @@ impl Operation for OutgoingAutomergeOperation {
                             StorageError::TransactionNotFound,
                         ));
                     };
+                    match self.emit_derived_user_updates(txn_id) {
+                        Ok(effects) => effects,
+                        Err(error) => self.fail(error),
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage write result", format!("{other:?}")),
+            },
+            OutgoingAutomergeState::UpdateDerivedState => match event {
+                Event::Storage(StorageEvent::BatchWriteResult { .. })
+                | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
+                    let Some(txn_id) = self.persist_txn_id else {
+                        return self.fail(OutgoingAutomergeError::StorageError(
+                            StorageError::TransactionNotFound,
+                        ));
+                    };
                     self.state = OutgoingAutomergeState::CommitPersist;
                     smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
+                other => self.unexpected_event("subject index update result", format!("{other:?}")),
             },
             OutgoingAutomergeState::CommitPersist => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -274,4 +323,99 @@ fn reconcile_documents(current: &[u8], session: Option<&[u8]>) -> Result<Vec<u8>
     let mut session_doc = automerge::Automerge::load(session)?;
     current_doc.merge(&mut session_doc)?;
     Ok(current_doc.save())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OutgoingAutomergeOperation;
+    use aruna_core::automerge::{AutomergeDocumentVariant, AutomergeEvent, AutomergeInit};
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::{Actor, RealmId, User, oidc_subject_key};
+    use aruna_core::{USER_SUBJECT_INDEX_KEYSPACE, UserId};
+    use byteview::ByteView;
+    use ulid::Ulid;
+
+    fn node_id(seed: u8) -> aruna_core::NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn user_bytes(user_id: UserId, subject_ids: Vec<String>) -> Vec<u8> {
+        User {
+            user_id,
+            name: "Alice".to_string(),
+            subject_ids,
+            attributes: Default::default(),
+        }
+        .to_bytes(&Actor {
+            node_id: node_id(1),
+            user_id,
+            realm_id: user_id.realm_id,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn outgoing_user_sync_rewrites_subject_index_before_commit() {
+        let sync_id = Ulid::new();
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        let subject_key = oidc_subject_key("https://issuer.example", "subject-1").unwrap();
+        let document = AutomergeDocumentVariant::User { user_id };
+        let bytes = user_bytes(user_id, vec![subject_key.clone()]);
+        let txn_id = Ulid::new();
+        let mut operation = OutgoingAutomergeOperation::new(node_id(4), document.clone());
+
+        operation.start();
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(user_id.to_bytes()),
+            value: None,
+        }));
+        operation.step(Event::Automerge(AutomergeEvent::SyncInitialized {
+            sync_id,
+            peer: node_id(4),
+            remote_init: AutomergeInit::new(document.clone(), Vec::new()),
+        }));
+        operation.step(Event::Automerge(AutomergeEvent::SyncFinished {
+            sync_id,
+            document,
+            before_heads: Vec::new(),
+            after_heads: Vec::new(),
+            updated_document: bytes,
+            changed: true,
+        }));
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: ByteView::from(user_id.to_bytes()),
+            value: None,
+        }));
+        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
+            key: ByteView::from(user_id.to_bytes()),
+        }));
+
+        match effects.first().unwrap() {
+            Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
+                assert_eq!(id, &Some(txn_id));
+                assert_eq!(writes.len(), 1);
+                let (key_space, key, value) = &writes[0];
+                assert_eq!(key_space, USER_SUBJECT_INDEX_KEYSPACE);
+                assert_eq!(key.as_ref(), subject_key.as_bytes());
+                assert_eq!(value.as_ref(), user_id.to_string().as_bytes());
+            }
+            other => panic!("unexpected effect: {other:?}"),
+        }
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: vec![(
+                USER_SUBJECT_INDEX_KEYSPACE.to_string(),
+                ByteView::from(subject_key.into_bytes()),
+            )],
+        }));
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::Storage(StorageEffect::CommitTransaction { txn_id: id }))
+                if *id == txn_id
+        ));
+    }
 }
