@@ -22,6 +22,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path};
 use std::sync::Arc;
 use utoipa::{OpenApi, ToSchema};
 
@@ -125,7 +126,7 @@ async fn snapshot_blob(
         Permission::WRITE,
     )
     .await?;
-    ensure_source_permission(&state, &auth, group_id).await?;
+    ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
     let result = materialize_snapshot(
         &state.get_ctx(),
@@ -188,7 +189,7 @@ async fn reference_blob(
         Permission::WRITE,
     )
     .await?;
-    ensure_source_permission(&state, &auth, group_id).await?;
+    ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
 
     let result = materialize_reference(
         &state.get_ctx(),
@@ -239,14 +240,55 @@ async fn ensure_source_permission(
     state: &ServerState,
     auth: &AuthContext,
     group_id: ulid::Ulid,
+    connector_id: ulid::Ulid,
+    source_path: &str,
 ) -> ServerResult<()> {
+    validate_relative_source_path(source_path)?;
+
     ensure_permission(
         state,
         auth,
-        format!("/{}/g/{group_id}/data/**", state.get_realm_id()),
+        source_connector_permission_path(state, group_id, connector_id, source_path),
         Permission::READ,
     )
     .await
+}
+
+fn source_connector_permission_path(
+    state: &ServerState,
+    group_id: ulid::Ulid,
+    connector_id: ulid::Ulid,
+    source_path: &str,
+) -> String {
+    format!(
+        "/{}/g/{group_id}/data/{}/_sources/{connector_id}/{source_path}",
+        state.get_realm_id(),
+        state.get_node_id(),
+    )
+}
+
+fn validate_relative_source_path(source_path: &str) -> ServerResult<()> {
+    let trimmed = source_path.trim();
+    if trimmed.is_empty() {
+        return Err(ServerError::BadRequest);
+    }
+
+    let mut has_normal_component = false;
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(_) => has_normal_component = true,
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(ServerError::BadRequest);
+            }
+        }
+    }
+
+    has_normal_component
+        .then_some(())
+        .ok_or(ServerError::BadRequest)
 }
 
 fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
@@ -311,7 +353,8 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
     use aruna_core::structs::{
-        Actor, Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+        Actor, Group, GroupAuthorizationDocument, NodeCapabilities, PathRestriction,
+        RealmAuthorizationDocument,
     };
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
@@ -323,6 +366,8 @@ mod tests {
         _storage_dir: TempDir,
         state: Arc<ServerState>,
         bucket_group_id: Ulid,
+        connector_id: Ulid,
+        source_path: String,
         bucket: String,
         key: String,
         auth_with_source_read: AuthContext,
@@ -330,7 +375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_requires_source_group_read_permission() {
+    async fn snapshot_requires_concrete_source_read_permission() {
         let test = setup_state().await;
 
         let result = snapshot_blob(
@@ -338,8 +383,8 @@ mod tests {
             test.auth_without_source_read,
             StageBlobTargetRequest {
                 group_id: test.bucket_group_id.to_string(),
-                connector_id: Ulid::new().to_string(),
-                source_path: "folder/file.txt".to_string(),
+                connector_id: test.connector_id.to_string(),
+                source_path: test.source_path,
                 bucket: test.bucket,
                 key: test.key,
             },
@@ -350,7 +395,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reference_allows_request_past_auth_when_source_group_read_is_granted() {
+    async fn reference_allows_request_past_auth_when_source_read_is_granted() {
         let test = setup_state().await;
 
         let result = reference_blob(
@@ -358,8 +403,8 @@ mod tests {
             test.auth_with_source_read,
             StageBlobTargetRequest {
                 group_id: test.bucket_group_id.to_string(),
-                connector_id: Ulid::new().to_string(),
-                source_path: "folder/file.txt".to_string(),
+                connector_id: test.connector_id.to_string(),
+                source_path: test.source_path,
                 bucket: test.bucket,
                 key: test.key,
             },
@@ -403,11 +448,14 @@ mod tests {
 
         let bucket_group_id = Ulid::new();
         let source_group_id = Ulid::new();
-        let bucket_auth = GroupAuthorizationDocument::new_default_group_doc(
+        let mut bucket_auth = GroupAuthorizationDocument::new_default_group_doc(
             user_with_source_read,
             realm_id,
             bucket_group_id,
         );
+        for role in bucket_auth.roles.values_mut() {
+            role.assigned_users.insert(user_without_source_read);
+        }
         let mut source_auth = GroupAuthorizationDocument::new_default_group_doc(
             user_with_source_read,
             realm_id,
@@ -469,6 +517,8 @@ mod tests {
 
         let bucket = "stage-bucket".to_string();
         let key = "test.txt".to_string();
+        let connector_id = Ulid::new();
+        let source_path = "folder/file.txt".to_string();
         let bucket_info = BucketInfo {
             group_id: bucket_group_id,
             created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -494,21 +544,44 @@ mod tests {
             .await,
         );
 
+        let target_path =
+            bucket_blob_permission_path(state.as_ref(), bucket_group_id, &bucket, &key);
+        let source_path_restriction = source_connector_permission_path(
+            state.as_ref(),
+            bucket_group_id,
+            connector_id,
+            &source_path,
+        );
+
         TestState {
             _storage_dir: storage_dir,
             state,
             bucket_group_id,
+            connector_id,
+            source_path,
             bucket,
             key,
             auth_with_source_read: AuthContext {
                 user_id: user_with_source_read,
                 realm_id,
-                path_restrictions: None,
+                path_restrictions: Some(vec![
+                    PathRestriction {
+                        pattern: target_path.clone(),
+                        permission: Permission::WRITE,
+                    },
+                    PathRestriction {
+                        pattern: source_path_restriction,
+                        permission: Permission::READ,
+                    },
+                ]),
             },
             auth_without_source_read: AuthContext {
                 user_id: user_without_source_read,
                 realm_id,
-                path_restrictions: None,
+                path_restrictions: Some(vec![PathRestriction {
+                    pattern: target_path,
+                    permission: Permission::WRITE,
+                }]),
             },
         }
     }
