@@ -65,6 +65,12 @@ pub enum IncomingVersionReplicationError {
     MissingBlobInfo,
     #[error("Materialized replication manifest is missing local blob location")]
     MissingBlobLocation,
+    #[error("Replicated blob hash does not match manifest")]
+    BlobHashMismatch,
+    #[error("Replicated blob size does not match manifest")]
+    BlobSizeMismatch,
+    #[error("Replicated blob storage flags do not match manifest")]
+    BlobStorageFlagsMismatch,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -294,6 +300,32 @@ impl IncomingVersionReplicationOperation {
         }
     }
 
+    fn validate_materialized_location(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<(), IncomingVersionReplicationError> {
+        let blob = self
+            .manifest
+            .blob
+            .as_ref()
+            .ok_or(IncomingVersionReplicationError::MissingBlobInfo)?;
+        let blake3 = location
+            .get_blake3()
+            .ok_or(IncomingVersionReplicationError::MissingBlobLocation)?;
+
+        if blake3 != blob.hash {
+            return Err(IncomingVersionReplicationError::BlobHashMismatch);
+        }
+        if location.blob_size != blob.size {
+            return Err(IncomingVersionReplicationError::BlobSizeMismatch);
+        }
+        if location.compressed != blob.compressed || location.encrypted != blob.encrypted {
+            return Err(IncomingVersionReplicationError::BlobStorageFlagsMismatch);
+        }
+
+        Ok(())
+    }
+
     fn write_hash_lookup_or_continue(&mut self) -> Effects {
         if self.received_blob_location.is_none() {
             return self.write_object_lookup_or_continue();
@@ -303,6 +335,9 @@ impl IncomingVersionReplicationOperation {
             Ok(location) => location,
             Err(err) => return self.fail(err),
         };
+        if let Err(err) = self.validate_materialized_location(&location) {
+            return self.fail(err);
+        }
         let blake3 = location
             .get_blake3()
             .map(|hash| hash.to_vec())
@@ -569,18 +604,13 @@ impl Operation for IncomingVersionReplicationOperation {
                 }
             }
             IncomingVersionReplicationState::ReadExistingVersion => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                let Event::Storage(StorageEvent::ReadResult { value: _, .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
-
-                if value.is_some() {
-                    return self
-                        .send_negotiation(ReplicationNegotiationResult::AlreadyReplicatedVersion);
-                }
 
                 match self.manifest.kind {
                     ReplicationItemKind::DeleteMarker => {
@@ -601,6 +631,11 @@ impl Operation for IncomingVersionReplicationOperation {
                 if let Some(value) = value {
                     match Location::from_bytes(value.as_ref()) {
                         Ok(Location::Real(location)) => {
+                            if self.validate_materialized_location(&location).is_err() {
+                                return self.send_negotiation(
+                                    ReplicationNegotiationResult::NeedBlobAndVersion,
+                                );
+                            }
                             self.existing_blob_location = Some(location);
                             self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
                         }
@@ -639,6 +674,11 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                if let Err(err) = self.validate_materialized_location(&location) {
+                    self.received_blob_location = Some(location.clone());
+                    self.cleanup_blob_location = Some(location);
+                    return self.fail(err);
+                }
                 self.received_blob_location = Some(location.clone());
                 self.cleanup_blob_location = Some(location);
                 self.start_transaction()
@@ -831,7 +871,7 @@ mod tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BucketInfo, RealmId, ReplicationItemKind,
+        AuthContext, BackendLocation, BucketInfo, Location, RealmId, ReplicationItemKind,
         ReplicationNegotiationResult, VersionMetadata,
     };
     use std::collections::HashMap;
@@ -955,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_version_short_circuits_with_already_replicated_response() {
+    fn existing_version_does_not_short_circuit_apply() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
@@ -977,14 +1017,83 @@ mod tests {
             key: vec![0u8; 4].into(),
             value: Some(version.to_bytes().unwrap().into()),
         }));
-        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn existing_blob_with_manifest_mismatch_requests_blob_transfer() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+
+        let _effects = advance_to_version_lookup(&mut op, Ulid::new());
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Read { .. })
+        ));
+
+        let mut mismatched_location = make_location();
+        mismatched_location.blob_size += 1;
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(Location::Real(mismatched_location).to_bytes().unwrap().into()),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         assert!(matches!(
             message_from_effect(&effects[0]),
             VersionReplicationMessage::VersionNegotiationResponse(
-                aruna_core::structs::ReplicationNegotiationResult::AlreadyReplicatedVersion
+                aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion
             )
         ));
+    }
+
+    #[test]
+    fn received_blob_manifest_mismatch_is_rejected_and_cleaned_up() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let stream_id = Ulid::new();
+        let mut op = IncomingVersionReplicationOperation::new(
+            stream_id,
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        let mut mismatched_location = make_location();
+        mismatched_location.blob_size += 1;
+
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+        op.state = IncomingVersionReplicationState::ReceiveBlob;
+
+        let effects = op.step(Event::Blob(BlobEvent::ReplicationFinished {
+            location: mismatched_location.clone(),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+
+        let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CleanupReceivedBlob);
+        assert_eq!(
+            effects[0],
+            Effect::Blob(BlobEffect::Delete {
+                location: mismatched_location
+            })
+        );
     }
 
     #[test]
