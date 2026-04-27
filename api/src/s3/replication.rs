@@ -1,6 +1,7 @@
 use aruna_core::NodeId;
 use aruna_core::structs::{AuthContext, RealmId};
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::replication::protocol::ReplicationMode;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
 };
@@ -53,6 +54,7 @@ async fn trigger_version_replication(
             target_node_id: target.node_id,
             auth_context: auth_context.clone(),
             replicate_delete_markers: target.replicate_delete_markers,
+            mode: ReplicationMode::Live,
         };
 
         match drive(ReplicateScopeOperation::new(input), &context)

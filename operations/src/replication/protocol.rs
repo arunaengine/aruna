@@ -66,13 +66,20 @@ impl VersionReplicationMessage {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ReplicationMode {
+    Live,
+    OnDemand,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct LiveReplicationRequest {
+pub struct VersionReplicationRequest {
     pub bucket: String,
     pub key: String,
     pub version_id: Ulid,
     pub target_node_id: NodeId,
     pub auth_context: AuthContext,
+    pub mode: ReplicationMode,
 }
 
 #[cfg(test)]
