@@ -10,7 +10,15 @@ use s3s::dto::{
     ChecksumType, CompletedPart, CreateMultipartUploadInput, PartNumber, PutObjectInput,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
+use std::ops::Range as StdRange;
 use ulid::Ulid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedByteRange {
+    pub range: StdRange<u64>,
+    pub content_range: String,
+    pub content_length: i64,
+}
 
 pub fn to_base64<T: AsRef<[u8]>>(input: T) -> String {
     BASE64_STANDARD.encode(input)
@@ -247,6 +255,25 @@ pub(crate) fn s3_checksum_type_from_multipart(
     }
 }
 
+pub(crate) fn resolve_byte_range(
+    requested_range: Option<s3s::dto::Range>,
+    full_length: u64,
+) -> S3Result<Option<ResolvedByteRange>> {
+    let Some(requested_range) = requested_range else {
+        return Ok(None);
+    };
+    if full_length == 0 {
+        return Err(S3ErrorCode::InvalidRange.into());
+    }
+
+    let range = requested_range.check(full_length)?;
+    Ok(Some(ResolvedByteRange {
+        content_range: format!("bytes {}-{}/{}", range.start, range.end - 1, full_length),
+        content_length: (range.end - range.start) as i64,
+        range,
+    }))
+}
+
 pub(crate) fn checksum_algorithm_from_s3(
     algorithm: &S3ChecksumAlgorithm,
 ) -> S3Result<ChecksumAlgorithm> {
@@ -262,8 +289,9 @@ pub(crate) fn checksum_algorithm_from_s3(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_multipart_part_number;
+    use super::{parse_multipart_part_number, resolve_byte_range};
     use s3s::S3ErrorCode;
+    use s3s::dto::Range;
 
     #[test]
     fn rejects_upload_part_number_zero() {
@@ -306,75 +334,42 @@ mod tests {
             10_000
         );
     }
-}
 
-/*
-pub async fn evaluate_s3_range(
-    input_range: Option<s3s::dto::Range>,
-    file_size: u64,
-    storage_path: &str,
-    operator: &Operator,
-) -> Result<(FuturesBytesStream, Option<String>, Option<String>, i64), S3Error> {
-    Ok(if let Some(range) = input_range {
-        let (range, bytes_range, content_range) = match range {
-            s3s::dto::Range::Int { first, last } => match last {
-                Some(end) => {
-                    // File size is maximum
-                    let end = if end >= file_size { file_size - 1 } else { end };
-
-                    (
-                        std::ops::Range {
-                            start: first,
-                            end: end + 1,
-                        },
-                        format!("bytes {}-{}/{}", first, end, file_size),
-                        (end + 1 - first) as i64,
-                    )
-                }
-                None => (
-                    std::ops::Range {
-                        start: first,
-                        end: file_size,
-                    },
-                    format!("bytes {}-{}/{}", first, file_size - 1, file_size),
-                    (file_size - first) as i64,
-                ),
-            },
-            s3s::dto::Range::Suffix { length } => {
-                // File size is maximum
-                let length = if length > file_size {
-                    file_size - 1
-                } else {
-                    length
-                };
-
-                (
-                    std::ops::Range {
-                        start: 0,
-                        end: length + 1,
-                    },
-                    format!("bytes 0-{}/{}", length, file_size),
-                    (length + 1) as i64,
-                )
-            }
-        };
-
-        let stream = IOHandler::<LmdbStore>::read_data_range(&operator, storage_path, range)
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e))?;
-
-        (
-            stream,
-            Some("bytes".to_string()),
-            Some(bytes_range),
-            content_range,
+    #[test]
+    fn resolves_explicit_byte_range() {
+        let resolved = resolve_byte_range(
+            Some(Range::Int {
+                first: 2,
+                last: Some(5),
+            }),
+            10,
         )
-    } else {
-        let stream = IOHandler::<LmdbStore>::read_data(&operator, storage_path)
-            .await
-            .map_err(|e| s3_error!(InternalError, "{}", e))?;
+        .unwrap()
+        .unwrap();
 
-        (stream, None, None, file_size as i64)
-    })
+        assert_eq!(resolved.range, 2..6);
+        assert_eq!(resolved.content_range, "bytes 2-5/10");
+        assert_eq!(resolved.content_length, 4);
+    }
+
+    #[test]
+    fn resolves_suffix_byte_range() {
+        let resolved = resolve_byte_range(Some(Range::Suffix { length: 3 }), 10)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(resolved.range, 7..10);
+        assert_eq!(resolved.content_range, "bytes 7-9/10");
+        assert_eq!(resolved.content_length, 3);
+    }
+
+    #[test]
+    fn rejects_empty_object_byte_range() {
+        assert_eq!(
+            *resolve_byte_range(Some(Range::Suffix { length: 1 }), 0)
+                .unwrap_err()
+                .code(),
+            S3ErrorCode::InvalidRange
+        );
+    }
 }
-*/

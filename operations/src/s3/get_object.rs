@@ -354,10 +354,15 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
 
+        let read_effect = match self.input.range.clone() {
+            Some(range) => BlobEffect::ReadRange { location, range },
+            None => BlobEffect::Read { location },
+        };
+
         self.state = GetObjectState::CommitTransaction;
         smallvec![
             Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-            Effect::Blob(BlobEffect::Read { location })
+            Effect::Blob(read_effect)
         ]
     }
 
@@ -676,7 +681,7 @@ mod test {
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
+    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
@@ -712,6 +717,45 @@ mod test {
             axum::serve(listener, app).await.unwrap();
         });
         format!("http://{}", addr)
+    }
+
+    #[test]
+    fn materialized_range_read_emits_blob_read_range() {
+        let mut operation = GetObjectOperation::new(GetObjectInput {
+            bucket: "s3test".to_string(),
+            key: "range.txt".to_string(),
+            version_id: None,
+            range: Some(2..5),
+            group_id: Ulid::new(),
+            user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+        });
+        let txn_id = Ulid::new();
+        let location = BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "aruna_test".to_string(),
+            backend_path: "s3test/range.txt".to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+            created_by: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 10,
+            hashes: HashMap::new(),
+        };
+        operation.txn_id = Some(txn_id);
+        operation.location = Some(location.clone());
+
+        let effects = operation.commit_and_read_blob();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [
+                Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed_txn_id }),
+                Effect::Blob(BlobEffect::ReadRange { location: emitted_location, range })
+            ] if *committed_txn_id == txn_id && emitted_location == &location && range == &(2..5)
+        ));
     }
 
     #[tokio::test]

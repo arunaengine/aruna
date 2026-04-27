@@ -9,7 +9,7 @@ use crate::s3::replication::spawn_version_replication;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    s3_checksum_type_from_multipart, to_base64,
+    resolve_byte_range, s3_checksum_type_from_multipart, to_base64,
 };
 use aruna_core::NodeId;
 use aruna_core::stream::BackendStream;
@@ -743,13 +743,45 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let requested_range = req.input.range;
         let version_id = parse_version_id(req.input.version_id)?;
+        let bucket = req.input.bucket;
+        let key = req.input.key;
+
+        let resolved_range = if requested_range.is_some() {
+            let head_result = drive(
+                HeadObjectOperation::new(HOI {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id,
+                }),
+                &self.state,
+            )
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to process HEAD request"))?;
+            let full_length = head_result
+                .location
+                .as_ref()
+                .map(|location| location.blob_size)
+                .or_else(|| {
+                    head_result
+                        .source_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.content_length)
+                })
+                .ok_or_else(|| s3_error!(InternalError, "Object length unavailable"))?;
+            resolve_byte_range(requested_range, full_length)?
+        } else {
+            None
+        };
 
         let operation = GetObjectOperation::new(GOI {
-            bucket: req.input.bucket,
-            key: req.input.key,
+            bucket,
+            key,
             version_id,
-            range: None,
+            range: resolved_range.as_ref().map(|range| range.range.clone()),
             group_id: bucket_info
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
@@ -772,7 +804,14 @@ impl S3 for ArunaS3Service {
         let content = StreamingBlob::wrap(result.blob);
         let mut output = GetObjectOutput {
             body: Some(content),
-            content_length: response_fields.content_length,
+            accept_ranges: resolved_range.as_ref().map(|_| "bytes".to_string()),
+            content_length: resolved_range
+                .as_ref()
+                .map(|range| range.content_length)
+                .or(response_fields.content_length),
+            content_range: resolved_range
+                .as_ref()
+                .map(|range| range.content_range.clone()),
             content_type: response_fields.content_type,
             e_tag: response_fields.e_tag,
             last_modified: response_fields.last_modified,
@@ -790,7 +829,11 @@ impl S3 for ArunaS3Service {
             ));
         }
 
-        Ok(S3Response::new(output))
+        Ok(if resolved_range.is_some() {
+            S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT)
+        } else {
+            S3Response::new(output)
+        })
     }
 
     #[tracing::instrument(err, skip(self, _req))]
