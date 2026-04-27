@@ -540,6 +540,13 @@ mod tests {
         let source = build_version_source_binding(
             aruna_core::structs::StagingStrategy::Reference,
             &created.connector,
+            &aruna_core::structs::SourceMetadata {
+                content_length: 42,
+                content_type: Some("text/plain".to_string()),
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            },
             "run-1/data.txt".to_string(),
             None,
             Some(created.connector.connector_id),

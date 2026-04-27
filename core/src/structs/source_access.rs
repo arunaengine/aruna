@@ -24,4 +24,6 @@ pub struct SourceMetadata {
     pub content_type: Option<String>,
     pub etag: Option<String>,
     pub last_modified: Option<SystemTime>,
+    #[serde(skip)]
+    pub source_version: Option<String>,
 }

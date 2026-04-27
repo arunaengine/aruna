@@ -235,6 +235,7 @@ mod tests {
             content_type: Some("text/plain".to_string()),
             etag: Some("etag-2".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
         }
     }
 

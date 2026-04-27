@@ -643,6 +643,7 @@ mod tests {
             content_type: Some("text/plain".to_string()),
             etag: Some("etag-123".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
         };
         let last_refresh = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(17);
         let source = VersionSourceBinding {

@@ -939,6 +939,7 @@ mod test {
             content_type: Some("text/plain".to_string()),
             etag: Some("etag-123".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
         };
         let source = VersionSourceBinding {
             strategy: StagingStrategy::Reference,
@@ -1141,6 +1142,7 @@ mod test {
                         content_type: Some("application/octet-stream".to_string()),
                         etag: Some("stale-etag".to_string()),
                         last_modified: None,
+                        source_version: None,
                     },
                     SystemTime::UNIX_EPOCH,
                     Default::default(),

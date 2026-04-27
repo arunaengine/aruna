@@ -63,6 +63,7 @@ pub async fn materialize_reference(
     let version_source = build_version_source_binding(
         StagingStrategy::Reference,
         &head_result.connector,
+        &head_result.metadata,
         input.source_path,
         Some(input.node_id),
         Some(head_result.connector.connector_id),

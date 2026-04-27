@@ -60,6 +60,7 @@ pub async fn materialize_snapshot(
     let version_source = build_version_source_binding(
         StagingStrategy::Snapshot,
         &read_result.connector,
+        &read_result.metadata,
         input.source_path,
         Some(input.node_id),
         Some(read_result.connector.connector_id),

@@ -226,6 +226,7 @@ mod tests {
             content_type: Some("application/octet-stream".to_string()),
             etag: Some("etag-1".to_string()),
             last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
         }
     }
 

@@ -1203,6 +1203,7 @@ mod tests {
                 content_type: Some("text/plain".to_string()),
                 etag: Some("etag-1".to_string()),
                 last_modified: Some(SystemTime::UNIX_EPOCH),
+                source_version: None,
             },
             SystemTime::now(),
             test_user_id(),
@@ -1501,6 +1502,7 @@ mod tests {
                 content_type: Some("text/plain".to_string()),
                 etag: Some("etag-2".to_string()),
                 last_modified: None,
+                source_version: None,
             },
             stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
                 Bytes::from_static(b"abc"),
@@ -1551,6 +1553,7 @@ mod tests {
                 content_type: Some("text/plain".to_string()),
                 etag: Some("etag-2".to_string()),
                 last_modified: None,
+                source_version: None,
             },
             stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
                 Bytes::from_static(b"abc"),
