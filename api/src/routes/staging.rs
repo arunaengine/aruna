@@ -125,6 +125,7 @@ async fn snapshot_blob(
         Permission::WRITE,
     )
     .await?;
+    ensure_source_permission(&state, &auth, group_id).await?;
 
     let result = materialize_snapshot(
         &state.get_ctx(),
@@ -187,6 +188,7 @@ async fn reference_blob(
         Permission::WRITE,
     )
     .await?;
+    ensure_source_permission(&state, &auth, group_id).await?;
 
     let result = materialize_reference(
         &state.get_ctx(),
@@ -231,6 +233,20 @@ async fn load_bucket_info(state: &ServerState, bucket: &str) -> ServerResult<Buc
         Ok(None) | Err(GetBucketInfoError::NotFound) => Err(ServerError::NotFound),
         Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
+}
+
+async fn ensure_source_permission(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: ulid::Ulid,
+) -> ServerResult<()> {
+    ensure_permission(
+        state,
+        auth,
+        format!("/{}/g/{group_id}/data/**", state.get_realm_id()),
+        Permission::READ,
+    )
+    .await
 }
 
 fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
@@ -284,4 +300,226 @@ fn map_staging_source_error(error: StagingSourceError) -> ServerError {
 
 fn format_system_time(value: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE};
+    use aruna_core::structs::{
+        Actor, Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument,
+    };
+    use aruna_operations::driver::DriverContext;
+    use aruna_storage::storage;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use ulid::Ulid;
+
+    struct TestState {
+        _storage_dir: TempDir,
+        state: Arc<ServerState>,
+        bucket_group_id: Ulid,
+        bucket: String,
+        key: String,
+        auth_with_source_read: AuthContext,
+        auth_without_source_read: AuthContext,
+    }
+
+    #[tokio::test]
+    async fn snapshot_requires_source_group_read_permission() {
+        let test = setup_state().await;
+
+        let result = snapshot_blob(
+            test.state.clone(),
+            test.auth_without_source_read,
+            StageBlobTargetRequest {
+                group_id: test.bucket_group_id.to_string(),
+                connector_id: Ulid::new().to_string(),
+                source_path: "folder/file.txt".to_string(),
+                bucket: test.bucket,
+                key: test.key,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn reference_allows_request_past_auth_when_source_group_read_is_granted() {
+        let test = setup_state().await;
+
+        let result = reference_blob(
+            test.state.clone(),
+            test.auth_with_source_read,
+            StageBlobTargetRequest {
+                group_id: test.bucket_group_id.to_string(),
+                connector_id: Ulid::new().to_string(),
+                source_path: "folder/file.txt".to_string(),
+                bucket: test.bucket,
+                key: test.key,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::NotFound)));
+    }
+
+    async fn setup_state() -> TestState {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let realm_signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let realm_id = aruna_core::structs::RealmId::from_bytes(
+            realm_signing_key.verifying_key().to_bytes(),
+        );
+        let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
+        let user_with_source_read = UserId::local(Ulid::new(), realm_id);
+        let user_without_source_read = UserId::local(Ulid::new(), realm_id);
+        let actor = Actor {
+            node_id,
+            user_id: user_with_source_read,
+            realm_id,
+        };
+        let driver_ctx = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+
+        let bucket_group_id = Ulid::new();
+        let source_group_id = Ulid::new();
+        let bucket_auth = GroupAuthorizationDocument::new_default_group_doc(
+            user_with_source_read,
+            realm_id,
+            bucket_group_id,
+        );
+        let mut source_auth =
+            GroupAuthorizationDocument::new_default_group_doc(user_with_source_read, realm_id, source_group_id);
+        for role in source_auth.roles.values_mut() {
+            role.assigned_users.remove(&user_without_source_read);
+        }
+
+        let bucket_group = Group {
+            display_name: "bucket-group".to_string(),
+            group_id: bucket_group_id,
+            realm_id,
+            roles: bucket_auth.roles.keys().copied().collect(),
+        };
+        let source_group = Group {
+            display_name: "source-group".to_string(),
+            group_id: source_group_id,
+            realm_id,
+            roles: source_auth.roles.keys().copied().collect(),
+        };
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
+
+        write_doc(
+            &driver_ctx,
+            AUTH_KEYSPACE,
+            (*realm_id.as_bytes()).into(),
+            realm_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            AUTH_KEYSPACE,
+            bucket_group_id.to_bytes().into(),
+            bucket_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            AUTH_KEYSPACE,
+            source_group_id.to_bytes().into(),
+            source_auth.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            GROUP_KEYSPACE,
+            bucket_group_id.to_bytes().into(),
+            bucket_group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+        write_doc(
+            &driver_ctx,
+            GROUP_KEYSPACE,
+            source_group_id.to_bytes().into(),
+            source_group.to_bytes(&actor).unwrap().into(),
+        )
+        .await;
+
+        let bucket = "stage-bucket".to_string();
+        let key = "test.txt".to_string();
+        let bucket_info = BucketInfo {
+            group_id: bucket_group_id,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            created_by: user_with_source_read,
+        };
+        write_doc(
+            &driver_ctx,
+            S3_BUCKET_KEYSPACE,
+            bucket.as_bytes().to_vec().into(),
+            bucket_info.to_bytes().unwrap().into(),
+        )
+        .await;
+
+        let state = Arc::new(
+            ServerState::new(
+                driver_ctx,
+                realm_id,
+                node_id,
+                NodeCapabilities::local_node(realm_id).unwrap(),
+                false,
+                None,
+            )
+            .await,
+        );
+
+        TestState {
+            _storage_dir: storage_dir,
+            state,
+            bucket_group_id,
+            bucket,
+            key,
+            auth_with_source_read: AuthContext {
+                user_id: user_with_source_read,
+                realm_id,
+                path_restrictions: None,
+            },
+            auth_without_source_read: AuthContext {
+                user_id: user_without_source_read,
+                realm_id,
+                path_restrictions: None,
+            },
+        }
+    }
+
+    async fn write_doc(
+        driver_ctx: &Arc<DriverContext>,
+        key_space: &str,
+        key: byteview::ByteView,
+        value: byteview::ByteView,
+    ) {
+        let event = driver_ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: key_space.to_string(),
+                key,
+                value,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
 }
