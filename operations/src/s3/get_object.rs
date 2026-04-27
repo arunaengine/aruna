@@ -36,11 +36,6 @@ pub enum GetObjectState {
     CommitTransaction,
     GetBlob,
     ReadReferenceSource,
-    StartRefreshTransaction,
-    ReadRefreshVersion,
-    WriteRefreshedReferenceVersion,
-    CommitRefreshTransaction,
-    AbortRefreshTransaction,
     Finish,
     Error,
 }
@@ -433,10 +428,7 @@ impl GetObjectOperation {
                 self.last_refresh = Some(SystemTime::now());
                 self.source_metadata = Some(metadata);
                 self.reference_stream = Some(stream);
-                self.state = GetObjectState::StartRefreshTransaction;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
+                self.finish_reference_output()
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.emit_error(error.into())
@@ -447,151 +439,6 @@ impl GetObjectOperation {
                 received: other,
             }),
         }
-    }
-
-    fn handle_refresh_transaction_started(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
-                    return self.finish_reference_output();
-                };
-
-                let key = match VersionKey::new(&self.input.bucket, &self.input.key, version_id)
-                    .to_bytes()
-                {
-                    Ok(key) => key.into(),
-                    Err(_) => return self.finish_reference_output(),
-                };
-
-                self.txn_id = Some(txn_id);
-                self.state = GetObjectState::ReadRefreshVersion;
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_VERSION_KEYSPACE.to_string(),
-                    key,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            Event::Storage(StorageEvent::Error { .. }) => self.finish_reference_output(),
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: other,
-            }),
-        }
-    }
-
-    fn handle_refresh_version_read(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                let Some(value) = value else {
-                    return self.abort_refresh_or_finish();
-                };
-                let Ok(metadata) = VersionMetadata::from_bytes(value.as_ref()) else {
-                    return self.abort_refresh_or_finish();
-                };
-                let VersionState::Reference { source, .. } = metadata.state else {
-                    return self.abort_refresh_or_finish();
-                };
-                let Some(source_metadata) = self.source_metadata.clone() else {
-                    return self.abort_refresh_or_finish();
-                };
-                let Some(txn_id) = self.txn_id else {
-                    return self.finish_reference_output();
-                };
-                let key =
-                    match VersionKey::new(&self.input.bucket, &self.input.key, metadata.version_id)
-                        .to_bytes()
-                    {
-                        Ok(key) => key.into(),
-                        Err(_) => return self.abort_refresh_or_finish(),
-                    };
-                let value = match VersionMetadata::reference(
-                    metadata.version_id,
-                    source,
-                    source_metadata,
-                    metadata.created_at,
-                    metadata.created_by,
-                    self.last_refresh.unwrap_or_else(SystemTime::now),
-                )
-                .to_bytes()
-                {
-                    Ok(value) => value.into(),
-                    Err(_) => return self.abort_refresh_or_finish(),
-                };
-
-                self.state = GetObjectState::WriteRefreshedReferenceVersion;
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: S3_VERSION_KEYSPACE.to_string(),
-                    key,
-                    value,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            Event::Storage(StorageEvent::Error { .. }) => self.abort_refresh_or_finish(),
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: other,
-            }),
-        }
-    }
-
-    fn handle_refreshed_reference_version_written(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.finish_reference_output();
-                };
-
-                self.state = GetObjectState::CommitRefreshTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            Event::Storage(StorageEvent::Error { .. }) => self.abort_refresh_or_finish(),
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::WriteResult)",
-                received: other,
-            }),
-        }
-    }
-
-    fn handle_refresh_transaction_committed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. })
-            | Event::Storage(StorageEvent::Error { .. }) => {
-                self.txn_id = None;
-                self.finish_reference_output()
-            }
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: other,
-            }),
-        }
-    }
-
-    fn handle_refresh_transaction_aborted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. })
-            | Event::Storage(StorageEvent::Error { .. }) => {
-                self.txn_id = None;
-                self.finish_reference_output()
-            }
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: other,
-            }),
-        }
-    }
-
-    fn abort_refresh_or_finish(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id.take() else {
-            return self.finish_reference_output();
-        };
-
-        self.state = GetObjectState::AbortRefreshTransaction;
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     }
 
     fn finish_reference_output(&mut self) -> Effects {
@@ -635,19 +482,6 @@ impl Operation for GetObjectOperation {
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.handle_received_reference_source(event),
-            GetObjectState::StartRefreshTransaction => {
-                self.handle_refresh_transaction_started(event)
-            }
-            GetObjectState::ReadRefreshVersion => self.handle_refresh_version_read(event),
-            GetObjectState::WriteRefreshedReferenceVersion => {
-                self.handle_refreshed_reference_version_written(event)
-            }
-            GetObjectState::CommitRefreshTransaction => {
-                self.handle_refresh_transaction_committed(event)
-            }
-            GetObjectState::AbortRefreshTransaction => {
-                self.handle_refresh_transaction_aborted(event)
-            }
             GetObjectState::Finish => smallvec![],
             GetObjectState::Error => self.abort(),
         }
@@ -1208,7 +1042,7 @@ mod test {
             })
             .await
         else {
-            panic!("missing refreshed version metadata");
+            panic!("missing version metadata");
         };
         let metadata = VersionMetadata::from_bytes(value.unwrap().as_ref()).unwrap();
         let VersionState::Reference {
@@ -1220,11 +1054,11 @@ mod test {
             panic!("expected reference metadata");
         };
         assert_eq!(cached_metadata.content_type.as_deref(), Some("text/plain"));
-        assert!(last_refresh > SystemTime::UNIX_EPOCH);
+        assert_eq!(last_refresh, SystemTime::UNIX_EPOCH);
     }
 
     #[tokio::test]
-    async fn test_get_reference_object_refreshes_cached_metadata() {
+    async fn test_get_reference_object_returns_fresh_metadata_without_persisting() {
         let endpoint = spawn_reference_server(b"hello reference").await;
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
@@ -1340,6 +1174,20 @@ mod test {
 
         let mut stream = result.blob;
         assert!(result.last_refresh.is_some());
+        assert_eq!(
+            result
+                .source_metadata
+                .as_ref()
+                .map(|metadata| metadata.content_length),
+            Some(15)
+        );
+        assert_eq!(
+            result
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.content_type.as_deref()),
+            Some("text/plain")
+        );
         while let Some(Ok(_)) = stream.next().await {}
 
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = driver_ctx
@@ -1354,7 +1202,7 @@ mod test {
             })
             .await
         else {
-            panic!("missing refreshed version metadata");
+            panic!("missing version metadata");
         };
         let metadata = VersionMetadata::from_bytes(value.unwrap().as_ref()).unwrap();
         let VersionState::Reference {
@@ -1365,9 +1213,12 @@ mod test {
         else {
             panic!("expected reference metadata");
         };
-        assert_eq!(cached_metadata.content_length, 15);
-        assert_eq!(cached_metadata.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(cached_metadata.etag.as_deref(), Some("etag-123"));
-        assert!(last_refresh > SystemTime::UNIX_EPOCH);
+        assert_eq!(cached_metadata.content_length, 1);
+        assert_eq!(
+            cached_metadata.content_type.as_deref(),
+            Some("application/octet-stream")
+        );
+        assert_eq!(cached_metadata.etag.as_deref(), Some("stale-etag"));
+        assert_eq!(last_refresh, SystemTime::UNIX_EPOCH);
     }
 }

@@ -12,9 +12,15 @@ use crate::s3::util::{
     resolve_byte_range, s3_checksum_type_from_multipart, to_base64,
 };
 use aruna_core::NodeId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::S3_VERSION_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
+use aruna_core::structs::{
+    AuthContext, BucketInfo, Permission, RealmId, SourceMetadata, UserAccess, VersionKey,
+    VersionMetadata, VersionState,
+};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::abort_multipart_upload::{
@@ -32,7 +38,9 @@ use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
     DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
 };
-use aruna_operations::s3::get_object::{GetObjectInput as GOI, GetObjectOperation};
+use aruna_operations::s3::get_object::{
+    GetObjectInput as GOI, GetObjectOperation, GetObjectResult,
+};
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
 use aruna_operations::s3::put_bucket_replication::{
@@ -57,7 +65,7 @@ use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 #[derive(Debug)]
 struct ObjectResponseFields {
@@ -66,6 +74,15 @@ struct ObjectResponseFields {
     e_tag: Option<ETag>,
     last_modified: Option<LastModified>,
     metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug)]
+struct ReferenceMetadataRefresh {
+    bucket: String,
+    key: String,
+    version_id: ulid::Ulid,
+    metadata: SourceMetadata,
+    refreshed_at: SystemTime,
 }
 
 #[derive(Clone)]
@@ -396,6 +413,140 @@ impl ArunaS3Service {
                 .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh)),
         }
     }
+}
+
+fn reference_metadata_refresh(
+    bucket: String,
+    key: String,
+    result: &GetObjectResult,
+) -> Option<ReferenceMetadataRefresh> {
+    if result.location.is_some() {
+        return None;
+    }
+
+    Some(ReferenceMetadataRefresh {
+        bucket,
+        key,
+        version_id: result.resolved_version_id.or(result.version_id)?,
+        metadata: result.source_metadata.clone()?,
+        refreshed_at: result.last_refresh?,
+    })
+}
+
+async fn refresh_reference_metadata(
+    context: Arc<DriverContext>,
+    refresh: ReferenceMetadataRefresh,
+) -> Result<(), String> {
+    let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id)
+        .to_bytes()
+        .map_err(|err| err.to_string())?;
+    let txn_id = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("unexpected start transaction event: {other:?}")),
+    };
+
+    let refreshed_value = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key: version_key.clone().into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            let metadata = match VersionMetadata::from_bytes(value.as_ref()) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    abort_reference_refresh(&context, txn_id).await;
+                    return Err(err.to_string());
+                }
+            };
+            let VersionState::Reference { source, .. } = metadata.state else {
+                abort_reference_refresh(&context, txn_id).await;
+                return Ok(());
+            };
+            match VersionMetadata::reference(
+                metadata.version_id,
+                source,
+                refresh.metadata,
+                metadata.created_at,
+                metadata.created_by,
+                refresh.refreshed_at,
+            )
+            .to_bytes()
+            {
+                Ok(value) => value,
+                Err(err) => {
+                    abort_reference_refresh(&context, txn_id).await;
+                    return Err(err.to_string());
+                }
+            }
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            abort_reference_refresh(&context, txn_id).await;
+            return Ok(());
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_reference_refresh(&context, txn_id).await;
+            return Err(error.to_string());
+        }
+        other => {
+            abort_reference_refresh(&context, txn_id).await;
+            return Err(format!("unexpected version read event: {other:?}"));
+        }
+    };
+
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key: version_key.into(),
+            value: refreshed_value.into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_reference_refresh(&context, txn_id).await;
+            return Err(error.to_string());
+        }
+        other => {
+            abort_reference_refresh(&context, txn_id).await;
+            return Err(format!("unexpected version write event: {other:?}"));
+        }
+    }
+
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_reference_refresh(&context, txn_id).await;
+            Err(error.to_string())
+        }
+        other => {
+            abort_reference_refresh(&context, txn_id).await;
+            Err(format!("unexpected commit event: {other:?}"))
+        }
+    }
+}
+
+async fn abort_reference_refresh(context: &DriverContext, txn_id: ulid::Ulid) {
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
 }
 
 #[async_trait::async_trait]
@@ -747,6 +898,8 @@ impl S3 for ArunaS3Service {
         let version_id = parse_version_id(req.input.version_id)?;
         let bucket = req.input.bucket;
         let key = req.input.key;
+        let response_bucket = bucket.clone();
+        let response_key = key.clone();
 
         let resolved_range = if requested_range.is_some() {
             let head_result = drive(
@@ -796,12 +949,25 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InternalError, "Failed to process GET request"))?;
 
         let version_id = result.version_id;
+        let reference_refresh = reference_metadata_refresh(response_bucket, response_key, &result);
         let response_fields = self.build_object_response_fields(
             result.location.as_ref(),
             result.source_metadata.as_ref(),
             result.last_refresh,
         );
-        let content = StreamingBlob::wrap(result.blob);
+        let blob = if let Some(refresh) = reference_refresh {
+            let context = self.state.clone();
+            result.blob.on_success(move || {
+                tokio::spawn(async move {
+                    if let Err(err) = refresh_reference_metadata(context, refresh).await {
+                        warn!(error = %err, "Failed to refresh reference metadata after read");
+                    }
+                });
+            })
+        } else {
+            result.blob
+        };
+        let content = StreamingBlob::wrap(blob);
         let mut output = GetObjectOutput {
             body: Some(content),
             accept_ranges: resolved_range.as_ref().map(|_| "bytes".to_string()),
