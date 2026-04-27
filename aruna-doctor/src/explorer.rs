@@ -102,6 +102,7 @@ enum DecodedField {
 
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 enum DecodedValue {
     Group {
         data: JsonGroup,

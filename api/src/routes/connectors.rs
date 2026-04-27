@@ -474,6 +474,7 @@ fn map_delete_connector_error(error: DeleteSourceConnectorError) -> ServerError 
 mod tests {
     use super::*;
     use crate::openapi::ApiDoc;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
@@ -630,12 +631,12 @@ mod tests {
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let realm_id = aruna_core::structs::RealmId([3u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
-        let user_id = Ulid::new();
-        let other_user_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        let other_user_id = UserId::local(Ulid::new(), realm_id);
         let actor = Actor {
             node_id,
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
         };
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
@@ -647,14 +648,14 @@ mod tests {
         });
         let group_id = Ulid::new();
         let group_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id.clone(), group_id);
+            GroupAuthorizationDocument::new_default_group_doc(user_id, realm_id, group_id);
         let group = Group {
             display_name: "connector-group".to_string(),
             group_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             roles: group_auth.roles.keys().copied().collect(),
         };
-        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id.clone());
+        let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
 
         write_doc(
             &driver_ctx,
@@ -681,9 +682,9 @@ mod tests {
         let state = Arc::new(
             ServerState::new(
                 driver_ctx,
-                realm_id.clone(),
+                realm_id,
                 node_id,
-                NodeCapabilities::local_node(realm_id.clone()).unwrap(),
+                NodeCapabilities::local_node(realm_id).unwrap(),
                 false,
                 None,
             )
@@ -694,7 +695,7 @@ mod tests {
             _storage_dir: storage_dir,
             auth: AuthContext {
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
                 path_restrictions: None,
             },
             other_auth: AuthContext {

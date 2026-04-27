@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{Instrument, info, warn};
 use ulid::Ulid;
 
+#[allow(clippy::too_many_arguments)]
 async fn trigger_version_replication(
     context: Arc<DriverContext>,
     _realm_id: RealmId,
@@ -99,6 +100,7 @@ async fn trigger_version_replication(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_version_replication(
     context: Arc<DriverContext>,
     realm_id: RealmId,

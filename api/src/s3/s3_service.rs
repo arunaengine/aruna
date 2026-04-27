@@ -251,7 +251,7 @@ impl ArunaS3Service {
 
         spawn_version_replication(
             self.state.clone(),
-            self.realm_id.clone(),
+            self.realm_id,
             self.node_id,
             replication_auth,
             replication_bucket,
@@ -289,7 +289,7 @@ impl ArunaS3Service {
         ));
         spawn_version_replication(
             self.state.clone(),
-            self.realm_id.clone(),
+            self.realm_id,
             self.node_id,
             replication_auth,
             replication_bucket,
@@ -312,7 +312,7 @@ impl ArunaS3Service {
         if replicate_latest_delete {
             spawn_version_replication(
                 self.state.clone(),
-                self.realm_id.clone(),
+                self.realm_id,
                 self.node_id,
                 replication_auth,
                 replication_bucket,

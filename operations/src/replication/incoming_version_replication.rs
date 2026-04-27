@@ -1050,7 +1050,12 @@ mod tests {
         mismatched_location.blob_size += 1;
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
-            value: Some(Location::Real(mismatched_location).to_bytes().unwrap().into()),
+            value: Some(
+                Location::Real(mismatched_location)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         assert!(matches!(
@@ -1087,7 +1092,10 @@ mod tests {
         ));
 
         let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
-        assert_eq!(op.state, IncomingVersionReplicationState::CleanupReceivedBlob);
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::CleanupReceivedBlob
+        );
         assert_eq!(
             effects[0],
             Effect::Blob(BlobEffect::Delete {

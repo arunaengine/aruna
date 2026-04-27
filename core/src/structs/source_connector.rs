@@ -46,6 +46,7 @@ pub struct SourceConnector {
 }
 
 impl SourceConnector {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         connector_id: Ulid,
         group_id: GroupId,
@@ -113,6 +114,12 @@ impl SourceConnectorSecret {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UserId;
+    use crate::structs::RealmId;
+
+    fn test_user_id(seed: u8) -> UserId {
+        UserId::local(Ulid::from_bytes([seed; 16]), RealmId([seed; 32]))
+    }
 
     #[test]
     fn source_connector_roundtrip_preserves_public_config() {
@@ -128,7 +135,7 @@ mod tests {
             ]),
             SystemTime::UNIX_EPOCH,
             SystemTime::UNIX_EPOCH,
-            Ulid::from_bytes([3u8; 16]),
+            test_user_id(3),
         );
 
         let restored = SourceConnector::from_bytes(&connector.to_bytes().unwrap()).unwrap();
@@ -161,7 +168,7 @@ mod tests {
             )]),
             SystemTime::UNIX_EPOCH,
             SystemTime::UNIX_EPOCH,
-            Ulid::from_bytes([7u8; 16]),
+            test_user_id(7),
         );
         let secret = SourceConnectorSecret::new(
             connector.connector_id,

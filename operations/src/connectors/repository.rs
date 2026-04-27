@@ -125,7 +125,7 @@ pub fn parse_connector_iter(
                 .into_iter()
                 .map(|(_, value)| {
                     SourceConnector::from_bytes(value.as_ref())
-                        .map_err(|error| StorageReadError::Conversion(error.into()))
+                        .map_err(StorageReadError::Conversion)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((records, next_start_after))

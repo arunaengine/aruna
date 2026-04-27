@@ -84,6 +84,7 @@ use crate::structs::Location;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::UserId;
     use crate::structs::SourceMetadata;
     use ulid::Ulid;
 
@@ -141,7 +142,7 @@ mod tests {
                 ulid: Ulid::nil(),
                 compressed: false,
                 encrypted: false,
-                created_by: Ulid::nil(),
+                created_by: UserId::default(),
                 created_at: SystemTime::UNIX_EPOCH,
                 staging: false,
                 partial: false,
