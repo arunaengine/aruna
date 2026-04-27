@@ -78,12 +78,14 @@ pub enum TopicId {
     Node(NodeId),
     Group(GroupId),
     Metadata(Ulid),
+    Users(RealmId),
 }
 
 const PREFIX_REALM: u8 = b'r';
 const PREFIX_NODE: u8 = b'n';
 const PREFIX_GROUP: u8 = b'g';
 const PREFIX_METADATA: u8 = b'm';
+const PREFIX_USERS: u8 = b'u';
 
 impl TopicId {
     #[inline]
@@ -104,6 +106,11 @@ impl TopicId {
     #[inline]
     pub fn metadata(id: Ulid) -> Self {
         Self::Metadata(id)
+    }
+
+    #[inline]
+    pub fn users(id: RealmId) -> Self {
+        Self::Users(id)
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -130,6 +137,12 @@ impl TopicId {
                 let mut buf = Vec::with_capacity(17);
                 buf.push(PREFIX_METADATA);
                 buf.extend_from_slice(&document_id.to_bytes());
+                buf
+            }
+            Self::Users(realm_id) => {
+                let mut buf = Vec::with_capacity(33);
+                buf.push(PREFIX_USERS);
+                buf.extend_from_slice(realm_id.as_bytes());
                 buf
             }
         }
@@ -171,6 +184,13 @@ impl TopicId {
                 let bytes: [u8; 16] = payload.try_into().ok()?;
                 Some(Self::Metadata(Ulid::from_bytes(bytes)))
             }
+            PREFIX_USERS => {
+                if payload.len() != 32 {
+                    return None;
+                }
+                let bytes: [u8; 32] = payload.try_into().ok()?;
+                Some(Self::Users(RealmId::from_bytes(bytes)))
+            }
             _ => None,
         }
     }
@@ -190,6 +210,7 @@ impl fmt::Debug for TopicId {
             Self::Node(id) => write!(f, "TopicId::Node({id})"),
             Self::Group(id) => write!(f, "TopicId::Group({id})"),
             Self::Metadata(id) => write!(f, "TopicId::Metadata({id})"),
+            Self::Users(id) => write!(f, "TopicId::Users({id})"),
         }
     }
 }
@@ -201,6 +222,7 @@ impl fmt::Display for TopicId {
             Self::Node(id) => write!(f, "n:{id}"),
             Self::Group(id) => write!(f, "g:{id}"),
             Self::Metadata(id) => write!(f, "m:{id}"),
+            Self::Users(id) => write!(f, "u:{id}"),
         }
     }
 }
@@ -270,6 +292,15 @@ mod tests {
         let topic = TopicId::metadata(Ulid::from_bytes([9u8; 16]));
         let bytes = topic.to_bytes();
         assert_eq!(bytes[0], PREFIX_METADATA);
+        let parsed = TopicId::from_bytes(&bytes).unwrap();
+        assert_eq!(topic, parsed);
+    }
+
+    #[test]
+    fn test_topic_id_users() {
+        let topic = TopicId::users(RealmId::from_bytes([10u8; 32]));
+        let bytes = topic.to_bytes();
+        assert_eq!(bytes[0], PREFIX_USERS);
         let parsed = TopicId::from_bytes(&bytes).unwrap();
         assert_eq!(topic, parsed);
     }

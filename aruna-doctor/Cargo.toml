@@ -19,15 +19,18 @@ aruna-api = { path = "../api" }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+byteview = { workspace = true }
 chrono = { workspace = true }
 clap = { version ="4.6.0", features = ["derive"]}
 craqle = { workspace = true }
+dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
 fjall = { workspace = true }
 hex = { workspace = true }
 iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 postcard = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -35,3 +38,6 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tempfile = { workspace = true }
 ulid = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

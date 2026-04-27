@@ -202,7 +202,7 @@ mod test {
                 BucketInfo {
                     group_id,
                     created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
+                    created_by: Default::default(),
                 },
             ),
             (
@@ -210,7 +210,7 @@ mod test {
                 BucketInfo {
                     group_id,
                     created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
+                    created_by: Default::default(),
                 },
             ),
             (
@@ -218,7 +218,7 @@ mod test {
                 BucketInfo {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
+                    created_by: Default::default(),
                 },
             ),
         ] {

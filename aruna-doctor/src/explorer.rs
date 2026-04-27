@@ -408,7 +408,7 @@ impl Serialize for JsonUserAccess {
     {
         let mut state = serializer.serialize_struct("UserAccess", 8)?;
         state.serialize_field("access_key", &self.0.access_key)?;
-        state.serialize_field("user_identity", &JsonUserIdentity(&self.0.user_identity))?;
+        state.serialize_field("user_identity", &self.0.user_identity)?;
         state.serialize_field("group_id", &self.0.group_id.to_string())?;
         state.serialize_field("secret", &self.0.secret)?;
         state.serialize_field("expiry", &self.0.expiry)?;
@@ -472,20 +472,6 @@ impl Serialize for JsonStoredEntry {
         )?;
         state.serialize_field("value_len", &self.0.value.len())?;
         state.serialize_field("value_hex", &hex::encode(&self.0.value))?;
-        state.end()
-    }
-}
-
-struct JsonUserIdentity<'a>(&'a aruna_core::structs::UserIdentity);
-
-impl Serialize for JsonUserIdentity<'_> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut state = serializer.serialize_struct("UserIdentity", 2)?;
-        state.serialize_field("user_id", &self.0.user_id.to_string())?;
-        state.serialize_field("realm_key", &self.0.realm_key.to_string())?;
         state.end()
     }
 }
@@ -1201,8 +1187,8 @@ mod tests {
         let realm_id = RealmId::from_bytes([7_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[9_u8; 32]).public(),
-            user_id: Ulid::new(),
-            realm_id: realm_id.clone(),
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            realm_id,
         };
         let group = Group {
             display_name: "Explorer Group".to_string(),
@@ -1273,11 +1259,11 @@ mod tests {
         let realm_id = RealmId::from_bytes([1_u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[3_u8; 32]).public(),
-            user_id: Ulid::new(),
-            realm_id: realm_id.clone(),
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            realm_id,
         };
         let realm = Realm {
-            realm_id: realm_id.clone(),
+            realm_id,
             description: "Explorer Realm".to_string(),
         };
 
@@ -1305,11 +1291,9 @@ mod tests {
     fn decodes_gossip_subscriptions_value() {
         let realm_id = RealmId::from_bytes([8_u8; 32]);
         let group_id = Ulid::new();
-        let value = postcard::to_allocvec(&vec![
-            TopicId::group(group_id),
-            TopicId::realm(realm_id.clone()),
-        ])
-        .unwrap();
+        let value =
+            postcard::to_allocvec(&vec![TopicId::group(group_id), TopicId::realm(realm_id)])
+                .unwrap();
 
         let decoded = decode_entry(GOSSIP_SUBSCRIPTIONS_KEYSPACE, b"topics", &value);
         assert_eq!(
@@ -1356,7 +1340,7 @@ mod tests {
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::PendingOnboarding,
-            realm_id: realm_id.clone(),
+            realm_id,
             net_secret_key: [11_u8; 32],
             bootstrap_endpoints: Vec::new(),
             onboarding_phase: None,
@@ -1385,7 +1369,7 @@ mod tests {
         let publisher = iroh::SecretKey::from_bytes(&[5_u8; 32]).public();
         let entries = vec![StoredEntry {
             publisher,
-            realm_id: realm_id.clone(),
+            realm_id,
             value: vec![1, 2, 3, 4],
             expires_at: 42,
             signature: None,

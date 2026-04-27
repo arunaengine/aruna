@@ -585,7 +585,7 @@ impl CompleteMultipartUploadOperation {
         self.state = CompleteMultipartUploadState::RegisterBlobInDht;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
             key,
-            realm_id: self.input.realm_id.clone(),
+            realm_id: self.input.realm_id,
             value: self.input.node_id.as_bytes().to_vec(),
             ttl: Default::default(),
         }))]

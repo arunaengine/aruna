@@ -129,7 +129,7 @@ impl UpdateMetadataDocumentOperation {
             ),
         };
         MetadataAuditRecord {
-            realm_id: record.realm_id.clone(),
+            realm_id: record.realm_id,
             group_id: record.group_id,
             document_id: record.document_id,
             graph_iri: record.graph_iri.clone(),

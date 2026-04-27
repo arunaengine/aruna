@@ -186,7 +186,7 @@ pub async fn create_group(
             actor: Actor {
                 node_id: state.get_node_id(),
                 user_id: auth.user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             display_name: request.name,
         }),

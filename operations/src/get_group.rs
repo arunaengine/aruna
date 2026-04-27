@@ -270,6 +270,7 @@ mod test {
     use crate::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::driver::{DriverContext, drive};
     use crate::get_group::{GetGroupConfig, GetGroupOperation};
+    use aruna_core::UserId;
     use aruna_core::structs::Actor;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -304,7 +305,7 @@ mod test {
         };
 
         let actor = Actor {
-            user_id: Ulid::new(),
+            user_id: UserId::local(Ulid::new(), aruna_core::structs::RealmId([0u8; 32])),
             realm_id: aruna_core::structs::RealmId([0u8; 32]),
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
         };

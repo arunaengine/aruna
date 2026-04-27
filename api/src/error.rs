@@ -58,6 +58,30 @@ pub enum TokenError {
     Base64Error(#[from] base64::DecodeError),
 }
 
+#[derive(Debug, Error)]
+pub enum OidcError {
+    #[error("OIDC is not configured")]
+    NotConfigured,
+    #[error("OIDC provider not found")]
+    ProviderNotFound,
+    #[error("unsupported OIDC signing algorithm")]
+    UnsupportedAlgorithm,
+    #[error("OIDC key id is missing")]
+    MissingKeyId,
+    #[error("OIDC signing key not found")]
+    SigningKeyNotFound,
+    #[error("OIDC token subject is missing")]
+    MissingSubject,
+    #[error("OIDC configuration error: {0}")]
+    Internal(String),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+    #[error(transparent)]
+    Jwt(#[from] jsonwebtoken::errors::Error),
+    #[error(transparent)]
+    Serde(#[from] serde_json::Error),
+}
+
 /// Standard error response for API endpoints.
 ///
 /// All API endpoints return this structure for error responses.

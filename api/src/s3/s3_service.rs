@@ -94,8 +94,8 @@ impl ArunaS3Service {
         drive(
             CheckPermissionsOperation::new(CheckPermissionsConfig {
                 auth_context: AuthContext {
-                    user_id: user_access.user_identity.user_id,
-                    realm_id: user_access.user_identity.realm_key.clone(),
+                    user_id: user_access.user_identity,
+                    realm_id: user_access.user_identity.realm_id,
                     path_restrictions: None,
                 },
                 path: format!(
@@ -148,7 +148,7 @@ impl ArunaS3Service {
                 .is_some_and(|status| status.as_str() == DeleteMarkerReplicationStatus::ENABLED);
             targets.push(aruna_core::structs::BucketReplicationTarget {
                 node_id: arn.node_id,
-                realm_id: arn.realm_id.clone(),
+                realm_id: arn.realm_id,
                 bucket: bucket.to_string(),
                 arn: arn.to_string(),
                 replicate_delete_markers,
@@ -187,7 +187,7 @@ impl ArunaS3Service {
                     access_control_translation: None,
                     account: None,
                     bucket: aruna_core::structs::ArunaArn::s3_bucket(
-                        target.realm_id.clone(),
+                        target.realm_id,
                         target.node_id,
                         target.bucket.clone(),
                     )
@@ -455,7 +455,7 @@ impl S3 for ArunaS3Service {
             BucketInfo {
                 group_id: user_access.group_id,
                 created_at: SystemTime::now(),
-                created_by: user_access.user_identity.user_id,
+                created_by: user_access.user_identity,
             },
         );
 
@@ -535,8 +535,8 @@ impl S3 for ArunaS3Service {
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let replication_auth = AuthContext {
-            user_id: user_access.user_identity.user_id,
-            realm_id: user_access.user_identity.realm_key.clone(),
+            user_id: user_access.user_identity,
+            realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
         };
         let replication_bucket = req.input.bucket.clone();
@@ -544,12 +544,12 @@ impl S3 for ArunaS3Service {
 
         let input = convert_input(req.input)?;
         let config = PutObjectConfig {
-            user_id: user_access.user_identity.user_id,
+            user_id: user_access.user_identity,
             group_id: bucket_info
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
                 .unwrap_or(user_access.group_id),
-            realm_id: self.realm_id.clone(),
+            realm_id: self.realm_id,
             node_id: self.node_id,
             request: input,
             expected_checksums: checksum_request.expected.clone(),
@@ -595,7 +595,7 @@ impl S3 for ArunaS3Service {
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
                 .unwrap_or(user_access.group_id),
-            created_by: user_access.user_identity.user_id,
+            created_by: user_access.user_identity,
             checksum_hint: checksum_hint.clone(),
         });
 
@@ -646,7 +646,7 @@ impl S3 for ArunaS3Service {
             )?,
             content_length: req.input.content_length.map(|length| length as u64),
             body: Some(body),
-            created_by: user_access.user_identity.user_id,
+            created_by: user_access.user_identity,
             compressed: false,
             encrypted: req.input.sse_customer_algorithm.is_some()
                 || req.input.sse_customer_key.is_some()
@@ -692,8 +692,8 @@ impl S3 for ArunaS3Service {
         let checksum_request = parse_upload_checksum_request(&req.headers)?;
         let upload_id = parse_upload_id(&req.input.upload_id)?;
         let replication_auth = AuthContext {
-            user_id: user_access.user_identity.user_id,
-            realm_id: user_access.user_identity.realm_key.clone(),
+            user_id: user_access.user_identity,
+            realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
         };
         let completed_parts = req
@@ -714,13 +714,13 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket.clone(),
             key: req.input.key.clone(),
             upload_id,
-            realm_id: self.realm_id.clone(),
+            realm_id: self.realm_id,
             node_id: self.node_id,
             completed_parts,
             expected_checksums: checksum_request.expected.clone(),
             checksum_type: multipart_checksum_type_from_s3(&checksum_request.checksum_type),
             object_size: req.input.mpu_object_size.map(|size| size as u64),
-            created_by: user_access.user_identity.user_id,
+            created_by: user_access.user_identity,
         });
 
         let result = drive(operation, &self.state)
@@ -888,8 +888,8 @@ impl S3 for ArunaS3Service {
         })?;
         let version_id = parse_version_id(req.input.version_id)?;
         let replication_auth = AuthContext {
-            user_id: user_access.user_identity.user_id,
-            realm_id: user_access.user_identity.realm_key.clone(),
+            user_id: user_access.user_identity,
+            realm_id: user_access.user_identity.realm_id,
             path_restrictions: user_access.path_restrictions.clone(),
         };
         let replication_bucket = req.input.bucket.clone();
@@ -900,7 +900,7 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket,
             key: req.input.key,
             version_id,
-            deleted_by: user_access.user_identity.user_id,
+            deleted_by: user_access.user_identity,
         });
 
         let result = drive(operation, &self.state)

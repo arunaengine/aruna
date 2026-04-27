@@ -1,5 +1,5 @@
-use crate::auth::OidcValidator;
-use crate::error::TokenError;
+use crate::auth::{OidcTokenSelector, OidcValidator};
+use crate::error::{OidcError, TokenError};
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
 use aruna_core::automerge::AutomergeDocumentVariant;
@@ -7,14 +7,15 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::API_STATE_KEYSPACE;
+use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
-use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId};
+use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use base64::Engine;
 use byteview::ByteView;
 use ed25519_dalek::Signer;
@@ -35,6 +36,7 @@ use utoipa_swagger_ui::SwaggerUi;
 pub const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
 pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
+pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
 
 #[derive(Clone, Debug)]
@@ -54,8 +56,8 @@ pub struct ServerState {
     realm_id: RealmId,
     // Realm membership
     node_id: NodeId,
-    // TODO: OIDC handling
-    _oidc_validator: Option<Arc<OidcValidator>>,
+    // Contains OIDC config and Client
+    oidc_validator: Option<Arc<OidcValidator>>,
 }
 
 impl ServerState {
@@ -88,12 +90,12 @@ impl ServerState {
         } else {
             None
         };
-        trusted_realms.insert(realm_id.clone());
+        trusted_realms.insert(realm_id);
         let state = Self {
             driver_ctx,
             realm_id,
             node_id,
-            _oidc_validator: oidc_validator,
+            oidc_validator,
             node_capabilities,
             token_revocation_list: Arc::new(RwLock::new(token_revocation_list)),
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
@@ -123,11 +125,40 @@ impl ServerState {
     }
 
     pub fn get_realm_id(&self) -> RealmId {
-        self.realm_id.clone()
+        self.realm_id
     }
 
     pub fn get_node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    pub fn node_capabilities(&self) -> &NodeCapabilities {
+        &self.node_capabilities
+    }
+
+    pub fn oidc_validator(&self) -> Result<&OidcValidator, OidcError> {
+        self.oidc_validator
+            .as_deref()
+            .ok_or(OidcError::NotConfigured)
+    }
+
+    pub async fn get_oidc_provider_by_token(
+        &self,
+        selector: &OidcTokenSelector,
+    ) -> Result<OidcProviderConfig, OidcError> {
+        let config = drive(
+            GetRealmConfigOperation::new(self.realm_id),
+            &self.driver_ctx,
+        )
+        .await
+        .map_err(|error| OidcError::Internal(error.to_string()))?;
+        config
+            .oidc_providers
+            .into_iter()
+            .find(|provider| {
+                provider.issuer == selector.issuer && selector.matches_audience(&provider.audience)
+            })
+            .ok_or(OidcError::ProviderNotFound)
     }
 
     pub fn is_management_node(&self) -> bool {
@@ -166,27 +197,57 @@ impl ServerState {
         }
     }
 
-    pub fn issue_onboarding_sync_ticket(
+    pub async fn issue_onboarding_sync_ticket(
         &self,
         node_id: NodeId,
     ) -> Result<OnboardingSyncTicket, OnboardingSecretError> {
         match &self.node_capabilities {
             NodeCapabilities::Management {
                 realm_signing_key, ..
-            } => OnboardingSyncTicket::issue(
-                realm_signing_key,
-                &self.realm_id,
-                node_id,
-                chrono::Utc::now().timestamp().max(0) as u64 + ONBOARDING_SYNC_TICKET_TTL_SECS,
-                vec![
+            } => {
+                let mut documents = vec![
                     AutomergeDocumentVariant::RealmAuthorization {
-                        realm_id: self.realm_id.clone(),
+                        realm_id: self.realm_id,
                     },
                     AutomergeDocumentVariant::RealmConfig {
-                        realm_id: self.realm_id.clone(),
+                        realm_id: self.realm_id,
                     },
-                ],
-            ),
+                ];
+
+                let user_documents = match self
+                    .driver_ctx
+                    .storage_handle
+                    .send_effect(Effect::Storage(StorageEffect::Iter {
+                        key_space: USER_KEYSPACE.to_string(),
+                        prefix: None,
+                        start_after: None,
+                        limit: 10_000,
+                        txn_id: None,
+                    }))
+                    .await
+                {
+                    Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+                    Event::Storage(StorageEvent::Error { .. }) => {
+                        return Err(OnboardingSecretError::InvalidSecret);
+                    }
+                    _ => return Err(OnboardingSecretError::InvalidSecret),
+                };
+
+                documents.extend(user_documents.into_iter().filter_map(|(key, _)| {
+                    aruna_core::UserId::from_string(std::str::from_utf8(key.as_ref()).ok()?)
+                        .ok()
+                        .filter(|user_id| user_id.realm_id == self.realm_id)
+                        .map(|user_id| AutomergeDocumentVariant::User { user_id })
+                }));
+
+                OnboardingSyncTicket::issue(
+                    realm_signing_key,
+                    &self.realm_id,
+                    node_id,
+                    chrono::Utc::now().timestamp().max(0) as u64 + ONBOARDING_SYNC_TICKET_TTL_SECS,
+                    documents,
+                )
+            }
             _ => Err(OnboardingSecretError::InvalidSecret),
         }
     }
@@ -237,6 +298,23 @@ impl ServerState {
             .is_some()
     }
 
+    pub async fn user_exists(&self, user_id: aruna_core::UserId) -> Result<bool, StorageError> {
+        match self
+            .driver_ctx
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: USER_KEYSPACE.to_string(),
+                key: ByteView::from(user_id.to_bytes()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+            Event::Storage(StorageEvent::Error { error }) => Err(error),
+            _ => Err(StorageError::InvalidEffect),
+        }
+    }
+
     pub async fn claim_initial_realm_admin(
         &self,
         auth: &AuthContext,
@@ -259,7 +337,7 @@ impl ServerState {
                     actor: Actor {
                         node_id: self.node_id,
                         user_id: auth.user_id,
-                        realm_id: auth.realm_id.clone(),
+                        realm_id: auth.realm_id,
                     },
                 }),
                 &self.driver_ctx,
@@ -354,7 +432,7 @@ where
     }
 }
 
-async fn persist_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
+pub async fn persist_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
 where
     T: Serialize,
 {

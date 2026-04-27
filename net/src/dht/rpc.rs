@@ -148,7 +148,7 @@ mod tests {
 
         let req = DhtRequest::GetValue {
             key,
-            realm_filter: Some(realm_id.clone()),
+            realm_filter: Some(realm_id),
         };
         let bytes = encode_request(&req).expect("encode request");
         let decoded = decode_request(&bytes).expect("decode request");
@@ -180,7 +180,7 @@ mod tests {
 
         let req = DhtRequest::PutValue {
             key,
-            realm_id: realm_id.clone(),
+            realm_id,
             value: value.clone(),
             ttl_secs,
             publisher,

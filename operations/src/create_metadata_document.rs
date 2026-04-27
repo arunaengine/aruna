@@ -119,7 +119,7 @@ impl CreateMetadataDocumentOperation {
 
     fn realm_config_ref(&self) -> AutomergeDocumentVariant {
         AutomergeDocumentVariant::RealmConfig {
-            realm_id: self.config.actor.realm_id.clone(),
+            realm_id: self.config.actor.realm_id,
         }
     }
 
@@ -143,7 +143,7 @@ impl CreateMetadataDocumentOperation {
     fn build_record(&self, holder_node_ids: Vec<NodeId>) -> MetadataRegistryRecord {
         let now = Self::current_timestamp_ms();
         MetadataRegistryRecord {
-            realm_id: self.config.actor.realm_id.clone(),
+            realm_id: self.config.actor.realm_id,
             group_id: self.config.group_id,
             document_id: self.config.document_id,
             document_path: MetadataRegistryRecord::normalize_document_path(
@@ -160,7 +160,7 @@ impl CreateMetadataDocumentOperation {
 
     fn audit_record(&self, record: &MetadataRegistryRecord) -> MetadataAuditRecord {
         MetadataAuditRecord {
-            realm_id: record.realm_id.clone(),
+            realm_id: record.realm_id,
             group_id: record.group_id,
             document_id: record.document_id,
             graph_iri: record.graph_iri.clone(),
@@ -281,12 +281,14 @@ impl Operation for CreateMetadataDocumentOperation {
                         Some(bytes) => {
                             RealmConfigDocument::from_bytes(bytes).unwrap_or_else(|_| {
                                 RealmConfigDocument::default_for_realm(
-                                    self.config.actor.realm_id.clone(),
+                                    self.config.actor.realm_id,
+                                    vec![],
                                 )
                             })
                         }
                         None => RealmConfigDocument::default_for_realm(
-                            self.config.actor.realm_id.clone(),
+                            self.config.actor.realm_id,
+                            vec![],
                         ),
                     };
                     self.selected_replication_factor =
@@ -294,17 +296,17 @@ impl Operation for CreateMetadataDocumentOperation {
                     self.state = CreateMetadataDocumentState::LoadReplicationTargets;
                     smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
                         key: *realm_presence_key(&self.config.actor.realm_id).as_bytes(),
-                        realm_filter: Some(self.config.actor.realm_id.clone()),
+                        realm_filter: Some(self.config.actor.realm_id),
                     }))]
                 }
                 Event::Storage(StorageEvent::Error { .. }) => {
                     self.selected_replication_factor =
-                        RealmConfigDocument::default_for_realm(self.config.actor.realm_id.clone())
+                        RealmConfigDocument::default_for_realm(self.config.actor.realm_id, vec![])
                             .metadata_replication_factor_for(self.config.group_id, None);
                     self.state = CreateMetadataDocumentState::LoadReplicationTargets;
                     smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
                         key: *realm_presence_key(&self.config.actor.realm_id).as_bytes(),
-                        realm_filter: Some(self.config.actor.realm_id.clone()),
+                        realm_filter: Some(self.config.actor.realm_id),
                     }))]
                 }
                 other => self.unexpected_event("realm config read result", format!("{other:?}")),
@@ -603,10 +605,11 @@ mod tests {
 
     #[test]
     fn failure_after_starting_transaction_aborts_before_graph_cleanup() {
+        let realm_id = RealmId([9u8; 32]);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
-            user_id: Ulid::new(),
-            realm_id: RealmId([9u8; 32]),
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            realm_id,
         };
         let group_id = GroupId::new();
         let document_id = Ulid::new();
@@ -634,7 +637,7 @@ mod tests {
             effects[0],
             crate::automerge::repository::read_effect(
                 &aruna_core::automerge::AutomergeDocumentVariant::RealmConfig {
-                    realm_id: actor.realm_id.clone(),
+                    realm_id: actor.realm_id,
                 },
                 None,
             )
@@ -650,7 +653,7 @@ mod tests {
             Effect::Net(aruna_core::effects::NetEffect::Dht(
                 aruna_core::effects::DhtEffect::Get {
                     key: *aruna_core::keys::realm_presence_key(&actor.realm_id).as_bytes(),
-                    realm_filter: Some(actor.realm_id.clone()),
+                    realm_filter: Some(actor.realm_id),
                 },
             ))
         );

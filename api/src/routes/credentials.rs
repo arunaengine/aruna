@@ -1,7 +1,7 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::structs::{AuthContext, PathRestriction, Permission, UserIdentity};
+use aruna_core::structs::{AuthContext, PathRestriction, Permission};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::create_user_access::{
@@ -80,10 +80,7 @@ pub async fn create_s3_credentials(
         return Err(ServerError::Forbidden);
     }
 
-    let user_identity = UserIdentity {
-        user_id: auth.user_id,
-        realm_key: auth.realm_id.clone(),
-    };
+    let user_identity = auth.user_id;
     let group_id = Ulid::from_str(&request.group_id).map_err(|_| ServerError::BadRequest)?;
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {

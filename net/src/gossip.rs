@@ -107,7 +107,7 @@ impl GossipService {
             self.storage.clone(),
             self.dht.clone(),
             self.local_node_id,
-            self.local_realm_id.clone(),
+            self.local_realm_id,
             self.subscriptions.clone(),
             self.pending_subscriptions.clone(),
             self.bootstrap_nodes.clone(),
@@ -256,7 +256,7 @@ async fn subscribe_owned(
         let reannounce_cancel = cancel.clone();
         let reannounce_topic = topic.clone();
         let reannounce_dht = dht.clone();
-        let reannounce_realm_id = local_realm_id.clone();
+        let reannounce_realm_id = local_realm_id;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -282,7 +282,7 @@ async fn subscribe_owned(
         let dht_for_stream = dht.clone();
         let bootstrap_nodes_for_stream = bootstrap_nodes_state.clone();
         let shutdown_for_stream = shutdown.clone();
-        let stream_realm_id = local_realm_id.clone();
+        let stream_realm_id = local_realm_id;
         tokio::spawn(async move {
             use futures::stream::StreamExt;
             let mut unexpected_termination = false;
@@ -353,7 +353,7 @@ async fn subscribe_owned(
                         storage_for_stream,
                         dht_for_stream,
                         local_node_id,
-                        stream_realm_id.clone(),
+                        stream_realm_id,
                         subscriptions_for_stream,
                         pending_for_stream,
                         bootstrap_nodes_for_stream,
@@ -426,14 +426,11 @@ async fn lookup_nodes_for_key_owned(
     dht_key: &DhtKeyId,
     local_realm_id: &RealmId,
 ) -> Result<Vec<NodeId>> {
-    let entries = dht
-        .get(dht_key, Some(local_realm_id.clone()))
-        .await
-        .map_err(|e| {
-            NetError::Gossip(format!(
-                "Failed to lookup gossip topic bootstrap nodes: {e}"
-            ))
-        })?;
+    let entries = dht.get(dht_key, Some(*local_realm_id)).await.map_err(|e| {
+        NetError::Gossip(format!(
+            "Failed to lookup gossip topic bootstrap nodes: {e}"
+        ))
+    })?;
     Ok(entries.into_iter().map(|entry| entry.node_id).collect())
 }
 
@@ -469,7 +466,7 @@ async fn announce_topic_subscription(
     let topic_key = gossip_peer_key(topic);
     dht.put(
         &topic_key,
-        local_realm_id.clone(),
+        *local_realm_id,
         local_node_id.as_bytes().to_vec(),
         GOSSIP_TOPIC_ANNOUNCE_TTL,
     )

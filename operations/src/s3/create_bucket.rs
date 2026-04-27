@@ -234,7 +234,7 @@ mod test {
         let bucket_info = BucketInfo {
             group_id: Ulid::new(),
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: Default::default(),
         };
 
         let result = drive(

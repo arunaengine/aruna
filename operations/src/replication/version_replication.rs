@@ -943,6 +943,7 @@ mod tests {
         ReplicateScopeOperation, ReplicateScopeTarget,
     };
     use crate::replication::protocol::LiveReplicationRequest;
+    use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::operation::Operation;
@@ -955,18 +956,26 @@ mod tests {
     use std::time::SystemTime;
     use ulid::Ulid;
 
+    fn test_realm_id() -> RealmId {
+        RealmId::from_bytes([7u8; 32])
+    }
+
+    fn test_user_id() -> UserId {
+        UserId::nil(test_realm_id())
+    }
+
     fn bucket_info() -> BucketInfo {
         BucketInfo {
             group_id: Ulid::new(),
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
         }
     }
 
     fn auth_context() -> AuthContext {
         AuthContext {
-            user_id: Ulid::new(),
-            realm_id: RealmId::from_bytes([7u8; 32]),
+            user_id: test_user_id(),
+            realm_id: test_realm_id(),
             path_restrictions: None,
         }
     }
@@ -992,7 +1001,7 @@ mod tests {
             version_id,
             location: Location::Deleted,
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
         }
         .to_bytes()
         .unwrap();
@@ -1009,7 +1018,7 @@ mod tests {
             ulid: Ulid::new(),
             compressed: false,
             encrypted: false,
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             created_at: SystemTime::now(),
             staging: false,
             partial: false,
@@ -1137,7 +1146,7 @@ mod tests {
                     version_id,
                     location: Location::Real(materialized_location()),
                     created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
+                    created_by: test_user_id(),
                 }
                 .to_bytes()
                 .unwrap()
@@ -1206,7 +1215,7 @@ mod tests {
                     version_id,
                     location: Location::Real(materialized_location()),
                     created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
+                    created_by: test_user_id(),
                 }
                 .to_bytes()
                 .unwrap()

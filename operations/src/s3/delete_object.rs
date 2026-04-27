@@ -507,8 +507,7 @@ mod test {
     use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        Backend, BackendConfig, Location, LookupKey, RealmId, UserIdentity, VersionKey,
-        VersionMetadata,
+        Backend, BackendConfig, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -554,7 +553,7 @@ mod test {
             task_handle: None,
         };
 
-        let user_id = Ulid::new();
+        let user_id = aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]));
         let put_result = drive(
             PutObjectOperation::new(PutObjectConfig {
                 user_id,
@@ -649,10 +648,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id,
-                    realm_key: RealmId([0u8; 32]),
-                },
+                user_identity: user_id,
             }),
             &context,
         )
@@ -696,7 +692,7 @@ mod test {
             task_handle: None,
         };
 
-        let user_id = Ulid::new();
+        let user_id = aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]));
         let put_result = drive(
             PutObjectOperation::new(PutObjectConfig {
                 user_id,
@@ -759,10 +755,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id,
-                    realm_key: RealmId([0u8; 32]),
-                },
+                user_identity: user_id,
             }),
             &context,
         )
@@ -796,10 +789,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id,
-                    realm_key: RealmId([0u8; 32]),
-                },
+                user_identity: user_id,
             }),
             &context,
         )

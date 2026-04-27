@@ -12,6 +12,7 @@ use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
+use aruna_core::UserId;
 use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
@@ -131,7 +132,7 @@ pub(crate) struct SeedNode {
     pub(crate) net: NetHandle,
     pub(crate) context: Arc<DriverContext>,
     pub(crate) realm_id: RealmId,
-    pub(crate) user_id: Ulid,
+    pub(crate) user_id: UserId,
     pub(crate) capabilities: NodeCapabilities,
     pub(crate) base_url: String,
     pub(crate) s3: Option<S3Endpoint>,
@@ -234,7 +235,7 @@ pub(crate) async fn wait_for_realm_nodes(
         Duration::from_millis(100),
         || async {
             for context in contexts {
-                match drive(GetRealmNodesOperation::new(realm_id.clone()), context).await {
+                match drive(GetRealmNodesOperation::new(*realm_id), context).await {
                     Ok(nodes) if nodes.len() == expected => {}
                     _ => return false,
                 }
@@ -247,7 +248,7 @@ pub(crate) async fn wait_for_realm_nodes(
 
 pub(crate) async fn create_bearer_token(
     context: &DriverContext,
-    user_id: Ulid,
+    user_id: UserId,
     realm_id: RealmId,
     node_capabilities: NodeCapabilities,
 ) -> TestResult<String> {
@@ -392,7 +393,7 @@ pub(crate) fn s3_client(endpoint: &S3Endpoint, credentials: &S3Credentials) -> S
 }
 
 pub(crate) fn bucket_arn(realm_id: &RealmId, node_id: iroh::PublicKey, bucket: &str) -> String {
-    ArunaArn::s3_bucket(realm_id.clone(), node_id, bucket.to_string())
+    ArunaArn::s3_bucket(*realm_id, node_id, bucket.to_string())
         .expect("bucket arn should be valid")
         .to_string()
 }
@@ -414,7 +415,7 @@ pub(crate) async fn create_onboarding_secret_via_http(
     let token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
-        seed.realm_id.clone(),
+        seed.realm_id,
         seed.capabilities.clone(),
     )
     .await?;
@@ -463,9 +464,13 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         .to_str()
         .ok_or_else(|| std::io::Error::other("invalid temp path"))?;
     let storage = FjallStorage::open(storage_path)?;
+    let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+    let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+    let user_id = UserId::new(Ulid::new(), realm_id);
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            realm_id,
             use_dns_discovery: false,
             ..NetConfig::default()
         },
@@ -476,17 +481,15 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         (mode == NodeServiceMode::Full).then(|| FullNodeStorageConfig::for_temp_dir(&temp_dir));
     let context = initialize_context(storage, net.clone(), full_storage_config.as_ref()).await?;
 
-    let realm_signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
-    let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = Ulid::new();
     drive(
         CreateRealmOperation::new(CreateRealmConfig {
             actor: Actor {
                 node_id: net.node_id(),
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             realm_description: "Test Realm".to_string(),
+            oidc_providers: Vec::new(),
         }),
         context.as_ref(),
     )
@@ -497,7 +500,7 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
             actor: Actor {
                 node_id: net.node_id(),
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
         }),
         context.as_ref(),
@@ -508,13 +511,13 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
     let capabilities = NodeCapabilities::management_node(realm_signing_key)?;
     let (base_url, server_task) = spawn_rest_server(
         context.clone(),
-        realm_id.clone(),
+        realm_id,
         net.node_id(),
         capabilities.clone(),
     )
     .await?;
     let (s3, s3_task) =
-        spawn_optional_s3_server(mode, context.clone(), realm_id.clone(), net.node_id()).await?;
+        spawn_optional_s3_server(mode, context.clone(), realm_id, net.node_id()).await?;
 
     Ok(SeedNode {
         _temp_dir: temp_dir,
@@ -542,7 +545,7 @@ async fn spawn_joiner_node_with_mode(
         NetConfig {
             bind_addr: config.p2p_socket_addr,
             secret_key: Some(config.net_secret_key.clone()),
-            realm_id: config.realm_id.clone(),
+            realm_id: config.realm_id,
             bootstrap_nodes: config.bootstrap_nodes.clone(),
             use_dns_discovery: false,
         },
@@ -586,7 +589,7 @@ async fn spawn_joiner_node_with_mode(
 
     let (base_url, server_task) = spawn_rest_server(
         joiner_context.clone(),
-        config.realm_id.clone(),
+        config.realm_id,
         config.node_id,
         config.node_capabilities.clone(),
     )
@@ -594,7 +597,7 @@ async fn spawn_joiner_node_with_mode(
     let (s3, s3_task) = spawn_optional_s3_server(
         mode,
         joiner_context.clone(),
-        config.realm_id.clone(),
+        config.realm_id,
         config.node_id,
     )
     .await?;
@@ -661,7 +664,7 @@ async fn announce_realm_presence(
 ) -> TestResult<()> {
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: realm_id.clone(),
+            realm_id: *realm_id,
             node_id,
             schedule_refresh: false,
         }),

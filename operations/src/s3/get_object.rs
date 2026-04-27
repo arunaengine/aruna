@@ -1,3 +1,4 @@
+use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -8,7 +9,7 @@ use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, Location, LookupKey, MultipartChecksumType, MultipartObjectMetadataKey,
-    MultipartObjectSummary, UserIdentity, VersionKey, VersionMetadata,
+    MultipartObjectSummary, VersionKey, VersionMetadata,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
@@ -67,7 +68,7 @@ pub struct GetObjectInput {
     pub version_id: Option<Ulid>,
     pub range: Option<Range<u64>>,
     pub group_id: Ulid,
-    pub user_identity: UserIdentity,
+    pub user_identity: UserId,
 }
 
 #[derive(Debug, PartialEq)]
@@ -405,7 +406,6 @@ mod test {
     use aruna_core::keyspaces::S3_LOOKUP_KEYSPACE;
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, Location, LookupKey, MultipartChecksumType,
-        RealmId, UserIdentity,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -520,10 +520,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id: Default::default(),
-                    realm_key: RealmId([0u8; 32]),
-                },
+                user_identity: Default::default(),
             },
             state: GetObjectState::Init,
             txn_id: None,
@@ -650,10 +647,7 @@ mod test {
             version_id: None,
             range: None,
             group_id: Ulid::new(),
-            user_identity: UserIdentity {
-                user_id: Default::default(),
-                realm_key: RealmId([0u8; 32]),
-            },
+            user_identity: Default::default(),
         });
 
         let mut blob_stream = drive(operation, &driver_ctx)

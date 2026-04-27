@@ -4,7 +4,9 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, Realm, RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::structs::{
+    Actor, OidcProviderConfig, Realm, RealmAuthorizationDocument, RealmConfigDocument,
+};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -16,6 +18,7 @@ use aruna_core::types::Effects;
 pub struct CreateRealmConfig {
     pub actor: Actor,
     pub realm_description: String,
+    pub oidc_providers: Vec<OidcProviderConfig>,
 }
 
 #[derive(PartialEq)]
@@ -56,7 +59,7 @@ impl CreateRealmOperation {
     }
     fn emit_create_realm(&mut self) -> Result<Effects, CreateRealmError> {
         let realm = Realm {
-            realm_id: self.config.actor.realm_id.clone(),
+            realm_id: self.config.actor.realm_id,
             description: self.config.realm_description.clone(),
         };
 
@@ -78,10 +81,10 @@ impl CreateRealmOperation {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
-        let realm_id = self.config.actor.realm_id.clone();
+        let realm_id = self.config.actor.realm_id;
 
         let auth_doc =
-            RealmAuthorizationDocument::new_default_realm_doc(self.config.actor.realm_id.clone());
+            RealmAuthorizationDocument::new_default_realm_doc(self.config.actor.realm_id);
 
         self.auth_doc = Some(auth_doc.clone());
 
@@ -99,8 +102,9 @@ impl CreateRealmOperation {
         self.txn_id
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
-        let realm_id = self.config.actor.realm_id.clone();
-        let config_doc = RealmConfigDocument::default_for_realm(realm_id.clone());
+        let realm_id = self.config.actor.realm_id;
+        let config_doc =
+            RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();
@@ -238,7 +242,7 @@ impl CreateRealmOperation {
             smallvec![Effect::SubOperation(boxed_suboperation(
                 AnnounceTopicOperation::new(
                     AutomergeDocumentVariant::RealmAuthorization {
-                        realm_id: realm.realm_id.clone(),
+                        realm_id: realm.realm_id,
                     }
                     .topic_id(),
                     self.config.actor.node_id,
@@ -272,7 +276,7 @@ impl CreateRealmOperation {
             smallvec![Effect::SubOperation(boxed_suboperation(
                 AnnounceTopicOperation::new(
                     AutomergeDocumentVariant::RealmConfig {
-                        realm_id: realm.realm_id.clone(),
+                        realm_id: realm.realm_id,
                     }
                     .topic_id(),
                     self.config.actor.node_id,
@@ -403,6 +407,7 @@ impl Operation for CreateRealmOperation {
 
 #[cfg(test)]
 mod test {
+    use aruna_core::UserId;
     use aruna_core::structs::{Actor, RealmId};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -445,7 +450,7 @@ mod test {
         let pubkey = realm_signing_key.verifying_key().to_bytes();
         let realm_id = RealmId::from_bytes(pubkey);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
-        let realm_admin = Ulid::new();
+        let realm_admin = UserId::local(Ulid::new(), realm_id);
 
         let realm_config = CreateRealmConfig {
             actor: Actor {
@@ -454,6 +459,7 @@ mod test {
                 realm_id,
             },
             realm_description: "A realm description".to_string(),
+            oidc_providers: Vec::new(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let result = drive(realm_operation, &context).await.unwrap();

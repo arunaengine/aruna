@@ -156,7 +156,7 @@ impl NetHandle {
                 endpoint.clone(),
                 storage.clone(),
                 dht.clone(),
-                config.realm_id.clone(),
+                config.realm_id,
                 config.bootstrap_nodes.clone(),
                 shutdown.child_token(),
                 gossip_msg_tx.clone(),
@@ -316,7 +316,7 @@ impl NetHandle {
         let inner = Arc::new(NetInner {
             effect_tx,
             node_id,
-            realm_id: config.realm_id.clone(),
+            realm_id: config.realm_id,
             endpoint,
             address_lookup,
             dht,
