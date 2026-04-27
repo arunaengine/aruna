@@ -15,9 +15,10 @@ use aruna_core::keyspaces::{
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BucketInfo, CurrentVersionPointer, LookupKey, MultipartObjectMetadataKey,
-    MultipartObjectPart, MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
-    ReplicationSuboperationResult, VersionKey, VersionMetadata,
+    AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, LookupKey,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
+    ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
+    VersionKey, VersionMetadata,
 };
 use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
@@ -439,6 +440,7 @@ enum ReplicateObjectVersionState {
     ResolveReferenceAccess,
     ReadReferenceSource,
     WriteReferenceBlob,
+    CleanupReferenceBlob,
     ReadMultipartSummary,
     ReadMultipartParts,
     ReadCurrentLookup,
@@ -463,6 +465,7 @@ pub struct ReplicateObjectVersionOperation {
     stream_id: Option<Ulid>,
     manifest: Option<VersionReplicationManifest>,
     blob_replication_id: Option<Ulid>,
+    cleanup_reference_blob: Option<BackendLocation>,
     result: Result<ReplicationSuboperationResult, ReplicateObjectVersionError>,
 }
 
@@ -478,6 +481,7 @@ impl ReplicateObjectVersionOperation {
             stream_id: None,
             manifest: None,
             blob_replication_id: None,
+            cleanup_reference_blob: None,
             result: Ok(ReplicationSuboperationResult::Replicated),
         }
     }
@@ -489,6 +493,7 @@ impl ReplicateObjectVersionOperation {
             ReplicateObjectVersionState::ResolveReferenceAccess => "ResolveReferenceAccess",
             ReplicateObjectVersionState::ReadReferenceSource => "ReadReferenceSource",
             ReplicateObjectVersionState::WriteReferenceBlob => "WriteReferenceBlob",
+            ReplicateObjectVersionState::CleanupReferenceBlob => "CleanupReferenceBlob",
             ReplicateObjectVersionState::ReadMultipartSummary => "ReadMultipartSummary",
             ReplicateObjectVersionState::ReadMultipartParts => "ReadMultipartParts",
             ReplicateObjectVersionState::ReadCurrentLookup => "ReadCurrentLookup",
@@ -664,6 +669,7 @@ impl ReplicateObjectVersionOperation {
                     return self.fail(ReplicateObjectVersionError::VersionNotFound);
                 };
                 let source = metadata.source_binding().cloned();
+                self.cleanup_reference_blob = Some(location.clone());
                 self.version_metadata = Some(VersionMetadata::materialized(
                     metadata.version_id,
                     location,
@@ -780,6 +786,15 @@ impl ReplicateObjectVersionOperation {
             return self.fail(ReplicationError::ConnectionMissing.into());
         };
         smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
+    }
+
+    fn cleanup_reference_blob_or_close(&mut self) -> Effects {
+        if let Some(location) = self.cleanup_reference_blob.take() {
+            self.state = ReplicateObjectVersionState::CleanupReferenceBlob;
+            smallvec![Effect::Blob(BlobEffect::Delete { location })]
+        } else {
+            self.close_connection()
+        }
     }
 }
 
@@ -997,7 +1012,7 @@ impl Operation for ReplicateObjectVersionOperation {
                 match VersionReplicationMessage::from_bytes(&payload) {
                     Ok(VersionReplicationMessage::VersionApplyComplete) => {
                         self.result = Ok(ReplicationSuboperationResult::Replicated);
-                        self.close_connection()
+                        self.cleanup_reference_blob_or_close()
                     }
                     Ok(VersionReplicationMessage::VersionApplyRejected(reason)) => {
                         self.fail(ReplicationError::ReplicationRejected(reason).into())
@@ -1014,6 +1029,16 @@ impl Operation for ReplicateObjectVersionOperation {
                     Err(err) => self.fail(err.into()),
                 }
             }
+            ReplicateObjectVersionState::CleanupReferenceBlob => match event {
+                Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
+                    self.close_connection()
+                }
+                other => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                    state: self.state_name(),
+                    expected: "Event::Blob(BlobEvent::DeleteFinished|Error)",
+                    received: other,
+                }),
+            },
             ReplicateObjectVersionState::CloseConnection => {
                 let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
                     return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
@@ -1048,10 +1073,14 @@ impl Operation for ReplicateObjectVersionOperation {
     }
 
     fn abort(&mut self) -> Effects {
-        self.stream_id
-            .map_or_else(smallvec::SmallVec::new, |stream_id| {
-                smallvec![Effect::Blob(BlobEffect::CloseConnection { stream_id })]
-            })
+        let mut effects = smallvec![];
+        if let Some(location) = self.cleanup_reference_blob.take() {
+            effects.push(Effect::Blob(BlobEffect::Delete { location }));
+        }
+        if let Some(stream_id) = self.stream_id {
+            effects.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }));
+        }
+        effects
     }
 }
 
@@ -1061,7 +1090,9 @@ mod tests {
         ReplicateObjectVersionError, ReplicateObjectVersionOperation, ReplicateScopeInput,
         ReplicateScopeOperation, ReplicateScopeTarget,
     };
-    use crate::replication::protocol::{ReplicationMode, VersionReplicationRequest};
+    use crate::replication::protocol::{
+        ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
+    };
     use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::events::{
@@ -1073,9 +1104,9 @@ mod tests {
     use aruna_core::structs::{
         AuthContext, BackendLocation, BucketInfo, MultipartChecksumType,
         MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-        PortableSourceDescriptor, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionMetadata,
-        VersionSourceBinding,
+        PortableSourceDescriptor, RealmId, ReplicationNegotiationResult,
+        ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind,
+        SourceMetadata, StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
     };
     use bytes::Bytes;
     use futures_util::stream;
@@ -1491,5 +1522,84 @@ mod tests {
                 if key_space == S3_CURRENT_VERSION_KEYSPACE
         ));
         assert!(op.version_metadata.as_ref().unwrap().is_materialized());
+    }
+
+    #[test]
+    fn on_demand_reference_replication_cleans_up_temporary_blob_after_apply() {
+        let version_id = Ulid::new();
+        let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
+            version_id,
+            ReplicationMode::OnDemand,
+        ));
+
+        op.start();
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(reference_metadata(version_id).to_bytes().unwrap().into()),
+        }));
+
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
+            path: "ref/file.txt".to_string(),
+        };
+        op.step(Event::SubOperation(
+            SubOperationEvent::VersionSourceAccessResolved { result: Ok(access) },
+        ));
+        op.step(Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata: SourceMetadata {
+                content_length: 3,
+                content_type: Some("text/plain".to_string()),
+                etag: Some("etag-2".to_string()),
+                last_modified: None,
+            },
+            stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
+                Bytes::from_static(b"abc"),
+            )])),
+        }));
+
+        let temp_location = materialized_location();
+        op.step(Event::Blob(BlobEvent::WriteFinished {
+            location: temp_location.clone(),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: None,
+        }));
+        op.step(Event::Blob(BlobEvent::ConnectionEstablished {
+            stream_id: Ulid::new(),
+        }));
+        op.step(Event::Blob(BlobEvent::MessageSent {
+            stream_id: op.stream_id.expect("stream id available"),
+        }));
+
+        let negotiation = VersionReplicationMessage::VersionNegotiationResponse(
+            ReplicationNegotiationResult::NeedBlobAndVersion,
+        )
+        .to_bytes()
+        .unwrap();
+        op.step(Event::Blob(BlobEvent::MessageReceived {
+            stream_id: op.stream_id.expect("stream id available"),
+            payload: negotiation,
+        }));
+        op.step(Event::Blob(BlobEvent::ReplicationFinished {
+            location: temp_location.clone(),
+        }));
+
+        let apply_complete = VersionReplicationMessage::VersionApplyComplete
+            .to_bytes()
+            .unwrap();
+        let effects = op.step(Event::Blob(BlobEvent::MessageReceived {
+            stream_id: op.stream_id.expect("stream id available"),
+            payload: apply_complete,
+        }));
+
+        assert_eq!(op.state, super::ReplicateObjectVersionState::CleanupReferenceBlob);
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Blob(BlobEffect::Delete {
+                location: temp_location
+            })]
+        );
     }
 }
