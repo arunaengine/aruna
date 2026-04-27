@@ -80,11 +80,7 @@ impl CreateTokenOperation {
                 realm_encoding_key, ..
             } => {
                 let claims = TokenClaims {
-                    sub: format!(
-                        "{}@{}",
-                        self.config.user_id.to_string(),
-                        self.config.realm_id
-                    ),
+                    sub: self.config.user_id.to_string(),
                     iss: self.config.realm_id.to_string(),
                     iat,
                     exp,
@@ -112,11 +108,7 @@ impl CreateTokenOperation {
                         .encode(issuer_signing_key.verifying_key().to_bytes()),
                 );
                 let claims = TokenClaims {
-                    sub: format!(
-                        "{}@{}",
-                        self.config.user_id.to_string(),
-                        self.config.realm_id
-                    ),
+                    sub: self.config.user_id.to_string(),
                     iss: self.config.realm_id.to_string(),
                     iat,
                     exp,
@@ -178,6 +170,7 @@ impl Operation for CreateTokenOperation {
 mod test {
     use crate::create_token::{CreateTokenConfig, CreateTokenOperation};
     use crate::driver::{DriverContext, drive};
+    use aruna_core::UserId;
     use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_storage::storage;
     use ed25519_dalek::SigningKey;
@@ -208,8 +201,8 @@ mod test {
         let token_config = CreateTokenConfig {
             time: chrono::Utc::now().timestamp() as u64,
             expiry: None,
-            user_id: Ulid::new(),
-            realm_id: realm_id.clone(),
+            user_id: UserId::local(Ulid::new(), realm_id),
+            realm_id,
             node_capabilities: capabilities,
         };
 

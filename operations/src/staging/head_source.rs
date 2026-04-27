@@ -205,7 +205,7 @@ mod tests {
             HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
             SystemTime::UNIX_EPOCH,
             SystemTime::UNIX_EPOCH,
-            Ulid::from_bytes([3u8; 16]),
+            Default::default(),
         )
     }
 

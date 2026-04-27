@@ -35,8 +35,8 @@ async fn group_creation_replicates_to_all_realm_nodes() -> Result<(), Box<dyn st
 
     let creator = Actor {
         node_id: nodes[0].net.node_id(),
-        user_id: Ulid::new(),
-        realm_id: realm_id.clone(),
+        user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+        realm_id,
     };
 
     let expected = drive(
@@ -78,7 +78,7 @@ async fn build_realm_nodes(
     for node in &nodes {
         drive(
             AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-                realm_id: realm_id.clone(),
+                realm_id: *realm_id,
                 node_id: node.net.node_id(),
                 schedule_refresh: true,
             }),
@@ -136,7 +136,7 @@ async fn wait_for_realm_node_convergence(
         let mut converged = true;
         for node in nodes {
             match drive(
-                GetRealmNodesOperation::new(realm_id.clone()),
+                GetRealmNodesOperation::new(*realm_id),
                 node.context.as_ref(),
             )
             .await

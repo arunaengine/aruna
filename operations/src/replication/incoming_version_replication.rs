@@ -447,14 +447,11 @@ impl IncomingVersionReplicationOperation {
         };
 
         self.state = IncomingVersionReplicationState::RegisterBlobInDht;
-        let effect = match dht_registration_effect(
-            blake3_hash,
-            self.local_realm_id.clone(),
-            self.local_node_id,
-        ) {
-            Ok(effect) => effect,
-            Err(_) => return self.send_apply_complete(),
-        };
+        let effect =
+            match dht_registration_effect(blake3_hash, self.local_realm_id, self.local_node_id) {
+                Ok(effect) => effect,
+                Err(_) => return self.send_apply_complete(),
+            };
         smallvec![effect]
     }
 
@@ -828,6 +825,7 @@ mod tests {
     use crate::replication::protocol::{
         MaterializedBlobInfo, VersionReplicationManifest, VersionReplicationMessage,
     };
+    use aruna_core::UserId;
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::AuthorizationError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
@@ -840,6 +838,14 @@ mod tests {
     use std::time::SystemTime;
     use ulid::Ulid;
 
+    fn test_realm_id() -> RealmId {
+        RealmId::from_bytes([7u8; 32])
+    }
+
+    fn test_user_id() -> UserId {
+        UserId::nil(test_realm_id())
+    }
+
     fn make_location() -> BackendLocation {
         let mut hashes = HashMap::new();
         hashes.insert("blake3".to_string(), vec![1u8; 32]);
@@ -850,7 +856,7 @@ mod tests {
             ulid: Ulid::new(),
             compressed: false,
             encrypted: false,
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             created_at: SystemTime::now(),
             staging: false,
             partial: false,
@@ -863,7 +869,7 @@ mod tests {
         BucketInfo {
             group_id,
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
         }
     }
 
@@ -888,11 +894,11 @@ mod tests {
             version_id: Ulid::new(),
             kind,
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             current_version: true,
             auth_context: AuthContext {
-                user_id: Ulid::new(),
-                realm_id: RealmId::from_bytes([7u8; 32]),
+                user_id: test_user_id(),
+                realm_id: test_realm_id(),
                 path_restrictions: None,
             },
             blob,

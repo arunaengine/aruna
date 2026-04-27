@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::id::{NodeId, TopicId};
+use crate::types::UserId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicMessage {
@@ -40,6 +41,7 @@ impl TopicMessage {
 pub enum TopicMessageKind {
     RealmAuthorization,
     RealmConfig,
+    User { user_id: UserId },
     Group,
     GroupAuthorization,
     Metadata,
@@ -47,14 +49,13 @@ pub enum TopicMessageKind {
 
 impl TopicMessageKind {
     pub fn allowed_in_topic(&self, topic: &TopicId) -> bool {
-        matches!(
-            (topic, self),
-            (
-                TopicId::Realm(_),
-                Self::RealmAuthorization | Self::RealmConfig
-            ) | (TopicId::Group(_), Self::Group | Self::GroupAuthorization)
-                | (TopicId::Metadata(_), Self::Metadata)
-        )
+        match (topic, self) {
+            (TopicId::Realm(_), Self::RealmAuthorization | Self::RealmConfig) => true,
+            (TopicId::Users(realm_id), Self::User { user_id }) => user_id.realm_id == *realm_id,
+            (TopicId::Group(_), Self::Group | Self::GroupAuthorization) => true,
+            (TopicId::Metadata(_), Self::Metadata) => true,
+            _ => false,
+        }
     }
 }
 
@@ -76,6 +77,7 @@ impl TopicMessageVersion {
             (
                 TopicMessageKind::RealmAuthorization
                     | TopicMessageKind::RealmConfig
+                    | TopicMessageKind::User { .. }
                     | TopicMessageKind::Group
                     | TopicMessageKind::GroupAuthorization,
                 Self::Automerge { .. }
@@ -92,7 +94,7 @@ mod tests {
 
     use super::*;
     use crate::structs::RealmId;
-    use crate::types::GroupId;
+    use crate::types::{GroupId, UserId};
 
     fn make_node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -101,6 +103,8 @@ mod tests {
     #[test]
     fn validates_topic_and_version_combinations() {
         let realm = TopicId::realm(RealmId::from_bytes([1u8; 32]));
+        let users = TopicId::users(RealmId::from_bytes([1u8; 32]));
+        let other_users = TopicId::users(RealmId::from_bytes([8u8; 32]));
         let group = TopicId::group(GroupId::from_bytes([2u8; 16]));
         let metadata = TopicId::metadata(Ulid::from_bytes([3u8; 16]));
 
@@ -116,6 +120,23 @@ mod tests {
         );
         assert!(automerge.is_valid_for(&realm));
         assert!(!automerge.is_valid_for(&group));
+
+        let user_message = TopicMessage::new(
+            TopicMessageKind::User {
+                user_id: UserId::new(Ulid::from_bytes([6u8; 16]), RealmId::from_bytes([1u8; 32])),
+            },
+            Ulid::new(),
+            make_node(6),
+            None,
+            TopicMessageVersion::Automerge {
+                heads: Vec::new(),
+                change_count: 0,
+            },
+        );
+        assert!(user_message.is_valid_for(&users));
+        assert!(!user_message.is_valid_for(&realm));
+        assert!(!user_message.is_valid_for(&other_users));
+        assert!(!user_message.is_valid_for(&group));
 
         let metadata_message = TopicMessage::new(
             TopicMessageKind::Metadata,

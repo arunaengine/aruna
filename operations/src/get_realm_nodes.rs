@@ -71,7 +71,7 @@ impl Operation for GetRealmNodesOperation {
         self.state = GetRealmNodesState::ReadDocument;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Get {
             key: *realm_presence_key(&self.realm_id).as_bytes(),
-            realm_filter: Some(self.realm_id.clone()),
+            realm_filter: Some(self.realm_id),
         }))]
     }
 

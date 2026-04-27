@@ -61,7 +61,13 @@ impl InboundEventHandler for OperationsInboundHandler {
                 "Received inbound gossip message"
             );
 
-            let op = IncomingGossipOperation::new(topic, sender, data);
+            let local_node_id = self
+                .context
+                .net_handle
+                .as_ref()
+                .map(|net_handle| net_handle.node_id())
+                .unwrap_or(sender);
+            let op = IncomingGossipOperation::new(topic, sender, local_node_id, data);
             if let Err(err) = drive(op, self.context.as_ref()).await {
                 error!(error = ?err, "Failed to process inbound gossip event");
             }
@@ -94,7 +100,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),
-                                            net_handle.realm_id().clone(),
+                                            *net_handle.realm_id(),
                                             manifest,
                                         );
                                         if let Err(err) = drive(op, self.context.as_ref()).await {
@@ -137,7 +143,12 @@ impl InboundEventHandler for OperationsInboundHandler {
                         return;
                     };
                     let sync_id = automerge_handle.register_inbound_stream(stream, node_id).await;
-                    let op = IncomingAutomergeOperation::new(sync_id, node_id, net_handle.node_id());
+                    let op = IncomingAutomergeOperation::new(
+                        sync_id,
+                        node_id,
+                        net_handle.node_id(),
+                        *net_handle.realm_id(),
+                    );
                     if let Err(err) = drive(op, self.context.as_ref()).await {
                         error!(error = ?err, "Failed to process inbound automerge stream event");
                     }

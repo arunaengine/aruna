@@ -18,6 +18,7 @@ aruna-tasks = { path = "../tasks" }
 
 # The rest
 base64.workspace = true
+blake3.workspace = true
 crypto_box.workspace = true
 dotenvy = "0.15.7"
 ed25519-dalek.workspace = true
@@ -36,8 +37,11 @@ tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 ulid.workspace = true
 byteview.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 aws-sdk-s3 = "1.124.0"
 tempfile.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

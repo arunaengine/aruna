@@ -52,7 +52,7 @@ mod tests {
             ]),
             SystemTime::UNIX_EPOCH,
             SystemTime::UNIX_EPOCH,
-            Ulid::from_bytes([3u8; 16]),
+            Default::default(),
         )
     }
 

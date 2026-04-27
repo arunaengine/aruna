@@ -350,7 +350,7 @@ mod test {
                 value: BucketInfo {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
+                    created_by: Default::default(),
                 }
                 .to_bytes()
                 .unwrap()
@@ -412,7 +412,7 @@ mod test {
                 value: BucketInfo {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
+                    created_by: aruna_core::UserId::nil(RealmId::from_bytes([0u8; 32])),
                 }
                 .to_bytes()
                 .unwrap()
@@ -487,7 +487,7 @@ mod test {
                 value: BucketInfo {
                     group_id: Ulid::new(),
                     created_at: SystemTime::now(),
-                    created_by: Ulid::new(),
+                    created_by: Default::default(),
                 }
                 .to_bytes()
                 .unwrap()
@@ -503,7 +503,7 @@ mod test {
             ulid: Ulid::new(),
             compressed: false,
             encrypted: false,
-            created_by: Ulid::new(),
+            created_by: Default::default(),
             created_at: SystemTime::now(),
             staging: false,
             partial: false,
@@ -532,7 +532,7 @@ mod test {
                     Ulid::new(),
                     location,
                     SystemTime::now(),
-                    Ulid::new(),
+                    Default::default(),
                     None,
                 )
                 .to_bytes()

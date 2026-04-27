@@ -156,7 +156,7 @@ fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         MetadataHandle::new(metadata_dir.path(), node_id, storage_handle.clone(), None)?;
     let actor = Actor {
         node_id,
-        user_id: Ulid::new(),
+        user_id: aruna_core::UserId::local(Ulid::new(), RealmId([5u8; 32])),
         realm_id: RealmId([5u8; 32]),
     };
     let context = Arc::new(DriverContext {

@@ -368,6 +368,7 @@ pub async fn bootstrap_onboarding(
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
     let onboarding_sync_ticket = state
         .issue_onboarding_sync_ticket(node_id)
+        .await
         .map_err(|err| ServerError::InternalError(err.to_string()))?
         .encode()
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
@@ -548,6 +549,7 @@ mod tests {
         revoke_onboarding_secret,
     };
     use crate::server_state::ServerState;
+    use aruna_core::UserId;
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
         bootstrap_issuer_proof_message, bootstrap_node_proof_message,
@@ -578,7 +580,7 @@ mod tests {
         Arc<ServerState>,
         RealmId,
         iroh::PublicKey,
-        Ulid,
+        UserId,
         NetHandle,
         TempDir,
     ) {
@@ -606,7 +608,7 @@ mod tests {
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
         let realm_signing_key = SigningKey::generate(&mut csprng);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let user_id = Ulid::new();
+        let user_id = UserId::local(Ulid::new(), realm_id);
         let node_id = net_handle.node_id();
 
         drive(
@@ -614,9 +616,10 @@ mod tests {
                 actor: Actor {
                     node_id,
                     user_id,
-                    realm_id: realm_id.clone(),
+                    realm_id,
                 },
                 realm_description: "Realm".to_string(),
+                oidc_providers: vec![],
             }),
             &driver_ctx,
         )
@@ -628,7 +631,7 @@ mod tests {
                 actor: Actor {
                     node_id,
                     user_id,
-                    realm_id: realm_id.clone(),
+                    realm_id,
                 },
             }),
             &driver_ctx,
@@ -639,7 +642,7 @@ mod tests {
         let state = Arc::new(
             ServerState::new(
                 driver_ctx,
-                realm_id.clone(),
+                realm_id,
                 node_id,
                 NodeCapabilities::management_node(realm_signing_key).unwrap(),
                 false,
@@ -657,7 +660,7 @@ mod tests {
             setup_management_state().await;
         let auth = AuthContext {
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             path_restrictions: None,
         };
 
@@ -726,7 +729,7 @@ mod tests {
             setup_management_state().await;
         let auth = AuthContext {
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             path_restrictions: None,
         };
 
@@ -780,7 +783,7 @@ mod tests {
             setup_management_state().await;
         let auth = AuthContext {
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             path_restrictions: None,
         };
 
@@ -862,7 +865,7 @@ mod tests {
             setup_management_state().await;
         let auth = AuthContext {
             user_id,
-            realm_id: realm_id.clone(),
+            realm_id,
             path_restrictions: None,
         };
 

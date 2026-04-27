@@ -173,7 +173,7 @@ mod tests {
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id,
-                created_by: ulid::Ulid::new(),
+                created_by: Default::default(),
                 name: "refdata".to_string(),
                 kind: SourceConnectorKind::S3,
                 public_config: HashMap::from([

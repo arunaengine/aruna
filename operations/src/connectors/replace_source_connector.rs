@@ -299,7 +299,7 @@ mod tests {
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id: ulid::Ulid::new(),
-                created_by: ulid::Ulid::new(),
+                created_by: Default::default(),
                 name: "old".to_string(),
                 kind: SourceConnectorKind::Http,
                 public_config: HashMap::from([(

@@ -411,7 +411,7 @@ mod tests {
             compressed: false,
             encrypted: false,
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: Default::default(),
             staging: false,
             partial: false,
             blob_size: 5,
@@ -558,7 +558,7 @@ mod tests {
             version_id,
             location.clone(),
             SystemTime::now(),
-            Ulid::new(),
+            Default::default(),
             None,
         );
 
@@ -694,7 +694,7 @@ mod tests {
                     source,
                     cached_metadata.clone(),
                     SystemTime::UNIX_EPOCH,
-                    Ulid::new(),
+                    Default::default(),
                     last_refresh,
                 )
                 .to_bytes()

@@ -1,14 +1,17 @@
 #![allow(clippy::result_large_err)]
 
 use aruna::bootstrap::{
-    announce_core_documents, fetch_core_onboarding_documents, realm_bootstrap_exists,
+    announce_core_documents, ensure_initial_local_onboarding_secret,
+    fetch_core_onboarding_documents, realm_bootstrap_exists,
 };
 use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
+use aruna_api::auth::OidcValidator;
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
 use aruna_blob::blob::BlobHandler;
+use aruna_core::UserId;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
@@ -29,8 +32,7 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{error, info};
-use ulid::Ulid;
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() {
@@ -52,7 +54,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         NetConfig {
             bind_addr: config.p2p_socket_addr,
             secret_key: Some(config.net_secret_key.clone()),
-            realm_id: config.realm_id.clone(),
+            realm_id: config.realm_id,
             bootstrap_nodes: config.bootstrap_nodes.clone(),
             use_dns_discovery: false,
         },
@@ -108,14 +110,37 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     CreateRealmOperation::new(CreateRealmConfig {
                         actor: Actor {
                             node_id: config.node_id,
-                            user_id: Ulid::from_bytes([0u8; 16]),
-                            realm_id: config.realm_id.clone(),
+                            user_id: UserId::nil(config.realm_id),
+                            realm_id: config.realm_id,
                         },
                         realm_description: realm_description.clone(),
+                        oidc_providers: config.oidc_providers.clone(),
                     }),
                     driver_ctx.as_ref(),
                 )
                 .await?;
+            }
+
+            if config.is_initial_node() {
+                match ensure_initial_local_onboarding_secret(
+                    driver_ctx.as_ref(),
+                    format!("http://{}", config.http_socket_addr),
+                )
+                .await
+                {
+                    Ok(secret) => warn!(
+                        onboarding_secret = %secret
+                            .encode()
+                            .expect("initial onboarding secret encoding should succeed"),
+                        "Created initial local onboarding secret for first user registration"
+                    ),
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to create initial local onboarding secret: {error}"
+                        )
+                        .into());
+                    }
+                }
             }
 
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
@@ -157,8 +182,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     EnsureRealmConfigOperation::new(EnsureRealmConfigConfig {
                         actor: Actor {
                             node_id: config.node_id,
-                            user_id: Ulid::from_bytes([0u8; 16]),
-                            realm_id: config.realm_id.clone(),
+                            user_id: UserId::nil(config.realm_id),
+                            realm_id: config.realm_id,
                         },
                         bootstrap_peers: config.bootstrap_nodes.clone(),
                         default_metadata_replication_factor: config
@@ -168,12 +193,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
             }
+
+            announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
         }
     }
 
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-            realm_id: config.realm_id.clone(),
+            realm_id: config.realm_id,
             node_id: config.node_id,
             schedule_refresh: true,
         }),
@@ -186,11 +213,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(
         ServerState::new(
             driver_ctx.clone(),
-            config.realm_id.clone(),
+            config.realm_id,
             config.node_id,
             config.node_capabilities,
             is_initial_node,
-            None,
+            Some(Arc::new(OidcValidator::new()?)),
         )
         .await,
     );
@@ -207,7 +234,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &s3_address,
         &s3_host,
         driver_ctx,
-        config.realm_id.clone(),
+        config.realm_id,
         config.node_id,
     )
     .await

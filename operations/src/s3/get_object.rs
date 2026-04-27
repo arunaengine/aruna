@@ -1,6 +1,7 @@
 use crate::connectors::{
     ResolveVersionSourceBindingInput, resolve_version_source_binding_suboperation,
 };
+use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{
     ConversionError, SourceConnectorResolutionError, StagingSourceError, StorageError,
@@ -14,7 +15,7 @@ use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
     BackendLocation, CurrentVersionPointer, LookupKey, MultipartChecksumType,
     MultipartObjectMetadataKey, MultipartObjectSummary, ResolvedSourceAccess, SourceMetadata,
-    UserIdentity, VersionKey, VersionMetadata, VersionState,
+    VersionKey, VersionMetadata, VersionState,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
@@ -84,7 +85,7 @@ pub struct GetObjectInput {
     pub version_id: Option<Ulid>,
     pub range: Option<Range<u64>>,
     pub group_id: Ulid,
-    pub user_identity: UserIdentity,
+    pub user_identity: UserId,
 }
 
 #[derive(Debug, PartialEq)]
@@ -674,6 +675,7 @@ mod test {
     use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
+    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
@@ -682,8 +684,8 @@ mod test {
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, CurrentVersionPointer, Location, LookupKey,
         MultipartChecksumType, PortableSourceDescriptor, RealmId, SourceConnectorKind,
-        SourceMetadata, StagingStrategy, UserIdentity, VersionKey, VersionMetadata,
-        VersionSourceBinding, VersionState,
+        SourceMetadata, StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
+        VersionState,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -840,10 +842,7 @@ mod test {
             version_id: None,
             range: None,
             group_id: Ulid::new(),
-            user_identity: UserIdentity {
-                user_id: Default::default(),
-                realm_key: RealmId([0u8; 32]),
-            },
+            user_identity: Default::default(),
         });
 
         let blob_result = drive(operation, &driver_ctx)
@@ -993,10 +992,7 @@ mod test {
             version_id: None,
             range: None,
             group_id: Ulid::new(),
-            user_identity: UserIdentity {
-                user_id: Default::default(),
-                realm_key: RealmId([0u8; 32]),
-            },
+            user_identity: Default::default(),
         });
 
         let mut blob_stream = drive(operation, &driver_ctx)
@@ -1110,7 +1106,7 @@ mod test {
                     source,
                     cached_metadata,
                     SystemTime::UNIX_EPOCH,
-                    Ulid::new(),
+                    Default::default(),
                     SystemTime::UNIX_EPOCH,
                 )
                 .to_bytes()
@@ -1131,10 +1127,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id: Ulid::new(),
-                    realm_key: RealmId([0u8; 32]),
-                },
+                user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
             }),
             &driver_ctx,
         )
@@ -1272,7 +1265,7 @@ mod test {
                         last_modified: None,
                     },
                     SystemTime::UNIX_EPOCH,
-                    Ulid::new(),
+                    Default::default(),
                     SystemTime::UNIX_EPOCH,
                 )
                 .to_bytes()
@@ -1292,10 +1285,7 @@ mod test {
                 version_id: None,
                 range: None,
                 group_id: Ulid::new(),
-                user_identity: UserIdentity {
-                    user_id: Ulid::new(),
-                    realm_key: RealmId([0u8; 32]),
-                },
+                user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
             }),
             &driver_ctx,
         )

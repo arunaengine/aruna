@@ -68,7 +68,7 @@ impl AnnounceRealmPresenceOperation {
 
     fn task_key(&self) -> TaskKey {
         TaskKey::RealmPresence {
-            realm_id: self.config.realm_id.clone(),
+            realm_id: self.config.realm_id,
             node_id: self.config.node_id,
         }
     }
@@ -103,7 +103,7 @@ impl Operation for AnnounceRealmPresenceOperation {
         self.state = AnnounceRealmPresenceState::PutPresence;
         smallvec![Effect::Net(NetEffect::Dht(DhtEffect::Put {
             key: self.presence_key(),
-            realm_id: self.config.realm_id.clone(),
+            realm_id: self.config.realm_id,
             value: self.config.node_id.as_bytes().to_vec(),
             ttl: REALM_PRESENCE_TTL,
         }))]

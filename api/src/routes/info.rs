@@ -75,7 +75,7 @@ mod tests {
         let state = Arc::new(
             ServerState::new(
                 driver_ctx,
-                realm_id.clone(),
+                realm_id,
                 node_id,
                 NodeCapabilities::local_node(realm_id).unwrap(),
                 false,

@@ -8,7 +8,7 @@ use aruna_core::onboarding::{
     OnboardingSecret, OnboardingSecretError, bootstrap_issuer_proof_message,
     bootstrap_node_proof_message,
 };
-use aruna_core::structs::{BlobTimeoutConfig, NodeCapabilities, RealmId};
+use aruna_core::structs::{BlobTimeoutConfig, NodeCapabilities, OidcProviderConfig, RealmId};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
 use byteview::ByteView;
@@ -53,6 +53,7 @@ pub struct Config {
     pub s3_host: String,
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
+    pub oidc_providers: Vec<OidcProviderConfig>,
     pub startup_mode: StartupMode,
     pub node_state: PersistedNodeState,
 }
@@ -149,6 +150,20 @@ impl Config {
     pub fn is_initial_node(&self) -> bool {
         matches!(self.node_state.boot_origin, BootOrigin::InitializedRealm)
     }
+
+    pub fn blob_timeout_config(&self) -> BlobTimeoutConfig {
+        BlobTimeoutConfig {
+            control_plane_connect_timeout: std::time::Duration::from_secs(
+                self.blob_control_plane_connect_timeout_secs,
+            ),
+            control_plane_io_timeout: std::time::Duration::from_secs(
+                self.blob_control_plane_io_timeout_secs,
+            ),
+            transfer_idle_timeout: std::time::Duration::from_secs(
+                self.blob_transfer_idle_timeout_secs,
+            ),
+        }
+    }
 }
 
 pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
@@ -215,6 +230,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let onboarding_secret = dotenvy::var("ONBOARDING_SECRET")
         .ok()
         .filter(|value| !value.trim().is_empty());
+    let oidc_providers = load_oidc_providers_from_env()?;
 
     let storage_handle = FjallStorage::open(&storage_path)?;
     let node_state = match load_persisted_node_state(&storage_handle).await? {
@@ -274,6 +290,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             s3_host,
             s3_address,
             onboarding_secret,
+            oidc_providers,
             startup_mode,
             node_state,
         },
@@ -281,20 +298,25 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     ))
 }
 
-impl Config {
-    pub fn blob_timeout_config(&self) -> BlobTimeoutConfig {
-        BlobTimeoutConfig {
-            control_plane_connect_timeout: std::time::Duration::from_secs(
-                self.blob_control_plane_connect_timeout_secs,
-            ),
-            control_plane_io_timeout: std::time::Duration::from_secs(
-                self.blob_control_plane_io_timeout_secs,
-            ),
-            transfer_idle_timeout: std::time::Duration::from_secs(
-                self.blob_transfer_idle_timeout_secs,
-            ),
-        }
-    }
+fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, SetupError> {
+    let Some(provider_ids) = dotenvy::var("OIDC_PROVIDER_IDS").ok() else {
+        return Ok(Vec::new());
+    };
+
+    provider_ids
+        .split(',')
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .map(|provider_id| {
+            let env_prefix = provider_id.to_ascii_uppercase().replace('-', "_");
+            Ok(OidcProviderConfig {
+                id: provider_id.to_string(),
+                issuer: dotenvy::var(format!("OIDC_{env_prefix}_ISSUER"))?,
+                audience: dotenvy::var(format!("OIDC_{env_prefix}_AUDIENCE"))?,
+                discovery_url: dotenvy::var(format!("OIDC_{env_prefix}_DISCOVERY_URL"))?,
+            })
+        })
+        .collect()
 }
 
 pub async fn mark_node_state_complete(
@@ -354,16 +376,16 @@ fn node_capabilities_from_state(
             issuer_private_key_pem,
             delegation_signature,
         } => Ok((
-            node_state.realm_id.clone(),
+            node_state.realm_id,
             NodeCapabilities::server_node(
                 SigningKey::from_pkcs8_pem(issuer_private_key_pem)?,
-                node_state.realm_id.clone(),
+                node_state.realm_id,
                 delegation_signature.clone(),
             )?,
         )),
         PersistedNodeIdentity::Local => Ok((
-            node_state.realm_id.clone(),
-            NodeCapabilities::local_node(node_state.realm_id.clone())?,
+            node_state.realm_id,
+            NodeCapabilities::local_node(node_state.realm_id)?,
         )),
     }
 }
@@ -588,7 +610,7 @@ async fn persist_node_state(
 mod tests {
     use super::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, load,
-        persist_node_state,
+        load_oidc_providers_from_env, persist_node_state,
     };
     use aruna_core::structs::RealmId;
     use aruna_storage::FjallStorage;
@@ -600,6 +622,119 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn restore_env(previous: Vec<(String, Option<String>)>) {
+        for (key, value) in previous {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn loads_oidc_providers_from_env() {
+        let _guard = env_lock().lock().await;
+        let vars = [
+            ("OIDC_PROVIDER_IDS", "main,internal".to_string()),
+            ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
+            ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
+            (
+                "OIDC_MAIN_DISCOVERY_URL",
+                "https://issuer.example/.well-known/openid-configuration".to_string(),
+            ),
+            (
+                "OIDC_INTERNAL_ISSUER",
+                "https://internal.example".to_string(),
+            ),
+            ("OIDC_INTERNAL_AUDIENCE", "internal-client".to_string()),
+            (
+                "OIDC_INTERNAL_DISCOVERY_URL",
+                "https://internal.example/.well-known/openid-configuration".to_string(),
+            ),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+
+        for (key, value) in &vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let providers = load_oidc_providers_from_env().unwrap();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].id, "main");
+        assert_eq!(providers[0].issuer, "https://issuer.example");
+        assert_eq!(providers[1].id, "internal");
+        assert_eq!(providers[1].audience, "internal-client");
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn oidc_provider_env_requires_all_fields() {
+        let _guard = env_lock().lock().await;
+        let vars = [
+            ("OIDC_PROVIDER_IDS", "main".to_string()),
+            ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
+            ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
+        ];
+        let cleanup_keys = [
+            "OIDC_PROVIDER_IDS",
+            "OIDC_MAIN_ISSUER",
+            "OIDC_MAIN_AUDIENCE",
+            "OIDC_MAIN_DISCOVERY_URL",
+        ];
+        let previous: Vec<_> = cleanup_keys
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+
+        unsafe { std::env::remove_var("OIDC_MAIN_DISCOVERY_URL") };
+        for (key, value) in &vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        assert!(load_oidc_providers_from_env().is_err());
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn load_includes_oidc_providers_in_config() {
+        let _guard = env_lock().lock().await;
+        let tempdir = tempdir().unwrap();
+        let vars = [
+            ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
+            ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
+            ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
+            ("S3_PORT", "1337".to_string()),
+            ("S3_HOST", "localhost".to_string()),
+            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("OIDC_PROVIDER_IDS", "main".to_string()),
+            ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
+            ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
+            (
+                "OIDC_MAIN_DISCOVERY_URL",
+                "https://issuer.example/.well-known/openid-configuration".to_string(),
+            ),
+        ];
+        let previous: Vec<_> = vars
+            .iter()
+            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+        for (key, value) in &vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let (config, _storage) = load().await.unwrap();
+        assert_eq!(config.oidc_providers.len(), 1);
+        assert_eq!(config.oidc_providers[0].id, "main");
+        assert_eq!(config.oidc_providers[0].audience, "aruna-api");
+
+        restore_env(previous);
     }
 
     #[tokio::test]
@@ -652,11 +787,6 @@ mod tests {
             super::StartupMode::Provisioned
         ));
 
-        for (key, value) in previous {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
+        restore_env(previous);
     }
 }

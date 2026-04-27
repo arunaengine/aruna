@@ -97,7 +97,7 @@ impl ReplicationHarness {
         let seed_token = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
-            seed.realm_id.clone(),
+            seed.realm_id,
             seed.capabilities.clone(),
         )
         .await?;

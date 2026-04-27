@@ -76,7 +76,7 @@ impl EnsureRealmConfigOperation {
 
     fn document_ref(&self) -> AutomergeDocumentVariant {
         AutomergeDocumentVariant::RealmConfig {
-            realm_id: self.config.actor.realm_id.clone(),
+            realm_id: self.config.actor.realm_id,
         }
     }
 
@@ -123,18 +123,21 @@ impl Operation for EnsureRealmConfigOperation {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => match value.as_deref() {
                     Some(value) => match RealmConfigDocument::from_bytes(value) {
                         Ok(document) => {
-                            self.output = Some(Ok(document));
                             let Some(txn_id) = self.txn_id else {
                                 return self.fail(EnsureRealmConfigError::MissingTransaction);
                             };
+                            self.output = Some(Ok(document));
                             self.state = EnsureRealmConfigState::CommitTransaction;
                             smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
                         }
                         Err(error) => self.fail(error.into()),
                     },
                     None => {
+                        // The RealmConfig is only created to create an empty automerge document
+                        // for syncing here
                         let document = RealmConfigDocument::new(
-                            self.config.actor.realm_id.clone(),
+                            self.config.actor.realm_id,
+                            Vec::new(),
                             self.config.default_metadata_replication_factor,
                         );
                         let bytes = match document.to_bytes(&self.config.actor) {
@@ -246,6 +249,7 @@ impl Operation for EnsureRealmConfigOperation {
         self.output.unwrap_or_else(|| {
             Ok(RealmConfigDocument::default_for_realm(
                 self.config.actor.realm_id,
+                Vec::new(),
             ))
         })
     }

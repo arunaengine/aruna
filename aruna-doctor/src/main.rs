@@ -1,12 +1,14 @@
 use crate::error::CliError;
 use crate::explorer::{explore_entries, explore_keyspaces};
 use crate::storage::{import, snapshot};
-use crate::tokens::{create_token, view_token};
+use crate::tokens::{create_local_bootstrap_token, create_oidc_token, view_token};
 use clap::{Parser, Subcommand};
 
 mod error;
 mod explorer;
 mod storage;
+#[cfg(test)]
+mod test_support;
 mod tokens;
 
 /// Simple program to greet a person
@@ -19,10 +21,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Name of the person to greet
     CreateToken {
-        user_id: Option<String>,
-        expiry: Option<u64>,
+        #[arg(long)]
+        oidc_username: String,
+        #[arg(long)]
+        oidc_password: String,
+        #[arg(long, default_value = "openid")]
+        oidc_scope: String,
+        #[arg(short = 'e', long)]
+        oidc_only: bool,
+        #[arg(short = 'b', long)]
+        bootstrap_secret: Option<String>,
     },
     ViewToken {
         token: String,
@@ -57,9 +66,20 @@ pub async fn main() -> Result<(), CliError> {
     let args = Cli::parse();
 
     match args.command {
-        Commands::CreateToken { user_id, expiry } => {
-            let token = create_token(user_id, expiry).await?;
-            println!("TOKEN: {token}");
+        Commands::CreateToken {
+            oidc_username,
+            oidc_password,
+            oidc_scope,
+            oidc_only,
+            bootstrap_secret,
+        } => {
+            let token = if let Some(secret) = bootstrap_secret {
+                create_local_bootstrap_token(oidc_username, oidc_password, oidc_scope, secret)
+                    .await?
+            } else {
+                create_oidc_token(oidc_username, oidc_password, oidc_scope, oidc_only).await?
+            };
+            println!("{}", token)
         }
         Commands::ViewToken { token } => {
             let token = view_token(token).await?;

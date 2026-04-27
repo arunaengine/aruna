@@ -387,7 +387,7 @@ mod tests {
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id,
-                created_by: Ulid::new(),
+                created_by: Default::default(),
                 name: "ftp-source".to_string(),
                 kind: SourceConnectorKind::Ftp,
                 public_config: HashMap::from([
@@ -504,7 +504,7 @@ mod tests {
         let created = drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id,
-                created_by: Ulid::new(),
+                created_by: Default::default(),
                 name: "ftp-source".to_string(),
                 kind: SourceConnectorKind::Ftp,
                 public_config: HashMap::from([

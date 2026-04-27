@@ -134,7 +134,7 @@ pub(crate) mod test_utils {
         drive(
             CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
                 group_id,
-                created_by: Ulid::new(),
+                created_by: Default::default(),
                 name: "http-source".to_string(),
                 kind: SourceConnectorKind::Http,
                 public_config: HashMap::from([("endpoint".to_string(), endpoint.to_string())]),

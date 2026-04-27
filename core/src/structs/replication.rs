@@ -188,7 +188,7 @@ mod tests {
     fn formats_s3_arn_canonically() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let node_id = test_node_id();
-        let arn = ArunaArn::s3_bucket(realm_id.clone(), node_id, "mybucket").unwrap();
+        let arn = ArunaArn::s3_bucket(realm_id, node_id, "mybucket").unwrap();
 
         assert_eq!(
             arn.to_string(),

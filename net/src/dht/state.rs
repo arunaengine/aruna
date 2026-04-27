@@ -311,7 +311,7 @@ impl DhtStateMachine {
 
         let mut op = OpState::Get(GetOp {
             key,
-            realm_filter: realm_filter.clone(),
+            realm_filter,
             values: Vec::new(),
             seen_publishers: HashSet::new(),
             frontier: LookupFrontier::default(),
@@ -582,10 +582,7 @@ impl DhtStateMachine {
                     if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
                         continue;
                     }
-                    if op
-                        .seen_publishers
-                        .insert((entry.publisher, entry.realm_id.clone()))
-                    {
+                    if op.seen_publishers.insert((entry.publisher, entry.realm_id)) {
                         op.values.push(DhtEntry {
                             node_id: entry.publisher,
                             realm_id: entry.realm_id,
@@ -824,7 +821,7 @@ impl DhtStateMachine {
 
                 let new_entry = StoredEntry {
                     publisher: self.local_id,
-                    realm_id: op.realm_id.clone(),
+                    realm_id: op.realm_id,
                     value: op.value.clone(),
                     expires_at: self.now_secs.saturating_add(op.ttl_secs),
                     signature: Some(op.signature),
@@ -851,10 +848,7 @@ impl DhtStateMachine {
                     if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
                         continue;
                     }
-                    if op
-                        .seen_publishers
-                        .insert((entry.publisher, entry.realm_id.clone()))
-                    {
+                    if op.seen_publishers.insert((entry.publisher, entry.realm_id)) {
                         op.values.push(DhtEntry {
                             node_id: entry.publisher,
                             realm_id: entry.realm_id,
@@ -1150,7 +1144,7 @@ impl DhtStateMachine {
                 let mut op = OpState::InboundGet(InboundGetOp {
                     inbound_id,
                     key,
-                    realm_filter: realm_filter.clone(),
+                    realm_filter,
                     pending: HashMap::new(),
                 });
                 self.queue_storage_read(
@@ -1242,7 +1236,7 @@ impl DhtStateMachine {
                 peer,
                 DhtRequest::GetValue {
                     key: op.key,
-                    realm_filter: op.realm_filter.clone(),
+                    realm_filter: op.realm_filter,
                 },
                 out,
             );
@@ -1297,7 +1291,7 @@ impl DhtStateMachine {
                 peer,
                 DhtRequest::PutValue {
                     key: op.key,
-                    realm_id: op.realm_id.clone(),
+                    realm_id: op.realm_id,
                     value: op.value.clone(),
                     ttl_secs: op.ttl_secs,
                     publisher: self.local_id,
@@ -2178,7 +2172,7 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
             op_id: 23,
             key,
-            realm_filter: Some(realm_filter.clone()),
+            realm_filter: Some(realm_filter),
         }));
 
         let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -2465,7 +2459,7 @@ mod tests {
             peer: make_node(25),
             request: DhtRequest::GetValue {
                 key,
-                realm_filter: Some(realm_filter.clone()),
+                realm_filter: Some(realm_filter),
             },
         }));
 
@@ -2497,7 +2491,7 @@ mod tests {
             entries: vec![
                 StoredEntry {
                     publisher: make_node(26),
-                    realm_id: realm_filter.clone(),
+                    realm_id: realm_filter,
                     value: b"allowed".to_vec(),
                     expires_at: 2_000,
                     signature: None,

@@ -207,6 +207,7 @@ pub mod autosurgeon_role_set {
 mod test {
     use std::collections::HashSet;
 
+    use crate::UserId;
     use crate::structs::{Group, GroupAuthorizationDocument, RealmId};
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
@@ -233,7 +234,7 @@ mod test {
     #[test]
     pub fn test_group_auth_doc_conversion() {
         let auth_doc = GroupAuthorizationDocument::new_default_group_doc(
-            Ulid::new(),
+            UserId::local(Ulid::new(), RealmId([0u8; 32])),
             RealmId([0u8; 32]),
             Ulid::new(),
         );

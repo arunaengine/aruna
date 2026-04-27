@@ -117,7 +117,7 @@ impl AddUserToRealmRolesOperation {
     fn auth_context(&self) -> AuthContext {
         AuthContext {
             user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id.clone(),
+            realm_id: self.input.actor.realm_id,
             path_restrictions: None,
         }
     }
@@ -245,7 +245,7 @@ impl AddUserToRealmRolesOperation {
         smallvec![Effect::SubOperation(boxed_suboperation(
             AnnounceTopicOperation::new(
                 AutomergeDocumentVariant::RealmAuthorization {
-                    realm_id: auth_doc.realm_id.clone(),
+                    realm_id: auth_doc.realm_id,
                 }
                 .topic_id(),
                 self.input.actor.node_id,
@@ -404,6 +404,7 @@ pub mod test {
     };
     use crate::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use crate::driver::{DriverContext, drive};
+    use aruna_core::UserId;
     use aruna_core::structs::Actor;
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -437,16 +438,17 @@ pub mod test {
             blob_handle: None,
         };
 
-        let user_id = Ulid::new();
         let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let user_id = UserId::local(Ulid::new(), realm_id);
         let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let realm_config = CreateRealmConfig {
             actor: Actor {
                 node_id,
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
             realm_description: "A realm description".to_string(),
+            oidc_providers: Vec::new(),
         };
         let realm_operation = CreateRealmOperation::new(realm_config.clone());
         let (_realm, realm_auth_doc) = drive(realm_operation, &context).await.unwrap();
@@ -475,10 +477,10 @@ pub mod test {
             actor: Actor {
                 node_id,
                 user_id,
-                realm_id: realm_id.clone(),
+                realm_id,
             },
-            realm_id: realm_id.clone(),
-            user_id: Ulid::new(),
+            realm_id,
+            user_id: UserId::local(Ulid::new(), realm_id),
             role_ids: admin_role,
         };
 

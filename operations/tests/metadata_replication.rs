@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::UserId;
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
@@ -46,7 +47,7 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
     let document_id = Ulid::new();
 
     let visible_nodes = drive(
-        GetRealmNodesOperation::new(realm_id.clone()),
+        GetRealmNodesOperation::new(realm_id),
         nodes[0].context.as_ref(),
     )
     .await?;
@@ -56,8 +57,8 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: Ulid::new(),
-                realm_id: realm_id.clone(),
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
             },
             group_id,
             document_id,
@@ -101,8 +102,8 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: Ulid::new(),
-                realm_id: realm_id.clone(),
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
             },
             group_id,
             document_id,
@@ -155,8 +156,8 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
         UpdateMetadataDocumentOperation::new(UpdateMetadataDocumentConfig {
             actor: Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: Ulid::new(),
-                realm_id: realm_id.clone(),
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
             },
             group_id,
             document_id,
@@ -184,7 +185,7 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
         DeleteMetadataDocumentOperation::new(
             Actor {
                 node_id: nodes[0].net.node_id(),
-                user_id: Ulid::new(),
+                user_id: UserId::local(Ulid::new(), realm_id),
                 realm_id,
             },
             group_id,
@@ -224,7 +225,7 @@ async fn build_realm_nodes(
     for node in &nodes {
         drive(
             AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
-                realm_id: realm_id.clone(),
+                realm_id: *realm_id,
                 node_id: node.net.node_id(),
                 schedule_refresh: true,
             }),
@@ -287,7 +288,7 @@ async fn wait_for_realm_node_convergence(
         let mut converged = true;
         for node in nodes {
             match drive(
-                GetRealmNodesOperation::new(realm_id.clone()),
+                GetRealmNodesOperation::new(*realm_id),
                 node.context.as_ref(),
             )
             .await

@@ -85,10 +85,19 @@ pub struct VersionReplicationRequest {
 #[cfg(test)]
 mod tests {
     use super::{VersionReplicationManifest, VersionReplicationMessage};
+    use aruna_core::UserId;
     use aruna_core::errors::ConversionError;
     use aruna_core::structs::{AuthContext, RealmId, ReplicationItemKind};
     use std::time::SystemTime;
     use ulid::Ulid;
+
+    fn test_realm_id() -> RealmId {
+        RealmId::from_bytes([7u8; 32])
+    }
+
+    fn test_user_id() -> UserId {
+        UserId::nil(test_realm_id())
+    }
 
     fn make_manifest() -> VersionReplicationManifest {
         VersionReplicationManifest {
@@ -97,11 +106,11 @@ mod tests {
             version_id: Ulid::new(),
             kind: ReplicationItemKind::DeleteMarker,
             created_at: SystemTime::now(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             current_version: true,
             auth_context: AuthContext {
-                user_id: Ulid::new(),
-                realm_id: RealmId::from_bytes([7u8; 32]),
+                user_id: test_user_id(),
+                realm_id: test_realm_id(),
                 path_restrictions: None,
             },
             blob: None,

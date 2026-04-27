@@ -6,13 +6,14 @@ use super::{
     },
 };
 use crate::messages::{MessageType, ReplicationMessage};
+use aruna_core::UserId;
 use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::BUCKET_STATS_DB;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::{
-    Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, ResolvedSourceAccess,
+    Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, RealmId, ResolvedSourceAccess,
     SourceConnectorKind,
 };
 use aruna_net::{NetConfig, NetHandle};
@@ -85,6 +86,10 @@ async fn bucket_load(storage_handle: &storage::StorageHandle, bucket: &str) -> u
         .unwrap_or(0)
 }
 
+fn test_user_id() -> UserId {
+    UserId::nil(RealmId::from_bytes([1u8; 32]))
+}
+
 fn make_test_location() -> BackendLocation {
     BackendLocation {
         root: "/tmp".to_string(),
@@ -93,7 +98,7 @@ fn make_test_location() -> BackendLocation {
         ulid: Ulid::new(),
         compressed: false,
         encrypted: false,
-        created_by: Ulid::new(),
+        created_by: test_user_id(),
         created_at: SystemTime::now(),
         staging: false,
         partial: false,
@@ -273,7 +278,7 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
         .send_blob_effect(BlobEffect::Write {
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
         })
         .await
@@ -286,7 +291,7 @@ async fn reuses_bucket_until_max_object_count_is_reached() {
         .send_blob_effect(BlobEffect::Write {
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
         })
         .await
@@ -311,7 +316,7 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
         .send_blob_effect(BlobEffect::Write {
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
         })
         .await
@@ -324,7 +329,7 @@ async fn creates_new_bucket_after_reaching_max_object_count() {
         .send_blob_effect(BlobEffect::Write {
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
         })
         .await
@@ -352,7 +357,7 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
         .send_blob_effect(BlobEffect::Write {
             bucket: "bucket-a".to_string(),
             key: "one.bin".to_string(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             blob: stream_from_bytes(b"one"),
         })
         .await
@@ -380,7 +385,7 @@ async fn deleting_last_object_keeps_bucket_stat_row_at_zero_for_reuse() {
         .send_blob_effect(BlobEffect::Write {
             bucket: "bucket-a".to_string(),
             key: "two.bin".to_string(),
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             blob: stream_from_bytes(b"two"),
         })
         .await
@@ -404,7 +409,7 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
         .send_blob_effect(BlobEffect::WritePart {
             upload_id: Ulid::new(),
             part_number: 1,
-            created_by: Ulid::new(),
+            created_by: test_user_id(),
             compressed: false,
             encrypted: false,
             blob: stream_from_bytes(b"part"),

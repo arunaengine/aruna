@@ -497,6 +497,7 @@ fn ensure_reader_exhausted(reader: &mut BufReader<File>) -> Result<(), SnapshotE
 #[cfg(test)]
 mod tests {
     use super::{SnapshotError, import_snapshot_into_new_database, snapshot_database};
+    use crate::test_support::env_lock;
     use aruna::config::load;
     use aruna_api::server_state::ServerState;
     use aruna_blob::blob::BlobHandler;
@@ -506,7 +507,7 @@ mod tests {
         S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
-    use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo, UserIdentity};
+    use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
     use aruna_net::{NetConfig, NetHandle};
     use aruna_operations::automerge::AutomergeHandle;
     use aruna_operations::claim_initial_realm_admin::{
@@ -525,17 +526,11 @@ mod tests {
     use aruna_tasks::TaskHandle;
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use std::time::SystemTime;
     use tempfile::tempdir;
-    use tokio::sync::Mutex;
     use tokio_util::io::ReaderStream;
     use ulid::Ulid;
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct TestEnvGuard {
         previous: Vec<(String, Option<String>)>,
@@ -596,6 +591,7 @@ mod tests {
             ("S3_PORT", "0".to_string()),
             ("S3_HOST", "localhost".to_string()),
             ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("OIDC_PROVIDER_IDS", "".to_string()),
         ]);
 
         {
@@ -605,7 +601,7 @@ mod tests {
                 NetConfig {
                     bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
                     secret_key: Some(config.net_secret_key.clone()),
-                    realm_id: config.realm_id.clone(),
+                    realm_id: config.realm_id,
                     bootstrap_nodes: Vec::new(),
                     use_dns_discovery: false,
                 },
@@ -643,7 +639,7 @@ mod tests {
 
             let server_state = ServerState::new(
                 context.clone(),
-                config.realm_id.clone(),
+                config.realm_id,
                 config.node_id,
                 config.node_capabilities.clone(),
                 false,
@@ -651,15 +647,16 @@ mod tests {
             )
             .await;
 
-            let realm_admin = Ulid::new();
+            let realm_admin = aruna_core::UserId::local(Ulid::new(), config.realm_id);
             drive(
                 CreateRealmOperation::new(CreateRealmConfig {
                     actor: Actor {
                         node_id: config.node_id,
                         user_id: realm_admin,
-                        realm_id: config.realm_id.clone(),
+                        realm_id: config.realm_id,
                     },
                     realm_description: "Snapshot Test Realm".to_string(),
+                    oidc_providers: Vec::new(),
                 }),
                 context.as_ref(),
             )
@@ -671,7 +668,7 @@ mod tests {
                     actor: Actor {
                         node_id: config.node_id,
                         user_id: realm_admin,
-                        realm_id: config.realm_id.clone(),
+                        realm_id: config.realm_id,
                     },
                 }),
                 context.as_ref(),
@@ -684,7 +681,7 @@ mod tests {
                     actor: Actor {
                         node_id: config.node_id,
                         user_id: realm_admin,
-                        realm_id: config.realm_id.clone(),
+                        realm_id: config.realm_id,
                     },
                     display_name: "Snapshot Test Group".to_string(),
                 }),
@@ -695,10 +692,7 @@ mod tests {
 
             let credentials = drive(
                 CreateUserAccessOperation::new(CreateUserAccessConfig {
-                    user_identity: UserIdentity {
-                        user_id: realm_admin,
-                        realm_key: config.realm_id.clone(),
-                    },
+                    user_identity: realm_admin,
                     group_id: group.0.group_id,
                     expiry: SystemTime::now() + DEFAULT_CREDENTIAL_TTL,
                     path_restrictions: None,
@@ -734,7 +728,7 @@ mod tests {
                 PutObjectOperation::new(PutObjectConfig {
                     user_id: realm_admin,
                     group_id: group.0.group_id,
-                    realm_id: config.realm_id.clone(),
+                    realm_id: config.realm_id,
                     node_id: config.node_id,
                     request: PutObjectInput {
                         bucket: bucket_name,
