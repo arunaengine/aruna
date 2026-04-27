@@ -288,7 +288,8 @@ impl Operation for ReplicateScopeOperation {
                         received: event,
                     });
                 };
-                self.start_iteration(Some(key.clone()), value.is_some())
+                let _current_version_exists = value.is_some();
+                self.start_iteration(Some(key.clone()), true)
             }
             ReplicateScopeState::ReadSingleVersion => {
                 let Event::Storage(StorageEvent::ReadResult { key, value }) = event else {
@@ -1255,7 +1256,7 @@ mod tests {
     }
 
     #[test]
-    fn object_miss_falls_back_to_prefix_iteration() {
+    fn object_miss_does_not_fall_back_to_prefix_iteration() {
         let mut op = ReplicateScopeOperation::new(scope_input(ReplicateScopeTarget::Object {
             key: "dir/file".to_string(),
         }));
@@ -1270,7 +1271,7 @@ mod tests {
             value: None,
         }));
         let Effect::Storage(StorageEffect::Iter { .. }) = &effects[0] else {
-            panic!("expected prefix iteration after object miss")
+            panic!("expected exact iteration after object miss")
         };
 
         let effects = op.step(Event::Storage(StorageEvent::IterResult {
@@ -1282,10 +1283,12 @@ mod tests {
             next_start_after: None,
         }));
 
-        let Effect::SubOperation(_) = &effects[0] else {
-            panic!("expected matching prefix version to be enqueued")
-        };
-        assert_eq!(op.pending_versions.len(), 1);
+        assert!(effects.is_empty());
+        assert_eq!(op.pending_versions.len(), 0);
+        assert_eq!(op.result.replicated, 0);
+        assert_eq!(op.result.skipped, 0);
+        assert_eq!(op.result.failed, 0);
+        assert_eq!(op.state, super::ReplicateScopeState::Finish);
     }
 
     #[test]
