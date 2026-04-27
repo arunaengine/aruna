@@ -604,7 +604,7 @@ impl Operation for IncomingVersionReplicationOperation {
                 }
             }
             IncomingVersionReplicationState::ReadExistingVersion => {
-                let Event::Storage(StorageEvent::ReadResult { value: _, .. }) = event else {
+                let Event::Storage(StorageEvent::ReadResult { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",

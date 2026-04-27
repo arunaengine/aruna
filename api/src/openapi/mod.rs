@@ -25,7 +25,7 @@ impl ApiDoc {
         let mut openapi = BaseApiDoc::openapi();
         openapi.merge(crate::routes::groups::GroupsApiDoc::openapi());
         openapi.merge(crate::routes::connectors::ConnectorsApiDoc::openapi());
-        openapi.merge(crate::routes::staging::BlobsApiDoc::openapi());
+        openapi.merge(crate::routes::staging::StagingApiDoc::openapi());
         openapi.merge(crate::routes::metadata::MetadataApiDoc::openapi());
         openapi.merge(crate::routes::credentials::CredentialsApiDoc::openapi());
         openapi.merge(crate::routes::blobs::BlobsApiDoc::openapi());

@@ -16,9 +16,8 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, LookupKey,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-    ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
-    VersionKey, VersionMetadata,
+    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, ReplicationItemKind,
+    ReplicationNegotiationResult, ReplicationSuboperationResult, VersionKey, VersionMetadata,
 };
 use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
@@ -1105,8 +1104,8 @@ mod tests {
         AuthContext, BackendLocation, BucketInfo, MultipartChecksumType,
         MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
         PortableSourceDescriptor, RealmId, ReplicationNegotiationResult,
-        ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind,
-        SourceMetadata, StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
+        ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
+        StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
     };
     use bytes::Bytes;
     use futures_util::stream;
@@ -1594,7 +1593,10 @@ mod tests {
             payload: apply_complete,
         }));
 
-        assert_eq!(op.state, super::ReplicateObjectVersionState::CleanupReferenceBlob);
+        assert_eq!(
+            op.state,
+            super::ReplicateObjectVersionState::CleanupReferenceBlob
+        );
         assert_eq!(
             effects.as_slice(),
             [Effect::Blob(BlobEffect::Delete {

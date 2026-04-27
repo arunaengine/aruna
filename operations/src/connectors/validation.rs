@@ -14,6 +14,8 @@ pub struct SourceConnectorValidationRules {
 pub enum ValidationError {
     #[error("connector name must not be empty")]
     EmptyName,
+    #[error("connector kind `{kind}` is not supported")]
+    UnsupportedConnectorKind { kind: SourceConnectorKind },
     #[error("missing required public config key `{key}` for connector kind `{kind}`")]
     MissingRequiredPublicKey {
         kind: SourceConnectorKind,
@@ -43,6 +45,10 @@ pub fn validate_connector_input(
 ) -> Result<(), ValidationError> {
     if name.trim().is_empty() {
         return Err(ValidationError::EmptyName);
+    }
+
+    if kind == SourceConnectorKind::ArunaNative {
+        return Err(ValidationError::UnsupportedConnectorKind { kind });
     }
 
     for (key, value) in public_config {
@@ -222,19 +228,23 @@ mod tests {
     }
 
     #[test]
-    fn accepts_valid_aruna_native_config() {
-        validate_connector_input(
+    fn rejects_unsupported_aruna_native_connector_kind() {
+        let err = validate_connector_input(
             "native",
             SourceConnectorKind::ArunaNative,
-            &HashMap::from([
-                (
-                    "endpoint".to_string(),
-                    "https://aruna.example.org".to_string(),
-                ),
-                ("realm_id".to_string(), "test-realm".to_string()),
-            ]),
-            &HashMap::from([("bearer_token".to_string(), "secret".to_string())]),
+            &HashMap::from([(
+                "endpoint".to_string(),
+                "https://aruna.example.org".to_string(),
+            )]),
+            &HashMap::new(),
         )
-        .unwrap();
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnsupportedConnectorKind {
+                kind: SourceConnectorKind::ArunaNative,
+            }
+        );
     }
 }

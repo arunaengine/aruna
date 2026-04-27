@@ -41,7 +41,14 @@ pub struct ReplicateBlobRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReplicateBlobResponse {}
+pub struct ReplicateBlobResponse {
+    pub bucket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    pub target_node_id: String,
+}
 
 #[utoipa::path(
     post,
@@ -138,6 +145,12 @@ pub async fn replicate_blob(
         replicate_delete_markers: true,
         mode: ReplicationMode::OnDemand,
     };
+    let response = ReplicateBlobResponse {
+        bucket: input.bucket.clone(),
+        path: path.clone(),
+        version_id: version_id.clone(),
+        target_node_id: input.target_node_id.to_string(),
+    };
     let bucket = input.bucket.clone();
     let path_for_span = path.clone();
     let version_id_for_span = version_id.clone();
@@ -198,5 +211,27 @@ pub async fn replicate_blob(
         .instrument(span),
     );
 
-    Ok((StatusCode::ACCEPTED, Json(ReplicateBlobResponse {})))
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::openapi::ApiDoc;
+
+    #[test]
+    fn openapi_includes_replicate_blob_response_schema() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert!(openapi["paths"].get("/blobs/replicate").is_some());
+        assert!(
+            openapi["components"]["schemas"]["ReplicateBlobResponse"]["properties"]
+                .get("bucket")
+                .is_some()
+        );
+        assert!(
+            openapi["components"]["schemas"]["ReplicateBlobResponse"]["properties"]
+                .get("target_node_id")
+                .is_some()
+        );
+    }
 }

@@ -27,13 +27,13 @@ use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
 #[openapi(
-    tags((name = "blobs", description = "Blob staging and replication")),
+    tags((name = "staging", description = "Blob staging")),
     paths(stage_blob)
 )]
-pub struct BlobsApiDoc;
+pub struct StagingApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
-    Router::new().route("/blobs/staging", post(stage_blob))
+    Router::new().route("/staging/", post(stage_blob))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -78,8 +78,8 @@ pub struct StageBlobResponse {
 
 #[utoipa::path(
     post,
-    path = "/blobs/staging",
-    tag = "blobs",
+    path = "/staging/",
+    tag = "staging",
     request_body = StageBlobRequest,
     responses(
         (status = 201, description = "Blob staged", body = StageBlobResponse),
@@ -305,6 +305,7 @@ fn format_system_time(value: std::time::SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::openapi::ApiDoc;
     use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
@@ -368,14 +369,21 @@ mod tests {
         assert!(matches!(result, Err(ServerError::NotFound)));
     }
 
+    #[test]
+    fn openapi_includes_staging_path() {
+        let openapi = ApiDoc::openapi();
+
+        assert!(openapi.paths.paths.contains_key("/staging/"));
+        assert!(!openapi.paths.paths.contains_key("/blobs/staging"));
+    }
+
     async fn setup_state() -> TestState {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
         let realm_signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
-        let realm_id = aruna_core::structs::RealmId::from_bytes(
-            realm_signing_key.verifying_key().to_bytes(),
-        );
+        let realm_id =
+            aruna_core::structs::RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
         let user_with_source_read = UserId::local(Ulid::new(), realm_id);
         let user_without_source_read = UserId::local(Ulid::new(), realm_id);
@@ -400,8 +408,11 @@ mod tests {
             realm_id,
             bucket_group_id,
         );
-        let mut source_auth =
-            GroupAuthorizationDocument::new_default_group_doc(user_with_source_read, realm_id, source_group_id);
+        let mut source_auth = GroupAuthorizationDocument::new_default_group_doc(
+            user_with_source_read,
+            realm_id,
+            source_group_id,
+        );
         for role in source_auth.roles.values_mut() {
             role.assigned_users.remove(&user_without_source_read);
         }
