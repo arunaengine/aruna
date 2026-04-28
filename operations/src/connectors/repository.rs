@@ -1,14 +1,17 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE};
-use aruna_core::structs::{SourceConnector, SourceConnectorSecret};
+use aruna_core::keyspaces::{
+    S3_VERSION_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
+};
+use aruna_core::structs::{SourceConnector, SourceConnectorSecret, VersionMetadata, VersionState};
 use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
 pub const LIST_SOURCE_CONNECTOR_PAGE_SIZE: usize = 128;
+pub const CONNECTOR_REFERENCE_SCAN_PAGE_SIZE: usize = 128;
 
 pub fn source_connector_key(group_id: GroupId, connector_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(32);
@@ -103,6 +106,19 @@ pub fn iter_connectors_effect(
     })
 }
 
+pub fn iter_connector_reference_versions_effect(
+    start_after: Option<Key>,
+    txn_id: Option<TxnId>,
+) -> Effect {
+    Effect::Storage(StorageEffect::Iter {
+        key_space: S3_VERSION_KEYSPACE.to_string(),
+        prefix: None,
+        start_after,
+        limit: CONNECTOR_REFERENCE_SCAN_PAGE_SIZE,
+        txn_id,
+    })
+}
+
 pub fn parse_connector_read(event: Event) -> Result<Option<SourceConnector>, StorageReadError> {
     parse_storage_read(event, SourceConnector::from_bytes)
 }
@@ -133,6 +149,38 @@ pub fn parse_connector_iter(
         Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
         _ => Err(StorageReadError::Storage(StorageError::ReadError)),
     }
+}
+
+pub fn parse_version_metadata_iter(
+    event: Event,
+) -> Result<(Vec<VersionMetadata>, Option<Key>), StorageReadError> {
+    match event {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => {
+            let records = values
+                .into_iter()
+                .map(|(_, value)| {
+                    VersionMetadata::from_bytes(value.as_ref())
+                        .map_err(StorageReadError::Conversion)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((records, next_start_after))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
+        _ => Err(StorageReadError::Storage(StorageError::ReadError)),
+    }
+}
+
+pub fn version_metadata_references_connector(
+    metadata: &VersionMetadata,
+    connector_id: Ulid,
+) -> bool {
+    matches!(
+        &metadata.state,
+        VersionState::Reference { source, .. } if source.connector_id == Some(connector_id)
+    )
 }
 
 fn parse_storage_read<T>(

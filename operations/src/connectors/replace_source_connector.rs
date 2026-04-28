@@ -12,8 +12,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    StorageReadError, delete_connector_secret_effect, parse_connector_read, read_connector_effect,
-    source_connector_key, source_connector_secret_key,
+    StorageReadError, delete_connector_secret_effect, iter_connector_reference_versions_effect,
+    parse_connector_read, parse_connector_secret_read, parse_version_metadata_iter,
+    read_connector_effect, read_connector_secret_effect, source_connector_key,
+    source_connector_secret_key, version_metadata_references_connector,
 };
 use crate::connectors::validation::{ValidationError, validate_connector_input};
 
@@ -37,6 +39,8 @@ pub struct ReplaceSourceConnectorResult {
 pub enum ReplaceSourceConnectorState {
     Init,
     ReadCurrent,
+    ReadSecret,
+    ScanReferenceVersions,
     WriteRecords,
     DeleteSecret,
     Finish,
@@ -53,6 +57,8 @@ pub enum ReplaceSourceConnectorError {
     ValidationError(#[from] ValidationError),
     #[error("Connector not found")]
     NotFound,
+    #[error("Connector credentials are referenced by object versions")]
+    ReferencedByObjectVersion,
     #[error("ReplaceSourceConnector failed")]
     ReplaceSourceConnectorFailed,
     #[error("State [{state:?}] invalid: expected [{expected}] - received [{received:?}]")]
@@ -119,70 +125,112 @@ impl ReplaceSourceConnectorOperation {
     fn handle_current_read(&mut self, event: Event) -> Effects {
         match parse_connector_read(event) {
             Ok(Some(existing)) => {
-                let now = SystemTime::now();
-                let replacement = SourceConnector::new(
-                    existing.connector_id,
-                    existing.group_id,
-                    self.input.name.clone(),
-                    self.input.kind,
-                    self.input.public_config.clone(),
-                    existing.created_at,
-                    now,
-                    existing.created_by,
-                );
-                let replacement_secret = SourceConnectorSecret::new(
-                    existing.connector_id,
-                    self.input.secret_config.clone(),
-                    now,
-                );
-
-                self.replacement = Some(replacement.clone());
-                self.replacement_secret = replacement_secret;
-                self.state = ReplaceSourceConnectorState::WriteRecords;
-
-                if let Some(secret) = self.replacement_secret.as_ref() {
-                    let connector_bytes = match replacement.to_bytes() {
-                        Ok(bytes) => bytes,
-                        Err(error) => return self.emit_error(error.into()),
-                    };
-                    let secret_bytes = match secret.to_bytes() {
-                        Ok(bytes) => bytes,
-                        Err(error) => return self.emit_error(error.into()),
-                    };
-                    smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                        writes: vec![
-                            (
-                                aruna_core::keyspaces::SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
-                                source_connector_key(
-                                    replacement.group_id,
-                                    replacement.connector_id
-                                ),
-                                connector_bytes.into(),
-                            ),
-                            (
-                                aruna_core::keyspaces::SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
-                                source_connector_secret_key(secret.connector_id),
-                                secret_bytes.into(),
-                            ),
-                        ],
-                        txn_id: None,
-                    })]
-                } else {
-                    let connector_bytes = match replacement.to_bytes() {
-                        Ok(bytes) => bytes,
-                        Err(error) => return self.emit_error(error.into()),
-                    };
-                    smallvec![Effect::Storage(StorageEffect::Write {
-                        key_space: aruna_core::keyspaces::SOURCE_CONNECTOR_INDEX_KEYSPACE
-                            .to_string(),
-                        key: source_connector_key(replacement.group_id, replacement.connector_id),
-                        value: connector_bytes.into(),
-                        txn_id: None,
-                    })]
-                }
+                self.prepare_replacement(existing);
+                self.state = ReplaceSourceConnectorState::ReadSecret;
+                smallvec![read_connector_secret_effect(self.input.connector_id, None)]
             }
             Ok(None) => self.emit_error(ReplaceSourceConnectorError::NotFound),
             Err(error) => self.emit_error(error.into()),
+        }
+    }
+
+    fn prepare_replacement(&mut self, existing: SourceConnector) {
+        let now = SystemTime::now();
+        self.replacement = Some(SourceConnector::new(
+            existing.connector_id,
+            existing.group_id,
+            self.input.name.clone(),
+            self.input.kind,
+            self.input.public_config.clone(),
+            existing.created_at,
+            now,
+            existing.created_by,
+        ));
+        self.replacement_secret = SourceConnectorSecret::new(
+            existing.connector_id,
+            self.input.secret_config.clone(),
+            now,
+        );
+    }
+
+    fn handle_current_secret_read(&mut self, event: Event) -> Effects {
+        let current_secret = match parse_connector_secret_read(event) {
+            Ok(secret) => secret,
+            Err(error) => return self.emit_error(error.into()),
+        };
+
+        if secret_config_changed(current_secret.as_ref(), self.replacement_secret.as_ref()) {
+            self.state = ReplaceSourceConnectorState::ScanReferenceVersions;
+            return smallvec![iter_connector_reference_versions_effect(None, None)];
+        }
+
+        self.write_records()
+    }
+
+    fn handle_reference_versions_scanned(&mut self, event: Event) -> Effects {
+        let (versions, next_start_after) = match parse_version_metadata_iter(event) {
+            Ok(result) => result,
+            Err(error) => return self.emit_error(error.into()),
+        };
+
+        if versions.iter().any(|metadata| {
+            version_metadata_references_connector(metadata, self.input.connector_id)
+        }) {
+            return self.emit_error(ReplaceSourceConnectorError::ReferencedByObjectVersion);
+        }
+
+        if let Some(start_after) = next_start_after {
+            return smallvec![iter_connector_reference_versions_effect(
+                Some(start_after),
+                None,
+            )];
+        }
+
+        self.write_records()
+    }
+
+    fn write_records(&mut self) -> Effects {
+        let Some(replacement) = self.replacement.clone() else {
+            return self.emit_error(ReplaceSourceConnectorError::ReplaceSourceConnectorFailed);
+        };
+
+        self.state = ReplaceSourceConnectorState::WriteRecords;
+
+        if let Some(secret) = self.replacement_secret.as_ref() {
+            let connector_bytes = match replacement.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => return self.emit_error(error.into()),
+            };
+            let secret_bytes = match secret.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => return self.emit_error(error.into()),
+            };
+            smallvec![Effect::Storage(StorageEffect::BatchWrite {
+                writes: vec![
+                    (
+                        aruna_core::keyspaces::SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+                        source_connector_key(replacement.group_id, replacement.connector_id),
+                        connector_bytes.into(),
+                    ),
+                    (
+                        aruna_core::keyspaces::SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+                        source_connector_secret_key(secret.connector_id),
+                        secret_bytes.into(),
+                    ),
+                ],
+                txn_id: None,
+            })]
+        } else {
+            let connector_bytes = match replacement.to_bytes() {
+                Ok(bytes) => bytes,
+                Err(error) => return self.emit_error(error.into()),
+            };
+            smallvec![Effect::Storage(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+                key: source_connector_key(replacement.group_id, replacement.connector_id),
+                value: connector_bytes.into(),
+                txn_id: None,
+            })]
         }
     }
 
@@ -230,6 +278,13 @@ impl ReplaceSourceConnectorOperation {
     }
 }
 
+fn secret_config_changed(
+    current: Option<&SourceConnectorSecret>,
+    replacement: Option<&SourceConnectorSecret>,
+) -> bool {
+    current.map(|secret| &secret.secret_config) != replacement.map(|secret| &secret.secret_config)
+}
+
 impl Operation for ReplaceSourceConnectorOperation {
     type Output = ReplaceSourceConnectorResult;
     type Error = ReplaceSourceConnectorError;
@@ -242,6 +297,10 @@ impl Operation for ReplaceSourceConnectorOperation {
         match self.state {
             ReplaceSourceConnectorState::Init => self.handle_init(),
             ReplaceSourceConnectorState::ReadCurrent => self.handle_current_read(event),
+            ReplaceSourceConnectorState::ReadSecret => self.handle_current_secret_read(event),
+            ReplaceSourceConnectorState::ScanReferenceVersions => {
+                self.handle_reference_versions_scanned(event)
+            }
             ReplaceSourceConnectorState::WriteRecords => self.handle_records_written(event),
             ReplaceSourceConnectorState::DeleteSecret => self.handle_secret_deleted(event),
             ReplaceSourceConnectorState::Finish => smallvec![],
@@ -279,9 +338,99 @@ mod tests {
     use crate::connectors::create_source_connector::{
         CreateSourceConnectorInput, CreateSourceConnectorOperation,
     };
+    use crate::connectors::resolver::{
+        ResolveVersionSourceBindingInput, ResolveVersionSourceBindingOperation,
+    };
     use crate::driver::{DriverContext, drive};
+    use crate::staging::descriptor::build_version_source_binding;
+    use aruna_core::keyspaces::S3_VERSION_KEYSPACE;
+    use aruna_core::structs::{
+        ResolvedSourceAccess, SourceMetadata, StagingStrategy, VersionKey, VersionMetadata,
+        VersionSourceBinding,
+    };
     use aruna_storage::storage;
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
+
+    fn test_context() -> (TempDir, DriverContext) {
+        let tempdir = tempdir().unwrap();
+        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+        (tempdir, context)
+    }
+
+    fn source_metadata() -> SourceMetadata {
+        SourceMetadata {
+            content_length: 42,
+            content_type: Some("text/plain".to_string()),
+            etag: None,
+            last_modified: None,
+            source_version: None,
+        }
+    }
+
+    async fn create_connector(context: &DriverContext) -> SourceConnector {
+        drive(
+            CreateSourceConnectorOperation::new(CreateSourceConnectorInput {
+                group_id: ulid::Ulid::new(),
+                created_by: Default::default(),
+                name: "ftp-source".to_string(),
+                kind: SourceConnectorKind::Ftp,
+                public_config: HashMap::from([
+                    (
+                        "endpoint".to_string(),
+                        "ftp://ftp.example.org:21".to_string(),
+                    ),
+                    ("root".to_string(), "/datasets".to_string()),
+                ]),
+                secret_config: HashMap::from([
+                    ("user".to_string(), "alice".to_string()),
+                    ("password".to_string(), "secret".to_string()),
+                ]),
+            }),
+            context,
+        )
+        .await
+        .unwrap()
+        .connector
+    }
+
+    async fn write_reference_version(context: &DriverContext, source: VersionSourceBinding) {
+        let version_id = ulid::Ulid::new();
+        let key = VersionKey::new("bucket", "key", version_id)
+            .to_bytes()
+            .unwrap();
+        let value = VersionMetadata::reference(
+            version_id,
+            source,
+            source_metadata(),
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+            SystemTime::UNIX_EPOCH,
+        )
+        .to_bytes()
+        .unwrap();
+
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: key.into(),
+                value: value.into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
 
     #[tokio::test]
     async fn replace_source_connector_can_remove_secret_config() {
@@ -332,5 +481,95 @@ mod tests {
 
         assert_eq!(replaced.connector.name, "new");
         assert!(!replaced.has_secret_config);
+    }
+
+    #[tokio::test]
+    async fn replace_source_connector_rejects_secret_change_when_reference_versions_exist() {
+        let (_tempdir, context) = test_context();
+        let connector = create_connector(&context).await;
+        let source = build_version_source_binding(
+            StagingStrategy::Reference,
+            &connector,
+            &source_metadata(),
+            "run-1/data.txt".to_string(),
+            None,
+            Some(connector.connector_id),
+        );
+        write_reference_version(&context, source).await;
+
+        let result = drive(
+            ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+                group_id: connector.group_id,
+                connector_id: connector.connector_id,
+                name: "new".to_string(),
+                kind: SourceConnectorKind::Ftp,
+                public_config: connector.public_config.clone(),
+                secret_config: HashMap::from([
+                    ("user".to_string(), "bob".to_string()),
+                    ("password".to_string(), "secret".to_string()),
+                ]),
+            }),
+            &context,
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(ReplaceSourceConnectorError::ReferencedByObjectVersion)
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_source_connector_allows_public_change_when_references_keep_same_secret() {
+        let (_tempdir, context) = test_context();
+        let connector = create_connector(&context).await;
+        let source = build_version_source_binding(
+            StagingStrategy::Reference,
+            &connector,
+            &source_metadata(),
+            "run-1/data.txt".to_string(),
+            None,
+            Some(connector.connector_id),
+        );
+        write_reference_version(&context, source.clone()).await;
+
+        let replaced = drive(
+            ReplaceSourceConnectorOperation::new(ReplaceSourceConnectorInput {
+                group_id: connector.group_id,
+                connector_id: connector.connector_id,
+                name: "new".to_string(),
+                kind: SourceConnectorKind::Ftp,
+                public_config: HashMap::from([
+                    (
+                        "endpoint".to_string(),
+                        "ftp://ftp.example.org/v2".to_string(),
+                    ),
+                    ("root".to_string(), "/datasets-v2".to_string()),
+                ]),
+                secret_config: HashMap::from([
+                    ("user".to_string(), "alice".to_string()),
+                    ("password".to_string(), "secret".to_string()),
+                ]),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(replaced.connector.name, "new");
+
+        let access = drive(
+            ResolveVersionSourceBindingOperation::new(ResolveVersionSourceBindingInput { source }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let ResolvedSourceAccess::OpenDal { config, .. } = access;
+        assert_eq!(
+            config.get("endpoint").map(String::as_str),
+            Some("ftp://ftp.example.org:21")
+        );
+        assert_eq!(config.get("root").map(String::as_str), Some("/datasets"));
+        assert_eq!(config.get("user").map(String::as_str), Some("alice"));
     }
 }
