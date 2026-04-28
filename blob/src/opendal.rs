@@ -52,11 +52,12 @@ pub(crate) fn init_operator(
 pub(crate) async fn head_staging_source(
     access: &ResolvedSourceAccess,
 ) -> Result<SourceMetadata, StagingSourceError> {
-    let (operator, path) = build_staging_source_operator(access)?;
-    let metadata = operator
-        .stat(path)
-        .await
-        .map_err(|error| map_staging_source_error(error, true))?;
+    let (operator, path, version) = build_staging_source_operator(access)?;
+    let metadata = match version {
+        Some(version) => operator.stat_with(path).version(version).await,
+        None => operator.stat(path).await,
+    }
+    .map_err(|error| map_staging_source_error(error, true))?;
 
     Ok(SourceMetadata {
         content_length: metadata.content_length(),
@@ -77,12 +78,13 @@ pub(crate) async fn read_staging_source(
     ),
     StagingSourceError,
 > {
-    let (operator, path) = build_staging_source_operator(access)?;
+    let (operator, path, version) = build_staging_source_operator(access)?;
     let metadata = head_staging_source(access).await?;
-    let reader = operator
-        .reader(path)
-        .await
-        .map_err(|error| map_staging_source_error(error, false))?;
+    let reader = match version {
+        Some(version) => operator.reader_with(path).version(version).await,
+        None => operator.reader(path).await,
+    }
+    .map_err(|error| map_staging_source_error(error, false))?;
     let stream = match range {
         Some(range) => reader
             .into_bytes_stream(range)
@@ -99,9 +101,14 @@ pub(crate) async fn read_staging_source(
 
 fn build_staging_source_operator(
     access: &ResolvedSourceAccess,
-) -> Result<(Operator, &str), StagingSourceError> {
+) -> Result<(Operator, &str, Option<&str>), StagingSourceError> {
     match access {
-        ResolvedSourceAccess::OpenDal { kind, config, path } => {
+        ResolvedSourceAccess::OpenDal {
+            kind,
+            config,
+            path,
+            version,
+        } => {
             let operator = match kind {
                 SourceConnectorKind::Http => build_service::<services::Http>(config.clone())
                     .map_err(staging_operator_creation_error)?,
@@ -115,7 +122,7 @@ fn build_staging_source_operator(
                     return Err(StagingSourceError::UnsupportedKind(kind.to_string()));
                 }
             };
-            Ok((operator, path.as_str()))
+            Ok((operator, path.as_str(), version.as_deref()))
         }
     }
 }
@@ -162,10 +169,12 @@ mod tests {
             kind: SourceConnectorKind::Http,
             config: HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
             path: "file.txt".to_string(),
+            version: Some("v42".to_string()),
         };
 
-        let (.., path) = build_staging_source_operator(&access).unwrap();
+        let (.., path, version) = build_staging_source_operator(&access).unwrap();
         assert_eq!(path, "file.txt");
+        assert_eq!(version, Some("v42"));
     }
 
     #[tokio::test]
@@ -179,10 +188,12 @@ mod tests {
                 ("password".to_string(), "secret".to_string()),
             ]),
             path: "run-1/data.txt".to_string(),
+            version: None,
         };
 
-        let (.., path) = build_staging_source_operator(&access).unwrap();
+        let (.., path, version) = build_staging_source_operator(&access).unwrap();
         assert_eq!(path, "run-1/data.txt");
+        assert_eq!(version, None);
     }
 
     #[tokio::test]

@@ -225,6 +225,7 @@ mod tests {
                 kind: SourceConnectorKind::Http,
                 config: HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
                 path: "folder/file.txt".to_string(),
+                version: None,
             },
         }
     }

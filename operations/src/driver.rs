@@ -480,6 +480,7 @@ mod test {
                         "https://missing.example.org".to_string(),
                     )]),
                     path: "file.txt".to_string(),
+                    version: None,
                 },
             })]
         }

@@ -9,6 +9,7 @@ pub enum ResolvedSourceAccess {
         kind: SourceConnectorKind,
         config: HashMap<String, String>,
         path: String,
+        version: Option<String>,
     },
 }
 

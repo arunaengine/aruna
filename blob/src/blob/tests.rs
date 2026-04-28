@@ -440,6 +440,7 @@ async fn staging_source_effect_dispatches_via_blob_handle() {
                     "https://missing.example.org".to_string(),
                 )]),
                 path: "not-found".to_string(),
+                version: None,
             },
         })
         .await;

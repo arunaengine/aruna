@@ -127,6 +127,7 @@ impl ResolveSourceConnectorOperation {
             &connector.public_config,
             secret.map(|secret| secret.secret_config),
             &self.input.source_path,
+            None,
         ) {
             Ok(access) => access,
             Err(error) => return self.emit_error(error),
@@ -279,6 +280,7 @@ pub(crate) fn build_source_access(
     public_config: &HashMap<String, String>,
     secret_config: Option<HashMap<String, String>>,
     source_path: &str,
+    version: Option<String>,
 ) -> Result<ResolvedSourceAccess, SourceConnectorResolutionError> {
     if !is_valid_relative_source_path(source_path) {
         return Err(SourceConnectorResolutionError::InvalidSourcePath);
@@ -299,6 +301,7 @@ pub(crate) fn build_source_access(
         kind,
         config,
         path: source_path.to_string(),
+        version,
     })
 }
 
@@ -311,7 +314,34 @@ pub(crate) fn build_source_access_from_binding(
         &source.descriptor.public_config,
         secret_config,
         &source.descriptor.source_path,
+        source_binding_version(source)?,
     )
+}
+
+fn source_binding_version(
+    source: &VersionSourceBinding,
+) -> Result<Option<String>, SourceConnectorResolutionError> {
+    let Some(selector) = source
+        .descriptor
+        .version_selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if let Some(version) = selector.strip_prefix("version:").map(str::trim) {
+        return (!version.is_empty())
+            .then(|| Some(version.to_string()))
+            .ok_or(SourceConnectorResolutionError::ResolveFailed);
+    }
+
+    if selector.contains(':') {
+        return Err(SourceConnectorResolutionError::ResolveFailed);
+    }
+
+    Ok(Some(selector.to_string()))
 }
 
 pub(crate) fn read_source_binding_secret_effect(
@@ -418,9 +448,15 @@ mod tests {
         .await
         .unwrap();
 
-        let ResolvedSourceAccess::OpenDal { kind, config, path } = resolved.access;
+        let ResolvedSourceAccess::OpenDal {
+            kind,
+            config,
+            path,
+            version,
+        } = resolved.access;
         assert_eq!(kind, SourceConnectorKind::Ftp);
         assert_eq!(path, "run-1/data.txt");
+        assert_eq!(version, None);
         assert_eq!(config.get("user").map(String::as_str), Some("alice"));
         assert_eq!(config.get("root").map(String::as_str), Some("/datasets"));
     }
@@ -439,7 +475,7 @@ mod tests {
                     ("root".to_string(), "/datasets".to_string()),
                 ]),
                 source_path: "run-1/data.txt".to_string(),
-                version_selector: None,
+                version_selector: Some("version:v42".to_string()),
                 capabilities: Vec::new(),
                 origin_node_id: None,
             },
@@ -455,11 +491,64 @@ mod tests {
         )
         .unwrap();
 
-        let ResolvedSourceAccess::OpenDal { kind, config, path } = access;
+        let ResolvedSourceAccess::OpenDal {
+            kind,
+            config,
+            path,
+            version,
+        } = access;
         assert_eq!(kind, SourceConnectorKind::Ftp);
         assert_eq!(path, "run-1/data.txt");
+        assert_eq!(version.as_deref(), Some("v42"));
         assert_eq!(config.get("root").map(String::as_str), Some("/datasets"));
         assert_eq!(config.get("user").map(String::as_str), Some("alice"));
+    }
+
+    #[test]
+    fn build_source_access_from_binding_rejects_invalid_version_selector() {
+        let source = VersionSourceBinding {
+            strategy: aruna_core::structs::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://example.org".to_string(),
+                )]),
+                source_path: "file.txt".to_string(),
+                version_selector: Some("etag:abc".to_string()),
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::from_bytes([9u8; 16])),
+        };
+
+        assert_eq!(
+            build_source_access_from_binding(&source, None),
+            Err(SourceConnectorResolutionError::ResolveFailed)
+        );
+    }
+
+    #[test]
+    fn build_source_access_from_binding_accepts_raw_persisted_version_selector() {
+        let source = VersionSourceBinding {
+            strategy: aruna_core::structs::StagingStrategy::Reference,
+            descriptor: aruna_core::structs::PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://example.org".to_string(),
+                )]),
+                source_path: "file.txt".to_string(),
+                version_selector: Some("v42".to_string()),
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::from_bytes([9u8; 16])),
+        };
+
+        let access = build_source_access_from_binding(&source, None).unwrap();
+        let ResolvedSourceAccess::OpenDal { version, .. } = access;
+        assert_eq!(version.as_deref(), Some("v42"));
     }
 
     #[test]
@@ -559,9 +648,15 @@ mod tests {
         .await
         .unwrap();
 
-        let ResolvedSourceAccess::OpenDal { kind, config, path } = access;
+        let ResolvedSourceAccess::OpenDal {
+            kind,
+            config,
+            path,
+            version,
+        } = access;
         assert_eq!(kind, SourceConnectorKind::Ftp);
         assert_eq!(path, "run-1/data.txt");
+        assert_eq!(version, None);
         assert_eq!(
             config.get("endpoint").map(String::as_str),
             Some("ftp://ftp.example.org:21")
@@ -594,6 +689,7 @@ mod tests {
             )]),
             None,
             "bucket/key",
+            None,
         )
         .unwrap_err();
         assert_eq!(

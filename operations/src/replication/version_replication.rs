@@ -1484,6 +1484,7 @@ mod tests {
             kind: SourceConnectorKind::Http,
             config: HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
             path: "ref/file.txt".to_string(),
+            version: None,
         };
         let effects = op.step(Event::SubOperation(
             SubOperationEvent::VersionSourceAccessResolved {
@@ -1543,6 +1544,7 @@ mod tests {
             kind: SourceConnectorKind::Http,
             config: HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
             path: "ref/file.txt".to_string(),
+            version: None,
         };
         op.step(Event::SubOperation(
             SubOperationEvent::VersionSourceAccessResolved { result: Ok(access) },
