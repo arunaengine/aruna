@@ -173,6 +173,9 @@ impl IntoS3Error for GetObjectError {
             GetObjectError::NoSuchVersion => no_such_version_error(),
             GetObjectError::DeleteMarker => delete_marker_error(),
             GetObjectError::NoSuchKey => no_such_key_error(),
+            GetObjectError::InvalidRange => {
+                s3_error!(InvalidRange, "The requested range is not satisfiable.")
+            }
             GetObjectError::ResolveReferenceError(error) => match error {
                 SourceConnectorResolutionError::ResolveFailed
                 | SourceConnectorResolutionError::NotFound => {

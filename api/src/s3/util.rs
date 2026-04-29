@@ -10,15 +10,7 @@ use s3s::dto::{
     ChecksumType, CompletedPart, CreateMultipartUploadInput, PartNumber, PutObjectInput,
 };
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
-use std::ops::Range as StdRange;
 use ulid::Ulid;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedByteRange {
-    pub range: StdRange<u64>,
-    pub content_range: String,
-    pub content_length: i64,
-}
 
 pub fn to_base64<T: AsRef<[u8]>>(input: T) -> String {
     BASE64_STANDARD.encode(input)
@@ -255,25 +247,6 @@ pub(crate) fn s3_checksum_type_from_multipart(
     }
 }
 
-pub(crate) fn resolve_byte_range(
-    requested_range: Option<s3s::dto::Range>,
-    full_length: u64,
-) -> S3Result<Option<ResolvedByteRange>> {
-    let Some(requested_range) = requested_range else {
-        return Ok(None);
-    };
-    if full_length == 0 {
-        return Err(S3ErrorCode::InvalidRange.into());
-    }
-
-    let range = requested_range.check(full_length)?;
-    Ok(Some(ResolvedByteRange {
-        content_range: format!("bytes {}-{}/{}", range.start, range.end - 1, full_length),
-        content_length: (range.end - range.start) as i64,
-        range,
-    }))
-}
-
 pub(crate) fn checksum_algorithm_from_s3(
     algorithm: &S3ChecksumAlgorithm,
 ) -> S3Result<ChecksumAlgorithm> {
@@ -289,9 +262,8 @@ pub(crate) fn checksum_algorithm_from_s3(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_multipart_part_number, resolve_byte_range};
+    use super::parse_multipart_part_number;
     use s3s::S3ErrorCode;
-    use s3s::dto::Range;
 
     #[test]
     fn rejects_upload_part_number_zero() {
@@ -332,44 +304,6 @@ mod tests {
         assert_eq!(
             parse_multipart_part_number(10_000, S3ErrorCode::InvalidPart).unwrap(),
             10_000
-        );
-    }
-
-    #[test]
-    fn resolves_explicit_byte_range() {
-        let resolved = resolve_byte_range(
-            Some(Range::Int {
-                first: 2,
-                last: Some(5),
-            }),
-            10,
-        )
-        .unwrap()
-        .unwrap();
-
-        assert_eq!(resolved.range, 2..6);
-        assert_eq!(resolved.content_range, "bytes 2-5/10");
-        assert_eq!(resolved.content_length, 4);
-    }
-
-    #[test]
-    fn resolves_suffix_byte_range() {
-        let resolved = resolve_byte_range(Some(Range::Suffix { length: 3 }), 10)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(resolved.range, 7..10);
-        assert_eq!(resolved.content_range, "bytes 7-9/10");
-        assert_eq!(resolved.content_length, 3);
-    }
-
-    #[test]
-    fn rejects_empty_object_byte_range() {
-        assert_eq!(
-            *resolve_byte_range(Some(Range::Suffix { length: 1 }), 0)
-                .unwrap_err()
-                .code(),
-            S3ErrorCode::InvalidRange
         );
     }
 }

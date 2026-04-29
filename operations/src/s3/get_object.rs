@@ -34,6 +34,7 @@ pub enum GetObjectState {
     ResolveReferenceAccess,
     ReadMultipartSummary,
     CommitTransaction,
+    HeadReferenceSource,
     GetBlob,
     ReadReferenceSource,
     Finish,
@@ -65,6 +66,10 @@ pub enum GetObjectError {
     NoSuchVersion,
     #[error("The specified version is a delete marker.")]
     DeleteMarker,
+    #[error("The requested range is not satisfiable.")]
+    InvalidRange,
+    #[error("Reference source metadata changed during ranged read.")]
+    ReferenceSourceChanged,
     #[error(transparent)]
     ResolveReferenceError(#[from] SourceConnectorResolutionError),
     #[error(transparent)]
@@ -73,12 +78,61 @@ pub enum GetObjectError {
     GetObjectFailed,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObjectRangeRequest {
+    StartEnd { start: u64, end: u64 },
+    Start { start: u64 },
+    Suffix { length: u64 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedObjectRange {
+    pub range: Range<u64>,
+    pub content_length: i64,
+    pub content_range: String,
+}
+
+impl ObjectRangeRequest {
+    pub fn resolve(&self, full_length: u64) -> Result<ResolvedObjectRange, GetObjectError> {
+        if full_length == 0 {
+            return Err(GetObjectError::InvalidRange);
+        }
+
+        let range = match self {
+            ObjectRangeRequest::StartEnd { start, end } => {
+                if start > end || *start >= full_length {
+                    return Err(GetObjectError::InvalidRange);
+                }
+                *start..((*end).min(full_length - 1) + 1)
+            }
+            ObjectRangeRequest::Start { start } => {
+                if *start >= full_length {
+                    return Err(GetObjectError::InvalidRange);
+                }
+                *start..full_length
+            }
+            ObjectRangeRequest::Suffix { length } => {
+                if *length == 0 {
+                    return Err(GetObjectError::InvalidRange);
+                }
+                full_length.saturating_sub(*length)..full_length
+            }
+        };
+
+        Ok(ResolvedObjectRange {
+            content_range: format!("bytes {}-{}/{}", range.start, range.end - 1, full_length),
+            content_length: (range.end - range.start) as i64,
+            range,
+        })
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct GetObjectInput {
     pub bucket: String,
     pub key: String,
     pub version_id: Option<Ulid>,
-    pub range: Option<Range<u64>>,
+    pub range: Option<ObjectRangeRequest>,
     pub group_id: Ulid,
     pub user_identity: UserId,
 }
@@ -92,6 +146,7 @@ pub struct GetObjectResult {
     pub version_id: Option<Ulid>,
     pub resolved_version_id: Option<Ulid>,
     pub checksum_type: MultipartChecksumType,
+    pub resolved_range: Option<ResolvedObjectRange>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -106,6 +161,7 @@ pub struct GetObjectOperation {
     last_refresh: Option<SystemTime>,
     resolved_version_id: Option<Ulid>,
     checksum_type: MultipartChecksumType,
+    resolved_range: Option<ResolvedObjectRange>,
     output: Option<Result<GetObjectResult, GetObjectError>>,
 }
 
@@ -122,6 +178,7 @@ impl GetObjectOperation {
             last_refresh: None,
             resolved_version_id: None,
             checksum_type: MultipartChecksumType::FullObject,
+            resolved_range: None,
             output: None,
         }
     }
@@ -349,8 +406,20 @@ impl GetObjectOperation {
             return self.emit_error(GetObjectError::GetObjectFailed);
         };
 
-        let read_effect = match self.input.range.clone() {
-            Some(range) => BlobEffect::ReadRange { location, range },
+        let resolved_range = match self.input.range.as_ref() {
+            Some(range) => match range.resolve(location.blob_size) {
+                Ok(range) => Some(range),
+                Err(err) => return self.emit_error(err),
+            },
+            None => None,
+        };
+        self.resolved_range = resolved_range.clone();
+
+        let read_effect = match resolved_range {
+            Some(range) => BlobEffect::ReadRange {
+                location,
+                range: range.range,
+            },
             None => BlobEffect::Read { location },
         };
 
@@ -370,18 +439,29 @@ impl GetObjectOperation {
         };
 
         self.state = GetObjectState::CommitTransaction;
-        smallvec![
-            Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-            Effect::StagingSource(StagingSourceEffect::Read {
-                access,
-                range: self.input.range.clone(),
-            })
-        ]
+        if self.input.range.is_some() {
+            smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        } else {
+            smallvec![
+                Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
+                Effect::StagingSource(StagingSourceEffect::Read {
+                    access,
+                    range: None,
+                })
+            ]
+        }
     }
 
     pub fn handle_transaction_committed(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
             self.txn_id = None;
+            if self.reference_access.is_some() && self.input.range.is_some() {
+                let Some(access) = self.reference_access.clone() else {
+                    return self.emit_error(GetObjectError::GetObjectFailed);
+                };
+                self.state = GetObjectState::HeadReferenceSource;
+                return smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })];
+            }
             self.state = if self.reference_access.is_some() {
                 GetObjectState::ReadReferenceSource
             } else {
@@ -394,6 +474,39 @@ impl GetObjectOperation {
                 expected: "Event::Storage(StorageEvent::TransactionCommitted)",
                 received: event,
             })
+        }
+    }
+
+    pub fn handle_reference_source_head(&mut self, event: Event) -> Effects {
+        match event {
+            Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
+                let Some(range_request) = self.input.range.as_ref() else {
+                    return self.emit_error(GetObjectError::GetObjectFailed);
+                };
+                let resolved_range = match range_request.resolve(metadata.content_length) {
+                    Ok(range) => range,
+                    Err(err) => return self.emit_error(err),
+                };
+                let Some(access) = self.reference_access.clone() else {
+                    return self.emit_error(GetObjectError::GetObjectFailed);
+                };
+
+                self.source_metadata = Some(metadata);
+                self.resolved_range = Some(resolved_range.clone());
+                self.state = GetObjectState::ReadReferenceSource;
+                smallvec![Effect::StagingSource(StagingSourceEffect::Read {
+                    access,
+                    range: Some(resolved_range.range),
+                })]
+            }
+            Event::StagingSource(StagingSourceEvent::Error { error }) => {
+                self.emit_error(error.into())
+            }
+            other => self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::StagingSource(StagingSourceEvent::HeadResult)",
+                received: other,
+            }),
         }
     }
 
@@ -411,6 +524,7 @@ impl GetObjectOperation {
                 version_id: self.resolved_version_id.or(self.input.version_id),
                 resolved_version_id: self.resolved_version_id,
                 checksum_type: self.checksum_type,
+                resolved_range: self.resolved_range.clone(),
             }));
             smallvec![]
         } else {
@@ -425,6 +539,13 @@ impl GetObjectOperation {
     pub fn handle_received_reference_source(&mut self, event: Event) -> Effects {
         match event {
             Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
+                if self.resolved_range.is_some()
+                    && self.source_metadata.as_ref().is_some_and(|head_metadata| {
+                        head_metadata.content_length != metadata.content_length
+                    })
+                {
+                    return self.emit_error(GetObjectError::ReferenceSourceChanged);
+                }
                 self.last_refresh = Some(SystemTime::now());
                 self.source_metadata = Some(metadata);
                 self.reference_stream = Some(stream);
@@ -458,6 +579,7 @@ impl GetObjectOperation {
             version_id: self.resolved_version_id.or(self.input.version_id),
             resolved_version_id: self.resolved_version_id,
             checksum_type: self.checksum_type,
+            resolved_range: self.resolved_range.clone(),
         }));
         smallvec![]
     }
@@ -480,6 +602,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::ResolveReferenceAccess => self.handle_resolved_reference_access(event),
             GetObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
             GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
+            GetObjectState::HeadReferenceSource => self.handle_reference_source_head(event),
             GetObjectState::GetBlob => self.handle_received_blob(event),
             GetObjectState::ReadReferenceSource => self.handle_received_reference_source(event),
             GetObjectState::Finish => smallvec![],
@@ -511,25 +634,29 @@ impl Operation for GetObjectOperation {
 #[cfg(test)]
 mod test {
     use crate::driver::{DriverContext, drive};
-    use crate::s3::get_object::{GetObjectInput, GetObjectOperation};
+    use crate::s3::get_object::{
+        GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, ObjectRangeRequest,
+    };
     use aruna_blob::blob::BlobHandler;
     use aruna_blob::hash::Hasher;
     use aruna_core::UserId;
-    use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
     use aruna_core::keyspaces::{
         S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
     };
+    use aruna_core::operation::Operation;
     use aruna_core::structs::{
         Backend, BackendConfig, BackendLocation, CurrentVersionPointer, Location, LookupKey,
-        MultipartChecksumType, PortableSourceDescriptor, RealmId, SourceConnectorKind,
-        SourceMetadata, StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
-        VersionState,
+        MultipartChecksumType, PortableSourceDescriptor, RealmId, ResolvedSourceAccess,
+        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionMetadata,
+        VersionSourceBinding, VersionState,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
     use axum::{Router, routing::get};
-    use futures_util::StreamExt;
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
     use std::collections::HashMap;
     use std::path::Path;
     use std::time::SystemTime;
@@ -554,12 +681,59 @@ mod test {
     }
 
     #[test]
+    fn resolves_explicit_object_range() {
+        let resolved = ObjectRangeRequest::StartEnd { start: 2, end: 5 }
+            .resolve(10)
+            .unwrap();
+
+        assert_eq!(resolved.range, 2..6);
+        assert_eq!(resolved.content_length, 4);
+        assert_eq!(resolved.content_range, "bytes 2-5/10");
+    }
+
+    #[test]
+    fn resolves_suffix_object_range() {
+        let resolved = ObjectRangeRequest::Suffix { length: 3 }
+            .resolve(10)
+            .unwrap();
+
+        assert_eq!(resolved.range, 7..10);
+        assert_eq!(resolved.content_length, 3);
+        assert_eq!(resolved.content_range, "bytes 7-9/10");
+    }
+
+    #[test]
+    fn resolves_open_ended_object_range() {
+        let resolved = ObjectRangeRequest::Start { start: 4 }.resolve(10).unwrap();
+
+        assert_eq!(resolved.range, 4..10);
+        assert_eq!(resolved.content_length, 6);
+        assert_eq!(resolved.content_range, "bytes 4-9/10");
+    }
+
+    #[test]
+    fn rejects_invalid_object_ranges() {
+        assert_eq!(
+            ObjectRangeRequest::Suffix { length: 1 }.resolve(0),
+            Err(GetObjectError::InvalidRange)
+        );
+        assert_eq!(
+            ObjectRangeRequest::Start { start: 10 }.resolve(10),
+            Err(GetObjectError::InvalidRange)
+        );
+        assert_eq!(
+            ObjectRangeRequest::StartEnd { start: 6, end: 5 }.resolve(10),
+            Err(GetObjectError::InvalidRange)
+        );
+    }
+
+    #[test]
     fn materialized_range_read_emits_blob_read_range() {
         let mut operation = GetObjectOperation::new(GetObjectInput {
             bucket: "s3test".to_string(),
             key: "range.txt".to_string(),
             version_id: None,
-            range: Some(2..5),
+            range: Some(ObjectRangeRequest::StartEnd { start: 2, end: 4 }),
             group_id: Ulid::new(),
             user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
         });
@@ -590,6 +764,123 @@ mod test {
                 Effect::Blob(BlobEffect::ReadRange { location: emitted_location, range })
             ] if *committed_txn_id == txn_id && emitted_location == &location && range == &(2..5)
         ));
+    }
+
+    #[test]
+    fn reference_range_read_heads_then_reads_resolved_range() {
+        let mut operation = GetObjectOperation::new(GetObjectInput {
+            bucket: "s3test".to_string(),
+            key: "range.txt".to_string(),
+            version_id: None,
+            range: Some(ObjectRangeRequest::Suffix { length: 4 }),
+            group_id: Ulid::new(),
+            user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+        });
+        let txn_id = Ulid::new();
+        let access = ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::new(),
+            path: "folder/file.txt".to_string(),
+            version: None,
+        };
+        operation.txn_id = Some(txn_id);
+        operation.reference_access = Some(access.clone());
+
+        let effects = operation.commit_and_read_reference();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed_txn_id })]
+                if *committed_txn_id == txn_id
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StagingSource(StagingSourceEffect::Head { access: emitted_access })]
+                if emitted_access == &access
+        ));
+
+        let metadata = SourceMetadata {
+            content_length: 10,
+            content_type: Some("text/plain".to_string()),
+            etag: None,
+            last_modified: None,
+            source_version: None,
+        };
+        let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: metadata.clone(),
+        }));
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StagingSource(StagingSourceEffect::Read { access: emitted_access, range })]
+                if emitted_access == &access && range == &Some(6..10)
+        ));
+
+        let effects = operation.step(Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata,
+            stream: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<
+                _,
+                std::io::Error,
+            >(
+                Bytes::from_static(b"ence"),
+            )])),
+        }));
+        assert!(effects.is_empty());
+        let result = operation.finalize().unwrap().unwrap().unwrap();
+        let resolved_range = result.resolved_range.unwrap();
+        assert_eq!(resolved_range.range, 6..10);
+        assert_eq!(resolved_range.content_length, 4);
+        assert_eq!(resolved_range.content_range, "bytes 6-9/10");
+    }
+
+    #[test]
+    fn reference_range_read_errors_when_read_length_differs_from_head() {
+        let mut operation = GetObjectOperation::new(GetObjectInput {
+            bucket: "s3test".to_string(),
+            key: "range.txt".to_string(),
+            version_id: None,
+            range: Some(ObjectRangeRequest::StartEnd { start: 1, end: 3 }),
+            group_id: Ulid::new(),
+            user_identity: UserId::local(Ulid::new(), RealmId([0u8; 32])),
+        });
+        operation.source_metadata = Some(SourceMetadata {
+            content_length: 10,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+        });
+        operation.resolved_range = Some(
+            ObjectRangeRequest::StartEnd { start: 1, end: 3 }
+                .resolve(10)
+                .unwrap(),
+        );
+        operation.state = GetObjectState::ReadReferenceSource;
+
+        let effects = operation.step(Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata: SourceMetadata {
+                content_length: 11,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+            },
+            stream: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<
+                _,
+                std::io::Error,
+            >(
+                Bytes::from_static(b"bad"),
+            )])),
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            operation.finalize(),
+            Err(GetObjectError::ReferenceSourceChanged)
+        );
     }
 
     #[tokio::test]

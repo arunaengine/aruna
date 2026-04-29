@@ -9,7 +9,7 @@ use crate::s3::replication::spawn_version_replication;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    resolve_byte_range, s3_checksum_type_from_multipart, to_base64,
+    s3_checksum_type_from_multipart, to_base64,
 };
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
@@ -39,7 +39,7 @@ use aruna_operations::s3::delete_object::{
     DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
 };
 use aruna_operations::s3::get_object::{
-    GetObjectInput as GOI, GetObjectOperation, GetObjectResult,
+    GetObjectInput as GOI, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
 };
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
@@ -83,6 +83,16 @@ struct ReferenceMetadataRefresh {
     version_id: ulid::Ulid,
     metadata: SourceMetadata,
     refreshed_at: SystemTime,
+}
+
+fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
+    match range {
+        s3s::dto::Range::Int { first, last } => match last {
+            Some(end) => ObjectRangeRequest::StartEnd { start: first, end },
+            None => ObjectRangeRequest::Start { start: first },
+        },
+        s3s::dto::Range::Suffix { length } => ObjectRangeRequest::Suffix { length },
+    }
 }
 
 #[derive(Clone)]
@@ -901,40 +911,13 @@ impl S3 for ArunaS3Service {
         let response_bucket = bucket.clone();
         let response_key = key.clone();
 
-        let resolved_range = if requested_range.is_some() {
-            let head_result = drive(
-                HeadObjectOperation::new(HOI {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    version_id,
-                }),
-                &self.state,
-            )
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to process HEAD request"))?;
-            let full_length = head_result
-                .location
-                .as_ref()
-                .map(|location| location.blob_size)
-                .or_else(|| {
-                    head_result
-                        .source_metadata
-                        .as_ref()
-                        .map(|metadata| metadata.content_length)
-                })
-                .ok_or_else(|| s3_error!(InternalError, "Object length unavailable"))?;
-            resolve_byte_range(requested_range, full_length)?
-        } else {
-            None
-        };
+        let range_request = requested_range.map(object_range_request);
 
         let operation = GetObjectOperation::new(GOI {
             bucket,
             key,
             version_id,
-            range: resolved_range.as_ref().map(|range| range.range.clone()),
+            range: range_request,
             group_id: bucket_info
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
@@ -949,6 +932,7 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InternalError, "Failed to process GET request"))?;
 
         let version_id = result.version_id;
+        let resolved_range = result.resolved_range.clone();
         let reference_refresh = reference_metadata_refresh(response_bucket, response_key, &result);
         let response_fields = self.build_object_response_fields(
             result.location.as_ref(),
