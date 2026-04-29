@@ -2,7 +2,7 @@ use super::{BlobHandle, BlobHandler, EffectReceiver};
 use crate::error::BlobLibError;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
@@ -35,6 +35,9 @@ impl Handle for BlobHandle {
                     Ok(event) => Event::Blob(event),
                     Err(_) => Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)),
                 }
+            }
+            Effect::StagingSource(staging_source_effect) => {
+                self.send_staging_source_effect(staging_source_effect).await
             }
             _ => Event::Blob(BlobEvent::Error(BlobError::InvalidEffect)),
         }
@@ -69,6 +72,17 @@ impl BlobHandle {
                 .unwrap_or_else(|_| BlobEvent::Error(BlobError::ChannelClosed))
         };
         Event::Blob(blob_event)
+    }
+
+    pub async fn send_staging_source_effect(&self, effect: StagingSourceEffect) -> Event {
+        let staging_source_event = match effect {
+            StagingSourceEffect::Head { access } => self.handler.head_staging_source(access).await,
+            StagingSourceEffect::Read { access, range } => {
+                self.handler.read_staging_source(access, range).await
+            }
+        };
+
+        Event::StagingSource(staging_source_event)
     }
 
     pub async fn store_connection(&mut self, stream: BiStream) -> Ulid {

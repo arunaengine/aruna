@@ -8,13 +8,13 @@ use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
     CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
     GROUP_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
-    USER_ACCESS_KEYSPACE,
+    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
+    S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
-    BucketInfo, Group, GroupAuthorizationDocument, Location, LookupKey, Realm,
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
+    BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, Location, LookupKey,
+    Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
     VersionMetadata,
 };
 use aruna_net::dht::storage::StoredEntry;
@@ -102,6 +102,7 @@ enum DecodedField {
 
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 enum DecodedValue {
     Group {
         data: JsonGroup,
@@ -123,6 +124,9 @@ enum DecodedValue {
     },
     BucketInfo {
         data: BucketInfo,
+    },
+    CurrentVersionPointer {
+        data: CurrentVersionPointer,
     },
     Location {
         data: Location,
@@ -807,7 +811,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 17] {
+fn defined_keyspaces() -> [&'static str; 18] {
     [
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
@@ -823,6 +827,7 @@ fn defined_keyspaces() -> [&'static str; 17] {
         REALM_CONFIG_KEYSPACE,
         REALM_KEYSPACE,
         S3_BUCKET_KEYSPACE,
+        S3_CURRENT_VERSION_KEYSPACE,
         S3_LOOKUP_KEYSPACE,
         S3_VERSION_KEYSPACE,
         USER_ACCESS_KEYSPACE,
@@ -893,7 +898,7 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | NODE_STATE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
         DHT_KEYSPACE => decode_dht_key(key),
-        S3_LOOKUP_KEYSPACE => LookupKey::from_bytes(key)
+        S3_LOOKUP_KEYSPACE | S3_CURRENT_VERSION_KEYSPACE => LookupKey::from_bytes(key)
             .map(|value| DecodedField::LookupKey { value })
             .unwrap_or_else(|_| raw_field(key)),
         S3_VERSION_KEYSPACE => VersionKey::from_bytes(key)
@@ -926,6 +931,11 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         S3_BUCKET_KEYSPACE => decode_value_with(value, BucketInfo::from_bytes, |data| {
             DecodedValue::BucketInfo { data }
         }),
+        S3_CURRENT_VERSION_KEYSPACE => {
+            decode_value_with(value, CurrentVersionPointer::from_bytes, |data| {
+                DecodedValue::CurrentVersionPointer { data }
+            })
+        }
         S3_LOOKUP_KEYSPACE => decode_value_with(value, Location::from_bytes, |data| {
             DecodedValue::Location { data }
         }),
@@ -1110,8 +1120,8 @@ mod tests {
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
         GROUP_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
-        USER_ACCESS_KEYSPACE,
+        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
+        S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{Actor, Group, Realm, RealmId};
@@ -1172,6 +1182,7 @@ mod tests {
             REALM_CONFIG_KEYSPACE.to_string(),
             REALM_KEYSPACE.to_string(),
             S3_BUCKET_KEYSPACE.to_string(),
+            S3_CURRENT_VERSION_KEYSPACE.to_string(),
             S3_LOOKUP_KEYSPACE.to_string(),
             S3_VERSION_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),

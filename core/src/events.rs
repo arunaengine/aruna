@@ -1,7 +1,10 @@
-use crate::errors::BlobError;
+use crate::errors::{BlobError, SourceConnectorResolutionError, StagingSourceError};
 use crate::metadata::MetadataEvent;
 use crate::stream::{BackendStream, StreamError as BackendStreamError};
-use crate::structs::{BackendLocation, RealmId, ReplicationSuboperationResult};
+use crate::structs::{
+    BackendLocation, RealmId, ReplicationSuboperationResult, ResolvedSourceAccess,
+    ResolvedSourceConnector, SourceMetadata,
+};
 use crate::{
     automerge::AutomergeEvent,
     errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
@@ -15,6 +18,7 @@ use ulid::Ulid;
 #[derive(Debug, PartialEq)]
 pub enum Event {
     Blob(BlobEvent),
+    StagingSource(StagingSourceEvent),
     Storage(StorageEvent),
     Net(NetEvent),
     Automerge(AutomergeEvent),
@@ -41,6 +45,12 @@ pub enum SubOperationEvent {
     },
     TopicAnnouncementResult {
         result: Result<(), String>,
+    },
+    SourceConnectorResolved {
+        result: Result<ResolvedSourceConnector, SourceConnectorResolutionError>,
+    },
+    VersionSourceAccessResolved {
+        result: Result<ResolvedSourceAccess, SourceConnectorResolutionError>,
     },
     ReplicationItemResult {
         result: Result<ReplicationSuboperationResult, String>,
@@ -80,6 +90,20 @@ pub enum BlobEvent {
         location: BackendLocation,
     },
     Error(BlobError),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StagingSourceEvent {
+    HeadResult {
+        metadata: SourceMetadata,
+    },
+    ReadResult {
+        metadata: SourceMetadata,
+        stream: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    Error {
+        error: StagingSourceError,
+    },
 }
 
 #[derive(Debug, PartialEq)]

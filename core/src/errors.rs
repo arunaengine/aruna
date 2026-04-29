@@ -1,3 +1,4 @@
+use crate::structs::SourceConnectorKind;
 use automerge::AutomergeError;
 use std::array::TryFromSliceError;
 use thiserror::Error;
@@ -62,6 +63,42 @@ pub enum BlobError {
     ReplicationRejected(String),
     #[error("Replication failed: {0}")]
     ReplicationFailed(String),
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum StagingSourceError {
+    #[error("Channel closed")]
+    ChannelClosed,
+    #[error("Invalid effect type")]
+    InvalidEffect,
+    #[error("Staging source handle missing")]
+    HandleMissing,
+    #[error("Staging source not found")]
+    NotFound,
+    #[error("Unsupported staging source kind `{0}`")]
+    UnsupportedKind(String),
+    #[error("Operator creation failed: {0}")]
+    OperatorCreationFailed(String),
+    #[error("Stat error: {0}")]
+    StatError(String),
+    #[error("Read error: {0}")]
+    ReadError(String),
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum SourceConnectorResolutionError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error("Connector not found")]
+    NotFound,
+    #[error("Connector kind `{0}` is not supported in Phase 3")]
+    UnsupportedConnectorKind(SourceConnectorKind),
+    #[error("Source path must be relative to connector root")]
+    InvalidSourcePath,
+    #[error("Source connector resolution failed")]
+    ResolveFailed,
 }
 
 #[derive(Debug, Error, PartialEq)]

@@ -30,6 +30,8 @@ pub enum ServerError {
     InternalError(String),
     #[error("Bad request")]
     BadRequest,
+    #[error("Bad gateway")]
+    BadGateway,
 }
 
 #[derive(Debug, Error)]
@@ -156,6 +158,7 @@ impl ServerError {
             ServerError::Forbidden => StatusCode::FORBIDDEN,
             ServerError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             ServerError::BadRequest => StatusCode::BAD_REQUEST,
+            ServerError::BadGateway => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -167,12 +170,14 @@ impl ServerError {
             ServerError::Forbidden => "Forbidden".to_string(),
             ServerError::InternalError(_) => "Internal error".to_string(),
             ServerError::BadRequest => "Bad request".to_string(),
+            ServerError::BadGateway => "Bad gateway".to_string(),
         }
     }
 
     fn public_message(&self) -> String {
         match self {
             ServerError::InternalError(_) => "Internal server error".to_string(),
+            ServerError::BadGateway => "Bad gateway".to_string(),
             _ => self.to_string(),
         }
     }

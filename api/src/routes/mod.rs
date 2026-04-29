@@ -6,11 +6,13 @@ use axum::middleware::{from_fn, from_fn_with_state};
 use std::sync::Arc;
 
 pub mod blobs;
+pub mod connectors;
 pub mod credentials;
 pub mod groups;
 pub mod info;
 pub mod metadata;
 pub mod onboarding;
+pub mod staging;
 pub mod users;
 
 pub fn rest_router(state: Arc<ServerState>) -> Router {
@@ -18,6 +20,8 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(info::router())
         .merge(onboarding::router())
         .merge(blobs::router())
+        .merge(staging::router())
+        .merge(connectors::router())
         .merge(credentials::router())
         .merge(groups::router())
         .merge(metadata::router())

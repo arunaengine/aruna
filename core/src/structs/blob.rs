@@ -1,6 +1,6 @@
 use crate::errors::{BlobError, ConversionError};
-use crate::structs::PathRestriction;
 use crate::structs::checksum::HASH_BLAKE3;
+use crate::structs::{PathRestriction, SourceMetadata, VersionSourceBinding, VersionState};
 use crate::types::UserId;
 use byteview::ByteView;
 use core::fmt;
@@ -104,7 +104,7 @@ impl From<(String, u64)> for BackendBucket {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendLocation {
     pub root: String,
     pub storage_bucket: String,
@@ -255,7 +255,7 @@ impl VersionKey {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Location {
     Real(BackendLocation),
     Deleted,
@@ -271,15 +271,36 @@ impl Location {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct VersionMetadata {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CurrentVersionPointer {
     pub version_id: Ulid,
-    pub location: Location,
-    pub created_at: SystemTime,
-    pub created_by: UserId,
+    pub generation: u64,
 }
 
-impl VersionMetadata {
+impl CurrentVersionPointer {
+    pub fn new(version_id: Ulid) -> Self {
+        Self {
+            version_id,
+            generation: 1,
+        }
+    }
+
+    pub fn new_with_generation(version_id: Ulid, generation: u64) -> Self {
+        Self {
+            version_id,
+            generation,
+        }
+    }
+
+    pub fn next_for(existing: Option<&Self>, version_id: Ulid) -> Self {
+        Self::new_with_generation(
+            version_id,
+            existing
+                .map(|pointer| pointer.generation.saturating_add(1))
+                .unwrap_or(1),
+        )
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(&self)?)
     }
@@ -289,11 +310,86 @@ impl VersionMetadata {
     }
 }
 
-pub enum MaterializationStrategy {
-    Local,
-    Reference,
-    Snapshot,
-    Sync,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VersionMetadata {
+    pub version_id: Ulid,
+    pub state: VersionState,
+    pub created_at: SystemTime,
+    pub created_by: UserId,
+}
+
+impl VersionMetadata {
+    pub fn materialized(
+        version_id: Ulid,
+        location: BackendLocation,
+        created_at: SystemTime,
+        created_by: UserId,
+        source: Option<VersionSourceBinding>,
+    ) -> Self {
+        Self {
+            version_id,
+            state: VersionState::Materialized { location, source },
+            created_at,
+            created_by,
+        }
+    }
+
+    pub fn deleted(version_id: Ulid, created_at: SystemTime, created_by: UserId) -> Self {
+        Self {
+            version_id,
+            state: VersionState::Deleted,
+            created_at,
+            created_by,
+        }
+    }
+
+    pub fn reference(
+        version_id: Ulid,
+        source: VersionSourceBinding,
+        cached_metadata: SourceMetadata,
+        created_at: SystemTime,
+        created_by: UserId,
+        last_refresh: SystemTime,
+    ) -> Self {
+        Self {
+            version_id,
+            state: VersionState::Reference {
+                source,
+                cached_metadata,
+                last_refresh,
+            },
+            created_at,
+            created_by,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn materialized_location(&self) -> Option<&BackendLocation> {
+        self.state.materialized_location()
+    }
+
+    pub fn lookup_location(&self) -> Option<Location> {
+        self.state.lookup_location()
+    }
+
+    pub fn source_binding(&self) -> Option<&VersionSourceBinding> {
+        self.state.source_binding()
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        self.state.is_deleted()
+    }
+
+    pub fn is_materialized(&self) -> bool {
+        self.state.is_materialized()
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -336,5 +432,20 @@ impl UserAccess {
 
     pub fn is_revoked(&self) -> bool {
         self.revoked_at.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CurrentVersionPointer;
+    use ulid::Ulid;
+
+    #[test]
+    fn current_version_pointer_roundtrip_preserves_fields() {
+        let pointer = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([7u8; 16]), 42);
+
+        let restored = CurrentVersionPointer::from_bytes(&pointer.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(pointer, restored);
     }
 }
