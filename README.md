@@ -1,18 +1,14 @@
 # Aruna
 
-Aruna is a federated peer-to-peer data orchestration network. It connects sovereign data sources into a unified mesh where every participant keeps full ownership of their data while making it discoverable and accessible across organizational boundaries.
+Aruna is a federated peer-to-peer data orchestration network for organizations that need to share data without handing control to a central platform. It connects sovereign data sources into a unified mesh where each participant keeps ownership of its data while making selected data discoverable and accessible across organizational boundaries.
 
-Each Aruna node is a self-contained data platform that speaks S3, serves a REST API, and automatically federates with other nodes over encrypted connections. Nodes discover each other through a Kademlia DHT, synchronize metadata via gossip and CRDTs, and replicate data with cryptographic integrity verification. The network has no central coordinator and scales horizontally as new nodes join.
+Each Aruna node exposes an S3 endpoint and REST API, federates with peer nodes over encrypted connections, and keeps metadata synchronized with gossip and CRDTs. The network has no central coordinator and scales horizontally as new nodes join.
 
 ## Features
 
 ### S3-compatible interface
 
-Every Aruna node exposes a standard S3 API. Existing tools, libraries, and workflows work out of the box.
-
-```bash
-aws --endpoint-url http://localhost:1337 s3 cp dataset.parquet s3://my-bucket/
-```
+Every Aruna node exposes a standard S3 API. Existing tools, libraries, and automation can be pointed at the node endpoint after S3 credentials have been created.
 
 ### Federated metadata with CRDTs
 
@@ -28,13 +24,13 @@ Aruna organizes the network into **realms**, each identified by an Ed25519 keypa
 
 Within a realm, **groups** define fine-grained access control with path-scoped roles and wildcard permissions.
 
-### Pluggable backends
+### Storage layer
 
-The blob layer supports filesystem, S3, PostgreSQL, and HTTP storage backends through [OpenDAL](https://opendal.apache.org/). Pick the right backend for your infrastructure.
+Aruna's blob layer builds on [OpenDAL](https://opendal.apache.org/). The default runtime configuration in this repository uses filesystem-backed blob storage, while the underlying storage layer also supports additional backend integrations.
 
 ### Single binary deployment
 
-Aruna compiles to a single binary with an embedded LSM database ([fjall](https://github.com/fjall-rs/fjall)). Configuration is a repo-root `.env` file.
+Aruna runs as a single binary and stores local state in an embedded LSM database ([fjall](https://github.com/fjall-rs/fjall)). When launched from this repository, configuration is provided through a repo-root `.env` file.
 
 ## Roadmap
 
@@ -45,120 +41,125 @@ Aruna compiles to a single binary with an embedded LSM database ([fjall](https:/
 - **Transparent request forwarding** so any node can serve as entry point for any resource in the realm, with single-hop DHT-based discovery
 - **Cross-realm data exchange** building on the already cross-realm-capable DHT layer
 
-## Getting started
+## Getting Started
+
+For most users, the fastest way to evaluate Aruna is the local 3-node smoke test.
 
 ### Prerequisites
 
-- Rust 1.93.0+ (edition 2024)
-- A C compiler and OpenSSL dev headers
+- Rust `1.93.0+` for source builds
+- OpenSSL development headers
+- On `x86_64-unknown-linux-gnu`, `clang` and `mold` are required because the repository linker configuration uses both
+- `just`, `curl`, and `ss` for the local smoke tests
+- `docker` for `just test-deploy-oidc`
 
-### Build and run
+### Evaluate a local cluster
+
+For a quick end-to-end evaluation, run:
 
 ```bash
-cargo build
-cargo run -p aruna
+just test-deploy
+# or
+just test-deploy-oidc
 ```
 
-### Configuration
+This smoke test:
 
-Aruna reads configuration from environment variables. Copy `.env.example` to `.env` in the repository root:
+- builds the workspace in release mode
+- boots 3 local Aruna nodes
+- waits for readiness at `http://127.0.0.1:<port>/swagger-ui`
+- writes per-node logs and `summary.txt` under `target/test-deploy/`
+- prints an `ADMIN_TOKEN=...` line that you can use for authenticated API calls during the session
+
+Common overrides:
+
+- `ARUNA_TEST_DEPLOY_BASE_PORT` to move the whole local port range
+- `ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1` to stop after readiness instead of keeping the cluster running
+
+`just test-deploy-oidc` adds a local Keycloak instance on top of the same 3-node smoke test.
+
+### Run a single node from source
+
+To start one node directly from source, copy the example environment file and run the main binary from the workspace root:
 
 ```bash
 cp .env.example .env
+cargo run -p aruna
 ```
 
-Required variables from `aruna/src/config.rs`:
+With the default example configuration:
+
+- the REST API and Swagger UI are served on `http://127.0.0.1:3000/swagger-ui`
+- the S3 endpoint listens on `http://127.0.0.1:1337`
+
+## Configuration
+
+Aruna reads configuration from environment variables. For most source deployments, start from `.env.example` and adjust the values below.
+
+Required variables:
+
+| Variable | Example | Purpose |
+|----------|---------|---------|
+| `STORAGE_PATH` | `/var/lib/aruna/data` | Root path for persisted node state and default local storage locations |
+| `SOCKET_ADDRESS` | `0.0.0.0:3000` | REST API and Swagger UI listen address |
+| `S3_PORT` | `1337` | S3 server port |
+| `S3_HOST` | `localhost` | Hostname presented to S3 clients |
+| `S3_ADDRESS` | `0.0.0.0` | S3 server listen address |
+
+Common optional variables:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `P2P_SOCKET_ADDRESS` | `SOCKET_ADDRESS` | P2P bind address |
+| `REALM_DESCRIPTION` | `Aruna Realm` | Display name for a newly initialized realm |
+| `ONBOARDING_SECRET` | unset | Used only when a new node joins an existing realm on first boot |
+| `BOOTSTRAP_NODES` | unset | Comma-separated bootstrap node public keys |
+| `METADATA_REPLICATION_FACTOR` | `3` | Default metadata replication factor, clamped to at least `1` |
+| `CRAQLE_STORAGE_PATH` | `${STORAGE_PATH}/craqle` | Metadata storage path |
+| `BLOB_ROOT` | `${STORAGE_PATH}/blobstore` | Blob storage root |
+| `BLOB_MULTIPART_BUCKET` | `uploaded-parts` | Bucket used for multipart uploads |
+| `BLOB_BUCKET_PREFIX` | unset | Optional bucket naming prefix |
+| `BLOB_MAX_BUCKET_SIZE` | `100000` | Maximum bucket size setting |
+| `BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS` | `30` | Blob control-plane connect timeout |
+| `BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS` | `30` | Blob control-plane I/O timeout |
+| `BLOB_TRANSFER_IDLE_TIMEOUT_SECS` | `1800` | Blob transfer idle timeout |
+
+Configure OIDC providers by listing provider IDs and defining one environment block per ID:
 
 ```bash
-STORAGE_PATH=/var/lib/aruna/data
-SOCKET_ADDRESS=0.0.0.0:8080
-S3_PORT=1337
-S3_HOST=localhost
-S3_ADDRESS=0.0.0.0
+OIDC_PROVIDER_IDS=main
+OIDC_MAIN_ISSUER=https://issuer.example/realms/aruna
+OIDC_MAIN_AUDIENCE=aruna-api
+OIDC_MAIN_DISCOVERY_URL=https://issuer.example/realms/aruna/.well-known/openid-configuration
 ```
 
-On first boot without an `ONBOARDING_SECRET`, the node initializes a new realm and persists its local identity under `STORAGE_PATH`. Additional nodes join an existing realm with `ONBOARDING_SECRET`.
+Logging and tracing:
 
-Optional variables:
+- `RUST_LOG` controls log verbosity
+- `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` enables OTLP trace export
+
+## State And Onboarding
+
+A node started without an `ONBOARDING_SECRET` initializes a new realm on first boot and persists its identity under `STORAGE_PATH`.
+
+Additional nodes join an existing realm by starting with an `ONBOARDING_SECRET` on their first boot. The first management node also logs an initial local onboarding secret when it creates a brand-new realm.
+
+Once a node has persisted state, later `.env` changes do not re-bootstrap or re-onboard it. If a data directory already contains node state, changing `ONBOARDING_SECRET` does not re-onboard that node. Use a fresh `STORAGE_PATH` when repeating onboarding tests or bootstrap flows.
+
+For a ready-made local multi-node onboarding flow, use `just test-deploy` instead of stepping through the onboarding APIs by hand.
+
+## S3 Access
+
+Aruna's S3 interface is authenticated. Create S3 credentials before using the endpoint, then point your AWS CLI or S3-compatible client at the node. For credential creation and a fuller S3 walkthrough, see the Aruna documentation: <https://docs.aruna-engine.org/latest/>.
 
 ```bash
-# Defaults to ${STORAGE_PATH}/blobstore when omitted
-BLOB_ROOT=/var/lib/aruna/data/blobstore
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
 
-# Optional bucket naming prefix
-BLOB_BUCKET_PREFIX=aruna-
-
-# Defaults to 100000
-BLOB_MAX_BUCKET_SIZE=100000
-
-# Defaults to SOCKET_ADDRESS when omitted
-P2P_SOCKET_ADDRESS=0.0.0.0:4433
-
-# Defaults to "Aruna Realm"
-REALM_DESCRIPTION="Aruna Realm"
-
-# Present only on joining nodes
-ONBOARDING_SECRET=...
-
-# Comma-separated iroh public keys
-BOOTSTRAP_NODES=pubkey1,pubkey2
-
-# Defaults to 3 and is clamped to at least 1
-METADATA_REPLICATION_FACTOR=3
+aws --endpoint-url http://127.0.0.1:1337 s3 mb s3://my-bucket
+aws --endpoint-url http://127.0.0.1:1337 s3 cp data.csv s3://my-bucket/
+aws --endpoint-url http://127.0.0.1:1337 s3 ls s3://my-bucket
 ```
-
-### Using S3
-
-```bash
-aws --endpoint-url http://localhost:1337 s3 mb s3://my-bucket
-aws --endpoint-url http://localhost:1337 s3 cp data.csv s3://my-bucket/
-aws --endpoint-url http://localhost:1337 s3 ls s3://my-bucket
-```
-
-### Connecting nodes
-
-Additional nodes join through the onboarding API:
-
-1. Start the first node without `ONBOARDING_SECRET` so it initializes a new realm.
-2. Let the first local user authenticate and claim the empty `realm_admin` role.
-3. Create an onboarding secret with `POST /api/v1/admin/onboarding/secrets`.
-4. Start the joining node with that `ONBOARDING_SECRET`.
-5. On first boot, the joining node calls `POST /api/v1/onboarding/bootstrap`, persists its local identity, subscribes to the realm auth/config topics, and explicitly syncs both documents.
-
-Admin routes currently available for onboarding:
-
-- `POST /api/v1/admin/onboarding/secrets`
-- `GET /api/v1/admin/onboarding/secrets`
-- `DELETE /api/v1/admin/onboarding/secrets/{id}`
-
-Bootstrap route:
-
-- `POST /api/v1/onboarding/bootstrap`
-
-## Development
-
-```bash
-cargo test --lib               # fast unit tests
-cargo test -p aruna-net        # test a specific crate
-cargo test test_name           # run one test
-cargo +nightly fmt             # format
-cargo +nightly clippy          # lint
-cargo test --test integration  # full integration suite (needs multi-node setup)
-```
-
-### Crate layout
-
-| Crate | Purpose |
-|-------|---------|
-| `aruna-core` | Foundation types, effect/event system, traits |
-| `aruna-storage` | Local persistence (fjall LSM database) |
-| `aruna-net` | P2P networking: Kademlia DHT, gossip, encrypted streams |
-| `aruna-blob` | Content-addressed blobs, Bao streaming, storage backends |
-| `aruna-tasks` | Periodic and scheduled task execution |
-| `aruna-operations` | State machine implementations and driver loop |
-| `aruna-search` | Distributed full-text search (in progress) |
-| `aruna-api` | REST API (axum) and S3 server (s3s) |
-| `aruna` | Main binary |
 
 ## Concepts
 
