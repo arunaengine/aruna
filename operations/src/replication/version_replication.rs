@@ -1150,7 +1150,7 @@ mod tests {
         ReplicateScopeInput {
             bucket: "bucket".to_string(),
             target,
-            target_node_id: iroh::SecretKey::generate(&mut rand::rng()).public(),
+            target_node_id: iroh::SecretKey::generate().public(),
             auth_context: auth_context(),
             replicate_delete_markers: true,
             mode: ReplicationMode::Live,
@@ -1228,7 +1228,7 @@ mod tests {
             bucket: "bucket".to_string(),
             key: "dir/file.txt".to_string(),
             version_id,
-            target_node_id: iroh::SecretKey::generate(&mut rand::rng()).public(),
+            target_node_id: iroh::SecretKey::generate().public(),
             auth_context: auth_context(),
             mode,
         }

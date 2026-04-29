@@ -880,7 +880,7 @@ mod test {
             user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
             group_id: Ulid::new(),
             realm_id,
-            node_id: iroh::SecretKey::generate(&mut rand::rng()).public(),
+            node_id: iroh::SecretKey::generate().public(),
             request: PutObjectInput {
                 bucket: "mybucket".to_string(),
                 key: "some-file.txt".to_string(),

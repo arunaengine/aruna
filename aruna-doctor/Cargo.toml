@@ -8,20 +8,20 @@ rust-version.workspace = true
 
 [dependencies]
 ahash = { workspace = true }
-aruna = { path = "../aruna" }
-aruna-core = { path = "../core" }
-aruna-blob = { path = "../blob" }
-aruna-storage = { path = "../storage" }
-aruna-operations = { path = "../operations" }
-aruna-net = { path = "../net" }
-aruna-tasks = { path = "../tasks" }
-aruna-api = { path = "../api" }
+aruna.workspace = true
+aruna-core.workspace = true
+aruna-blob.workspace = true
+aruna-storage.workspace = true
+aruna-operations.workspace = true
+aruna-net.workspace = true
+aruna-tasks.workspace = true
+aruna-api.workspace = true
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 byteview = { workspace = true }
 chrono = { workspace = true }
-clap = { version ="4.6.0", features = ["derive"]}
+clap.workspace = true
 craqle = { workspace = true }
 dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }

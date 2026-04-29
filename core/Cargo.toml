@@ -14,7 +14,7 @@ smallvec = { workspace = true }
 ulid = { workspace = true }
 thiserror = { workspace = true }
 craqle = { workspace = true }
-byteview = "0.10.1"
+byteview.workspace = true
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }

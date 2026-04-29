@@ -1,9 +1,9 @@
 use crate::error::BlobLibError;
 use crate::hash::Hasher;
+use aruna_net::streams::{RecvStream, SendStream};
 use bytes::Bytes;
 use futures::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use iroh_io::{AsyncSliceReader, AsyncSliceWriter, AsyncStreamReader, AsyncStreamWriter};
-use iroh_quinn::{RecvStream, SendStream};
 use opendal::{FuturesAsyncReader, FuturesAsyncWriter, Operator};
 use std::{future::Future, io, time::Duration};
 use tokio::io::AsyncWriteExt as TokioAsyncWriteExt;

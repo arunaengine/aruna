@@ -1103,7 +1103,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
@@ -1135,7 +1135,7 @@ mod tests {
         manifest.current_version_generation = Some(10);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
@@ -1161,7 +1161,7 @@ mod tests {
         manifest.current_version_generation = None;
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1189,7 +1189,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1217,7 +1217,7 @@ mod tests {
         manifest.current_version_generation = Some(1);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
@@ -1245,7 +1245,7 @@ mod tests {
         manifest.current_version = false;
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1270,7 +1270,7 @@ mod tests {
         manifest.current_version_generation = Some(20);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
@@ -1313,7 +1313,7 @@ mod tests {
         manifest.current_version_generation = Some(7);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
@@ -1349,7 +1349,7 @@ mod tests {
         manifest.current_version_generation = Some(7);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1374,7 +1374,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1416,7 +1416,7 @@ mod tests {
         let stream_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1454,7 +1454,7 @@ mod tests {
         let stream_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1495,7 +1495,7 @@ mod tests {
         let stream_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1532,7 +1532,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1560,7 +1560,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1585,7 +1585,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1621,7 +1621,7 @@ mod tests {
         let txn_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1660,7 +1660,7 @@ mod tests {
         let txn_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1710,7 +1710,7 @@ mod tests {
         let txn_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1748,7 +1748,7 @@ mod tests {
         let received = make_location();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );

@@ -8,8 +8,4 @@ pub enum BlobLibError {
     PostcardError(#[from] postcard::Error),
     #[error(transparent)]
     OpenDalError(#[from] opendal::Error),
-    #[error(transparent)]
-    IrohWriteError(#[from] iroh_quinn::WriteError),
-    #[error(transparent)]
-    IrohReadExactError(#[from] iroh_quinn::ReadExactError),
 }

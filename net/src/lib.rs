@@ -21,7 +21,8 @@ use async_trait::async_trait;
 use crossfire::TrySendError;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
-use iroh::{Endpoint, EndpointAddr, RelayMode};
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr};
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -102,12 +103,10 @@ impl std::fmt::Debug for NetHandle {
 
 impl NetHandle {
     pub async fn new(config: NetConfig, storage: StorageHandle) -> Result<Self> {
-        let secret_key = config
-            .secret_key
-            .unwrap_or_else(|| iroh::SecretKey::generate(&mut rand::rng()));
+        let secret_key = config.secret_key.unwrap_or_else(iroh::SecretKey::generate);
 
         let address_lookup = MemoryLookup::new();
-        let mut endpoint_builder = Endpoint::empty_builder(RelayMode::Disabled)
+        let mut endpoint_builder = Endpoint::builder(presets::Minimal)
             .secret_key(secret_key)
             .address_lookup(address_lookup.clone())
             .alpns(vec![

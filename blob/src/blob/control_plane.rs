@@ -2,6 +2,7 @@ use super::{BlobEvent, BlobHandler, ControlPlaneTimeoutKind};
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::errors::BlobError;
 use aruna_core::structs::BackendLocation;
+use aruna_net::streams::{RecvStream, SendStream};
 use std::future::Future;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt};
@@ -37,7 +38,7 @@ where
 }
 
 pub(super) async fn send_replication_message_with_timeout(
-    sender: &mut iroh_quinn::SendStream,
+    sender: &mut SendStream,
     message: ReplicationMessage,
     timeout_duration: Duration,
     action: &'static str,
@@ -57,7 +58,7 @@ pub(super) async fn send_replication_message_with_timeout(
 }
 
 pub(super) async fn read_replication_message_with_timeout(
-    receiver: &mut iroh_quinn::RecvStream,
+    receiver: &mut RecvStream,
     timeout_duration: Duration,
     action: &'static str,
 ) -> Result<ReplicationMessage, BlobEvent> {
@@ -76,7 +77,7 @@ pub(super) async fn read_replication_message_with_timeout(
 }
 
 pub(super) async fn send_framed_message_with_timeout(
-    sender: &mut iroh_quinn::SendStream,
+    sender: &mut SendStream,
     payload: &[u8],
     timeout_duration: Duration,
     action: &'static str,
@@ -100,7 +101,7 @@ pub(super) async fn send_framed_message_with_timeout(
 }
 
 pub(super) async fn read_framed_message_with_timeout(
-    receiver: &mut iroh_quinn::RecvStream,
+    receiver: &mut RecvStream,
     timeout_duration: Duration,
     action: &'static str,
 ) -> Result<Vec<u8>, BlobEvent> {

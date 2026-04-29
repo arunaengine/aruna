@@ -1,12 +1,14 @@
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use iroh::Endpoint;
-use iroh::endpoint::{Connection, RecvStream, SendStream};
+use iroh::endpoint::Connection;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::error::{NetError, Result};
+
+pub use iroh::endpoint::{RecvStream, SendStream};
 
 pub type BiStream = (SendStream, RecvStream);
 
