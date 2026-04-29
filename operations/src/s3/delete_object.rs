@@ -186,14 +186,13 @@ impl DeleteObjectOperation {
             .max_by_key(|(version_id, _)| *version_id)
             .map(|(_, metadata)| metadata);
 
-        match self
+        let replacement_version_id = self
             .latest_remaining
             .as_ref()
             .map(|metadata| metadata.version_id)
-        {
-            Some(version_id) => self.read_current_lookup(version_id),
-            None => self.delete_current_lookup(),
-        }
+            .unwrap_or(target_version_id);
+
+        self.read_current_lookup(replacement_version_id)
     }
 
     fn read_current_lookup(&mut self, version_id: Ulid) -> Effects {
@@ -226,10 +225,29 @@ impl DeleteObjectOperation {
         let Some(version_id) = self.pending_current_version_id.take() else {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
-        if self.input.version_id.is_some() {
-            self.write_current_lookup(version_id, existing.as_ref())
+        if let Some(target_version_id) = self.input.version_id {
+            self.handle_version_delete_current_lookup(target_version_id, existing.as_ref())
         } else {
             self.write_tombstone_current_lookup(version_id, existing.as_ref())
+        }
+    }
+
+    fn handle_version_delete_current_lookup(
+        &mut self,
+        target_version_id: Ulid,
+        existing: Option<&CurrentVersionPointer>,
+    ) -> Effects {
+        if !existing.is_some_and(|pointer| pointer.version_id == target_version_id) {
+            return self.delete_target_version();
+        }
+
+        match self
+            .latest_remaining
+            .as_ref()
+            .map(|metadata| metadata.version_id)
+        {
+            Some(version_id) => self.write_current_lookup(version_id, existing),
+            None => self.delete_current_lookup(),
         }
     }
 
@@ -573,6 +591,172 @@ mod test {
     use std::fs::exists;
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    fn test_user_id() -> aruna_core::UserId {
+        aruna_core::UserId::local(Ulid::new(), RealmId::from_bytes([1u8; 32]))
+    }
+
+    fn deleted_version_value(
+        version_id: Ulid,
+        user_id: aruna_core::UserId,
+    ) -> aruna_core::types::Value {
+        VersionMetadata::deleted(version_id, SystemTime::UNIX_EPOCH, user_id)
+            .to_bytes()
+            .unwrap()
+            .into()
+    }
+
+    fn deleted_version_entry(
+        bucket: &str,
+        key: &str,
+        version_id: Ulid,
+        user_id: aruna_core::UserId,
+    ) -> (aruna_core::types::Key, aruna_core::types::Value) {
+        (
+            VersionKey::new(bucket, key, version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            deleted_version_value(version_id, user_id),
+        )
+    }
+
+    fn version_delete_until_current_lookup(
+        target_version_id: Ulid,
+        all_version_ids: Vec<Ulid>,
+        user_id: aruna_core::UserId,
+    ) -> DeleteObjectOperation {
+        let mut op = DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Some(target_version_id),
+            deleted_by: user_id,
+        });
+
+        let effects = op.start();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
+            txn_id: Ulid::new(),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == S3_VERSION_KEYSPACE
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8].into(),
+            value: Some(deleted_version_value(target_version_id, user_id)),
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == S3_VERSION_KEYSPACE
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::IterResult {
+            values: all_version_ids
+                .into_iter()
+                .map(|version_id| deleted_version_entry("bucket", "key", version_id, user_id))
+                .collect(),
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == S3_CURRENT_VERSION_KEYSPACE
+        ));
+
+        op
+    }
+
+    #[test]
+    fn version_delete_preserves_current_pointer_when_target_is_not_current() {
+        let user_id = test_user_id();
+        let current_version_id = Ulid::from_bytes([1u8; 16]);
+        let target_version_id = Ulid::from_bytes([2u8; 16]);
+        let newer_version_id = Ulid::from_bytes([9u8; 16]);
+        let mut op = version_delete_until_current_lookup(
+            target_version_id,
+            vec![current_version_id, target_version_id, newer_version_id],
+            user_id,
+        );
+        let current_pointer = CurrentVersionPointer::new_with_generation(current_version_id, 20);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: Some(current_pointer.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, DeleteObjectState::DeleteTargetVersion);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+                if key_space == S3_VERSION_KEYSPACE
+        ));
+    }
+
+    #[test]
+    fn version_delete_rewrites_current_pointer_when_target_is_current() {
+        let user_id = test_user_id();
+        let target_version_id = Ulid::from_bytes([1u8; 16]);
+        let fallback_version_id = Ulid::from_bytes([9u8; 16]);
+        let mut op = version_delete_until_current_lookup(
+            target_version_id,
+            vec![target_version_id, fallback_version_id],
+            user_id,
+        );
+        let current_pointer = CurrentVersionPointer::new_with_generation(target_version_id, 20);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: Some(current_pointer.to_bytes().unwrap().into()),
+        }));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected current pointer write");
+        };
+        assert_eq!(key_space, S3_CURRENT_VERSION_KEYSPACE);
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(fallback_version_id, 21)
+        );
+    }
+
+    #[test]
+    fn version_delete_removes_current_pointer_when_current_has_no_fallback() {
+        let user_id = test_user_id();
+        let target_version_id = Ulid::from_bytes([1u8; 16]);
+        let mut op = version_delete_until_current_lookup(
+            target_version_id,
+            vec![target_version_id],
+            user_id,
+        );
+        let current_pointer = CurrentVersionPointer::new_with_generation(target_version_id, 20);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![2u8].into(),
+            value: Some(current_pointer.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, DeleteObjectState::DeleteCurrentLookup);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+                if key_space == S3_CURRENT_VERSION_KEYSPACE
+        ));
+    }
 
     #[tokio::test]
     async fn test_delete_object_tombstone() {
