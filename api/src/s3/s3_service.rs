@@ -479,25 +479,36 @@ async fn refresh_reference_metadata(
                     return Err(err.to_string());
                 }
             };
-            let VersionState::Reference { source, .. } = metadata.state else {
+            let VersionState::Reference {
+                source,
+                last_refresh,
+                ..
+            } = metadata.state
+            else {
                 abort_reference_refresh(&context, txn_id).await;
                 return Ok(());
             };
-            match VersionMetadata::reference(
-                metadata.version_id,
-                source,
-                refresh.metadata,
-                metadata.created_at,
-                metadata.created_by,
-                refresh.refreshed_at,
-            )
-            .to_bytes()
-            {
-                Ok(value) => value,
-                Err(err) => {
-                    abort_reference_refresh(&context, txn_id).await;
-                    return Err(err.to_string());
-                }
+            if refresh.refreshed_at <= last_refresh {
+                None
+            } else {
+                Some(
+                    match VersionMetadata::reference(
+                        metadata.version_id,
+                        source,
+                        refresh.metadata,
+                        metadata.created_at,
+                        metadata.created_by,
+                        refresh.refreshed_at,
+                    )
+                    .to_bytes()
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            abort_reference_refresh(&context, txn_id).await;
+                            return Err(err.to_string());
+                        }
+                    },
+                )
             }
         }
         Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
@@ -514,24 +525,26 @@ async fn refresh_reference_metadata(
         }
     };
 
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
-            key: version_key.into(),
-            value: refreshed_value.into(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => {
-            abort_reference_refresh(&context, txn_id).await;
-            return Err(error.to_string());
-        }
-        other => {
-            abort_reference_refresh(&context, txn_id).await;
-            return Err(format!("unexpected version write event: {other:?}"));
+    if let Some(refreshed_value) = refreshed_value {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: version_key.into(),
+                value: refreshed_value.into(),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                abort_reference_refresh(&context, txn_id).await;
+                return Err(error.to_string());
+            }
+            other => {
+                abort_reference_refresh(&context, txn_id).await;
+                return Err(format!("unexpected version write event: {other:?}"));
+            }
         }
     }
 
@@ -1174,5 +1187,207 @@ impl S3 for ArunaS3Service {
         .ok_or_else(|| s3_error!(InternalError, "Failed to delete bucket replication config"))?;
 
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::structs::{
+        PortableSourceDescriptor, SourceConnectorKind, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_operations::driver::DriverContext;
+    use aruna_storage::storage;
+    use std::collections::HashMap;
+    use std::time::{Duration, UNIX_EPOCH};
+    use tempfile::TempDir;
+    use ulid::Ulid;
+
+    struct TestState {
+        _storage_dir: TempDir,
+        context: Arc<DriverContext>,
+        bucket: String,
+        key: String,
+        version_id: Ulid,
+        created_by: UserId,
+    }
+
+    #[tokio::test]
+    async fn stale_reference_metadata_refresh_does_not_overwrite_newer_cache() {
+        let test = setup_state();
+        let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
+        let original_metadata = source_metadata(10, "original");
+        write_reference_version(&test, original_metadata.clone(), last_refresh).await;
+
+        refresh_reference_metadata(
+            test.context.clone(),
+            refresh(
+                &test,
+                source_metadata(20, "older"),
+                UNIX_EPOCH + Duration::from_secs(10),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_reference_state(&test, &original_metadata, last_refresh).await;
+
+        refresh_reference_metadata(
+            test.context.clone(),
+            refresh(&test, source_metadata(30, "equal"), last_refresh),
+        )
+        .await
+        .unwrap();
+
+        assert_reference_state(&test, &original_metadata, last_refresh).await;
+    }
+
+    #[tokio::test]
+    async fn newer_reference_metadata_refresh_updates_cache() {
+        let test = setup_state();
+        let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
+        let refreshed_at = UNIX_EPOCH + Duration::from_secs(30);
+        let new_metadata = source_metadata(20, "newer");
+        write_reference_version(&test, source_metadata(10, "original"), last_refresh).await;
+
+        refresh_reference_metadata(
+            test.context.clone(),
+            refresh(&test, new_metadata.clone(), refreshed_at),
+        )
+        .await
+        .unwrap();
+
+        assert_reference_state(&test, &new_metadata, refreshed_at).await;
+    }
+
+    fn setup_state() -> TestState {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = aruna_core::structs::RealmId([9u8; 32]);
+
+        TestState {
+            _storage_dir: storage_dir,
+            context,
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::new(),
+            created_by: UserId::local(Ulid::new(), realm_id),
+        }
+    }
+
+    async fn write_reference_version(
+        test: &TestState,
+        cached_metadata: SourceMetadata,
+        last_refresh: SystemTime,
+    ) {
+        let metadata = VersionMetadata::reference(
+            test.version_id,
+            source_binding(),
+            cached_metadata,
+            UNIX_EPOCH,
+            test.created_by,
+            last_refresh,
+        );
+        let event = test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: version_key(test).into(),
+                value: metadata.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn assert_reference_state(
+        test: &TestState,
+        expected_metadata: &SourceMetadata,
+        expected_last_refresh: SystemTime,
+    ) {
+        let event = test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: version_key(test).into(),
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = event
+        else {
+            panic!("unexpected version read event: {event:?}");
+        };
+        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
+        let VersionState::Reference {
+            cached_metadata,
+            last_refresh,
+            ..
+        } = metadata.state
+        else {
+            panic!("version was not a reference");
+        };
+        assert_eq!(cached_metadata, *expected_metadata);
+        assert_eq!(last_refresh, expected_last_refresh);
+    }
+
+    fn refresh(
+        test: &TestState,
+        metadata: SourceMetadata,
+        refreshed_at: SystemTime,
+    ) -> ReferenceMetadataRefresh {
+        ReferenceMetadataRefresh {
+            bucket: test.bucket.clone(),
+            key: test.key.clone(),
+            version_id: test.version_id,
+            metadata,
+            refreshed_at,
+        }
+    }
+
+    fn version_key(test: &TestState) -> Vec<u8> {
+        VersionKey::new(&test.bucket, &test.key, test.version_id)
+            .to_bytes()
+            .unwrap()
+    }
+
+    fn source_metadata(content_length: u64, etag: &str) -> SourceMetadata {
+        SourceMetadata {
+            content_length,
+            content_type: Some("application/octet-stream".to_string()),
+            etag: Some(etag.to_string()),
+            last_modified: Some(UNIX_EPOCH + Duration::from_secs(content_length)),
+            source_version: None,
+        }
+    }
+
+    fn source_binding() -> VersionSourceBinding {
+        VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::new(),
+                source_path: "source/path".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: None,
+        }
     }
 }
