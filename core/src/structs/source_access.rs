@@ -16,6 +16,7 @@ pub enum ResolvedSourceAccess {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedSourceConnector {
     pub connector: SourceConnector,
+    pub secret_fingerprint: Option<[u8; 16]>,
     pub access: ResolvedSourceAccess,
 }
 

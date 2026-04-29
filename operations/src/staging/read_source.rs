@@ -221,6 +221,7 @@ mod tests {
     fn sample_resolved_connector() -> ResolvedSourceConnector {
         ResolvedSourceConnector {
             connector: sample_connector(),
+            secret_fingerprint: None,
             access: ResolvedSourceAccess::OpenDal {
                 kind: SourceConnectorKind::Http,
                 config: HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),

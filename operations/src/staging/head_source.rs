@@ -20,6 +20,7 @@ pub struct HeadStagingSourceInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeadStagingSourceResult {
     pub connector: SourceConnector,
+    pub secret_fingerprint: Option<[u8; 16]>,
     pub metadata: SourceMetadata,
 }
 
@@ -53,6 +54,7 @@ pub struct HeadStagingSourceOperation {
     input: HeadStagingSourceInput,
     state: HeadStagingSourceState,
     connector: Option<SourceConnector>,
+    secret_fingerprint: Option<[u8; 16]>,
     output: Option<Result<HeadStagingSourceResult, HeadStagingSourceError>>,
 }
 
@@ -62,6 +64,7 @@ impl HeadStagingSourceOperation {
             input,
             state: HeadStagingSourceState::Init,
             connector: None,
+            secret_fingerprint: None,
             output: None,
         }
     }
@@ -97,6 +100,7 @@ impl HeadStagingSourceOperation {
                 result: Ok(resolved),
             }) => {
                 self.connector = Some(resolved.connector);
+                self.secret_fingerprint = resolved.secret_fingerprint;
                 self.state = HeadStagingSourceState::HeadSource;
                 smallvec![Effect::StagingSource(StagingSourceEffect::Head {
                     access: resolved.access,
@@ -122,6 +126,7 @@ impl HeadStagingSourceOperation {
                 self.state = HeadStagingSourceState::Finish;
                 self.output = Some(Ok(HeadStagingSourceResult {
                     connector,
+                    secret_fingerprint: self.secret_fingerprint,
                     metadata,
                 }));
                 smallvec![]
@@ -212,6 +217,7 @@ mod tests {
     fn sample_resolved_connector() -> ResolvedSourceConnector {
         ResolvedSourceConnector {
             connector: sample_connector(),
+            secret_fingerprint: None,
             access: ResolvedSourceAccess::OpenDal {
                 kind: SourceConnectorKind::Http,
                 config: HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
@@ -307,6 +313,7 @@ mod tests {
             operation.finalize(),
             Ok(HeadStagingSourceResult {
                 connector: expected_connector,
+                secret_fingerprint: None,
                 metadata: expected_metadata,
             })
         );

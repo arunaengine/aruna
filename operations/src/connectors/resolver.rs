@@ -125,7 +125,7 @@ impl ResolveSourceConnectorOperation {
         let access = match build_source_access(
             connector.kind,
             &connector.public_config,
-            secret.map(|secret| secret.secret_config),
+            secret.clone().map(|secret| secret.secret_config),
             &self.input.source_path,
             None,
         ) {
@@ -134,7 +134,13 @@ impl ResolveSourceConnectorOperation {
         };
 
         self.state = ResolveSourceConnectorState::Finish;
-        self.output = Some(Ok(ResolvedSourceConnector { connector, access }));
+        let secret_fingerprint = secret.as_ref().map(secret_fingerprint);
+
+        self.output = Some(Ok(ResolvedSourceConnector {
+            connector,
+            secret_fingerprint,
+            access,
+        }));
         smallvec![]
     }
 }
@@ -303,6 +309,24 @@ pub(crate) fn build_source_access(
         path: source_path.to_string(),
         version,
     })
+}
+
+pub(crate) fn secret_fingerprint(secret: &aruna_core::structs::SourceConnectorSecret) -> [u8; 16] {
+    let mut entries = secret.secret_config.iter().collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|(key, _)| *key);
+
+    let mut hasher = blake3::Hasher::new();
+    for (key, value) in entries {
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    let hash = hasher.finalize();
+    let mut fingerprint = [0u8; 16];
+    fingerprint.copy_from_slice(&hash.as_bytes()[..16]);
+    fingerprint
 }
 
 pub(crate) fn build_source_access_from_binding(
