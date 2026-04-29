@@ -3,6 +3,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::{
     AuthContext, BackendLocation, MultipartChecksumType, MultipartObjectPart,
     MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
+    VersionSourceBinding,
 };
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
@@ -21,6 +22,7 @@ pub struct VersionReplicationManifest {
     pub current_version_generation: Option<u64>,
     pub auth_context: AuthContext,
     pub blob: Option<MaterializedBlobInfo>,
+    pub source: Option<VersionSourceBinding>,
     pub multipart: Option<MultipartObjectReplicationMetadata>,
 }
 
@@ -116,6 +118,7 @@ mod tests {
                 path_restrictions: None,
             },
             blob: None,
+            source: None,
             multipart: None,
         }
     }

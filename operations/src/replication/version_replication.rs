@@ -719,6 +719,11 @@ impl ReplicateObjectVersionOperation {
         } else {
             None
         };
+        let source = if blob.is_some() {
+            metadata.source_binding().cloned()
+        } else {
+            None
+        };
 
         let multipart =
             self.multipart_summary
@@ -744,6 +749,7 @@ impl ReplicateObjectVersionOperation {
             current_version_generation: current_version_pointer.map(|pointer| pointer.generation),
             auth_context: self.request.auth_context.clone(),
             blob,
+            source,
             multipart,
         });
         Ok(())
@@ -1471,6 +1477,52 @@ mod tests {
     }
 
     #[test]
+    fn manifest_includes_source_binding_for_materialized_version() {
+        let version_id = Ulid::new();
+        let source = reference_metadata(version_id)
+            .source_binding()
+            .cloned()
+            .expect("reference metadata has source");
+        let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
+        op.version_metadata = Some(VersionMetadata::materialized(
+            version_id,
+            materialized_location(),
+            SystemTime::now(),
+            test_user_id(),
+            Some(source.clone()),
+        ));
+
+        op.build_manifest(None).unwrap();
+
+        let manifest = op.manifest.expect("manifest built");
+        assert_eq!(
+            manifest.kind,
+            aruna_core::structs::ReplicationItemKind::Materialized
+        );
+        assert_eq!(manifest.source, Some(source));
+    }
+
+    #[test]
+    fn manifest_omits_source_binding_for_delete_marker() {
+        let version_id = Ulid::new();
+        let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
+        op.version_metadata = Some(VersionMetadata::deleted(
+            version_id,
+            SystemTime::now(),
+            test_user_id(),
+        ));
+
+        op.build_manifest(None).unwrap();
+
+        let manifest = op.manifest.expect("manifest built");
+        assert_eq!(
+            manifest.kind,
+            aruna_core::structs::ReplicationItemKind::DeleteMarker
+        );
+        assert_eq!(manifest.source, None);
+    }
+
+    #[test]
     fn reference_versions_are_skipped_without_replication_manifest() {
         let version_id = Ulid::new();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
@@ -1492,6 +1544,8 @@ mod tests {
     #[test]
     fn on_demand_reference_replication_materializes_before_manifest() {
         let version_id = Ulid::new();
+        let original_metadata = reference_metadata(version_id);
+        let original_source = original_metadata.source_binding().cloned();
         let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
@@ -1500,7 +1554,7 @@ mod tests {
         op.start();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
-            value: Some(reference_metadata(version_id).to_bytes().unwrap().into()),
+            value: Some(original_metadata.to_bytes().unwrap().into()),
         }));
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
 
@@ -1548,6 +1602,13 @@ mod tests {
                 if key_space == S3_CURRENT_VERSION_KEYSPACE
         ));
         assert!(op.version_metadata.as_ref().unwrap().is_materialized());
+        assert_eq!(
+            op.version_metadata.as_ref().unwrap().source_binding(),
+            original_source.as_ref()
+        );
+
+        op.build_manifest(None).unwrap();
+        assert_eq!(op.manifest.as_ref().unwrap().source, original_source);
     }
 
     #[test]

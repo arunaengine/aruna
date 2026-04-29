@@ -449,7 +449,7 @@ impl IncomingVersionReplicationOperation {
                 location,
                 self.manifest.created_at,
                 self.manifest.created_by,
-                None,
+                self.manifest.source.clone(),
             )
             .to_bytes(),
             Ok(Location::Deleted) => VersionMetadata::deleted(
@@ -940,7 +940,8 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
         AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, Location, RealmId,
-        ReplicationItemKind, ReplicationNegotiationResult, VersionMetadata,
+        ReplicationItemKind, ReplicationNegotiationResult, SourceConnectorKind, StagingStrategy,
+        VersionMetadata, VersionSourceBinding,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -1011,7 +1012,26 @@ mod tests {
                 path_restrictions: None,
             },
             blob,
+            source: None,
             multipart: None,
+        }
+    }
+
+    fn make_source_binding() -> VersionSourceBinding {
+        VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: aruna_core::structs::PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://example.org".to_string(),
+                )]),
+                source_path: "dir/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::new()),
         }
     }
 
@@ -1215,6 +1235,30 @@ mod tests {
         let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
         assert_eq!(metadata.version_id, manifest.version_id);
         assert!(metadata.is_deleted());
+    }
+
+    #[test]
+    fn write_version_preserves_manifest_source_binding() {
+        let source = make_source_binding();
+        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+        manifest.source = Some(source.clone());
+        manifest.current_version = false;
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        op.txn_id = Some(Ulid::new());
+        op.existing_blob_location = Some(make_location());
+
+        let effects = op.write_version();
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected version metadata write")
+        };
+        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(metadata.source_binding(), Some(&source));
     }
 
     #[test]
