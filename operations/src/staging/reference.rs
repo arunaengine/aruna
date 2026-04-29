@@ -83,12 +83,32 @@ pub async fn materialize_reference(
 
     let result: Result<(), MaterializeReferenceError> = async {
         let current_key = LookupKey::object(&input.bucket, &input.key).to_bytes()?;
+        let existing_pointer = match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+                key: current_key.clone().into(),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+                .as_ref()
+                .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+                .transpose()?,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(MaterializeReferenceError::Storage(error));
+            }
+            _ => return Err(MaterializeReferenceError::Storage(StorageError::ReadError)),
+        };
         match context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                 key: current_key.into(),
-                value: CurrentVersionPointer::new(version_id).to_bytes()?.into(),
+                value: CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)
+                    .to_bytes()?
+                    .into(),
                 txn_id: Some(txn_id),
             })
             .await

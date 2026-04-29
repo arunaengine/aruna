@@ -23,6 +23,7 @@ pub enum PutObjectState {
     StartTransaction,
     CheckHashLookup,
     CreateHashLookup,
+    ReadObjectLookup,
     CreateObjectLookup,
     CreateVersionRecord,
     CommitTransaction,
@@ -251,6 +252,38 @@ impl PutObjectOperation {
         let Some(_output) = self.get_output().cloned() else {
             return self.emit_error(PutObjectError::MissingOutput);
         };
+
+        self.state = PutObjectState::ReadObjectLookup;
+        let key = match LookupKey::object(
+            self.config.request.bucket.clone(),
+            self.config.request.key.clone(),
+        )
+        .to_bytes()
+        {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        };
+
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_object_lookup_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+
+        let existing = match value
+            .as_ref()
+            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(existing) => existing,
+            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        };
         let version_id = *self.version_id.get_or_insert_with(Ulid::new);
 
         self.state = PutObjectState::CreateObjectLookup;
@@ -263,7 +296,8 @@ impl PutObjectOperation {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
-        let value = match CurrentVersionPointer::new(version_id).to_bytes() {
+        let value = match CurrentVersionPointer::next_for(existing.as_ref(), version_id).to_bytes()
+        {
             Ok(bytes) => bytes.into(),
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
@@ -466,6 +500,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             PutObjectState::CreateHashLookup => self.handle_hash_lookup_created(event),
+            PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
             PutObjectState::CreateObjectLookup => self.handle_object_lookup_created(event),
             PutObjectState::CreateVersionRecord => self.handle_version_record_created(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
@@ -525,7 +560,7 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::effects::StorageEffect;
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         DHT_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
@@ -533,8 +568,8 @@ mod test {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
-        Backend, BackendConfig, CurrentVersionPointer, Location, LookupKey, RealmId, VersionKey,
-        VersionMetadata,
+        Backend, BackendConfig, BackendLocation, CurrentVersionPointer, Location, LookupKey,
+        RealmId, VersionKey, VersionMetadata,
     };
     use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
@@ -663,7 +698,7 @@ mod test {
         };
         assert_eq!(
             CurrentVersionPointer::from_bytes(object_lookup_value.as_ref()).unwrap(),
-            CurrentVersionPointer::new(result.version_id)
+            CurrentVersionPointer::new_with_generation(result.version_id, 1)
         );
 
         let version_prefix = VersionKey::object_prefix("mybucket", "some-file.txt").unwrap();
@@ -833,9 +868,61 @@ mod test {
 
             assert_eq!(
                 CurrentVersionPointer::from_bytes(object_lookup_value.as_ref()).unwrap(),
-                CurrentVersionPointer::new(expected_version_id)
+                CurrentVersionPointer::new_with_generation(expected_version_id, 1)
             );
         }
+    }
+
+    #[test]
+    fn put_object_current_pointer_generation_increments_from_existing_pointer() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            group_id: Ulid::new(),
+            realm_id,
+            node_id: iroh::SecretKey::generate(&mut rand::rng()).public(),
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "some-file.txt".to_string(),
+                content_length: None,
+                body: None,
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+        });
+        let version_id = Ulid::new();
+        op.version_id = Some(version_id);
+        op.output = Some(Ok(BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "path".to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+            created_by: op.config.user_id,
+            created_at: std::time::SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 1,
+            hashes: HashMap::new(),
+        }));
+        op.txn_id = Some(Ulid::new());
+        let existing = CurrentVersionPointer::new_with_generation(Ulid::new(), 4);
+
+        let effects = op.handle_object_lookup_read(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0].into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected current pointer write")
+        };
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(version_id, 5)
+        );
     }
 
     #[tokio::test]

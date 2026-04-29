@@ -699,8 +699,10 @@ impl ReplicateObjectVersionOperation {
             .version_metadata
             .clone()
             .ok_or(ReplicateObjectVersionError::VersionNotFound)?;
-        let current_version =
-            current_lookup.is_some_and(|pointer| pointer.version_id == metadata.version_id);
+        let current_version_pointer = current_lookup
+            .as_ref()
+            .filter(|pointer| pointer.version_id == metadata.version_id);
+        let current_version = current_version_pointer.is_some();
         let blob = if let Some(location) = metadata.materialized_location().cloned() {
             let hash = location
                 .get_blake3()
@@ -739,6 +741,7 @@ impl ReplicateObjectVersionOperation {
             created_at: metadata.created_at,
             created_by: metadata.created_by,
             current_version,
+            current_version_generation: current_version_pointer.map(|pointer| pointer.generation),
             auth_context: self.request.auth_context.clone(),
             blob,
             multipart,
@@ -1101,7 +1104,7 @@ mod tests {
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BucketInfo, MultipartChecksumType,
+        AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, MultipartChecksumType,
         MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
         PortableSourceDescriptor, RealmId, ReplicationNegotiationResult,
         ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
@@ -1444,6 +1447,27 @@ mod tests {
                 actual: 1,
             })
         );
+    }
+
+    #[test]
+    fn manifest_includes_sender_current_pointer_generation() {
+        let version_id = Ulid::new();
+        let generation = 42;
+        let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
+        op.version_metadata = Some(VersionMetadata::deleted(
+            version_id,
+            SystemTime::now(),
+            test_user_id(),
+        ));
+
+        op.build_manifest(Some(CurrentVersionPointer::new_with_generation(
+            version_id, generation,
+        )))
+        .unwrap();
+
+        let manifest = op.manifest.expect("manifest built");
+        assert!(manifest.current_version);
+        assert_eq!(manifest.current_version_generation, Some(generation));
     }
 
     #[test]

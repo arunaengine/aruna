@@ -34,6 +34,7 @@ pub enum CompleteMultipartUploadState {
     ComposeBlob,
     StartFinalizeTransaction,
     WriteHashLookup,
+    ReadObjectLookup,
     WriteObjectLookup,
     WriteVersionRecord,
     WriteObjectMetadata,
@@ -411,12 +412,38 @@ impl CompleteMultipartUploadOperation {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
+        let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
+            Ok(key) => key,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+
+        self.state = CompleteMultipartUploadState::ReadObjectLookup;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_object_lookup_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+        let existing = match value
+            .as_ref()
+            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(existing) => existing,
+            Err(err) => return self.schedule_error(err.into()),
+        };
         let version_id = *self.version_id.get_or_insert_with(Ulid::new);
         let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.schedule_error(err.into()),
         };
-        let value = match CurrentVersionPointer::new(version_id).to_bytes() {
+        let value = match CurrentVersionPointer::next_for(existing.as_ref(), version_id).to_bytes()
+        {
             Ok(value) => value,
             Err(err) => return self.schedule_error(err.into()),
         };
@@ -762,6 +789,7 @@ impl Operation for CompleteMultipartUploadOperation {
                 self.handle_finalize_transaction_started(event)
             }
             CompleteMultipartUploadState::WriteHashLookup => self.handle_hash_lookup_written(event),
+            CompleteMultipartUploadState::ReadObjectLookup => self.handle_object_lookup_read(event),
             CompleteMultipartUploadState::WriteObjectLookup => {
                 self.handle_object_lookup_written(event)
             }

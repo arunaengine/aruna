@@ -18,6 +18,7 @@ pub struct VersionReplicationManifest {
     pub created_at: std::time::SystemTime,
     pub created_by: aruna_core::types::UserId,
     pub current_version: bool,
+    pub current_version_generation: Option<u64>,
     pub auth_context: AuthContext,
     pub blob: Option<MaterializedBlobInfo>,
     pub multipart: Option<MultipartObjectReplicationMetadata>,
@@ -108,6 +109,7 @@ mod tests {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
             current_version: true,
+            current_version_generation: Some(1),
             auth_context: AuthContext {
                 user_id: test_user_id(),
                 realm_id: test_realm_id(),

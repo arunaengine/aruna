@@ -20,6 +20,7 @@ pub enum DeleteObjectState {
     StartTransaction,
     ReadTargetVersion,
     ReadAllVersions,
+    ReadCurrentLookup,
     WriteCurrentLookup,
     DeleteCurrentLookup,
     DeleteTargetVersion,
@@ -71,6 +72,7 @@ pub struct DeleteObjectOperation {
     version_id: Option<Ulid>,
     target_version: Option<VersionMetadata>,
     latest_remaining: Option<VersionMetadata>,
+    pending_current_version_id: Option<Ulid>,
     multipart_part_keys: Vec<Key>,
     multipart_delete_index: usize,
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
@@ -85,6 +87,7 @@ impl DeleteObjectOperation {
             version_id: None,
             target_version: None,
             latest_remaining: None,
+            pending_current_version_id: None,
             multipart_part_keys: Vec::new(),
             multipart_delete_index: 0,
             output: None,
@@ -188,18 +191,59 @@ impl DeleteObjectOperation {
             .as_ref()
             .map(|metadata| metadata.version_id)
         {
-            Some(version_id) => self.write_current_lookup(version_id),
+            Some(version_id) => self.read_current_lookup(version_id),
             None => self.delete_current_lookup(),
         }
     }
 
-    fn write_current_lookup(&mut self, version_id: Ulid) -> Effects {
+    fn read_current_lookup(&mut self, version_id: Ulid) -> Effects {
+        self.pending_current_version_id = Some(version_id);
+        self.state = DeleteObjectState::ReadCurrentLookup;
+        let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(err.into()),
+        };
+
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_current_lookup_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let existing = match value
+            .as_ref()
+            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(existing) => existing,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        let Some(version_id) = self.pending_current_version_id.take() else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        if self.input.version_id.is_some() {
+            self.write_current_lookup(version_id, existing.as_ref())
+        } else {
+            self.write_tombstone_current_lookup(version_id, existing.as_ref())
+        }
+    }
+
+    fn write_current_lookup(
+        &mut self,
+        version_id: Ulid,
+        existing: Option<&CurrentVersionPointer>,
+    ) -> Effects {
         self.state = DeleteObjectState::WriteCurrentLookup;
         let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(err.into()),
         };
-        let value = match CurrentVersionPointer::new(version_id).to_bytes() {
+        let value = match CurrentVersionPointer::next_for(existing, version_id).to_bytes() {
             Ok(value) => value.into(),
             Err(err) => return self.emit_error(err.into()),
         };
@@ -349,12 +393,20 @@ impl DeleteObjectOperation {
     fn write_tombstone(&mut self) -> Effects {
         let version_id = Ulid::new();
         self.version_id = Some(version_id);
+        self.read_current_lookup(version_id)
+    }
+
+    fn write_tombstone_current_lookup(
+        &mut self,
+        version_id: Ulid,
+        existing: Option<&CurrentVersionPointer>,
+    ) -> Effects {
         self.state = DeleteObjectState::WriteTombstone;
         let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(err.into()),
         };
-        let value = match CurrentVersionPointer::new(version_id).to_bytes() {
+        let value = match CurrentVersionPointer::next_for(existing, version_id).to_bytes() {
             Ok(value) => value.into(),
             Err(err) => return self.emit_error(err.into()),
         };
@@ -458,6 +510,7 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::StartTransaction => self.handle_transaction_started(event),
             DeleteObjectState::ReadTargetVersion => self.handle_target_version_read(event),
             DeleteObjectState::ReadAllVersions => self.handle_all_versions_read(event),
+            DeleteObjectState::ReadCurrentLookup => self.handle_current_lookup_read(event),
             DeleteObjectState::WriteCurrentLookup => self.handle_current_lookup_written(event),
             DeleteObjectState::DeleteCurrentLookup => self.handle_current_lookup_deleted(event),
             DeleteObjectState::DeleteTargetVersion => self.handle_target_version_deleted(event),
@@ -619,7 +672,7 @@ mod test {
         };
         assert_eq!(
             CurrentVersionPointer::from_bytes(object_lookup_value.as_ref()).unwrap(),
-            CurrentVersionPointer::new(delete_result.version_id)
+            CurrentVersionPointer::new_with_generation(delete_result.version_id, 2)
         );
 
         let version_prefix = VersionKey::object_prefix("mybucket", "to-delete.txt").unwrap();

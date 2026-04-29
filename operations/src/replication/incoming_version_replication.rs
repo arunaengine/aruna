@@ -31,6 +31,7 @@ enum IncomingVersionReplicationState {
     ReceiveBlob,
     StartTransaction,
     WriteHashLookup,
+    ReadObjectLookup,
     WriteObjectLookup,
     WriteVersion,
     WriteMultipartMetadata,
@@ -61,6 +62,8 @@ pub enum IncomingVersionReplicationError {
     DestinationBucketNotFound,
     #[error("Replication requires WRITE permission on the destination path")]
     WritePermissionDenied,
+    #[error("Current version manifest is missing current pointer generation")]
+    MissingCurrentVersionGeneration,
     #[error("Materialized replication manifest is missing blob info")]
     MissingBlobInfo,
     #[error("Materialized replication manifest is missing local blob location")]
@@ -129,6 +132,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
             IncomingVersionReplicationState::WriteHashLookup => "WriteHashLookup",
+            IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
             IncomingVersionReplicationState::WriteObjectLookup => "WriteObjectLookup",
             IncomingVersionReplicationState::WriteVersion => "WriteVersion",
             IncomingVersionReplicationState::WriteMultipartMetadata => "WriteMultipartMetadata",
@@ -358,6 +362,52 @@ impl IncomingVersionReplicationOperation {
         if !self.manifest.current_version {
             return self.write_version();
         }
+        if self.manifest.current_version_generation.is_none() {
+            return self.fail(IncomingVersionReplicationError::MissingCurrentVersionGeneration);
+        }
+
+        self.state = IncomingVersionReplicationState::ReadObjectLookup;
+        let key = match LookupKey::object(&self.manifest.bucket, &self.manifest.key).to_bytes() {
+            Ok(key) => key,
+            Err(err) => return self.fail(err.into()),
+        };
+
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn write_object_lookup_after_compare(&mut self, existing: Option<&[u8]>) -> Effects {
+        let Some(incoming_generation) = self.manifest.current_version_generation else {
+            return self.write_version();
+        };
+
+        let existing_pointer = match existing.map(CurrentVersionPointer::from_bytes).transpose() {
+            Ok(pointer) => pointer,
+            Err(err) => return self.fail(err.into()),
+        };
+        let should_write = match existing_pointer {
+            Some(pointer)
+                if (incoming_generation, self.manifest.version_id)
+                    > (pointer.generation, pointer.version_id) =>
+            {
+                true
+            }
+            Some(pointer)
+                if (incoming_generation, self.manifest.version_id)
+                    == (pointer.generation, pointer.version_id) =>
+            {
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+
+        if !should_write {
+            return self.write_version();
+        }
 
         self.state = IncomingVersionReplicationState::WriteObjectLookup;
         let key = match LookupKey::object(&self.manifest.bucket, &self.manifest.key).to_bytes() {
@@ -365,10 +415,17 @@ impl IncomingVersionReplicationOperation {
             Err(err) => return self.fail(err.into()),
         };
         let value = match self.version_location() {
-            Ok(_) => match CurrentVersionPointer::new(self.manifest.version_id).to_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => return self.fail(err.into()),
-            },
+            Ok(_) => {
+                match CurrentVersionPointer::new_with_generation(
+                    self.manifest.version_id,
+                    incoming_generation,
+                )
+                .to_bytes()
+                {
+                    Ok(bytes) => bytes,
+                    Err(err) => return self.fail(err.into()),
+                }
+            }
             Err(err) => return self.fail(err),
         };
 
@@ -704,6 +761,16 @@ impl Operation for IncomingVersionReplicationOperation {
                 };
                 self.write_object_lookup_or_continue()
             }
+            IncomingVersionReplicationState::ReadObjectLookup => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                self.write_object_lookup_after_compare(value.as_deref())
+            }
             IncomingVersionReplicationState::WriteObjectLookup => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
@@ -869,10 +936,11 @@ mod tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::AuthorizationError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+    use aruna_core::keyspaces::{S3_CURRENT_VERSION_KEYSPACE, S3_VERSION_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BucketInfo, Location, RealmId, ReplicationItemKind,
-        ReplicationNegotiationResult, VersionMetadata,
+        AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, Location, RealmId,
+        ReplicationItemKind, ReplicationNegotiationResult, VersionMetadata,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -936,6 +1004,7 @@ mod tests {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
             current_version: true,
+            current_version_generation: Some(1),
             auth_context: AuthContext {
                 user_id: test_user_id(),
                 realm_id: test_realm_id(),
@@ -994,6 +1063,21 @@ mod tests {
         effects.remove(0)
     }
 
+    fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
+        let txn_id = Ulid::new();
+        op.state = IncomingVersionReplicationState::StartTransaction;
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn_id, .. })]
+                if key_space == S3_CURRENT_VERSION_KEYSPACE && *read_txn_id == Some(txn_id)
+        ));
+        txn_id
+    }
+
     #[test]
     fn existing_version_does_not_short_circuit_apply() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
@@ -1022,6 +1106,222 @@ mod tests {
         assert!(matches!(
             effects[0],
             Effect::Storage(StorageEffect::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_current_pointer_update_skips_current_pointer_overwrite() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.current_version_generation = Some(10);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        let txn_id = start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::new(), 20);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::WriteVersion);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, txn_id: write_txn_id, .. })]
+                if key_space == S3_VERSION_KEYSPACE && *write_txn_id == Some(txn_id)
+        ));
+    }
+
+    #[test]
+    fn current_manifest_without_pointer_generation_rejects_apply() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.current_version_generation = None;
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        let txn_id = Ulid::new();
+        op.state = IncomingVersionReplicationState::StartTransaction;
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            &op.output,
+            Some(Err(
+                IncomingVersionReplicationError::MissingCurrentVersionGeneration
+            ))
+        ));
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+    }
+
+    #[test]
+    fn unparsable_existing_current_pointer_rejects_apply() {
+        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        start_apply_transaction(&mut op);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(vec![255, 255, 255].into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            &op.output,
+            Some(Err(IncomingVersionReplicationError::ConversionError(_)))
+        ));
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+    }
+
+    #[test]
+    fn stale_current_pointer_update_still_writes_version_metadata() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.current_version_generation = Some(1);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::new(), 2);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected version metadata write")
+        };
+        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(metadata.version_id, manifest.version_id);
+        assert!(metadata.is_deleted());
+    }
+
+    #[test]
+    fn newer_current_pointer_generation_allows_rollback_to_older_version_id() {
+        let existing_version_id = Ulid::from_bytes([9u8; 16]);
+        let incoming_version_id = Ulid::from_bytes([1u8; 16]);
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.version_id = incoming_version_id;
+        manifest.current_version_generation = Some(20);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        let txn_id = start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 10);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                value,
+                txn_id: write_txn_id,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected current pointer write")
+        };
+        assert_eq!(key_space, S3_CURRENT_VERSION_KEYSPACE);
+        assert_eq!(*write_txn_id, Some(txn_id));
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(
+                incoming_version_id,
+                manifest.current_version_generation.unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn same_generation_higher_ulid_overwrites_current_pointer() {
+        let existing_version_id = Ulid::from_bytes([1u8; 16]);
+        let incoming_version_id = Ulid::from_bytes([9u8; 16]);
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.version_id = incoming_version_id;
+        manifest.current_version_generation = Some(7);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 7);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected current pointer write")
+        };
+        assert_eq!(key_space, S3_CURRENT_VERSION_KEYSPACE);
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(incoming_version_id, 7)
+        );
+    }
+
+    #[test]
+    fn same_generation_lower_ulid_skips_current_pointer_overwrite() {
+        let existing_version_id = Ulid::from_bytes([9u8; 16]);
+        let incoming_version_id = Ulid::from_bytes([1u8; 16]);
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.version_id = incoming_version_id;
+        manifest.current_version_generation = Some(7);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 7);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::WriteVersion);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == S3_VERSION_KEYSPACE
         ));
     }
 

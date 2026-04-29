@@ -274,11 +274,31 @@ impl Location {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CurrentVersionPointer {
     pub version_id: Ulid,
+    pub generation: u64,
 }
 
 impl CurrentVersionPointer {
     pub fn new(version_id: Ulid) -> Self {
-        Self { version_id }
+        Self {
+            version_id,
+            generation: 1,
+        }
+    }
+
+    pub fn new_with_generation(version_id: Ulid, generation: u64) -> Self {
+        Self {
+            version_id,
+            generation,
+        }
+    }
+
+    pub fn next_for(existing: Option<&Self>, version_id: Ulid) -> Self {
+        Self::new_with_generation(
+            version_id,
+            existing
+                .map(|pointer| pointer.generation.saturating_add(1))
+                .unwrap_or(1),
+        )
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -421,8 +441,8 @@ mod tests {
     use ulid::Ulid;
 
     #[test]
-    fn current_version_pointer_roundtrip_preserves_version_id() {
-        let pointer = CurrentVersionPointer::new(Ulid::from_bytes([7u8; 16]));
+    fn current_version_pointer_roundtrip_preserves_fields() {
+        let pointer = CurrentVersionPointer::new_with_generation(Ulid::from_bytes([7u8; 16]), 42);
 
         let restored = CurrentVersionPointer::from_bytes(&pointer.to_bytes().unwrap()).unwrap();
 
