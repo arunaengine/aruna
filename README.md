@@ -182,7 +182,7 @@ For a ready-made local multi-node onboarding flow, use `just test-deploy` instea
 
 ## S3 Access
 
-Aruna's S3 interface is authenticated. Create S3 credentials before using the endpoint, then point your AWS CLI or S3-compatible client at the node. For credential creation and a fuller S3 walkthrough, see the Aruna documentation: <https://docs.aruna-engine.org/latest/>.
+Aruna's S3 interface is authenticated. Create S3 credentials via [the API](http://127.0.0.1:3000/swagger-ui/#/credentials) before using the endpoint, then point your AWS CLI or S3-compatible client at the node.
 
 ```bash
 export AWS_ACCESS_KEY_ID=...
