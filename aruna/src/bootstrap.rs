@@ -16,7 +16,7 @@ use aruna_operations::create_onboarding_secret::{
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::outgoing_automerge::OutgoingAutomergeOperation;
 use byteview::ByteView;
-use rand::RngCore;
+use rand::Rng;
 
 pub async fn realm_bootstrap_exists(
     driver_ctx: &DriverContext,

@@ -443,8 +443,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_target(bucket: &str) -> BucketReplicationTarget {
-        let mut rng = rand::rng();
-        let node_id = iroh::SecretKey::generate(&mut rng).public();
+        let node_id = iroh::SecretKey::generate().public();
         BucketReplicationTarget {
             node_id,
             realm_id: RealmId::from_bytes([9u8; 32]),
