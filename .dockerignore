@@ -1,0 +1,5 @@
+.git
+target
+.env
+**/.env
+.compose-data

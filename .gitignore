@@ -1,4 +1,5 @@
 target/
+.compose-data/
 .idea
 .env
 **/.env

@@ -1,5 +1,11 @@
-test-deploy:
-	bash scripts/test_deploy.sh
+local:
+	bash scripts/local_deploy.sh
 
-test-deploy-oidc:
-	bash scripts/test_deploy.sh --with-keycloak
+local-new:
+	bash scripts/local_deploy.sh --new
+
+local-cluster:
+	bash scripts/local_cluster_deploy.sh
+
+local-cluster-oidc:
+	bash scripts/local_cluster_deploy.sh --with-keycloak
