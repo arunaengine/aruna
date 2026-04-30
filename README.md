@@ -1,5 +1,8 @@
 # Aruna
 
+> [!WARNING]
+> Work in progress. Interfaces, behavior, and deployment details may still change.
+
 Aruna is a federated peer-to-peer data orchestration network for organizations that need to share data without handing control to a central platform. It connects sovereign data sources into a unified mesh where each participant keeps ownership of its data while making selected data discoverable and accessible across organizational boundaries.
 
 Each Aruna node exposes an S3 endpoint and REST API, federates with peer nodes over encrypted connections, and keeps metadata synchronized with gossip and CRDTs. The network has no central coordinator and scales horizontally as new nodes join.
@@ -32,14 +35,29 @@ Aruna's blob layer builds on [OpenDAL](https://opendal.apache.org/). The default
 
 Aruna runs as a single binary and stores local state in an embedded LSM database ([fjall](https://github.com/fjall-rs/fjall)). When launched from this repository, configuration is provided through a repo-root `.env` file.
 
-## Roadmap
+### Distributed full-text search
 
-- **Distributed full-text search** with per-node Tantivy indexes, fan-out queries, and authorization-filtered results
-- **Policy engine** using CEL expressions for constraint enforcement (upload size limits, file type restrictions, archival locks) that sync across nodes
-- **Compute orchestration** through a GA4GH TES/DRS interface with data-locality-aware scheduling, automatic provenance tracking (RO-Crate Process Runs), and pluggable execution backends (Docker, Kubernetes, SLURM)
-- **Event subscriptions** on path patterns with optional CEL filters and automated actions (webhooks, compute triggers, replication rules)
-- **Transparent request forwarding** so any node can serve as entry point for any resource in the realm, with single-hop DHT-based discovery
-- **Cross-realm data exchange** building on the already cross-realm-capable DHT layer
+Aruna is expanding toward distributed full-text search with per-node Tantivy indexes, fan-out queries, and authorization-filtered results.
+
+### Policy engine
+
+Aruna is adding a CEL-based policy engine for constraint enforcement such as upload size limits, file type restrictions, and archival locks that synchronize across nodes.
+
+### Compute orchestration
+
+Aruna is growing toward GA4GH TES/DRS-based compute orchestration with data-locality-aware scheduling, automatic provenance tracking through RO-Crate Process Runs, and pluggable execution backends such as Docker, Kubernetes, and SLURM.
+
+### Event subscriptions
+
+Aruna is adding path-based event subscriptions with optional CEL filters and automated actions such as webhooks, compute triggers, and replication rules.
+
+### Transparent request forwarding
+
+Aruna is working toward transparent request forwarding so any node can serve as an entry point for any resource in the realm, backed by single-hop DHT-based discovery.
+
+### Cross-realm data exchange
+
+Aruna is extending its cross-realm-capable DHT foundations toward direct cross-realm data exchange.
 
 ## Getting Started
 
