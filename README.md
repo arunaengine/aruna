@@ -45,7 +45,15 @@ Aruna is adding a CEL-based policy engine for constraint enforcement such as upl
 
 ### Compute orchestration
 
-Aruna is growing toward GA4GH TES/DRS-based compute orchestration with data-locality-aware scheduling, automatic provenance tracking through RO-Crate Process Runs, and pluggable execution backends such as Docker, Kubernetes, and SLURM.
+Aruna is growing toward GA4GH Task Execution Service (TES)-based compute orchestration with data-locality-aware scheduling, automatic provenance tracking through RO-Crate Process Runs, and pluggable execution backends such as Docker, Kubernetes, and SLURM.
+
+### GA4GH DRS interoperability
+
+Aruna is adding GA4GH Data Repository Service (DRS) endpoints so datasets and objects can be referenced through stable, workflow-friendly identifiers and resolved into access methods without depending on Aruna-specific URLs. This gives external workflow engines and future TES integrations a standard way to locate Aruna-managed data.
+
+### OAI-PMH metadata harvesting
+
+Aruna is adding OAI-PMH support so external catalogs, aggregators, and repository portals can harvest Aruna metadata incrementally. This provides a standards-based export path for Aruna's RO-Crate-backed metadata while keeping native synchronization and conflict resolution inside the Aruna network.
 
 ### Event subscriptions
 
