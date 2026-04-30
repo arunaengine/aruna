@@ -28,6 +28,7 @@ services:
       start_period: 5s
     restart: unless-stopped
   aruna:
+    image: aruna:latest
     build:
       context: ..
     depends_on:
@@ -35,6 +36,6 @@ services:
         condition: service_healthy
     network_mode: host
     volumes:
-      - ${ARUNA_COMPOSE_DATA_DIR:-../target/compose/node/storage}:/data
+      - ${ARUNA_COMPOSE_DATA_DIR:-../target/node/storage}:/data
       - ./compose.aruna.env:/run/.env:ro
     restart: unless-stopped
