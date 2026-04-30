@@ -9,9 +9,9 @@ rust-version.workspace = true
 [dependencies]
 fjall = { workspace = true }
 thiserror = { workspace = true }
-crossfire.workspace = true
-aruna-core.workspace = true
+crossfire = { workspace = true }
+aruna-core = { workspace = true }
 ulid = { workspace = true }
-byteview.workspace = true
+byteview = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }

@@ -8,40 +8,40 @@ rust-version.workspace = true
 
 [dependencies]
 # Aruna modules
-aruna-api.workspace = true
-aruna-blob.workspace = true
-aruna-core.workspace = true
-aruna-net.workspace = true
-aruna-operations.workspace = true
-aruna-storage.workspace = true
-aruna-tasks.workspace = true
+aruna-api = { workspace = true }
+aruna-blob = { workspace = true }
+aruna-core = { workspace = true }
+aruna-net = { workspace = true }
+aruna-operations = { workspace = true }
+aruna-storage = { workspace = true }
+aruna-tasks = { workspace = true }
 
 # The rest
-base64.workspace = true
-blake3.workspace = true
-crypto_box.workspace = true
-dotenvy.workspace = true
-ed25519-dalek.workspace = true
-iroh.workspace = true
-jsonwebtoken.workspace = true
-opentelemetry.workspace = true
-opentelemetry-otlp.workspace = true
-opentelemetry_sdk.workspace = true
-postcard.workspace = true
-reqwest.workspace = true
-serde.workspace = true
-thiserror.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-opentelemetry.workspace = true
-tracing-subscriber.workspace = true
-ulid.workspace = true
-byteview.workspace = true
-rand.workspace = true
+base64 = { workspace = true }
+blake3 = { workspace = true }
+crypto_box = { workspace = true }
+dotenvy = { workspace = true }
+ed25519-dalek = { workspace = true }
+iroh = { workspace = true }
+jsonwebtoken = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+postcard = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-subscriber = { workspace = true }
+ulid = { workspace = true }
+byteview = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
-axum.workspace = true
-aws-sdk-s3.workspace = true
-tempfile.workspace = true
-serde_json.workspace = true
-chrono.workspace = true
+axum = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }

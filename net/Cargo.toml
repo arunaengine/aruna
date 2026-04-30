@@ -7,8 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-aruna-core.workspace = true
-aruna-storage.workspace = true
+aruna-core = { workspace = true }
+aruna-storage = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 tokio = { workspace = true }
@@ -21,13 +21,13 @@ serde = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
-byteview.workspace = true
+byteview = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 smallvec = { workspace = true }
-crossfire.workspace = true
+crossfire = { workspace = true }
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true }
 tempfile = { workspace = true }
 ulid = { workspace = true }
