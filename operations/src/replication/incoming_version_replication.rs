@@ -6,14 +6,14 @@ use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-    S3_VERSION_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BucketInfo, Location, LookupKey, MultipartObjectMetadataKey,
-    Permission, RealmId, ReplicationItemKind, ReplicationNegotiationResult, VersionKey,
-    VersionMetadata,
+    AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, Location, LookupKey,
+    MultipartObjectMetadataKey, Permission, RealmId, ReplicationItemKind,
+    ReplicationNegotiationResult, VersionKey, VersionMetadata,
 };
 use aruna_core::types::{Effects, NodeId};
 use smallvec::smallvec;
@@ -31,6 +31,7 @@ enum IncomingVersionReplicationState {
     ReceiveBlob,
     StartTransaction,
     WriteHashLookup,
+    ReadObjectLookup,
     WriteObjectLookup,
     WriteVersion,
     WriteMultipartMetadata,
@@ -61,10 +62,18 @@ pub enum IncomingVersionReplicationError {
     DestinationBucketNotFound,
     #[error("Replication requires WRITE permission on the destination path")]
     WritePermissionDenied,
+    #[error("Current version manifest is missing current pointer generation")]
+    MissingCurrentVersionGeneration,
     #[error("Materialized replication manifest is missing blob info")]
     MissingBlobInfo,
     #[error("Materialized replication manifest is missing local blob location")]
     MissingBlobLocation,
+    #[error("Replicated blob hash does not match manifest")]
+    BlobHashMismatch,
+    #[error("Replicated blob size does not match manifest")]
+    BlobSizeMismatch,
+    #[error("Replicated blob storage flags do not match manifest")]
+    BlobStorageFlagsMismatch,
     #[error("Unexpected event in state {state}: expected {expected}, got {received:?}")]
     InvalidStateEvent {
         state: &'static str,
@@ -123,6 +132,7 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
             IncomingVersionReplicationState::WriteHashLookup => "WriteHashLookup",
+            IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
             IncomingVersionReplicationState::WriteObjectLookup => "WriteObjectLookup",
             IncomingVersionReplicationState::WriteVersion => "WriteVersion",
             IncomingVersionReplicationState::WriteMultipartMetadata => "WriteMultipartMetadata",
@@ -294,6 +304,32 @@ impl IncomingVersionReplicationOperation {
         }
     }
 
+    fn validate_materialized_location(
+        &self,
+        location: &BackendLocation,
+    ) -> Result<(), IncomingVersionReplicationError> {
+        let blob = self
+            .manifest
+            .blob
+            .as_ref()
+            .ok_or(IncomingVersionReplicationError::MissingBlobInfo)?;
+        let blake3 = location
+            .get_blake3()
+            .ok_or(IncomingVersionReplicationError::MissingBlobLocation)?;
+
+        if blake3 != blob.hash {
+            return Err(IncomingVersionReplicationError::BlobHashMismatch);
+        }
+        if location.blob_size != blob.size {
+            return Err(IncomingVersionReplicationError::BlobSizeMismatch);
+        }
+        if location.compressed != blob.compressed || location.encrypted != blob.encrypted {
+            return Err(IncomingVersionReplicationError::BlobStorageFlagsMismatch);
+        }
+
+        Ok(())
+    }
+
     fn write_hash_lookup_or_continue(&mut self) -> Effects {
         if self.received_blob_location.is_none() {
             return self.write_object_lookup_or_continue();
@@ -303,6 +339,9 @@ impl IncomingVersionReplicationOperation {
             Ok(location) => location,
             Err(err) => return self.fail(err),
         };
+        if let Err(err) = self.validate_materialized_location(&location) {
+            return self.fail(err);
+        }
         let blake3 = location
             .get_blake3()
             .map(|hash| hash.to_vec())
@@ -323,6 +362,52 @@ impl IncomingVersionReplicationOperation {
         if !self.manifest.current_version {
             return self.write_version();
         }
+        if self.manifest.current_version_generation.is_none() {
+            return self.fail(IncomingVersionReplicationError::MissingCurrentVersionGeneration);
+        }
+
+        self.state = IncomingVersionReplicationState::ReadObjectLookup;
+        let key = match LookupKey::object(&self.manifest.bucket, &self.manifest.key).to_bytes() {
+            Ok(key) => key,
+            Err(err) => return self.fail(err.into()),
+        };
+
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn write_object_lookup_after_compare(&mut self, existing: Option<&[u8]>) -> Effects {
+        let Some(incoming_generation) = self.manifest.current_version_generation else {
+            return self.write_version();
+        };
+
+        let existing_pointer = match existing.map(CurrentVersionPointer::from_bytes).transpose() {
+            Ok(pointer) => pointer,
+            Err(err) => return self.fail(err.into()),
+        };
+        let should_write = match existing_pointer {
+            Some(pointer)
+                if (incoming_generation, self.manifest.version_id)
+                    > (pointer.generation, pointer.version_id) =>
+            {
+                true
+            }
+            Some(pointer)
+                if (incoming_generation, self.manifest.version_id)
+                    == (pointer.generation, pointer.version_id) =>
+            {
+                true
+            }
+            Some(_) => false,
+            None => true,
+        };
+
+        if !should_write {
+            return self.write_version();
+        }
 
         self.state = IncomingVersionReplicationState::WriteObjectLookup;
         let key = match LookupKey::object(&self.manifest.bucket, &self.manifest.key).to_bytes() {
@@ -330,15 +415,22 @@ impl IncomingVersionReplicationOperation {
             Err(err) => return self.fail(err.into()),
         };
         let value = match self.version_location() {
-            Ok(location) => match location.to_bytes() {
-                Ok(bytes) => bytes,
-                Err(err) => return self.fail(err.into()),
-            },
+            Ok(_) => {
+                match CurrentVersionPointer::new_with_generation(
+                    self.manifest.version_id,
+                    incoming_generation,
+                )
+                .to_bytes()
+                {
+                    Ok(bytes) => bytes,
+                    Err(err) => return self.fail(err.into()),
+                }
+            }
             Err(err) => return self.fail(err),
         };
 
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
             key: key.into(),
             value: value.into(),
             txn_id: self.txn_id,
@@ -351,17 +443,23 @@ impl IncomingVersionReplicationOperation {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
-        let value = match (VersionMetadata {
-            version_id: self.manifest.version_id,
-            location: match self.version_location() {
-                Ok(location) => location,
-                Err(err) => return self.fail(err),
-            },
-            created_at: self.manifest.created_at,
-            created_by: self.manifest.created_by,
-        })
-        .to_bytes()
-        {
+        let value = match match self.version_location() {
+            Ok(Location::Real(location)) => VersionMetadata::materialized(
+                self.manifest.version_id,
+                location,
+                self.manifest.created_at,
+                self.manifest.created_by,
+                self.manifest.source.clone(),
+            )
+            .to_bytes(),
+            Ok(Location::Deleted) => VersionMetadata::deleted(
+                self.manifest.version_id,
+                self.manifest.created_at,
+                self.manifest.created_by,
+            )
+            .to_bytes(),
+            Err(err) => return self.fail(err),
+        } {
             Ok(value) => value,
             Err(err) => return self.fail(err.into()),
         };
@@ -563,18 +661,13 @@ impl Operation for IncomingVersionReplicationOperation {
                 }
             }
             IncomingVersionReplicationState::ReadExistingVersion => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                let Event::Storage(StorageEvent::ReadResult { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
-
-                if value.is_some() {
-                    return self
-                        .send_negotiation(ReplicationNegotiationResult::AlreadyReplicatedVersion);
-                }
 
                 match self.manifest.kind {
                     ReplicationItemKind::DeleteMarker => {
@@ -595,6 +688,11 @@ impl Operation for IncomingVersionReplicationOperation {
                 if let Some(value) = value {
                     match Location::from_bytes(value.as_ref()) {
                         Ok(Location::Real(location)) => {
+                            if self.validate_materialized_location(&location).is_err() {
+                                return self.send_negotiation(
+                                    ReplicationNegotiationResult::NeedBlobAndVersion,
+                                );
+                            }
                             self.existing_blob_location = Some(location);
                             self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
                         }
@@ -633,6 +731,11 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                if let Err(err) = self.validate_materialized_location(&location) {
+                    self.received_blob_location = Some(location.clone());
+                    self.cleanup_blob_location = Some(location);
+                    return self.fail(err);
+                }
                 self.received_blob_location = Some(location.clone());
                 self.cleanup_blob_location = Some(location);
                 self.start_transaction()
@@ -657,6 +760,16 @@ impl Operation for IncomingVersionReplicationOperation {
                     });
                 };
                 self.write_object_lookup_or_continue()
+            }
+            IncomingVersionReplicationState::ReadObjectLookup => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                self.write_object_lookup_after_compare(value.as_deref())
             }
             IncomingVersionReplicationState::WriteObjectLookup => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
@@ -823,10 +936,12 @@ mod tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::AuthorizationError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
+    use aruna_core::keyspaces::{S3_CURRENT_VERSION_KEYSPACE, S3_VERSION_KEYSPACE};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BucketInfo, Location, RealmId, ReplicationItemKind,
-        ReplicationNegotiationResult, VersionMetadata,
+        AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, Location, RealmId,
+        ReplicationItemKind, ReplicationNegotiationResult, SourceConnectorKind, StagingStrategy,
+        VersionMetadata, VersionSourceBinding,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -890,13 +1005,33 @@ mod tests {
             created_at: SystemTime::now(),
             created_by: test_user_id(),
             current_version: true,
+            current_version_generation: Some(1),
             auth_context: AuthContext {
                 user_id: test_user_id(),
                 realm_id: test_realm_id(),
                 path_restrictions: None,
             },
             blob,
+            source: None,
             multipart: None,
+        }
+    }
+
+    fn make_source_binding() -> VersionSourceBinding {
+        VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: aruna_core::structs::PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://example.org".to_string(),
+                )]),
+                source_path: "dir/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::new()),
         }
     }
 
@@ -948,36 +1083,369 @@ mod tests {
         effects.remove(0)
     }
 
+    fn start_apply_transaction(op: &mut IncomingVersionReplicationOperation) -> Ulid {
+        let txn_id = Ulid::new();
+        op.state = IncomingVersionReplicationState::StartTransaction;
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn_id, .. })]
+                if key_space == S3_CURRENT_VERSION_KEYSPACE && *read_txn_id == Some(txn_id)
+        ));
+        txn_id
+    }
+
     #[test]
-    fn existing_version_short_circuits_with_already_replicated_response() {
+    fn existing_version_does_not_short_circuit_apply() {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest.clone(),
         );
 
         let _effects = advance_to_version_lookup(&mut op, Ulid::new());
 
-        let version = VersionMetadata {
-            version_id: manifest.version_id,
-            location: Location::Real(make_location()),
-            created_at: manifest.created_at,
-            created_by: manifest.created_by,
-        };
+        let version = VersionMetadata::materialized(
+            manifest.version_id,
+            make_location(),
+            manifest.created_at,
+            manifest.created_by,
+            None,
+        );
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(version.to_bytes().unwrap().into()),
         }));
-        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Read { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_current_pointer_update_skips_current_pointer_overwrite() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.current_version_generation = Some(10);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        let txn_id = start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::new(), 20);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::WriteVersion);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, txn_id: write_txn_id, .. })]
+                if key_space == S3_VERSION_KEYSPACE && *write_txn_id == Some(txn_id)
+        ));
+    }
+
+    #[test]
+    fn current_manifest_without_pointer_generation_rejects_apply() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.current_version_generation = None;
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        let txn_id = Ulid::new();
+        op.state = IncomingVersionReplicationState::StartTransaction;
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
+
+        let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            &op.output,
+            Some(Err(
+                IncomingVersionReplicationError::MissingCurrentVersionGeneration
+            ))
+        ));
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+    }
+
+    #[test]
+    fn unparsable_existing_current_pointer_rejects_apply() {
+        let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        start_apply_transaction(&mut op);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(vec![255, 255, 255].into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            &op.output,
+            Some(Err(IncomingVersionReplicationError::ConversionError(_)))
+        ));
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+    }
+
+    #[test]
+    fn stale_current_pointer_update_still_writes_version_metadata() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.current_version_generation = Some(1);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(Ulid::new(), 2);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected version metadata write")
+        };
+        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(metadata.version_id, manifest.version_id);
+        assert!(metadata.is_deleted());
+    }
+
+    #[test]
+    fn write_version_preserves_manifest_source_binding() {
+        let source = make_source_binding();
+        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+        manifest.source = Some(source.clone());
+        manifest.current_version = false;
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        op.txn_id = Some(Ulid::new());
+        op.existing_blob_location = Some(make_location());
+
+        let effects = op.write_version();
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected version metadata write")
+        };
+        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(metadata.source_binding(), Some(&source));
+    }
+
+    #[test]
+    fn newer_current_pointer_generation_allows_rollback_to_older_version_id() {
+        let existing_version_id = Ulid::from_bytes([9u8; 16]);
+        let incoming_version_id = Ulid::from_bytes([1u8; 16]);
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.version_id = incoming_version_id;
+        manifest.current_version_generation = Some(20);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        let txn_id = start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 10);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                value,
+                txn_id: write_txn_id,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected current pointer write")
+        };
+        assert_eq!(key_space, S3_CURRENT_VERSION_KEYSPACE);
+        assert_eq!(*write_txn_id, Some(txn_id));
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(
+                incoming_version_id,
+                manifest.current_version_generation.unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn same_generation_higher_ulid_overwrites_current_pointer() {
+        let existing_version_id = Ulid::from_bytes([1u8; 16]);
+        let incoming_version_id = Ulid::from_bytes([9u8; 16]);
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.version_id = incoming_version_id;
+        manifest.current_version_generation = Some(7);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 7);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected current pointer write")
+        };
+        assert_eq!(key_space, S3_CURRENT_VERSION_KEYSPACE);
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(incoming_version_id, 7)
+        );
+    }
+
+    #[test]
+    fn same_generation_lower_ulid_skips_current_pointer_overwrite() {
+        let existing_version_id = Ulid::from_bytes([9u8; 16]);
+        let incoming_version_id = Ulid::from_bytes([1u8; 16]);
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.version_id = incoming_version_id;
+        manifest.current_version_generation = Some(7);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        start_apply_transaction(&mut op);
+        let existing_pointer = CurrentVersionPointer::new_with_generation(existing_version_id, 7);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(existing_pointer.to_bytes().unwrap().into()),
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::WriteVersion);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Write { key_space, .. })]
+                if key_space == S3_VERSION_KEYSPACE
+        ));
+    }
+
+    #[test]
+    fn existing_blob_with_manifest_mismatch_requests_blob_transfer() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+
+        let _effects = advance_to_version_lookup(&mut op, Ulid::new());
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Read { .. })
+        ));
+
+        let mut mismatched_location = make_location();
+        mismatched_location.blob_size += 1;
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: Some(
+                Location::Real(mismatched_location)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         assert!(matches!(
             message_from_effect(&effects[0]),
             VersionReplicationMessage::VersionNegotiationResponse(
-                aruna_core::structs::ReplicationNegotiationResult::AlreadyReplicatedVersion
+                aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion
             )
         ));
+    }
+
+    #[test]
+    fn received_blob_manifest_mismatch_is_rejected_and_cleaned_up() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let stream_id = Ulid::new();
+        let mut op = IncomingVersionReplicationOperation::new(
+            stream_id,
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+        let mut mismatched_location = make_location();
+        mismatched_location.blob_size += 1;
+
+        op.negotiation_result = Some(ReplicationNegotiationResult::NeedBlobAndVersion);
+        op.state = IncomingVersionReplicationState::ReceiveBlob;
+
+        let effects = op.step(Event::Blob(BlobEvent::ReplicationFinished {
+            location: mismatched_location.clone(),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::SendApplyRejected);
+        assert!(matches!(
+            message_from_effect(&effects[0]),
+            VersionReplicationMessage::VersionApplyRejected(_)
+        ));
+
+        let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+        assert_eq!(
+            op.state,
+            IncomingVersionReplicationState::CleanupReceivedBlob
+        );
+        assert_eq!(
+            effects[0],
+            Effect::Blob(BlobEffect::Delete {
+                location: mismatched_location
+            })
+        );
     }
 
     #[test]
@@ -986,7 +1454,7 @@ mod tests {
         let stream_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1027,7 +1495,7 @@ mod tests {
         let stream_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1064,7 +1532,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1092,7 +1560,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::DeleteMarker);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1117,7 +1585,7 @@ mod tests {
         let manifest = make_manifest(ReplicationItemKind::Materialized);
         let mut op = IncomingVersionReplicationOperation::new(
             Ulid::new(),
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1153,7 +1621,7 @@ mod tests {
         let txn_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1192,7 +1660,7 @@ mod tests {
         let txn_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1242,7 +1710,7 @@ mod tests {
         let txn_id = Ulid::new();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );
@@ -1280,7 +1748,7 @@ mod tests {
         let received = make_location();
         let mut op = IncomingVersionReplicationOperation::new(
             stream_id,
-            iroh::SecretKey::generate(&mut rand::rng()).public(),
+            iroh::SecretKey::generate().public(),
             RealmId::from_bytes([7u8; 32]),
             manifest,
         );

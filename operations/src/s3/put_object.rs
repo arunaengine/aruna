@@ -1,12 +1,13 @@
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
+use aruna_core::keyspaces::{S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
-    BackendLocation, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
+    BackendLocation, CurrentVersionPointer, Location, LookupKey, RealmId, VersionKey,
+    VersionMetadata, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -22,6 +23,7 @@ pub enum PutObjectState {
     StartTransaction,
     CheckHashLookup,
     CreateHashLookup,
+    ReadObjectLookup,
     CreateObjectLookup,
     CreateVersionRecord,
     CommitTransaction,
@@ -75,6 +77,7 @@ pub struct PutObjectConfig {
     pub expected_checksums: Vec<ExpectedChecksum>,
     pub checksum_type: Option<String>,
     pub exists: bool, //Note: For version shenanigans which will be implemented later
+    pub version_source: Option<VersionSourceBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -246,9 +249,42 @@ impl PutObjectOperation {
     }
 
     fn create_object_lookup(&mut self) -> Effects {
-        let Some(output) = self.get_output().cloned() else {
+        let Some(_output) = self.get_output().cloned() else {
             return self.emit_error(PutObjectError::MissingOutput);
         };
+
+        self.state = PutObjectState::ReadObjectLookup;
+        let key = match LookupKey::object(
+            self.config.request.bucket.clone(),
+            self.config.request.key.clone(),
+        )
+        .to_bytes()
+        {
+            Ok(key) => key.into(),
+            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        };
+
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_object_lookup_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+
+        let existing = match value
+            .as_ref()
+            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+            .transpose()
+        {
+            Ok(existing) => existing,
+            Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+        };
+        let version_id = *self.version_id.get_or_insert_with(Ulid::new);
 
         self.state = PutObjectState::CreateObjectLookup;
         let key = match LookupKey::object(
@@ -260,13 +296,14 @@ impl PutObjectOperation {
             Ok(key) => key.into(),
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
-        let value = match Location::Real(output).to_bytes() {
+        let value = match CurrentVersionPointer::next_for(existing.as_ref(), version_id).to_bytes()
+        {
             Ok(bytes) => bytes.into(),
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
 
         smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
+            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
             key,
             value,
             txn_id: self.txn_id,
@@ -286,8 +323,9 @@ impl PutObjectOperation {
             let Some(output) = self.get_output().cloned() else {
                 return self.emit_error(PutObjectError::MissingOutput);
             };
-            let version_id = Ulid::new();
-            self.version_id = Some(version_id);
+            let Some(version_id) = self.version_id else {
+                return self.emit_error(PutObjectError::PutObjectFailed);
+            };
             self.state = PutObjectState::CreateVersionRecord;
 
             let key = match VersionKey::new(
@@ -300,12 +338,13 @@ impl PutObjectOperation {
                 Ok(key) => key.into(),
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
             };
-            let value = match (VersionMetadata {
+            let value = match VersionMetadata::materialized(
                 version_id,
-                location: Location::Real(output.clone()),
-                created_at: output.created_at,
-                created_by: output.created_by,
-            })
+                output.clone(),
+                output.created_at,
+                output.created_by,
+                self.config.version_source.clone(),
+            )
             .to_bytes()
             {
                 Ok(bytes) => bytes.into(),
@@ -461,6 +500,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::StartTransaction => self.handle_transaction_started(event),
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             PutObjectState::CreateHashLookup => self.handle_hash_lookup_created(event),
+            PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
             PutObjectState::CreateObjectLookup => self.handle_object_lookup_created(event),
             PutObjectState::CreateVersionRecord => self.handle_version_record_created(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
@@ -520,13 +560,16 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
     use aruna_blob::blob::BlobHandler;
-    use aruna_core::effects::StorageEffect;
+    use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{DHT_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE};
+    use aruna_core::keyspaces::{
+        DHT_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
+    };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
     use aruna_core::structs::{
-        Backend, BackendConfig, Location, LookupKey, RealmId, VersionKey, VersionMetadata,
+        Backend, BackendConfig, BackendLocation, CurrentVersionPointer, Location, LookupKey,
+        RealmId, VersionKey, VersionMetadata,
     };
     use aruna_net::dht::storage::decode_entries;
     use aruna_net::{NetConfig, NetHandle};
@@ -588,6 +631,7 @@ mod test {
             expected_checksums: vec![],
             checksum_type: None,
             exists: false,
+            version_source: None,
         };
         let put_operation = PutObjectOperation::new(put_config);
 
@@ -644,7 +688,7 @@ mod test {
         }) = context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                 key: object_lookup_key.into(),
                 txn_id: None,
             })
@@ -653,8 +697,8 @@ mod test {
             panic!("missing object lookup entry");
         };
         assert_eq!(
-            Location::from_bytes(object_lookup_value.as_ref()).unwrap(),
-            Location::Real(result.location.clone())
+            CurrentVersionPointer::from_bytes(object_lookup_value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(result.version_id, 1)
         );
 
         let version_prefix = VersionKey::object_prefix("mybucket", "some-file.txt").unwrap();
@@ -674,7 +718,10 @@ mod test {
         assert_eq!(values.len(), 1);
         let version = VersionMetadata::from_bytes(values[0].1.as_ref()).unwrap();
         assert_eq!(version.version_id, result.version_id);
-        assert_eq!(version.location, Location::Real(result.location.clone()));
+        assert_eq!(
+            version.lookup_location(),
+            Some(Location::Real(result.location.clone()))
+        );
 
         let Event::Storage(StorageEvent::ReadResult {
             value: Some(dht_value),
@@ -758,6 +805,7 @@ mod test {
                 expected_checksums: vec![],
                 checksum_type: None,
                 exists: false,
+                version_source: None,
             }),
             &context,
         )
@@ -783,6 +831,7 @@ mod test {
                 expected_checksums: vec![],
                 checksum_type: None,
                 exists: false,
+                version_source: None,
             }),
             &context,
         )
@@ -802,7 +851,7 @@ mod test {
             }) = context
                 .storage_handle
                 .send_storage_effect(StorageEffect::Read {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
+                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
                     key: object_lookup_key.into(),
                     txn_id: None,
                 })
@@ -811,11 +860,69 @@ mod test {
                 panic!("missing object lookup entry for duplicate test");
             };
 
+            let expected_version_id = if key == "first.txt" {
+                first.version_id
+            } else {
+                second.version_id
+            };
+
             assert_eq!(
-                Location::from_bytes(object_lookup_value.as_ref()).unwrap(),
-                Location::Real(first.location.clone())
+                CurrentVersionPointer::from_bytes(object_lookup_value.as_ref()).unwrap(),
+                CurrentVersionPointer::new_with_generation(expected_version_id, 1)
             );
         }
+    }
+
+    #[test]
+    fn put_object_current_pointer_generation_increments_from_existing_pointer() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let mut op = PutObjectOperation::new(PutObjectConfig {
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            group_id: Ulid::new(),
+            realm_id,
+            node_id: iroh::SecretKey::generate().public(),
+            request: PutObjectInput {
+                bucket: "mybucket".to_string(),
+                key: "some-file.txt".to_string(),
+                content_length: None,
+                body: None,
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+        });
+        let version_id = Ulid::new();
+        op.version_id = Some(version_id);
+        op.output = Some(Ok(BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "bucket".to_string(),
+            backend_path: "path".to_string(),
+            ulid: Ulid::new(),
+            compressed: false,
+            encrypted: false,
+            created_by: op.config.user_id,
+            created_at: std::time::SystemTime::now(),
+            staging: false,
+            partial: false,
+            blob_size: 1,
+            hashes: HashMap::new(),
+        }));
+        op.txn_id = Some(Ulid::new());
+        let existing = CurrentVersionPointer::new_with_generation(Ulid::new(), 4);
+
+        let effects = op.handle_object_lookup_read(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0].into(),
+            value: Some(existing.to_bytes().unwrap().into()),
+        }));
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected current pointer write")
+        };
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(version_id, 5)
+        );
     }
 
     #[tokio::test]
@@ -874,6 +981,7 @@ mod test {
                 }],
                 checksum_type: None,
                 exists: false,
+                version_source: None,
             }),
             &context,
         )

@@ -5,20 +5,24 @@ use crate::s3::checksum::{
     encode_checksums, parse_upload_checksum_request,
 };
 use crate::s3::error::IntoS3Error;
+use crate::s3::replication::spawn_version_replication;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
     s3_checksum_type_from_multipart, to_base64,
 };
 use aruna_core::NodeId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::S3_VERSION_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
+use aruna_core::structs::{
+    AuthContext, BucketInfo, Permission, RealmId, SourceMetadata, UserAccess, VersionKey,
+    VersionMetadata, VersionState,
+};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::replication::version_replication::{
-    ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
-};
 use aruna_operations::s3::abort_multipart_upload::{
     AbortMultipartUploadInput as AMUI, AbortMultipartUploadOperation,
 };
@@ -34,12 +38,13 @@ use aruna_operations::s3::delete_bucket::DeleteBucketOperation;
 use aruna_operations::s3::delete_object::{
     DeleteObjectInput as DOI, DeleteObjectOperation, DeleteObjectResult,
 };
-use aruna_operations::s3::get_object::{GetObjectInput as GOI, GetObjectOperation};
+use aruna_operations::s3::get_object::{
+    GetObjectInput as GOI, GetObjectOperation, GetObjectResult, ObjectRangeRequest,
+};
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
 use aruna_operations::s3::put_bucket_replication::{
-    DeleteBucketReplicationOperation, GetBucketReplicationError, GetBucketReplicationOperation,
-    PutBucketReplicationOperation,
+    DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
@@ -51,15 +56,44 @@ use s3s::dto::{
     DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
     GetBucketReplicationInput, GetBucketReplicationOutput, GetObjectAttributesInput,
     GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    ListBucketsInput, ListBucketsOutput, PutBucketReplicationInput, PutBucketReplicationOutput,
-    PutObjectInput, PutObjectOutput, ReplicationConfiguration, ReplicationRule,
-    ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
+    LastModified, ListBucketsInput, ListBucketsOutput, PutBucketReplicationInput,
+    PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
+    ReplicationRule, ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::fmt::Debug;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tracing::{Instrument, debug, error, info, warn};
+use tracing::{debug, error, warn};
+
+#[derive(Debug)]
+struct ObjectResponseFields {
+    content_length: Option<i64>,
+    content_type: Option<String>,
+    e_tag: Option<ETag>,
+    last_modified: Option<LastModified>,
+    metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug)]
+struct ReferenceMetadataRefresh {
+    bucket: String,
+    key: String,
+    version_id: ulid::Ulid,
+    metadata: SourceMetadata,
+    refreshed_at: SystemTime,
+}
+
+fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
+    match range {
+        s3s::dto::Range::Int { first, last } => match last {
+            Some(end) => ObjectRangeRequest::StartEnd { start: first, end },
+            None => ObjectRangeRequest::Start { start: first },
+        },
+        s3s::dto::Range::Suffix { length } => ObjectRangeRequest::Suffix { length },
+    }
+}
 
 #[derive(Clone)]
 pub struct ArunaS3Service {
@@ -214,128 +248,6 @@ impl ArunaS3Service {
         }
     }
 
-    async fn trigger_version_replication(
-        &self,
-        auth_context: AuthContext,
-        bucket: &str,
-        key: &str,
-        version_id: ulid::Ulid,
-        delete_marker: bool,
-    ) {
-        let config = match drive(
-            GetBucketReplicationOperation::new(bucket.to_string()),
-            &self.state,
-        )
-        .await
-        .and_then(|result| result.transpose())
-        {
-            Ok(Some(config)) => config,
-            Ok(None) | Err(GetBucketReplicationError::NotFound) => return,
-            Err(err) => {
-                warn!(bucket, key, version_id = %version_id, error = %err, "Failed to load bucket replication config");
-                return;
-            }
-        };
-
-        for target in config.targets {
-            if target.node_id == self.node_id {
-                continue;
-            }
-            if delete_marker && !target.replicate_delete_markers {
-                continue;
-            }
-
-            let input = ReplicateScopeInput {
-                bucket: bucket.to_string(),
-                target: ReplicateScopeTarget::Version {
-                    key: key.to_string(),
-                    version_id,
-                },
-                target_node_id: target.node_id,
-                auth_context: auth_context.clone(),
-                replicate_delete_markers: target.replicate_delete_markers,
-            };
-
-            match drive(ReplicateScopeOperation::new(input), &self.state)
-                .await
-                .and_then(|result| result.transpose())
-            {
-                Ok(Some(result)) if result.failed == 0 => {
-                    info!(
-                        bucket,
-                        key,
-                        version_id = ?version_id,
-                        target_node = %target.node_id,
-                        "Version replication succeeded"
-                    );
-                }
-                Ok(Some(result)) => {
-                    warn!(
-                        bucket,
-                        key,
-                        version_id = %version_id,
-                        target_node = %target.node_id,
-                        replicated = result.replicated,
-                        skipped = result.skipped,
-                        failed = result.failed,
-                        "Version replication completed with failures"
-                    );
-                }
-                Err(err) => {
-                    warn!(
-                        bucket,
-                        key,
-                        version_id = %version_id,
-                        target_node = %target.node_id,
-                        error = %err,
-                        "Failed to trigger version replication"
-                    );
-                }
-                Ok(None) => {
-                    warn!(
-                        bucket,
-                        key,
-                        version_id = %version_id,
-                        target_node = %target.node_id,
-                        "Version replication produced no result"
-                    );
-                }
-            }
-        }
-    }
-
-    fn spawn_version_replication(
-        &self,
-        auth_context: AuthContext,
-        bucket: String,
-        key: String,
-        version_id: ulid::Ulid,
-        delete_marker: bool,
-    ) {
-        let service = self.clone();
-        let span = tracing::info_span!(
-            "s3.live_replication",
-            bucket = %bucket,
-            key = %key,
-            version_id = %version_id,
-            delete_marker,
-        );
-        tokio::spawn(
-            async move {
-                service
-                    .trigger_version_replication(
-                        auth_context,
-                        &bucket,
-                        &key,
-                        version_id,
-                        delete_marker,
-                    )
-                    .await;
-            }
-            .instrument(span),
-        );
-    }
-
     fn complete_multipart_upload_response(
         &self,
         bucket: String,
@@ -364,7 +276,10 @@ impl ArunaS3Service {
             s3_checksum_type_from_multipart(result.checksum_type),
         ));
 
-        self.spawn_version_replication(
+        spawn_version_replication(
+            self.state.clone(),
+            self.realm_id,
+            self.node_id,
             replication_auth,
             replication_bucket,
             replication_key,
@@ -399,7 +314,10 @@ impl ArunaS3Service {
             ChecksumSelection::Requested(checksum_request.response_algorithm),
             checksum_request.checksum_type.clone(),
         ));
-        self.spawn_version_replication(
+        spawn_version_replication(
+            self.state.clone(),
+            self.realm_id,
+            self.node_id,
             replication_auth,
             replication_bucket,
             replication_key,
@@ -419,7 +337,10 @@ impl ArunaS3Service {
         result: DeleteObjectResult,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         if replicate_latest_delete {
-            self.spawn_version_replication(
+            spawn_version_replication(
+                self.state.clone(),
+                self.realm_id,
+                self.node_id,
                 replication_auth,
                 replication_bucket,
                 replication_key,
@@ -434,6 +355,221 @@ impl ArunaS3Service {
             ..Default::default()
         }))
     }
+
+    fn source_metadata_headers(
+        &self,
+        metadata: &aruna_core::structs::SourceMetadata,
+        last_refresh: Option<SystemTime>,
+    ) -> Option<std::collections::HashMap<String, String>> {
+        let mut headers = std::collections::HashMap::new();
+
+        if let Some(content_type) = &metadata.content_type {
+            headers.insert(
+                "aruna-source-content-type".to_string(),
+                content_type.clone(),
+            );
+        }
+        if let Some(etag) = &metadata.etag {
+            headers.insert("aruna-source-etag".to_string(), etag.clone());
+        }
+        if let Some(last_modified) = metadata.last_modified {
+            headers.insert(
+                "aruna-source-last-modified".to_string(),
+                chrono::DateTime::<chrono::Utc>::from(last_modified).to_rfc3339(),
+            );
+        }
+        if let Some(last_refresh) = last_refresh {
+            headers.insert(
+                "aruna-last-refresh".to_string(),
+                chrono::DateTime::<chrono::Utc>::from(last_refresh).to_rfc3339(),
+            );
+        }
+
+        (!headers.is_empty()).then_some(headers)
+    }
+
+    fn build_object_response_fields(
+        &self,
+        location: Option<&aruna_core::structs::BackendLocation>,
+        source_metadata: Option<&aruna_core::structs::SourceMetadata>,
+        last_refresh: Option<SystemTime>,
+    ) -> ObjectResponseFields {
+        ObjectResponseFields {
+            content_length: location
+                .map(|location| location.blob_size as i64)
+                .or_else(|| source_metadata.map(|metadata| metadata.content_length as i64)),
+            content_type: source_metadata.and_then(|metadata| metadata.content_type.clone()),
+            e_tag: location
+                .and_then(|location| {
+                    location
+                        .hashes
+                        .get(HASH_MD5)
+                        .map(|value| ETag::Strong(to_base64(value)))
+                })
+                .or_else(|| {
+                    source_metadata.and_then(|metadata| {
+                        metadata
+                            .etag
+                            .as_deref()
+                            .and_then(|etag| ETag::from_str(etag).ok())
+                    })
+                }),
+            last_modified: location
+                .map(|location| location.created_at.into())
+                .or_else(|| {
+                    source_metadata.and_then(|metadata| metadata.last_modified.map(Into::into))
+                }),
+            metadata: source_metadata
+                .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh)),
+        }
+    }
+}
+
+fn reference_metadata_refresh(
+    bucket: String,
+    key: String,
+    result: &GetObjectResult,
+) -> Option<ReferenceMetadataRefresh> {
+    if result.location.is_some() {
+        return None;
+    }
+
+    Some(ReferenceMetadataRefresh {
+        bucket,
+        key,
+        version_id: result.resolved_version_id.or(result.version_id)?,
+        metadata: result.source_metadata.clone()?,
+        refreshed_at: result.last_refresh?,
+    })
+}
+
+async fn refresh_reference_metadata(
+    context: Arc<DriverContext>,
+    refresh: ReferenceMetadataRefresh,
+) -> Result<(), String> {
+    let version_key = VersionKey::new(&refresh.bucket, &refresh.key, refresh.version_id)
+        .to_bytes()
+        .map_err(|err| err.to_string())?;
+    let txn_id = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
+        other => return Err(format!("unexpected start transaction event: {other:?}")),
+    };
+
+    let refreshed_value = match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key: version_key.clone().into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            let metadata = match VersionMetadata::from_bytes(value.as_ref()) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    abort_reference_refresh(&context, txn_id).await;
+                    return Err(err.to_string());
+                }
+            };
+            let VersionState::Reference {
+                source,
+                last_refresh,
+                ..
+            } = metadata.state
+            else {
+                abort_reference_refresh(&context, txn_id).await;
+                return Ok(());
+            };
+            if refresh.refreshed_at <= last_refresh {
+                None
+            } else {
+                Some(
+                    match VersionMetadata::reference(
+                        metadata.version_id,
+                        source,
+                        refresh.metadata,
+                        metadata.created_at,
+                        metadata.created_by,
+                        refresh.refreshed_at,
+                    )
+                    .to_bytes()
+                    {
+                        Ok(value) => value,
+                        Err(err) => {
+                            abort_reference_refresh(&context, txn_id).await;
+                            return Err(err.to_string());
+                        }
+                    },
+                )
+            }
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            abort_reference_refresh(&context, txn_id).await;
+            return Ok(());
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_reference_refresh(&context, txn_id).await;
+            return Err(error.to_string());
+        }
+        other => {
+            abort_reference_refresh(&context, txn_id).await;
+            return Err(format!("unexpected version read event: {other:?}"));
+        }
+    };
+
+    if let Some(refreshed_value) = refreshed_value {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: version_key.into(),
+                value: refreshed_value.into(),
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                abort_reference_refresh(&context, txn_id).await;
+                return Err(error.to_string());
+            }
+            other => {
+                abort_reference_refresh(&context, txn_id).await;
+                return Err(format!("unexpected version write event: {other:?}"));
+            }
+        }
+    }
+
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_reference_refresh(&context, txn_id).await;
+            Err(error.to_string())
+        }
+        other => {
+            abort_reference_refresh(&context, txn_id).await;
+            Err(format!("unexpected commit event: {other:?}"))
+        }
+    }
+}
+
+async fn abort_reference_refresh(context: &DriverContext, txn_id: ulid::Ulid) {
+    let _ = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await;
 }
 
 #[async_trait::async_trait]
@@ -554,6 +690,7 @@ impl S3 for ArunaS3Service {
             request: input,
             expected_checksums: checksum_request.expected.clone(),
             checksum_type: Some(checksum_request.checksum_type.as_str().to_string()),
+            version_source: None,
             exists: false,
         };
         let operation = PutObjectOperation::new(config);
@@ -780,13 +917,20 @@ impl S3 for ArunaS3Service {
             s3_error!(UnexpectedContent, "Missing user context")
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let requested_range = req.input.range;
         let version_id = parse_version_id(req.input.version_id)?;
+        let bucket = req.input.bucket;
+        let key = req.input.key;
+        let response_bucket = bucket.clone();
+        let response_key = key.clone();
+
+        let range_request = requested_range.map(object_range_request);
 
         let operation = GetObjectOperation::new(GOI {
-            bucket: req.input.bucket,
-            key: req.input.key,
+            bucket,
+            key,
             version_id,
-            range: None,
+            range: range_request,
             group_id: bucket_info
                 .as_ref()
                 .map(|bucket_info| bucket_info.group_id)
@@ -801,22 +945,58 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InternalError, "Failed to process GET request"))?;
 
         let version_id = result.version_id;
-        let hashes = result.location.hashes.clone();
-        let content = StreamingBlob::wrap(result.blob);
+        let resolved_range = result.resolved_range.clone();
+        let reference_refresh = reference_metadata_refresh(response_bucket, response_key, &result);
+        let response_fields = self.build_object_response_fields(
+            result.location.as_ref(),
+            result.source_metadata.as_ref(),
+            result.last_refresh,
+        );
+        let blob = if let Some(refresh) = reference_refresh {
+            let context = self.state.clone();
+            result.blob.on_success(move || {
+                tokio::spawn(async move {
+                    if let Err(err) = refresh_reference_metadata(context, refresh).await {
+                        warn!(error = %err, "Failed to refresh reference metadata after read");
+                    }
+                });
+            })
+        } else {
+            result.blob
+        };
+        let content = StreamingBlob::wrap(blob);
         let mut output = GetObjectOutput {
             body: Some(content),
+            accept_ranges: resolved_range.as_ref().map(|_| "bytes".to_string()),
+            content_length: resolved_range
+                .as_ref()
+                .map(|range| range.content_length)
+                .or(response_fields.content_length),
+            content_range: resolved_range
+                .as_ref()
+                .map(|range| range.content_range.clone()),
+            content_type: response_fields.content_type,
+            e_tag: response_fields.e_tag,
+            last_modified: response_fields.last_modified,
+            metadata: response_fields.metadata,
             version_id: version_id.map(|version_id| version_id.to_string()),
             ..Default::default()
         };
-        if checksum_mode_enabled(&req.headers) {
+        if checksum_mode_enabled(&req.headers)
+            && let Some(location) = result.location.as_ref()
+        {
             output.apply_checksums(encode_checksums(
-                &hashes,
+                &location.hashes,
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
             ));
         }
 
-        Ok(S3Response::new(output))
+        Ok(if resolved_range.is_some() {
+            S3Response::with_status(output, http::StatusCode::PARTIAL_CONTENT)
+        } else {
+            S3Response::new(output)
+        })
     }
 
     #[tracing::instrument(err, skip(self, _req))]
@@ -852,21 +1032,26 @@ impl S3 for ArunaS3Service {
             .map_err(IntoS3Error::into_s3_error)?
             .ok_or_else(|| s3_error!(InternalError, "Failed to process HEAD request"))?;
 
+        let response_fields = self.build_object_response_fields(
+            result.location.as_ref(),
+            result.source_metadata.as_ref(),
+            result.last_refresh,
+        );
         let mut output = HeadObjectOutput {
-            content_length: Some(result.location.blob_size as i64),
-            e_tag: result
-                .location
-                .hashes
-                .get(HASH_MD5)
-                .map(|value| ETag::Strong(to_base64(value))),
+            content_length: response_fields.content_length,
+            content_type: response_fields.content_type,
+            e_tag: response_fields.e_tag,
             version_id: result.version_id.map(|version_id| version_id.to_string()),
-            last_modified: Some(result.location.created_at.into()),
+            last_modified: response_fields.last_modified,
+            metadata: response_fields.metadata,
             ..Default::default()
         };
 
-        if checksum_mode_enabled(&req.headers) {
+        if checksum_mode_enabled(&req.headers)
+            && let Some(location) = result.location.as_ref()
+        {
             output.apply_checksums(encode_checksums(
-                &result.location.hashes,
+                &location.hashes,
                 ChecksumSelection::AllStored,
                 s3_checksum_type_from_multipart(result.checksum_type),
             ));
@@ -1002,5 +1187,207 @@ impl S3 for ArunaS3Service {
         .ok_or_else(|| s3_error!(InternalError, "Failed to delete bucket replication config"))?;
 
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::UserId;
+    use aruna_core::structs::{
+        PortableSourceDescriptor, SourceConnectorKind, StagingStrategy, VersionSourceBinding,
+    };
+    use aruna_operations::driver::DriverContext;
+    use aruna_storage::storage;
+    use std::collections::HashMap;
+    use std::time::{Duration, UNIX_EPOCH};
+    use tempfile::TempDir;
+    use ulid::Ulid;
+
+    struct TestState {
+        _storage_dir: TempDir,
+        context: Arc<DriverContext>,
+        bucket: String,
+        key: String,
+        version_id: Ulid,
+        created_by: UserId,
+    }
+
+    #[tokio::test]
+    async fn stale_reference_metadata_refresh_does_not_overwrite_newer_cache() {
+        let test = setup_state();
+        let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
+        let original_metadata = source_metadata(10, "original");
+        write_reference_version(&test, original_metadata.clone(), last_refresh).await;
+
+        refresh_reference_metadata(
+            test.context.clone(),
+            refresh(
+                &test,
+                source_metadata(20, "older"),
+                UNIX_EPOCH + Duration::from_secs(10),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_reference_state(&test, &original_metadata, last_refresh).await;
+
+        refresh_reference_metadata(
+            test.context.clone(),
+            refresh(&test, source_metadata(30, "equal"), last_refresh),
+        )
+        .await
+        .unwrap();
+
+        assert_reference_state(&test, &original_metadata, last_refresh).await;
+    }
+
+    #[tokio::test]
+    async fn newer_reference_metadata_refresh_updates_cache() {
+        let test = setup_state();
+        let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
+        let refreshed_at = UNIX_EPOCH + Duration::from_secs(30);
+        let new_metadata = source_metadata(20, "newer");
+        write_reference_version(&test, source_metadata(10, "original"), last_refresh).await;
+
+        refresh_reference_metadata(
+            test.context.clone(),
+            refresh(&test, new_metadata.clone(), refreshed_at),
+        )
+        .await
+        .unwrap();
+
+        assert_reference_state(&test, &new_metadata, refreshed_at).await;
+    }
+
+    fn setup_state() -> TestState {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = aruna_core::structs::RealmId([9u8; 32]);
+
+        TestState {
+            _storage_dir: storage_dir,
+            context,
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            version_id: Ulid::new(),
+            created_by: UserId::local(Ulid::new(), realm_id),
+        }
+    }
+
+    async fn write_reference_version(
+        test: &TestState,
+        cached_metadata: SourceMetadata,
+        last_refresh: SystemTime,
+    ) {
+        let metadata = VersionMetadata::reference(
+            test.version_id,
+            source_binding(),
+            cached_metadata,
+            UNIX_EPOCH,
+            test.created_by,
+            last_refresh,
+        );
+        let event = test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: version_key(test).into(),
+                value: metadata.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+    }
+
+    async fn assert_reference_state(
+        test: &TestState,
+        expected_metadata: &SourceMetadata,
+        expected_last_refresh: SystemTime,
+    ) {
+        let event = test
+            .context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key: version_key(test).into(),
+                txn_id: None,
+            })
+            .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) = event
+        else {
+            panic!("unexpected version read event: {event:?}");
+        };
+        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
+        let VersionState::Reference {
+            cached_metadata,
+            last_refresh,
+            ..
+        } = metadata.state
+        else {
+            panic!("version was not a reference");
+        };
+        assert_eq!(cached_metadata, *expected_metadata);
+        assert_eq!(last_refresh, expected_last_refresh);
+    }
+
+    fn refresh(
+        test: &TestState,
+        metadata: SourceMetadata,
+        refreshed_at: SystemTime,
+    ) -> ReferenceMetadataRefresh {
+        ReferenceMetadataRefresh {
+            bucket: test.bucket.clone(),
+            key: test.key.clone(),
+            version_id: test.version_id,
+            metadata,
+            refreshed_at,
+        }
+    }
+
+    fn version_key(test: &TestState) -> Vec<u8> {
+        VersionKey::new(&test.bucket, &test.key, test.version_id)
+            .to_bytes()
+            .unwrap()
+    }
+
+    fn source_metadata(content_length: u64, etag: &str) -> SourceMetadata {
+        SourceMetadata {
+            content_length,
+            content_type: Some("application/octet-stream".to_string()),
+            etag: Some(etag.to_string()),
+            last_modified: Some(UNIX_EPOCH + Duration::from_secs(content_length)),
+            source_version: None,
+        }
+    }
+
+    fn source_binding() -> VersionSourceBinding {
+        VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::new(),
+                source_path: "source/path".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: None,
+        }
     }
 }

@@ -7,12 +7,15 @@ use super::{
 };
 use crate::messages::{MessageType, ReplicationMessage};
 use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::effects::{BlobEffect, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::BUCKET_STATS_DB;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::{Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, RealmId};
+use aruna_core::structs::{
+    Backend, BackendConfig, BackendLocation, BlobTimeoutConfig, RealmId, ResolvedSourceAccess,
+    SourceConnectorKind,
+};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_storage::storage;
 use std::collections::HashMap;
@@ -421,4 +424,30 @@ async fn multipart_part_bucket_is_excluded_from_bucket_stats() {
         bucket_load(&context.storage_handle, "uploaded-parts").await,
         0
     );
+}
+
+#[tokio::test]
+async fn staging_source_effect_dispatches_via_blob_handle() {
+    let context = setup_blob_handle(1).await;
+
+    let event = context
+        .blob_handle
+        .send_staging_source_effect(StagingSourceEffect::Head {
+            access: ResolvedSourceAccess::OpenDal {
+                kind: SourceConnectorKind::Http,
+                config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://missing.example.org".to_string(),
+                )]),
+                path: "not-found".to_string(),
+                version: None,
+            },
+        })
+        .await;
+
+    assert!(matches!(
+        event,
+        Event::StagingSource(StagingSourceEvent::Error { .. })
+            | Event::StagingSource(StagingSourceEvent::HeadResult { .. })
+    ));
 }

@@ -70,7 +70,7 @@ mod tests {
         let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
         let realm_signing_key = SigningKey::generate(&mut csprng);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let node_id = iroh::SecretKey::generate(&mut rand::rng()).public();
+        let node_id = iroh::SecretKey::generate().public();
 
         let state = Arc::new(
             ServerState::new(

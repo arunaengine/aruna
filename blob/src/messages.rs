@@ -2,7 +2,7 @@ use crate::error::BlobLibError;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::structs::BackendLocation;
-use iroh_quinn::{RecvStream, SendStream};
+use aruna_net::streams::{RecvStream, SendStream};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use ulid::Ulid;
@@ -30,9 +30,9 @@ impl ReplicationMessage {
 
     pub async fn send(self, sender: &mut SendStream) -> Result<(), BlobLibError> {
         let request_buf = postcard::to_allocvec(&self)?;
-        sender.write_u32(request_buf.len() as u32).await?;
-        sender.write_all(&request_buf).await?;
-        sender.flush().await?;
+        AsyncWriteExt::write_u32(sender, request_buf.len() as u32).await?;
+        AsyncWriteExt::write_all(sender, &request_buf).await?;
+        AsyncWriteExt::flush(sender).await?;
         Ok(())
     }
 

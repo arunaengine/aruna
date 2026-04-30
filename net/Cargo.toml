@@ -7,8 +7,8 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-aruna-core = { path = "../core" }
-aruna-storage = { path = "../storage" }
+aruna-core = { workspace = true }
+aruna-storage = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 tokio = { workspace = true }
@@ -21,13 +21,13 @@ serde = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
-byteview = "0.10.0"
+byteview = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 smallvec = { workspace = true }
-crossfire = "3.0.4"
+crossfire = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true }
 tempfile = { workspace = true }
 ulid = { workspace = true }

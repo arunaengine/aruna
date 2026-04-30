@@ -32,7 +32,7 @@ use crypto_box::{
     aead::{Aead, AeadCore, OsRng as CryptoOsRng},
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use rand::RngCore;
+use rand::Rng;
 use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;

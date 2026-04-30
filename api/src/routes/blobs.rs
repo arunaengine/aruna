@@ -4,6 +4,7 @@ use aruna_core::NodeId;
 use aruna_core::structs::{AuthContext, Permission};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
+use aruna_operations::replication::protocol::ReplicationMode;
 use aruna_operations::replication::version_replication::{
     ReplicateScopeInput, ReplicateScopeOperation, ReplicateScopeTarget,
 };
@@ -40,7 +41,14 @@ pub struct ReplicateBlobRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ReplicateBlobResponse {}
+pub struct ReplicateBlobResponse {
+    pub bucket: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    pub target_node_id: String,
+}
 
 #[utoipa::path(
     post,
@@ -135,6 +143,13 @@ pub async fn replicate_blob(
         target_node_id: node_id,
         auth_context: auth,
         replicate_delete_markers: true,
+        mode: ReplicationMode::OnDemand,
+    };
+    let response = ReplicateBlobResponse {
+        bucket: input.bucket.clone(),
+        path: path.clone(),
+        version_id: version_id.clone(),
+        target_node_id: input.target_node_id.to_string(),
     };
     let bucket = input.bucket.clone();
     let path_for_span = path.clone();
@@ -142,7 +157,7 @@ pub async fn replicate_blob(
     let target_node_id = input.target_node_id;
     let ctx = state.get_ctx();
     let span = tracing::info_span!(
-        "api.manual_replication",
+        "api.on_demand_replication",
         bucket = %bucket,
         path = ?path_for_span,
         version_id = ?version_id_for_span,
@@ -157,7 +172,7 @@ pub async fn replicate_blob(
                         path = ?path,
                         version_id = ?version_id,
                         target_node = %target_node_id,
-                        "Manual replication succeeded"
+                        "On-demand replication succeeded"
                     );
                 }
                 Ok(Some(Ok(result))) => {
@@ -169,7 +184,7 @@ pub async fn replicate_blob(
                         replicated = result.replicated,
                         skipped = result.skipped,
                         failed = result.failed,
-                        "Manual replication completed with failures"
+                        "On-demand replication completed with failures"
                     );
                 }
                 Ok(Some(Err(err))) | Err(err) => {
@@ -179,7 +194,7 @@ pub async fn replicate_blob(
                         version_id = ?version_id,
                         target_node = %target_node_id,
                         error = %err,
-                        "Manual replication failed"
+                        "On-demand replication failed"
                     );
                 }
                 Ok(None) => {
@@ -188,7 +203,7 @@ pub async fn replicate_blob(
                         path = ?path,
                         version_id = ?version_id,
                         target_node = %target_node_id,
-                        "Manual replication produced no result"
+                        "On-demand replication produced no result"
                     );
                 }
             }
@@ -196,5 +211,27 @@ pub async fn replicate_blob(
         .instrument(span),
     );
 
-    Ok((StatusCode::ACCEPTED, Json(ReplicateBlobResponse {})))
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::openapi::ApiDoc;
+
+    #[test]
+    fn openapi_includes_replicate_blob_response_schema() {
+        let openapi = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert!(openapi["paths"].get("/blobs/replicate").is_some());
+        assert!(
+            openapi["components"]["schemas"]["ReplicateBlobResponse"]["properties"]
+                .get("bucket")
+                .is_some()
+        );
+        assert!(
+            openapi["components"]["schemas"]["ReplicateBlobResponse"]["properties"]
+                .get("target_node_id")
+                .is_some()
+        );
+    }
 }

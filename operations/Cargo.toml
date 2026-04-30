@@ -7,25 +7,26 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-aruna-blob = { path = "../blob" }
-aruna-core = { path = "../core" }
-aruna-storage = { path = "../storage" }
-aruna-net = { path = "../net" }
-aruna-tasks = { path = "../tasks" }
+aruna-blob = { workspace = true }
+aruna-core = { workspace = true }
+aruna-storage = { workspace = true }
+aruna-net = { workspace = true }
+aruna-tasks = { workspace = true }
 craqle = { workspace = true }
 async-trait = { workspace = true }
 automerge = { workspace = true }
 autosurgeon = { workspace = true }
 base64 = { workspace = true }
-bytes.workspace = true
+blake3 = { workspace = true }
+bytes = { workspace = true }
 byteview = { workspace = true }
 chrono = { workspace = true }
 globset = { workspace = true }
 iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
 opentelemetry = { workspace = true }
-postcard.workspace = true
-rand.workspace = true
+postcard = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
@@ -38,7 +39,8 @@ ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
 
 [dev-dependencies]
-futures-util.workspace = true
+axum = { workspace = true }
+futures-util = { workspace = true }
 rand = { workspace = true }
 tempfile = { workspace = true }
-tokio-util = "0.7.18"
+tokio-util = { workspace = true }
