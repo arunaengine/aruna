@@ -10,9 +10,9 @@ Each Aruna node exposes an S3 endpoint and REST API, federates with peer nodes o
 
 Every Aruna node exposes a standard S3 API. Existing tools, libraries, and automation can be pointed at the node endpoint after S3 credentials have been created.
 
-### Federated metadata with CRDTs
+### Federated resources with CRDTs
 
-Metadata is stored as [Automerge](https://automerge.org/) documents following the [RO-Crate](https://www.researchobject.org/ro-crate/) JSON-LD schema. Changes propagate through gossip and merge automatically, even when nodes were offline or edits happened concurrently.
+Management resources such as groups, and users are stored as [Automerge](https://automerge.org/) documents. Metadata itself is stored in a CRDT based triple-store, following the [RO-Crate](https://www.researchobject.org/ro-crate/) JSON-LD schema. Changes propagate through gossip and merge automatically, even when nodes were offline or edits happened concurrently.
 
 ### Content-addressed storage
 
@@ -34,7 +34,7 @@ Aruna runs as a single binary and stores local state in an embedded LSM database
 
 ## Roadmap
 
-- **Distributed full-text search** with per-node Tantivy indexes, fan-out queries, and authorization-filtered results via roaring bitmaps
+- **Distributed full-text search** with per-node Tantivy indexes, fan-out queries, and authorization-filtered results
 - **Policy engine** using CEL expressions for constraint enforcement (upload size limits, file type restrictions, archival locks) that sync across nodes
 - **Compute orchestration** through a GA4GH TES/DRS interface with data-locality-aware scheduling, automatic provenance tracking (RO-Crate Process Runs), and pluggable execution backends (Docker, Kubernetes, SLURM)
 - **Event subscriptions** on path patterns with optional CEL filters and automated actions (webhooks, compute triggers, replication rules)
@@ -52,6 +52,20 @@ For most users, the fastest way to evaluate Aruna is the local 3-node smoke test
 - On `x86_64-unknown-linux-gnu`, `clang` and `mold` are required because the repository linker configuration uses both
 - `just`, `curl`, and `ss` for the local smoke tests
 - `docker` for `just test-deploy-oidc`
+- `docker-compose` for `just compose`
+
+### Run a single node with an external identity provider
+
+To start one node, run:
+
+```bash
+just compose
+```
+
+With the default example configuration:
+
+- the REST API and Swagger UI are served on `http://127.0.0.1:3000/swagger-ui`
+- the S3 endpoint listens on `http://127.0.0.1:1337`
 
 ### Evaluate a local cluster
 
