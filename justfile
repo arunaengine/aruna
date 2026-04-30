@@ -1,11 +1,11 @@
-compose:
-	bash scripts/bootstrap_compose.sh
+local:
+	bash scripts/local_deploy.sh
 
-compose-new:
-	bash scripts/bootstrap_compose.sh --new
+local-new:
+	bash scripts/local_deploy.sh --new
 
-test-deploy:
-	bash scripts/test_deploy.sh
+local-cluster:
+	bash scripts/local_cluster_deploy.sh
 
-test-deploy-oidc:
-	bash scripts/test_deploy.sh --with-keycloak
+local-cluster-oidc:
+	bash scripts/local_cluster_deploy.sh --with-keycloak

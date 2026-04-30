@@ -1,217 +1,148 @@
-# Aruna
+[![Rust](https://img.shields.io/badge/built_with-Rust-dca282.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-APACHE)
+[![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)](https://github.com/arunaengine/aruna/blob/main/LICENSE-MIT)
+![CI](https://github.com/arunaengine/aruna/actions/workflows/test.yml/badge.svg)
+[![Codecov](https://codecov.io/github/arunaengine/aruna/coverage.svg?branch=main)](https://codecov.io/gh/ArunaStorage/aruna)
+[![dependency status](https://deps.rs/repo/github/ArunaStorage/aruna/status.svg?path=components%2Fserver)](https://deps.rs/repo/github/ArunaStorage/aruna?path=components%2Fserver)
+___
+
+<p align="center">
+    <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./img/aruna_white_font.png">
+    <img alt="Aruna logo" src="./img/aruna_dark_font.png" width="70%">
+    </picture>
+</p>
+
+<br>
+
+# A FAIR, federated data orchestration engine
 
 > [!WARNING]
-> Work in progress. Interfaces, behavior, and deployment details may still change.
+> Work in progress! You are viewing the upcoming version 3. See the [v2](https://github.com/arunaengine/aruna/tree/v2) branch for the latest stable release. 
 
-Aruna is a federated peer-to-peer data orchestration network for organizations that need to share data without handing control to a central platform. It connects sovereign data sources into a unified mesh where each participant keeps ownership of its data while making selected data discoverable and accessible across organizational boundaries.
-
-Each Aruna node exposes an S3 endpoint and REST API, federates with peer nodes over encrypted connections, and keeps metadata synchronized with gossip and CRDTs. The network has no central coordinator and scales horizontally as new nodes join.
+Aruna is a federated peer-to-peer data management framework that enables organizations to share and organize data and metadata without handing over control to a central platform. 
 
 ## Features
 
-### S3-compatible interface
+- **Sovereign trust model**: Each node belongs to one organization. Realms define shared trust between them.
+- **Fine-grained access control**: Path-based permissions with wildcard support and group-based roles.
+- **S3-compatible interface**: Every node exposes an [S3 API](https://docs.aws.amazon.com/AmazonS3/latest/API/API_Operations_Amazon_Simple_Storage_Service.html) for data access.
+- **Virtualized buckets**: Buckets are virtual collections of local and remote data resources, with configurable materialization behavior.
+- **Extensible storage backends**: Support for a variety of storage backends through OpenDAL
+- **Standardized metadata**: Metadata is stored as [RO-Crate](https://www.researchobject.org/ro-crate/) JSON-LD enabling rich, interoperable descriptions of datasets, files, and processes.
+- **Powerful metadata manipulation**: RO-Crates can be created, edited and viewed through a SPARQL query.
+- **Distributed full-text search**: Per-node [Tantivy](https://github.com/quickwit-oss/tantivy) indexes with fan-out queries and authorization filtering
+- **Built-in replication and synchronization**: Metadata and data are replicated across nodes with automatic conflict resolution.
+- **Interoperable using open standards**: [OIDC](https://openid.net/connect/) for authentication, [GA4GH DRS](https://www.ga4gh.org/product/data-repository-service-drs/) for data referencing, [OAI-PMH](https://www.openarchives.org/pmh/) for metadata harvesting
+- **Easy deployment**: Run a node as a single binary or as a multi-cluster deployment.
 
-Every Aruna node exposes a standard S3 API. Existing tools, libraries, and automation can be pointed at the node endpoint after S3 credentials have been created.
+## Architecture and Goals
 
-### Federated resources with CRDTs
+Aruna is built for research data that does not live in one place, and often cannot be moved into one. Universities, institutes, labs, archives, repositories and infrastructure providers each have their own storage systems, policies, identities, and responsibilities. A central platform can be convenient, but it also creates a new point of control and tends to clash with legal, organizational, or practical constraints. Aruna takes a different approach: every participating organization runs its own node, keeps authority over its data, and still joins a shared network for discovery, access, replication, and collaboration.
+ 
+The system is organized around **realms**. A realm is an organizational trust boundary, such as an institute, department, consortium, or project network. Each node belongs to one realm, and realms can establish trust with each other when collaboration requires it. Trust is not the same as access. A trusted partner does not automatically gain permission to read or modify data. Access stays explicit, granted through groups, roles, and path-based permissions. Data sits with the organization responsible for it, while researchers can still work across institutions.
 
-Management resources such as groups, and users are stored as [Automerge](https://automerge.org/) documents. Metadata itself is stored in a CRDT based triple-store, following the [RO-Crate](https://www.researchobject.org/ro-crate/) JSON-LD schema. Changes propagate through gossip and merge automatically, even when nodes were offline or edits happened concurrently.
+### Data, metadata, and access
 
-### Content-addressed storage
+Each Aruna node exposes an **S3-compatible API**, so researchers can keep using the tools, scripts, workflow systems, and libraries they already have instead of learning a new storage protocol. Buckets are virtual collections that mix local data, replicated data, and references to remote resources. To a user, this looks like one coherent access point. Underneath, Aruna tracks where data actually lives, which permissions apply, and whether an object should be materialized locally or fetched on demand.
+ 
+Metadata is part of the core system, not an external catalog bolted on afterwards. Descriptions are stored as **RO-Crate JSON-LD**, so datasets, files, people, instruments, workflows, software, and process runs can be described in a shared format. These descriptions live in a CRDT-based triple store, which allows concurrent edits on different nodes and merges them without a single authority arbitrating the result. Management resources such as users and groups follow the same idea through Automerge documents, which lets nodes keep working through network outages and reconcile state once they reconnect.
+ 
+File contents go into a content-addressed blob layer. Objects are hashed with **BLAKE3**, making integrity checks and deduplication part of the storage model rather than a separate step. If the same file shows up under different paths or on different nodes, it is recognized by its content instead of its location. Replication uses Bao-tree verified streaming, so data can be checked incrementally as it arrives.
 
-All data is hashed with BLAKE3 and deduplicated at the storage layer. Upload the same file through different paths or on different nodes, and it's stored once. Replication uses [Bao tree](https://github.com/oconnor663/bao) verified streaming, where integrity is checked incrementally as bytes arrive.
+### Network and research workflows
 
-### Sovereign trust model
+The network layer is built on **iroh**, which gives Aruna a peer-to-peer foundation for node discovery, authenticated communication, and direct exchange between nodes, even if they are behind NATs or firewalls.
+ 
+For researchers, the data remains where it is, but becomes easier to find, describe, access, replicate and incorporate into workflows. Familiar S3 tooling keeps working, while Aruna adds shared metadata, authorization, replication, provenance, and standards-based interoperability on top of the existing infrastructure.
 
-Aruna organizes the network into **realms**, each identified by an Ed25519 keypair. A realm represents a trust boundary - an organization, a department, a consortium. Every node belongs to exactly one realm. Realms can establish mutual trust relationships to enable cross-organization collaboration, but the decision is always unilateral: trusting someone else doesn't grant them access to your data.
+Aruna serves as a base layer for larger research infrastructures. Distributed full-text search, GA4GH DRS identifiers, OAI-PMH harvesting, GA4GH TES-based compute execution, CEL-based policy enforcement, event subscriptions, and transparent request forwarding all rest on the same foundation: sovereign nodes, shared metadata, verified data exchange, and open interfaces. 
 
-Within a realm, **groups** define fine-grained access control with path-scoped roles and wildcard permissions.
-
-### Storage layer
-
-Aruna's blob layer builds on [OpenDAL](https://opendal.apache.org/). The default runtime configuration in this repository uses filesystem-backed blob storage, while the underlying storage layer also supports additional backend integrations.
-
-### Single binary deployment
-
-Aruna runs as a single binary and stores local state in an embedded LSM database ([fjall](https://github.com/fjall-rs/fjall)). When launched from this repository, configuration is provided through a repo-root `.env` file.
-
-### Distributed full-text search
-
-Aruna is expanding toward distributed full-text search with per-node Tantivy indexes, fan-out queries, and authorization-filtered results.
-
-### Policy engine
-
-Aruna is adding a CEL-based policy engine for constraint enforcement such as upload size limits, file type restrictions, and archival locks that synchronize across nodes.
-
-### Compute orchestration
-
-Aruna is growing toward GA4GH Task Execution Service (TES)-based compute orchestration with data-locality-aware scheduling, automatic provenance tracking through RO-Crate Process Runs, and pluggable execution backends such as Docker, Kubernetes, and SLURM.
-
-### GA4GH DRS interoperability
-
-Aruna is adding GA4GH Data Repository Service (DRS) endpoints so datasets and objects can be referenced through stable, workflow-friendly identifiers and resolved into access methods without depending on Aruna-specific URLs. This gives external workflow engines and future TES integrations a standard way to locate Aruna-managed data.
-
-### OAI-PMH metadata harvesting
-
-Aruna is adding OAI-PMH support so external catalogs, aggregators, and repository portals can harvest Aruna metadata incrementally. This provides a standards-based export path for Aruna's RO-Crate-backed metadata while keeping native synchronization and conflict resolution inside the Aruna network.
-
-### Event subscriptions
-
-Aruna is adding path-based event subscriptions with optional CEL filters and automated actions such as webhooks, compute triggers, and replication rules.
-
-### Transparent request forwarding
-
-Aruna is working toward transparent request forwarding so any node can serve as an entry point for any resource in the realm, backed by single-hop DHT-based discovery.
-
-### Cross-realm data exchange
-
-Aruna is extending its cross-realm-capable DHT foundations toward direct cross-realm data exchange.
+The goal is to support FAIR data practice in a way that matches how research actually works, distributed, collaborative, policy-bound, and owned by many parties at once.
 
 ## Getting Started
 
-For most users, the fastest way to evaluate Aruna is the local 3-node smoke test.
+The quickest way to try Aruna is a local 3-node demo deployment.
 
 ### Prerequisites
 
-- Rust `1.93.0+` for source builds
+
+#### For local builds:
+
+- Rust `1.95.0+` (for source builds)
 - OpenSSL development headers
-- On `x86_64-unknown-linux-gnu`, `clang` and `mold` are required because the repository linker configuration uses both
-- `just`, `curl`, and `ss` for the local smoke tests
-- `docker` for `just test-deploy-oidc`
-- `docker-compose` for `just compose`
+- `mold` linker
+
+#### For local test deployments:
+
+- `curl` (`ss` for cluster setup)
+- `docker`
+- `docker-compose`
+- `just` (optional, for convenience)
 
 ### Run a single node with an external identity provider
 
-To start one node, run:
+Start one node with:
 
 ```bash
-just compose
+just local
 ```
 
-With the default example configuration:
+or invoke [scripts/local_deploy.sh](scripts/local_deploy.sh) directly.
 
-- the REST API and Swagger UI are served on `http://127.0.0.1:3000/swagger-ui`
-- the S3 endpoint listens on `http://127.0.0.1:1337`
+The default example configuration exposes:
+
+- the REST API and Swagger UI on `http://127.0.0.1:3000/swagger-ui`
+- the S3 endpoint on `http://127.0.0.1:1337`
 
 ### Evaluate a local cluster
 
 For a quick end-to-end evaluation, run:
 
 ```bash
-just test-deploy
+just local-cluster
 # or
-just test-deploy-oidc
+just local-cluster-oidc
 ```
 
-This smoke test:
+This demo deployment:
 
 - builds the workspace in release mode
-- boots 3 local Aruna nodes
+- launches 3 local Aruna nodes
 - waits for readiness at `http://127.0.0.1:<port>/swagger-ui`
-- writes per-node logs and `summary.txt` under `target/test-deploy/`
-- prints an `ADMIN_TOKEN=...` line that you can use for authenticated API calls during the session
+- writes per-node logs and `summary.txt` to `target/test-deploy/`
+- prints an `ADMIN_TOKEN=...` line for use in authenticated API calls during the session
 
-Common overrides:
+Useful overrides:
 
-- `ARUNA_TEST_DEPLOY_BASE_PORT` to move the whole local port range
-- `ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1` to stop after readiness instead of keeping the cluster running
+- `ARUNA_TEST_DEPLOY_BASE_PORT` shifts the entire local port range
+- `ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1` exits once the cluster is ready instead of keeping it running
 
-`just test-deploy-oidc` adds a local Keycloak instance on top of the same 3-node smoke test.
+`just local-cluster-oidc` extends the same 3-node smoke test with a local Keycloak instance.
 
 ### Run a single node from source
 
-To start one node directly from source, copy the example environment file and run the main binary from the workspace root:
+To run a node directly from source, copy the example environment file and start the main binary from the workspace root:
 
 ```bash
 cp .env.example .env
 cargo run -p aruna
 ```
 
-With the default example configuration:
+The default example configuration exposes:
 
-- the REST API and Swagger UI are served on `http://127.0.0.1:3000/swagger-ui`
-- the S3 endpoint listens on `http://127.0.0.1:1337`
-
-## Configuration
-
-Aruna reads configuration from environment variables. For most source deployments, start from `.env.example` and adjust the values below.
-
-Required variables:
-
-| Variable | Example | Purpose |
-|----------|---------|---------|
-| `STORAGE_PATH` | `/var/lib/aruna/data` | Root path for persisted node state and default local storage locations |
-| `SOCKET_ADDRESS` | `0.0.0.0:3000` | REST API and Swagger UI listen address |
-| `S3_PORT` | `1337` | S3 server port |
-| `S3_HOST` | `localhost` | Hostname presented to S3 clients |
-| `S3_ADDRESS` | `0.0.0.0` | S3 server listen address |
-
-Common optional variables:
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `P2P_SOCKET_ADDRESS` | `SOCKET_ADDRESS` | P2P bind address |
-| `REALM_DESCRIPTION` | `Aruna Realm` | Display name for a newly initialized realm |
-| `ONBOARDING_SECRET` | unset | Used only when a new node joins an existing realm on first boot |
-| `BOOTSTRAP_NODES` | unset | Comma-separated bootstrap node public keys |
-| `METADATA_REPLICATION_FACTOR` | `3` | Default metadata replication factor, clamped to at least `1` |
-| `CRAQLE_STORAGE_PATH` | `${STORAGE_PATH}/craqle` | Metadata storage path |
-| `BLOB_ROOT` | `${STORAGE_PATH}/blobstore` | Blob storage root |
-| `BLOB_MULTIPART_BUCKET` | `uploaded-parts` | Bucket used for multipart uploads |
-| `BLOB_BUCKET_PREFIX` | unset | Optional bucket naming prefix |
-| `BLOB_MAX_BUCKET_SIZE` | `100000` | Maximum bucket size setting |
-| `BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS` | `30` | Blob control-plane connect timeout |
-| `BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS` | `30` | Blob control-plane I/O timeout |
-| `BLOB_TRANSFER_IDLE_TIMEOUT_SECS` | `1800` | Blob transfer idle timeout |
-
-Configure OIDC providers by listing provider IDs and defining one environment block per ID:
-
-```bash
-OIDC_PROVIDER_IDS=main
-OIDC_MAIN_ISSUER=https://issuer.example/realms/aruna
-OIDC_MAIN_AUDIENCE=aruna-api
-OIDC_MAIN_DISCOVERY_URL=https://issuer.example/realms/aruna/.well-known/openid-configuration
-```
-
-Logging and tracing:
-
-- `RUST_LOG` controls log verbosity
-- `OTEL_EXPORTER_OTLP_ENDPOINT` or `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` enables OTLP trace export
+- the REST API and Swagger UI on `http://127.0.0.1:3000/swagger-ui`
+- the S3 endpoint on `http://127.0.0.1:1337`
 
 ## State And Onboarding
 
-A node started without an `ONBOARDING_SECRET` initializes a new realm on first boot and persists its identity under `STORAGE_PATH`.
+A node started without an `ONBOARDING_SECRET` initializes a new realm on first boot and persists its identity under `STORAGE_PATH`. When this happens, the first management node also logs an initial local onboarding secret for the new realm.
 
-Additional nodes join an existing realm by starting with an `ONBOARDING_SECRET` on their first boot. The first management node also logs an initial local onboarding secret when it creates a brand-new realm.
+Additional nodes join an existing realm by setting `ONBOARDING_SECRET` on their first boot.
 
-Once a node has persisted state, later `.env` changes do not re-bootstrap or re-onboard it. If a data directory already contains node state, changing `ONBOARDING_SECRET` does not re-onboard that node. Use a fresh `STORAGE_PATH` when repeating onboarding tests or bootstrap flows.
+Onboarding only takes effect on a fresh data directory. Once a node has persisted state, later `.env` changes — including a new `ONBOARDING_SECRET` — do not re-bootstrap or re-onboard it. To repeat an onboarding or bootstrap flow, point the node at a fresh `STORAGE_PATH`.
 
-For a ready-made local multi-node onboarding flow, use `just test-deploy` instead of stepping through the onboarding APIs by hand.
-
-## S3 Access
-
-Aruna's S3 interface is authenticated. Create S3 credentials via [the API](http://127.0.0.1:3000/swagger-ui/#/credentials) before using the endpoint, then point your AWS CLI or S3-compatible client at the node.
-
-```bash
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-
-aws --endpoint-url http://127.0.0.1:1337 s3 mb s3://my-bucket
-aws --endpoint-url http://127.0.0.1:1337 s3 cp data.csv s3://my-bucket/
-aws --endpoint-url http://127.0.0.1:1337 s3 ls s3://my-bucket
-```
-
-## Concepts
-
-**Realm** - a trust boundary identified by an Ed25519 keypair. Represents an organization, a project, or any logical grouping. Nodes belong to exactly one realm. Realms can establish trust relationships for cross-boundary collaboration.
-
-**Node** - a running Aruna instance that handles storage, networking, and API serving. Participates in DHT routing and gossip-based metadata replication.
-
-**Meta Resources** - structured metadata documents stored as Automerge CRDTs following the RO-Crate JSON-LD schema. They sync automatically, support concurrent editing, and carry full version history.
-
-**Data Resources** - immutable blobs identified by their BLAKE3 content hash. Updating a file creates a new blob; the old version is preserved.
-
-**Groups** - permission boundaries within a realm. Each group has roles that map to path patterns with read/write/admin permissions and wildcard support.
+For a ready-made multi-node onboarding flow, use `just test-deploy` instead of walking through the onboarding APIs manually.
 
 ## License
 
