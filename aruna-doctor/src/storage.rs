@@ -604,6 +604,7 @@ mod tests {
                     realm_id: config.realm_id,
                     bootstrap_nodes: Vec::new(),
                     use_dns_discovery: false,
+                    ..Default::default()
                 },
                 storage_handle.clone(),
             )

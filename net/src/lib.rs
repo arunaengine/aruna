@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use crossfire::TrySendError;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
-use iroh::endpoint::presets;
+use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr};
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -40,6 +40,8 @@ pub struct NetConfig {
     pub realm_id: RealmId,
     pub bootstrap_nodes: Vec<NodeId>,
     pub use_dns_discovery: bool,
+    pub max_concurrent_uni_streams: Option<u64>,
+    pub max_concurrent_bidi_streams: Option<u64>,
 }
 
 impl Default for NetConfig {
@@ -50,6 +52,8 @@ impl Default for NetConfig {
             realm_id: RealmId::from_bytes([0u8; 32]),
             bootstrap_nodes: vec![],
             use_dns_discovery: true,
+            max_concurrent_bidi_streams: None,
+            max_concurrent_uni_streams: None,
         }
     }
 }
@@ -106,7 +110,19 @@ impl NetHandle {
         let secret_key = config.secret_key.unwrap_or_else(iroh::SecretKey::generate);
 
         let address_lookup = MemoryLookup::new();
+
+        let mut transport_config = QuicTransportConfig::builder();
+        if let Some(max_uni) = config.max_concurrent_uni_streams {
+            transport_config =
+                transport_config.max_concurrent_uni_streams(VarInt::from_u64(max_uni)?);
+        }
+        if let Some(max_bidi) = config.max_concurrent_bidi_streams {
+            transport_config =
+                transport_config.max_concurrent_bidi_streams(VarInt::from_u64(max_bidi)?);
+        }
+
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)
+            .transport_config(transport_config.build())
             .secret_key(secret_key)
             .address_lookup(address_lookup.clone())
             .alpns(vec![
