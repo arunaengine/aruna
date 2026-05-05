@@ -17,6 +17,7 @@ pub enum TaskEffect {
     ResetTimer { key: TaskKey, after: Duration },
     ShortenTimer { key: TaskKey, after: Duration },
     CancelTimer { key: TaskKey },
+    AbortRunningHandlers { key: TaskKey },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,10 @@ pub enum TaskEvent {
     },
     TimerCancelled {
         key: TaskKey,
+    },
+    RunningHandlersAborted {
+        key: TaskKey,
+        count: usize,
     },
     Error {
         key: Option<TaskKey>,

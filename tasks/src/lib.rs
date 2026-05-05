@@ -7,6 +7,7 @@ use aruna_core::handle::Handle;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::warn;
 
@@ -45,6 +46,10 @@ enum TaskCommand {
         key: TaskKey,
         response: oneshot::Sender<TaskEvent>,
     },
+    AbortRunningHandlers {
+        key: TaskKey,
+        response: oneshot::Sender<TaskEvent>,
+    },
     HandlerCompleted {
         run_id: u64,
         key: TaskKey,
@@ -79,6 +84,7 @@ struct RunningTaskEntry {
     started_at: Instant,
     warn_at: Instant,
     warned: bool,
+    task: JoinHandle<()>,
 }
 
 impl SchedulerState {
@@ -141,7 +147,7 @@ impl SchedulerState {
         }
     }
 
-    fn track_running_task(&mut self, task: &RunningTask) {
+    fn track_running_task(&mut self, task: &RunningTask, handle: JoinHandle<()>) {
         let Some(id) = task.id else {
             return;
         };
@@ -157,6 +163,7 @@ impl SchedulerState {
                 started_at: task.started_at,
                 warn_at,
                 warned: false,
+                task: handle,
             },
         );
         self.running_warn_deadlines.insert((warn_at, id));
@@ -197,8 +204,8 @@ impl SchedulerState {
 
                 if let Some(handler) = self.inbound_handler.clone() {
                     let task = self.prepare_running_task(key, now);
-                    spawn_timer_handler(handler, command_tx.clone(), task.clone());
-                    self.track_running_task(&task);
+                    let handle = spawn_timer_handler(handler, command_tx.clone(), task.clone());
+                    self.track_running_task(&task, handle);
                 }
             }
         }
@@ -310,6 +317,27 @@ impl SchedulerState {
         }
     }
 
+    fn abort_running_handlers(&mut self, key: TaskKey) -> TaskEvent {
+        let run_ids = self
+            .running_by_id
+            .iter()
+            .filter_map(|(run_id, entry)| (entry.key == key).then_some(*run_id))
+            .collect::<Vec<_>>();
+
+        for run_id in &run_ids {
+            if let Some(entry) = self.running_by_id.remove(run_id) {
+                self.running_warn_deadlines
+                    .remove(&(entry.warn_at, *run_id));
+                entry.task.abort();
+            }
+        }
+
+        TaskEvent::RunningHandlersAborted {
+            key,
+            count: run_ids.len(),
+        }
+    }
+
     fn handle_command(&mut self, command: TaskCommand) {
         match command {
             TaskCommand::SetInboundHandler { handler, response } => {
@@ -336,6 +364,9 @@ impl SchedulerState {
             }
             TaskCommand::CancelTimer { key, response } => {
                 let _ = response.send(self.cancel_timer(key));
+            }
+            TaskCommand::AbortRunningHandlers { key, response } => {
+                let _ = response.send(self.abort_running_handlers(key));
             }
             TaskCommand::HandlerCompleted {
                 run_id,
@@ -384,7 +415,7 @@ fn spawn_timer_handler(
     handler: Arc<dyn InboundTaskHandler>,
     command_tx: mpsc::WeakSender<TaskCommand>,
     task: RunningTask,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if task.id.is_none() {
             warn!(
@@ -414,7 +445,7 @@ fn spawn_timer_handler(
                 "Untracked timer handler task exceeded warning threshold before completing"
             );
         }
-    });
+    })
 }
 
 impl TaskHandle {
@@ -512,6 +543,23 @@ impl TaskHandle {
             .await
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
     }
+
+    pub async fn abort_running_handlers(&self, key: TaskKey) -> TaskEvent {
+        let command_key = key.clone();
+        let (response, result) = oneshot::channel();
+        if self
+            .command_tx
+            .send(TaskCommand::AbortRunningHandlers { key, response })
+            .await
+            .is_err()
+        {
+            return scheduler_unavailable(command_key);
+        }
+
+        result
+            .await
+            .unwrap_or_else(|_| scheduler_unavailable(command_key))
+    }
 }
 
 fn scheduler_unavailable(key: TaskKey) -> TaskEvent {
@@ -542,6 +590,9 @@ impl Handle for TaskHandle {
                     TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after).await,
                     TaskEffect::ShortenTimer { key, after } => self.shorten_timer(key, after).await,
                     TaskEffect::CancelTimer { key } => self.cancel_timer(key).await,
+                    TaskEffect::AbortRunningHandlers { key } => {
+                        self.abort_running_handlers(key).await
+                    }
                 };
                 Event::Task(event)
             }
@@ -593,6 +644,20 @@ mod tests {
         finished: Arc<Notify>,
     }
 
+    struct NotifyOnDrop(Arc<Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    #[derive(Clone)]
+    struct BlockingHandler {
+        started: Arc<Notify>,
+        dropped: Arc<Notify>,
+    }
+
     #[async_trait]
     impl InboundTaskHandler for SelfReschedulingHandler {
         async fn handle_timer(&self, key: TaskKey) {
@@ -607,6 +672,15 @@ mod tests {
 
             tokio::task::yield_now().await;
             self.finished.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for BlockingHandler {
+        async fn handle_timer(&self, _key: TaskKey) {
+            let _notify_on_drop = NotifyOnDrop(self.dropped.clone());
+            self.started.notify_one();
+            std::future::pending::<()>().await;
         }
     }
 
@@ -676,6 +750,44 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), finished.notified())
             .await
             .expect("handler should continue after resetting its own timer");
+    }
+
+    #[tokio::test]
+    async fn abort_running_handlers_aborts_matching_handler_task() {
+        let handle = TaskHandle::new();
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(Notify::new());
+        let key = test_key();
+
+        handle
+            .set_inbound_handler(Arc::new(BlockingHandler {
+                started: started.clone(),
+                dropped: dropped.clone(),
+            }))
+            .await;
+
+        let _ = handle
+            .send_effect(Effect::Task(TaskEffect::ResetTimer {
+                key: key.clone(),
+                after: Duration::from_millis(10),
+            }))
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("handler should start");
+
+        let Event::Task(TaskEvent::RunningHandlersAborted { count, .. }) = handle
+            .send_effect(Effect::Task(TaskEffect::AbortRunningHandlers { key }))
+            .await
+        else {
+            panic!("expected running handler abort event");
+        };
+        assert_eq!(count, 1);
+
+        tokio::time::timeout(Duration::from_secs(1), dropped.notified())
+            .await
+            .expect("handler future should be dropped after abort");
     }
 
     #[tokio::test]
