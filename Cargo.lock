@@ -441,6 +441,7 @@ dependencies = [
  "async-trait",
  "iroh",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

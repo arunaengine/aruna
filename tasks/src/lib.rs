@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use aruna_core::effects::Effect;
@@ -8,8 +8,10 @@ use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use async_trait::async_trait;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
+use tracing::warn;
 
 const TASK_COMMAND_BUFFER: usize = 1024;
+const TIMER_HANDLER_WARN_AFTER: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub trait InboundTaskHandler: Send + Sync {
@@ -43,13 +45,21 @@ enum TaskCommand {
         key: TaskKey,
         response: oneshot::Sender<TaskEvent>,
     },
+    HandlerCompleted {
+        run_id: u64,
+        key: TaskKey,
+        elapsed: Duration,
+    },
 }
 
 struct SchedulerState {
     timers_by_key: HashMap<TaskKey, TimerEntry>,
     timers_by_deadline: BTreeMap<(Instant, u64), TaskKey>,
+    running_by_id: HashMap<u64, RunningTaskEntry>,
+    running_warn_deadlines: BTreeSet<(Instant, u64)>,
     inbound_handler: Option<Arc<dyn InboundTaskHandler>>,
     next_timer_id: u64,
+    next_run_id: u64,
 }
 
 struct TimerEntry {
@@ -57,13 +67,30 @@ struct TimerEntry {
     deadline: Instant,
 }
 
+#[derive(Clone)]
+struct RunningTask {
+    id: Option<u64>,
+    key: TaskKey,
+    started_at: Instant,
+}
+
+struct RunningTaskEntry {
+    key: TaskKey,
+    started_at: Instant,
+    warn_at: Instant,
+    warned: bool,
+}
+
 impl SchedulerState {
     fn new() -> Self {
         Self {
             timers_by_key: HashMap::new(),
             timers_by_deadline: BTreeMap::new(),
+            running_by_id: HashMap::new(),
+            running_warn_deadlines: BTreeSet::new(),
             inbound_handler: None,
             next_timer_id: 1,
+            next_run_id: 1,
         }
     }
 
@@ -73,6 +100,19 @@ impl SchedulerState {
             self.next_timer_id = next_id(self.next_timer_id);
 
             if !self.timers_by_deadline.contains_key(&(deadline, id)) {
+                return Some(id);
+            }
+        }
+
+        None
+    }
+
+    fn allocate_run_id(&mut self) -> Option<u64> {
+        for _ in 0..=self.running_by_id.len() {
+            let id = self.next_run_id;
+            self.next_run_id = next_id(self.next_run_id);
+
+            if !self.running_by_id.contains_key(&id) {
                 return Some(id);
             }
         }
@@ -92,13 +132,55 @@ impl SchedulerState {
         Some(entry)
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
-        self.timers_by_deadline
-            .first_key_value()
-            .map(|(&(deadline, _), _)| deadline)
+    fn prepare_running_task(&mut self, key: TaskKey, started_at: Instant) -> RunningTask {
+        let id = self.allocate_run_id();
+        RunningTask {
+            id,
+            key,
+            started_at,
+        }
     }
 
-    fn dispatch_due_timers(&mut self) {
+    fn track_running_task(&mut self, task: &RunningTask) {
+        let Some(id) = task.id else {
+            return;
+        };
+
+        let warn_at = task
+            .started_at
+            .checked_add(TIMER_HANDLER_WARN_AFTER)
+            .unwrap_or(task.started_at);
+        self.running_by_id.insert(
+            id,
+            RunningTaskEntry {
+                key: task.key.clone(),
+                started_at: task.started_at,
+                warn_at,
+                warned: false,
+            },
+        );
+        self.running_warn_deadlines.insert((warn_at, id));
+    }
+
+    fn next_deadline(&self) -> Option<Instant> {
+        let next_timer = self
+            .timers_by_deadline
+            .first_key_value()
+            .map(|(&(deadline, _), _)| deadline);
+        let next_running_warning = self
+            .running_warn_deadlines
+            .first()
+            .map(|(deadline, _)| *deadline);
+
+        match (next_timer, next_running_warning) {
+            (Some(timer), Some(warning)) => Some(timer.min(warning)),
+            (Some(timer), None) => Some(timer),
+            (None, Some(warning)) => Some(warning),
+            (None, None) => None,
+        }
+    }
+
+    fn dispatch_due_timers(&mut self, command_tx: &mpsc::WeakSender<TaskCommand>) {
         let now = Instant::now();
 
         while let Some((&(deadline, timer_id), key)) = self.timers_by_deadline.first_key_value() {
@@ -114,10 +196,35 @@ impl SchedulerState {
                 self.timers_by_key.remove(&key);
 
                 if let Some(handler) = self.inbound_handler.clone() {
-                    tokio::spawn(async move {
-                        handler.handle_timer(key).await;
-                    });
+                    let task = self.prepare_running_task(key, now);
+                    spawn_timer_handler(handler, command_tx.clone(), task.clone());
+                    self.track_running_task(&task);
                 }
+            }
+        }
+    }
+
+    fn warn_for_long_running_tasks(&mut self) {
+        let now = Instant::now();
+
+        while let Some(&(warn_at, run_id)) = self.running_warn_deadlines.first() {
+            if warn_at > now {
+                break;
+            }
+
+            self.running_warn_deadlines.pop_first();
+
+            if let Some(entry) = self.running_by_id.get_mut(&run_id)
+                && !entry.warned
+            {
+                entry.warned = true;
+                warn!(
+                    task_run_id = run_id,
+                    key = ?entry.key,
+                    elapsed_ms = now.saturating_duration_since(entry.started_at).as_millis(),
+                    threshold_ms = TIMER_HANDLER_WARN_AFTER.as_millis(),
+                    "Timer handler task is still running after warning threshold"
+                );
             }
         }
     }
@@ -185,6 +292,24 @@ impl SchedulerState {
         TaskEvent::TimerCancelled { key }
     }
 
+    fn complete_handler(&mut self, run_id: u64, key: TaskKey, elapsed: Duration) {
+        let Some(entry) = self.running_by_id.remove(&run_id) else {
+            return;
+        };
+
+        self.running_warn_deadlines.remove(&(entry.warn_at, run_id));
+
+        if !entry.warned && elapsed >= TIMER_HANDLER_WARN_AFTER {
+            warn!(
+                task_run_id = run_id,
+                key = ?key,
+                elapsed_ms = elapsed.as_millis(),
+                threshold_ms = TIMER_HANDLER_WARN_AFTER.as_millis(),
+                "Timer handler task exceeded warning threshold before completing"
+            );
+        }
+    }
+
     fn handle_command(&mut self, command: TaskCommand) {
         match command {
             TaskCommand::SetInboundHandler { handler, response } => {
@@ -212,6 +337,11 @@ impl SchedulerState {
             TaskCommand::CancelTimer { key, response } => {
                 let _ = response.send(self.cancel_timer(key));
             }
+            TaskCommand::HandlerCompleted {
+                run_id,
+                key,
+                elapsed,
+            } => self.complete_handler(run_id, key, elapsed),
         }
     }
 }
@@ -220,11 +350,15 @@ fn next_id(id: u64) -> u64 {
     id.checked_add(1).unwrap_or(1)
 }
 
-async fn run_scheduler(mut command_rx: mpsc::Receiver<TaskCommand>) {
+async fn run_scheduler(
+    mut command_rx: mpsc::Receiver<TaskCommand>,
+    command_tx: mpsc::WeakSender<TaskCommand>,
+) {
     let mut state = SchedulerState::new();
 
     loop {
-        state.dispatch_due_timers();
+        state.dispatch_due_timers(&command_tx);
+        state.warn_for_long_running_tasks();
 
         match state.next_deadline() {
             Some(deadline) => {
@@ -246,12 +380,51 @@ async fn run_scheduler(mut command_rx: mpsc::Receiver<TaskCommand>) {
     }
 }
 
+fn spawn_timer_handler(
+    handler: Arc<dyn InboundTaskHandler>,
+    command_tx: mpsc::WeakSender<TaskCommand>,
+    task: RunningTask,
+) {
+    tokio::spawn(async move {
+        if task.id.is_none() {
+            warn!(
+                key = ?task.key,
+                "Timer handler task is running without runtime tracking because run id space is exhausted"
+            );
+        }
+
+        handler.handle_timer(task.key.clone()).await;
+
+        let elapsed = task.started_at.elapsed();
+        if let Some(run_id) = task.id {
+            if let Some(command_tx) = command_tx.upgrade() {
+                let _ = command_tx
+                    .send(TaskCommand::HandlerCompleted {
+                        run_id,
+                        key: task.key,
+                        elapsed,
+                    })
+                    .await;
+            }
+        } else if elapsed >= TIMER_HANDLER_WARN_AFTER {
+            warn!(
+                key = ?task.key,
+                elapsed_ms = elapsed.as_millis(),
+                threshold_ms = TIMER_HANDLER_WARN_AFTER.as_millis(),
+                "Untracked timer handler task exceeded warning threshold before completing"
+            );
+        }
+    });
+}
+
 impl TaskHandle {
     pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(run_scheduler(command_rx));
+            handle.spawn(run_scheduler(command_rx, command_tx.downgrade()));
+        } else {
+            warn!("TaskHandle created without an active Tokio runtime; task scheduler unavailable");
         }
 
         Self { command_tx }
