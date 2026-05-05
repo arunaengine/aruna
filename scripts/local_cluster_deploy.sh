@@ -132,6 +132,13 @@ write_node_env() {
     if [[ -n "$onboarding_secret" ]]; then
       printf 'ONBOARDING_SECRET=%s\n' "$onboarding_secret"
     fi
+
+    if [[ -n "$MAX_CONCURRENT_UNI_STREAMS" ]]; then
+      printf 'MAX_CONCURRENT_UNI_STREAMS=%s\n' "$MAX_CONCURRENT_UNI_STREAMS"
+    fi
+    if [[ -n "$MAX_CONCURRENT_BIDI_STREAMS" ]]; then
+      printf 'MAX_CONCURRENT_BIDI_STREAMS=%s\n' "$MAX_CONCURRENT_BIDI_STREAMS"
+    fi
   } >"$node_dir/.env"
 }
 

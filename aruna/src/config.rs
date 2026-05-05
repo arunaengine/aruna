@@ -176,11 +176,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
 
-    let max_concurrent_uni_streams = dotenvy::var("MAX_UNI_CONCURRENT_STREAMS")
+    let max_concurrent_uni_streams = dotenvy::var("MAX_CONCURRENT_UNI_STREAMS")
         .ok()
         .map(|value| value.parse::<u64>())
         .transpose()?;
-    let max_concurrent_bidi_streams = dotenvy::var("MAX_BIDI_CONCURRENT_STREAMS")
+    let max_concurrent_bidi_streams = dotenvy::var("MAX_CONCURRENT_BIDI_STREAMS")
         .ok()
         .map(|value| value.parse::<u64>())
         .transpose()?;
