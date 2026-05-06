@@ -1,0 +1,1590 @@
+use crate::error::CliError;
+use aruna::config::PersistedNodeState;
+use aruna_api::server_state::{
+    INITIAL_REALM_ADMIN_CLAIMED_KEY, TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY,
+};
+use aruna_core::id::{DhtKeyId, TopicId};
+use aruna_core::keyspaces::{
+    API_STATE_KEYSPACE, AUTH_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
+    CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
+    GROUP_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
+    S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
+};
+use aruna_core::onboarding::OnboardingSecretRecord;
+use aruna_core::structs::{
+    BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, Location, LookupKey,
+    Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
+    VersionMetadata,
+};
+use aruna_net::dht::storage::StoredEntry;
+use chrono::{DateTime, Utc};
+use craqle::{
+    ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
+    VectorClock as CraqleVectorClock,
+};
+use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
+use serde::ser::{SerializeStruct, Serializer};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::Path;
+use ulid::Ulid;
+
+const CRAQLE_DOT_ENCODING_TAG: u8 = b'D';
+const CRAQLE_BATCH_LOG_ENCODING_TAG: u8 = b'B';
+const CRAQLE_GRAPH_META_PREFIX: u8 = b'M';
+const CRAQLE_GRAPH_DIRTY_PREFIX: u8 = b'D';
+const CRAQLE_GRAPH_REINDEX_PREFIX: u8 = b'R';
+const CRAQLE_LOG_HEAD_PREFIX: u8 = b'H';
+const CRAQLE_LOG_BATCH_PREFIX: u8 = b'B';
+
+#[derive(Debug, thiserror::Error)]
+pub enum ExplorerError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Fjall(#[from] fjall::Error),
+    #[error("keyspace not found: {0}")]
+    KeyspaceNotFound(String),
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct KeyspacesOutput {
+    database_path: String,
+    keyspaces: Vec<KeyspaceEntry>,
+    missing_keyspaces: Vec<KeyspaceEntry>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct KeyspaceEntry {
+    name: String,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct EntriesOutput {
+    database_path: String,
+    keyspace: String,
+    entries: Vec<EntryOutput>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct EntryOutput {
+    key: DecodedField,
+    value: DecodedValue,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "format")]
+enum DecodedField {
+    #[serde(rename = "ulid")]
+    Ulid { value: String },
+    #[serde(rename = "realm_id")]
+    RealmId { value: String },
+    #[serde(rename = "dht_key")]
+    DhtKeyId { value: String },
+    #[serde(rename = "craqle_term_id")]
+    CraqleTermId { value: String },
+    #[serde(rename = "craqle_quad_key")]
+    CraqleQuadKey { value: JsonCraqleQuadKey },
+    #[serde(rename = "craqle_graph_key")]
+    CraqleGraphKey { value: JsonCraqleGraphKey },
+    #[serde(rename = "craqle_log_key")]
+    CraqleLogKey { value: JsonCraqleLogKey },
+    #[serde(rename = "utf8")]
+    Utf8 { value: String },
+    #[serde(rename = "lookup_key")]
+    LookupKey { value: LookupKey },
+    #[serde(rename = "version_key")]
+    VersionKey { value: VersionKey },
+    #[serde(rename = "raw")]
+    Raw { hex: String },
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
+enum DecodedValue {
+    Group {
+        data: JsonGroup,
+    },
+    GroupAuthorizationDocument {
+        data: GroupAuthorizationDocument,
+    },
+    Realm {
+        data: JsonRealm,
+    },
+    RealmAuthorizationDocument {
+        data: JsonRealmAuthorizationDocument,
+    },
+    RealmConfigDocument {
+        data: JsonRealmConfigDocument,
+    },
+    UserAccess {
+        data: JsonUserAccess,
+    },
+    BucketInfo {
+        data: BucketInfo,
+    },
+    CurrentVersionPointer {
+        data: CurrentVersionPointer,
+    },
+    Location {
+        data: Location,
+    },
+    VersionMetadata {
+        data: VersionMetadata,
+    },
+    ApiTokenRevocationList {
+        data: HashSet<String>,
+    },
+    ApiTrustedRealmsList {
+        data: Vec<String>,
+    },
+    ApiInitialRealmAdminClaimed {
+        data: bool,
+    },
+    GossipSubscriptions {
+        data: Vec<String>,
+    },
+    NodeState {
+        data: JsonPersistedNodeState,
+    },
+    OnboardingSecretRecord {
+        data: OnboardingSecretRecord,
+    },
+    DhtEntries {
+        data: Vec<JsonStoredEntry>,
+    },
+    CraqleTerm {
+        data: String,
+    },
+    CraqleQuadDots {
+        data: Vec<JsonCraqleDot>,
+    },
+    CraqleGraphMeta {
+        data: JsonCraqleGraphMeta,
+    },
+    CraqleGraphDirtyToken {
+        data: u64,
+    },
+    CraqleGraphReindexToken {
+        data: u64,
+    },
+    CraqleLogHead {
+        data: u64,
+    },
+    CraqleLogBatch {
+        data: JsonCraqleStoredBatch,
+    },
+    Raw {
+        hex: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        decode_error: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct CraqleTermId(u128);
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct CraqleStoredGraphMeta {
+    policy: CraqleGraphPolicy,
+    clock: CraqleVectorClock,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+enum CraqleStoredQuadOp {
+    Add {
+        subject: CraqleTermId,
+        predicate: CraqleTermId,
+        object: CraqleTermId,
+        dot: CraqleDot,
+    },
+    Remove {
+        subject: CraqleTermId,
+        predicate: CraqleTermId,
+        object: CraqleTermId,
+        witnessed: CraqleVectorClock,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct CraqleStoredBatch {
+    actor: CraqleActorId,
+    counter: u64,
+    base_clock: CraqleVectorClock,
+    ops: Vec<CraqleStoredQuadOp>,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CraqleQuadKeyParts {
+    graph: CraqleTermId,
+    subject: CraqleTermId,
+    predicate: CraqleTermId,
+    object: CraqleTermId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CraqleGraphKeyParts {
+    Meta {
+        graph: CraqleTermId,
+    },
+    Dirty {
+        graph: CraqleTermId,
+        subject: CraqleTermId,
+    },
+    Reindex {
+        graph: CraqleTermId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CraqleLogKeyParts {
+    Head {
+        graph: CraqleTermId,
+        actor: CraqleActorId,
+    },
+    Batch {
+        graph: CraqleTermId,
+        actor: CraqleActorId,
+        counter: u64,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleQuadKey {
+    graph: String,
+    subject: String,
+    predicate: String,
+    object: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum JsonCraqleGraphKey {
+    Meta { graph: String },
+    Dirty { graph: String, subject: String },
+    Reindex { graph: String },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum JsonCraqleLogKey {
+    Head {
+        graph: String,
+        actor: String,
+    },
+    Batch {
+        graph: String,
+        actor: String,
+        counter: u64,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleClockEntry {
+    actor: String,
+    counter: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleVectorClock {
+    entries: Vec<JsonCraqleClockEntry>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleDot {
+    actor: String,
+    counter: u64,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleGraphPolicy {
+    public: bool,
+    permission_paths: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleGraphMeta {
+    graph: String,
+    policy: JsonCraqleGraphPolicy,
+    clock: JsonCraqleVectorClock,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum JsonCraqleStoredBatchOp {
+    Add {
+        subject: String,
+        predicate: String,
+        object: String,
+        dot: JsonCraqleDot,
+    },
+    Remove {
+        subject: String,
+        predicate: String,
+        object: String,
+        witnessed: JsonCraqleVectorClock,
+    },
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct JsonCraqleStoredBatch {
+    graph: String,
+    actor: String,
+    counter: u64,
+    base_clock: JsonCraqleVectorClock,
+    ops: Vec<JsonCraqleStoredBatchOp>,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct JsonGroup(Group);
+
+impl Serialize for JsonGroup {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Group", 4)?;
+        state.serialize_field("display_name", &self.0.display_name)?;
+        state.serialize_field("group_id", &self.0.group_id.to_string())?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("roles", &self.0.roles)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct JsonRealm(Realm);
+
+impl Serialize for JsonRealm {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Realm", 2)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("description", &self.0.description)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct JsonRealmAuthorizationDocument(RealmAuthorizationDocument);
+
+impl Serialize for JsonRealmAuthorizationDocument {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("RealmAuthorizationDocument", 3)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("roles", &self.0.roles)?;
+        state.serialize_field("operation_restrictions", &self.0.operation_restrictions)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct JsonRealmConfigDocument(RealmConfigDocument);
+
+impl Serialize for JsonRealmConfigDocument {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("RealmConfigDocument", 2)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("metadata_replication", &self.0.metadata_replication)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct JsonUserAccess(UserAccess);
+
+impl Serialize for JsonUserAccess {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("UserAccess", 8)?;
+        state.serialize_field("access_key", &self.0.access_key)?;
+        state.serialize_field("user_identity", &self.0.user_identity)?;
+        state.serialize_field("group_id", &self.0.group_id.to_string())?;
+        state.serialize_field("secret", &self.0.secret)?;
+        state.serialize_field("expiry", &self.0.expiry)?;
+        state.serialize_field("path_restrictions", &self.0.path_restrictions)?;
+        state.serialize_field("issued_by", &self.0.issued_by)?;
+        state.serialize_field("revoked_at", &self.0.revoked_at)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct JsonPersistedNodeState(PersistedNodeState);
+
+impl Serialize for JsonPersistedNodeState {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("PersistedNodeState", 7)?;
+        state.serialize_field("boot_origin", &self.0.boot_origin)?;
+        state.serialize_field("status", &self.0.status)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("net_secret_key", &hex::encode(self.0.net_secret_key))?;
+        state.serialize_field("bootstrap_endpoints", &self.0.bootstrap_endpoints)?;
+        state.serialize_field("onboarding_phase", &self.0.onboarding_phase)?;
+        state.serialize_field("onboarding_sync_ticket", &self.0.onboarding_sync_ticket)?;
+        state.serialize_field("identity", &self.0.identity)?;
+        state.end()
+    }
+}
+
+#[derive(Debug)]
+struct JsonStoredEntry(StoredEntry);
+
+impl PartialEq for JsonStoredEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.publisher == other.0.publisher
+            && self.0.realm_id == other.0.realm_id
+            && self.0.value == other.0.value
+            && self.0.expires_at == other.0.expires_at
+            && self.0.signature == other.0.signature
+    }
+}
+
+impl Serialize for JsonStoredEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("StoredEntry", 6)?;
+        state.serialize_field("publisher", &self.0.publisher.to_string())?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
+        state.serialize_field("expires_at", &self.0.expires_at)?;
+        state.serialize_field(
+            "signature",
+            &self
+                .0
+                .signature
+                .as_ref()
+                .map(std::string::ToString::to_string),
+        )?;
+        state.serialize_field("value_len", &self.0.value.len())?;
+        state.serialize_field("value_hex", &hex::encode(&self.0.value))?;
+        state.end()
+    }
+}
+
+fn craqle_term_id_string(id: CraqleTermId) -> String {
+    format!("{:032x}", id.0)
+}
+
+fn decode_craqle_term_id(bytes: &[u8], context: &'static str) -> Result<CraqleTermId, String> {
+    let raw: [u8; 16] = bytes.try_into().map_err(|_| {
+        format!(
+            "invalid {context}: expected 16 bytes, found {}",
+            bytes.len()
+        )
+    })?;
+    Ok(CraqleTermId(u128::from_be_bytes(raw)))
+}
+
+fn decode_craqle_u64(bytes: &[u8], context: &'static str) -> Result<u64, String> {
+    let raw: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| format!("invalid {context}: expected 8 bytes, found {}", bytes.len()))?;
+    Ok(u64::from_be_bytes(raw))
+}
+
+fn json_craqle_quad_key(parts: CraqleQuadKeyParts) -> JsonCraqleQuadKey {
+    JsonCraqleQuadKey {
+        graph: craqle_term_id_string(parts.graph),
+        subject: craqle_term_id_string(parts.subject),
+        predicate: craqle_term_id_string(parts.predicate),
+        object: craqle_term_id_string(parts.object),
+    }
+}
+
+fn json_craqle_graph_key(parts: CraqleGraphKeyParts) -> JsonCraqleGraphKey {
+    match parts {
+        CraqleGraphKeyParts::Meta { graph } => JsonCraqleGraphKey::Meta {
+            graph: craqle_term_id_string(graph),
+        },
+        CraqleGraphKeyParts::Dirty { graph, subject } => JsonCraqleGraphKey::Dirty {
+            graph: craqle_term_id_string(graph),
+            subject: craqle_term_id_string(subject),
+        },
+        CraqleGraphKeyParts::Reindex { graph } => JsonCraqleGraphKey::Reindex {
+            graph: craqle_term_id_string(graph),
+        },
+    }
+}
+
+fn json_craqle_log_key(parts: CraqleLogKeyParts) -> JsonCraqleLogKey {
+    match parts {
+        CraqleLogKeyParts::Head { graph, actor } => JsonCraqleLogKey::Head {
+            graph: craqle_term_id_string(graph),
+            actor: actor.to_string(),
+        },
+        CraqleLogKeyParts::Batch {
+            graph,
+            actor,
+            counter,
+        } => JsonCraqleLogKey::Batch {
+            graph: craqle_term_id_string(graph),
+            actor: actor.to_string(),
+            counter,
+        },
+    }
+}
+
+fn json_craqle_dot(dot: CraqleDot) -> JsonCraqleDot {
+    JsonCraqleDot {
+        actor: dot.actor.to_string(),
+        counter: dot.counter,
+    }
+}
+
+fn json_craqle_vector_clock(clock: CraqleVectorClock) -> JsonCraqleVectorClock {
+    JsonCraqleVectorClock {
+        entries: clock
+            .0
+            .into_iter()
+            .map(|(actor, counter)| JsonCraqleClockEntry {
+                actor: actor.to_string(),
+                counter,
+            })
+            .collect(),
+    }
+}
+
+fn json_craqle_graph_policy(policy: CraqleGraphPolicy) -> JsonCraqleGraphPolicy {
+    let mut permission_paths = policy.permission_paths;
+    permission_paths.sort();
+    permission_paths.dedup();
+    JsonCraqleGraphPolicy {
+        public: policy.public,
+        permission_paths,
+    }
+}
+
+fn json_craqle_graph_meta(graph: CraqleTermId, meta: CraqleStoredGraphMeta) -> JsonCraqleGraphMeta {
+    JsonCraqleGraphMeta {
+        graph: craqle_term_id_string(graph),
+        policy: json_craqle_graph_policy(meta.policy),
+        clock: json_craqle_vector_clock(meta.clock),
+    }
+}
+
+fn json_craqle_stored_batch(
+    graph: CraqleTermId,
+    batch: CraqleStoredBatch,
+) -> JsonCraqleStoredBatch {
+    JsonCraqleStoredBatch {
+        graph: craqle_term_id_string(graph),
+        actor: batch.actor.to_string(),
+        counter: batch.counter,
+        base_clock: json_craqle_vector_clock(batch.base_clock),
+        ops: batch
+            .ops
+            .into_iter()
+            .map(|op| match op {
+                CraqleStoredQuadOp::Add {
+                    subject,
+                    predicate,
+                    object,
+                    dot,
+                } => JsonCraqleStoredBatchOp::Add {
+                    subject: craqle_term_id_string(subject),
+                    predicate: craqle_term_id_string(predicate),
+                    object: craqle_term_id_string(object),
+                    dot: json_craqle_dot(dot),
+                },
+                CraqleStoredQuadOp::Remove {
+                    subject,
+                    predicate,
+                    object,
+                    witnessed,
+                } => JsonCraqleStoredBatchOp::Remove {
+                    subject: craqle_term_id_string(subject),
+                    predicate: craqle_term_id_string(predicate),
+                    object: craqle_term_id_string(object),
+                    witnessed: json_craqle_vector_clock(witnessed),
+                },
+            })
+            .collect(),
+        timestamp: batch.timestamp,
+    }
+}
+
+fn decode_craqle_quad_key(key: &[u8]) -> Result<CraqleQuadKeyParts, String> {
+    if key.len() != 64 {
+        return Err(format!(
+            "invalid craqle quad key: expected 64 bytes, found {}",
+            key.len()
+        ));
+    }
+    Ok(CraqleQuadKeyParts {
+        graph: decode_craqle_term_id(&key[0..16], "craqle quad graph")?,
+        subject: decode_craqle_term_id(&key[16..32], "craqle quad subject")?,
+        predicate: decode_craqle_term_id(&key[32..48], "craqle quad predicate")?,
+        object: decode_craqle_term_id(&key[48..64], "craqle quad object")?,
+    })
+}
+
+fn decode_craqle_graph_key(key: &[u8]) -> Result<CraqleGraphKeyParts, String> {
+    match key.first().copied() {
+        Some(CRAQLE_GRAPH_META_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Meta {
+            graph: decode_craqle_term_id(&key[1..17], "craqle graph meta graph")?,
+        }),
+        Some(CRAQLE_GRAPH_DIRTY_PREFIX) if key.len() == 33 => Ok(CraqleGraphKeyParts::Dirty {
+            graph: decode_craqle_term_id(&key[1..17], "craqle graph dirty graph")?,
+            subject: decode_craqle_term_id(&key[17..33], "craqle graph dirty subject")?,
+        }),
+        Some(CRAQLE_GRAPH_REINDEX_PREFIX) if key.len() == 17 => Ok(CraqleGraphKeyParts::Reindex {
+            graph: decode_craqle_term_id(&key[1..17], "craqle graph reindex graph")?,
+        }),
+        Some(prefix) => Err(format!(
+            "invalid craqle graph key prefix `{}` with length {}",
+            prefix as char,
+            key.len()
+        )),
+        None => Err("invalid craqle graph key: empty key".to_string()),
+    }
+}
+
+fn decode_craqle_log_key(key: &[u8]) -> Result<CraqleLogKeyParts, String> {
+    match key.first().copied() {
+        Some(CRAQLE_LOG_HEAD_PREFIX) if key.len() == 49 => Ok(CraqleLogKeyParts::Head {
+            graph: decode_craqle_term_id(&key[1..17], "craqle log head graph")?,
+            actor: CraqleActorId::from_bytes(
+                key[17..49]
+                    .try_into()
+                    .map_err(|_| "invalid craqle log head actor".to_string())?,
+            ),
+        }),
+        Some(CRAQLE_LOG_BATCH_PREFIX) if key.len() == 57 => Ok(CraqleLogKeyParts::Batch {
+            graph: decode_craqle_term_id(&key[1..17], "craqle log batch graph")?,
+            actor: CraqleActorId::from_bytes(
+                key[17..49]
+                    .try_into()
+                    .map_err(|_| "invalid craqle log batch actor".to_string())?,
+            ),
+            counter: decode_craqle_u64(&key[49..57], "craqle log batch counter")?,
+        }),
+        Some(prefix) => Err(format!(
+            "invalid craqle log key prefix `{}` with length {}",
+            prefix as char,
+            key.len()
+        )),
+        None => Err("invalid craqle log key: empty key".to_string()),
+    }
+}
+
+fn decode_craqle_dots(value: &[u8]) -> Result<Vec<JsonCraqleDot>, String> {
+    let dots = if value.first().copied() == Some(CRAQLE_DOT_ENCODING_TAG) {
+        if !(value.len() - 1).is_multiple_of(40) {
+            return Err(format!("invalid craqle dot payload length {}", value.len()));
+        }
+        value[1..]
+            .chunks_exact(40)
+            .map(|chunk| {
+                Ok(CraqleDot {
+                    actor: CraqleActorId::from_bytes(chunk[0..32].try_into().unwrap()),
+                    counter: u64::from_be_bytes(chunk[32..40].try_into().unwrap()),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        postcard::from_bytes::<Vec<CraqleDot>>(value).map_err(|error| error.to_string())?
+    };
+    Ok(dots.into_iter().map(json_craqle_dot).collect())
+}
+
+fn decode_craqle_graph_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match decode_craqle_graph_key(key) {
+        Ok(CraqleGraphKeyParts::Meta { graph }) => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<CraqleStoredGraphMeta>(bytes),
+            |data| DecodedValue::CraqleGraphMeta {
+                data: json_craqle_graph_meta(graph, data),
+            },
+        ),
+        Ok(CraqleGraphKeyParts::Dirty { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle graph dirty token"),
+            |data| DecodedValue::CraqleGraphDirtyToken { data },
+        ),
+        Ok(CraqleGraphKeyParts::Reindex { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle graph reindex token"),
+            |data| DecodedValue::CraqleGraphReindexToken { data },
+        ),
+        Err(error) => raw_value(value, Some(error)),
+    }
+}
+
+fn decode_craqle_log_batch(key: &[u8], value: &[u8]) -> Result<JsonCraqleStoredBatch, String> {
+    let CraqleLogKeyParts::Batch { graph, .. } = decode_craqle_log_key(key)? else {
+        return Err("craqle log batch value requires a batch key".to_string());
+    };
+    if value.first().copied() != Some(CRAQLE_BATCH_LOG_ENCODING_TAG) {
+        return Err("unsupported craqle log batch encoding".to_string());
+    }
+    let batch = postcard::from_bytes::<CraqleStoredBatch>(&value[1..])
+        .map_err(|error| error.to_string())?;
+    Ok(json_craqle_stored_batch(graph, batch))
+}
+
+fn decode_craqle_log_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match decode_craqle_log_key(key) {
+        Ok(CraqleLogKeyParts::Head { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_u64(bytes, "craqle log head"),
+            |data| DecodedValue::CraqleLogHead { data },
+        ),
+        Ok(CraqleLogKeyParts::Batch { .. }) => decode_value_with(
+            value,
+            |bytes| decode_craqle_log_batch(key, bytes),
+            |data| DecodedValue::CraqleLogBatch { data },
+        ),
+        Err(error) => raw_value(value, Some(error)),
+    }
+}
+
+pub async fn explore_keyspaces(database_path: String) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        move || list_keyspaces(&database_path)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+pub async fn explore_entries(database_path: String, keyspace: String) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        let keyspace = keyspace.clone();
+        move || list_entries(&database_path, &keyspace)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError> {
+    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
+    let mut keyspaces = db.list_keyspace_names();
+    keyspaces.sort();
+    let existing = keyspaces
+        .iter()
+        .map(|name| name.as_ref())
+        .collect::<HashSet<_>>();
+    let mut missing_keyspaces = defined_keyspaces()
+        .into_iter()
+        .filter(|name| !existing.contains(name))
+        .map(|name| KeyspaceEntry {
+            name: name.to_string(),
+        })
+        .collect::<Vec<_>>();
+    missing_keyspaces.sort_by(|left, right| left.name.cmp(&right.name));
+
+    Ok(KeyspacesOutput {
+        database_path: database_path.to_string(),
+        keyspaces: keyspaces
+            .into_iter()
+            .map(|name| KeyspaceEntry {
+                name: name.to_string(),
+            })
+            .collect(),
+        missing_keyspaces,
+    })
+}
+
+fn defined_keyspaces() -> [&'static str; 18] {
+    [
+        API_STATE_KEYSPACE,
+        AUTH_KEYSPACE,
+        CRAQLE_GRAPHS_KEYSPACE,
+        CRAQLE_LOG_KEYSPACE,
+        CRAQLE_QUADS_KEYSPACE,
+        CRAQLE_TERMS_KEYSPACE,
+        DHT_KEYSPACE,
+        GOSSIP_SUBSCRIPTIONS_KEYSPACE,
+        GROUP_KEYSPACE,
+        NODE_STATE_KEYSPACE,
+        ONBOARDING_KEYSPACE,
+        REALM_CONFIG_KEYSPACE,
+        REALM_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
+        S3_CURRENT_VERSION_KEYSPACE,
+        S3_LOOKUP_KEYSPACE,
+        S3_VERSION_KEYSPACE,
+        USER_ACCESS_KEYSPACE,
+    ]
+}
+
+fn list_entries(database_path: &str, keyspace_name: &str) -> Result<EntriesOutput, ExplorerError> {
+    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
+    let keyspace_names = db.list_keyspace_names();
+    if !keyspace_names
+        .iter()
+        .any(|name| name.as_ref() == keyspace_name)
+    {
+        return Err(ExplorerError::KeyspaceNotFound(keyspace_name.to_string()));
+    }
+
+    let keyspace = db.keyspace(keyspace_name, KeyspaceCreateOptions::default)?;
+    let snapshot = db.read_tx();
+    let mut entries = Vec::new();
+
+    for entry in snapshot.iter(&keyspace) {
+        let (key, value) = entry.into_inner()?;
+        entries.push(decode_entry(keyspace_name, key.as_ref(), value.as_ref()));
+    }
+
+    Ok(EntriesOutput {
+        database_path: database_path.to_string(),
+        keyspace: keyspace_name.to_string(),
+        entries,
+    })
+}
+
+fn decode_entry(keyspace_name: &str, key: &[u8], value: &[u8]) -> EntryOutput {
+    EntryOutput {
+        key: decode_key(keyspace_name, key),
+        value: decode_value(keyspace_name, key, value),
+    }
+}
+
+fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
+    match keyspace_name {
+        GROUP_KEYSPACE | AUTH_KEYSPACE => decode_ulid_key(key),
+        REALM_KEYSPACE | REALM_CONFIG_KEYSPACE => decode_realm_id_key(key),
+        CRAQLE_TERMS_KEYSPACE => decode_craqle_term_id(key, "craqle term key")
+            .map(|value| DecodedField::CraqleTermId {
+                value: craqle_term_id_string(value),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        CRAQLE_QUADS_KEYSPACE => decode_craqle_quad_key(key)
+            .map(|value| DecodedField::CraqleQuadKey {
+                value: json_craqle_quad_key(value),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        CRAQLE_GRAPHS_KEYSPACE => decode_craqle_graph_key(key)
+            .map(|value| DecodedField::CraqleGraphKey {
+                value: json_craqle_graph_key(value),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        CRAQLE_LOG_KEYSPACE => decode_craqle_log_key(key)
+            .map(|value| DecodedField::CraqleLogKey {
+                value: json_craqle_log_key(value),
+            })
+            .unwrap_or_else(|_| raw_field(key)),
+        USER_ACCESS_KEYSPACE
+        | S3_BUCKET_KEYSPACE
+        | API_STATE_KEYSPACE
+        | GOSSIP_SUBSCRIPTIONS_KEYSPACE
+        | NODE_STATE_KEYSPACE
+        | ONBOARDING_KEYSPACE => decode_utf8_key(key),
+        DHT_KEYSPACE => decode_dht_key(key),
+        S3_LOOKUP_KEYSPACE | S3_CURRENT_VERSION_KEYSPACE => LookupKey::from_bytes(key)
+            .map(|value| DecodedField::LookupKey { value })
+            .unwrap_or_else(|_| raw_field(key)),
+        S3_VERSION_KEYSPACE => VersionKey::from_bytes(key)
+            .map(|value| DecodedField::VersionKey { value })
+            .unwrap_or_else(|_| raw_field(key)),
+        _ => raw_field(key),
+    }
+}
+
+fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
+    match keyspace_name {
+        GROUP_KEYSPACE => decode_value_with(value, Group::from_bytes, |data| DecodedValue::Group {
+            data: JsonGroup(data),
+        }),
+        REALM_KEYSPACE => decode_value_with(value, Realm::from_bytes, |data| DecodedValue::Realm {
+            data: JsonRealm(data),
+        }),
+        REALM_CONFIG_KEYSPACE => {
+            decode_value_with(value, RealmConfigDocument::from_bytes, |data| {
+                DecodedValue::RealmConfigDocument {
+                    data: JsonRealmConfigDocument(data),
+                }
+            })
+        }
+        USER_ACCESS_KEYSPACE => decode_value_with(value, UserAccess::from_bytes, |data| {
+            DecodedValue::UserAccess {
+                data: JsonUserAccess(data),
+            }
+        }),
+        S3_BUCKET_KEYSPACE => decode_value_with(value, BucketInfo::from_bytes, |data| {
+            DecodedValue::BucketInfo { data }
+        }),
+        S3_CURRENT_VERSION_KEYSPACE => {
+            decode_value_with(value, CurrentVersionPointer::from_bytes, |data| {
+                DecodedValue::CurrentVersionPointer { data }
+            })
+        }
+        S3_LOOKUP_KEYSPACE => decode_value_with(value, Location::from_bytes, |data| {
+            DecodedValue::Location { data }
+        }),
+        S3_VERSION_KEYSPACE => decode_value_with(value, VersionMetadata::from_bytes, |data| {
+            DecodedValue::VersionMetadata { data }
+        }),
+        AUTH_KEYSPACE => decode_auth_value(value),
+        API_STATE_KEYSPACE => decode_api_state_value(key, value),
+        GOSSIP_SUBSCRIPTIONS_KEYSPACE => decode_gossip_subscriptions_value(value),
+        NODE_STATE_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<PersistedNodeState>(bytes),
+            |data| DecodedValue::NodeState {
+                data: JsonPersistedNodeState(data),
+            },
+        ),
+        ONBOARDING_KEYSPACE => decode_value_with(
+            value,
+            |bytes| postcard::from_bytes::<OnboardingSecretRecord>(bytes),
+            |data| DecodedValue::OnboardingSecretRecord { data },
+        ),
+        CRAQLE_TERMS_KEYSPACE => decode_value_with(
+            value,
+            |bytes| String::from_utf8(bytes.to_vec()),
+            |data| DecodedValue::CraqleTerm { data },
+        ),
+        CRAQLE_QUADS_KEYSPACE => decode_value_with(value, decode_craqle_dots, |data| {
+            DecodedValue::CraqleQuadDots { data }
+        }),
+        CRAQLE_GRAPHS_KEYSPACE => decode_craqle_graph_value(key, value),
+        CRAQLE_LOG_KEYSPACE => decode_craqle_log_value(key, value),
+        DHT_KEYSPACE => decode_value_with(value, decode_dht_entries, |data| {
+            DecodedValue::DhtEntries { data }
+        }),
+        _ => raw_value(value, None),
+    }
+}
+
+fn decode_gossip_subscriptions_value(value: &[u8]) -> DecodedValue {
+    decode_value_with(
+        value,
+        |bytes| postcard::from_bytes::<Vec<TopicId>>(bytes),
+        |data| {
+            let mut data = data
+                .into_iter()
+                .map(|topic| topic.to_string())
+                .collect::<Vec<_>>();
+            data.sort();
+            DecodedValue::GossipSubscriptions { data }
+        },
+    )
+}
+
+fn decode_auth_value(value: &[u8]) -> DecodedValue {
+    if let Ok(data) = GroupAuthorizationDocument::from_bytes(value) {
+        return DecodedValue::GroupAuthorizationDocument { data };
+    }
+    if let Ok(data) = RealmAuthorizationDocument::from_bytes(value) {
+        return DecodedValue::RealmAuthorizationDocument {
+            data: JsonRealmAuthorizationDocument(data),
+        };
+    }
+
+    raw_value(
+        value,
+        Some(
+            "failed to decode as GroupAuthorizationDocument or RealmAuthorizationDocument"
+                .to_string(),
+        ),
+    )
+}
+
+fn decode_api_state_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match key {
+        TOKEN_REVOCATION_LIST_KEY => postcard::from_bytes::<HashSet<String>>(value)
+            .map(|data| DecodedValue::ApiTokenRevocationList { data })
+            .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
+        TRUSTED_REALMS_LIST_KEY => postcard::from_bytes::<HashSet<RealmId>>(value)
+            .map(|data| {
+                let mut data = data
+                    .into_iter()
+                    .map(|realm_id| realm_id.to_string())
+                    .collect::<Vec<_>>();
+                data.sort();
+                DecodedValue::ApiTrustedRealmsList { data }
+            })
+            .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
+        INITIAL_REALM_ADMIN_CLAIMED_KEY => postcard::from_bytes::<bool>(value)
+            .map(|data| DecodedValue::ApiInitialRealmAdminClaimed { data })
+            .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
+        _ => raw_value(value, Some("unsupported api_state key".to_string())),
+    }
+}
+
+fn decode_value_with<T, E>(
+    value: &[u8],
+    decoder: impl Fn(&[u8]) -> Result<T, E>,
+    mapper: impl Fn(T) -> DecodedValue,
+) -> DecodedValue
+where
+    E: std::fmt::Display,
+{
+    match decoder(value) {
+        Ok(data) => mapper(data),
+        Err(error) => raw_value(value, Some(error.to_string())),
+    }
+}
+
+fn decode_ulid_key(key: &[u8]) -> DecodedField {
+    if key.len() == 16 {
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(key);
+        DecodedField::Ulid {
+            value: Ulid::from_bytes(bytes).to_string(),
+        }
+    } else {
+        raw_field(key)
+    }
+}
+
+fn decode_realm_id_key(key: &[u8]) -> DecodedField {
+    if key.len() == 32 {
+        let mut bytes = [0_u8; 32];
+        bytes.copy_from_slice(key);
+        DecodedField::RealmId {
+            value: RealmId::from_bytes(bytes).to_string(),
+        }
+    } else {
+        raw_field(key)
+    }
+}
+
+fn decode_utf8_key(key: &[u8]) -> DecodedField {
+    String::from_utf8(key.to_vec())
+        .map(|value| DecodedField::Utf8 { value })
+        .unwrap_or_else(|_| raw_field(key))
+}
+
+fn decode_dht_key(key: &[u8]) -> DecodedField {
+    if key.len() == 32 {
+        let mut bytes = [0_u8; 32];
+        bytes.copy_from_slice(key);
+        DecodedField::DhtKeyId {
+            value: DhtKeyId::from_bytes(bytes).to_string(),
+        }
+    } else {
+        raw_field(key)
+    }
+}
+
+fn decode_dht_entries(value: &[u8]) -> Result<Vec<JsonStoredEntry>, postcard::Error> {
+    postcard::from_bytes::<Vec<StoredEntry>>(value)
+        .map(|entries| entries.into_iter().map(JsonStoredEntry).collect())
+}
+
+fn raw_field(bytes: &[u8]) -> DecodedField {
+    DecodedField::Raw {
+        hex: hex::encode(bytes),
+    }
+}
+
+fn raw_value(value: &[u8], decode_error: Option<String>) -> DecodedValue {
+    DecodedValue::Raw {
+        hex: hex::encode(value),
+        decode_error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CRAQLE_BATCH_LOG_ENCODING_TAG, CRAQLE_DOT_ENCODING_TAG, CRAQLE_GRAPH_META_PREFIX,
+        CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
+        CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
+        CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
+        raw_field,
+    };
+    use aruna::config::{
+        BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
+    };
+    use aruna_core::id::{DhtKeyId, TopicId};
+    use aruna_core::keyspaces::{
+        API_STATE_KEYSPACE, AUTH_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
+        GROUP_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
+        S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
+    };
+    use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
+    use aruna_core::structs::{Actor, Group, Realm, RealmId};
+    use aruna_net::dht::storage::StoredEntry;
+    use chrono::{DateTime, Utc};
+    use craqle::{
+        ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
+        VectorClock as CraqleVectorClock,
+    };
+    use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
+    use std::collections::BTreeMap;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    #[test]
+    fn lists_sorted_keyspaces() {
+        let temp = tempdir().unwrap();
+        {
+            let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
+            db.keyspace("zeta", KeyspaceCreateOptions::default).unwrap();
+            db.keyspace("alpha", KeyspaceCreateOptions::default)
+                .unwrap();
+            db.keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+        }
+
+        let output = list_keyspaces(temp.path().to_str().unwrap()).unwrap();
+        let names = output
+            .keyspaces
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "alpha".to_string(),
+                GROUP_KEYSPACE.to_string(),
+                "zeta".to_string()
+            ]
+        );
+
+        let missing = output
+            .missing_keyspaces
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>();
+        let mut expected_missing = vec![
+            API_STATE_KEYSPACE.to_string(),
+            AUTH_KEYSPACE.to_string(),
+            CRAQLE_GRAPHS_KEYSPACE.to_string(),
+            CRAQLE_LOG_KEYSPACE.to_string(),
+            CRAQLE_QUADS_KEYSPACE.to_string(),
+            CRAQLE_TERMS_KEYSPACE.to_string(),
+            DHT_KEYSPACE.to_string(),
+            GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            NODE_STATE_KEYSPACE.to_string(),
+            ONBOARDING_KEYSPACE.to_string(),
+            REALM_CONFIG_KEYSPACE.to_string(),
+            REALM_KEYSPACE.to_string(),
+            S3_BUCKET_KEYSPACE.to_string(),
+            S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            S3_LOOKUP_KEYSPACE.to_string(),
+            S3_VERSION_KEYSPACE.to_string(),
+            USER_ACCESS_KEYSPACE.to_string(),
+        ];
+        expected_missing.sort();
+        assert_eq!(missing, expected_missing);
+    }
+
+    #[test]
+    fn decodes_typed_group_entries() {
+        let temp = tempdir().unwrap();
+        let group_id = Ulid::new();
+        let realm_id = RealmId::from_bytes([7_u8; 32]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[9_u8; 32]).public(),
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            realm_id,
+        };
+        let group = Group {
+            display_name: "Explorer Group".to_string(),
+            group_id,
+            realm_id,
+            roles: Default::default(),
+        };
+
+        {
+            let db = OptimisticTxDatabase::builder(temp.path()).open().unwrap();
+            let keyspace = db
+                .keyspace(GROUP_KEYSPACE, KeyspaceCreateOptions::default)
+                .unwrap();
+            let mut txn = db.write_tx().unwrap();
+            txn.insert(
+                keyspace,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            );
+            let _ = txn.commit().unwrap();
+        }
+
+        let output = list_entries(temp.path().to_str().unwrap(), GROUP_KEYSPACE).unwrap();
+        assert_eq!(output.entries.len(), 1);
+        assert_eq!(
+            output.entries[0].key,
+            DecodedField::Ulid {
+                value: group_id.to_string()
+            }
+        );
+        match &output.entries[0].value {
+            DecodedValue::Group { data } => assert_eq!(data.0.display_name, "Explorer Group"),
+            other => panic!("expected group, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_raw_for_unknown_keyspace() {
+        let entry = decode_entry("unknown", b"\x01\x02", b"\x03\x04");
+        assert_eq!(entry.key, raw_field(b"\x01\x02"));
+        match entry.value {
+            DecodedValue::Raw { hex, .. } => assert_eq!(hex, "0304"),
+            other => panic!("expected raw fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_realm_key() {
+        let realm_id = RealmId::from_bytes([5_u8; 32]);
+        let entry = decode_entry(REALM_KEYSPACE, realm_id.as_bytes(), b"not-a-realm");
+        assert_eq!(
+            entry.key,
+            DecodedField::RealmId {
+                value: realm_id.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn returns_missing_keyspace_error() {
+        let temp = tempdir().unwrap();
+        let error = list_entries(temp.path().to_str().unwrap(), "missing").unwrap_err();
+        assert!(error.to_string().contains("keyspace not found"));
+    }
+
+    #[test]
+    fn decodes_typed_realm_value_with_raw_error_fallback() {
+        let realm_id = RealmId::from_bytes([1_u8; 32]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[3_u8; 32]).public(),
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            realm_id,
+        };
+        let realm = Realm {
+            realm_id,
+            description: "Explorer Realm".to_string(),
+        };
+
+        let decoded = decode_entry(
+            REALM_KEYSPACE,
+            realm_id.as_bytes(),
+            &realm.to_bytes(&actor).unwrap(),
+        );
+        match decoded.value {
+            DecodedValue::Realm { data } => assert_eq!(data.0.description, "Explorer Realm"),
+            other => panic!("expected realm, got {other:?}"),
+        }
+
+        let fallback = decode_entry(REALM_KEYSPACE, realm_id.as_bytes(), b"broken");
+        match fallback.value {
+            DecodedValue::Raw {
+                decode_error: Some(_),
+                ..
+            } => {}
+            other => panic!("expected raw decode fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_gossip_subscriptions_value() {
+        let realm_id = RealmId::from_bytes([8_u8; 32]);
+        let group_id = Ulid::new();
+        let value =
+            postcard::to_allocvec(&vec![TopicId::group(group_id), TopicId::realm(realm_id)])
+                .unwrap();
+
+        let decoded = decode_entry(GOSSIP_SUBSCRIPTIONS_KEYSPACE, b"topics", &value);
+        assert_eq!(
+            decoded.key,
+            DecodedField::Utf8 {
+                value: "topics".to_string()
+            }
+        );
+        match decoded.value {
+            DecodedValue::GossipSubscriptions { data } => {
+                assert_eq!(data, vec![format!("g:{group_id}"), format!("r:{realm_id}")]);
+            }
+            other => panic!("expected gossip subscriptions, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_onboarding_secret_record_value() {
+        let record = OnboardingSecretRecord {
+            enrollment_id: Ulid::new(),
+            secret_hash: "hash123".to_string(),
+            mode: OnboardingMode::Server,
+            expires_at: 1234,
+            consumed: false,
+        };
+        let value = postcard::to_allocvec(&record).unwrap();
+
+        let decoded = decode_entry(ONBOARDING_KEYSPACE, b"secret:test", &value);
+        assert_eq!(
+            decoded.key,
+            DecodedField::Utf8 {
+                value: "secret:test".to_string()
+            }
+        );
+        match decoded.value {
+            DecodedValue::OnboardingSecretRecord { data } => assert_eq!(data, record),
+            other => panic!("expected onboarding secret record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_node_state_value() {
+        let realm_id = RealmId::from_bytes([4_u8; 32]);
+        let state = PersistedNodeState {
+            boot_origin: BootOrigin::Onboarded,
+            status: PersistedNodeStatus::PendingOnboarding,
+            realm_id,
+            net_secret_key: [11_u8; 32],
+            bootstrap_endpoints: Vec::new(),
+            onboarding_phase: None,
+            onboarding_sync_ticket: Some("ticket".to_string()),
+            identity: PersistedNodeIdentity::Local,
+        };
+        let value = postcard::to_allocvec(&state).unwrap();
+
+        let decoded = decode_entry(NODE_STATE_KEYSPACE, b"node_state", &value);
+        assert_eq!(
+            decoded.key,
+            DecodedField::Utf8 {
+                value: "node_state".to_string()
+            }
+        );
+        match decoded.value {
+            DecodedValue::NodeState { data } => assert_eq!(data.0, state),
+            other => panic!("expected node state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_dht_entries_and_key() {
+        let key = DhtKeyId::from_bytes([6_u8; 32]);
+        let realm_id = RealmId::from_bytes([7_u8; 32]);
+        let publisher = iroh::SecretKey::from_bytes(&[5_u8; 32]).public();
+        let entries = vec![StoredEntry {
+            publisher,
+            realm_id,
+            value: vec![1, 2, 3, 4],
+            expires_at: 42,
+            signature: None,
+        }];
+        let value = postcard::to_allocvec(&entries).unwrap();
+
+        let decoded = decode_entry(DHT_KEYSPACE, key.as_bytes(), &value);
+        assert_eq!(
+            decoded.key,
+            DecodedField::DhtKeyId {
+                value: key.to_string()
+            }
+        );
+        match decoded.value {
+            DecodedValue::DhtEntries { data } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0].0.publisher, publisher);
+                assert_eq!(data[0].0.realm_id, realm_id);
+                assert_eq!(data[0].0.value, vec![1, 2, 3, 4]);
+            }
+            other => panic!("expected dht entries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_craqle_term_entry() {
+        let term_id = 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10_u128;
+        let decoded = decode_entry(
+            CRAQLE_TERMS_KEYSPACE,
+            &term_id.to_be_bytes(),
+            b"<https://example.org/dataset>",
+        );
+
+        assert_eq!(
+            decoded.key,
+            DecodedField::CraqleTermId {
+                value: format!("{term_id:032x}")
+            }
+        );
+        match decoded.value {
+            DecodedValue::CraqleTerm { data } => {
+                assert_eq!(data, "<https://example.org/dataset>")
+            }
+            other => panic!("expected craqle term, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_craqle_quad_entry() {
+        let graph = 1_u128;
+        let subject = 2_u128;
+        let predicate = 3_u128;
+        let object = 4_u128;
+        let actor = CraqleActorId::from_bytes([8_u8; 32]);
+
+        let mut key = Vec::new();
+        key.extend_from_slice(&graph.to_be_bytes());
+        key.extend_from_slice(&subject.to_be_bytes());
+        key.extend_from_slice(&predicate.to_be_bytes());
+        key.extend_from_slice(&object.to_be_bytes());
+
+        let mut value = vec![CRAQLE_DOT_ENCODING_TAG];
+        value.extend_from_slice(actor.as_bytes());
+        value.extend_from_slice(&7_u64.to_be_bytes());
+
+        let decoded = decode_entry(CRAQLE_QUADS_KEYSPACE, &key, &value);
+        assert_eq!(
+            decoded.key,
+            DecodedField::CraqleQuadKey {
+                value: super::JsonCraqleQuadKey {
+                    graph: format!("{graph:032x}"),
+                    subject: format!("{subject:032x}"),
+                    predicate: format!("{predicate:032x}"),
+                    object: format!("{object:032x}"),
+                }
+            }
+        );
+        match decoded.value {
+            DecodedValue::CraqleQuadDots { data } => {
+                assert_eq!(data.len(), 1);
+                assert_eq!(data[0].actor, actor.to_string());
+                assert_eq!(data[0].counter, 7);
+            }
+            other => panic!("expected craqle quad dots, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_craqle_graph_meta_entry() {
+        let graph = 9_u128;
+        let actor = CraqleActorId::from_bytes([5_u8; 32]);
+        let mut key = vec![CRAQLE_GRAPH_META_PREFIX];
+        key.extend_from_slice(&graph.to_be_bytes());
+
+        let value = postcard::to_allocvec(&CraqleStoredGraphMeta {
+            policy: CraqleGraphPolicy {
+                public: true,
+                permission_paths: vec!["/b".to_string(), "/a".to_string(), "/a".to_string()],
+            },
+            clock: CraqleVectorClock(BTreeMap::from([(actor, 11_u64)])),
+        })
+        .unwrap();
+
+        let decoded = decode_entry(CRAQLE_GRAPHS_KEYSPACE, &key, &value);
+        match decoded.key {
+            DecodedField::CraqleGraphKey { value } => assert_eq!(
+                value,
+                super::JsonCraqleGraphKey::Meta {
+                    graph: format!("{graph:032x}")
+                }
+            ),
+            other => panic!("expected craqle graph key, got {other:?}"),
+        }
+        match decoded.value {
+            DecodedValue::CraqleGraphMeta { data } => {
+                assert_eq!(data.graph, format!("{graph:032x}"));
+                assert!(data.policy.public);
+                assert_eq!(data.policy.permission_paths, vec!["/a", "/b"]);
+                assert_eq!(data.clock.entries.len(), 1);
+                assert_eq!(data.clock.entries[0].actor, actor.to_string());
+                assert_eq!(data.clock.entries[0].counter, 11);
+            }
+            other => panic!("expected craqle graph meta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_craqle_log_batch_entry() {
+        let graph = 12_u128;
+        let subject = 13_u128;
+        let predicate = 14_u128;
+        let object = 15_u128;
+        let actor = CraqleActorId::from_bytes([3_u8; 32]);
+
+        let mut key = vec![CRAQLE_LOG_BATCH_PREFIX];
+        key.extend_from_slice(&graph.to_be_bytes());
+        key.extend_from_slice(actor.as_bytes());
+        key.extend_from_slice(&17_u64.to_be_bytes());
+
+        let batch = CraqleStoredBatch {
+            actor,
+            counter: 17,
+            base_clock: CraqleVectorClock(BTreeMap::from([(actor, 16_u64)])),
+            ops: vec![CraqleStoredQuadOp::Add {
+                subject: super::CraqleTermId(subject),
+                predicate: super::CraqleTermId(predicate),
+                object: super::CraqleTermId(object),
+                dot: CraqleDot { actor, counter: 17 },
+            }],
+            timestamp: DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+        };
+
+        let mut value = vec![CRAQLE_BATCH_LOG_ENCODING_TAG];
+        value.extend_from_slice(&postcard::to_allocvec(&batch).unwrap());
+
+        let decoded = decode_entry(CRAQLE_LOG_KEYSPACE, &key, &value);
+        match decoded.key {
+            DecodedField::CraqleLogKey { value } => assert_eq!(
+                value,
+                super::JsonCraqleLogKey::Batch {
+                    graph: format!("{graph:032x}"),
+                    actor: actor.to_string(),
+                    counter: 17,
+                }
+            ),
+            other => panic!("expected craqle log key, got {other:?}"),
+        }
+        match decoded.value {
+            DecodedValue::CraqleLogBatch { data } => {
+                assert_eq!(data.graph, format!("{graph:032x}"));
+                assert_eq!(data.actor, actor.to_string());
+                assert_eq!(data.counter, 17);
+                assert_eq!(data.base_clock.entries.len(), 1);
+                assert_eq!(data.base_clock.entries[0].counter, 16);
+                assert_eq!(data.ops.len(), 1);
+                match &data.ops[0] {
+                    super::JsonCraqleStoredBatchOp::Add {
+                        subject: got_subject,
+                        predicate: got_predicate,
+                        object: got_object,
+                        dot,
+                    } => {
+                        assert_eq!(got_subject, &format!("{subject:032x}"));
+                        assert_eq!(got_predicate, &format!("{predicate:032x}"));
+                        assert_eq!(got_object, &format!("{object:032x}"));
+                        assert_eq!(dot.actor, actor.to_string());
+                        assert_eq!(dot.counter, 17);
+                    }
+                    other => panic!("expected add op, got {other:?}"),
+                }
+            }
+            other => panic!("expected craqle log batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_raw_for_invalid_node_state_value() {
+        let decoded = decode_entry(NODE_STATE_KEYSPACE, b"node_state", b"broken");
+        match decoded.value {
+            DecodedValue::Raw {
+                decode_error: Some(_),
+                ..
+            } => {}
+            other => panic!("expected raw decode fallback, got {other:?}"),
+        }
+    }
+}

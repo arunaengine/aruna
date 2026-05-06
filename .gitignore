@@ -1,2 +1,6 @@
-/target
+target/
+.compose-data/
 .idea
+.env
+**/.env
+!.env.example

@@ -1,0 +1,41 @@
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.6
+    command:
+      - start-dev
+      - --import-realm
+      - --http-port=8080
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${ARUNA_KEYCLOAK_ADMIN_USER:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${ARUNA_KEYCLOAK_ADMIN_PASSWORD:-admin}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak/realm-import:/opt/keycloak/data/import:ro
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -c
+        - >-
+          exec 3<>/dev/tcp/127.0.0.1/8080 &&
+          printf 'GET /realms/aruna/.well-known/openid-configuration HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' >&3 &&
+          read -r line <&3 &&
+          [[ "$$line" == *" 200 "* ]]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    restart: unless-stopped
+  aruna:
+    image: aruna:latest
+    build:
+      context: ..
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    network_mode: host
+    volumes:
+      - ${ARUNA_COMPOSE_DATA_DIR:-../target/node/storage}:/data
+      - ./compose.aruna.env:/run/.env:ro
+    restart: unless-stopped

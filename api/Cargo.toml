@@ -1,0 +1,54 @@
+[package]
+name = "aruna-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Aruna modules
+aruna-core = { workspace = true }
+aruna-operations = { workspace = true }
+
+# General
+ahash = { workspace = true }
+base64 = { workspace = true }
+opentelemetry = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+ulid = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+
+# REST
+axum = { workspace = true }
+byteview = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+crypto_box = { workspace = true }
+ed25519-dalek = { workspace = true }
+jsonwebtoken = { workspace = true }
+postcard = { workspace = true }
+rand = { workspace = true }
+iroh = { workspace = true }
+utoipa = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+
+# S3
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+s3s = { workspace = true }
+
+[dev-dependencies]
+aruna-net = { workspace = true }
+aruna-storage = { workspace = true }
+aruna-tasks = { workspace = true }
+tempfile = { workspace = true }
