@@ -40,7 +40,7 @@ impl From<std::io::Error> for NetError {
 
 impl From<VarIntBoundsExceeded> for NetError {
     fn from(err: VarIntBoundsExceeded) -> Self {
-        NetError::Connection(format!("Setup error: {}", err.to_string()))
+        NetError::Connection(format!("Setup error: {}", err))
     }
 }
 
