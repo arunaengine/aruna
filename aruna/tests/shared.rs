@@ -19,7 +19,7 @@ use aruna_core::onboarding::{
 use aruna_core::structs::{
     Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, NodeCapabilities, RealmId,
 };
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
@@ -471,7 +471,8 @@ async fn spawn_seed_node_with_mode(mode: NodeServiceMode) -> TestResult<SeedNode
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
             realm_id,
-            use_dns_discovery: false,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
             ..NetConfig::default()
         },
         storage.clone(),
@@ -547,7 +548,8 @@ async fn spawn_joiner_node_with_mode(
             secret_key: Some(config.net_secret_key.clone()),
             realm_id: config.realm_id,
             bootstrap_nodes: config.bootstrap_nodes.clone(),
-            use_dns_discovery: false,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
         },

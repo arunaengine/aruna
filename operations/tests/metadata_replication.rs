@@ -8,7 +8,7 @@ use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::structs::{Actor, RealmId};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
@@ -244,7 +244,8 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-            use_dns_discovery: false,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
             ..NetConfig::default()
         },
         storage.clone(),

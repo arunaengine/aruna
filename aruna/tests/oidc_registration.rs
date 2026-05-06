@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use aruna_core::structs::{Actor, NodeCapabilities, OidcProviderConfig, User, oidc_subject_key};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
@@ -183,7 +183,8 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
-            use_dns_discovery: false,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
             ..NetConfig::default()
         },
         storage.clone(),

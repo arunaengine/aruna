@@ -555,7 +555,7 @@ mod tests {
         bootstrap_issuer_proof_message, bootstrap_node_proof_message,
     };
     use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId};
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -589,7 +589,8 @@ mod tests {
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
-                use_dns_discovery: false,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
                 ..NetConfig::default()
             },
             storage_handle.clone(),

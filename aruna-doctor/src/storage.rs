@@ -508,7 +508,7 @@ mod tests {
     };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::automerge::AutomergeHandle;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -603,7 +603,8 @@ mod tests {
                     secret_key: Some(config.net_secret_key.clone()),
                     realm_id: config.realm_id,
                     bootstrap_nodes: Vec::new(),
-                    use_dns_discovery: false,
+                    discovery_method: DiscoveryMethod::None,
+                    relay_method: RelayMethod::None,
                     ..Default::default()
                 },
                 storage_handle.clone(),

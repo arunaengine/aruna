@@ -297,7 +297,7 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use aruna_core::UserId;
     use aruna_core::structs::{Actor, RealmId};
-    use aruna_net::{NetConfig, NetHandle};
+    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use ed25519_dalek::SigningKey;
@@ -311,7 +311,8 @@ mod tests {
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
-                use_dns_discovery: false,
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
                 ..NetConfig::default()
             },
             storage_handle.clone(),

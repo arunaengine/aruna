@@ -19,10 +19,10 @@ use aruna_core::structs::RealmId;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use crossfire::TrySendError;
+use iroh::address_lookup::DnsAddressLookup;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode};
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -39,9 +39,24 @@ pub struct NetConfig {
     pub secret_key: Option<iroh::SecretKey>,
     pub realm_id: RealmId,
     pub bootstrap_nodes: Vec<NodeId>,
-    pub use_dns_discovery: bool,
+    pub discovery_method: DiscoveryMethod,
+    pub relay_method: RelayMethod,
     pub max_concurrent_uni_streams: Option<u64>,
     pub max_concurrent_bidi_streams: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub enum DiscoveryMethod {
+    None,
+    N0Dns,
+    CustomDns(Vec<String>),
+}
+
+#[derive(Clone, Debug)]
+pub enum RelayMethod {
+    None,
+    N0,
+    Custom(Vec<String>),
 }
 
 impl Default for NetConfig {
@@ -51,7 +66,8 @@ impl Default for NetConfig {
             secret_key: None,
             realm_id: RealmId::from_bytes([0u8; 32]),
             bootstrap_nodes: vec![],
-            use_dns_discovery: true,
+            discovery_method: DiscoveryMethod::N0Dns,
+            relay_method: RelayMethod::N0,
             max_concurrent_bidi_streams: None,
             max_concurrent_uni_streams: None,
         }
@@ -65,7 +81,8 @@ impl std::fmt::Debug for NetConfig {
             .field("has_secret_key", &self.secret_key.is_some())
             .field("realm_id", &self.realm_id)
             .field("bootstrap_nodes", &self.bootstrap_nodes.len())
-            .field("use_dns_discovery", &self.use_dns_discovery)
+            .field("discovery_method", &self.discovery_method)
+            .field("relay_method", &self.relay_method)
             .finish()
     }
 }
@@ -133,10 +150,33 @@ impl NetHandle {
                 Alpn::Metadata.as_bytes().to_vec(),
             ]);
 
-        if config.use_dns_discovery {
-            endpoint_builder = endpoint_builder
-                .address_lookup(PkarrPublisher::n0_dns())
-                .address_lookup(DnsAddressLookup::n0_dns());
+        match config.relay_method {
+            RelayMethod::None => {
+                endpoint_builder = endpoint_builder.relay_mode(RelayMode::Disabled);
+            }
+            RelayMethod::N0 => {
+                endpoint_builder = endpoint_builder.relay_mode(RelayMode::Default);
+            }
+            RelayMethod::Custom(relays) => {
+                let relays = RelayMap::try_from_iter(relays.iter().map(|s| s.as_ref()))
+                    .map_err(|e| NetError::Bootstrap(format!("Invalid relay URL: {}", e)))?;
+                endpoint_builder = endpoint_builder.relay_mode(RelayMode::Custom(relays));
+            }
+        }
+
+        match config.discovery_method {
+            DiscoveryMethod::None => {
+                // No additional configuration needed for no discovery
+            }
+            DiscoveryMethod::N0Dns => {
+                endpoint_builder = endpoint_builder.address_lookup(DnsAddressLookup::n0_dns());
+            }
+            DiscoveryMethod::CustomDns(servers) => {
+                for server in servers {
+                    let dns_lookup = DnsAddressLookup::builder(server).build();
+                    endpoint_builder = endpoint_builder.address_lookup(dns_lookup);
+                }
+            }
         }
 
         let endpoint_builder = endpoint_builder
@@ -475,7 +515,8 @@ mod tests {
         .map_err(|e| NetError::Io(e.to_string()))?;
 
         let config = NetConfig {
-            use_dns_discovery: false,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
             ..NetConfig::default()
         };
 

@@ -11,7 +11,7 @@ use aruna_core::keys::gossip_peer_key;
 use aruna_core::structs::RealmId;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_net::streams::BiStream;
-use aruna_net::{InboundEventHandler, NetConfig, NetHandle};
+use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
 use aruna_storage::FjallStorage;
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -118,7 +118,8 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
 
     let cfg = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-        use_dns_discovery: false,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
         ..NetConfig::default()
     };
 
@@ -194,7 +195,8 @@ async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::er
 
     let cfg = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-        use_dns_discovery: false,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
         ..NetConfig::default()
     };
 
@@ -283,7 +285,8 @@ async fn test_automerge_topic_subscription_announces_document_holders()
 
     let cfg = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-        use_dns_discovery: false,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
         ..NetConfig::default()
     };
 
@@ -343,7 +346,8 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
 
     let cfg = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-        use_dns_discovery: false,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
         ..NetConfig::default()
     };
 
@@ -397,7 +401,8 @@ async fn test_dht_rpc_ping_roundtrip() -> Result<(), Box<dyn std::error::Error>>
 
     let cfg = || NetConfig {
         bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-        use_dns_discovery: false,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
         ..NetConfig::default()
     };
 
