@@ -57,6 +57,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             realm_id: config.realm_id,
             bootstrap_nodes: config.bootstrap_nodes.clone(),
             use_dns_discovery: false,
+            max_concurrent_uni_streams: config.max_concurrent_uni_streams,
+            max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
         },
         storage_handle.clone(),
     )

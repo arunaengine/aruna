@@ -1,3 +1,4 @@
+use iroh::endpoint::VarIntBoundsExceeded;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -34,6 +35,12 @@ pub enum NetError {
 impl From<std::io::Error> for NetError {
     fn from(err: std::io::Error) -> Self {
         NetError::Io(err.to_string())
+    }
+}
+
+impl From<VarIntBoundsExceeded> for NetError {
+    fn from(err: VarIntBoundsExceeded) -> Self {
+        NetError::Connection(format!("Setup error: {}", err))
     }
 }
 

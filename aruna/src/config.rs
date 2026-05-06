@@ -42,6 +42,8 @@ pub struct Config {
     pub blob_transfer_idle_timeout_secs: u64,
     pub http_socket_addr: SocketAddr,
     pub p2p_socket_addr: SocketAddr,
+    pub max_concurrent_uni_streams: Option<u64>,
+    pub max_concurrent_bidi_streams: Option<u64>,
     pub node_capabilities: NodeCapabilities,
     pub realm_id: RealmId,
     pub node_id: iroh::PublicKey,
@@ -173,6 +175,16 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
+
+    let max_concurrent_uni_streams = dotenvy::var("MAX_CONCURRENT_UNI_STREAMS")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
+    let max_concurrent_bidi_streams = dotenvy::var("MAX_CONCURRENT_BIDI_STREAMS")
+        .ok()
+        .map(|value| value.parse::<u64>())
+        .transpose()?;
+
     let blob_max_bucket_size = dotenvy::var("BLOB_MAX_BUCKET_SIZE")
         .ok()
         .map(|value| value.parse::<u64>())
@@ -279,6 +291,8 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             blob_transfer_idle_timeout_secs,
             http_socket_addr,
             p2p_socket_addr,
+            max_concurrent_uni_streams,
+            max_concurrent_bidi_streams,
             node_capabilities,
             realm_id,
             node_id,

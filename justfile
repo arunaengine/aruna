@@ -4,8 +4,8 @@ local:
 local-new:
 	bash scripts/local_deploy.sh --new
 
-local-cluster:
-	bash scripts/local_cluster_deploy.sh
+local-cluster nodes="3":
+	bash scripts/local_cluster_deploy.sh --node-count {{nodes}}
 
-local-cluster-oidc:
-	bash scripts/local_cluster_deploy.sh --with-keycloak
+local-cluster-oidc nodes="3":
+	bash scripts/local_cluster_deploy.sh --with-keycloak --node-count {{nodes}}
