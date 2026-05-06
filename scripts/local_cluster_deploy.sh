@@ -8,7 +8,8 @@ ARUNA_DOCTOR_BIN="$ROOT_DIR/target/release/aruna-doctor"
 READY_TIMEOUT_SECS="${ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS:-90}"
 EXIT_AFTER_READY="${ARUNA_TEST_DEPLOY_EXIT_AFTER_READY:-0}"
 BASE_PORT="${ARUNA_TEST_DEPLOY_BASE_PORT:-43000}"
-KEYCLOAK_HTTP_PORT="${ARUNA_TEST_DEPLOY_KEYCLOAK_PORT:-$((BASE_PORT + 31))}"
+NODE_COUNT="${ARUNA_TEST_DEPLOY_NODE_COUNT:-3}"
+KEYCLOAK_HTTP_PORT="${ARUNA_TEST_DEPLOY_KEYCLOAK_PORT:-}"
 KEYCLOAK_PROJECT_NAME="${ARUNA_TEST_DEPLOY_KEYCLOAK_PROJECT:-aruna-test-deploy-oidc}"
 KEYCLOAK_ADMIN_USER="${ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_USER:-admin}"
 KEYCLOAK_ADMIN_PASSWORD="${ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_PASSWORD:-admin}"
@@ -18,19 +19,13 @@ KEYCLOAK_OIDC_USERNAME="${ARUNA_TEST_DEPLOY_OIDC_USERNAME:-aruna-admin}"
 KEYCLOAK_OIDC_PASSWORD="${ARUNA_TEST_DEPLOY_OIDC_PASSWORD:-aruna-admin}"
 WITH_KEYCLOAK=0
 PIDS=()
+NODE_NAMES=()
+NODE_DIRS=()
+NODE_BASE_URLS=()
+NODE_HTTP_PORTS=()
+NODE_P2P_PORTS=()
+NODE_S3_PORTS=()
 STARTED_PID=""
-
-while (($# > 0)); do
-  case "$1" in
-    --with-keycloak)
-      WITH_KEYCLOAK=1
-      ;;
-    *)
-      die "unknown argument: $1"
-      ;;
-  esac
-  shift
-done
 
 log() {
   printf '==> %s\n' "$*"
@@ -39,6 +34,31 @@ log() {
 die() {
   printf 'error: %s\n' "$*" >&2
   exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: bash scripts/local_cluster_deploy.sh [--with-keycloak] [--node-count N]
+
+Behavior:
+  default          Build the workspace in release mode and launch 3 local Aruna nodes.
+  --with-keycloak  Start a local Keycloak instance and configure every node for OIDC.
+  --node-count N   Launch N total Aruna nodes. Defaults to 3.
+
+Environment overrides:
+  ARUNA_TEST_DEPLOY_BASE_PORT
+  ARUNA_TEST_DEPLOY_EXIT_AFTER_READY
+  ARUNA_TEST_DEPLOY_NODE_COUNT
+  ARUNA_TEST_DEPLOY_READY_TIMEOUT_SECS
+  ARUNA_TEST_DEPLOY_KEYCLOAK_PORT
+  ARUNA_TEST_DEPLOY_KEYCLOAK_PROJECT
+  ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_USER
+  ARUNA_TEST_DEPLOY_KEYCLOAK_ADMIN_PASSWORD
+  ARUNA_TEST_DEPLOY_KEYCLOAK_REALM
+  ARUNA_TEST_DEPLOY_KEYCLOAK_CLIENT_ID
+  ARUNA_TEST_DEPLOY_OIDC_USERNAME
+  ARUNA_TEST_DEPLOY_OIDC_PASSWORD
+EOF
 }
 
 require_command() {
@@ -58,7 +78,7 @@ cleanup() {
   fi
 
   if [[ "$WITH_KEYCLOAK" == "1" ]]; then
-    docker compose \
+    ARUNA_TEST_DEPLOY_KEYCLOAK_PORT="$KEYCLOAK_HTTP_PORT" docker compose \
       --project-name "$KEYCLOAK_PROJECT_NAME" \
       --file "$ROOT_DIR/scripts/keycloak/docker-compose.yml" \
       down --volumes >/dev/null 2>&1 || true
@@ -109,6 +129,8 @@ write_node_env() {
   local p2p_port=$3
   local s3_port=$4
   local onboarding_secret=${5:-}
+  local max_concurrent_uni_streams="${MAX_CONCURRENT_UNI_STREAMS:-}"
+  local max_concurrent_bidi_streams="${MAX_CONCURRENT_BIDI_STREAMS:-}"
 
   mkdir -p "$node_dir/storage" "$node_dir/blob"
   {
@@ -133,11 +155,11 @@ write_node_env() {
       printf 'ONBOARDING_SECRET=%s\n' "$onboarding_secret"
     fi
 
-    if [[ -n "$MAX_CONCURRENT_UNI_STREAMS" ]]; then
-      printf 'MAX_CONCURRENT_UNI_STREAMS=%s\n' "$MAX_CONCURRENT_UNI_STREAMS"
+    if [[ -n "$max_concurrent_uni_streams" ]]; then
+      printf 'MAX_CONCURRENT_UNI_STREAMS=%s\n' "$max_concurrent_uni_streams"
     fi
-    if [[ -n "$MAX_CONCURRENT_BIDI_STREAMS" ]]; then
-      printf 'MAX_CONCURRENT_BIDI_STREAMS=%s\n' "$MAX_CONCURRENT_BIDI_STREAMS"
+    if [[ -n "$max_concurrent_bidi_streams" ]]; then
+      printf 'MAX_CONCURRENT_BIDI_STREAMS=%s\n' "$max_concurrent_bidi_streams"
     fi
   } >"$node_dir/.env"
 }
@@ -240,7 +262,7 @@ wait_for_keycloak() {
 
 start_keycloak() {
   log "Starting Keycloak with realm import"
-  docker compose \
+  ARUNA_TEST_DEPLOY_KEYCLOAK_PORT="$KEYCLOAK_HTTP_PORT" docker compose \
     --project-name "$KEYCLOAK_PROJECT_NAME" \
     --file "$ROOT_DIR/scripts/keycloak/docker-compose.yml" \
     up --detach
@@ -311,38 +333,119 @@ start_node() {
   log "Started $name (pid $pid)"
 }
 
-write_summary() {
-  local summary_file=$1
-  shift
+prepare_nodes() {
+  local node_index
+  local offset
+  local node_name
+  local node_dir
+  local http_port
+  local p2p_port
+  local s3_port
 
-  : >"$summary_file"
-  while (($# > 0)); do
-    printf '%s\n' "$1" >>"$summary_file"
-    shift
+  for ((node_index = 1; node_index <= NODE_COUNT; node_index++)); do
+    offset=$(((node_index - 1) * 10))
+    node_name="node-$node_index"
+    node_dir="$DEPLOY_ROOT/$node_name"
+    http_port=$((BASE_PORT + offset + 1))
+    p2p_port=$((BASE_PORT + offset + 2))
+    s3_port=$((BASE_PORT + offset + 3))
+
+    mkdir -p "$node_dir"
+    NODE_NAMES+=("$node_name")
+    NODE_DIRS+=("$node_dir")
+    NODE_BASE_URLS+=("http://127.0.0.1:$http_port")
+    NODE_HTTP_PORTS+=("$http_port")
+    NODE_P2P_PORTS+=("$p2p_port")
+    NODE_S3_PORTS+=("$s3_port")
   done
 }
 
-append_summary_line() {
-  local summary_file=$1
-  local line=$2
+assert_node_ports_free() {
+  local node_index
 
-  printf '%s\n' "$line" >>"$summary_file"
+  for node_index in "${!NODE_NAMES[@]}"; do
+    assert_port_free "${NODE_HTTP_PORTS[$node_index]}"
+    assert_port_free "${NODE_P2P_PORTS[$node_index]}"
+    assert_port_free "${NODE_S3_PORTS[$node_index]}"
+  done
+}
+
+write_summary_file() {
+  local summary_file=$1
+  local node_index
+
+  : >"$summary_file"
+  for node_index in "${!NODE_NAMES[@]}"; do
+    printf '%s http=%s s3=127.0.0.1:%s dir=%s log=%s\n' \
+      "${NODE_NAMES[$node_index]}" \
+      "${NODE_BASE_URLS[$node_index]}" \
+      "${NODE_S3_PORTS[$node_index]}" \
+      "${NODE_DIRS[$node_index]}" \
+      "${NODE_DIRS[$node_index]}/${NODE_NAMES[$node_index]}.log" \
+      >>"$summary_file"
+  done
+
+  if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+    printf 'keycloak issuer=%s discovery=%s admin=%s/%s\n' \
+      "$KEYCLOAK_ISSUER" \
+      "$KEYCLOAK_DISCOVERY_URL" \
+      "$KEYCLOAK_ADMIN_USER" \
+      "$KEYCLOAK_ADMIN_PASSWORD" \
+      >>"$summary_file"
+  fi
+}
+
+print_summary() {
+  local summary_file=$1
+  local line
+
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+  done <"$summary_file"
 }
 
 monitor_nodes() {
-  local names=("node-1" "node-2" "node-3")
+  local node_index
 
   while true; do
-    local i=0
-    for pid in "${PIDS[@]}"; do
-      if ! kill -0 "$pid" >/dev/null 2>&1; then
-        die "${names[$i]} exited unexpectedly; inspect $DEPLOY_ROOT/${names[$i]}/${names[$i]}.log"
+    for node_index in "${!PIDS[@]}"; do
+      if ! kill -0 "${PIDS[$node_index]}" >/dev/null 2>&1; then
+        die "${NODE_NAMES[$node_index]} exited unexpectedly; inspect $DEPLOY_ROOT/${NODE_NAMES[$node_index]}/${NODE_NAMES[$node_index]}.log"
       fi
-      i=$((i + 1))
     done
     sleep 2
   done
 }
+
+while (($# > 0)); do
+  case "$1" in
+    --with-keycloak)
+      WITH_KEYCLOAK=1
+      ;;
+    --node-count)
+      shift
+      [[ $# -gt 0 ]] || die "missing value for --node-count"
+      NODE_COUNT=$1
+      ;;
+    --node-count=*)
+      NODE_COUNT="${1#*=}"
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown argument: $1"
+      ;;
+  esac
+  shift
+done
+
+[[ "$NODE_COUNT" =~ ^[1-9][0-9]*$ ]] || die "--node-count must be a positive integer"
+
+if [[ -z "$KEYCLOAK_HTTP_PORT" ]]; then
+  KEYCLOAK_HTTP_PORT=$((BASE_PORT + NODE_COUNT * 10 + 1))
+fi
 
 trap cleanup EXIT
 trap handle_signal INT TERM
@@ -359,84 +462,63 @@ mkdir -p "$ROOT_DIR/target"
 rm -rf "$DEPLOY_ROOT"
 mkdir -p "$DEPLOY_ROOT"
 
+prepare_nodes
+
+assert_node_ports_free
+if [[ "$WITH_KEYCLOAK" == "1" ]]; then
+  assert_port_free "$KEYCLOAK_HTTP_PORT"
+fi
+
 log "Building the full release workspace"
 cargo build --workspace --release --locked
 
 [[ -x "$ARUNA_BIN" ]] || die "missing binary: $ARUNA_BIN"
 [[ -x "$ARUNA_DOCTOR_BIN" ]] || die "missing binary: $ARUNA_DOCTOR_BIN"
 
-NODE_1_DIR="$DEPLOY_ROOT/node-1"
-NODE_2_DIR="$DEPLOY_ROOT/node-2"
-NODE_3_DIR="$DEPLOY_ROOT/node-3"
-
-mkdir -p "$NODE_1_DIR" "$NODE_2_DIR" "$NODE_3_DIR"
-
-NODE_1_HTTP_PORT=$((BASE_PORT + 1))
-NODE_1_P2P_PORT=$((BASE_PORT + 2))
-NODE_1_S3_PORT=$((BASE_PORT + 3))
-NODE_2_HTTP_PORT=$((BASE_PORT + 11))
-NODE_2_P2P_PORT=$((BASE_PORT + 12))
-NODE_2_S3_PORT=$((BASE_PORT + 13))
-NODE_3_HTTP_PORT=$((BASE_PORT + 21))
-NODE_3_P2P_PORT=$((BASE_PORT + 22))
-NODE_3_S3_PORT=$((BASE_PORT + 23))
-
-for port in \
-  "$NODE_1_HTTP_PORT" "$NODE_1_P2P_PORT" "$NODE_1_S3_PORT" \
-  "$NODE_2_HTTP_PORT" "$NODE_2_P2P_PORT" "$NODE_2_S3_PORT" \
-  "$NODE_3_HTTP_PORT" "$NODE_3_P2P_PORT" "$NODE_3_S3_PORT"
-do
-  assert_port_free "$port"
-done
-
-if [[ "$WITH_KEYCLOAK" == "1" ]]; then
-  assert_port_free "$KEYCLOAK_HTTP_PORT"
-fi
-
-NODE_1_BASE_URL="http://127.0.0.1:$NODE_1_HTTP_PORT"
-NODE_2_BASE_URL="http://127.0.0.1:$NODE_2_HTTP_PORT"
-NODE_3_BASE_URL="http://127.0.0.1:$NODE_3_HTTP_PORT"
+NODE_1_BASE_URL="${NODE_BASE_URLS[0]}"
 
 if [[ "$WITH_KEYCLOAK" == "1" ]]; then
   start_keycloak
 fi
 
-write_node_env "$NODE_1_DIR" "$NODE_1_HTTP_PORT" "$NODE_1_P2P_PORT" "$NODE_1_S3_PORT"
+write_node_env "${NODE_DIRS[0]}" "${NODE_HTTP_PORTS[0]}" "${NODE_P2P_PORTS[0]}" "${NODE_S3_PORTS[0]}"
 
-start_node "node-1" "$NODE_1_DIR"
+start_node "${NODE_NAMES[0]}" "${NODE_DIRS[0]}"
 NODE_1_PID="$STARTED_PID"
-wait_for_http "node-1" "$NODE_1_BASE_URL" "$NODE_1_PID"
+wait_for_http "${NODE_NAMES[0]}" "$NODE_1_BASE_URL" "$NODE_1_PID"
 
-log "Reading the initial onboarding secret from node-1"
-INITIAL_LOCAL_ONBOARDING_SECRET="$(wait_for_initial_onboarding_secret "$NODE_1_DIR/node-1.log" "$NODE_1_PID")"
+log "Reading the initial onboarding secret from ${NODE_NAMES[0]}"
+INITIAL_LOCAL_ONBOARDING_SECRET="$(wait_for_initial_onboarding_secret "${NODE_DIRS[0]}/${NODE_NAMES[0]}.log" "$NODE_1_PID")"
 
-log "Generating the bootstrap admin token from node-1"
-INITIAL_ADMIN_TOKEN="$(generate_test_token "$NODE_1_DIR" "$INITIAL_LOCAL_ONBOARDING_SECRET")"
+log "Generating the bootstrap admin token from ${NODE_NAMES[0]}"
+INITIAL_ADMIN_TOKEN="$(generate_test_token "${NODE_DIRS[0]}" "$INITIAL_LOCAL_ONBOARDING_SECRET")"
 printf 'ADMIN_TOKEN=%s\n' "$INITIAL_ADMIN_TOKEN"
 
-log "Onboarding node-2"
-onboard_server_node "node-2" "$NODE_2_DIR" "$NODE_2_HTTP_PORT" "$NODE_2_P2P_PORT" "$NODE_2_S3_PORT" "$NODE_2_BASE_URL"
-NODE_2_PID="$STARTED_PID"
+for node_index in "${!NODE_NAMES[@]}"; do
+  if [[ $node_index -eq 0 ]]; then
+    continue
+  fi
 
-log "Onboarding node-3"
-onboard_server_node "node-3" "$NODE_3_DIR" "$NODE_3_HTTP_PORT" "$NODE_3_P2P_PORT" "$NODE_3_S3_PORT" "$NODE_3_BASE_URL"
-NODE_3_PID="$STARTED_PID"
+  log "Onboarding ${NODE_NAMES[$node_index]}"
+  onboard_server_node \
+    "${NODE_NAMES[$node_index]}" \
+    "${NODE_DIRS[$node_index]}" \
+    "${NODE_HTTP_PORTS[$node_index]}" \
+    "${NODE_P2P_PORTS[$node_index]}" \
+    "${NODE_S3_PORTS[$node_index]}" \
+    "${NODE_BASE_URLS[$node_index]}"
+done
 
-write_summary \
-  "$DEPLOY_ROOT/summary.txt" \
-  "node-1 http=$NODE_1_BASE_URL s3=127.0.0.1:$NODE_1_S3_PORT dir=$NODE_1_DIR log=$NODE_1_DIR/node-1.log" \
-  "node-2 http=$NODE_2_BASE_URL s3=127.0.0.1:$NODE_2_S3_PORT dir=$NODE_2_DIR log=$NODE_2_DIR/node-2.log" \
-  "node-3 http=$NODE_3_BASE_URL s3=127.0.0.1:$NODE_3_S3_PORT dir=$NODE_3_DIR log=$NODE_3_DIR/node-3.log"
+write_summary_file "$DEPLOY_ROOT/summary.txt"
 
 if [[ "$WITH_KEYCLOAK" == "1" ]]; then
-  append_summary_line \
-    "$DEPLOY_ROOT/summary.txt" \
-    "keycloak issuer=$KEYCLOAK_ISSUER discovery=$KEYCLOAK_DISCOVERY_URL admin=$KEYCLOAK_ADMIN_USER/$KEYCLOAK_ADMIN_PASSWORD"
+  log "$NODE_COUNT aruna nodes and Keycloak are up"
+else
+  log "$NODE_COUNT aruna nodes are up"
 fi
 
-log "Three aruna nodes are up"
 log "Deployment summary:"
-cat "$DEPLOY_ROOT/summary.txt"
+print_summary "$DEPLOY_ROOT/summary.txt"
 
 if [[ "$EXIT_AFTER_READY" == "1" ]]; then
   log "Exiting after readiness because ARUNA_TEST_DEPLOY_EXIT_AFTER_READY=1"
