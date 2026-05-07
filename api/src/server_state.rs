@@ -27,6 +27,7 @@ use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
 use serde::{Serialize, de::DeserializeOwned};
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
@@ -58,6 +59,28 @@ pub struct ServerState {
     node_id: NodeId,
     // Contains OIDC config and Client
     oidc_validator: Option<Arc<OidcValidator>>,
+    interface_state: Arc<RwLock<InterfaceRuntimeState>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InterfaceRuntimeState {
+    pub rest: Option<RestInterfaceRuntime>,
+    pub s3: Option<S3InterfaceRuntime>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestInterfaceRuntime {
+    pub bind_address: SocketAddr,
+    pub base_url: String,
+    pub api_base_url: String,
+    pub info_url: String,
+    pub swagger_ui_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct S3InterfaceRuntime {
+    pub bind_address: SocketAddr,
+    pub base_url: String,
 }
 
 impl ServerState {
@@ -101,6 +124,7 @@ impl ServerState {
             trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
             issuer_keys: Arc::new(RwLock::new(HashMap::default())),
             initial_admin_claim,
+            interface_state: Arc::new(RwLock::new(InterfaceRuntimeState::default())),
         };
         state.persist_trusted_realms().await;
         state
@@ -140,6 +164,23 @@ impl ServerState {
         self.oidc_validator
             .as_deref()
             .ok_or(OidcError::NotConfigured)
+    }
+
+    pub async fn register_rest_interface(&self, bind_address: SocketAddr) {
+        let mut interface_state = self.interface_state.write().await;
+        interface_state.rest = Some(RestInterfaceRuntime::from_bind_address(bind_address));
+    }
+
+    pub async fn register_s3_interface(&self, bind_address: SocketAddr, base_url: String) {
+        let mut interface_state = self.interface_state.write().await;
+        interface_state.s3 = Some(S3InterfaceRuntime {
+            bind_address,
+            base_url,
+        });
+    }
+
+    pub async fn interface_state(&self) -> InterfaceRuntimeState {
+        self.interface_state.read().await.clone()
     }
 
     pub async fn get_oidc_provider_by_token(
@@ -462,4 +503,25 @@ where
 /// - `/api-docs/s3-openapi.json` - S3-compatible API
 pub fn swagger_ui() -> SwaggerUi {
     SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi())
+}
+
+impl RestInterfaceRuntime {
+    pub fn from_bind_address(bind_address: SocketAddr) -> Self {
+        let host = match bind_address.ip() {
+            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+                std::net::Ipv4Addr::LOCALHOST.to_string()
+            }
+            std::net::IpAddr::V6(ip) if ip.is_unspecified() => "::1".to_string(),
+            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+            std::net::IpAddr::V4(ip) => ip.to_string(),
+        };
+        let base_url = format!("http://{host}:{}", bind_address.port());
+        Self {
+            bind_address,
+            api_base_url: format!("{base_url}/api/v1"),
+            info_url: format!("{base_url}/api/v1/info"),
+            swagger_ui_url: format!("{base_url}/swagger-ui"),
+            base_url,
+        }
+    }
 }

@@ -32,6 +32,7 @@ use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_tasks::TaskHandle;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -228,7 +229,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server_config = ServerConfig {
         http_addr: config.http_socket_addr,
     };
-    let server = Server::new(state, server_config);
+    let server = Server::new(state.clone(), server_config);
 
     // S3 Server
     let s3_address = format!("{}:{}", config.s3_address, config.s3_port);
@@ -243,7 +244,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await
     .unwrap();
 
-    let server_handle = s3_server.run().await.unwrap();
+    let s3_listener = TcpListener::bind(&s3_address).await.unwrap();
+    let s3_bound_addr = s3_listener.local_addr().unwrap();
+    state
+        .register_s3_interface(
+            s3_bound_addr,
+            format!("http://{}:{}", config.s3_host, s3_bound_addr.port()),
+        )
+        .await;
+    let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
+
+    let rest_listener = TcpListener::bind(config.http_socket_addr).await?;
 
     tokio::select! {
         res = server_handle => {
@@ -252,7 +263,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Err(e) => error!("S3 Server panicked: {:?}", e),
             }
         }
-        res = server.run() => {
+        res = server.run_with_listener(rest_listener) => {
             match res {
                 Ok(_) => info!("REST Server stopped normally"),
                 Err(e) => error!("REST Server panicked: {:?}", e),

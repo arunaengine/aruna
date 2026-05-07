@@ -306,7 +306,6 @@ mod tests {
     use aruna_operations::incoming::initialize_net_incoming;
     use aruna_operations::task_incoming::initialize_task_incoming;
     use aruna_tasks::TaskHandle;
-    use axum::Router;
     use ed25519_dalek::SigningKey;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -440,14 +439,9 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let router: Router = Server::new(state, ServerConfig { http_addr: addr }).build_router();
+        let server = Server::new(state, ServerConfig { http_addr: addr });
         let server_task = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .await
-            .unwrap();
+            server.run_with_listener(listener).await.unwrap();
         });
 
         TestNode {
@@ -575,6 +569,15 @@ mod tests {
         let info = fetch_info(&config).await.unwrap();
 
         assert!(matches!(info.net_state, aruna_api::routes::info::NetStatus::Available { .. }));
+        assert!(matches!(
+            info.interface_status.rest,
+            aruna_api::routes::info::RestInterfaceStatus::Available {
+                ref base_url,
+                ref info_url,
+                ..
+            } if base_url == &format!("http://{}", node.http_addr)
+                && info_url == &format!("http://{}/api/v1/info", node.http_addr)
+        ));
         node.shutdown().await;
     }
 }

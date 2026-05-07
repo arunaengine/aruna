@@ -42,10 +42,14 @@ impl Server {
     }
 
     pub async fn run(self) -> Result<(), ServerSetupError> {
-        let router = self.build_router();
-
-        // Create TCP listener for main HTTP server
         let listener = TcpListener::bind(self.config.http_addr).await?;
+        self.run_with_listener(listener).await
+    }
+
+    pub async fn run_with_listener(self, listener: TcpListener) -> Result<(), ServerSetupError> {
+        let bound_addr = listener.local_addr()?;
+        self.state.register_rest_interface(bound_addr).await;
+        let router = self.build_router();
 
         axum::serve(
             listener,

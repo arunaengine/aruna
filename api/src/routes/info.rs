@@ -1,5 +1,4 @@
 use crate::server_state::ServerState;
-use aruna_core::structs::Status;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -60,8 +59,31 @@ pub struct TimeoutConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InterfaceStatus {
-    pub s3_status: String,
-    pub rest_status: String,
+    pub rest: RestInterfaceStatus,
+    pub s3: S3InterfaceStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status")]
+pub enum RestInterfaceStatus {
+    Available {
+        bind_address: String,
+        base_url: String,
+        api_base_url: String,
+        info_url: String,
+        swagger_ui_url: String,
+    },
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "status")]
+pub enum S3InterfaceStatus {
+    Available {
+        bind_address: String,
+        base_url: String,
+    },
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -138,12 +160,25 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
         }
         None => BlobStatus::Unavailable,
     };
-    // TODO: 
-    // - Replace hardcoded values
-    // - Add s3 interface address
+    let interface_runtime = state.interface_state().await;
     let interface_status = InterfaceStatus {
-        s3_status: Status::Available.to_string(),
-        rest_status: Status::Available.to_string(),
+        rest: match interface_runtime.rest {
+            Some(rest) => RestInterfaceStatus::Available {
+                bind_address: rest.bind_address.to_string(),
+                base_url: rest.base_url,
+                api_base_url: rest.api_base_url,
+                info_url: rest.info_url,
+                swagger_ui_url: rest.swagger_ui_url,
+            },
+            None => RestInterfaceStatus::Unavailable,
+        },
+        s3: match interface_runtime.s3 {
+            Some(s3) => S3InterfaceStatus::Available {
+                bind_address: s3.bind_address.to_string(),
+                base_url: s3.base_url,
+            },
+            None => S3InterfaceStatus::Unavailable,
+        },
     };
     let storage_metrics = state.get_ctx().storage_handle.snapshot_metrics();
     let database_status = DatabaseStatus {
@@ -169,11 +204,14 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobStatus, InfoResponse, InterfaceStatus, NetStatus, DatabaseStatus, get_info};
+    use super::{
+        BlobStatus, DatabaseStatus, InfoResponse, InterfaceStatus, NetStatus,
+        RestInterfaceStatus, S3InterfaceStatus, get_info,
+    };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::structs::{NodeCapabilities, RealmId, Status};
+    use aruna_core::structs::{NodeCapabilities, RealmId};
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
     use axum::Json;
@@ -229,8 +267,8 @@ mod tests {
                 net_state: NetStatus::Unavailable,
                 blob_status: BlobStatus::Unavailable,
                 interface_status: InterfaceStatus {
-                    s3_status: Status::Available.to_string(),
-                    rest_status: Status::Available.to_string(),
+                    rest: RestInterfaceStatus::Unavailable,
+                    s3: S3InterfaceStatus::Unavailable,
                 },
                 database_status: DatabaseStatus {
                     requests_total: baseline.requests_total,
@@ -241,6 +279,40 @@ mod tests {
                     } else {
                         baseline.errors_total as f64 / baseline.requests_total as f64
                     },
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn get_info_reports_registered_interface_paths() {
+        let (state, _tempdir) = setup_state().await;
+        state
+            .register_rest_interface("0.0.0.0:3000".parse().unwrap())
+            .await;
+        state
+            .register_s3_interface(
+                "0.0.0.0:1337".parse().unwrap(),
+                "http://localhost:1337".to_string(),
+            )
+            .await;
+
+        let (status, Json(response)) = get_info(State(state)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.interface_status,
+            InterfaceStatus {
+                rest: RestInterfaceStatus::Available {
+                    bind_address: "0.0.0.0:3000".to_string(),
+                    base_url: "http://127.0.0.1:3000".to_string(),
+                    api_base_url: "http://127.0.0.1:3000/api/v1".to_string(),
+                    info_url: "http://127.0.0.1:3000/api/v1/info".to_string(),
+                    swagger_ui_url: "http://127.0.0.1:3000/swagger-ui".to_string(),
+                },
+                s3: S3InterfaceStatus::Available {
+                    bind_address: "0.0.0.0:1337".to_string(),
+                    base_url: "http://localhost:1337".to_string(),
                 },
             }
         );
