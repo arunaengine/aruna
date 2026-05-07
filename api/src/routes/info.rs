@@ -20,6 +20,7 @@ pub fn router() -> Router<Arc<ServerState>> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
+    pub node_info: LocalNodeInfo,
     pub net_state: NetStatus,
     pub blob_status: BlobStatus,
     pub interface_status: InterfaceStatus,
@@ -27,27 +28,74 @@ pub struct InfoResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub enum NetStatus {
-    Available {
-        realm_id: String,
-        node_id: String,
-        bootstrap_nodes: Vec<String>,
-        endpoint_addr: serde_json::Value,
-        open_connections: Vec<OpenConnection>,
-    },
+pub struct LocalNodeInfo {
+    pub realm_id: String,
+    pub node_id: String,
+    pub capabilities: NodeCapabilityKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeCapabilityKind {
+    Management,
+    Server,
+    Local,
+}
+
+impl From<&aruna_core::structs::NodeCapabilities> for NodeCapabilityKind {
+    fn from(capabilities: &aruna_core::structs::NodeCapabilities) -> Self {
+        match capabilities {
+            aruna_core::structs::NodeCapabilities::Management { .. } => Self::Management,
+            aruna_core::structs::NodeCapabilities::Server { .. } => Self::Server,
+            aruna_core::structs::NodeCapabilities::Local { .. } => Self::Local,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceStatus {
+    Available,
+    NotConfigured,
     Unavailable,
 }
 
+impl From<aruna_core::structs::Status> for ServiceStatus {
+    fn from(status: aruna_core::structs::Status) -> Self {
+        match status {
+            aruna_core::structs::Status::Available => Self::Available,
+            aruna_core::structs::Status::NotConfigured => Self::NotConfigured,
+            aruna_core::structs::Status::Unavailable => Self::Unavailable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub enum BlobStatus {
-    Available {
-        backend_type: String,
-        max_bucket_size: Option<u64>,
-        multipart_bucket: Option<String>,
-        timeouts: TimeoutConfig,
-        status: String,
-    },
-    Unavailable,
+pub struct NetStatus {
+    pub status: ServiceStatus,
+    pub realm_id: Option<String>,
+    pub node_id: Option<String>,
+    pub bootstrap_nodes: Vec<String>,
+    pub endpoint_addr: Option<serde_json::Value>,
+    pub monitor: ConnectionMonitorStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ConnectionMonitorStatus {
+    pub open_connections: Vec<OpenConnection>,
+    pub observed_connections_total: u64,
+    pub dropped_observations_total: u64,
+    pub closed_connections_total: u64,
+    pub close_task_errors_total: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BlobStatus {
+    pub status: ServiceStatus,
+    pub backend_type: Option<String>,
+    pub max_bucket_size: Option<u64>,
+    pub multipart_bucket: Option<String>,
+    pub timeouts: Option<TimeoutConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -64,40 +112,38 @@ pub struct InterfaceStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "status")]
-pub enum RestInterfaceStatus {
-    Available {
-        bind_address: String,
-        base_url: String,
-        api_base_url: String,
-        info_url: String,
-        swagger_ui_url: String,
-    },
-    Unavailable,
+pub struct RestInterfaceStatus {
+    pub status: ServiceStatus,
+    pub bind_address: Option<String>,
+    pub base_url: Option<String>,
+    pub api_base_url: Option<String>,
+    pub info_url: Option<String>,
+    pub swagger_ui_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "status")]
-pub enum S3InterfaceStatus {
-    Available {
-        bind_address: String,
-        base_url: String,
-    },
-    Unavailable,
+pub struct S3InterfaceStatus {
+    pub status: ServiceStatus,
+    pub bind_address: Option<String>,
+    pub base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct DatabaseStatus {
+    pub status: ServiceStatus,
     pub requests_total: u64,
     pub errors_total: u64,
     pub conflicts_total: u64,
+    pub failed_total: u64,
     pub error_rate: f64,
+    pub channel_closed: bool,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct OpenConnection {
-    pub alpn: Option<String>,
     pub connection_id: u64,
+    pub alpn: Option<String>,
     pub remote_id: String,
     pub side: String,
 }
@@ -114,37 +160,52 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
     let net_state = match &state.get_ctx().net_handle {
         Some(net) => {
             let info = net.get_status().await;
-            NetStatus::Available {
-                realm_id: info.realm_id.to_string(),
-                node_id: info.node_id.to_string(),
+            NetStatus {
+                status: ServiceStatus::Available,
+                realm_id: Some(info.realm_id.to_string()),
+                node_id: Some(info.node_id.to_string()),
                 bootstrap_nodes: info.bootstrap_nodes.iter().map(|n| n.to_string()).collect(),
-                endpoint_addr: serde_json::to_value(&info.endpoint_addr).unwrap(),
-                open_connections: info
-                    .monitor
-                    .open_connections
-                    .iter()
-                    .map(|c| OpenConnection {
-                        connection_id: c.connection_id,
-                        alpn: c.alpn.map(|a| a.to_string()),
-                        remote_id: c.remote_id.to_string(),
-                        side: match c.side {
-                            iroh::endpoint::Side::Client => "Client".to_string(),
-                            iroh::endpoint::Side::Server => "Server".to_string(),
-                        },
-                    })
-                    .collect(),
+                endpoint_addr: serde_json::to_value(&info.endpoint_addr).ok(),
+                monitor: ConnectionMonitorStatus {
+                    open_connections: info
+                        .monitor
+                        .open_connections
+                        .iter()
+                        .map(|c| OpenConnection {
+                            connection_id: c.connection_id,
+                            alpn: c.alpn.map(|a| a.to_string()),
+                            remote_id: c.remote_id.to_string(),
+                            side: match c.side {
+                                iroh::endpoint::Side::Client => "Client".to_string(),
+                                iroh::endpoint::Side::Server => "Server".to_string(),
+                            },
+                        })
+                        .collect(),
+                    observed_connections_total: info.monitor.observed_connections_total,
+                    dropped_observations_total: info.monitor.dropped_observations_total,
+                    closed_connections_total: info.monitor.closed_connections_total,
+                    close_task_errors_total: info.monitor.close_task_errors_total,
+                },
             }
         }
-        None => NetStatus::Unavailable,
+        None => NetStatus {
+            status: ServiceStatus::Unavailable,
+            realm_id: None,
+            node_id: None,
+            bootstrap_nodes: Vec::new(),
+            endpoint_addr: None,
+            monitor: ConnectionMonitorStatus::default(),
+        },
     };
     let blob_status = match &state.get_ctx().blob_handle {
         Some(blob) => {
             let info = blob.get_status().await;
-            BlobStatus::Available {
-                backend_type: info.backend_type.to_string(),
+            BlobStatus {
+                status: ServiceStatus::from(info.status),
+                backend_type: Some(info.backend_type.to_string()),
                 max_bucket_size: info.max_bucket_size,
                 multipart_bucket: info.multipart_bucket,
-                timeouts: TimeoutConfig {
+                timeouts: Some(TimeoutConfig {
                     control_plane_connect_timeout: format!(
                         "{}s",
                         info.timeouts.control_plane_connect_timeout.as_secs()
@@ -157,46 +218,77 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
                         "{}s",
                         info.timeouts.transfer_idle_timeout.as_secs()
                     ),
-                },
-                status: info.status.to_string(),
+                }),
             }
         }
-        None => BlobStatus::Unavailable,
+        None => BlobStatus {
+            status: ServiceStatus::NotConfigured,
+            backend_type: None,
+            max_bucket_size: None,
+            multipart_bucket: None,
+            timeouts: None,
+        },
     };
     let interface_runtime = state.interface_state().await;
     let interface_status = InterfaceStatus {
         rest: match interface_runtime.rest {
-            Some(rest) => RestInterfaceStatus::Available {
-                bind_address: rest.bind_address.to_string(),
-                base_url: rest.base_url,
-                api_base_url: rest.api_base_url,
-                info_url: rest.info_url,
-                swagger_ui_url: rest.swagger_ui_url,
+            Some(rest) => RestInterfaceStatus {
+                status: ServiceStatus::Available,
+                bind_address: Some(rest.bind_address.to_string()),
+                base_url: Some(rest.base_url),
+                api_base_url: Some(rest.api_base_url),
+                info_url: Some(rest.info_url),
+                swagger_ui_url: Some(rest.swagger_ui_url),
             },
-            None => RestInterfaceStatus::Unavailable,
+            None => RestInterfaceStatus {
+                status: ServiceStatus::Unavailable,
+                bind_address: None,
+                base_url: None,
+                api_base_url: None,
+                info_url: None,
+                swagger_ui_url: None,
+            },
         },
         s3: match interface_runtime.s3 {
-            Some(s3) => S3InterfaceStatus::Available {
-                bind_address: s3.bind_address.to_string(),
-                base_url: s3.base_url,
+            Some(s3) => S3InterfaceStatus {
+                status: ServiceStatus::Available,
+                bind_address: Some(s3.bind_address.to_string()),
+                base_url: Some(s3.base_url),
             },
-            None => S3InterfaceStatus::Unavailable,
+            None => S3InterfaceStatus {
+                status: ServiceStatus::Unavailable,
+                bind_address: None,
+                base_url: None,
+            },
         },
     };
     let storage_metrics = state.get_ctx().storage_handle.snapshot_metrics();
     let database_status = DatabaseStatus {
+        status: if storage_metrics.channel_closed {
+            ServiceStatus::Unavailable
+        } else {
+            ServiceStatus::Available
+        },
         requests_total: storage_metrics.requests_total,
         errors_total: storage_metrics.errors_total,
         conflicts_total: storage_metrics.conflicts_total,
+        failed_total: storage_metrics.failed_total,
         error_rate: if storage_metrics.requests_total == 0 {
             0.0
         } else {
-            storage_metrics.errors_total as f64 / storage_metrics.requests_total as f64
+            storage_metrics.failed_total as f64 / storage_metrics.requests_total as f64
         },
+        channel_closed: storage_metrics.channel_closed,
+        last_error: storage_metrics.last_error,
     };
     (
         StatusCode::OK,
         Json(InfoResponse {
+            node_info: LocalNodeInfo {
+                realm_id: state.get_realm_id().to_string(),
+                node_id: state.get_node_id().to_string(),
+                capabilities: NodeCapabilityKind::from(state.node_capabilities()),
+            },
             net_state,
             blob_status,
             interface_status,
@@ -208,8 +300,9 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobStatus, DatabaseStatus, InfoResponse, InterfaceStatus, NetStatus,
-        RestInterfaceStatus, S3InterfaceStatus, get_info,
+        BlobStatus, ConnectionMonitorStatus, DatabaseStatus, InfoResponse, InterfaceStatus,
+        LocalNodeInfo, NetStatus, NodeCapabilityKind, RestInterfaceStatus, S3InterfaceStatus,
+        ServiceStatus, get_info,
     };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
@@ -260,6 +353,11 @@ mod tests {
     async fn get_info_returns_unavailable_optional_statuses_when_handles_are_missing() {
         let (state, _tempdir) = setup_state().await;
         let baseline = state.get_ctx().storage_handle.snapshot_metrics();
+        let expected_node_info = LocalNodeInfo {
+            realm_id: state.get_realm_id().to_string(),
+            node_id: state.get_node_id().to_string(),
+            capabilities: NodeCapabilityKind::Local,
+        };
 
         let (status, Json(response)) = get_info(State(state)).await;
 
@@ -267,21 +365,50 @@ mod tests {
         assert_eq!(
             response,
             InfoResponse {
-                net_state: NetStatus::Unavailable,
-                blob_status: BlobStatus::Unavailable,
+                node_info: expected_node_info,
+                net_state: NetStatus {
+                    status: ServiceStatus::Unavailable,
+                    realm_id: None,
+                    node_id: None,
+                    bootstrap_nodes: Vec::new(),
+                    endpoint_addr: None,
+                    monitor: ConnectionMonitorStatus::default(),
+                },
+                blob_status: BlobStatus {
+                    status: ServiceStatus::NotConfigured,
+                    backend_type: None,
+                    max_bucket_size: None,
+                    multipart_bucket: None,
+                    timeouts: None,
+                },
                 interface_status: InterfaceStatus {
-                    rest: RestInterfaceStatus::Unavailable,
-                    s3: S3InterfaceStatus::Unavailable,
+                    rest: RestInterfaceStatus {
+                        status: ServiceStatus::Unavailable,
+                        bind_address: None,
+                        base_url: None,
+                        api_base_url: None,
+                        info_url: None,
+                        swagger_ui_url: None,
+                    },
+                    s3: S3InterfaceStatus {
+                        status: ServiceStatus::Unavailable,
+                        bind_address: None,
+                        base_url: None,
+                    },
                 },
                 database_status: DatabaseStatus {
+                    status: ServiceStatus::Available,
                     requests_total: baseline.requests_total,
                     errors_total: baseline.errors_total,
                     conflicts_total: baseline.conflicts_total,
+                    failed_total: baseline.failed_total,
                     error_rate: if baseline.requests_total == 0 {
                         0.0
                     } else {
-                        baseline.errors_total as f64 / baseline.requests_total as f64
+                        baseline.failed_total as f64 / baseline.requests_total as f64
                     },
+                    channel_closed: baseline.channel_closed,
+                    last_error: baseline.last_error,
                 },
             }
         );
@@ -303,16 +430,18 @@ mod tests {
         assert_eq!(
             response.interface_status,
             InterfaceStatus {
-                rest: RestInterfaceStatus::Available {
-                    bind_address: "0.0.0.0:3000".to_string(),
-                    base_url: "http://127.0.0.1:3000".to_string(),
-                    api_base_url: "http://127.0.0.1:3000/api/v1".to_string(),
-                    info_url: "http://127.0.0.1:3000/api/v1/info".to_string(),
-                    swagger_ui_url: "http://127.0.0.1:3000/swagger-ui".to_string(),
+                rest: RestInterfaceStatus {
+                    status: ServiceStatus::Available,
+                    bind_address: Some("0.0.0.0:3000".to_string()),
+                    base_url: Some("http://127.0.0.1:3000".to_string()),
+                    api_base_url: Some("http://127.0.0.1:3000/api/v1".to_string()),
+                    info_url: Some("http://127.0.0.1:3000/api/v1/info".to_string()),
+                    swagger_ui_url: Some("http://127.0.0.1:3000/swagger-ui".to_string()),
                 },
-                s3: S3InterfaceStatus::Available {
-                    bind_address: "0.0.0.0:1337".to_string(),
-                    base_url: "http://localhost:1337".to_string(),
+                s3: S3InterfaceStatus {
+                    status: ServiceStatus::Available,
+                    bind_address: Some("0.0.0.0:1337".to_string()),
+                    base_url: Some("http://localhost:1337".to_string()),
                 },
             }
         );
@@ -339,10 +468,15 @@ mod tests {
         assert_eq!(
             response.database_status,
             DatabaseStatus {
+                status: ServiceStatus::Available,
                 requests_total: baseline.requests_total + 1,
                 errors_total: baseline.errors_total + 1,
                 conflicts_total: baseline.conflicts_total,
-                error_rate: (baseline.errors_total + 1) as f64 / (baseline.requests_total + 1) as f64,
+                failed_total: baseline.failed_total + 1,
+                error_rate: (baseline.failed_total + 1) as f64
+                    / (baseline.requests_total + 1) as f64,
+                channel_closed: false,
+                last_error: Some("Transaction not found".to_string()),
             }
         );
     }
