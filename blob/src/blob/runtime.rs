@@ -1,12 +1,13 @@
 use super::{BlobHandle, BlobHandler, EffectReceiver};
 use crate::error::BlobLibError;
+use crate::opendal::init_operator;
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::handle::Handle;
-use aruna_core::structs::BackendConfig;
+use aruna_core::structs::{BackendConfig, BlobState, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::storage::StorageHandle;
@@ -87,6 +88,19 @@ impl BlobHandle {
 
     pub async fn store_connection(&mut self, stream: BiStream) -> Ulid {
         self.handler.add_connection(None, stream).await
+    }
+
+    pub async fn get_status(&self) -> BlobState {
+        let backend_type = self.handler.backend_config.backend_type.clone();
+        let status = self.handler.get_operator_status().await;
+
+        BlobState {
+            backend_type,
+            max_bucket_size: self.handler.backend_config.max_bucket_size,
+            multipart_bucket: self.handler.backend_config.multipart_bucket.clone(),
+            timeouts: self.handler.backend_config.timeouts,
+            status,
+        }
     }
 }
 
@@ -268,5 +282,22 @@ impl BlobHandler {
         _ = sx.finish();
         _ = rx.stop(0u32.into());
         BlobEvent::ConnectionClosed { stream_id }
+    }
+
+    async fn get_operator_status(&self) -> Status {
+        let backend_type = self.backend_config.backend_type.clone();
+        let mut config = self.backend_config.service_config.clone();
+        if !self.backend_config.root.trim().is_empty() {
+            config.insert("root".to_string(), self.backend_config.root.clone());
+        }
+
+        match init_operator(backend_type, config) {
+            Ok(operator) => match operator.check().await {
+                Ok(_) => Status::Available,
+                Err(_) => Status::Unavailable,
+            },
+            Err(BlobError::OperatorCreationFailed(_)) => Status::NotConfigured,
+            Err(_) => Status::Unavailable,
+        }
     }
 }

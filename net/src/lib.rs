@@ -5,6 +5,7 @@ pub mod dht;
 mod effect_handlers;
 pub mod error;
 pub mod gossip;
+mod monitoring;
 pub mod streams;
 
 use std::net::SocketAddr;
@@ -15,7 +16,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetError as CoreNetError, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{NetState, RealmId};
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use crossfire::TrySendError;
@@ -32,8 +33,10 @@ use tracing::{Instrument, Span, warn};
 pub use dht::DhtHandle;
 pub use error::{NetError, Result};
 pub use gossip::GossipService;
+pub use monitoring::Monitor;
 pub use streams::StreamsService;
 
+#[derive(Clone)]
 pub struct NetConfig {
     pub bind_addr: SocketAddr,
     pub secret_key: Option<iroh::SecretKey>,
@@ -98,6 +101,7 @@ pub trait InboundEventHandler: Send + Sync {
 #[derive(Clone)]
 pub struct NetHandle {
     inner: Arc<NetInner>,
+    monitor: Monitor,
 }
 
 struct NetInner {
@@ -138,7 +142,10 @@ impl NetHandle {
                 transport_config.max_concurrent_bidi_streams(VarInt::from_u64(max_bidi)?);
         }
 
+        let monitor = Monitor::new();
+
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)
+            .hooks(monitor.clone())
             .transport_config(transport_config.build())
             .secret_key(secret_key)
             .address_lookup(address_lookup.clone())
@@ -382,7 +389,7 @@ impl NetHandle {
             tasks: Mutex::new(tasks),
         });
 
-        Ok(Self { inner })
+        Ok(Self { inner, monitor })
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -455,6 +462,16 @@ impl NetHandle {
         let mut tasks = self.inner.tasks.lock().await;
         while let Some(handle) = tasks.pop() {
             let _ = handle.await;
+        }
+    }
+
+    pub async fn get_status(&self) -> NetState {
+        NetState {
+            endpoint_addr: local_endpoint_addr(&self.inner.endpoint),
+            realm_id: *self.realm_id(),
+            node_id: self.node_id(),
+            boostrap_nodes: self.inner.gossip.get_bootstrap_nodes(),
+            open_connections: self.monitor.get_connections().await,
         }
     }
 }

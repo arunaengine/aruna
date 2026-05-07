@@ -11,7 +11,7 @@ use aruna_core::structs::RealmId;
 use aruna_storage::StorageHandle;
 use bytes::Bytes;
 use byteview::ByteView;
-use iroh::Endpoint;
+use iroh::{Endpoint, PublicKey};
 use iroh_gossip::api::GossipSender;
 use iroh_gossip::net::Gossip;
 use parking_lot::RwLock;
@@ -123,6 +123,10 @@ impl GossipService {
         if !nodes.contains(&node_id) {
             nodes.push(node_id);
         }
+    }
+
+    pub fn get_bootstrap_nodes(&self) -> Vec<PublicKey> {
+        self.bootstrap_nodes.read().clone()
     }
 
     pub async fn broadcast(&self, topic: TopicId, message: Vec<u8>) -> Result<()> {
