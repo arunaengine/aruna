@@ -247,10 +247,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let s3_listener = TcpListener::bind(&s3_address).await.unwrap();
     let s3_bound_addr = s3_listener.local_addr().unwrap();
     state
-        .register_s3_interface(
-            s3_bound_addr,
-            format!("http://{}:{}", config.s3_host, s3_bound_addr.port()),
-        )
+        .register_s3_interface(s3_bound_addr, &config.s3_host)
         .await;
     let (_s3_addr, server_handle) = s3_server.run_with_listener(s3_listener).unwrap();
 

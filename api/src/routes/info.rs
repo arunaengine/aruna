@@ -294,10 +294,7 @@ mod tests {
             .register_rest_interface("0.0.0.0:3000".parse().unwrap())
             .await;
         state
-            .register_s3_interface(
-                "0.0.0.0:1337".parse().unwrap(),
-                "http://localhost:1337".to_string(),
-            )
+            .register_s3_interface("0.0.0.0:1337".parse().unwrap(), "localhost")
             .await;
 
         let (status, Json(response)) = get_info(State(state)).await;

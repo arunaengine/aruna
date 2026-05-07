@@ -171,11 +171,11 @@ impl ServerState {
         interface_state.rest = Some(RestInterfaceRuntime::from_bind_address(bind_address));
     }
 
-    pub async fn register_s3_interface(&self, bind_address: SocketAddr, base_url: String) {
+    pub async fn register_s3_interface(&self, bind_address: SocketAddr, advertised_host: &str) {
         let mut interface_state = self.interface_state.write().await;
         interface_state.s3 = Some(S3InterfaceRuntime {
             bind_address,
-            base_url,
+            base_url: client_base_url_from_advertised_host(advertised_host, bind_address),
         });
     }
 
@@ -507,15 +507,7 @@ pub fn swagger_ui() -> SwaggerUi {
 
 impl RestInterfaceRuntime {
     pub fn from_bind_address(bind_address: SocketAddr) -> Self {
-        let host = match bind_address.ip() {
-            std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
-                std::net::Ipv4Addr::LOCALHOST.to_string()
-            }
-            std::net::IpAddr::V6(ip) if ip.is_unspecified() => "::1".to_string(),
-            std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-            std::net::IpAddr::V4(ip) => ip.to_string(),
-        };
-        let base_url = format!("http://{host}:{}", bind_address.port());
+        let base_url = client_base_url_from_bind_address(bind_address);
         Self {
             bind_address,
             api_base_url: format!("{base_url}/api/v1"),
@@ -523,5 +515,66 @@ impl RestInterfaceRuntime {
             swagger_ui_url: format!("{base_url}/swagger-ui"),
             base_url,
         }
+    }
+}
+
+pub fn client_base_url_from_bind_address(bind_address: SocketAddr) -> String {
+    format!(
+        "http://{}:{}",
+        client_host_from_ip(bind_address.ip()),
+        bind_address.port()
+    )
+}
+
+pub fn client_base_url_from_advertised_host(
+    advertised_host: &str,
+    bind_address: SocketAddr,
+) -> String {
+    let host = match advertised_host.trim() {
+        "" => client_host_from_ip(bind_address.ip()),
+        host => match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => client_host_from_ip(ip),
+            Err(_) => host.to_string(),
+        },
+    };
+
+    format!("http://{host}:{}", bind_address.port())
+}
+
+fn client_host_from_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
+            std::net::Ipv4Addr::LOCALHOST.to_string()
+        }
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
+            format!("[{}]", std::net::Ipv6Addr::LOCALHOST)
+        }
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_base_url_from_advertised_host, client_base_url_from_bind_address};
+
+    #[test]
+    fn client_base_url_rewrites_unspecified_ipv6() {
+        assert_eq!(
+            client_base_url_from_bind_address("[::]:3000".parse().unwrap()),
+            "http://[::1]:3000"
+        );
+    }
+
+    #[test]
+    fn s3_base_url_normalizes_advertised_wildcards() {
+        assert_eq!(
+            client_base_url_from_advertised_host("0.0.0.0", "0.0.0.0:1337".parse().unwrap()),
+            "http://127.0.0.1:1337"
+        );
+        assert_eq!(
+            client_base_url_from_advertised_host("::", "[::]:1337".parse().unwrap()),
+            "http://[::1]:1337"
+        );
     }
 }
