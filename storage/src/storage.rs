@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use aruna_core::effects::{Effect, StorageEffect};
@@ -21,7 +23,6 @@ enum Txn {
     Read(fjall::Snapshot),
     Write(Box<fjall::OptimisticWriteTx>),
 }
-
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
 
 struct Store {
@@ -57,9 +58,24 @@ pub struct FjallStorage {
     txns: HashMap<Ulid, Txn>,
 }
 
+#[derive(Debug, Default)]
+struct StorageMetrics {
+    requests_total: AtomicU64,
+    errors_total: AtomicU64,
+    conflicts_total: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageMetricsSnapshot {
+    pub requests_total: u64,
+    pub errors_total: u64,
+    pub conflicts_total: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct StorageHandle {
     write_channel: EffectSender,
+    metrics: Arc<StorageMetrics>,
 }
 
 impl StorageHandle {
@@ -68,27 +84,63 @@ impl StorageHandle {
         (
             StorageHandle {
                 write_channel: sender,
+                metrics: Arc::new(StorageMetrics::default()),
             },
             receiver,
         )
     }
 
+    pub fn get_errors(&self) -> u64 {
+        self.metrics.errors_total.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
+        StorageMetricsSnapshot {
+            requests_total: self.metrics.requests_total.load(Ordering::Relaxed),
+            errors_total: self.metrics.errors_total.load(Ordering::Relaxed),
+            conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
+        }
+    }
+
     pub async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
-        let storage_event = {
-            let (response_tx, response_rx) = crossfire::oneshot::oneshot();
-            if self.write_channel.send((effect, response_tx)).is_err() {
-                return Event::Storage(StorageEvent::Error {
-                    error: StorageError::ChannelClosed,
-                });
+        Event::Storage(self.dispatch_storage_effect(effect).await)
+    }
+
+    async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+
+        let (response_tx, response_rx) = crossfire::oneshot::oneshot();
+        if self.write_channel.send((effect, response_tx)).is_err() {
+            return self.observe_storage_event(StorageEvent::Error {
+                error: StorageError::ChannelClosed,
+            });
+        }
+
+        match response_rx.await {
+            Ok(event) => self.observe_storage_event(event),
+            Err(_) => self.observe_storage_event(StorageEvent::Error {
+                error: StorageError::ChannelClosed,
+            }),
+        }
+    }
+
+    fn observe_storage_event(&self, event: StorageEvent) -> StorageEvent {
+        if let StorageEvent::Error { error } = &event {
+            self.observe_storage_error(error);
+        }
+
+        event
+    }
+
+    fn observe_storage_error(&self, error: &StorageError) {
+        match error {
+            StorageError::TransactionConflict => {
+                self.metrics.conflicts_total.fetch_add(1, Ordering::Relaxed);
             }
-            match response_rx.await {
-                Ok(event) => event,
-                Err(_) => StorageEvent::Error {
-                    error: StorageError::ChannelClosed,
-                },
+            _ => {
+                self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
             }
-        };
-        Event::Storage(storage_event)
+        }
     }
 }
 
@@ -96,27 +148,13 @@ impl StorageHandle {
 impl Handle for StorageHandle {
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
-            Effect::Storage(storage_effect) => {
-                let (response_tx, response_rx) = crossfire::oneshot::oneshot();
-                if self
-                    .write_channel
-                    .send((storage_effect, response_tx))
-                    .is_err()
-                {
-                    return Event::Storage(StorageEvent::Error {
-                        error: StorageError::ChannelClosed,
-                    });
-                }
-                match response_rx.await {
-                    Ok(event) => Event::Storage(event),
-                    Err(_) => Event::Storage(StorageEvent::Error {
-                        error: StorageError::ChannelClosed,
-                    }),
-                }
+            Effect::Storage(storage_effect) => Event::Storage(self.dispatch_storage_effect(storage_effect).await),
+            _ => {
+                self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                let error = StorageError::InvalidEffect;
+                self.observe_storage_error(&error);
+                Event::Storage(StorageEvent::Error { error })
             }
-            _ => Event::Storage(StorageEvent::Error {
-                error: StorageError::InvalidEffect,
-            }),
         }
     }
 }
@@ -561,4 +599,87 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FjallStorage, StorageHandle};
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::StorageError;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::handle::Handle;
+    use std::thread;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    async fn send_storage_effect_counts_requests_and_errors() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        let event = handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "missing".to_string(),
+                key: b"key".to_vec().into(),
+                txn_id: Some(Ulid::new()),
+            })
+            .await;
+
+        assert!(matches!(event, Event::Storage(StorageEvent::Error { .. })));
+        assert_eq!(
+            handle.snapshot_metrics(),
+            super::StorageMetricsSnapshot {
+                requests_total: 1,
+                errors_total: 1,
+                conflicts_total: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn send_effect_counts_conflicts_separately_from_errors() {
+        let (handle, receiver) = StorageHandle::new();
+        thread::spawn(move || {
+            let (effect, response_tx) = receiver.recv().expect("first effect should arrive");
+            assert!(matches!(effect, StorageEffect::CommitTransaction { .. }));
+            response_tx.send(StorageEvent::Error {
+                error: StorageError::TransactionNotFound,
+            });
+
+            let (effect, response_tx) = receiver.recv().expect("second effect should arrive");
+            assert!(matches!(effect, StorageEffect::StartTransaction { read: false }));
+            response_tx.send(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            });
+        });
+
+        let event = handle
+            .send_effect(Effect::Storage(StorageEffect::CommitTransaction {
+                txn_id: Ulid::new(),
+            }))
+            .await;
+
+        assert!(matches!(event, Event::Storage(StorageEvent::Error { .. })));
+
+        let metrics_after_not_found = handle.snapshot_metrics();
+        assert_eq!(metrics_after_not_found.requests_total, 1);
+        assert_eq!(metrics_after_not_found.errors_total, 1);
+        assert_eq!(metrics_after_not_found.conflicts_total, 0);
+
+        let event = handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::TransactionConflict,
+            })
+        ));
+
+        let metrics_after_conflict = handle.snapshot_metrics();
+        assert_eq!(metrics_after_conflict.requests_total, 2);
+        assert_eq!(metrics_after_conflict.errors_total, 1);
+        assert_eq!(metrics_after_conflict.conflicts_total, 1);
+    }
 }

@@ -19,11 +19,12 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new().route("/info", get(get_info))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
     pub net_state: NetStatus,
     pub blob_status: BlobStatus,
     pub interface_status: InterfaceStatus,
+    pub database_status: DatabaseStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -61,7 +62,14 @@ pub struct TimeoutConfig {
 pub struct InterfaceStatus {
     pub s3_status: String,
     pub rest_status: String,
-    pub db_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct DatabaseStatus {
+    pub requests_total: u64,
+    pub errors_total: u64,
+    pub conflicts_total: u64,
+    pub error_rate: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -130,10 +138,23 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
         }
         None => BlobStatus::Unavailable,
     };
+    // TODO: 
+    // - Replace hardcoded values
+    // - Add s3 interface address
     let interface_status = InterfaceStatus {
         s3_status: Status::Available.to_string(),
         rest_status: Status::Available.to_string(),
-        db_status: Status::Available.to_string(),
+    };
+    let storage_metrics = state.get_ctx().storage_handle.snapshot_metrics();
+    let database_status = DatabaseStatus {
+        requests_total: storage_metrics.requests_total,
+        errors_total: storage_metrics.errors_total,
+        conflicts_total: storage_metrics.conflicts_total,
+        error_rate: if storage_metrics.requests_total == 0 {
+            0.0
+        } else {
+            storage_metrics.errors_total as f64 / storage_metrics.requests_total as f64
+        },
     };
     (
         StatusCode::OK,
@@ -141,15 +162,17 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
             net_state,
             blob_status,
             interface_status,
+            database_status,
         }),
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BlobStatus, InfoResponse, InterfaceStatus, NetStatus, get_info};
+    use super::{BlobStatus, InfoResponse, InterfaceStatus, NetStatus, DatabaseStatus, get_info};
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::{NodeCapabilities, RealmId, Status};
     use aruna_operations::driver::DriverContext;
     use aruna_storage::storage;
@@ -195,6 +218,7 @@ mod tests {
     #[tokio::test]
     async fn get_info_returns_unavailable_optional_statuses_when_handles_are_missing() {
         let (state, _tempdir) = setup_state().await;
+        let baseline = state.get_ctx().storage_handle.snapshot_metrics();
 
         let (status, Json(response)) = get_info(State(state)).await;
 
@@ -207,8 +231,46 @@ mod tests {
                 interface_status: InterfaceStatus {
                     s3_status: Status::Available.to_string(),
                     rest_status: Status::Available.to_string(),
-                    db_status: Status::Available.to_string(),
                 },
+                database_status: DatabaseStatus {
+                    requests_total: baseline.requests_total,
+                    errors_total: baseline.errors_total,
+                    conflicts_total: baseline.conflicts_total,
+                    error_rate: if baseline.requests_total == 0 {
+                        0.0
+                    } else {
+                        baseline.errors_total as f64 / baseline.requests_total as f64
+                    },
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn get_info_reports_storage_error_metrics() {
+        let (state, _tempdir) = setup_state().await;
+        let ctx = state.get_ctx();
+        let baseline = ctx.storage_handle.snapshot_metrics();
+
+        let _ = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: "missing".to_string(),
+                key: b"key".to_vec().into(),
+                txn_id: Some(ulid::Ulid::new()),
+            })
+            .await;
+
+        let (status, Json(response)) = get_info(State(state)).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.database_status,
+            DatabaseStatus {
+                requests_total: baseline.requests_total + 1,
+                errors_total: baseline.errors_total + 1,
+                conflicts_total: baseline.conflicts_total,
+                error_rate: (baseline.errors_total + 1) as f64 / (baseline.requests_total + 1) as f64,
             }
         );
     }

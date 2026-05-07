@@ -1,11 +1,13 @@
 use crate::error::CliError;
 use crate::explorer::{explore_entries, explore_keyspaces};
+use crate::info::print_info;
 use crate::storage::{import, snapshot};
 use crate::tokens::{create_local_bootstrap_token, create_oidc_token, view_token};
 use clap::{Parser, Subcommand};
 
 mod error;
 mod explorer;
+mod info;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -48,6 +50,7 @@ pub enum Commands {
         snapshot_path: String,
         target_path: String,
     },
+    Info,
 }
 
 #[derive(Subcommand, Debug)]
@@ -102,6 +105,7 @@ pub async fn main() -> Result<(), CliError> {
             snapshot_path,
             target_path,
         } => import(snapshot_path, target_path).await?,
+        Commands::Info => print_info().await?,
     };
 
     Ok(())
