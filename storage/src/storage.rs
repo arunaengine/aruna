@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use aruna_core::effects::{Effect, StorageEffect};
@@ -63,13 +63,18 @@ struct StorageMetrics {
     requests_total: AtomicU64,
     errors_total: AtomicU64,
     conflicts_total: AtomicU64,
+    channel_closed: AtomicBool,
+    last_error: Mutex<Option<String>>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StorageMetricsSnapshot {
     pub requests_total: u64,
     pub errors_total: u64,
     pub conflicts_total: u64,
+    pub failed_total: u64,
+    pub channel_closed: bool,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,10 +100,19 @@ impl StorageHandle {
     }
 
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
+        let errors_total = self.metrics.errors_total.load(Ordering::Relaxed);
         StorageMetricsSnapshot {
             requests_total: self.metrics.requests_total.load(Ordering::Relaxed),
-            errors_total: self.metrics.errors_total.load(Ordering::Relaxed),
+            errors_total,
             conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
+            failed_total: errors_total,
+            channel_closed: self.metrics.channel_closed.load(Ordering::Relaxed),
+            last_error: self
+                .metrics
+                .last_error
+                .lock()
+                .expect("storage metrics mutex poisoned")
+                .clone(),
         }
     }
 
@@ -133,13 +147,19 @@ impl StorageHandle {
     }
 
     fn observe_storage_error(&self, error: &StorageError) {
-        match error {
-            StorageError::TransactionConflict => {
-                self.metrics.conflicts_total.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {
-                self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
-            }
+        self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+        *self
+            .metrics
+            .last_error
+            .lock()
+            .expect("storage metrics mutex poisoned") = Some(error.to_string());
+
+        if matches!(error, StorageError::TransactionConflict) {
+            self.metrics.conflicts_total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if matches!(error, StorageError::ChannelClosed) {
+            self.metrics.channel_closed.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -148,7 +168,9 @@ impl StorageHandle {
 impl Handle for StorageHandle {
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
-            Effect::Storage(storage_effect) => Event::Storage(self.dispatch_storage_effect(storage_effect).await),
+            Effect::Storage(storage_effect) => {
+                Event::Storage(self.dispatch_storage_effect(storage_effect).await)
+            }
             _ => {
                 self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
                 let error = StorageError::InvalidEffect;
@@ -632,6 +654,9 @@ mod tests {
                 requests_total: 1,
                 errors_total: 1,
                 conflicts_total: 0,
+                failed_total: 1,
+                channel_closed: false,
+                last_error: Some("Transaction not found".to_string()),
             }
         );
     }
@@ -647,7 +672,10 @@ mod tests {
             });
 
             let (effect, response_tx) = receiver.recv().expect("second effect should arrive");
-            assert!(matches!(effect, StorageEffect::StartTransaction { read: false }));
+            assert!(matches!(
+                effect,
+                StorageEffect::StartTransaction { read: false }
+            ));
             response_tx.send(StorageEvent::Error {
                 error: StorageError::TransactionConflict,
             });
@@ -665,6 +693,11 @@ mod tests {
         assert_eq!(metrics_after_not_found.requests_total, 1);
         assert_eq!(metrics_after_not_found.errors_total, 1);
         assert_eq!(metrics_after_not_found.conflicts_total, 0);
+        assert_eq!(metrics_after_not_found.failed_total, 1);
+        assert_eq!(
+            metrics_after_not_found.last_error,
+            Some("Transaction not found".to_string())
+        );
 
         let event = handle
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
@@ -679,7 +712,12 @@ mod tests {
 
         let metrics_after_conflict = handle.snapshot_metrics();
         assert_eq!(metrics_after_conflict.requests_total, 2);
-        assert_eq!(metrics_after_conflict.errors_total, 1);
+        assert_eq!(metrics_after_conflict.errors_total, 2);
         assert_eq!(metrics_after_conflict.conflicts_total, 1);
+        assert_eq!(metrics_after_conflict.failed_total, 2);
+        assert_eq!(
+            metrics_after_conflict.last_error,
+            Some("Transaction conflict".to_string())
+        );
     }
 }
