@@ -470,8 +470,8 @@ impl NetHandle {
             endpoint_addr: local_endpoint_addr(&self.inner.endpoint),
             realm_id: *self.realm_id(),
             node_id: self.node_id(),
-            boostrap_nodes: self.inner.gossip.get_bootstrap_nodes(),
-            open_connections: self.monitor.get_connections().await,
+            bootstrap_nodes: self.inner.gossip.get_bootstrap_nodes(),
+            monitor: self.monitor.get_status().await,
         }
     }
 }
@@ -519,6 +519,9 @@ impl Handle for NetHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::time::{Duration, sleep};
 
     #[tokio::test]
     async fn test_net_handle_creates() -> Result<()> {
@@ -540,6 +543,92 @@ mod tests {
         let handle = NetHandle::new(config, storage).await?;
         assert_ne!(handle.node_id().as_bytes(), &[0u8; 32]);
         handle.shutdown().await;
+        Ok(())
+    }
+
+    struct HoldingInboundHandler {
+        streams: tokio::sync::Mutex<Vec<streams::BiStream>>,
+    }
+
+    #[async_trait]
+    impl InboundEventHandler for HoldingInboundHandler {
+        async fn handle_gossip_message(&self, _topic: TopicId, _sender: NodeId, _data: Vec<u8>) {}
+
+        async fn handle_incoming_stream(
+            &self,
+            _alpn: Alpn,
+            stream: streams::BiStream,
+            _node_id: NodeId,
+        ) {
+            self.streams.lock().await.push(stream);
+        }
+    }
+
+    async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
+        let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
+        let storage = aruna_storage::FjallStorage::open(
+            temp_dir
+                .path()
+                .to_str()
+                .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
+        )
+        .map_err(|e| NetError::Io(e.to_string()))?;
+        let handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage,
+        )
+        .await?;
+        handle.set_inbound_handler(Arc::new(HoldingInboundHandler {
+            streams: tokio::sync::Mutex::new(Vec::new()),
+        }));
+
+        Ok((handle, temp_dir))
+    }
+
+    async fn wait_for_open_connections(handle: &NetHandle, expected: usize) -> NetState {
+        for _ in 0..50 {
+            let status = handle.get_status().await;
+            if status.monitor.open_connections.len() >= expected {
+                return status;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        handle.get_status().await
+    }
+
+    #[tokio::test]
+    async fn monitor_tracks_multiple_open_connections() -> Result<()> {
+        let (a, _a_dir) = test_net_handle().await?;
+        let (b, _b_dir) = test_net_handle().await?;
+        a.add_peer_addr(b.endpoint_addr()).await;
+        b.add_peer_addr(a.endpoint_addr()).await;
+
+        let _a_to_b = a.open_stream(b.node_id(), Alpn::Bao).await?;
+        let _b_to_a = b.open_stream(a.node_id(), Alpn::Bao).await?;
+
+        let status = wait_for_open_connections(&a, 2).await;
+        assert_eq!(status.monitor.open_connections.len(), 2);
+        assert!(status.monitor.observed_connections_total >= 2);
+        assert_eq!(status.monitor.dropped_observations_total, 0);
+
+        let mut connection_ids = status
+            .monitor
+            .open_connections
+            .iter()
+            .map(|connection| connection.connection_id)
+            .collect::<Vec<_>>();
+        connection_ids.sort_unstable();
+        connection_ids.dedup();
+        assert_eq!(connection_ids.len(), status.monitor.open_connections.len());
+
+        a.shutdown().await;
+        b.shutdown().await;
         Ok(())
     }
 }

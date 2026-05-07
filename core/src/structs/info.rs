@@ -5,17 +5,27 @@ use iroh::EndpointAddr;
 
 #[derive(Debug, Clone)]
 pub struct OpenConnection {
+    pub connection_id: u64,
     pub alpn: Option<Alpn>,
     pub remote_id: iroh::EndpointId,
     pub side: iroh::endpoint::Side,
 }
 
+#[derive(Debug, Clone)]
+pub struct ConnectionMonitorState {
+    pub open_connections: Vec<OpenConnection>,
+    pub observed_connections_total: u64,
+    pub dropped_observations_total: u64,
+    pub closed_connections_total: u64,
+    pub close_task_errors_total: u64,
+}
+
 pub struct NetState {
     pub realm_id: RealmId,
     pub node_id: NodeId,
-    pub boostrap_nodes: Vec<NodeId>,
+    pub bootstrap_nodes: Vec<NodeId>,
     pub endpoint_addr: EndpointAddr,
-    pub open_connections: Vec<OpenConnection>,
+    pub monitor: ConnectionMonitorState,
 }
 
 pub struct BlobState {

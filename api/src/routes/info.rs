@@ -31,7 +31,7 @@ pub enum NetStatus {
     Available {
         realm_id: String,
         node_id: String,
-        boostrap_nodes: Vec<String>,
+        bootstrap_nodes: Vec<String>,
         endpoint_addr: serde_json::Value,
         open_connections: Vec<OpenConnection>,
     },
@@ -97,6 +97,7 @@ pub struct DatabaseStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct OpenConnection {
     pub alpn: Option<String>,
+    pub connection_id: u64,
     pub remote_id: String,
     pub side: String,
 }
@@ -116,12 +117,14 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
             NetStatus::Available {
                 realm_id: info.realm_id.to_string(),
                 node_id: info.node_id.to_string(),
-                boostrap_nodes: info.boostrap_nodes.iter().map(|n| n.to_string()).collect(),
+                bootstrap_nodes: info.bootstrap_nodes.iter().map(|n| n.to_string()).collect(),
                 endpoint_addr: serde_json::to_value(&info.endpoint_addr).unwrap(),
                 open_connections: info
+                    .monitor
                     .open_connections
                     .iter()
                     .map(|c| OpenConnection {
+                        connection_id: c.connection_id,
                         alpn: c.alpn.map(|a| a.to_string()),
                         remote_id: c.remote_id.to_string(),
                         side: match c.side {
