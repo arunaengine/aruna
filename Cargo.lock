@@ -366,6 +366,7 @@ dependencies = [
  "hex",
  "iroh",
  "iroh-gossip",
+ "n0-future",
  "parking_lot",
  "postcard",
  "rand 0.10.1",

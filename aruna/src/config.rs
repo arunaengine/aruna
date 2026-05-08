@@ -9,6 +9,7 @@ use aruna_core::onboarding::{
     bootstrap_node_proof_message,
 };
 use aruna_core::structs::{BlobTimeoutConfig, NodeCapabilities, OidcProviderConfig, RealmId};
+use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_from_config_string};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
 use byteview::ByteView;
@@ -50,6 +51,8 @@ pub struct Config {
     pub net_secret_key: iroh::SecretKey,
     pub bootstrap_nodes: Vec<iroh::PublicKey>,
     pub bootstrap_endpoints: Vec<EndpointAddr>,
+    pub discovery_method: DiscoveryMethod,
+    pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
     pub s3_port: u16,
     pub s3_host: String,
@@ -146,6 +149,12 @@ pub enum SetupError {
     OnboardingModeMismatch,
     #[error("unexpected storage event while loading node state: {0}")]
     UnexpectedStorageEvent(String),
+    #[error("invalid {key} value {value:?}: {message}")]
+    InvalidConfigValue {
+        key: &'static str,
+        value: String,
+        message: String,
+    },
 }
 
 impl Config {
@@ -226,6 +235,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         })
         .transpose()?
         .unwrap_or_default();
+    let configured_bootstrap_endpoints = parse_endpoint_addr_list_env("BOOTSTRAP_ENDPOINTS")?;
+    let discovery_method = load_discovery_method_from_env()?;
+    let relay_method = load_relay_method_from_env()?;
     let default_metadata_replication_factor = dotenvy::var("METADATA_REPLICATION_FACTOR")
         .ok()
         .map(|value| value.parse::<u32>())
@@ -278,6 +290,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         PersistedNodeStatus::Complete => StartupMode::Provisioned,
     };
 
+    let bootstrap_endpoints = merge_bootstrap_endpoints(
+        node_state.bootstrap_endpoints.clone(),
+        configured_bootstrap_endpoints,
+    );
+
     Ok((
         Config {
             storage_path,
@@ -298,7 +315,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             node_id,
             net_secret_key,
             bootstrap_nodes,
-            bootstrap_endpoints: node_state.bootstrap_endpoints.clone(),
+            bootstrap_endpoints,
+            discovery_method,
+            relay_method,
             default_metadata_replication_factor,
             s3_port,
             s3_host,
@@ -310,6 +329,115 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         },
         storage_handle,
     ))
+}
+
+fn load_discovery_method_from_env() -> Result<DiscoveryMethod, SetupError> {
+    let value = optional_env("P2P_DISCOVERY_METHOD").unwrap_or_else(|| "none".to_string());
+    match normalize_env_value(&value).as_str() {
+        "none" => Ok(DiscoveryMethod::None),
+        "n0" | "n0_dns" => Ok(DiscoveryMethod::N0Dns),
+        "custom_dns" => {
+            let origins = parse_list_env("P2P_DISCOVERY_DNS_ORIGINS");
+            if origins.is_empty() {
+                return Err(invalid_config_value(
+                    "P2P_DISCOVERY_DNS_ORIGINS",
+                    "",
+                    "custom DNS discovery requires at least one DNS origin",
+                ));
+            }
+            Ok(DiscoveryMethod::CustomDns(origins))
+        }
+        _ => Err(invalid_config_value(
+            "P2P_DISCOVERY_METHOD",
+            value,
+            "expected one of none, n0, n0_dns, custom_dns",
+        )),
+    }
+}
+
+fn load_relay_method_from_env() -> Result<RelayMethod, SetupError> {
+    let value = optional_env("P2P_RELAY_METHOD").unwrap_or_else(|| "none".to_string());
+    match normalize_env_value(&value).as_str() {
+        "none" => Ok(RelayMethod::None),
+        "n0" => Ok(RelayMethod::N0),
+        "custom" => {
+            let relays = parse_list_env("P2P_RELAY_URLS");
+            if relays.is_empty() {
+                return Err(invalid_config_value(
+                    "P2P_RELAY_URLS",
+                    "",
+                    "custom relay mode requires at least one relay URL",
+                ));
+            }
+            Ok(RelayMethod::Custom(relays))
+        }
+        _ => Err(invalid_config_value(
+            "P2P_RELAY_METHOD",
+            value,
+            "expected one of none, n0, custom",
+        )),
+    }
+}
+
+fn parse_endpoint_addr_list_env(key: &'static str) -> Result<Vec<EndpointAddr>, SetupError> {
+    parse_list_env(key)
+        .into_iter()
+        .map(|value| {
+            endpoint_addr_from_config_string(&value)
+                .map_err(|error| invalid_config_value(key, value, error))
+        })
+        .collect()
+}
+
+fn parse_list_env(key: &str) -> Vec<String> {
+    dotenvy::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn optional_env(key: &str) -> Option<String> {
+    dotenvy::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn normalize_env_value(value: &str) -> String {
+    value.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn merge_bootstrap_endpoints(
+    persisted: Vec<EndpointAddr>,
+    configured: Vec<EndpointAddr>,
+) -> Vec<EndpointAddr> {
+    let mut merged = Vec::<EndpointAddr>::new();
+    for endpoint_addr in persisted.into_iter().chain(configured) {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.id == endpoint_addr.id)
+        {
+            *existing = endpoint_addr;
+        } else {
+            merged.push(endpoint_addr);
+        }
+    }
+    merged.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+    merged
+}
+
+fn invalid_config_value(
+    key: &'static str,
+    value: impl Into<String>,
+    message: impl std::fmt::Display,
+) -> SetupError {
+    SetupError::InvalidConfigValue {
+        key,
+        value: value.into(),
+        message: message.to_string(),
+    }
 }
 
 fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, SetupError> {
@@ -627,6 +755,7 @@ mod tests {
         load_oidc_providers_from_env, persist_node_state,
     };
     use aruna_core::structs::RealmId;
+    use aruna_net::{DiscoveryMethod, RelayMethod};
     use aruna_storage::FjallStorage;
     use ed25519_dalek::SigningKey;
     use std::sync::OnceLock;
@@ -735,10 +864,32 @@ mod tests {
                 "https://issuer.example/.well-known/openid-configuration".to_string(),
             ),
         ];
-        let previous: Vec<_> = vars
+        let cleanup_keys = [
+            "STORAGE_PATH",
+            "SOCKET_ADDRESS",
+            "P2P_SOCKET_ADDRESS",
+            "S3_PORT",
+            "S3_HOST",
+            "S3_ADDRESS",
+            "OIDC_PROVIDER_IDS",
+            "OIDC_MAIN_ISSUER",
+            "OIDC_MAIN_AUDIENCE",
+            "OIDC_MAIN_DISCOVERY_URL",
+            "P2P_DISCOVERY_METHOD",
+            "P2P_DISCOVERY_DNS_ORIGINS",
+            "P2P_RELAY_METHOD",
+            "P2P_RELAY_URLS",
+            "BOOTSTRAP_ENDPOINTS",
+        ];
+        let previous: Vec<_> = cleanup_keys
             .iter()
-            .map(|(key, _)| ((*key).to_string(), std::env::var(key).ok()))
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
             .collect();
+        unsafe { std::env::remove_var("P2P_DISCOVERY_METHOD") };
+        unsafe { std::env::remove_var("P2P_DISCOVERY_DNS_ORIGINS") };
+        unsafe { std::env::remove_var("P2P_RELAY_METHOD") };
+        unsafe { std::env::remove_var("P2P_RELAY_URLS") };
+        unsafe { std::env::remove_var("BOOTSTRAP_ENDPOINTS") };
         for (key, value) in &vars {
             unsafe { std::env::set_var(key, value) };
         }
@@ -747,6 +898,65 @@ mod tests {
         assert_eq!(config.oidc_providers.len(), 1);
         assert_eq!(config.oidc_providers[0].id, "main");
         assert_eq!(config.oidc_providers[0].audience, "aruna-api");
+        assert_eq!(config.discovery_method, DiscoveryMethod::None);
+        assert_eq!(config.relay_method, RelayMethod::None);
+
+        restore_env(previous);
+    }
+
+    #[tokio::test]
+    async fn load_includes_configured_p2p_discovery_relay_and_endpoints() {
+        let _guard = env_lock().lock().await;
+        let tempdir = tempdir().unwrap();
+        let peer = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let endpoint = aruna_net::endpoint_addr_to_config_string(
+            &iroh::EndpointAddr::new(peer)
+                .with_relay_url("https://relay.example.com".parse().unwrap()),
+        );
+        let vars = [
+            ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
+            ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
+            ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
+            ("S3_PORT", "1337".to_string()),
+            ("S3_HOST", "localhost".to_string()),
+            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("P2P_DISCOVERY_METHOD", "n0".to_string()),
+            ("P2P_RELAY_METHOD", "custom".to_string()),
+            ("P2P_RELAY_URLS", "https://relay.example.com".to_string()),
+            ("BOOTSTRAP_ENDPOINTS", endpoint),
+        ];
+        let cleanup_keys = [
+            "STORAGE_PATH",
+            "SOCKET_ADDRESS",
+            "P2P_SOCKET_ADDRESS",
+            "S3_PORT",
+            "S3_HOST",
+            "S3_ADDRESS",
+            "P2P_DISCOVERY_METHOD",
+            "P2P_DISCOVERY_DNS_ORIGINS",
+            "P2P_RELAY_METHOD",
+            "P2P_RELAY_URLS",
+            "BOOTSTRAP_ENDPOINTS",
+        ];
+        let previous: Vec<_> = cleanup_keys
+            .iter()
+            .map(|key| ((*key).to_string(), std::env::var(key).ok()))
+            .collect();
+
+        unsafe { std::env::remove_var("P2P_DISCOVERY_DNS_ORIGINS") };
+        for (key, value) in &vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+
+        let (config, _storage) = load().await.unwrap();
+
+        assert_eq!(config.discovery_method, DiscoveryMethod::N0Dns);
+        assert_eq!(
+            config.relay_method,
+            RelayMethod::Custom(vec!["https://relay.example.com".to_string()])
+        );
+        assert_eq!(config.bootstrap_endpoints.len(), 1);
+        assert_eq!(config.bootstrap_endpoints[0].id, peer);
 
         restore_env(previous);
     }

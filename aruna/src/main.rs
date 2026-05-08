@@ -17,7 +17,7 @@ use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
@@ -57,8 +57,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             secret_key: Some(config.net_secret_key.clone()),
             realm_id: config.realm_id,
             bootstrap_nodes: config.bootstrap_nodes.clone(),
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
+            bootstrap_endpoints: config.bootstrap_endpoints.clone(),
+            discovery_method: config.discovery_method.clone(),
+            relay_method: config.relay_method.clone(),
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
         },
@@ -99,10 +100,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
-
-    for endpoint in &config.bootstrap_endpoints {
-        net_handle.add_peer_addr(endpoint.clone()).await;
-    }
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {

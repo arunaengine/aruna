@@ -60,7 +60,12 @@ pub struct PeerConnectivityState {
 pub struct NetState {
     pub realm_id: RealmId,
     pub node_id: NodeId,
+    pub discovery_methods: Vec<String>,
+    pub discovery_dns_origins: Vec<String>,
+    pub relay_method: String,
+    pub relay_urls: Vec<String>,
     pub bootstrap_nodes: Vec<NodeId>,
+    pub bootstrap_endpoints: Vec<String>,
     pub endpoint_addr: EndpointAddr,
     pub monitor: ConnectionMonitorState,
     pub bootstrap: BootstrapDiagnosticsState,

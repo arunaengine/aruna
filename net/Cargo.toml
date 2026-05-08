@@ -23,6 +23,7 @@ hex = { workspace = true }
 rand = { workspace = true }
 byteview = { workspace = true }
 futures = { workspace = true }
+n0-future = { workspace = true }
 tracing = { workspace = true }
 smallvec = { workspace = true }
 crossfire = { workspace = true }

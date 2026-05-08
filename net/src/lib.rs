@@ -9,6 +9,7 @@ mod monitoring;
 pub mod streams;
 
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,10 +25,14 @@ use aruna_core::structs::{
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use crossfire::TrySendError;
-use iroh::address_lookup::DnsAddressLookup;
 use iroh::address_lookup::memory::MemoryLookup;
+use iroh::address_lookup::{
+    AddressLookup, AddressLookupBuilder, AddressLookupBuilderError, DnsAddressLookup, EndpointData,
+    Error as AddressLookupError, Item as AddressLookupItem,
+};
 use iroh::endpoint::{QuicTransportConfig, TransportAddrUsage, VarInt, presets};
-use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, TransportAddr};
+use n0_future::{boxed::BoxStream, stream::StreamExt};
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -46,24 +51,106 @@ pub struct NetConfig {
     pub secret_key: Option<iroh::SecretKey>,
     pub realm_id: RealmId,
     pub bootstrap_nodes: Vec<NodeId>,
+    pub bootstrap_endpoints: Vec<EndpointAddr>,
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
     pub max_concurrent_uni_streams: Option<u64>,
     pub max_concurrent_bidi_streams: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DiscoveryMethod {
     None,
     N0Dns,
     CustomDns(Vec<String>),
 }
 
-#[derive(Clone, Debug)]
+impl DiscoveryMethod {
+    pub fn enabled_methods(&self) -> Vec<String> {
+        match self {
+            Self::None => Vec::new(),
+            Self::N0Dns => vec!["n0_dns".to_string()],
+            Self::CustomDns(_) => vec!["custom_dns".to_string()],
+        }
+    }
+
+    pub fn dns_origins(&self) -> Vec<String> {
+        match self {
+            Self::CustomDns(origins) => origins.clone(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RelayMethod {
     None,
     N0,
     Custom(Vec<String>),
+}
+
+impl RelayMethod {
+    pub fn method_name(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::N0 => "n0",
+            Self::Custom(_) => "custom",
+        }
+    }
+
+    pub fn relay_urls(&self) -> Vec<String> {
+        match self {
+            Self::Custom(relays) => relays.clone(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+pub fn endpoint_addr_to_config_string(endpoint_addr: &EndpointAddr) -> String {
+    let mut parts = Vec::with_capacity(endpoint_addr.addrs.len() + 1);
+    parts.push(endpoint_addr.id.to_string());
+    parts.extend(endpoint_addr.addrs.iter().map(|addr| match addr {
+        TransportAddr::Relay(url) => format!("relay:{url}"),
+        TransportAddr::Ip(addr) => format!("ip:{addr}"),
+        _ => format!("{addr}"),
+    }));
+    parts.join(";")
+}
+
+pub fn endpoint_addr_from_config_string(value: &str) -> std::result::Result<EndpointAddr, String> {
+    let mut parts = value
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let node_id = parts
+        .next()
+        .ok_or_else(|| "missing endpoint id".to_string())?
+        .parse::<iroh::PublicKey>()
+        .map_err(|error| error.to_string())?;
+    let mut addrs = Vec::new();
+    for part in parts {
+        if let Some(value) = part.strip_prefix("relay:") {
+            addrs.push(TransportAddr::Relay(
+                value
+                    .parse::<iroh::RelayUrl>()
+                    .map_err(|error| error.to_string())?,
+            ));
+        } else if let Some(value) = part.strip_prefix("ip:") {
+            addrs.push(TransportAddr::Ip(
+                SocketAddr::from_str(value).map_err(|error| error.to_string())?,
+            ));
+        } else if part.starts_with("http://") || part.starts_with("https://") {
+            addrs.push(TransportAddr::Relay(
+                part.parse::<iroh::RelayUrl>()
+                    .map_err(|error| error.to_string())?,
+            ));
+        } else {
+            addrs.push(TransportAddr::Ip(
+                SocketAddr::from_str(part).map_err(|error| error.to_string())?,
+            ));
+        }
+    }
+    Ok(EndpointAddr::from_parts(node_id, addrs))
 }
 
 impl Default for NetConfig {
@@ -73,6 +160,7 @@ impl Default for NetConfig {
             secret_key: None,
             realm_id: RealmId::from_bytes([0u8; 32]),
             bootstrap_nodes: vec![],
+            bootstrap_endpoints: vec![],
             discovery_method: DiscoveryMethod::N0Dns,
             relay_method: RelayMethod::N0,
             max_concurrent_bidi_streams: None,
@@ -88,6 +176,7 @@ impl std::fmt::Debug for NetConfig {
             .field("has_secret_key", &self.secret_key.is_some())
             .field("realm_id", &self.realm_id)
             .field("bootstrap_nodes", &self.bootstrap_nodes.len())
+            .field("bootstrap_endpoints", &self.bootstrap_endpoints.len())
             .field("discovery_method", &self.discovery_method)
             .field("relay_method", &self.relay_method)
             .finish()
@@ -155,6 +244,9 @@ struct NetInner {
     realm_id: RealmId,
     endpoint: Endpoint,
     address_lookup: MemoryLookup,
+    discovery_method: DiscoveryMethod,
+    relay_method: RelayMethod,
+    bootstrap_endpoints: Vec<EndpointAddr>,
     dht: Arc<DhtHandle>,
     gossip: Arc<GossipService>,
     streams: Arc<StreamsService>,
@@ -174,11 +266,73 @@ impl std::fmt::Debug for NetHandle {
     }
 }
 
+#[derive(Debug)]
+struct ReplacingMemoryLookupBuilder<T> {
+    inner: T,
+    memory: MemoryLookup,
+}
+
+impl<T> ReplacingMemoryLookupBuilder<T> {
+    fn new(inner: T, memory: MemoryLookup) -> Self {
+        Self { inner, memory }
+    }
+}
+
+impl<T> AddressLookupBuilder for ReplacingMemoryLookupBuilder<T>
+where
+    T: AddressLookupBuilder,
+{
+    fn into_address_lookup(
+        self,
+        endpoint: &Endpoint,
+    ) -> std::result::Result<impl AddressLookup, AddressLookupBuilderError> {
+        Ok(ReplacingMemoryLookup {
+            inner: self.inner.into_address_lookup(endpoint)?,
+            memory: self.memory,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ReplacingMemoryLookup<T> {
+    inner: T,
+    memory: MemoryLookup,
+}
+
+impl<T> AddressLookup for ReplacingMemoryLookup<T>
+where
+    T: AddressLookup,
+{
+    fn publish(&self, data: &EndpointData) {
+        self.inner.publish(data);
+    }
+
+    fn resolve(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Option<BoxStream<std::result::Result<AddressLookupItem, AddressLookupError>>> {
+        let memory = self.memory.clone();
+        self.inner.resolve(endpoint_id).map(|stream| {
+            stream
+                .map(move |result| {
+                    if let Ok(item) = &result {
+                        memory.set_endpoint_info(item.endpoint_info().clone());
+                    }
+                    result
+                })
+                .boxed()
+        })
+    }
+}
+
 impl NetHandle {
     pub async fn new(config: NetConfig, storage: StorageHandle) -> Result<Self> {
         let secret_key = config.secret_key.unwrap_or_else(iroh::SecretKey::generate);
 
         let address_lookup = MemoryLookup::new();
+        let discovery_method = config.discovery_method.clone();
+        let relay_method = config.relay_method.clone();
+        let configured_relay_urls = relay_method.relay_urls();
 
         let mut transport_config = QuicTransportConfig::builder();
         if let Some(max_uni) = config.max_concurrent_uni_streams {
@@ -205,7 +359,7 @@ impl NetHandle {
                 Alpn::Metadata.as_bytes().to_vec(),
             ]);
 
-        match config.relay_method {
+        match &config.relay_method {
             RelayMethod::None => {
                 endpoint_builder = endpoint_builder.relay_mode(RelayMode::Disabled);
             }
@@ -219,17 +373,23 @@ impl NetHandle {
             }
         }
 
-        match config.discovery_method {
+        match &config.discovery_method {
             DiscoveryMethod::None => {
                 // No additional configuration needed for no discovery
             }
             DiscoveryMethod::N0Dns => {
-                endpoint_builder = endpoint_builder.address_lookup(DnsAddressLookup::n0_dns());
+                endpoint_builder =
+                    endpoint_builder.address_lookup(ReplacingMemoryLookupBuilder::new(
+                        DnsAddressLookup::n0_dns(),
+                        address_lookup.clone(),
+                    ));
             }
             DiscoveryMethod::CustomDns(servers) => {
                 for server in servers {
-                    let dns_lookup = DnsAddressLookup::builder(server).build();
-                    endpoint_builder = endpoint_builder.address_lookup(dns_lookup);
+                    let dns_lookup = DnsAddressLookup::builder(server.clone());
+                    endpoint_builder = endpoint_builder.address_lookup(
+                        ReplacingMemoryLookupBuilder::new(dns_lookup, address_lookup.clone()),
+                    );
                 }
             }
         }
@@ -242,10 +402,17 @@ impl NetHandle {
             .bind()
             .await
             .map_err(|e| NetError::Bootstrap(e.to_string()))?;
-        address_lookup.add_endpoint_info(local_endpoint_addr(&endpoint));
+        address_lookup.set_endpoint_info(local_endpoint_addr(&endpoint, &configured_relay_urls));
 
         let node_id = endpoint.id();
-        let bootstrap_nodes = unique_peer_nodes(config.bootstrap_nodes.clone(), node_id);
+        let bootstrap_endpoints =
+            unique_endpoint_addrs(config.bootstrap_endpoints.clone(), node_id);
+        for endpoint_addr in &bootstrap_endpoints {
+            address_lookup.set_endpoint_info(endpoint_addr.clone());
+        }
+        let mut bootstrap_nodes = config.bootstrap_nodes.clone();
+        bootstrap_nodes.extend(bootstrap_endpoints.iter().map(|endpoint| endpoint.id));
+        let bootstrap_nodes = unique_peer_nodes(bootstrap_nodes, node_id);
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
             &bootstrap_nodes,
             "bootstrap_config",
@@ -441,6 +608,9 @@ impl NetHandle {
             realm_id: config.realm_id,
             endpoint,
             address_lookup,
+            discovery_method,
+            relay_method,
+            bootstrap_endpoints,
             dht,
             gossip,
             streams,
@@ -464,7 +634,7 @@ impl NetHandle {
     }
 
     pub fn endpoint_addr(&self) -> EndpointAddr {
-        local_endpoint_addr(&self.inner.endpoint)
+        local_endpoint_addr(&self.inner.endpoint, &self.inner.relay_method.relay_urls())
     }
 
     pub async fn add_peer_addr(&self, endpoint_addr: EndpointAddr) {
@@ -474,7 +644,7 @@ impl NetHandle {
 
         self.inner
             .address_lookup
-            .add_endpoint_info(endpoint_addr.clone());
+            .set_endpoint_info(endpoint_addr.clone());
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
@@ -572,6 +742,7 @@ impl NetHandle {
 
     pub async fn get_status(&self) -> NetState {
         let bootstrap_nodes = self.inner.gossip.get_bootstrap_nodes();
+        let configured_relay_urls = self.inner.relay_method.relay_urls();
         let monitor = self.monitor.get_status().await;
         let mut bootstrap = self.inner.bootstrap_diagnostics.lock().await.clone();
         if let Ok(size) = self.inner.dht.routing_table_size().await {
@@ -596,10 +767,20 @@ impl NetHandle {
         );
 
         NetState {
-            endpoint_addr: local_endpoint_addr(&self.inner.endpoint),
+            endpoint_addr: local_endpoint_addr(&self.inner.endpoint, &configured_relay_urls),
             realm_id: *self.realm_id(),
             node_id: self.node_id(),
+            discovery_methods: self.inner.discovery_method.enabled_methods(),
+            discovery_dns_origins: self.inner.discovery_method.dns_origins(),
+            relay_method: self.inner.relay_method.method_name().to_string(),
+            relay_urls: configured_relay_urls,
             bootstrap_nodes,
+            bootstrap_endpoints: self
+                .inner
+                .bootstrap_endpoints
+                .iter()
+                .map(endpoint_addr_to_config_string)
+                .collect(),
             monitor,
             bootstrap,
             peer_connectivity,
@@ -609,18 +790,45 @@ impl NetHandle {
     }
 }
 
-fn local_endpoint_addr(endpoint: &Endpoint) -> EndpointAddr {
+fn local_endpoint_addr(endpoint: &Endpoint, configured_relay_urls: &[String]) -> EndpointAddr {
     let observed = endpoint.addr();
     let mut addr = EndpointAddr::new(endpoint.id());
 
     for relay in observed.relay_urls().cloned() {
         addr = addr.with_relay_url(relay);
     }
+    for relay in configured_relay_urls {
+        if let Ok(relay) = relay.parse::<iroh::RelayUrl>() {
+            addr = addr.with_relay_url(relay);
+        }
+    }
     for socket in endpoint.bound_sockets() {
         addr = addr.with_ip_addr(socket);
     }
 
     addr
+}
+
+fn unique_endpoint_addrs(
+    mut endpoint_addrs: Vec<EndpointAddr>,
+    local_id: NodeId,
+) -> Vec<EndpointAddr> {
+    let mut unique = Vec::<EndpointAddr>::new();
+    for endpoint_addr in endpoint_addrs.drain(..) {
+        if endpoint_addr.id == local_id {
+            continue;
+        }
+        if let Some(existing) = unique
+            .iter_mut()
+            .find(|existing| existing.id == endpoint_addr.id)
+        {
+            *existing = endpoint_addr;
+        } else {
+            unique.push(endpoint_addr);
+        }
+    }
+    unique.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+    unique
 }
 
 fn unique_peer_nodes(mut nodes: Vec<NodeId>, local_id: NodeId) -> Vec<NodeId> {
@@ -1126,9 +1334,60 @@ impl Handle for NetHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use n0_future::stream::{self, StreamExt};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::time::{Duration, sleep};
+
+    #[derive(Debug)]
+    struct StaticLookup {
+        endpoint_addr: EndpointAddr,
+    }
+
+    impl AddressLookup for StaticLookup {
+        fn resolve(
+            &self,
+            endpoint_id: EndpointId,
+        ) -> Option<BoxStream<std::result::Result<AddressLookupItem, AddressLookupError>>> {
+            (endpoint_id == self.endpoint_addr.id).then(|| {
+                stream::iter(Some(Ok(AddressLookupItem::new(
+                    self.endpoint_addr.clone().into(),
+                    "static",
+                    None,
+                ))))
+                .boxed()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn replacing_lookup_overwrites_memory_endpoint_info() -> Result<()> {
+        let memory = MemoryLookup::new();
+        let peer = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let old_addr =
+            EndpointAddr::from_parts(peer, [TransportAddr::Ip("127.0.0.1:1000".parse().unwrap())]);
+        let new_addr =
+            EndpointAddr::from_parts(peer, [TransportAddr::Ip("127.0.0.1:2000".parse().unwrap())]);
+        memory.set_endpoint_info(old_addr);
+        let lookup = ReplacingMemoryLookup {
+            inner: StaticLookup {
+                endpoint_addr: new_addr.clone(),
+            },
+            memory: memory.clone(),
+        };
+
+        let mut stream = lookup.resolve(peer).expect("static lookup resolves peer");
+        assert!(stream.next().await.expect("lookup item").is_ok());
+
+        assert_eq!(
+            memory
+                .get_endpoint_info(peer)
+                .expect("memory entry")
+                .into_endpoint_addr(),
+            new_addr
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_net_handle_creates() -> Result<()> {
@@ -1149,6 +1408,9 @@ mod tests {
 
         let handle = NetHandle::new(config, storage).await?;
         assert_ne!(handle.node_id().as_bytes(), &[0u8; 32]);
+        let status = handle.get_status().await;
+        assert!(status.discovery_methods.is_empty());
+        assert_eq!(status.relay_method, "none");
         handle.shutdown().await;
         Ok(())
     }
