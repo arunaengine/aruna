@@ -547,8 +547,9 @@ async fn spawn_joiner_node_with_mode(
             bind_addr: config.p2p_socket_addr,
             secret_key: Some(config.net_secret_key.clone()),
             realm_id: config.realm_id,
-            bootstrap_nodes: config.bootstrap_nodes.clone(),
-            bootstrap_endpoints: config.bootstrap_endpoints.clone(),
+            peer_nodes: config.peer_nodes.clone(),
+            peer_endpoints: config.peer_endpoints.clone(),
+            temporary_bootstrap_active: config.temporary_bootstrap_active,
             discovery_method: DiscoveryMethod::None,
             relay_method: RelayMethod::None,
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
@@ -572,10 +573,7 @@ async fn spawn_joiner_node_with_mode(
         joiner_context.as_ref(),
         &config.node_state,
         &config.realm_id,
-        config
-            .bootstrap_endpoints
-            .first()
-            .map(|endpoint| endpoint.id),
+        config.peer_endpoints.first().map(|endpoint| endpoint.id),
     )
     .await?;
     assert!(realm_bootstrap_exists(joiner_context.as_ref(), &config.realm_id).await?);

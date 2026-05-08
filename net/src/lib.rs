@@ -15,18 +15,21 @@ use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{Event, NetError as CoreNetError, NetEvent};
+use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
+use aruna_core::keys::realm_endpoint_key;
 use aruna_core::structs::{
     BootstrapDiagnosticsState, ConnectionMonitorState, KnownPeerAddressState, NetState,
-    PeerConnectivityState, RealmId,
+    PeerConnectivityState, RealmEndpointAnnouncement, RealmId,
+    realm_endpoint_announcement_signing_bytes,
 };
+use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use crossfire::TrySendError;
-use iroh::address_lookup::DnsAddressLookup;
 use iroh::address_lookup::memory::MemoryLookup;
+use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, TransportAddrUsage, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use parking_lot::RwLock;
@@ -46,8 +49,9 @@ pub struct NetConfig {
     pub bind_addr: SocketAddr,
     pub secret_key: Option<iroh::SecretKey>,
     pub realm_id: RealmId,
-    pub bootstrap_nodes: Vec<NodeId>,
-    pub bootstrap_endpoints: Vec<EndpointAddr>,
+    pub peer_nodes: Vec<NodeId>,
+    pub peer_endpoints: Vec<EndpointAddr>,
+    pub temporary_bootstrap_active: bool,
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
     pub max_concurrent_uni_streams: Option<u64>,
@@ -59,22 +63,77 @@ pub enum DiscoveryMethod {
     None,
     N0Dns,
     CustomDns(Vec<String>),
+    DhtSigned {
+        ttl: Duration,
+        refresh_after: Duration,
+    },
+    Ordered(Vec<DiscoveryMethod>),
 }
 
 impl DiscoveryMethod {
-    pub fn enabled_methods(&self) -> Vec<String> {
-        match self {
-            Self::None => Vec::new(),
-            Self::N0Dns => vec!["n0_dns".to_string()],
-            Self::CustomDns(_) => vec!["custom_dns".to_string()],
+    pub fn ordered(methods: Vec<Self>) -> Self {
+        let mut flattened = Vec::new();
+        for method in methods {
+            match method {
+                Self::None => {}
+                Self::Ordered(methods) => flattened.extend(methods),
+                other => flattened.push(other),
+            }
+        }
+
+        match flattened.len() {
+            0 => Self::None,
+            1 => flattened.remove(0),
+            _ => Self::Ordered(flattened),
         }
     }
 
+    pub fn enabled_methods(&self) -> Vec<String> {
+        self.leaf_methods()
+            .into_iter()
+            .filter_map(|method| match method {
+                Self::None | Self::Ordered(_) => None,
+                Self::N0Dns => Some("n0_dns".to_string()),
+                Self::CustomDns(_) => Some("custom_dns".to_string()),
+                Self::DhtSigned { .. } => Some("dht_signed".to_string()),
+            })
+            .collect()
+    }
+
     pub fn dns_origins(&self) -> Vec<String> {
-        match self {
-            Self::CustomDns(origins) => origins.clone(),
-            _ => Vec::new(),
+        let mut origins = Vec::new();
+        for method in self.leaf_methods() {
+            if let Self::CustomDns(method_origins) = method {
+                origins.extend(method_origins.clone());
+            }
         }
+        origins
+    }
+
+    fn leaf_methods(&self) -> Vec<&DiscoveryMethod> {
+        let mut methods = Vec::new();
+        self.append_leaf_methods(&mut methods);
+        methods
+    }
+
+    fn append_leaf_methods<'a>(&'a self, methods: &mut Vec<&'a DiscoveryMethod>) {
+        match self {
+            Self::Ordered(ordered) => {
+                for method in ordered {
+                    method.append_leaf_methods(methods);
+                }
+            }
+            method => methods.push(method),
+        }
+    }
+
+    fn dht_signed_config(&self) -> Option<(Duration, Duration)> {
+        self.leaf_methods()
+            .into_iter()
+            .find_map(|method| match method {
+                Self::DhtSigned { ttl, refresh_after } => Some((*ttl, *refresh_after)),
+                _ => None,
+            })
     }
 }
 
@@ -83,6 +142,7 @@ pub enum RelayMethod {
     None,
     N0,
     Custom(Vec<String>),
+    N0WithCustom(Vec<String>),
 }
 
 impl RelayMethod {
@@ -91,15 +151,46 @@ impl RelayMethod {
             Self::None => "none",
             Self::N0 => "n0",
             Self::Custom(_) => "custom",
+            Self::N0WithCustom(_) => "n0+custom",
         }
     }
 
     pub fn relay_urls(&self) -> Vec<String> {
         match self {
-            Self::Custom(relays) => relays.clone(),
+            Self::Custom(relays) | Self::N0WithCustom(relays) => relays.clone(),
             _ => Vec::new(),
         }
     }
+
+    pub fn with_additional_relays(self, additional: Vec<String>) -> Self {
+        if additional.is_empty() {
+            return self;
+        }
+
+        match self {
+            Self::None => Self::Custom(unique_relay_urls(additional)),
+            Self::N0 => Self::N0WithCustom(unique_relay_urls(additional)),
+            Self::Custom(relays) => Self::Custom(merge_relay_urls(relays, additional)),
+            Self::N0WithCustom(relays) => Self::N0WithCustom(merge_relay_urls(relays, additional)),
+        }
+    }
+}
+
+fn merge_relay_urls(mut relays: Vec<String>, additional: Vec<String>) -> Vec<String> {
+    relays.extend(additional);
+    unique_relay_urls(relays)
+}
+
+fn unique_relay_urls(relays: Vec<String>) -> Vec<String> {
+    let mut unique = Vec::new();
+    for relay in relays {
+        let relay = relay.trim();
+        if relay.is_empty() || unique.iter().any(|existing| existing == relay) {
+            continue;
+        }
+        unique.push(relay.to_string());
+    }
+    unique
 }
 
 pub fn endpoint_addr_to_config_string(endpoint_addr: &EndpointAddr) -> String {
@@ -155,8 +246,9 @@ impl Default for NetConfig {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
             secret_key: None,
             realm_id: RealmId::from_bytes([0u8; 32]),
-            bootstrap_nodes: vec![],
-            bootstrap_endpoints: vec![],
+            peer_nodes: vec![],
+            peer_endpoints: vec![],
+            temporary_bootstrap_active: false,
             discovery_method: DiscoveryMethod::N0Dns,
             relay_method: RelayMethod::N0,
             max_concurrent_bidi_streams: None,
@@ -171,8 +263,12 @@ impl std::fmt::Debug for NetConfig {
             .field("bind_addr", &self.bind_addr)
             .field("has_secret_key", &self.secret_key.is_some())
             .field("realm_id", &self.realm_id)
-            .field("bootstrap_nodes", &self.bootstrap_nodes.len())
-            .field("bootstrap_endpoints", &self.bootstrap_endpoints.len())
+            .field("peer_nodes", &self.peer_nodes.len())
+            .field("peer_endpoints", &self.peer_endpoints.len())
+            .field(
+                "temporary_bootstrap_active",
+                &self.temporary_bootstrap_active,
+            )
             .field("discovery_method", &self.discovery_method)
             .field("relay_method", &self.relay_method)
             .finish()
@@ -242,7 +338,8 @@ struct NetInner {
     address_lookup: MemoryLookup,
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
-    bootstrap_endpoints: Vec<EndpointAddr>,
+    peer_endpoints: Vec<EndpointAddr>,
+    dht_signed_authorized_nodes: Vec<NodeId>,
     dht: Arc<DhtHandle>,
     gossip: Arc<GossipService>,
     streams: Arc<StreamsService>,
@@ -308,20 +405,31 @@ impl NetHandle {
                     .map_err(|e| NetError::Bootstrap(format!("Invalid relay URL: {}", e)))?;
                 endpoint_builder = endpoint_builder.relay_mode(RelayMode::Custom(relays));
             }
+            RelayMethod::N0WithCustom(relays) => {
+                let relay_map = iroh::defaults::prod::default_relay_map();
+                let custom = RelayMap::try_from_iter(relays.iter().map(|s| s.as_ref()))
+                    .map_err(|e| NetError::Bootstrap(format!("Invalid relay URL: {}", e)))?;
+                relay_map.extend(&custom);
+                endpoint_builder = endpoint_builder.relay_mode(RelayMode::Custom(relay_map));
+            }
         }
 
-        match &config.discovery_method {
-            DiscoveryMethod::None => {
-                // No additional configuration needed for no discovery
-            }
-            DiscoveryMethod::N0Dns => {
-                endpoint_builder = endpoint_builder.address_lookup(DnsAddressLookup::n0_dns());
-            }
-            DiscoveryMethod::CustomDns(servers) => {
-                for server in servers {
-                    endpoint_builder =
-                        endpoint_builder.address_lookup(DnsAddressLookup::builder(server.clone()));
+        for method in config.discovery_method.leaf_methods() {
+            match method {
+                DiscoveryMethod::None | DiscoveryMethod::DhtSigned { .. } => {
+                    // No endpoint builder setup needed for these methods.
                 }
+                DiscoveryMethod::N0Dns => {
+                    endpoint_builder = endpoint_builder.address_lookup(PkarrPublisher::n0_dns());
+                    endpoint_builder = endpoint_builder.address_lookup(DnsAddressLookup::n0_dns());
+                }
+                DiscoveryMethod::CustomDns(servers) => {
+                    for server in servers {
+                        endpoint_builder = endpoint_builder
+                            .address_lookup(DnsAddressLookup::builder(server.clone()));
+                    }
+                }
+                DiscoveryMethod::Ordered(_) => {}
             }
         }
 
@@ -336,19 +444,22 @@ impl NetHandle {
         address_lookup.set_endpoint_info(local_endpoint_addr(&endpoint, &configured_relay_urls));
 
         let node_id = endpoint.id();
-        let bootstrap_endpoints =
-            unique_endpoint_addrs(config.bootstrap_endpoints.clone(), node_id);
-        for endpoint_addr in &bootstrap_endpoints {
+        let peer_endpoints = unique_endpoint_addrs(config.peer_endpoints.clone(), node_id);
+        for endpoint_addr in &peer_endpoints {
             address_lookup.set_endpoint_info(endpoint_addr.clone());
         }
-        let mut bootstrap_nodes = config.bootstrap_nodes.clone();
-        bootstrap_nodes.extend(bootstrap_endpoints.iter().map(|endpoint| endpoint.id));
-        let bootstrap_nodes = unique_peer_nodes(bootstrap_nodes, node_id);
+        let mut peer_nodes = config.peer_nodes.clone();
+        let dht_signed_authorized_nodes = unique_peer_nodes(peer_nodes.clone(), node_id);
+        peer_nodes.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
+        let peer_nodes = unique_peer_nodes(peer_nodes, node_id);
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
-            &bootstrap_nodes,
-            "bootstrap_config",
+            &peer_nodes,
+            "realm_config",
         )));
-        let bootstrap_diagnostics = Arc::new(Mutex::new(BootstrapDiagnosticsState::default()));
+        let bootstrap_diagnostics = Arc::new(Mutex::new(BootstrapDiagnosticsState {
+            temporary_bootstrap_active: config.temporary_bootstrap_active,
+            ..BootstrapDiagnosticsState::default()
+        }));
         let (peer_connectivity_tx, peer_connectivity_rx) = mpsc::channel(256);
         let shutdown = CancellationToken::new();
 
@@ -366,7 +477,7 @@ impl NetHandle {
                 storage.clone(),
                 dht.clone(),
                 config.realm_id,
-                bootstrap_nodes.clone(),
+                peer_nodes.clone(),
                 shutdown.child_token(),
                 gossip_msg_tx.clone(),
             )
@@ -516,6 +627,9 @@ impl NetHandle {
             dht.clone(),
             endpoint.clone(),
             address_lookup.clone(),
+            discovery_method.clone(),
+            config.realm_id,
+            dht_signed_authorized_nodes.clone(),
             peer_connectivity.clone(),
             bootstrap_diagnostics.clone(),
             peer_connectivity_rx,
@@ -523,6 +637,18 @@ impl NetHandle {
         ));
 
         let mut tasks = dht_resources.tasks;
+        if let Some((ttl, refresh_after)) = discovery_method.dht_signed_config() {
+            tasks.push(spawn_dht_signed_publisher(
+                dht.clone(),
+                endpoint.clone(),
+                config.realm_id,
+                configured_relay_urls.clone(),
+                ttl,
+                refresh_after,
+                bootstrap_diagnostics.clone(),
+                shutdown.child_token(),
+            ));
+        }
         tasks.extend(vec![
             effect_task,
             dht_task,
@@ -541,7 +667,8 @@ impl NetHandle {
             address_lookup,
             discovery_method,
             relay_method,
-            bootstrap_endpoints,
+            peer_endpoints,
+            dht_signed_authorized_nodes,
             dht,
             gossip,
             streams,
@@ -627,7 +754,56 @@ impl NetHandle {
                 }
                 Ok(stream)
             }
-            Err(err) => {
+            Err(mut err) => {
+                if node_id != self.inner.node_id {
+                    match resolve_dht_signed_endpoint(
+                        &self.inner.dht,
+                        self.inner.realm_id,
+                        &self.inner.dht_signed_authorized_nodes,
+                        node_id,
+                        self.inner.discovery_method.dht_signed_config(),
+                        &self.inner.bootstrap_diagnostics,
+                    )
+                    .await
+                    {
+                        Ok(Some(endpoint_addr)) => {
+                            install_dht_signed_endpoint(
+                                &self.inner.address_lookup,
+                                &self.inner.dht,
+                                &self.inner.gossip,
+                                endpoint_addr,
+                            );
+                            debug!(
+                                node_id = %node_id,
+                                "Retrying stream after DHT-signed endpoint resolution"
+                            );
+                            match self.inner.streams.open(node_id, alpn).await {
+                                Ok(stream) => {
+                                    send_peer_connectivity_event(
+                                        &self.inner.peer_connectivity_tx,
+                                        PeerConnectivityEvent::ConnectionSuccess {
+                                            node_id,
+                                            source: "stream_open_dht_signed".to_string(),
+                                        },
+                                    );
+                                    return Ok(stream);
+                                }
+                                Err(retry_err) => {
+                                    err = retry_err;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(resolve_err) => {
+                            debug!(
+                                node_id = %node_id,
+                                error = %resolve_err,
+                                "DHT-signed endpoint resolution failed"
+                            );
+                        }
+                    }
+                }
+
                 if node_id != self.inner.node_id {
                     send_peer_connectivity_event(
                         &self.inner.peer_connectivity_tx,
@@ -672,7 +848,7 @@ impl NetHandle {
     }
 
     pub async fn get_status(&self) -> NetState {
-        let bootstrap_nodes = self.inner.gossip.get_bootstrap_nodes();
+        let peer_nodes = self.inner.gossip.get_bootstrap_nodes();
         let configured_relay_urls = self.inner.relay_method.relay_urls();
         let monitor = self.monitor.get_status().await;
         let mut bootstrap = self.inner.bootstrap_diagnostics.lock().await.clone();
@@ -680,7 +856,7 @@ impl NetHandle {
             bootstrap.routing_table_size = Some(size);
         }
         let peer_connectivity = peer_connectivity_status(&self.inner.peer_connectivity).await;
-        let mut address_nodes = bootstrap_nodes.clone();
+        let mut address_nodes = peer_nodes.clone();
         address_nodes.extend(peer_connectivity.iter().map(|peer| peer.node_id));
         address_nodes = unique_peer_nodes(address_nodes, self.inner.node_id);
         let known_peer_addresses = known_peer_addresses(
@@ -690,7 +866,7 @@ impl NetHandle {
         )
         .await;
         let warnings = net_warnings(
-            &bootstrap_nodes,
+            &peer_nodes,
             &peer_connectivity,
             &known_peer_addresses,
             &monitor,
@@ -705,10 +881,10 @@ impl NetHandle {
             discovery_dns_origins: self.inner.discovery_method.dns_origins(),
             relay_method: self.inner.relay_method.method_name().to_string(),
             relay_urls: configured_relay_urls,
-            bootstrap_nodes,
-            bootstrap_endpoints: self
+            peer_nodes,
+            peer_endpoints: self
                 .inner
-                .bootstrap_endpoints
+                .peer_endpoints
                 .iter()
                 .map(endpoint_addr_to_config_string)
                 .collect(),
@@ -718,6 +894,295 @@ impl NetHandle {
             known_peer_addresses,
             warnings,
         }
+    }
+}
+
+fn spawn_dht_signed_publisher(
+    dht: Arc<DhtHandle>,
+    endpoint: Endpoint,
+    realm_id: RealmId,
+    configured_relay_urls: Vec<String>,
+    ttl: Duration,
+    refresh_after: Duration,
+    diagnostics: Arc<Mutex<BootstrapDiagnosticsState>>,
+    shutdown: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let (ttl, refresh_after) = normalized_dht_signed_timing(ttl, refresh_after);
+        let mut sequence = 0u64;
+
+        loop {
+            sequence = sequence.saturating_add(1);
+            {
+                let mut status = diagnostics.lock().await;
+                status.dht_signed_publish_attempts_total =
+                    status.dht_signed_publish_attempts_total.saturating_add(1);
+            }
+            match publish_realm_endpoint_announcement(
+                &dht,
+                &endpoint,
+                realm_id,
+                &configured_relay_urls,
+                ttl,
+                sequence,
+            )
+            .await
+            {
+                Ok(()) => {
+                    let mut status = diagnostics.lock().await;
+                    status.dht_signed_publish_successes_total =
+                        status.dht_signed_publish_successes_total.saturating_add(1);
+                    status.dht_signed_last_error = None;
+                    debug!(
+                        realm_id = %realm_id,
+                        node_id = %endpoint.id(),
+                        ttl_secs = ttl.as_secs(),
+                        sequence,
+                        "Published DHT-signed realm endpoint announcement"
+                    );
+                }
+                Err(err) => {
+                    let mut status = diagnostics.lock().await;
+                    status.dht_signed_publish_failures_total =
+                        status.dht_signed_publish_failures_total.saturating_add(1);
+                    status.dht_signed_last_error = Some(err.to_string());
+                    warn!(
+                        realm_id = %realm_id,
+                        node_id = %endpoint.id(),
+                        error = %err,
+                        "Failed to publish DHT-signed realm endpoint announcement"
+                    );
+                }
+            }
+
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(refresh_after) => {}
+            }
+        }
+    })
+}
+
+fn normalized_dht_signed_timing(ttl: Duration, refresh_after: Duration) -> (Duration, Duration) {
+    let ttl_secs = ttl.as_secs().max(1);
+    let mut refresh_secs = refresh_after.as_secs().max(1);
+    if refresh_secs >= ttl_secs && ttl_secs > 1 {
+        refresh_secs = (ttl_secs / 2).max(1);
+    }
+
+    (
+        Duration::from_secs(ttl_secs),
+        Duration::from_secs(refresh_secs),
+    )
+}
+
+async fn publish_realm_endpoint_announcement(
+    dht: &DhtHandle,
+    endpoint: &Endpoint,
+    realm_id: RealmId,
+    configured_relay_urls: &[String],
+    ttl: Duration,
+    sequence: u64,
+) -> Result<()> {
+    let ttl_secs = ttl.as_secs().max(1);
+    let issued_at = unix_timestamp_secs();
+    let expires_at = issued_at.saturating_add(ttl_secs);
+    let node_id = endpoint.id();
+    let endpoint_addr = local_endpoint_addr(endpoint, configured_relay_urls);
+    let signing_bytes = realm_endpoint_announcement_signing_bytes(
+        &realm_id,
+        &node_id,
+        &endpoint_addr,
+        issued_at,
+        expires_at,
+        sequence,
+    )
+    .map_err(|err| NetError::Dht(format!("encode endpoint announcement signing bytes: {err}")))?;
+    let signature = endpoint.secret_key().sign(&signing_bytes);
+    let announcement = RealmEndpointAnnouncement {
+        realm_id,
+        node_id,
+        endpoint_addr,
+        issued_at,
+        expires_at,
+        sequence,
+        signature,
+    };
+    let value = postcard::to_allocvec(&announcement)
+        .map_err(|err| NetError::Dht(format!("encode endpoint announcement: {err}")))?;
+    let key = realm_endpoint_key(&realm_id, &node_id);
+
+    dht.put(&key, realm_id, value, Duration::from_secs(ttl_secs))
+        .await
+}
+
+async fn lookup_dht_signed_endpoint(
+    dht: &DhtHandle,
+    realm_id: RealmId,
+    authorized_nodes: &[NodeId],
+    peer: NodeId,
+    config: Option<(Duration, Duration)>,
+) -> Result<Option<EndpointAddr>> {
+    if config.is_none() || !authorized_nodes.contains(&peer) {
+        return Ok(None);
+    }
+
+    let key = realm_endpoint_key(&realm_id, &peer);
+    let entries = dht.get(&key, Some(realm_id)).await?;
+    let now = unix_timestamp_secs();
+
+    Ok(select_dht_signed_endpoint(
+        entries,
+        peer,
+        realm_id,
+        authorized_nodes,
+        now,
+    ))
+}
+
+fn select_dht_signed_endpoint(
+    entries: Vec<DhtEntry>,
+    peer: NodeId,
+    realm_id: RealmId,
+    authorized_nodes: &[NodeId],
+    now: u64,
+) -> Option<EndpointAddr> {
+    let mut best = None::<RealmEndpointAnnouncement>;
+
+    for entry in entries {
+        let Ok(announcement) = postcard::from_bytes::<RealmEndpointAnnouncement>(&entry.value)
+        else {
+            continue;
+        };
+        if validate_realm_endpoint_announcement(
+            &announcement,
+            entry.node_id,
+            peer,
+            realm_id,
+            authorized_nodes,
+            now,
+        )
+        .is_err()
+        {
+            continue;
+        }
+
+        let replace = best.as_ref().is_none_or(|current| {
+            announcement.sequence > current.sequence
+                || (announcement.sequence == current.sequence
+                    && announcement.expires_at > current.expires_at)
+        });
+        if replace {
+            best = Some(announcement);
+        }
+    }
+
+    best.map(|announcement| announcement.endpoint_addr)
+}
+
+async fn resolve_dht_signed_endpoint(
+    dht: &DhtHandle,
+    realm_id: RealmId,
+    authorized_nodes: &[NodeId],
+    peer: NodeId,
+    config: Option<(Duration, Duration)>,
+    diagnostics: &Arc<Mutex<BootstrapDiagnosticsState>>,
+) -> Result<Option<EndpointAddr>> {
+    if !dht_signed_lookup_enabled(config, authorized_nodes, peer) {
+        return Ok(None);
+    }
+
+    {
+        let mut status = diagnostics.lock().await;
+        status.dht_signed_resolve_attempts_total =
+            status.dht_signed_resolve_attempts_total.saturating_add(1);
+    }
+
+    let result = lookup_dht_signed_endpoint(dht, realm_id, authorized_nodes, peer, config).await;
+    match &result {
+        Ok(Some(_)) => {
+            let mut status = diagnostics.lock().await;
+            status.dht_signed_resolve_successes_total =
+                status.dht_signed_resolve_successes_total.saturating_add(1);
+            status.dht_signed_last_error = None;
+        }
+        Ok(None) => {}
+        Err(err) => {
+            let mut status = diagnostics.lock().await;
+            status.dht_signed_resolve_failures_total =
+                status.dht_signed_resolve_failures_total.saturating_add(1);
+            status.dht_signed_last_error = Some(err.to_string());
+        }
+    }
+
+    result
+}
+
+fn dht_signed_lookup_enabled(
+    config: Option<(Duration, Duration)>,
+    authorized_nodes: &[NodeId],
+    peer: NodeId,
+) -> bool {
+    config.is_some() && authorized_nodes.contains(&peer)
+}
+
+fn validate_realm_endpoint_announcement(
+    announcement: &RealmEndpointAnnouncement,
+    entry_publisher: NodeId,
+    requested_peer: NodeId,
+    realm_id: RealmId,
+    authorized_nodes: &[NodeId],
+    now: u64,
+) -> std::result::Result<(), String> {
+    if !authorized_nodes.contains(&requested_peer) {
+        return Err("node is not authorized for realm discovery".to_string());
+    }
+    if announcement.realm_id != realm_id {
+        return Err("announcement realm does not match lookup realm".to_string());
+    }
+    if announcement.node_id != requested_peer {
+        return Err("announcement node does not match requested peer".to_string());
+    }
+    if entry_publisher != requested_peer {
+        return Err("DHT entry publisher does not match announcement node".to_string());
+    }
+    if announcement.endpoint_addr.id != requested_peer {
+        return Err("announcement endpoint id does not match requested peer".to_string());
+    }
+    if announcement.issued_at > announcement.expires_at || announcement.expires_at <= now {
+        return Err("announcement is expired or has invalid timestamps".to_string());
+    }
+
+    let signing_bytes = realm_endpoint_announcement_signing_bytes(
+        &announcement.realm_id,
+        &announcement.node_id,
+        &announcement.endpoint_addr,
+        announcement.issued_at,
+        announcement.expires_at,
+        announcement.sequence,
+    )
+    .map_err(|err| err.to_string())?;
+    announcement
+        .node_id
+        .verify(&signing_bytes, &announcement.signature)
+        .map_err(|err| err.to_string())
+}
+
+fn install_dht_signed_endpoint(
+    address_lookup: &MemoryLookup,
+    dht: &DhtHandle,
+    gossip: &GossipService,
+    endpoint_addr: EndpointAddr,
+) {
+    let node_id = endpoint_addr.id;
+    address_lookup.set_endpoint_info(endpoint_addr);
+    gossip.add_bootstrap_node(node_id);
+    if let Err(err) = dht.add_peer(node_id) {
+        debug!(
+            node_id = %node_id,
+            error = %err,
+            "Failed to add DHT-signed endpoint peer"
+        );
     }
 }
 
@@ -950,6 +1415,9 @@ async fn run_peer_connectivity_manager(
     dht: Arc<DhtHandle>,
     endpoint: Endpoint,
     address_lookup: MemoryLookup,
+    discovery_method: DiscoveryMethod,
+    realm_id: RealmId,
+    dht_signed_authorized_nodes: Vec<NodeId>,
     state: Arc<Mutex<PeerConnectivityManagerState>>,
     diagnostics: Arc<Mutex<BootstrapDiagnosticsState>>,
     mut event_rx: mpsc::Receiver<PeerConnectivityEvent>,
@@ -970,6 +1438,9 @@ async fn run_peer_connectivity_manager(
                     &dht,
                     &endpoint,
                     &address_lookup,
+                    &discovery_method,
+                    realm_id,
+                    &dht_signed_authorized_nodes,
                     &state,
                     &diagnostics,
                     peer,
@@ -1035,6 +1506,9 @@ async fn run_peer_connectivity_attempt(
     dht: &DhtHandle,
     endpoint: &Endpoint,
     address_lookup: &MemoryLookup,
+    discovery_method: &DiscoveryMethod,
+    realm_id: RealmId,
+    dht_signed_authorized_nodes: &[NodeId],
     state: &Arc<Mutex<PeerConnectivityManagerState>>,
     diagnostics: &Arc<Mutex<BootstrapDiagnosticsState>>,
     peer: NodeId,
@@ -1045,7 +1519,39 @@ async fn run_peer_connectivity_attempt(
         status.attempts_total = status.attempts_total.saturating_add(1);
     }
 
-    let result = dht.bootstrap_nodes(&[peer]).await;
+    let mut result = dht.bootstrap_nodes(&[peer]).await;
+    if result.is_err() {
+        match resolve_dht_signed_endpoint(
+            dht,
+            realm_id,
+            dht_signed_authorized_nodes,
+            peer,
+            discovery_method.dht_signed_config(),
+            diagnostics,
+        )
+        .await
+        {
+            Ok(Some(endpoint_addr)) => {
+                address_lookup.set_endpoint_info(endpoint_addr.clone());
+                if let Err(err) = dht.add_peer(endpoint_addr.id) {
+                    debug!(
+                        node_id = %endpoint_addr.id,
+                        error = %err,
+                        "Failed to add DHT-signed endpoint peer before retry"
+                    );
+                }
+                result = dht.bootstrap_nodes(&[peer]).await;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                debug!(
+                    peer = %peer,
+                    error = %err,
+                    "DHT-signed endpoint resolution failed during connectivity check"
+                );
+            }
+        }
+    }
     let routing_table_size = dht.routing_table_size().await.ok();
     match result {
         Ok(()) => {
@@ -1171,7 +1677,7 @@ fn transport_addr_to_string(addr: &TransportAddr) -> String {
 }
 
 fn net_warnings(
-    bootstrap_nodes: &[NodeId],
+    peer_nodes: &[NodeId],
     peer_connectivity: &[PeerConnectivityState],
     known_peer_addresses: &[KnownPeerAddressState],
     monitor: &ConnectionMonitorState,
@@ -1193,17 +1699,17 @@ fn net_warnings(
             .push("no open p2p connections after one or more managed peer failures".to_string());
     }
 
-    if bootstrap.routing_table_size == Some(0) && !bootstrap_nodes.is_empty() {
-        warnings.push("DHT routing table is empty despite configured bootstrap peers".to_string());
+    if bootstrap.routing_table_size == Some(0) && !peer_nodes.is_empty() {
+        warnings.push("DHT routing table is empty despite configured realm peers".to_string());
     }
 
-    for node_id in bootstrap_nodes {
+    for node_id in peer_nodes {
         let has_known_address = known_peer_addresses
             .iter()
             .any(|state| state.node_id == *node_id && !state.addresses.is_empty());
         if !has_known_address {
             warnings.push(format!(
-                "bootstrap peer {node_id} has no known addresses; add BOOTSTRAP_ENDPOINTS or enable discovery"
+                "realm peer {node_id} has no known addresses; add peer endpoints or enable realm discovery"
             ));
         }
     }
@@ -1225,7 +1731,7 @@ fn net_warnings(
             .any(|state| state.node_id == peer.node_id && !state.addresses.is_empty());
         if !has_known_address {
             warnings.push(format!(
-                "managed peer {} has no known addresses; add BOOTSTRAP_ENDPOINTS or enable discovery",
+                "managed peer {} has no known addresses; add peer endpoints or enable realm discovery",
                 peer.node_id
             ));
         }
@@ -1269,6 +1775,195 @@ mod tests {
     use tempfile::TempDir;
     use tokio::time::{Duration, sleep};
 
+    fn make_secret(seed: u8) -> iroh::SecretKey {
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&seed_bytes)
+    }
+
+    fn make_announcement(
+        secret: &iroh::SecretKey,
+        realm_id: RealmId,
+        endpoint_addr: EndpointAddr,
+        issued_at: u64,
+        expires_at: u64,
+        sequence: u64,
+    ) -> RealmEndpointAnnouncement {
+        let node_id = secret.public();
+        let signing_bytes = realm_endpoint_announcement_signing_bytes(
+            &realm_id,
+            &node_id,
+            &endpoint_addr,
+            issued_at,
+            expires_at,
+            sequence,
+        )
+        .expect("signing bytes should encode");
+        let signature = secret.sign(&signing_bytes);
+
+        RealmEndpointAnnouncement {
+            realm_id,
+            node_id,
+            endpoint_addr,
+            issued_at,
+            expires_at,
+            sequence,
+            signature,
+        }
+    }
+
+    #[test]
+    fn ordered_discovery() {
+        let method = DiscoveryMethod::ordered(vec![
+            DiscoveryMethod::N0Dns,
+            DiscoveryMethod::DhtSigned {
+                ttl: Duration::from_secs(300),
+                refresh_after: Duration::from_secs(60),
+            },
+        ]);
+
+        assert_eq!(
+            method.enabled_methods(),
+            vec!["n0_dns".to_string(), "dht_signed".to_string()]
+        );
+        assert_eq!(
+            method.dht_signed_config(),
+            Some((Duration::from_secs(300), Duration::from_secs(60)))
+        );
+    }
+
+    #[test]
+    fn relay_additions() {
+        let relays = vec![
+            "https://relay-a.example".to_string(),
+            "https://relay-a.example".to_string(),
+            "https://relay-b.example".to_string(),
+        ];
+
+        let relay_method = RelayMethod::N0.with_additional_relays(relays);
+
+        assert_eq!(relay_method.method_name(), "n0+custom");
+        assert_eq!(
+            relay_method.relay_urls(),
+            vec![
+                "https://relay-a.example".to_string(),
+                "https://relay-b.example".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn signed_announcement() {
+        let secret = make_secret(51);
+        let node_id = secret.public();
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let endpoint_addr = EndpointAddr::new(node_id)
+            .with_ip_addr("127.0.0.1:12345".parse().expect("valid socket addr"));
+        let now = 1_000;
+        let announcement = make_announcement(&secret, realm_id, endpoint_addr, now, now + 300, 1);
+
+        assert!(
+            validate_realm_endpoint_announcement(
+                &announcement,
+                node_id,
+                node_id,
+                realm_id,
+                &[node_id],
+                now,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_realm_endpoint_announcement(
+                &announcement,
+                node_id,
+                node_id,
+                realm_id,
+                &[],
+                now,
+            )
+            .is_err()
+        );
+
+        let forged_secret = make_secret(52);
+        let signing_bytes = realm_endpoint_announcement_signing_bytes(
+            &announcement.realm_id,
+            &announcement.node_id,
+            &announcement.endpoint_addr,
+            announcement.issued_at,
+            announcement.expires_at,
+            announcement.sequence,
+        )
+        .expect("signing bytes should encode");
+        let mut forged = announcement.clone();
+        forged.signature = forged_secret.sign(&signing_bytes);
+
+        assert!(
+            validate_realm_endpoint_announcement(
+                &forged,
+                node_id,
+                node_id,
+                realm_id,
+                &[node_id],
+                now,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn latest_announcement() {
+        let secret = make_secret(53);
+        let node_id = secret.public();
+        let realm_id = RealmId::from_bytes([10u8; 32]);
+        let older = EndpointAddr::new(node_id)
+            .with_ip_addr("127.0.0.1:10001".parse().expect("valid socket addr"));
+        let newer = EndpointAddr::new(node_id)
+            .with_ip_addr("127.0.0.1:10002".parse().expect("valid socket addr"));
+        let now = 1_000;
+        let older = make_announcement(&secret, realm_id, older, now, now + 300, 1);
+        let newer = make_announcement(&secret, realm_id, newer, now, now + 300, 2);
+        let entries = vec![
+            DhtEntry {
+                node_id,
+                realm_id,
+                value: postcard::to_allocvec(&older).expect("encode announcement"),
+                expires_at: now + 300,
+            },
+            DhtEntry {
+                node_id,
+                realm_id,
+                value: postcard::to_allocvec(&newer).expect("encode announcement"),
+                expires_at: now + 300,
+            },
+        ];
+
+        let endpoint = select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], now)
+            .expect("valid announcement");
+
+        assert_eq!(endpoint.addrs, newer.endpoint_addr.addrs);
+    }
+
+    #[test]
+    fn expired_announcement() {
+        let secret = make_secret(54);
+        let node_id = secret.public();
+        let realm_id = RealmId::from_bytes([11u8; 32]);
+        let endpoint_addr = EndpointAddr::new(node_id)
+            .with_ip_addr("127.0.0.1:10003".parse().expect("valid socket addr"));
+        let announcement = make_announcement(&secret, realm_id, endpoint_addr, 500, 900, 1);
+        let entries = vec![DhtEntry {
+            node_id,
+            realm_id,
+            value: postcard::to_allocvec(&announcement).expect("encode announcement"),
+            expires_at: 900,
+        }];
+
+        assert!(
+            select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], 1_000).is_none()
+        );
+    }
+
     #[tokio::test]
     async fn test_net_handle_creates() -> Result<()> {
         let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
@@ -1291,6 +1986,35 @@ mod tests {
         let status = handle.get_status().await;
         assert!(status.discovery_methods.is_empty());
         assert_eq!(status.relay_method, "none");
+        handle.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn temporary_bootstrap() -> Result<()> {
+        let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
+        let storage = aruna_storage::FjallStorage::open(
+            temp_dir
+                .path()
+                .to_str()
+                .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
+        )
+        .map_err(|e| NetError::Io(e.to_string()))?;
+
+        let handle = NetHandle::new(
+            NetConfig {
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                temporary_bootstrap_active: true,
+                ..NetConfig::default()
+            },
+            storage,
+        )
+        .await?;
+
+        let status = handle.get_status().await;
+        assert!(status.bootstrap.temporary_bootstrap_active);
+
         handle.shutdown().await;
         Ok(())
     }
@@ -1410,14 +2134,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reports_known_bootstrap_peer_addresses() -> Result<()> {
+    async fn peer_addresses() -> Result<()> {
         let (a, _a_dir) = test_net_handle().await?;
         let (b, _b_dir) = test_net_handle().await?;
 
         a.add_peer_addr(b.endpoint_addr()).await;
 
         let status = a.get_status().await;
-        assert!(status.bootstrap_nodes.contains(&b.node_id()));
+        assert!(status.peer_nodes.contains(&b.node_id()));
         assert!(status.known_peer_addresses.iter().any(|peer| {
             peer.node_id == b.node_id()
                 && peer.source == "memory_lookup"
@@ -1434,7 +2158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reports_bootstrap_failure_warnings() -> Result<()> {
+    async fn peer_warnings() -> Result<()> {
         let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
         let storage = aruna_storage::FjallStorage::open(
             temp_dir
@@ -1447,7 +2171,7 @@ mod tests {
         let handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
-                bootstrap_nodes: vec![missing_peer],
+                peer_nodes: vec![missing_peer],
                 discovery_method: DiscoveryMethod::None,
                 relay_method: RelayMethod::None,
                 ..NetConfig::default()

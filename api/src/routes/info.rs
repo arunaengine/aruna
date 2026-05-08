@@ -79,8 +79,8 @@ pub struct NetStatus {
     pub discovery_dns_origins: Vec<String>,
     pub relay_method: Option<String>,
     pub relay_urls: Vec<String>,
-    pub bootstrap_nodes: Vec<String>,
-    pub bootstrap_endpoints: Vec<String>,
+    pub peer_nodes: Vec<String>,
+    pub peer_endpoints: Vec<String>,
     pub endpoint_addr: Option<serde_json::Value>,
     pub monitor: ConnectionMonitorStatus,
     pub bootstrap: BootstrapDiagnosticsStatus,
@@ -108,6 +108,14 @@ pub struct BootstrapDiagnosticsStatus {
     pub last_error: Option<String>,
     pub last_successful: bool,
     pub routing_table_size: Option<usize>,
+    pub temporary_bootstrap_active: bool,
+    pub dht_signed_publish_attempts_total: u64,
+    pub dht_signed_publish_successes_total: u64,
+    pub dht_signed_publish_failures_total: u64,
+    pub dht_signed_resolve_attempts_total: u64,
+    pub dht_signed_resolve_successes_total: u64,
+    pub dht_signed_resolve_failures_total: u64,
+    pub dht_signed_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -214,8 +222,8 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
                 discovery_dns_origins: info.discovery_dns_origins,
                 relay_method: Some(info.relay_method),
                 relay_urls: info.relay_urls,
-                bootstrap_nodes: info.bootstrap_nodes.iter().map(|n| n.to_string()).collect(),
-                bootstrap_endpoints: info.bootstrap_endpoints,
+                peer_nodes: info.peer_nodes.iter().map(|n| n.to_string()).collect(),
+                peer_endpoints: info.peer_endpoints,
                 endpoint_addr: serde_json::to_value(&info.endpoint_addr).ok(),
                 monitor: ConnectionMonitorStatus {
                     open_connections: info
@@ -248,6 +256,26 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
                     last_error: info.bootstrap.last_error,
                     last_successful: info.bootstrap.last_successful,
                     routing_table_size: info.bootstrap.routing_table_size,
+                    temporary_bootstrap_active: info.bootstrap.temporary_bootstrap_active,
+                    dht_signed_publish_attempts_total: info
+                        .bootstrap
+                        .dht_signed_publish_attempts_total,
+                    dht_signed_publish_successes_total: info
+                        .bootstrap
+                        .dht_signed_publish_successes_total,
+                    dht_signed_publish_failures_total: info
+                        .bootstrap
+                        .dht_signed_publish_failures_total,
+                    dht_signed_resolve_attempts_total: info
+                        .bootstrap
+                        .dht_signed_resolve_attempts_total,
+                    dht_signed_resolve_successes_total: info
+                        .bootstrap
+                        .dht_signed_resolve_successes_total,
+                    dht_signed_resolve_failures_total: info
+                        .bootstrap
+                        .dht_signed_resolve_failures_total,
+                    dht_signed_last_error: info.bootstrap.dht_signed_last_error,
                 },
                 peer_connectivity: info
                     .peer_connectivity
@@ -292,8 +320,8 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
             discovery_dns_origins: Vec::new(),
             relay_method: None,
             relay_urls: Vec::new(),
-            bootstrap_nodes: Vec::new(),
-            bootstrap_endpoints: Vec::new(),
+            peer_nodes: Vec::new(),
+            peer_endpoints: Vec::new(),
             endpoint_addr: None,
             monitor: ConnectionMonitorStatus::default(),
             bootstrap: BootstrapDiagnosticsStatus::default(),
@@ -479,8 +507,8 @@ mod tests {
                     discovery_dns_origins: Vec::new(),
                     relay_method: None,
                     relay_urls: Vec::new(),
-                    bootstrap_nodes: Vec::new(),
-                    bootstrap_endpoints: Vec::new(),
+                    peer_nodes: Vec::new(),
+                    peer_endpoints: Vec::new(),
                     endpoint_addr: None,
                     monitor: ConnectionMonitorStatus::default(),
                     bootstrap: BootstrapDiagnosticsStatus::default(),

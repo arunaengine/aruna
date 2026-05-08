@@ -30,6 +30,14 @@ pub struct BootstrapDiagnosticsState {
     pub last_error: Option<String>,
     pub last_successful: bool,
     pub routing_table_size: Option<usize>,
+    pub temporary_bootstrap_active: bool,
+    pub dht_signed_publish_attempts_total: u64,
+    pub dht_signed_publish_successes_total: u64,
+    pub dht_signed_publish_failures_total: u64,
+    pub dht_signed_resolve_attempts_total: u64,
+    pub dht_signed_resolve_successes_total: u64,
+    pub dht_signed_resolve_failures_total: u64,
+    pub dht_signed_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,8 +72,8 @@ pub struct NetState {
     pub discovery_dns_origins: Vec<String>,
     pub relay_method: String,
     pub relay_urls: Vec<String>,
-    pub bootstrap_nodes: Vec<NodeId>,
-    pub bootstrap_endpoints: Vec<String>,
+    pub peer_nodes: Vec<NodeId>,
+    pub peer_endpoints: Vec<String>,
     pub endpoint_addr: EndpointAddr,
     pub monitor: ConnectionMonitorState,
     pub bootstrap: BootstrapDiagnosticsState,

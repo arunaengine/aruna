@@ -187,6 +187,77 @@ async fn test_multi_node_dht_put_get() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[tokio::test]
+async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let temp_c = tempdir()?;
+    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
+    let storage_c = FjallStorage::open(temp_c.path().to_str().ok_or("invalid temp path")?)?;
+
+    let secret_a = iroh::SecretKey::from_bytes(&[61u8; 32]);
+    let secret_b = iroh::SecretKey::from_bytes(&[62u8; 32]);
+    let secret_c = iroh::SecretKey::from_bytes(&[63u8; 32]);
+    let node_a = secret_a.public();
+    let node_b = secret_b.public();
+    let node_c = secret_c.public();
+    let realm_id = RealmId::from_bytes([31u8; 32]);
+    let discovery_method = DiscoveryMethod::ordered(vec![DiscoveryMethod::DhtSigned {
+        ttl: Duration::from_secs(30),
+        refresh_after: Duration::from_secs(1),
+    }]);
+
+    let cfg = |secret_key: iroh::SecretKey, peer_nodes: Vec<NodeId>| NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        secret_key: Some(secret_key),
+        realm_id,
+        peer_nodes,
+        discovery_method: discovery_method.clone(),
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(secret_a, vec![node_b, node_c]), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(secret_b, vec![node_a, node_c]), storage_b).await?;
+    let handle_c = NetHandle::new(cfg(secret_c, vec![node_a, node_b]), storage_c).await?;
+
+    let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
+    handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
+        gossip_tx: None,
+        stream_tx: Some(stream_tx),
+    }));
+
+    handle_a.add_peer_addr(handle_c.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_c.endpoint_addr()).await;
+    handle_c.add_peer_addr(handle_b.endpoint_addr()).await;
+
+    let mut opened = false;
+    for _ in 0..20 {
+        if handle_a.open_stream(node_b, Alpn::Bao).await.is_ok() {
+            opened = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    let status = handle_a.get_status().await;
+    assert!(opened, "expected DHT-signed fallback to resolve node_b");
+    assert!(status.discovery_methods.contains(&"dht_signed".to_string()));
+    assert!(status.bootstrap.dht_signed_publish_attempts_total > 0);
+    assert!(status.bootstrap.dht_signed_resolve_attempts_total > 0);
+    assert!(status.bootstrap.dht_signed_resolve_successes_total > 0);
+    assert!(status.known_peer_addresses.iter().any(|peer| {
+        peer.node_id == node_b && peer.source == "memory_lookup" && !peer.addresses.is_empty()
+    }));
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+    handle_c.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;

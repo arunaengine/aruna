@@ -28,12 +28,7 @@ struct ConfigView {
     p2p_socket_addr: String,
     max_concurrent_uni_streams: Option<u64>,
     max_concurrent_bidi_streams: Option<u64>,
-    p2p_discovery_methods: Vec<String>,
-    p2p_discovery_dns_origins: Vec<String>,
-    p2p_relay_method: String,
-    p2p_relay_urls: Vec<String>,
-    bootstrap_nodes: Vec<String>,
-    bootstrap_endpoints: Vec<String>,
+    p2p_additional_relay_urls: Vec<String>,
     default_metadata_replication_factor: u32,
     s3_port: u16,
     s3_host: String,
@@ -162,12 +157,7 @@ impl ConfigView {
                 .unwrap_or_else(|_| http_socket_addr.to_string()),
             max_concurrent_uni_streams: parse_optional_env("MAX_CONCURRENT_UNI_STREAMS")?,
             max_concurrent_bidi_streams: parse_optional_env("MAX_CONCURRENT_BIDI_STREAMS")?,
-            p2p_discovery_methods: discovery_methods_from_env()?,
-            p2p_discovery_dns_origins: parse_list_env("P2P_DISCOVERY_DNS_ORIGINS"),
-            p2p_relay_method: relay_method_from_env()?,
-            p2p_relay_urls: parse_list_env("P2P_RELAY_URLS"),
-            bootstrap_nodes: parse_list_env("BOOTSTRAP_NODES"),
-            bootstrap_endpoints: parse_list_env("BOOTSTRAP_ENDPOINTS"),
+            p2p_additional_relay_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
             default_metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
                 .unwrap_or(3),
             s3_port: parse_optional_env("S3_PORT")?.unwrap_or_default(),
@@ -214,56 +204,6 @@ fn parse_list_env(key: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect()
-}
-
-fn discovery_methods_from_env() -> Result<Vec<String>, CliError> {
-    let value = optional_env("P2P_DISCOVERY_METHOD").unwrap_or_else(|| "none".to_string());
-    match normalize_env_value(&value).as_str() {
-        "none" => Ok(Vec::new()),
-        "n0" | "n0_dns" => Ok(vec!["n0_dns".to_string()]),
-        "custom_dns" => Ok(vec!["custom_dns".to_string()]),
-        _ => Err(invalid_config_value(
-            "P2P_DISCOVERY_METHOD",
-            value,
-            "expected one of none, n0, n0_dns, custom_dns",
-        )),
-    }
-}
-
-fn relay_method_from_env() -> Result<String, CliError> {
-    let value = optional_env("P2P_RELAY_METHOD").unwrap_or_else(|| "none".to_string());
-    match normalize_env_value(&value).as_str() {
-        "none" => Ok("none".to_string()),
-        "n0" => Ok("n0".to_string()),
-        "custom" => Ok("custom".to_string()),
-        _ => Err(invalid_config_value(
-            "P2P_RELAY_METHOD",
-            value,
-            "expected one of none, n0, custom",
-        )),
-    }
-}
-
-fn optional_env(key: &str) -> Option<String> {
-    dotenvy::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
-fn normalize_env_value(value: &str) -> String {
-    value.trim().to_ascii_lowercase().replace('-', "_")
-}
-
-fn invalid_config_value(
-    key: &'static str,
-    value: impl Into<String>,
-    message: impl std::fmt::Display,
-) -> CliError {
-    CliError::InvalidConfigValue {
-        key,
-        value: value.into(),
-        message: message.to_string(),
-    }
 }
 
 fn env_key(id: &str) -> String {
@@ -361,7 +301,7 @@ mod tests {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 secret_key: Some(config.net_secret_key.clone()),
                 realm_id: config.realm_id,
-                bootstrap_nodes: Vec::new(),
+                peer_nodes: Vec::new(),
                 discovery_method: DiscoveryMethod::None,
                 relay_method: RelayMethod::None,
                 ..Default::default()
@@ -433,19 +373,19 @@ mod tests {
     }
 
     #[test]
-    fn http_base_url_rewrites_unspecified_ipv4() {
+    fn ipv4_base_url() {
         let addr: std::net::SocketAddr = "0.0.0.0:3000".parse().unwrap();
         assert_eq!(http_base_url(addr), "http://127.0.0.1:3000");
     }
 
     #[test]
-    fn http_base_url_rewrites_unspecified_ipv6() {
+    fn ipv6_base_url() {
         let addr: std::net::SocketAddr = "[::]:3000".parse().unwrap();
         assert_eq!(http_base_url(addr), "http://[::1]:3000");
     }
 
     #[tokio::test]
-    async fn config_view_marks_onboarding_secret_presence_without_exposing_secret() {
+    async fn onboarding_secret() {
         let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[
             ("STORAGE_PATH", "/tmp/storage".to_string()),
@@ -455,32 +395,29 @@ mod tests {
 
         assert_eq!(view.http_base_url, "http://127.0.0.1:3000");
         assert!(view.onboarding_secret_present);
-        assert!(view.p2p_discovery_methods.is_empty());
-        assert_eq!(view.p2p_relay_method, "none");
     }
 
     #[tokio::test]
-    async fn config_view_reports_p2p_discovery_and_relay_config() {
+    async fn doctor_relays() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[
-            ("P2P_DISCOVERY_METHOD", "n0".to_string()),
-            ("P2P_RELAY_METHOD", "custom".to_string()),
-            ("P2P_RELAY_URLS", "https://relay.example.com".to_string()),
-            ("BOOTSTRAP_ENDPOINTS", "node.example.invalid".to_string()),
-        ]);
+        let _guard = TestEnvGuard::set(&[(
+            "P2P_ADDITIONAL_RELAY_URLS",
+            "https://relay-a.example,https://relay-b.example".to_string(),
+        )]);
+
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
 
-        assert_eq!(view.p2p_discovery_methods, vec!["n0_dns"]);
-        assert_eq!(view.p2p_relay_method, "custom");
         assert_eq!(
-            view.p2p_relay_urls,
-            vec!["https://relay.example.com".to_string()]
+            view.p2p_additional_relay_urls,
+            vec![
+                "https://relay-a.example".to_string(),
+                "https://relay-b.example".to_string(),
+            ]
         );
-        assert_eq!(view.bootstrap_endpoints, vec!["node.example.invalid"]);
     }
 
     #[tokio::test]
-    async fn fetch_info_reads_live_info_endpoint() {
+    async fn live_info() {
         let _guard = env_lock().lock().await;
         let node = spawn_test_node().await;
 

@@ -2,13 +2,16 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, OnboardingMode, OnboardingPhase,
     OnboardingSecret, OnboardingSecretError, bootstrap_issuer_proof_message,
     bootstrap_node_proof_message,
 };
-use aruna_core::structs::{BlobTimeoutConfig, NodeCapabilities, OidcProviderConfig, RealmId};
+use aruna_core::structs::{
+    BlobTimeoutConfig, DynamicDiscoveryMethod, NodeCapabilities, OidcProviderConfig,
+    RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
+};
 use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_from_config_string};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
@@ -49,8 +52,9 @@ pub struct Config {
     pub realm_id: RealmId,
     pub node_id: iroh::PublicKey,
     pub net_secret_key: iroh::SecretKey,
-    pub bootstrap_nodes: Vec<iroh::PublicKey>,
-    pub bootstrap_endpoints: Vec<EndpointAddr>,
+    pub peer_nodes: Vec<iroh::PublicKey>,
+    pub peer_endpoints: Vec<EndpointAddr>,
+    pub temporary_bootstrap_active: bool,
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
@@ -101,7 +105,6 @@ pub struct PersistedNodeState {
     pub status: PersistedNodeStatus,
     pub realm_id: RealmId,
     pub net_secret_key: [u8; 32],
-    pub bootstrap_endpoints: Vec<EndpointAddr>,
     pub onboarding_phase: Option<OnboardingPhase>,
     pub onboarding_sync_ticket: Option<String>,
     pub identity: PersistedNodeIdentity,
@@ -223,21 +226,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
     )?;
-    let bootstrap_nodes = dotenvy::var("BOOTSTRAP_NODES")
-        .ok()
-        .map(|nodes| {
-            nodes
-                .split(',')
-                .map(str::trim)
-                .filter(|node| !node.is_empty())
-                .map(iroh::PublicKey::from_str)
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let configured_bootstrap_endpoints = parse_endpoint_addr_list_env("BOOTSTRAP_ENDPOINTS")?;
-    let discovery_method = load_discovery_method_from_env()?;
-    let relay_method = load_relay_method_from_env()?;
+    let additional_relay_urls = parse_list_env("P2P_ADDITIONAL_RELAY_URLS");
     let default_metadata_replication_factor = dotenvy::var("METADATA_REPLICATION_FACTOR")
         .ok()
         .map(|value| value.parse::<u32>())
@@ -257,12 +246,15 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let oidc_providers = load_oidc_providers_from_env()?;
 
     let storage_handle = FjallStorage::open(&storage_path)?;
+    let mut temporary_bootstrap_endpoint = None;
     let node_state = match load_persisted_node_state(&storage_handle).await? {
         Some(state) => state,
         None => {
             let state = match onboarding_secret.as_deref() {
                 Some(onboarding_secret) => {
-                    bootstrap_onboarded_node_state(onboarding_secret).await?
+                    let bootstrapped = bootstrap_onboarded_node_state(onboarding_secret).await?;
+                    temporary_bootstrap_endpoint = Some(bootstrapped.temporary_bootstrap_endpoint);
+                    bootstrapped.node_state
                 }
                 None => generate_initialized_node_state()?,
             };
@@ -278,6 +270,20 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         return Err(SetupError::PersistedNodeStateMismatch);
     }
 
+    let mut node_state = node_state;
+    if matches!(node_state.status, PersistedNodeStatus::PendingOnboarding) {
+        let onboarding_secret = onboarding_secret.as_deref().ok_or_else(|| {
+            SetupError::OnboardingBootstrapFailed(
+                "pending onboarding requires ONBOARDING_SECRET to refresh bootstrap material"
+                    .to_string(),
+            )
+        })?;
+        let response = refresh_onboarding_bootstrap(onboarding_secret, &node_state).await?;
+        temporary_bootstrap_endpoint = Some(response.temporary_bootstrap_endpoint);
+        node_state.onboarding_sync_ticket = Some(response.onboarding_sync_ticket);
+        persist_node_state(&storage_handle, &node_state).await?;
+    }
+
     let startup_mode = match node_state.status {
         PersistedNodeStatus::PendingInitialization => StartupMode::InitializeRealm {
             realm_description: realm_description.clone(),
@@ -290,10 +296,14 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         PersistedNodeStatus::Complete => StartupMode::Provisioned,
     };
 
-    let bootstrap_endpoints = merge_bootstrap_endpoints(
-        node_state.bootstrap_endpoints.clone(),
-        configured_bootstrap_endpoints,
-    );
+    let realm_config = load_realm_config_document(&storage_handle, &realm_id).await?;
+    let (peer_nodes, mut peer_endpoints, discovery_method, relay_method) =
+        realm_network_config(realm_config.as_ref(), node_id)?;
+    let relay_method = relay_method.with_additional_relays(additional_relay_urls);
+    let temporary_bootstrap_active = temporary_bootstrap_endpoint.is_some();
+    if let Some(endpoint) = temporary_bootstrap_endpoint {
+        peer_endpoints.push(endpoint);
+    }
 
     Ok((
         Config {
@@ -314,8 +324,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             realm_id,
             node_id,
             net_secret_key,
-            bootstrap_nodes,
-            bootstrap_endpoints,
+            peer_nodes,
+            peer_endpoints,
+            temporary_bootstrap_active,
             discovery_method,
             relay_method,
             default_metadata_replication_factor,
@@ -331,101 +342,8 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     ))
 }
 
-fn load_discovery_method_from_env() -> Result<DiscoveryMethod, SetupError> {
-    let value = optional_env("P2P_DISCOVERY_METHOD").unwrap_or_else(|| "none".to_string());
-    match normalize_env_value(&value).as_str() {
-        "none" => Ok(DiscoveryMethod::None),
-        "n0" | "n0_dns" => Ok(DiscoveryMethod::N0Dns),
-        "custom_dns" => {
-            let origins = parse_list_env("P2P_DISCOVERY_DNS_ORIGINS");
-            if origins.is_empty() {
-                return Err(invalid_config_value(
-                    "P2P_DISCOVERY_DNS_ORIGINS",
-                    "",
-                    "custom DNS discovery requires at least one DNS origin",
-                ));
-            }
-            Ok(DiscoveryMethod::CustomDns(origins))
-        }
-        _ => Err(invalid_config_value(
-            "P2P_DISCOVERY_METHOD",
-            value,
-            "expected one of none, n0, n0_dns, custom_dns",
-        )),
-    }
-}
-
-fn load_relay_method_from_env() -> Result<RelayMethod, SetupError> {
-    let value = optional_env("P2P_RELAY_METHOD").unwrap_or_else(|| "none".to_string());
-    match normalize_env_value(&value).as_str() {
-        "none" => Ok(RelayMethod::None),
-        "n0" => Ok(RelayMethod::N0),
-        "custom" => {
-            let relays = parse_list_env("P2P_RELAY_URLS");
-            if relays.is_empty() {
-                return Err(invalid_config_value(
-                    "P2P_RELAY_URLS",
-                    "",
-                    "custom relay mode requires at least one relay URL",
-                ));
-            }
-            Ok(RelayMethod::Custom(relays))
-        }
-        _ => Err(invalid_config_value(
-            "P2P_RELAY_METHOD",
-            value,
-            "expected one of none, n0, custom",
-        )),
-    }
-}
-
-fn parse_endpoint_addr_list_env(key: &'static str) -> Result<Vec<EndpointAddr>, SetupError> {
-    parse_list_env(key)
-        .into_iter()
-        .map(|value| {
-            endpoint_addr_from_config_string(&value)
-                .map_err(|error| invalid_config_value(key, value, error))
-        })
-        .collect()
-}
-
-fn parse_list_env(key: &str) -> Vec<String> {
-    dotenvy::var(key)
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn optional_env(key: &str) -> Option<String> {
-    dotenvy::var(key)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-}
-
 fn normalize_env_value(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace('-', "_")
-}
-
-fn merge_bootstrap_endpoints(
-    persisted: Vec<EndpointAddr>,
-    configured: Vec<EndpointAddr>,
-) -> Vec<EndpointAddr> {
-    let mut merged = Vec::<EndpointAddr>::new();
-    for endpoint_addr in persisted.into_iter().chain(configured) {
-        if let Some(existing) = merged
-            .iter_mut()
-            .find(|existing| existing.id == endpoint_addr.id)
-        {
-            *existing = endpoint_addr;
-        } else {
-            merged.push(endpoint_addr);
-        }
-    }
-    merged.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
-    merged
 }
 
 fn invalid_config_value(
@@ -438,6 +356,16 @@ fn invalid_config_value(
         value: value.into(),
         message: message.to_string(),
     }
+}
+
+fn parse_list_env(key: &str) -> Vec<String> {
+    dotenvy::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, SetupError> {
@@ -542,7 +470,6 @@ fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
         status: PersistedNodeStatus::PendingInitialization,
         realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
         net_secret_key: node_signing_key.to_bytes(),
-        bootstrap_endpoints: Vec::new(),
         onboarding_phase: None,
         onboarding_sync_ticket: None,
         identity: PersistedNodeIdentity::Management {
@@ -553,9 +480,14 @@ fn generate_initialized_node_state() -> Result<PersistedNodeState, SetupError> {
     })
 }
 
+struct BootstrappedNodeState {
+    node_state: PersistedNodeState,
+    temporary_bootstrap_endpoint: EndpointAddr,
+}
+
 async fn bootstrap_onboarded_node_state(
     onboarding_secret: &str,
-) -> Result<PersistedNodeState, SetupError> {
+) -> Result<BootstrappedNodeState, SetupError> {
     let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
     let mut csprng = jsonwebtoken::signature::rand_core::OsRng;
     let node_signing_key = SigningKey::generate(&mut csprng);
@@ -628,13 +560,8 @@ async fn bootstrap_onboarded_node_state(
     if response.mode != decoded_secret.mode {
         return Err(SetupError::OnboardingModeMismatch);
     }
-    if response.bootstrap_endpoints.is_empty() {
-        return Err(SetupError::OnboardingBootstrapFailed(
-            "bootstrap endpoint list was empty".to_string(),
-        ));
-    }
-
     let realm_id = response.realm_id()?;
+    let temporary_bootstrap_endpoint = response.temporary_bootstrap_endpoint.clone();
     let identity =
         match response.mode {
             OnboardingMode::Management => {
@@ -694,16 +621,225 @@ async fn bootstrap_onboarded_node_state(
             OnboardingMode::Local => PersistedNodeIdentity::Local,
         };
 
-    Ok(PersistedNodeState {
-        boot_origin: BootOrigin::Onboarded,
-        status: PersistedNodeStatus::PendingOnboarding,
-        realm_id,
-        net_secret_key,
-        bootstrap_endpoints: response.bootstrap_endpoints,
-        onboarding_phase: Some(OnboardingPhase::Bootstrapped),
-        onboarding_sync_ticket: Some(response.onboarding_sync_ticket),
-        identity,
+    Ok(BootstrappedNodeState {
+        temporary_bootstrap_endpoint,
+        node_state: PersistedNodeState {
+            boot_origin: BootOrigin::Onboarded,
+            status: PersistedNodeStatus::PendingOnboarding,
+            realm_id,
+            net_secret_key,
+            onboarding_phase: Some(OnboardingPhase::Bootstrapped),
+            onboarding_sync_ticket: Some(response.onboarding_sync_ticket),
+            identity,
+        },
     })
+}
+
+async fn refresh_onboarding_bootstrap(
+    onboarding_secret: &str,
+    node_state: &PersistedNodeState,
+) -> Result<BootstrapOnboardingResponse, SetupError> {
+    let decoded_secret = OnboardingSecret::decode(onboarding_secret)?;
+    let node_signing_key = SigningKey::from_bytes(&node_state.net_secret_key);
+    let node_id = iroh::SecretKey::from_bytes(&node_state.net_secret_key).public();
+
+    let mut transport_secret_key = None;
+    let transport_public_key = if matches!(decoded_secret.mode, OnboardingMode::Management) {
+        let secret_key = TransportSecretKey::generate(&mut CryptoOsRng);
+        let public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(secret_key.public_key().as_bytes());
+        transport_secret_key = Some(secret_key);
+        Some(public_key)
+    } else {
+        None
+    };
+
+    let issuer_signing_key = match (&decoded_secret.mode, &node_state.identity) {
+        (
+            OnboardingMode::Server,
+            PersistedNodeIdentity::Server {
+                issuer_private_key_pem,
+                ..
+            },
+        ) => Some(SigningKey::from_pkcs8_pem(issuer_private_key_pem)?),
+        (OnboardingMode::Server, _) => {
+            return Err(SetupError::MissingOnboardingMaterial(
+                OnboardingMode::Server,
+            ));
+        }
+        _ => None,
+    };
+    let issuer_public_key = issuer_signing_key.as_ref().map(|issuer_signing_key| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(issuer_signing_key.verifying_key().to_bytes())
+    });
+    let node_id_string = node_id.to_string();
+    let node_proof = node_signing_key
+        .sign(&bootstrap_node_proof_message(
+            onboarding_secret,
+            &node_id_string,
+            transport_public_key.as_deref(),
+        ))
+        .to_string();
+    let issuer_proof = issuer_signing_key
+        .as_ref()
+        .zip(issuer_public_key.as_ref())
+        .map(|(issuer_signing_key, issuer_public_key)| {
+            issuer_signing_key
+                .sign(&bootstrap_issuer_proof_message(
+                    onboarding_secret,
+                    &node_id_string,
+                    issuer_public_key,
+                ))
+                .to_string()
+        });
+
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}/api/v1/onboarding/bootstrap",
+            decoded_secret.seed_url.trim_end_matches('/'),
+        ))
+        .json(&BootstrapOnboardingRequest {
+            onboarding_secret: onboarding_secret.to_string(),
+            node_id: node_id_string,
+            node_proof,
+            transport_public_key,
+            issuer_public_key,
+            issuer_proof,
+        })
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        return Err(SetupError::OnboardingBootstrapFailed(format!(
+            "bootstrap endpoint returned {}",
+            response.status()
+        )));
+    }
+
+    let response: BootstrapOnboardingResponse = response.json().await?;
+    if response.mode != decoded_secret.mode {
+        return Err(SetupError::OnboardingModeMismatch);
+    }
+
+    drop(transport_secret_key);
+    Ok(response)
+}
+
+async fn load_realm_config_document(
+    storage: &StorageHandle,
+    realm_id: &RealmId,
+) -> Result<Option<RealmConfigDocument>, SetupError> {
+    match storage
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: ByteView::from(*realm_id.as_bytes()),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => Ok(Some(
+            RealmConfigDocument::from_bytes(&bytes).map_err(ConversionError::from)?,
+        )),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(SetupError::UnexpectedStorageEvent(format!("{other:?}"))),
+    }
+}
+
+fn realm_network_config(
+    realm_config: Option<&RealmConfigDocument>,
+    local_node_id: iroh::PublicKey,
+) -> Result<
+    (
+        Vec<iroh::PublicKey>,
+        Vec<EndpointAddr>,
+        DiscoveryMethod,
+        RelayMethod,
+    ),
+    SetupError,
+> {
+    let Some(realm_config) = realm_config else {
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            DiscoveryMethod::N0Dns,
+            RelayMethod::N0,
+        ));
+    };
+
+    let nodes = realm_config
+        .nodes
+        .iter()
+        .map(|node| iroh::PublicKey::from_str(&node.node_id))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|node_id| *node_id != local_node_id)
+        .collect::<Vec<_>>();
+
+    match &realm_config.discovery {
+        RealmDiscoveryConfig::Static { endpoints } => {
+            let mut endpoint_addrs = Vec::new();
+            for endpoint in endpoints {
+                let endpoint_addr = endpoint_addr_from_config_string(&endpoint.endpoint_addr)
+                    .map_err(|message| {
+                        invalid_config_value(
+                            "realm_static_endpoint",
+                            &endpoint.endpoint_addr,
+                            message,
+                        )
+                    })?;
+                if endpoint_addr.id != local_node_id {
+                    endpoint_addrs.push(endpoint_addr);
+                }
+            }
+            Ok((
+                nodes,
+                endpoint_addrs,
+                DiscoveryMethod::None,
+                RelayMethod::None,
+            ))
+        }
+        RealmDiscoveryConfig::Dynamic { methods } => {
+            let discovery_methods = methods
+                .iter()
+                .map(|method| match method {
+                    DynamicDiscoveryMethod::IrohDns { origins, .. } => {
+                        if origins
+                            .iter()
+                            .all(|origin| normalize_env_value(origin) == "n0")
+                        {
+                            DiscoveryMethod::N0Dns
+                        } else {
+                            DiscoveryMethod::CustomDns(origins.clone())
+                        }
+                    }
+                    DynamicDiscoveryMethod::DhtSigned {
+                        ttl_secs,
+                        refresh_after_secs,
+                    } => DiscoveryMethod::DhtSigned {
+                        ttl: std::time::Duration::from_secs(*ttl_secs),
+                        refresh_after: std::time::Duration::from_secs(*refresh_after_secs),
+                    },
+                })
+                .collect();
+            let discovery_method = DiscoveryMethod::ordered(discovery_methods);
+            let relay_method = methods
+                .iter()
+                .find_map(|method| match method {
+                    DynamicDiscoveryMethod::IrohDns { relay_policy, .. } => match relay_policy {
+                        RelayPolicy::Disabled => Some(RelayMethod::None),
+                        RelayPolicy::Default => Some(RelayMethod::N0),
+                        RelayPolicy::Custom { relays } => Some(RelayMethod::Custom(relays.clone())),
+                    },
+                    DynamicDiscoveryMethod::DhtSigned { .. } => None,
+                })
+                .unwrap_or(RelayMethod::None);
+            Ok((nodes, Vec::new(), discovery_method, relay_method))
+        }
+    }
 }
 
 async fn load_persisted_node_state(
@@ -754,7 +890,7 @@ mod tests {
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus, load,
         load_oidc_providers_from_env, persist_node_state,
     };
-    use aruna_core::structs::RealmId;
+    use aruna_core::structs::{RealmConfigDocument, RealmId};
     use aruna_net::{DiscoveryMethod, RelayMethod};
     use aruna_storage::FjallStorage;
     use ed25519_dalek::SigningKey;
@@ -875,21 +1011,11 @@ mod tests {
             "OIDC_MAIN_ISSUER",
             "OIDC_MAIN_AUDIENCE",
             "OIDC_MAIN_DISCOVERY_URL",
-            "P2P_DISCOVERY_METHOD",
-            "P2P_DISCOVERY_DNS_ORIGINS",
-            "P2P_RELAY_METHOD",
-            "P2P_RELAY_URLS",
-            "BOOTSTRAP_ENDPOINTS",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()
             .map(|key| ((*key).to_string(), std::env::var(key).ok()))
             .collect();
-        unsafe { std::env::remove_var("P2P_DISCOVERY_METHOD") };
-        unsafe { std::env::remove_var("P2P_DISCOVERY_DNS_ORIGINS") };
-        unsafe { std::env::remove_var("P2P_RELAY_METHOD") };
-        unsafe { std::env::remove_var("P2P_RELAY_URLS") };
-        unsafe { std::env::remove_var("BOOTSTRAP_ENDPOINTS") };
         for (key, value) in &vars {
             unsafe { std::env::set_var(key, value) };
         }
@@ -898,21 +1024,31 @@ mod tests {
         assert_eq!(config.oidc_providers.len(), 1);
         assert_eq!(config.oidc_providers[0].id, "main");
         assert_eq!(config.oidc_providers[0].audience, "aruna-api");
-        assert_eq!(config.discovery_method, DiscoveryMethod::None);
-        assert_eq!(config.relay_method, RelayMethod::None);
+        assert_eq!(config.discovery_method, DiscoveryMethod::N0Dns);
+        assert_eq!(config.relay_method, RelayMethod::N0);
 
         restore_env(previous);
     }
 
+    #[test]
+    fn realm_discovery() {
+        let realm_id = RealmId::from_bytes([41u8; 32]);
+        let local_node_id = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
+        let realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        let (_, _, discovery_method, relay_method) =
+            super::realm_network_config(Some(&realm_config), local_node_id).unwrap();
+
+        assert_eq!(
+            discovery_method.enabled_methods(),
+            vec!["n0_dns".to_string(), "dht_signed".to_string()]
+        );
+        assert_eq!(relay_method, RelayMethod::N0);
+    }
+
     #[tokio::test]
-    async fn load_includes_configured_p2p_discovery_relay_and_endpoints() {
+    async fn extra_relays() {
         let _guard = env_lock().lock().await;
         let tempdir = tempdir().unwrap();
-        let peer = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let endpoint = aruna_net::endpoint_addr_to_config_string(
-            &iroh::EndpointAddr::new(peer)
-                .with_relay_url("https://relay.example.com".parse().unwrap()),
-        );
         let vars = [
             ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
@@ -920,10 +1056,10 @@ mod tests {
             ("S3_PORT", "1337".to_string()),
             ("S3_HOST", "localhost".to_string()),
             ("S3_ADDRESS", "127.0.0.1".to_string()),
-            ("P2P_DISCOVERY_METHOD", "n0".to_string()),
-            ("P2P_RELAY_METHOD", "custom".to_string()),
-            ("P2P_RELAY_URLS", "https://relay.example.com".to_string()),
-            ("BOOTSTRAP_ENDPOINTS", endpoint),
+            (
+                "P2P_ADDITIONAL_RELAY_URLS",
+                "https://relay-a.example, https://relay-b.example".to_string(),
+            ),
         ];
         let cleanup_keys = [
             "STORAGE_PATH",
@@ -932,31 +1068,25 @@ mod tests {
             "S3_PORT",
             "S3_HOST",
             "S3_ADDRESS",
-            "P2P_DISCOVERY_METHOD",
-            "P2P_DISCOVERY_DNS_ORIGINS",
-            "P2P_RELAY_METHOD",
-            "P2P_RELAY_URLS",
-            "BOOTSTRAP_ENDPOINTS",
+            "P2P_ADDITIONAL_RELAY_URLS",
         ];
         let previous: Vec<_> = cleanup_keys
             .iter()
             .map(|key| ((*key).to_string(), std::env::var(key).ok()))
             .collect();
-
-        unsafe { std::env::remove_var("P2P_DISCOVERY_DNS_ORIGINS") };
         for (key, value) in &vars {
             unsafe { std::env::set_var(key, value) };
         }
 
         let (config, _storage) = load().await.unwrap();
 
-        assert_eq!(config.discovery_method, DiscoveryMethod::N0Dns);
         assert_eq!(
             config.relay_method,
-            RelayMethod::Custom(vec!["https://relay.example.com".to_string()])
+            RelayMethod::N0WithCustom(vec![
+                "https://relay-a.example".to_string(),
+                "https://relay-b.example".to_string(),
+            ])
         );
-        assert_eq!(config.bootstrap_endpoints.len(), 1);
-        assert_eq!(config.bootstrap_endpoints[0].id, peer);
 
         restore_env(previous);
     }
@@ -975,7 +1105,6 @@ mod tests {
             status: PersistedNodeStatus::Complete,
             realm_id: RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes()),
             net_secret_key: net_signing_key.to_bytes(),
-            bootstrap_endpoints: Vec::new(),
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::Local,
