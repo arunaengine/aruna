@@ -14,10 +14,47 @@ pub struct OpenConnection {
 #[derive(Debug, Clone)]
 pub struct ConnectionMonitorState {
     pub open_connections: Vec<OpenConnection>,
+    pub outbound_connection_attempts_total: u64,
     pub observed_connections_total: u64,
     pub dropped_observations_total: u64,
     pub closed_connections_total: u64,
     pub close_task_errors_total: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BootstrapDiagnosticsState {
+    pub attempts_total: u64,
+    pub successes_total: u64,
+    pub failures_total: u64,
+    pub last_attempted_peer_count: usize,
+    pub last_error: Option<String>,
+    pub last_successful: bool,
+    pub routing_table_size: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct KnownPeerAddressState {
+    pub node_id: NodeId,
+    pub source: String,
+    pub endpoint_addr: Option<EndpointAddr>,
+    pub addresses: Vec<String>,
+    pub has_direct_ip: bool,
+    pub has_relay: bool,
+    pub active_addresses: usize,
+    pub inactive_addresses: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerConnectivityState {
+    pub node_id: NodeId,
+    pub source: String,
+    pub attempts_total: u64,
+    pub successes_total: u64,
+    pub failures_total: u64,
+    pub consecutive_failures: u64,
+    pub last_error: Option<String>,
+    pub last_successful: bool,
+    pub next_retry_in_secs: Option<u64>,
 }
 
 pub struct NetState {
@@ -26,6 +63,10 @@ pub struct NetState {
     pub bootstrap_nodes: Vec<NodeId>,
     pub endpoint_addr: EndpointAddr,
     pub monitor: ConnectionMonitorState,
+    pub bootstrap: BootstrapDiagnosticsState,
+    pub peer_connectivity: Vec<PeerConnectivityState>,
+    pub known_peer_addresses: Vec<KnownPeerAddressState>,
+    pub warnings: Vec<String>,
 }
 
 pub struct BlobState {

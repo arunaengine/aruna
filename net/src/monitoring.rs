@@ -2,7 +2,9 @@ use aruna_core::{
     alpn::Alpn,
     structs::{ConnectionMonitorState, OpenConnection},
 };
-use iroh::endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks, Side};
+use iroh::endpoint::{
+    AfterHandshakeOutcome, BeforeConnectOutcome, ConnectionInfo, EndpointHooks, Side,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -29,6 +31,7 @@ pub struct Monitor {
 
 #[derive(Debug, Default)]
 struct MonitorStats {
+    outbound_connection_attempts_total: AtomicU64,
     observed_connections_total: AtomicU64,
     dropped_observations_total: AtomicU64,
     closed_connections_total: AtomicU64,
@@ -44,6 +47,23 @@ struct ObservedConnection {
 }
 
 impl EndpointHooks for Monitor {
+    async fn before_connect(
+        &self,
+        remote_addr: &iroh::EndpointAddr,
+        alpn: &[u8],
+    ) -> BeforeConnectOutcome {
+        self.stats
+            .outbound_connection_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        trace!(
+            node_id = %remote_addr.id,
+            ?alpn,
+            addrs = ?remote_addr.addrs,
+            "outbound connection attempt"
+        );
+        BeforeConnectOutcome::Accept
+    }
+
     async fn after_handshake(&self, conn: &ConnectionInfo) -> AfterHandshakeOutcome {
         let info = ObservedConnection {
             alpn: conn.alpn().to_vec(),
@@ -128,6 +148,10 @@ impl Monitor {
     pub async fn get_status(&self) -> ConnectionMonitorState {
         ConnectionMonitorState {
             open_connections: self.connections.lock().await.clone(),
+            outbound_connection_attempts_total: self
+                .stats
+                .outbound_connection_attempts_total
+                .load(Ordering::Relaxed),
             observed_connections_total: self
                 .stats
                 .observed_connections_total

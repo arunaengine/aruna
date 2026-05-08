@@ -16,7 +16,7 @@ use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetError as CoreNetError, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
-use aruna_core::structs::{NetState, RealmId};
+use aruna_core::structs::{BootstrapDiagnosticsState, NetState, RealmId};
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use crossfire::TrySendError;
@@ -472,6 +472,10 @@ impl NetHandle {
             node_id: self.node_id(),
             bootstrap_nodes: self.inner.gossip.get_bootstrap_nodes(),
             monitor: self.monitor.get_status().await,
+            bootstrap: BootstrapDiagnosticsState::default(),
+            peer_connectivity: Vec::new(),
+            known_peer_addresses: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 }

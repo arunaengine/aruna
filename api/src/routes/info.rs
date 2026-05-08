@@ -78,15 +78,56 @@ pub struct NetStatus {
     pub bootstrap_nodes: Vec<String>,
     pub endpoint_addr: Option<serde_json::Value>,
     pub monitor: ConnectionMonitorStatus,
+    pub bootstrap: BootstrapDiagnosticsStatus,
+    pub peer_connectivity: Vec<PeerConnectivityStatus>,
+    pub known_peer_addresses: Vec<KnownPeerAddressStatus>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ConnectionMonitorStatus {
     pub open_connections: Vec<OpenConnection>,
+    pub outbound_connection_attempts_total: u64,
     pub observed_connections_total: u64,
     pub dropped_observations_total: u64,
     pub closed_connections_total: u64,
     pub close_task_errors_total: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BootstrapDiagnosticsStatus {
+    pub attempts_total: u64,
+    pub successes_total: u64,
+    pub failures_total: u64,
+    pub last_attempted_peer_count: usize,
+    pub last_error: Option<String>,
+    pub last_successful: bool,
+    pub routing_table_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct KnownPeerAddressStatus {
+    pub node_id: String,
+    pub source: String,
+    pub endpoint_addr: Option<serde_json::Value>,
+    pub addresses: Vec<String>,
+    pub has_direct_ip: bool,
+    pub has_relay: bool,
+    pub active_addresses: usize,
+    pub inactive_addresses: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PeerConnectivityStatus {
+    pub node_id: String,
+    pub source: String,
+    pub attempts_total: u64,
+    pub successes_total: u64,
+    pub failures_total: u64,
+    pub consecutive_failures: u64,
+    pub last_error: Option<String>,
+    pub last_successful: bool,
+    pub next_retry_in_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -181,11 +222,56 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
                             },
                         })
                         .collect(),
+                    outbound_connection_attempts_total: info
+                        .monitor
+                        .outbound_connection_attempts_total,
                     observed_connections_total: info.monitor.observed_connections_total,
                     dropped_observations_total: info.monitor.dropped_observations_total,
                     closed_connections_total: info.monitor.closed_connections_total,
                     close_task_errors_total: info.monitor.close_task_errors_total,
                 },
+                bootstrap: BootstrapDiagnosticsStatus {
+                    attempts_total: info.bootstrap.attempts_total,
+                    successes_total: info.bootstrap.successes_total,
+                    failures_total: info.bootstrap.failures_total,
+                    last_attempted_peer_count: info.bootstrap.last_attempted_peer_count,
+                    last_error: info.bootstrap.last_error,
+                    last_successful: info.bootstrap.last_successful,
+                    routing_table_size: info.bootstrap.routing_table_size,
+                },
+                peer_connectivity: info
+                    .peer_connectivity
+                    .iter()
+                    .map(|peer| PeerConnectivityStatus {
+                        node_id: peer.node_id.to_string(),
+                        source: peer.source.clone(),
+                        attempts_total: peer.attempts_total,
+                        successes_total: peer.successes_total,
+                        failures_total: peer.failures_total,
+                        consecutive_failures: peer.consecutive_failures,
+                        last_error: peer.last_error.clone(),
+                        last_successful: peer.last_successful,
+                        next_retry_in_secs: peer.next_retry_in_secs,
+                    })
+                    .collect(),
+                known_peer_addresses: info
+                    .known_peer_addresses
+                    .iter()
+                    .map(|peer| KnownPeerAddressStatus {
+                        node_id: peer.node_id.to_string(),
+                        source: peer.source.clone(),
+                        endpoint_addr: peer
+                            .endpoint_addr
+                            .as_ref()
+                            .and_then(|addr| serde_json::to_value(addr).ok()),
+                        addresses: peer.addresses.clone(),
+                        has_direct_ip: peer.has_direct_ip,
+                        has_relay: peer.has_relay,
+                        active_addresses: peer.active_addresses,
+                        inactive_addresses: peer.inactive_addresses,
+                    })
+                    .collect(),
+                warnings: info.warnings,
             }
         }
         None => NetStatus {
@@ -195,6 +281,10 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
             bootstrap_nodes: Vec::new(),
             endpoint_addr: None,
             monitor: ConnectionMonitorStatus::default(),
+            bootstrap: BootstrapDiagnosticsStatus::default(),
+            peer_connectivity: Vec::new(),
+            known_peer_addresses: Vec::new(),
+            warnings: Vec::new(),
         },
     };
     let blob_status = match &state.get_ctx().blob_handle {
@@ -300,9 +390,9 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobStatus, ConnectionMonitorStatus, DatabaseStatus, InfoResponse, InterfaceStatus,
-        LocalNodeInfo, NetStatus, NodeCapabilityKind, RestInterfaceStatus, S3InterfaceStatus,
-        ServiceStatus, get_info,
+        BlobStatus, BootstrapDiagnosticsStatus, ConnectionMonitorStatus, DatabaseStatus,
+        InfoResponse, InterfaceStatus, LocalNodeInfo, NetStatus, NodeCapabilityKind,
+        PeerConnectivityStatus, RestInterfaceStatus, S3InterfaceStatus, ServiceStatus, get_info,
     };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
@@ -373,6 +463,10 @@ mod tests {
                     bootstrap_nodes: Vec::new(),
                     endpoint_addr: None,
                     monitor: ConnectionMonitorStatus::default(),
+                    bootstrap: BootstrapDiagnosticsStatus::default(),
+                    peer_connectivity: Vec::<PeerConnectivityStatus>::new(),
+                    known_peer_addresses: Vec::new(),
+                    warnings: Vec::new(),
                 },
                 blob_status: BlobStatus {
                     status: ServiceStatus::NotConfigured,
