@@ -73,4 +73,10 @@ pub enum CliError {
     MissingInitialOnboardingSecret,
     #[error("Arbitrary user ids require --unsafe-arbitrary-user-id")]
     UnsafeUserIdRequired,
+    #[error("invalid {key} value {value:?}: {message}")]
+    InvalidConfigValue {
+        key: &'static str,
+        value: String,
+        message: String,
+    },
 }
