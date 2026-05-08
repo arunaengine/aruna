@@ -3,7 +3,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::{Actor, RealmConfigDocument};
+use aruna_core::structs::{Actor, RealmConfigDocument, RealmNodeKind};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -135,11 +135,12 @@ impl Operation for EnsureRealmConfigOperation {
                     None => {
                         // The RealmConfig is only created to create an empty automerge document
                         // for syncing here
-                        let document = RealmConfigDocument::new(
+                        let mut document = RealmConfigDocument::new(
                             self.config.actor.realm_id,
                             Vec::new(),
                             self.config.default_metadata_replication_factor,
                         );
+                        document.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
                         let bytes = match document.to_bytes(&self.config.actor) {
                             Ok(bytes) => bytes,
                             Err(error) => return self.fail(error.into()),
