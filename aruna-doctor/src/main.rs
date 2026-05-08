@@ -1,6 +1,7 @@
 use crate::error::CliError;
 use crate::explorer::{explore_entries, explore_keyspaces};
 use crate::info::print_info;
+use crate::iroh_check::print_iroh_check;
 use crate::storage::{import, snapshot};
 use crate::tokens::{create_local_bootstrap_token, create_oidc_token, view_token};
 use clap::{Parser, Subcommand};
@@ -8,6 +9,7 @@ use clap::{Parser, Subcommand};
 mod error;
 mod explorer;
 mod info;
+mod iroh_check;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -50,6 +52,10 @@ pub enum Commands {
         snapshot_path: String,
         target_path: String,
     },
+    Iroh {
+        #[command(subcommand)]
+        command: IrohCommands,
+    },
     Info,
 }
 
@@ -61,6 +67,16 @@ pub enum ExploreCommands {
     Entries {
         database_path: String,
         keyspace: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IrohCommands {
+    Check {
+        #[arg(long)]
+        info_url: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        timeout_secs: u64,
     },
 }
 
@@ -105,6 +121,12 @@ pub async fn main() -> Result<(), CliError> {
             snapshot_path,
             target_path,
         } => import(snapshot_path, target_path).await?,
+        Commands::Iroh { command } => match command {
+            IrohCommands::Check {
+                info_url,
+                timeout_secs,
+            } => print_iroh_check(info_url, timeout_secs).await?,
+        },
         Commands::Info => print_info().await?,
     };
 

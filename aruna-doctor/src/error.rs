@@ -35,6 +35,8 @@ pub enum CliError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("iroh check failed during {step}: {message}")]
+    IrohCheck { step: &'static str, message: String },
     #[error(transparent)]
     DotenvError(#[from] dotenvy::Error),
     #[error(transparent)]
