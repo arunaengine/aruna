@@ -25,14 +25,10 @@ use aruna_core::structs::{
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use crossfire::TrySendError;
+use iroh::address_lookup::DnsAddressLookup;
 use iroh::address_lookup::memory::MemoryLookup;
-use iroh::address_lookup::{
-    AddressLookup, AddressLookupBuilder, AddressLookupBuilderError, DnsAddressLookup, EndpointData,
-    Error as AddressLookupError, Item as AddressLookupItem,
-};
 use iroh::endpoint::{QuicTransportConfig, TransportAddrUsage, VarInt, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, TransportAddr};
-use n0_future::{boxed::BoxStream, stream::StreamExt};
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use parking_lot::RwLock;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -266,65 +262,6 @@ impl std::fmt::Debug for NetHandle {
     }
 }
 
-#[derive(Debug)]
-struct ReplacingMemoryLookupBuilder<T> {
-    inner: T,
-    memory: MemoryLookup,
-}
-
-impl<T> ReplacingMemoryLookupBuilder<T> {
-    fn new(inner: T, memory: MemoryLookup) -> Self {
-        Self { inner, memory }
-    }
-}
-
-impl<T> AddressLookupBuilder for ReplacingMemoryLookupBuilder<T>
-where
-    T: AddressLookupBuilder,
-{
-    fn into_address_lookup(
-        self,
-        endpoint: &Endpoint,
-    ) -> std::result::Result<impl AddressLookup, AddressLookupBuilderError> {
-        Ok(ReplacingMemoryLookup {
-            inner: self.inner.into_address_lookup(endpoint)?,
-            memory: self.memory,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct ReplacingMemoryLookup<T> {
-    inner: T,
-    memory: MemoryLookup,
-}
-
-impl<T> AddressLookup for ReplacingMemoryLookup<T>
-where
-    T: AddressLookup,
-{
-    fn publish(&self, data: &EndpointData) {
-        self.inner.publish(data);
-    }
-
-    fn resolve(
-        &self,
-        endpoint_id: EndpointId,
-    ) -> Option<BoxStream<std::result::Result<AddressLookupItem, AddressLookupError>>> {
-        let memory = self.memory.clone();
-        self.inner.resolve(endpoint_id).map(|stream| {
-            stream
-                .map(move |result| {
-                    if let Ok(item) = &result {
-                        memory.set_endpoint_info(item.endpoint_info().clone());
-                    }
-                    result
-                })
-                .boxed()
-        })
-    }
-}
-
 impl NetHandle {
     pub async fn new(config: NetConfig, storage: StorageHandle) -> Result<Self> {
         let secret_key = config.secret_key.unwrap_or_else(iroh::SecretKey::generate);
@@ -378,18 +315,12 @@ impl NetHandle {
                 // No additional configuration needed for no discovery
             }
             DiscoveryMethod::N0Dns => {
-                endpoint_builder =
-                    endpoint_builder.address_lookup(ReplacingMemoryLookupBuilder::new(
-                        DnsAddressLookup::n0_dns(),
-                        address_lookup.clone(),
-                    ));
+                endpoint_builder = endpoint_builder.address_lookup(DnsAddressLookup::n0_dns());
             }
             DiscoveryMethod::CustomDns(servers) => {
                 for server in servers {
-                    let dns_lookup = DnsAddressLookup::builder(server.clone());
-                    endpoint_builder = endpoint_builder.address_lookup(
-                        ReplacingMemoryLookupBuilder::new(dns_lookup, address_lookup.clone()),
-                    );
+                    endpoint_builder =
+                        endpoint_builder.address_lookup(DnsAddressLookup::builder(server.clone()));
                 }
             }
         }
@@ -1334,60 +1265,9 @@ impl Handle for NetHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use n0_future::stream::{self, StreamExt};
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::time::{Duration, sleep};
-
-    #[derive(Debug)]
-    struct StaticLookup {
-        endpoint_addr: EndpointAddr,
-    }
-
-    impl AddressLookup for StaticLookup {
-        fn resolve(
-            &self,
-            endpoint_id: EndpointId,
-        ) -> Option<BoxStream<std::result::Result<AddressLookupItem, AddressLookupError>>> {
-            (endpoint_id == self.endpoint_addr.id).then(|| {
-                stream::iter(Some(Ok(AddressLookupItem::new(
-                    self.endpoint_addr.clone().into(),
-                    "static",
-                    None,
-                ))))
-                .boxed()
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn replacing_lookup_overwrites_memory_endpoint_info() -> Result<()> {
-        let memory = MemoryLookup::new();
-        let peer = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
-        let old_addr =
-            EndpointAddr::from_parts(peer, [TransportAddr::Ip("127.0.0.1:1000".parse().unwrap())]);
-        let new_addr =
-            EndpointAddr::from_parts(peer, [TransportAddr::Ip("127.0.0.1:2000".parse().unwrap())]);
-        memory.set_endpoint_info(old_addr);
-        let lookup = ReplacingMemoryLookup {
-            inner: StaticLookup {
-                endpoint_addr: new_addr.clone(),
-            },
-            memory: memory.clone(),
-        };
-
-        let mut stream = lookup.resolve(peer).expect("static lookup resolves peer");
-        assert!(stream.next().await.expect("lookup item").is_ok());
-
-        assert_eq!(
-            memory
-                .get_endpoint_info(peer)
-                .expect("memory entry")
-                .into_endpoint_addr(),
-            new_addr
-        );
-        Ok(())
-    }
 
     #[tokio::test]
     async fn test_net_handle_creates() -> Result<()> {
