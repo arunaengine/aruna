@@ -59,34 +59,65 @@ pub async fn print_info() -> Result<(), CliError> {
     Ok(())
 }
 
-async fn fetch_info(http_socket_addr: SocketAddr) -> Result<InfoResponse, CliError> {
-    let base_url = http_base_url(http_socket_addr);
-    let url = format!("{base_url}/api/v1/info");
+pub(crate) fn default_info_url_from_env() -> Result<String, CliError> {
+    let http_socket_addr: SocketAddr = dotenvy::var("SOCKET_ADDRESS")?.parse()?;
+    Ok(info_url(http_socket_addr))
+}
+
+pub(crate) async fn fetch_info(http_socket_addr: SocketAddr) -> Result<InfoResponse, CliError> {
+    fetch_info_url(&info_url(http_socket_addr)).await
+}
+
+pub(crate) async fn fetch_info_url(url: &str) -> Result<InfoResponse, CliError> {
+    fetch_info_url_with_timeout(url, Duration::from_secs(10)).await
+}
+
+pub(crate) async fn fetch_info_url_with_timeout(
+    url: &str,
+    timeout: Duration,
+) -> Result<InfoResponse, CliError> {
+    let timeout = nonzero_timeout(timeout);
+    let connect_timeout = nonzero_timeout(timeout.min(Duration::from_secs(2)));
     let response = Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(10))
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
         .build()?
-        .get(&url)
+        .get(url)
         .send()
         .await
         .map_err(|source| CliError::InfoRequest {
-            url: url.clone(),
+            url: url.to_string(),
             source,
         })?
         .error_for_status()
         .map_err(|source| CliError::InfoRequest {
-            url: url.clone(),
+            url: url.to_string(),
             source,
         })?;
 
     response
         .json::<InfoResponse>()
         .await
-        .map_err(|source| CliError::InfoRequest { url, source })
+        .map_err(|source| CliError::InfoRequest {
+            url: url.to_string(),
+            source,
+        })
 }
 
 fn http_base_url(addr: SocketAddr) -> String {
     client_base_url_from_bind_address(addr)
+}
+
+fn info_url(addr: SocketAddr) -> String {
+    format!("{}/api/v1/info", http_base_url(addr))
+}
+
+fn nonzero_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        timeout
+    }
 }
 
 impl ConfigView {
