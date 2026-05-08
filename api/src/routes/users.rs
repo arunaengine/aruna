@@ -131,7 +131,7 @@ fn map_consume_onboarding_error(error: ConsumeOnboardingSecretError) -> ServerEr
     match error {
         ConsumeOnboardingSecretError::NotFound
         | ConsumeOnboardingSecretError::Expired
-        | ConsumeOnboardingSecretError::AlreadyConsumed
+        | ConsumeOnboardingSecretError::AlreadyClaimed
         | ConsumeOnboardingSecretError::InvalidSecret => ServerError::Unauthorized,
         other => ServerError::InternalError(other.to_string()),
     }
@@ -141,7 +141,7 @@ fn map_inspect_onboarding_error(error: InspectOnboardingSecretError) -> ServerEr
     match error {
         InspectOnboardingSecretError::NotFound
         | InspectOnboardingSecretError::Expired
-        | InspectOnboardingSecretError::AlreadyConsumed
+        | InspectOnboardingSecretError::AlreadyClaimed
         | InspectOnboardingSecretError::InvalidSecret => ServerError::Unauthorized,
         other => ServerError::InternalError(other.to_string()),
     }
@@ -302,6 +302,7 @@ async fn register_admin(
         ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash,
+            node_id: user_id.to_string(),
             now: now_timestamp(),
         }),
         &state.get_ctx(),
@@ -1003,7 +1004,7 @@ mod tests {
                     secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
                     mode: OnboardingMode::Local,
                     expires_at: u64::MAX,
-                    consumed: false,
+                    claimed_node_id: None,
                 },
             }),
             node.context.as_ref(),

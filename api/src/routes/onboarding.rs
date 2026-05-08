@@ -1,12 +1,17 @@
 use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateOnboardingSecretRequest,
     CreateOnboardingSecretResponse, OnboardingMode, OnboardingSecret, OnboardingSecretRecord,
     bootstrap_issuer_proof_message, bootstrap_node_proof_message,
 };
-use aruna_core::structs::{AuthContext, Permission};
+use aruna_core::structs::{Actor, AuthContext, Permission, RealmConfigDocument, RealmNodeKind};
+use aruna_core::types::UserId;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::consume_onboarding_secret::{
     ConsumeOnboardingSecretError, ConsumeOnboardingSecretInput, ConsumeOnboardingSecretOperation,
@@ -27,6 +32,7 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine;
+use byteview::ByteView;
 use crypto_box::{
     PublicKey as TransportPublicKey, SalsaBox, SecretKey as TransportSecretKey,
     aead::{Aead, AeadCore, OsRng as CryptoOsRng},
@@ -97,7 +103,7 @@ pub struct BootstrapOnboardingRequestDoc {
 pub struct BootstrapOnboardingResponseDoc {
     pub realm_id: String,
     pub mode: String,
-    pub bootstrap_endpoints: Vec<BootstrapEndpointDoc>,
+    pub temporary_bootstrap_endpoint: BootstrapEndpointDoc,
     pub wrapped_realm_private_key: Option<String>,
     pub wrapped_realm_private_key_nonce: Option<String>,
     pub wrapping_public_key: Option<String>,
@@ -115,7 +121,7 @@ pub struct OnboardingSecretSummary {
     pub enrollment_id: String,
     pub mode: String,
     pub expires_at: u64,
-    pub consumed: bool,
+    pub claimed_node_id: Option<String>,
 }
 
 impl From<OnboardingSecretRecord> for OnboardingSecretSummary {
@@ -124,7 +130,7 @@ impl From<OnboardingSecretRecord> for OnboardingSecretSummary {
             enrollment_id: record.enrollment_id.to_string(),
             mode: format!("{:?}", record.mode),
             expires_at: record.expires_at,
-            consumed: record.consumed,
+            claimed_node_id: record.claimed_node_id,
         }
     }
 }
@@ -163,7 +169,7 @@ async fn prune_stale_onboarding_secrets(state: &Arc<ServerState>) -> ServerResul
         .map_err(|err| ServerError::InternalError(err.to_string()))?;
 
     for secret in secrets {
-        if secret.consumed || secret.expires_at < now {
+        if secret.expires_at < now {
             drive(
                 DeleteOnboardingSecretOperation::new(DeleteOnboardingSecretInput {
                     enrollment_id: secret.enrollment_id,
@@ -221,7 +227,7 @@ pub async fn create_onboarding_secret(
         secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
         mode: onboarding_secret.mode,
         expires_at,
-        consumed: false,
+        claimed_node_id: None,
     };
 
     drive(
@@ -356,6 +362,7 @@ pub async fn bootstrap_onboarding(
         ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
+            node_id: node_id.to_string(),
             now: now_timestamp(),
         }),
         &state.get_ctx(),
@@ -366,6 +373,7 @@ pub async fn bootstrap_onboarding(
     let bootstrap_endpoint = state
         .bootstrap_endpoint()
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
+    ensure_realm_node(&state, node_id, record.mode).await?;
     let onboarding_sync_ticket = state
         .issue_onboarding_sync_ticket(node_id)
         .await
@@ -387,7 +395,7 @@ pub async fn bootstrap_onboarding(
         OnboardingMode::Management => BootstrapOnboardingResponse {
             realm_id: state.get_realm_id().to_string(),
             mode: OnboardingMode::Management,
-            bootstrap_endpoints: vec![bootstrap_endpoint],
+            temporary_bootstrap_endpoint: bootstrap_endpoint,
             wrapped_realm_private_key: wrapped_management_key.as_ref().map(|value| value.0.clone()),
             wrapped_realm_private_key_nonce: wrapped_management_key
                 .as_ref()
@@ -407,7 +415,7 @@ pub async fn bootstrap_onboarding(
             BootstrapOnboardingResponse {
                 realm_id: state.get_realm_id().to_string(),
                 mode: OnboardingMode::Server,
-                bootstrap_endpoints: vec![bootstrap_endpoint],
+                temporary_bootstrap_endpoint: bootstrap_endpoint,
                 wrapped_realm_private_key: None,
                 wrapped_realm_private_key_nonce: None,
                 wrapping_public_key: None,
@@ -418,7 +426,7 @@ pub async fn bootstrap_onboarding(
         OnboardingMode::Local => BootstrapOnboardingResponse {
             realm_id: state.get_realm_id().to_string(),
             mode: OnboardingMode::Local,
-            bootstrap_endpoints: vec![bootstrap_endpoint],
+            temporary_bootstrap_endpoint: bootstrap_endpoint,
             wrapped_realm_private_key: None,
             wrapped_realm_private_key_nonce: None,
             wrapping_public_key: None,
@@ -430,6 +438,89 @@ pub async fn bootstrap_onboarding(
     Ok((StatusCode::OK, Json(response)))
 }
 
+async fn ensure_realm_node(
+    state: &Arc<ServerState>,
+    node_id: NodeId,
+    mode: OnboardingMode,
+) -> ServerResult<()> {
+    let realm_id = state.get_realm_id();
+    let key = ByteView::from(*realm_id.as_bytes());
+    let ctx = state.get_ctx();
+    let current = match ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => value,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            return Err(ServerError::InternalError(
+                "realm config document missing".to_string(),
+            ));
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(ServerError::InternalError(error.to_string()));
+        }
+        other => {
+            return Err(ServerError::InternalError(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    };
+
+    let mut document = RealmConfigDocument::from_bytes(&current)
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let kind = match mode {
+        OnboardingMode::Management => RealmNodeKind::Management,
+        OnboardingMode::Server => RealmNodeKind::Server,
+        OnboardingMode::Local => RealmNodeKind::Local,
+    };
+    let node_id_string = node_id.to_string();
+    if let Some(existing) = document
+        .nodes
+        .iter()
+        .find(|node| node.node_id == node_id_string)
+    {
+        if existing.kind != kind {
+            return Err(ServerError::BadRequest);
+        }
+    }
+    document.ensure_node(node_id, kind);
+
+    let actor = Actor {
+        node_id: state.get_node_id(),
+        user_id: UserId::nil(realm_id),
+        realm_id,
+    };
+    let value = document
+        .reconcile_bytes(Some(&current), &actor)
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+
+    match ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Write {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key,
+            value: ByteView::from(value),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(ServerError::InternalError(error.to_string()))
+        }
+        other => Err(ServerError::InternalError(format!(
+            "unexpected storage event: {other:?}"
+        ))),
+    }
+}
+
 fn now_timestamp() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
@@ -438,7 +529,7 @@ fn map_consume_error(error: ConsumeOnboardingSecretError) -> ServerError {
     match error {
         ConsumeOnboardingSecretError::NotFound
         | ConsumeOnboardingSecretError::Expired
-        | ConsumeOnboardingSecretError::AlreadyConsumed
+        | ConsumeOnboardingSecretError::AlreadyClaimed
         | ConsumeOnboardingSecretError::InvalidSecret => ServerError::Unauthorized,
         other => ServerError::InternalError(other.to_string()),
     }
@@ -448,7 +539,7 @@ fn map_inspect_error(error: InspectOnboardingSecretError) -> ServerError {
     match error {
         InspectOnboardingSecretError::NotFound
         | InspectOnboardingSecretError::Expired
-        | InspectOnboardingSecretError::AlreadyConsumed
+        | InspectOnboardingSecretError::AlreadyClaimed
         | InspectOnboardingSecretError::InvalidSecret => ServerError::Unauthorized,
         other => ServerError::InternalError(other.to_string()),
     }
@@ -715,8 +806,7 @@ mod tests {
 
         assert_eq!(bootstrap.mode, OnboardingMode::Server);
         assert_eq!(bootstrap.realm_id, realm_id.to_string());
-        assert_eq!(bootstrap.bootstrap_endpoints.len(), 1);
-        assert_eq!(bootstrap.bootstrap_endpoints[0].id, seed_node_id);
+        assert_eq!(bootstrap.temporary_bootstrap_endpoint.id, seed_node_id);
         assert!(bootstrap.wrapped_realm_private_key.is_none());
         assert!(bootstrap.delegation_signature.is_some());
         assert!(!bootstrap.onboarding_sync_ticket.is_empty());

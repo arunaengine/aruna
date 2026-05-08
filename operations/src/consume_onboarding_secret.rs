@@ -16,6 +16,7 @@ use crate::create_onboarding_secret::secret_record_key;
 pub struct ConsumeOnboardingSecretInput {
     pub enrollment_id: Ulid,
     pub secret_hash: String,
+    pub node_id: String,
     pub now: u64,
 }
 
@@ -54,8 +55,8 @@ pub enum ConsumeOnboardingSecretError {
     NotFound,
     #[error("onboarding secret expired")]
     Expired,
-    #[error("onboarding secret already consumed")]
-    AlreadyConsumed,
+    #[error("onboarding secret already claimed")]
+    AlreadyClaimed,
     #[error("onboarding secret does not match")]
     InvalidSecret,
     #[error("consuming onboarding secret did not finish")]
@@ -144,17 +145,28 @@ impl Operation for ConsumeOnboardingSecretOperation {
                     }
                 };
 
-                if record.consumed {
-                    return fail(self, ConsumeOnboardingSecretError::AlreadyConsumed);
-                }
                 if record.expires_at < self.input.now {
                     return fail(self, ConsumeOnboardingSecretError::Expired);
                 }
                 if record.secret_hash != self.input.secret_hash {
                     return fail(self, ConsumeOnboardingSecretError::InvalidSecret);
                 }
+                match &record.claimed_node_id {
+                    Some(claimed_node_id) if claimed_node_id != &self.input.node_id => {
+                        return fail(self, ConsumeOnboardingSecretError::AlreadyClaimed);
+                    }
+                    Some(_) => {
+                        self.state = ConsumeOnboardingSecretState::CommitTransaction {
+                            record: record.clone(),
+                        };
+                        return smallvec![Effect::Storage(StorageEffect::CommitTransaction {
+                            txn_id,
+                        })];
+                    }
+                    None => {}
+                }
 
-                record.consumed = true;
+                record.claimed_node_id = Some(self.input.node_id.clone());
                 let value = match postcard::to_allocvec(&record) {
                     Ok(value) => value,
                     Err(error) => {
@@ -266,7 +278,7 @@ mod tests {
     use ulid::Ulid;
 
     #[tokio::test]
-    async fn consumes_secret_once() {
+    async fn claims_secret_idempotently_for_same_node() {
         let tempdir = tempdir().unwrap();
         let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
@@ -284,7 +296,7 @@ mod tests {
             secret_hash: "abc".to_string(),
             mode: OnboardingMode::Server,
             expires_at: 100,
-            consumed: false,
+            claimed_node_id: None,
         };
 
         drive(
@@ -300,23 +312,40 @@ mod tests {
             ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
                 enrollment_id,
                 secret_hash: "abc".to_string(),
+                node_id: "node-a".to_string(),
                 now: 10,
             }),
             &context,
         )
         .await
         .unwrap();
-        assert!(consumed.consumed);
+        assert_eq!(consumed.claimed_node_id.as_deref(), Some("node-a"));
 
         let second = drive(
             ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
                 enrollment_id,
                 secret_hash: "abc".to_string(),
+                node_id: "node-a".to_string(),
                 now: 10,
             }),
             &context,
         )
         .await;
-        assert_eq!(second, Err(ConsumeOnboardingSecretError::AlreadyConsumed));
+        assert!(second.is_ok());
+
+        let different_node = drive(
+            ConsumeOnboardingSecretOperation::new(ConsumeOnboardingSecretInput {
+                enrollment_id,
+                secret_hash: "abc".to_string(),
+                node_id: "node-b".to_string(),
+                now: 10,
+            }),
+            &context,
+        )
+        .await;
+        assert_eq!(
+            different_node,
+            Err(ConsumeOnboardingSecretError::AlreadyClaimed)
+        );
     }
 }
