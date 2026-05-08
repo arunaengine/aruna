@@ -42,6 +42,8 @@ pub use dht::DhtHandle;
 pub use error::{NetError, Result};
 pub use gossip::GossipService;
 pub use monitoring::Monitor;
+
+const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
 pub use streams::StreamsService;
 
 #[derive(Clone)]
@@ -339,7 +341,7 @@ struct NetInner {
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
     peer_endpoints: Vec<EndpointAddr>,
-    dht_signed_authorized_nodes: Vec<NodeId>,
+    dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
     gossip: Arc<GossipService>,
     streams: Arc<StreamsService>,
@@ -449,9 +451,9 @@ impl NetHandle {
             address_lookup.set_endpoint_info(endpoint_addr.clone());
         }
         let mut peer_nodes = config.peer_nodes.clone();
-        let dht_signed_authorized_nodes = unique_peer_nodes(peer_nodes.clone(), node_id);
         peer_nodes.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
         let peer_nodes = unique_peer_nodes(peer_nodes, node_id);
+        let dht_signed_authorized_nodes = Arc::new(RwLock::new(peer_nodes.clone()));
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
             &peer_nodes,
             "realm_config",
@@ -700,6 +702,11 @@ impl NetHandle {
             return;
         }
 
+        authorize_dht_signed_node(
+            &self.inner.dht_signed_authorized_nodes,
+            endpoint_addr.id,
+            self.inner.node_id,
+        );
         self.inner
             .address_lookup
             .set_endpoint_info(endpoint_addr.clone());
@@ -717,6 +724,34 @@ impl NetHandle {
                 node_id = %endpoint_addr.id,
                 error = %err,
                 "Failed to add endpoint address peer to DHT"
+            );
+        }
+    }
+
+    pub async fn add_peer_node(&self, node_id: NodeId) {
+        if node_id == self.inner.node_id {
+            return;
+        }
+
+        authorize_dht_signed_node(
+            &self.inner.dht_signed_authorized_nodes,
+            node_id,
+            self.inner.node_id,
+        );
+        send_peer_connectivity_event(
+            &self.inner.peer_connectivity_tx,
+            PeerConnectivityEvent::ManagePeer {
+                node_id,
+                source: "peer_node".to_string(),
+                immediate: true,
+            },
+        );
+        self.inner.gossip.add_bootstrap_node(node_id);
+        if let Err(err) = self.inner.dht.add_peer(node_id) {
+            warn!(
+                node_id = %node_id,
+                error = %err,
+                "Failed to add peer node to DHT"
             );
         }
     }
@@ -756,10 +791,11 @@ impl NetHandle {
             }
             Err(mut err) => {
                 if node_id != self.inner.node_id {
+                    let authorized_nodes = self.inner.dht_signed_authorized_nodes.read().clone();
                     match resolve_dht_signed_endpoint(
                         &self.inner.dht,
                         self.inner.realm_id,
-                        &self.inner.dht_signed_authorized_nodes,
+                        &authorized_nodes,
                         node_id,
                         self.inner.discovery_method.dht_signed_config(),
                         &self.inner.bootstrap_diagnostics,
@@ -897,6 +933,7 @@ impl NetHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_dht_signed_publisher(
     dht: Arc<DhtHandle>,
     endpoint: Endpoint,
@@ -1023,7 +1060,10 @@ async fn lookup_dht_signed_endpoint(
     peer: NodeId,
     config: Option<(Duration, Duration)>,
 ) -> Result<Option<EndpointAddr>> {
-    if config.is_none() || !authorized_nodes.contains(&peer) {
+    let Some((ttl, _)) = config else {
+        return Ok(None);
+    };
+    if !authorized_nodes.contains(&peer) {
         return Ok(None);
     }
 
@@ -1037,6 +1077,7 @@ async fn lookup_dht_signed_endpoint(
         realm_id,
         authorized_nodes,
         now,
+        ttl.as_secs().max(1),
     ))
 }
 
@@ -1046,6 +1087,7 @@ fn select_dht_signed_endpoint(
     realm_id: RealmId,
     authorized_nodes: &[NodeId],
     now: u64,
+    max_ttl_secs: u64,
 ) -> Option<EndpointAddr> {
     let mut best = None::<RealmEndpointAnnouncement>;
 
@@ -1061,6 +1103,7 @@ fn select_dht_signed_endpoint(
             realm_id,
             authorized_nodes,
             now,
+            max_ttl_secs,
         )
         .is_err()
         {
@@ -1068,8 +1111,11 @@ fn select_dht_signed_endpoint(
         }
 
         let replace = best.as_ref().is_none_or(|current| {
-            announcement.sequence > current.sequence
-                || (announcement.sequence == current.sequence
+            announcement.issued_at > current.issued_at
+                || (announcement.issued_at == current.issued_at
+                    && announcement.sequence > current.sequence)
+                || (announcement.issued_at == current.issued_at
+                    && announcement.sequence == current.sequence
                     && announcement.expires_at > current.expires_at)
         });
         if replace {
@@ -1133,6 +1179,7 @@ fn validate_realm_endpoint_announcement(
     realm_id: RealmId,
     authorized_nodes: &[NodeId],
     now: u64,
+    max_ttl_secs: u64,
 ) -> std::result::Result<(), String> {
     if !authorized_nodes.contains(&requested_peer) {
         return Err("node is not authorized for realm discovery".to_string());
@@ -1151,6 +1198,16 @@ fn validate_realm_endpoint_announcement(
     }
     if announcement.issued_at > announcement.expires_at || announcement.expires_at <= now {
         return Err("announcement is expired or has invalid timestamps".to_string());
+    }
+    if announcement.issued_at > now.saturating_add(DHT_SIGNED_MAX_CLOCK_SKEW_SECS) {
+        return Err("announcement is issued too far in the future".to_string());
+    }
+    if announcement
+        .expires_at
+        .saturating_sub(announcement.issued_at)
+        > max_ttl_secs
+    {
+        return Err("announcement ttl exceeds configured maximum".to_string());
     }
 
     let signing_bytes = realm_endpoint_announcement_signing_bytes(
@@ -1199,10 +1256,29 @@ fn local_endpoint_addr(endpoint: &Endpoint, configured_relay_urls: &[String]) ->
         }
     }
     for socket in endpoint.bound_sockets() {
-        addr = addr.with_ip_addr(socket);
+        if !socket.ip().is_unspecified() {
+            addr = addr.with_ip_addr(socket);
+        }
     }
 
     addr
+}
+
+fn authorize_dht_signed_node(
+    authorized_nodes: &Arc<RwLock<Vec<NodeId>>>,
+    node_id: NodeId,
+    local_id: NodeId,
+) {
+    if node_id == local_id {
+        return;
+    }
+
+    let mut nodes = authorized_nodes.write();
+    if nodes.contains(&node_id) {
+        return;
+    }
+    nodes.push(node_id);
+    nodes.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 }
 
 fn unique_endpoint_addrs(
@@ -1411,13 +1487,14 @@ async fn peer_connectivity_status(
     state.lock().await.status(Instant::now())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_peer_connectivity_manager(
     dht: Arc<DhtHandle>,
     endpoint: Endpoint,
     address_lookup: MemoryLookup,
     discovery_method: DiscoveryMethod,
     realm_id: RealmId,
-    dht_signed_authorized_nodes: Vec<NodeId>,
+    dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     state: Arc<Mutex<PeerConnectivityManagerState>>,
     diagnostics: Arc<Mutex<BootstrapDiagnosticsState>>,
     mut event_rx: mpsc::Receiver<PeerConnectivityEvent>,
@@ -1434,13 +1511,14 @@ async fn run_peer_connectivity_manager(
                 if shutdown.is_cancelled() {
                     return;
                 }
+                let authorized_nodes = dht_signed_authorized_nodes.read().clone();
                 run_peer_connectivity_attempt(
                     &dht,
                     &endpoint,
                     &address_lookup,
                     &discovery_method,
                     realm_id,
-                    &dht_signed_authorized_nodes,
+                    &authorized_nodes,
                     &state,
                     &diagnostics,
                     peer,
@@ -1502,6 +1580,7 @@ async fn apply_peer_connectivity_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_peer_connectivity_attempt(
     dht: &DhtHandle,
     endpoint: &Endpoint,
@@ -1605,44 +1684,51 @@ async fn known_peer_addresses(
     let mut states = Vec::new();
 
     for peer in peers.drain(..) {
+        let mut sources = Vec::new();
+        let mut addrs = Vec::new();
+        let mut active = 0;
+        let mut inactive = 0;
+
         if let Some(info) = address_lookup.get_endpoint_info(peer) {
             let endpoint_addr = info.into_endpoint_addr();
-            states.push(peer_address_state(
-                peer,
-                "memory_lookup",
-                endpoint_addr.addrs.into_iter().collect(),
-                0,
-                0,
-            ));
+            sources.push("memory_lookup");
+            for addr in endpoint_addr.addrs {
+                push_unique_transport_addr(&mut addrs, addr);
+            }
         }
 
         if let Some(remote_info) = endpoint.remote_info(peer).await {
-            let mut addrs = Vec::new();
-            let mut active = 0;
-            let mut inactive = 0;
+            sources.push("remote_info");
             for addr in remote_info.addrs() {
                 match addr.usage() {
                     TransportAddrUsage::Active => active += 1,
                     TransportAddrUsage::Inactive => inactive += 1,
                     _ => inactive += 1,
                 }
-                addrs.push(addr.addr().clone());
+                push_unique_transport_addr(&mut addrs, addr.addr().clone());
             }
+        }
+
+        if sources.is_empty() {
+            states.push(peer_address_state(peer, "none", Vec::new(), 0, 0));
+        } else {
             states.push(peer_address_state(
                 peer,
-                "remote_info",
+                &sources.join(","),
                 addrs,
                 active,
                 inactive,
             ));
         }
-
-        if !states.iter().any(|state| state.node_id == peer) {
-            states.push(peer_address_state(peer, "none", Vec::new(), 0, 0));
-        }
     }
 
     states
+}
+
+fn push_unique_transport_addr(addrs: &mut Vec<TransportAddr>, addr: TransportAddr) {
+    if !addrs.iter().any(|existing| existing == &addr) {
+        addrs.push(addr);
+    }
 }
 
 fn peer_address_state(
@@ -1870,6 +1956,7 @@ mod tests {
                 realm_id,
                 &[node_id],
                 now,
+                300,
             )
             .is_ok()
         );
@@ -1881,6 +1968,7 @@ mod tests {
                 realm_id,
                 &[],
                 now,
+                300,
             )
             .is_err()
         );
@@ -1906,6 +1994,7 @@ mod tests {
                 realm_id,
                 &[node_id],
                 now,
+                300,
             )
             .is_err()
         );
@@ -1938,10 +2027,44 @@ mod tests {
             },
         ];
 
-        let endpoint = select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], now)
+        let endpoint = select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], now, 300)
             .expect("valid announcement");
 
         assert_eq!(endpoint.addrs, newer.endpoint_addr.addrs);
+    }
+
+    #[test]
+    fn newer_issued_announcement_wins_after_sequence_reset() {
+        let secret = make_secret(55);
+        let node_id = secret.public();
+        let realm_id = RealmId::from_bytes([12u8; 32]);
+        let stale = EndpointAddr::new(node_id)
+            .with_ip_addr("127.0.0.1:10010".parse().expect("valid socket addr"));
+        let fresh = EndpointAddr::new(node_id)
+            .with_ip_addr("127.0.0.1:10011".parse().expect("valid socket addr"));
+        let now = 1_000;
+        let stale = make_announcement(&secret, realm_id, stale, now, now + 300, 10);
+        let fresh = make_announcement(&secret, realm_id, fresh, now + 10, now + 310, 1);
+        let entries = vec![
+            DhtEntry {
+                node_id,
+                realm_id,
+                value: postcard::to_allocvec(&stale).expect("encode announcement"),
+                expires_at: now + 300,
+            },
+            DhtEntry {
+                node_id,
+                realm_id,
+                value: postcard::to_allocvec(&fresh).expect("encode announcement"),
+                expires_at: now + 310,
+            },
+        ];
+
+        let endpoint =
+            select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], now + 10, 300)
+                .expect("valid announcement");
+
+        assert_eq!(endpoint.addrs, fresh.endpoint_addr.addrs);
     }
 
     #[test]
@@ -1960,7 +2083,52 @@ mod tests {
         }];
 
         assert!(
-            select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], 1_000).is_none()
+            select_dht_signed_endpoint(entries, node_id, realm_id, &[node_id], 1_000, 300)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_future_and_excessive_ttl_announcements() {
+        let secret = make_secret(56);
+        let node_id = secret.public();
+        let realm_id = RealmId::from_bytes([13u8; 32]);
+        let endpoint_addr = EndpointAddr::new(node_id)
+            .with_ip_addr("127.0.0.1:10012".parse().expect("valid socket addr"));
+        let now = 1_000;
+        let future = make_announcement(
+            &secret,
+            realm_id,
+            endpoint_addr.clone(),
+            now + DHT_SIGNED_MAX_CLOCK_SKEW_SECS + 1,
+            now + DHT_SIGNED_MAX_CLOCK_SKEW_SECS + 301,
+            1,
+        );
+        let excessive_ttl = make_announcement(&secret, realm_id, endpoint_addr, now, now + 301, 1);
+
+        assert!(
+            validate_realm_endpoint_announcement(
+                &future,
+                node_id,
+                node_id,
+                realm_id,
+                &[node_id],
+                now,
+                300,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_realm_endpoint_announcement(
+                &excessive_ttl,
+                node_id,
+                node_id,
+                realm_id,
+                &[node_id],
+                now,
+                300,
+            )
+            .is_err()
         );
     }
 
@@ -1986,7 +2154,67 @@ mod tests {
         let status = handle.get_status().await;
         assert!(status.discovery_methods.is_empty());
         assert_eq!(status.relay_method, "none");
+        assert!(
+            status
+                .endpoint_addr
+                .ip_addrs()
+                .all(|socket| !socket.ip().is_unspecified())
+        );
         handle.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_endpoint_only_nodes_are_dht_signed_authorized() -> Result<()> {
+        let temp_a = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
+        let temp_b = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
+        let storage_a = aruna_storage::FjallStorage::open(
+            temp_a
+                .path()
+                .to_str()
+                .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
+        )
+        .map_err(|e| NetError::Io(e.to_string()))?;
+        let storage_b = aruna_storage::FjallStorage::open(
+            temp_b
+                .path()
+                .to_str()
+                .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
+        )
+        .map_err(|e| NetError::Io(e.to_string()))?;
+        let peer = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_b,
+        )
+        .await?;
+        let peer_id = peer.node_id();
+        let handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                peer_endpoints: vec![peer.endpoint_addr()],
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_a,
+        )
+        .await?;
+
+        assert!(
+            handle
+                .inner
+                .dht_signed_authorized_nodes
+                .read()
+                .contains(&peer_id)
+        );
+
+        handle.shutdown().await;
+        peer.shutdown().await;
         Ok(())
     }
 
@@ -2144,7 +2372,7 @@ mod tests {
         assert!(status.peer_nodes.contains(&b.node_id()));
         assert!(status.known_peer_addresses.iter().any(|peer| {
             peer.node_id == b.node_id()
-                && peer.source == "memory_lookup"
+                && peer.source.contains("memory_lookup")
                 && peer.has_direct_ip
                 && peer
                     .endpoint_addr

@@ -294,8 +294,8 @@ impl DhtDriver {
 
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {
-            match read_request_from_stream(&mut recv).await {
-                Ok(request) => {
+            match tokio::time::timeout(RPC_TIMEOUT, read_request_from_stream(&mut recv)).await {
+                Ok(Ok(request)) => {
                     let _ = io_tx
                         .send(DhtIo::InboundRequest {
                             inbound_id,
@@ -304,9 +304,17 @@ impl DhtDriver {
                         })
                         .await;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let _ = io_tx
                         .send(DhtIo::InboundReadError { inbound_id, error })
+                        .await;
+                }
+                Err(error) => {
+                    let _ = io_tx
+                        .send(DhtIo::InboundReadError {
+                            inbound_id,
+                            error: error.into(),
+                        })
                         .await;
                 }
             }

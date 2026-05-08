@@ -2,6 +2,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
@@ -45,6 +46,7 @@ use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
 const DEFAULT_ONBOARDING_SECRET_TTL_SECS: u64 = 3600;
+const REALM_NODE_UPDATE_RETRIES: usize = 5;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -374,6 +376,9 @@ pub async fn bootstrap_onboarding(
         .bootstrap_endpoint()
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
     ensure_realm_node(&state, node_id, record.mode).await?;
+    if let Some(net_handle) = state.get_ctx().net_handle.as_ref() {
+        net_handle.add_peer_node(node_id).await;
+    }
     let onboarding_sync_ticket = state
         .issue_onboarding_sync_ticket(node_id)
         .await
@@ -443,26 +448,41 @@ async fn ensure_realm_node(
     node_id: NodeId,
     mode: OnboardingMode,
 ) -> ServerResult<()> {
+    let mut last_conflict = None;
+    for _ in 0..REALM_NODE_UPDATE_RETRIES {
+        match ensure_realm_node_once(state, node_id, mode).await {
+            Ok(()) => return Ok(()),
+            Err(ServerError::InternalError(message))
+                if message == StorageError::TransactionConflict.to_string() =>
+            {
+                last_conflict = Some(message);
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(ServerError::InternalError(last_conflict.unwrap_or_else(
+        || "realm config update conflicted".to_string(),
+    )))
+}
+
+async fn ensure_realm_node_once(
+    state: &Arc<ServerState>,
+    node_id: NodeId,
+    mode: OnboardingMode,
+) -> ServerResult<()> {
     let realm_id = state.get_realm_id();
     let key = ByteView::from(*realm_id.as_bytes());
     let ctx = state.get_ctx();
-    let current = match ctx
+    let txn_id = match ctx
         .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: key.clone(),
-            txn_id: None,
+        .send_effect(Effect::Storage(StorageEffect::StartTransaction {
+            read: false,
         }))
         .await
     {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => value,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            return Err(ServerError::InternalError(
-                "realm config document missing".to_string(),
-            ));
-        }
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
         Event::Storage(StorageEvent::Error { error }) => {
             return Err(ServerError::InternalError(error.to_string()));
         }
@@ -473,8 +493,43 @@ async fn ensure_realm_node(
         }
     };
 
-    let mut document = RealmConfigDocument::from_bytes(&current)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let current = match ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: REALM_CONFIG_KEYSPACE.to_string(),
+            key: key.clone(),
+            txn_id: Some(txn_id),
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => value,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
+            return Err(ServerError::InternalError(
+                "realm config document missing".to_string(),
+            ));
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
+            return Err(ServerError::InternalError(error.to_string()));
+        }
+        other => {
+            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
+            return Err(ServerError::InternalError(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    };
+
+    let mut document = match RealmConfigDocument::from_bytes(&current) {
+        Ok(document) => document,
+        Err(error) => {
+            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
+            return Err(ServerError::InternalError(error.to_string()));
+        }
+    };
     let kind = match mode {
         OnboardingMode::Management => RealmNodeKind::Management,
         OnboardingMode::Server => RealmNodeKind::Server,
@@ -485,10 +540,10 @@ async fn ensure_realm_node(
         .nodes
         .iter()
         .find(|node| node.node_id == node_id_string)
+        && existing.kind != kind
     {
-        if existing.kind != kind {
-            return Err(ServerError::BadRequest);
-        }
+        abort_realm_node_update(&ctx.storage_handle, txn_id).await;
+        return Err(ServerError::BadRequest);
     }
     document.ensure_node(node_id, kind);
 
@@ -497,9 +552,13 @@ async fn ensure_realm_node(
         user_id: UserId::nil(realm_id),
         realm_id,
     };
-    let value = document
-        .reconcile_bytes(Some(&current), &actor)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let value = match document.reconcile_bytes(Some(&current), &actor) {
+        Ok(value) => value,
+        Err(error) => {
+            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
+            return Err(ServerError::InternalError(error.to_string()));
+        }
+    };
 
     match ctx
         .storage_handle
@@ -507,11 +566,29 @@ async fn ensure_realm_node(
             key_space: REALM_CONFIG_KEYSPACE.to_string(),
             key,
             value: ByteView::from(value),
-            txn_id: None,
+            txn_id: Some(txn_id),
         }))
         .await
     {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
+            return Err(ServerError::InternalError(error.to_string()));
+        }
+        other => {
+            abort_realm_node_update(&ctx.storage_handle, txn_id).await;
+            return Err(ServerError::InternalError(format!(
+                "unexpected storage event: {other:?}"
+            )));
+        }
+    }
+
+    match ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => {
             Err(ServerError::InternalError(error.to_string()))
         }
@@ -519,6 +596,12 @@ async fn ensure_realm_node(
             "unexpected storage event: {other:?}"
         ))),
     }
+}
+
+async fn abort_realm_node_update<H: Handle>(storage: &H, txn_id: Ulid) {
+    let _ = storage
+        .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
+        .await;
 }
 
 fn now_timestamp() -> u64 {
@@ -641,11 +724,15 @@ mod tests {
     };
     use crate::server_state::ServerState;
     use aruna_core::UserId;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::onboarding::{
         BootstrapOnboardingRequest, CreateOnboardingSecretRequest, OnboardingMode,
         bootstrap_issuer_proof_message, bootstrap_node_proof_message,
     };
-    use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmId};
+    use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, RealmConfigDocument, RealmId};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
@@ -791,7 +878,7 @@ mod tests {
             .to_string();
 
         let (_, Json(bootstrap)) = bootstrap_onboarding(
-            State(state),
+            State(state.clone()),
             Json(BootstrapOnboardingRequest {
                 onboarding_secret,
                 node_id,
@@ -810,6 +897,23 @@ mod tests {
         assert!(bootstrap.wrapped_realm_private_key.is_none());
         assert!(bootstrap.delegation_signature.is_some());
         assert!(!bootstrap.onboarding_sync_ticket.is_empty());
+
+        let config = match state
+            .get_ctx()
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: byteview::ByteView::from(*realm_id.as_bytes()),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => RealmConfigDocument::from_bytes(&bytes).unwrap(),
+            other => panic!("unexpected realm config read result: {other:?}"),
+        };
+        assert!(config.has_node(bootstrap_node_id));
 
         net_handle.shutdown().await;
     }

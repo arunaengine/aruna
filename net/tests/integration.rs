@@ -247,7 +247,9 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
     assert!(status.bootstrap.dht_signed_resolve_attempts_total > 0);
     assert!(status.bootstrap.dht_signed_resolve_successes_total > 0);
     assert!(status.known_peer_addresses.iter().any(|peer| {
-        peer.node_id == node_b && peer.source == "memory_lookup" && !peer.addresses.is_empty()
+        peer.node_id == node_b
+            && peer.source.contains("memory_lookup")
+            && !peer.addresses.is_empty()
     }));
 
     handle_a.shutdown().await;

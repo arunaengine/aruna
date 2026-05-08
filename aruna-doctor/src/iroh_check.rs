@@ -6,8 +6,8 @@ use aruna_api::routes::info::{
 };
 use aruna_core::alpn::Alpn;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
-use iroh::endpoint::{PathId, presets};
-use iroh::{Endpoint, EndpointAddr, RelayMode, TransportAddr, Watcher};
+use iroh::endpoint::presets;
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr, Watcher};
 use serde::Serialize;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -98,7 +98,7 @@ async fn run_iroh_check(info_url: String, timeout: Duration) -> Result<IrohCheck
 
     let endpoint_started = Instant::now();
     let endpoint_addr = endpoint_addr_from_info(&endpoint_info)?;
-    let endpoint_addr = normalize_endpoint_addr(endpoint_addr, &info_url);
+    let endpoint_addr = normalize_endpoint_addr(endpoint_addr, &info_url)?;
     checks.push(ok_step("endpoint_addr", endpoint_started.elapsed()));
 
     let active = active_iroh_check(endpoint_addr.clone(), timeout, &mut checks).await?;
@@ -124,17 +124,28 @@ fn endpoint_addr_from_info(endpoint_info: &InfoResponse) -> Result<EndpointAddr,
         .map_err(|error| iroh_check_error("endpoint_addr", error))
 }
 
-fn normalize_endpoint_addr(endpoint_addr: EndpointAddr, info_url: &str) -> EndpointAddr {
+fn normalize_endpoint_addr(
+    endpoint_addr: EndpointAddr,
+    info_url: &str,
+) -> Result<EndpointAddr, CliError> {
     let replacement_ip = replacement_ip_from_url(info_url);
-    let addrs = endpoint_addr.addrs.into_iter().map(|addr| match addr {
-        TransportAddr::Ip(socket) if socket.ip().is_unspecified() => {
-            let ip = replacement_ip.unwrap_or_else(|| loopback_for(socket.ip()));
-            TransportAddr::Ip(SocketAddr::new(ip, socket.port()))
+    let mut addrs = Vec::with_capacity(endpoint_addr.addrs.len());
+    for addr in endpoint_addr.addrs {
+        match addr {
+            TransportAddr::Ip(socket) if socket.ip().is_unspecified() => {
+                let Some(ip) = replacement_ip else {
+                    return Err(iroh_check_error(
+                        "endpoint_addr",
+                        "target advertised a wildcard p2p address; use an IP-literal info URL or configure a dialable p2p address",
+                    ));
+                };
+                addrs.push(TransportAddr::Ip(SocketAddr::new(ip, socket.port())));
+            }
+            addr => addrs.push(addr),
         }
-        addr => addr,
-    });
+    }
 
-    EndpointAddr::from_parts(endpoint_addr.id, addrs)
+    Ok(EndpointAddr::from_parts(endpoint_addr.id, addrs))
 }
 
 async fn active_iroh_check(
@@ -143,8 +154,9 @@ async fn active_iroh_check(
     checks: &mut Vec<IrohCheckStep>,
 ) -> Result<ActiveIrohCheck, CliError> {
     let bind_addr = local_bind_addr_for(&endpoint_addr);
+    let relay_mode = relay_mode_for_target(&endpoint_addr)?;
     let endpoint_builder = Endpoint::builder(presets::Minimal)
-        .relay_mode(RelayMode::Disabled)
+        .relay_mode(relay_mode)
         .alpns(vec![Alpn::Dht.as_bytes().to_vec()])
         .bind_addr(bind_addr)
         .map_err(|error| iroh_check_error("bind", error))?;
@@ -207,17 +219,32 @@ async fn active_iroh_check_with_endpoint(
 
     let paths = path_statuses(&conn);
     let selected_path = paths.iter().find(|path| path.selected).cloned();
+    let rtt_ms = selected_path.as_ref().and_then(|path| path.rtt_ms);
     let active = ActiveIrohCheck {
         doctor_node_id: endpoint.id().to_string(),
         remote_id: conn.remote_id().to_string(),
         negotiated_alpn: String::from_utf8_lossy(conn.alpn()).to_string(),
-        rtt_ms: conn.rtt(PathId::ZERO).map(duration_ms),
+        rtt_ms,
         selected_path,
         paths,
     };
     conn.close(0u8.into(), b"aruna-doctor iroh check complete");
 
     Ok(active)
+}
+
+fn relay_mode_for_target(endpoint_addr: &EndpointAddr) -> Result<RelayMode, CliError> {
+    let relay_urls = endpoint_addr
+        .relay_urls()
+        .map(|url| url.to_string())
+        .collect::<Vec<_>>();
+    if relay_urls.is_empty() {
+        return Ok(RelayMode::Disabled);
+    }
+
+    let relays = RelayMap::try_from_iter(relay_urls.iter().map(|url| url.as_ref()))
+        .map_err(|error| iroh_check_error("relay", error))?;
+    Ok(RelayMode::Custom(relays))
 }
 
 async fn with_timeout<T, E>(
@@ -297,14 +324,11 @@ fn replacement_ip_from_url(info_url: &str) -> Option<IpAddr> {
         return Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
     host.parse().ok()
-}
-
-fn loopback_for(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-    }
 }
 
 fn transport_addr_to_string(addr: &TransportAddr) -> String {
@@ -451,7 +475,7 @@ mod tests {
             EndpointAddr::new(node_id).with_ip_addr("0.0.0.0:3001".parse().unwrap());
 
         let normalized =
-            normalize_endpoint_addr(endpoint_addr, "http://127.0.0.1:3000/api/v1/info");
+            normalize_endpoint_addr(endpoint_addr, "http://127.0.0.1:3000/api/v1/info").unwrap();
 
         assert!(
             normalized
@@ -465,13 +489,32 @@ mod tests {
         let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
         let endpoint_addr = EndpointAddr::new(node_id).with_ip_addr("[::]:3001".parse().unwrap());
 
-        let normalized = normalize_endpoint_addr(endpoint_addr, "http://[::1]:3000/api/v1/info");
+        let normalized =
+            normalize_endpoint_addr(endpoint_addr, "http://[::1]:3000/api/v1/info").unwrap();
 
         assert!(
             normalized
                 .ip_addrs()
                 .any(|addr| *addr == "[::1]:3001".parse::<SocketAddr>().unwrap())
         );
+    }
+
+    #[test]
+    fn normalize_endpoint_addr_rejects_dns_wildcard() {
+        let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
+        let endpoint_addr =
+            EndpointAddr::new(node_id).with_ip_addr("0.0.0.0:3001".parse().unwrap());
+
+        let error =
+            normalize_endpoint_addr(endpoint_addr, "https://node.example/api/v1/info").unwrap_err();
+
+        assert!(matches!(
+            error,
+            CliError::IrohCheck {
+                step: "endpoint_addr",
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
