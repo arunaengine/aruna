@@ -263,6 +263,7 @@ mod tests {
             ("S3_HOST", "localhost".to_string()),
             ("S3_ADDRESS", "127.0.0.1".to_string()),
             ("OIDC_PROVIDER_IDS", "".to_string()),
+            ("ONBOARDING_SECRET", "".to_string()),
         ]);
 
         let (config, storage_handle) = load().await.unwrap();
@@ -354,8 +355,9 @@ mod tests {
         assert_eq!(http_base_url(addr), "http://[::1]:3000");
     }
 
-    #[test]
-    fn config_view_marks_onboarding_secret_presence_without_exposing_secret() {
+    #[tokio::test]
+    async fn config_view_marks_onboarding_secret_presence_without_exposing_secret() {
+        let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[
             ("STORAGE_PATH", "/tmp/storage".to_string()),
             ("ONBOARDING_SECRET", "secret".to_string()),
