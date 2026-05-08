@@ -243,8 +243,7 @@ fn target_output(endpoint_info: &InfoResponse, endpoint_addr: &EndpointAddr) -> 
     IrohCheckTarget {
         realm_id: endpoint_info.net_state.realm_id.clone(),
         node_id: endpoint_info.net_state.node_id.clone(),
-        endpoint_addr: serde_json::to_value(endpoint_addr)
-            .unwrap_or_else(|_| serde_json::Value::Null),
+        endpoint_addr: serde_json::to_value(endpoint_addr).unwrap_or(serde_json::Value::Null),
         addresses: endpoint_addr
             .addrs
             .iter()
