@@ -29,12 +29,20 @@ pub enum CliError {
     JsonError(#[from] serde_json::Error),
     #[error(transparent)]
     ReqwestError(#[from] reqwest::Error),
+    #[error("request to {url} failed")]
+    InfoRequest {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
     #[error(transparent)]
     DotenvError(#[from] dotenvy::Error),
     #[error(transparent)]
     OnboardingSecretError(#[from] OnboardingSecretError),
     #[error(transparent)]
     AddrParseError(#[from] std::net::AddrParseError),
+    #[error(transparent)]
+    ParseIntError(#[from] std::num::ParseIntError),
     #[error(transparent)]
     SetupError(#[from] Box<SetupError>),
     #[error(transparent)]

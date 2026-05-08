@@ -8,7 +8,7 @@ use bao_tree::BlockSize;
 use crossfire::{mpsc, oneshot};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use ulid::Ulid;
 
 mod backend;
@@ -40,6 +40,7 @@ pub struct BlobHandler {
     storage: StorageHandle,
     net: NetHandle,
     connections: Arc<Mutex<HashMap<Ulid, BiStream>>>,
+    operator_status: Arc<RwLock<aruna_core::structs::Status>>,
 }
 
 #[derive(Clone, Debug)]
