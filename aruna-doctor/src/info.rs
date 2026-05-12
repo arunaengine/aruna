@@ -424,24 +424,19 @@ mod tests {
         let info = fetch_info(node.http_addr).await.unwrap();
 
         assert_eq!(
-            info.net_state.status,
+            info.services.network.status,
             aruna_api::routes::info::ServiceStatus::Available
         );
-        assert!(info.net_state.discovery_methods.is_empty());
-        assert_eq!(info.net_state.relay_method.as_deref(), Some("none"));
+        assert!(info.services.network.discovery.is_empty());
+        assert_eq!(info.services.network.relay.as_deref(), Some("none"));
         assert_eq!(
-            info.interface_status.rest.status,
+            info.services.interfaces.rest.status,
             aruna_api::routes::info::ServiceStatus::Available
         );
-        let base_url = format!("http://{}", node.http_addr);
-        let info_url = format!("http://{}/api/v1/info", node.http_addr);
+        let api_url = format!("http://{}/api/v1", node.http_addr);
         assert_eq!(
-            info.interface_status.rest.base_url.as_deref(),
-            Some(base_url.as_str())
-        );
-        assert_eq!(
-            info.interface_status.rest.info_url.as_deref(),
-            Some(info_url.as_str())
+            info.services.interfaces.rest.url.as_deref(),
+            Some(api_url.as_str())
         );
         node.shutdown().await;
     }

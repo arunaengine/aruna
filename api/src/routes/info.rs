@@ -1,4 +1,6 @@
 use crate::server_state::ServerState;
+use aruna_core::alpn::Alpn;
+use aruna_core::structs::{PeerConnectionStatus, RequestSummaryState};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -20,17 +22,18 @@ pub fn router() -> Router<Arc<ServerState>> {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct InfoResponse {
-    pub node_info: LocalNodeInfo,
-    pub net_state: NetStatus,
-    pub blob_status: BlobStatus,
-    pub interface_status: InterfaceStatus,
-    pub database_status: DatabaseStatus,
+    pub node: NodeStatus,
+    pub my_addresses: Vec<String>,
+    pub connections: Vec<PeerConnectionInfo>,
+    pub services: ServicesStatus,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct LocalNodeInfo {
+pub struct NodeStatus {
+    pub status: ServiceStatus,
     pub realm_id: String,
-    pub node_id: String,
+    pub peer_id: String,
     pub capabilities: NodeCapabilityKind,
 }
 
@@ -71,135 +74,101 @@ impl From<aruna_core::structs::Status> for ServiceStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct NetStatus {
+pub struct PeerConnectionInfo {
+    pub peer_id: String,
+    pub status: PeerStatus,
+    pub active_addresses: Vec<ConnectionAddressInfo>,
+    pub last_error: Option<String>,
+    pub next_retry_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerStatus {
+    Connected,
+    Known,
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ConnectionAddressInfo {
+    pub address: String,
+    pub rtt_ms: Option<u64>,
+    pub protocol_connections: Vec<ProtocolConnectionInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ProtocolConnectionInfo {
+    pub connection_id: u64,
+    pub protocol: Option<String>,
+    pub side: String,
+    pub status: ProtocolConnectionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolConnectionStatus {
+    Open,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct ServicesStatus {
+    pub network: NetworkServiceStatus,
+    pub blob: BlobServiceStatus,
+    pub database: DatabaseServiceStatus,
+    pub interfaces: InterfaceServicesStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct NetworkServiceStatus {
     pub status: ServiceStatus,
-    pub realm_id: Option<String>,
-    pub node_id: Option<String>,
-    pub discovery_methods: Vec<String>,
-    pub discovery_dns_origins: Vec<String>,
-    pub relay_method: Option<String>,
+    pub discovery: Vec<String>,
+    pub relay: Option<String>,
     pub relay_urls: Vec<String>,
-    pub peer_nodes: Vec<String>,
-    pub peer_endpoints: Vec<String>,
-    pub endpoint_addr: Option<serde_json::Value>,
-    pub monitor: ConnectionMonitorStatus,
-    pub bootstrap: BootstrapDiagnosticsStatus,
-    pub peer_connectivity: Vec<PeerConnectivityStatus>,
-    pub known_peer_addresses: Vec<KnownPeerAddressStatus>,
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ConnectionMonitorStatus {
-    pub open_connections: Vec<OpenConnection>,
-    pub outbound_connection_attempts_total: u64,
-    pub observed_connections_total: u64,
-    pub dropped_observations_total: u64,
-    pub closed_connections_total: u64,
-    pub close_task_errors_total: u64,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct BootstrapDiagnosticsStatus {
-    pub attempts_total: u64,
-    pub successes_total: u64,
-    pub failures_total: u64,
-    pub last_attempted_peer_count: usize,
-    pub last_error: Option<String>,
-    pub last_successful: bool,
     pub routing_table_size: Option<usize>,
-    pub temporary_bootstrap_active: bool,
-    pub dht_signed_publish_attempts_total: u64,
-    pub dht_signed_publish_successes_total: u64,
-    pub dht_signed_publish_failures_total: u64,
-    pub dht_signed_resolve_attempts_total: u64,
-    pub dht_signed_resolve_successes_total: u64,
-    pub dht_signed_resolve_failures_total: u64,
-    pub dht_signed_last_error: Option<String>,
+    pub requests: RequestSummary,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct KnownPeerAddressStatus {
-    pub node_id: String,
-    pub source: String,
-    pub endpoint_addr: Option<serde_json::Value>,
-    pub addresses: Vec<String>,
-    pub has_direct_ip: bool,
-    pub has_relay: bool,
-    pub active_addresses: usize,
-    pub inactive_addresses: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PeerConnectivityStatus {
-    pub node_id: String,
-    pub source: String,
-    pub attempts_total: u64,
-    pub successes_total: u64,
-    pub failures_total: u64,
-    pub consecutive_failures: u64,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct RequestSummary {
+    pub total: u64,
+    pub failure_rate: f64,
     pub last_error: Option<String>,
-    pub last_successful: bool,
-    pub next_retry_in_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct BlobStatus {
+pub struct BlobServiceStatus {
     pub status: ServiceStatus,
-    pub backend_type: Option<String>,
+    pub backend: Option<String>,
     pub max_bucket_size: Option<u64>,
     pub multipart_bucket: Option<String>,
-    pub timeouts: Option<TimeoutConfig>,
+    pub timeouts_secs: Option<TimeoutConfigSecs>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct TimeoutConfig {
-    pub control_plane_connect_timeout: String,
-    pub control_plane_io_timeout: String,
-    pub transfer_idle_timeout: String,
+pub struct TimeoutConfigSecs {
+    pub connect: u64,
+    pub io: u64,
+    pub transfer_idle: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct DatabaseServiceStatus {
+    pub status: ServiceStatus,
+    pub requests: RequestSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct InterfaceServicesStatus {
+    pub rest: InterfaceStatus,
+    pub s3: InterfaceStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct InterfaceStatus {
-    pub rest: RestInterfaceStatus,
-    pub s3: S3InterfaceStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct RestInterfaceStatus {
     pub status: ServiceStatus,
-    pub bind_address: Option<String>,
-    pub base_url: Option<String>,
-    pub api_base_url: Option<String>,
-    pub info_url: Option<String>,
-    pub swagger_ui_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct S3InterfaceStatus {
-    pub status: ServiceStatus,
-    pub bind_address: Option<String>,
-    pub base_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct DatabaseStatus {
-    pub status: ServiceStatus,
-    pub requests_total: u64,
-    pub errors_total: u64,
-    pub conflicts_total: u64,
-    pub failed_total: u64,
-    pub error_rate: f64,
-    pub channel_closed: bool,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct OpenConnection {
-    pub connection_id: u64,
-    pub alpn: Option<String>,
-    pub remote_id: String,
-    pub side: String,
+    pub bind: Option<String>,
+    pub url: Option<String>,
 }
 
 #[utoipa::path(
@@ -211,231 +180,219 @@ pub struct OpenConnection {
     )
 )]
 pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Json<InfoResponse>) {
-    let net_state = match &state.get_ctx().net_handle {
+    let (network, my_addresses, connections, warnings) = match &state.get_ctx().net_handle {
         Some(net) => {
             let info = net.get_status().await;
-            NetStatus {
-                status: ServiceStatus::Available,
-                realm_id: Some(info.realm_id.to_string()),
-                node_id: Some(info.node_id.to_string()),
-                discovery_methods: info.discovery_methods,
-                discovery_dns_origins: info.discovery_dns_origins,
-                relay_method: Some(info.relay_method),
-                relay_urls: info.relay_urls,
-                peer_nodes: info.peer_nodes.iter().map(|n| n.to_string()).collect(),
-                peer_endpoints: info.peer_endpoints,
-                endpoint_addr: serde_json::to_value(&info.endpoint_addr).ok(),
-                monitor: ConnectionMonitorStatus {
-                    open_connections: info
-                        .monitor
-                        .open_connections
-                        .iter()
-                        .map(|c| OpenConnection {
-                            connection_id: c.connection_id,
-                            alpn: c.alpn.map(|a| a.to_string()),
-                            remote_id: c.remote_id.to_string(),
-                            side: match c.side {
-                                iroh::endpoint::Side::Client => "Client".to_string(),
-                                iroh::endpoint::Side::Server => "Server".to_string(),
-                            },
-                        })
-                        .collect(),
-                    outbound_connection_attempts_total: info
-                        .monitor
-                        .outbound_connection_attempts_total,
-                    observed_connections_total: info.monitor.observed_connections_total,
-                    dropped_observations_total: info.monitor.dropped_observations_total,
-                    closed_connections_total: info.monitor.closed_connections_total,
-                    close_task_errors_total: info.monitor.close_task_errors_total,
+            (
+                NetworkServiceStatus {
+                    status: ServiceStatus::Available,
+                    discovery: info.discovery_methods,
+                    relay: Some(info.relay_method),
+                    relay_urls: info.relay_urls,
+                    routing_table_size: info.routing_table_size,
+                    requests: RequestSummary::from_state(&info.requests),
                 },
-                bootstrap: BootstrapDiagnosticsStatus {
-                    attempts_total: info.bootstrap.attempts_total,
-                    successes_total: info.bootstrap.successes_total,
-                    failures_total: info.bootstrap.failures_total,
-                    last_attempted_peer_count: info.bootstrap.last_attempted_peer_count,
-                    last_error: info.bootstrap.last_error,
-                    last_successful: info.bootstrap.last_successful,
-                    routing_table_size: info.bootstrap.routing_table_size,
-                    temporary_bootstrap_active: info.bootstrap.temporary_bootstrap_active,
-                    dht_signed_publish_attempts_total: info
-                        .bootstrap
-                        .dht_signed_publish_attempts_total,
-                    dht_signed_publish_successes_total: info
-                        .bootstrap
-                        .dht_signed_publish_successes_total,
-                    dht_signed_publish_failures_total: info
-                        .bootstrap
-                        .dht_signed_publish_failures_total,
-                    dht_signed_resolve_attempts_total: info
-                        .bootstrap
-                        .dht_signed_resolve_attempts_total,
-                    dht_signed_resolve_successes_total: info
-                        .bootstrap
-                        .dht_signed_resolve_successes_total,
-                    dht_signed_resolve_failures_total: info
-                        .bootstrap
-                        .dht_signed_resolve_failures_total,
-                    dht_signed_last_error: info.bootstrap.dht_signed_last_error,
-                },
-                peer_connectivity: info
-                    .peer_connectivity
+                info.endpoint_addr
+                    .addrs
                     .iter()
-                    .map(|peer| PeerConnectivityStatus {
-                        node_id: peer.node_id.to_string(),
-                        source: peer.source.clone(),
-                        attempts_total: peer.attempts_total,
-                        successes_total: peer.successes_total,
-                        failures_total: peer.failures_total,
-                        consecutive_failures: peer.consecutive_failures,
+                    .map(transport_addr_to_string)
+                    .collect(),
+                info.connections
+                    .iter()
+                    .map(|peer| PeerConnectionInfo {
+                        peer_id: peer.node_id.to_string(),
+                        status: PeerStatus::from(peer.status),
+                        active_addresses: peer
+                            .active_addresses
+                            .iter()
+                            .map(|address| ConnectionAddressInfo {
+                                address: address.address.clone(),
+                                rtt_ms: address.rtt_ms,
+                                protocol_connections: address
+                                    .protocol_connections
+                                    .iter()
+                                    .map(|connection| ProtocolConnectionInfo {
+                                        connection_id: connection.connection_id,
+                                        protocol: protocol_name(connection.alpn),
+                                        side: side_name(connection.side),
+                                        status: ProtocolConnectionStatus::Open,
+                                    })
+                                    .collect(),
+                            })
+                            .collect(),
                         last_error: peer.last_error.clone(),
-                        last_successful: peer.last_successful,
-                        next_retry_in_secs: peer.next_retry_in_secs,
+                        next_retry_secs: peer.next_retry_in_secs,
                     })
                     .collect(),
-                known_peer_addresses: info
-                    .known_peer_addresses
-                    .iter()
-                    .map(|peer| KnownPeerAddressStatus {
-                        node_id: peer.node_id.to_string(),
-                        source: peer.source.clone(),
-                        endpoint_addr: peer
-                            .endpoint_addr
-                            .as_ref()
-                            .and_then(|addr| serde_json::to_value(addr).ok()),
-                        addresses: peer.addresses.clone(),
-                        has_direct_ip: peer.has_direct_ip,
-                        has_relay: peer.has_relay,
-                        active_addresses: peer.active_addresses,
-                        inactive_addresses: peer.inactive_addresses,
-                    })
-                    .collect(),
-                warnings: info.warnings,
-            }
+                info.warnings,
+            )
         }
-        None => NetStatus {
-            status: ServiceStatus::Unavailable,
-            realm_id: None,
-            node_id: None,
-            discovery_methods: Vec::new(),
-            discovery_dns_origins: Vec::new(),
-            relay_method: None,
-            relay_urls: Vec::new(),
-            peer_nodes: Vec::new(),
-            peer_endpoints: Vec::new(),
-            endpoint_addr: None,
-            monitor: ConnectionMonitorStatus::default(),
-            bootstrap: BootstrapDiagnosticsStatus::default(),
-            peer_connectivity: Vec::new(),
-            known_peer_addresses: Vec::new(),
-            warnings: Vec::new(),
-        },
+        None => (
+            NetworkServiceStatus {
+                status: ServiceStatus::Unavailable,
+                discovery: Vec::new(),
+                relay: None,
+                relay_urls: Vec::new(),
+                routing_table_size: None,
+                requests: RequestSummary::default(),
+            },
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
     };
-    let blob_status = match &state.get_ctx().blob_handle {
+
+    let blob = match &state.get_ctx().blob_handle {
         Some(blob) => {
             let info = blob.get_status().await;
-            BlobStatus {
+            BlobServiceStatus {
                 status: ServiceStatus::from(info.status),
-                backend_type: Some(info.backend_type.to_string()),
+                backend: Some(info.backend_type.to_string()),
                 max_bucket_size: info.max_bucket_size,
                 multipart_bucket: info.multipart_bucket,
-                timeouts: Some(TimeoutConfig {
-                    control_plane_connect_timeout: format!(
-                        "{}s",
-                        info.timeouts.control_plane_connect_timeout.as_secs()
-                    ),
-                    control_plane_io_timeout: format!(
-                        "{}s",
-                        info.timeouts.control_plane_io_timeout.as_secs()
-                    ),
-                    transfer_idle_timeout: format!(
-                        "{}s",
-                        info.timeouts.transfer_idle_timeout.as_secs()
-                    ),
+                timeouts_secs: Some(TimeoutConfigSecs {
+                    connect: info.timeouts.control_plane_connect_timeout.as_secs(),
+                    io: info.timeouts.control_plane_io_timeout.as_secs(),
+                    transfer_idle: info.timeouts.transfer_idle_timeout.as_secs(),
                 }),
             }
         }
-        None => BlobStatus {
+        None => BlobServiceStatus {
             status: ServiceStatus::NotConfigured,
-            backend_type: None,
+            backend: None,
             max_bucket_size: None,
             multipart_bucket: None,
-            timeouts: None,
+            timeouts_secs: None,
         },
     };
+
     let interface_runtime = state.interface_state().await;
-    let interface_status = InterfaceStatus {
+    let interfaces = InterfaceServicesStatus {
         rest: match interface_runtime.rest {
-            Some(rest) => RestInterfaceStatus {
+            Some(rest) => InterfaceStatus {
                 status: ServiceStatus::Available,
-                bind_address: Some(rest.bind_address.to_string()),
-                base_url: Some(rest.base_url),
-                api_base_url: Some(rest.api_base_url),
-                info_url: Some(rest.info_url),
-                swagger_ui_url: Some(rest.swagger_ui_url),
+                bind: Some(rest.bind_address.to_string()),
+                url: Some(rest.api_base_url),
             },
-            None => RestInterfaceStatus {
+            None => InterfaceStatus {
                 status: ServiceStatus::Unavailable,
-                bind_address: None,
-                base_url: None,
-                api_base_url: None,
-                info_url: None,
-                swagger_ui_url: None,
+                bind: None,
+                url: None,
             },
         },
         s3: match interface_runtime.s3 {
-            Some(s3) => S3InterfaceStatus {
+            Some(s3) => InterfaceStatus {
                 status: ServiceStatus::Available,
-                bind_address: Some(s3.bind_address.to_string()),
-                base_url: Some(s3.base_url),
+                bind: Some(s3.bind_address.to_string()),
+                url: Some(s3.base_url),
             },
-            None => S3InterfaceStatus {
+            None => InterfaceStatus {
                 status: ServiceStatus::Unavailable,
-                bind_address: None,
-                base_url: None,
+                bind: None,
+                url: None,
             },
         },
     };
+
     let storage_metrics = state.get_ctx().storage_handle.snapshot_metrics();
-    let database_status = DatabaseStatus {
+    let database = DatabaseServiceStatus {
         status: if storage_metrics.channel_closed {
             ServiceStatus::Unavailable
         } else {
             ServiceStatus::Available
         },
-        requests_total: storage_metrics.requests_total,
-        errors_total: storage_metrics.errors_total,
-        conflicts_total: storage_metrics.conflicts_total,
-        failed_total: storage_metrics.failed_total,
-        error_rate: if storage_metrics.requests_total == 0 {
-            0.0
-        } else {
-            storage_metrics.failed_total as f64 / storage_metrics.requests_total as f64
-        },
-        channel_closed: storage_metrics.channel_closed,
-        last_error: storage_metrics.last_error,
+        requests: RequestSummary::from_counts(
+            storage_metrics.requests_total,
+            storage_metrics.failed_total,
+            storage_metrics.last_error,
+        ),
     };
+
     (
         StatusCode::OK,
         Json(InfoResponse {
-            node_info: LocalNodeInfo {
+            node: NodeStatus {
+                status: ServiceStatus::Available,
                 realm_id: state.get_realm_id().to_string(),
-                node_id: state.get_node_id().to_string(),
+                peer_id: state.get_node_id().to_string(),
                 capabilities: NodeCapabilityKind::from(state.node_capabilities()),
             },
-            net_state,
-            blob_status,
-            interface_status,
-            database_status,
+            my_addresses,
+            connections,
+            services: ServicesStatus {
+                network,
+                blob,
+                database,
+                interfaces,
+            },
+            warnings,
         }),
     )
+}
+
+impl RequestSummary {
+    fn default() -> Self {
+        Self::from_counts(0, 0, None)
+    }
+
+    fn from_state(state: &RequestSummaryState) -> Self {
+        Self::from_counts(state.total, state.failures, state.last_error.clone())
+    }
+
+    fn from_counts(total: u64, failures: u64, last_error: Option<String>) -> Self {
+        Self {
+            total,
+            failure_rate: if total == 0 {
+                0.0
+            } else {
+                failures as f64 / total as f64
+            },
+            last_error,
+        }
+    }
+}
+
+impl From<PeerConnectionStatus> for PeerStatus {
+    fn from(status: PeerConnectionStatus) -> Self {
+        match status {
+            PeerConnectionStatus::Connected => Self::Connected,
+            PeerConnectionStatus::Known => Self::Known,
+            PeerConnectionStatus::Unreachable => Self::Unreachable,
+        }
+    }
+}
+
+fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
+    alpn.map(|alpn| match alpn {
+        Alpn::Dht => "dht".to_string(),
+        Alpn::Gossip => "gossip".to_string(),
+        Alpn::Bao => "bao".to_string(),
+        Alpn::Automerge => "automerge".to_string(),
+        Alpn::Metadata => "metadata".to_string(),
+    })
+}
+
+fn side_name(side: iroh::endpoint::Side) -> String {
+    match side {
+        iroh::endpoint::Side::Client => "client".to_string(),
+        iroh::endpoint::Side::Server => "server".to_string(),
+    }
+}
+
+fn transport_addr_to_string(addr: &iroh::TransportAddr) -> String {
+    match addr {
+        iroh::TransportAddr::Ip(addr) => addr.to_string(),
+        iroh::TransportAddr::Relay(url) => url.to_string(),
+        _ => format!("{addr:?}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobStatus, BootstrapDiagnosticsStatus, ConnectionMonitorStatus, DatabaseStatus,
-        InfoResponse, InterfaceStatus, LocalNodeInfo, NetStatus, NodeCapabilityKind,
-        PeerConnectivityStatus, RestInterfaceStatus, S3InterfaceStatus, ServiceStatus, get_info,
+        BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
+        InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, RequestSummary,
+        ServiceStatus, ServicesStatus, get_info,
     };
     use crate::openapi::ApiDoc;
     use crate::server_state::ServerState;
@@ -486,9 +443,10 @@ mod tests {
     async fn get_info_returns_unavailable_optional_statuses_when_handles_are_missing() {
         let (state, _tempdir) = setup_state().await;
         let baseline = state.get_ctx().storage_handle.snapshot_metrics();
-        let expected_node_info = LocalNodeInfo {
+        let expected_node = NodeStatus {
+            status: ServiceStatus::Available,
             realm_id: state.get_realm_id().to_string(),
-            node_id: state.get_node_id().to_string(),
+            peer_id: state.get_node_id().to_string(),
             capabilities: NodeCapabilityKind::Local,
         };
 
@@ -498,60 +456,55 @@ mod tests {
         assert_eq!(
             response,
             InfoResponse {
-                node_info: expected_node_info,
-                net_state: NetStatus {
-                    status: ServiceStatus::Unavailable,
-                    realm_id: None,
-                    node_id: None,
-                    discovery_methods: Vec::new(),
-                    discovery_dns_origins: Vec::new(),
-                    relay_method: None,
-                    relay_urls: Vec::new(),
-                    peer_nodes: Vec::new(),
-                    peer_endpoints: Vec::new(),
-                    endpoint_addr: None,
-                    monitor: ConnectionMonitorStatus::default(),
-                    bootstrap: BootstrapDiagnosticsStatus::default(),
-                    peer_connectivity: Vec::<PeerConnectivityStatus>::new(),
-                    known_peer_addresses: Vec::new(),
-                    warnings: Vec::new(),
-                },
-                blob_status: BlobStatus {
-                    status: ServiceStatus::NotConfigured,
-                    backend_type: None,
-                    max_bucket_size: None,
-                    multipart_bucket: None,
-                    timeouts: None,
-                },
-                interface_status: InterfaceStatus {
-                    rest: RestInterfaceStatus {
+                node: expected_node,
+                my_addresses: Vec::new(),
+                connections: Vec::new(),
+                services: ServicesStatus {
+                    network: NetworkServiceStatus {
                         status: ServiceStatus::Unavailable,
-                        bind_address: None,
-                        base_url: None,
-                        api_base_url: None,
-                        info_url: None,
-                        swagger_ui_url: None,
+                        discovery: Vec::new(),
+                        relay: None,
+                        relay_urls: Vec::new(),
+                        routing_table_size: None,
+                        requests: RequestSummary {
+                            total: 0,
+                            failure_rate: 0.0,
+                            last_error: None,
+                        },
                     },
-                    s3: S3InterfaceStatus {
-                        status: ServiceStatus::Unavailable,
-                        bind_address: None,
-                        base_url: None,
+                    blob: BlobServiceStatus {
+                        status: ServiceStatus::NotConfigured,
+                        backend: None,
+                        max_bucket_size: None,
+                        multipart_bucket: None,
+                        timeouts_secs: None,
+                    },
+                    database: DatabaseServiceStatus {
+                        status: ServiceStatus::Available,
+                        requests: RequestSummary {
+                            total: baseline.requests_total,
+                            failure_rate: if baseline.requests_total == 0 {
+                                0.0
+                            } else {
+                                baseline.failed_total as f64 / baseline.requests_total as f64
+                            },
+                            last_error: baseline.last_error,
+                        },
+                    },
+                    interfaces: InterfaceServicesStatus {
+                        rest: InterfaceStatus {
+                            status: ServiceStatus::Unavailable,
+                            bind: None,
+                            url: None,
+                        },
+                        s3: InterfaceStatus {
+                            status: ServiceStatus::Unavailable,
+                            bind: None,
+                            url: None,
+                        },
                     },
                 },
-                database_status: DatabaseStatus {
-                    status: ServiceStatus::Available,
-                    requests_total: baseline.requests_total,
-                    errors_total: baseline.errors_total,
-                    conflicts_total: baseline.conflicts_total,
-                    failed_total: baseline.failed_total,
-                    error_rate: if baseline.requests_total == 0 {
-                        0.0
-                    } else {
-                        baseline.failed_total as f64 / baseline.requests_total as f64
-                    },
-                    channel_closed: baseline.channel_closed,
-                    last_error: baseline.last_error,
-                },
+                warnings: Vec::new(),
             }
         );
     }
@@ -570,20 +523,17 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            response.interface_status,
-            InterfaceStatus {
-                rest: RestInterfaceStatus {
+            response.services.interfaces,
+            InterfaceServicesStatus {
+                rest: InterfaceStatus {
                     status: ServiceStatus::Available,
-                    bind_address: Some("0.0.0.0:3000".to_string()),
-                    base_url: Some("http://127.0.0.1:3000".to_string()),
-                    api_base_url: Some("http://127.0.0.1:3000/api/v1".to_string()),
-                    info_url: Some("http://127.0.0.1:3000/api/v1/info".to_string()),
-                    swagger_ui_url: Some("http://127.0.0.1:3000/swagger-ui".to_string()),
+                    bind: Some("0.0.0.0:3000".to_string()),
+                    url: Some("http://127.0.0.1:3000/api/v1".to_string()),
                 },
-                s3: S3InterfaceStatus {
+                s3: InterfaceStatus {
                     status: ServiceStatus::Available,
-                    bind_address: Some("0.0.0.0:1337".to_string()),
-                    base_url: Some("http://localhost:1337".to_string()),
+                    bind: Some("0.0.0.0:1337".to_string()),
+                    url: Some("http://localhost:1337".to_string()),
                 },
             }
         );
@@ -608,17 +558,15 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
-            response.database_status,
-            DatabaseStatus {
+            response.services.database,
+            DatabaseServiceStatus {
                 status: ServiceStatus::Available,
-                requests_total: baseline.requests_total + 1,
-                errors_total: baseline.errors_total + 1,
-                conflicts_total: baseline.conflicts_total,
-                failed_total: baseline.failed_total + 1,
-                error_rate: (baseline.failed_total + 1) as f64
-                    / (baseline.requests_total + 1) as f64,
-                channel_closed: false,
-                last_error: Some("Transaction not found".to_string()),
+                requests: RequestSummary {
+                    total: baseline.requests_total + 1,
+                    failure_rate: (baseline.failed_total + 1) as f64
+                        / (baseline.requests_total + 1) as f64,
+                    last_error: Some("Transaction not found".to_string()),
+                },
             }
         );
     }

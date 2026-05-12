@@ -2,13 +2,11 @@ use aruna_core::{
     alpn::Alpn,
     structs::{ConnectionMonitorState, OpenConnection},
 };
+use iroh::TransportAddr;
 use iroh::endpoint::{
     AfterHandshakeOutcome, BeforeConnectOutcome, ConnectionInfo, EndpointHooks, Side,
 };
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 use tokio::{
     sync::{
         Mutex,
@@ -23,24 +21,23 @@ const MONITOR_CHANNEL_CAPACITY: usize = 4096;
 
 #[derive(Clone, Debug)]
 pub struct Monitor {
-    connections: Arc<Mutex<Vec<OpenConnection>>>,
-    stats: Arc<MonitorStats>,
+    connections: Arc<Mutex<Vec<TrackedConnection>>>,
     tx: Sender<ObservedConnection>,
     _task: Arc<AbortOnDropHandle<()>>,
-}
-
-#[derive(Debug, Default)]
-struct MonitorStats {
-    outbound_connection_attempts_total: AtomicU64,
-    observed_connections_total: AtomicU64,
-    dropped_observations_total: AtomicU64,
-    closed_connections_total: AtomicU64,
-    close_task_errors_total: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
 struct ObservedConnection {
     alpn: Vec<u8>,
+    remote_id: iroh::EndpointId,
+    side: Side,
+    handle: ConnectionInfo,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedConnection {
+    connection_id: u64,
+    alpn: Option<Alpn>,
     remote_id: iroh::EndpointId,
     side: Side,
     handle: ConnectionInfo,
@@ -52,9 +49,6 @@ impl EndpointHooks for Monitor {
         remote_addr: &iroh::EndpointAddr,
         alpn: &[u8],
     ) -> BeforeConnectOutcome {
-        self.stats
-            .outbound_connection_attempts_total
-            .fetch_add(1, Ordering::Relaxed);
         trace!(
             node_id = %remote_addr.id,
             ?alpn,
@@ -71,13 +65,7 @@ impl EndpointHooks for Monitor {
             side: conn.side(),
             handle: conn.clone(),
         };
-        self.stats
-            .observed_connections_total
-            .fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.tx.try_send(info) {
-            self.stats
-                .dropped_observations_total
-                .fetch_add(1, Ordering::Relaxed);
             match error {
                 TrySendError::Full(_) => trace!("connection monitor channel full"),
                 TrySendError::Closed(_) => trace!("connection monitor task is unavailable"),
@@ -90,34 +78,30 @@ impl EndpointHooks for Monitor {
 impl Monitor {
     pub fn new() -> Self {
         let connections = Arc::new(Mutex::new(Vec::new()));
-        let stats = Arc::new(MonitorStats::default());
         let (tx, rx) = tokio::sync::mpsc::channel(MONITOR_CHANNEL_CAPACITY);
         let conn = connections.clone();
-        let task =
-            tokio::spawn(Self::run(conn, stats.clone(), rx).instrument(info_span!("watcher")));
+        let task = tokio::spawn(Self::run(conn, rx).instrument(info_span!("watcher")));
         Self {
             connections,
-            stats,
             tx,
             _task: Arc::new(AbortOnDropHandle::new(task)),
         }
     }
 
     async fn run(
-        connections: Arc<Mutex<Vec<OpenConnection>>>,
-        stats: Arc<MonitorStats>,
+        connections: Arc<Mutex<Vec<TrackedConnection>>>,
         mut rx: Receiver<ObservedConnection>,
     ) {
         let mut tasks = JoinSet::new();
-        let next_connection_id = AtomicU64::new(1);
+        let mut next_connection_id = 1u64;
         let conn = connections.clone();
         loop {
             tokio::select! {
                 Some(ObservedConnection { alpn, remote_id, side, handle }) = rx.recv() => {
-                    let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
-                    conn.lock().await.push(OpenConnection{ connection_id, alpn: Alpn::from_bytes(&alpn), remote_id, side });
+                    let connection_id = next_connection_id;
+                    next_connection_id = next_connection_id.saturating_add(1);
+                    conn.lock().await.push(TrackedConnection{ connection_id, alpn: Alpn::from_bytes(&alpn), remote_id, side, handle: handle.clone() });
                     let conn_clone = conn.clone();
-                    let stats = stats.clone();
                     tasks.spawn(async move {
                         match handle.closed().await {
                             Some((error, state)) => {
@@ -130,13 +114,11 @@ impl Monitor {
                             }
 
                         };
-                        stats.closed_connections_total.fetch_add(1, Ordering::Relaxed);
                         conn_clone.lock().await.retain(|mx| mx.connection_id != connection_id);
                     }.instrument(tracing::Span::current()));
                 }
                 Some(res) = tasks.join_next(), if !tasks.is_empty() => {
                     if let Err(error) = res {
-                        stats.close_task_errors_total.fetch_add(1, Ordering::Relaxed);
                         warn!(?error, "connection close watcher task failed");
                     }
                 },
@@ -146,23 +128,39 @@ impl Monitor {
     }
 
     pub async fn get_status(&self) -> ConnectionMonitorState {
+        let connections = self.connections.lock().await;
         ConnectionMonitorState {
-            open_connections: self.connections.lock().await.clone(),
-            outbound_connection_attempts_total: self
-                .stats
-                .outbound_connection_attempts_total
-                .load(Ordering::Relaxed),
-            observed_connections_total: self
-                .stats
-                .observed_connections_total
-                .load(Ordering::Relaxed),
-            dropped_observations_total: self
-                .stats
-                .dropped_observations_total
-                .load(Ordering::Relaxed),
-            closed_connections_total: self.stats.closed_connections_total.load(Ordering::Relaxed),
-            close_task_errors_total: self.stats.close_task_errors_total.load(Ordering::Relaxed),
+            open_connections: connections
+                .iter()
+                .map(|connection| {
+                    let selected_path = connection.handle.selected_path();
+                    let selected_address = selected_path
+                        .as_ref()
+                        .map(|path| transport_addr_to_string(path.remote_addr()));
+                    let rtt_ms = selected_path
+                        .as_ref()
+                        .and_then(|path| path.rtt())
+                        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
+
+                    OpenConnection {
+                        connection_id: connection.connection_id,
+                        alpn: connection.alpn,
+                        remote_id: connection.remote_id,
+                        side: connection.side,
+                        selected_address,
+                        rtt_ms,
+                    }
+                })
+                .collect(),
         }
+    }
+}
+
+fn transport_addr_to_string(addr: &TransportAddr) -> String {
+    match addr {
+        TransportAddr::Ip(addr) => addr.to_string(),
+        TransportAddr::Relay(url) => url.to_string(),
+        _ => format!("{addr:?}"),
     }
 }
 

@@ -8,7 +8,7 @@ use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keys::gossip_peer_key;
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{PeerConnectionStatus, RealmId};
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
@@ -231,25 +231,41 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
     handle_b.add_peer_addr(handle_c.endpoint_addr()).await;
     handle_c.add_peer_addr(handle_b.endpoint_addr()).await;
 
-    let mut opened = false;
+    let mut opened_stream = None;
     for _ in 0..20 {
-        if handle_a.open_stream(node_b, Alpn::Bao).await.is_ok() {
-            opened = true;
+        if let Ok(stream) = handle_a.open_stream(node_b, Alpn::Bao).await {
+            opened_stream = Some(stream);
             break;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    let status = handle_a.get_status().await;
-    assert!(opened, "expected DHT-signed fallback to resolve node_b");
+    assert!(
+        opened_stream.is_some(),
+        "expected DHT-signed fallback to resolve node_b"
+    );
+    let mut status = handle_a.get_status().await;
+    for _ in 0..50 {
+        if status.connections.iter().any(|peer| {
+            peer.node_id == node_b
+                && peer.status == PeerConnectionStatus::Connected
+                && peer.active_addresses.iter().any(|address| {
+                    !address.address.is_empty() && !address.protocol_connections.is_empty()
+                })
+        }) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        status = handle_a.get_status().await;
+    }
     assert!(status.discovery_methods.contains(&"dht_signed".to_string()));
-    assert!(status.bootstrap.dht_signed_publish_attempts_total > 0);
-    assert!(status.bootstrap.dht_signed_resolve_attempts_total > 0);
-    assert!(status.bootstrap.dht_signed_resolve_successes_total > 0);
-    assert!(status.known_peer_addresses.iter().any(|peer| {
+    assert!(status.requests.total > 0);
+    assert!(status.connections.iter().any(|peer| {
         peer.node_id == node_b
-            && peer.source.contains("memory_lookup")
-            && !peer.addresses.is_empty()
+            && peer.status == PeerConnectionStatus::Connected
+            && peer.active_addresses.iter().any(|address| {
+                !address.address.is_empty() && !address.protocol_connections.is_empty()
+            })
     }));
 
     handle_a.shutdown().await;

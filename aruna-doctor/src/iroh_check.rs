@@ -1,8 +1,7 @@
 use crate::error::CliError;
 use crate::info::{default_info_url_from_env, fetch_info_url_with_timeout};
 use aruna_api::routes::info::{
-    BootstrapDiagnosticsStatus, ConnectionMonitorStatus, InfoResponse, KnownPeerAddressStatus,
-    PeerConnectivityStatus, ServiceStatus,
+    InfoResponse, NetworkServiceStatus, PeerConnectionInfo, ServiceStatus,
 };
 use aruna_core::alpn::Alpn;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
@@ -37,10 +36,8 @@ struct IrohCheckTarget {
 
 #[derive(Debug, Serialize)]
 struct ReportedNetDiagnostics {
-    monitor: ConnectionMonitorStatus,
-    bootstrap: BootstrapDiagnosticsStatus,
-    peer_connectivity: Vec<PeerConnectivityStatus>,
-    known_peer_addresses: Vec<KnownPeerAddressStatus>,
+    network: NetworkServiceStatus,
+    connections: Vec<PeerConnectionInfo>,
     warnings: Vec<String>,
 }
 
@@ -89,10 +86,13 @@ async fn run_iroh_check(info_url: String, timeout: Duration) -> Result<IrohCheck
     let endpoint_info = fetch_info_url_with_timeout(&info_url, timeout).await?;
     checks.push(ok_step("info", info_started.elapsed()));
 
-    if endpoint_info.net_state.status != ServiceStatus::Available {
+    if endpoint_info.services.network.status != ServiceStatus::Available {
         return Err(iroh_check_error(
             "info",
-            format!("net state is {:?}", endpoint_info.net_state.status),
+            format!(
+                "network state is {:?}",
+                endpoint_info.services.network.status
+            ),
         ));
     }
 
@@ -114,13 +114,35 @@ async fn run_iroh_check(info_url: String, timeout: Duration) -> Result<IrohCheck
 }
 
 fn endpoint_addr_from_info(endpoint_info: &InfoResponse) -> Result<EndpointAddr, CliError> {
-    let value = endpoint_info
-        .net_state
-        .endpoint_addr
-        .clone()
-        .ok_or_else(|| iroh_check_error("endpoint_addr", "missing net_state.endpoint_addr"))?;
+    let peer_id = endpoint_info
+        .node
+        .peer_id
+        .parse::<iroh::PublicKey>()
+        .map_err(|error| iroh_check_error("endpoint_addr", error))?;
+    let addresses = endpoint_info
+        .my_addresses
+        .iter()
+        .map(|address| transport_addr_from_info(address))
+        .collect::<Result<Vec<_>, _>>()?;
 
-    serde_json::from_value::<EndpointAddr>(value)
+    if addresses.is_empty() {
+        return Err(iroh_check_error("endpoint_addr", "missing my_addresses"));
+    }
+
+    Ok(EndpointAddr::from_parts(peer_id, addresses))
+}
+
+fn transport_addr_from_info(address: &str) -> Result<TransportAddr, CliError> {
+    if address.starts_with("http://") || address.starts_with("https://") {
+        return address
+            .parse::<iroh::RelayUrl>()
+            .map(TransportAddr::Relay)
+            .map_err(|error| iroh_check_error("endpoint_addr", error));
+    }
+
+    address
+        .parse::<SocketAddr>()
+        .map(TransportAddr::Ip)
         .map_err(|error| iroh_check_error("endpoint_addr", error))
 }
 
@@ -268,8 +290,8 @@ where
 
 fn target_output(endpoint_info: &InfoResponse, endpoint_addr: &EndpointAddr) -> IrohCheckTarget {
     IrohCheckTarget {
-        realm_id: endpoint_info.net_state.realm_id.clone(),
-        node_id: endpoint_info.net_state.node_id.clone(),
+        realm_id: Some(endpoint_info.node.realm_id.clone()),
+        node_id: Some(endpoint_info.node.peer_id.clone()),
         endpoint_addr: serde_json::to_value(endpoint_addr).unwrap_or(serde_json::Value::Null),
         addresses: endpoint_addr
             .addrs
@@ -283,11 +305,9 @@ fn target_output(endpoint_info: &InfoResponse, endpoint_addr: &EndpointAddr) -> 
 
 fn reported_diagnostics(endpoint_info: &InfoResponse) -> ReportedNetDiagnostics {
     ReportedNetDiagnostics {
-        monitor: endpoint_info.net_state.monitor.clone(),
-        bootstrap: endpoint_info.net_state.bootstrap.clone(),
-        peer_connectivity: endpoint_info.net_state.peer_connectivity.clone(),
-        known_peer_addresses: endpoint_info.net_state.known_peer_addresses.clone(),
-        warnings: endpoint_info.net_state.warnings.clone(),
+        network: endpoint_info.services.network.clone(),
+        connections: endpoint_info.connections.clone(),
+        warnings: endpoint_info.warnings.clone(),
     }
 }
 
@@ -370,70 +390,76 @@ fn iroh_check_error(step: &'static str, message: impl std::fmt::Display) -> CliE
 mod tests {
     use super::*;
     use aruna_api::routes::info::{
-        BlobStatus, InterfaceStatus, LocalNodeInfo, NetStatus, NodeCapabilityKind,
-        RestInterfaceStatus, S3InterfaceStatus,
+        BlobServiceStatus, DatabaseServiceStatus, InfoResponse, InterfaceServicesStatus,
+        InterfaceStatus, NetworkServiceStatus, NodeCapabilityKind, NodeStatus, RequestSummary,
+        ServicesStatus,
     };
     use aruna_core::structs::RealmId;
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::FjallStorage;
     use tempfile::{TempDir, tempdir};
 
-    fn test_info_response(endpoint_addr: Option<serde_json::Value>) -> InfoResponse {
+    fn test_info_response(endpoint_addr: Option<EndpointAddr>) -> InfoResponse {
+        let node_id = endpoint_addr
+            .as_ref()
+            .map(|addr| addr.id)
+            .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[2u8; 32]).public());
+        let my_addresses = endpoint_addr
+            .as_ref()
+            .map(|addr| addr.addrs.iter().map(transport_addr_to_string).collect())
+            .unwrap_or_default();
+
         InfoResponse {
-            node_info: LocalNodeInfo {
+            node: NodeStatus {
+                status: ServiceStatus::Available,
                 realm_id: RealmId::from_bytes([1u8; 32]).to_string(),
-                node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public().to_string(),
+                peer_id: node_id.to_string(),
                 capabilities: NodeCapabilityKind::Management,
             },
-            net_state: NetStatus {
-                status: ServiceStatus::Available,
-                realm_id: Some(RealmId::from_bytes([1u8; 32]).to_string()),
-                node_id: Some(iroh::SecretKey::from_bytes(&[2u8; 32]).public().to_string()),
-                discovery_methods: Vec::new(),
-                discovery_dns_origins: Vec::new(),
-                relay_method: Some("none".to_string()),
-                relay_urls: Vec::new(),
-                peer_nodes: Vec::new(),
-                peer_endpoints: Vec::new(),
-                endpoint_addr,
-                monitor: ConnectionMonitorStatus::default(),
-                bootstrap: BootstrapDiagnosticsStatus::default(),
-                peer_connectivity: Vec::new(),
-                known_peer_addresses: Vec::new(),
-                warnings: Vec::new(),
-            },
-            blob_status: BlobStatus {
-                status: ServiceStatus::NotConfigured,
-                backend_type: None,
-                max_bucket_size: None,
-                multipart_bucket: None,
-                timeouts: None,
-            },
-            interface_status: InterfaceStatus {
-                rest: RestInterfaceStatus {
+            my_addresses,
+            connections: Vec::new(),
+            services: ServicesStatus {
+                network: NetworkServiceStatus {
                     status: ServiceStatus::Available,
-                    bind_address: None,
-                    base_url: None,
-                    api_base_url: None,
-                    info_url: None,
-                    swagger_ui_url: None,
+                    discovery: Vec::new(),
+                    relay: Some("none".to_string()),
+                    relay_urls: Vec::new(),
+                    routing_table_size: None,
+                    requests: RequestSummary {
+                        total: 0,
+                        failure_rate: 0.0,
+                        last_error: None,
+                    },
                 },
-                s3: S3InterfaceStatus {
-                    status: ServiceStatus::Unavailable,
-                    bind_address: None,
-                    base_url: None,
+                blob: BlobServiceStatus {
+                    status: ServiceStatus::NotConfigured,
+                    backend: None,
+                    max_bucket_size: None,
+                    multipart_bucket: None,
+                    timeouts_secs: None,
+                },
+                database: DatabaseServiceStatus {
+                    status: ServiceStatus::Available,
+                    requests: RequestSummary {
+                        total: 0,
+                        failure_rate: 0.0,
+                        last_error: None,
+                    },
+                },
+                interfaces: InterfaceServicesStatus {
+                    rest: InterfaceStatus {
+                        status: ServiceStatus::Available,
+                        bind: None,
+                        url: None,
+                    },
+                    s3: InterfaceStatus {
+                        status: ServiceStatus::Unavailable,
+                        bind: None,
+                        url: None,
+                    },
                 },
             },
-            database_status: aruna_api::routes::info::DatabaseStatus {
-                status: ServiceStatus::Available,
-                requests_total: 0,
-                errors_total: 0,
-                conflicts_total: 0,
-                failed_total: 0,
-                error_rate: 0.0,
-                channel_closed: false,
-                last_error: None,
-            },
+            warnings: Vec::new(),
         }
     }
 
@@ -536,9 +562,8 @@ mod tests {
     #[tokio::test]
     async fn run_iroh_check_builds_output_from_info() {
         let (target, _dir) = test_net_handle().await;
-        let endpoint_addr = serde_json::to_value(target.endpoint_addr()).unwrap();
         let output_endpoint =
-            endpoint_addr_from_info(&test_info_response(Some(endpoint_addr))).unwrap();
+            endpoint_addr_from_info(&test_info_response(Some(target.endpoint_addr()))).unwrap();
         let mut checks = Vec::new();
 
         let active = active_iroh_check(output_endpoint, Duration::from_secs(5), &mut checks)

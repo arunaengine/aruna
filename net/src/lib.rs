@@ -20,9 +20,9 @@ use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_core::keys::realm_endpoint_key;
 use aruna_core::structs::{
-    BootstrapDiagnosticsState, ConnectionMonitorState, KnownPeerAddressState, NetState,
-    PeerConnectivityState, RealmEndpointAnnouncement, RealmId,
-    realm_endpoint_announcement_signing_bytes,
+    ConnectionAddressState, ConnectionMonitorState, NetState, NetworkDiagnosticsState,
+    PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState, RealmEndpointAnnouncement,
+    RealmId, realm_endpoint_announcement_signing_bytes,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
@@ -293,13 +293,17 @@ struct PeerConnectivityManagerState {
 struct ManagedPeer {
     node_id: NodeId,
     source: String,
-    attempts_total: u64,
-    successes_total: u64,
-    failures_total: u64,
     consecutive_failures: u64,
     last_error: Option<String>,
-    last_successful: bool,
     next_attempt: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct PeerConnectivityState {
+    node_id: NodeId,
+    consecutive_failures: u64,
+    last_error: Option<String>,
+    next_retry_in_secs: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -340,13 +344,12 @@ struct NetInner {
     address_lookup: MemoryLookup,
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
-    peer_endpoints: Vec<EndpointAddr>,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
     gossip: Arc<GossipService>,
     streams: Arc<StreamsService>,
     peer_connectivity: Arc<Mutex<PeerConnectivityManagerState>>,
-    bootstrap_diagnostics: Arc<Mutex<BootstrapDiagnosticsState>>,
+    network_diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
     peer_connectivity_tx: mpsc::Sender<PeerConnectivityEvent>,
     inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
     shutdown: CancellationToken,
@@ -458,10 +461,7 @@ impl NetHandle {
             &peer_nodes,
             "realm_config",
         )));
-        let bootstrap_diagnostics = Arc::new(Mutex::new(BootstrapDiagnosticsState {
-            temporary_bootstrap_active: config.temporary_bootstrap_active,
-            ..BootstrapDiagnosticsState::default()
-        }));
+        let network_diagnostics = Arc::new(Mutex::new(NetworkDiagnosticsState::default()));
         let (peer_connectivity_tx, peer_connectivity_rx) = mpsc::channel(256);
         let shutdown = CancellationToken::new();
 
@@ -627,13 +627,12 @@ impl NetHandle {
 
         let peer_connectivity_task = tokio::spawn(run_peer_connectivity_manager(
             dht.clone(),
-            endpoint.clone(),
             address_lookup.clone(),
             discovery_method.clone(),
             config.realm_id,
             dht_signed_authorized_nodes.clone(),
             peer_connectivity.clone(),
-            bootstrap_diagnostics.clone(),
+            network_diagnostics.clone(),
             peer_connectivity_rx,
             shutdown.child_token(),
         ));
@@ -647,7 +646,7 @@ impl NetHandle {
                 configured_relay_urls.clone(),
                 ttl,
                 refresh_after,
-                bootstrap_diagnostics.clone(),
+                network_diagnostics.clone(),
                 shutdown.child_token(),
             ));
         }
@@ -669,13 +668,12 @@ impl NetHandle {
             address_lookup,
             discovery_method,
             relay_method,
-            peer_endpoints,
             dht_signed_authorized_nodes,
             dht,
             gossip,
             streams,
             peer_connectivity,
-            bootstrap_diagnostics,
+            network_diagnostics,
             peer_connectivity_tx,
             inbound_handler,
             shutdown,
@@ -798,7 +796,7 @@ impl NetHandle {
                         &authorized_nodes,
                         node_id,
                         self.inner.discovery_method.dht_signed_config(),
-                        &self.inner.bootstrap_diagnostics,
+                        &self.inner.network_diagnostics,
                     )
                     .await
                     {
@@ -887,47 +885,31 @@ impl NetHandle {
         let peer_nodes = self.inner.gossip.get_bootstrap_nodes();
         let configured_relay_urls = self.inner.relay_method.relay_urls();
         let monitor = self.monitor.get_status().await;
-        let mut bootstrap = self.inner.bootstrap_diagnostics.lock().await.clone();
+        let mut diagnostics = self.inner.network_diagnostics.lock().await.clone();
         if let Ok(size) = self.inner.dht.routing_table_size().await {
-            bootstrap.routing_table_size = Some(size);
+            diagnostics.routing_table_size = Some(size);
         }
         let peer_connectivity = peer_connectivity_status(&self.inner.peer_connectivity).await;
-        let mut address_nodes = peer_nodes.clone();
-        address_nodes.extend(peer_connectivity.iter().map(|peer| peer.node_id));
-        address_nodes = unique_peer_nodes(address_nodes, self.inner.node_id);
-        let known_peer_addresses = known_peer_addresses(
+        let connections = peer_connection_states(
             &self.inner.endpoint,
-            &self.inner.address_lookup,
-            &address_nodes,
+            &monitor,
+            &peer_connectivity,
+            &peer_nodes,
+            self.inner.node_id,
         )
         .await;
-        let warnings = net_warnings(
-            &peer_nodes,
-            &peer_connectivity,
-            &known_peer_addresses,
-            &monitor,
-            &bootstrap,
-        );
+        let warnings = net_warnings(&peer_nodes, &connections, diagnostics.routing_table_size);
 
         NetState {
             endpoint_addr: local_endpoint_addr(&self.inner.endpoint, &configured_relay_urls),
             realm_id: *self.realm_id(),
             node_id: self.node_id(),
             discovery_methods: self.inner.discovery_method.enabled_methods(),
-            discovery_dns_origins: self.inner.discovery_method.dns_origins(),
             relay_method: self.inner.relay_method.method_name().to_string(),
             relay_urls: configured_relay_urls,
-            peer_nodes,
-            peer_endpoints: self
-                .inner
-                .peer_endpoints
-                .iter()
-                .map(endpoint_addr_to_config_string)
-                .collect(),
-            monitor,
-            bootstrap,
-            peer_connectivity,
-            known_peer_addresses,
+            connections,
+            requests: diagnostics.requests,
+            routing_table_size: diagnostics.routing_table_size,
             warnings,
         }
     }
@@ -941,7 +923,7 @@ fn spawn_dht_signed_publisher(
     configured_relay_urls: Vec<String>,
     ttl: Duration,
     refresh_after: Duration,
-    diagnostics: Arc<Mutex<BootstrapDiagnosticsState>>,
+    diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -950,11 +932,6 @@ fn spawn_dht_signed_publisher(
 
         loop {
             sequence = sequence.saturating_add(1);
-            {
-                let mut status = diagnostics.lock().await;
-                status.dht_signed_publish_attempts_total =
-                    status.dht_signed_publish_attempts_total.saturating_add(1);
-            }
             match publish_realm_endpoint_announcement(
                 &dht,
                 &endpoint,
@@ -966,10 +943,7 @@ fn spawn_dht_signed_publisher(
             .await
             {
                 Ok(()) => {
-                    let mut status = diagnostics.lock().await;
-                    status.dht_signed_publish_successes_total =
-                        status.dht_signed_publish_successes_total.saturating_add(1);
-                    status.dht_signed_last_error = None;
+                    diagnostics.lock().await.requests.record_success();
                     debug!(
                         realm_id = %realm_id,
                         node_id = %endpoint.id(),
@@ -979,10 +953,11 @@ fn spawn_dht_signed_publisher(
                     );
                 }
                 Err(err) => {
-                    let mut status = diagnostics.lock().await;
-                    status.dht_signed_publish_failures_total =
-                        status.dht_signed_publish_failures_total.saturating_add(1);
-                    status.dht_signed_last_error = Some(err.to_string());
+                    diagnostics
+                        .lock()
+                        .await
+                        .requests
+                        .record_failure(format!("publish DHT-signed endpoint: {err}"));
                     warn!(
                         realm_id = %realm_id,
                         node_id = %endpoint.id(),
@@ -1132,32 +1107,21 @@ async fn resolve_dht_signed_endpoint(
     authorized_nodes: &[NodeId],
     peer: NodeId,
     config: Option<(Duration, Duration)>,
-    diagnostics: &Arc<Mutex<BootstrapDiagnosticsState>>,
+    diagnostics: &Arc<Mutex<NetworkDiagnosticsState>>,
 ) -> Result<Option<EndpointAddr>> {
     if !dht_signed_lookup_enabled(config, authorized_nodes, peer) {
         return Ok(None);
     }
 
-    {
-        let mut status = diagnostics.lock().await;
-        status.dht_signed_resolve_attempts_total =
-            status.dht_signed_resolve_attempts_total.saturating_add(1);
-    }
-
     let result = lookup_dht_signed_endpoint(dht, realm_id, authorized_nodes, peer, config).await;
     match &result {
-        Ok(Some(_)) => {
-            let mut status = diagnostics.lock().await;
-            status.dht_signed_resolve_successes_total =
-                status.dht_signed_resolve_successes_total.saturating_add(1);
-            status.dht_signed_last_error = None;
-        }
-        Ok(None) => {}
+        Ok(_) => diagnostics.lock().await.requests.record_success(),
         Err(err) => {
-            let mut status = diagnostics.lock().await;
-            status.dht_signed_resolve_failures_total =
-                status.dht_signed_resolve_failures_total.saturating_add(1);
-            status.dht_signed_last_error = Some(err.to_string());
+            diagnostics
+                .lock()
+                .await
+                .requests
+                .record_failure(format!("resolve DHT-signed endpoint for {peer}: {err}"));
         }
     }
 
@@ -1349,11 +1313,8 @@ impl PeerConnectivityManagerState {
         }
         if let Some(peer) = self.peer_mut(node_id) {
             merge_source(&mut peer.source, source);
-            peer.attempts_total = peer.attempts_total.saturating_add(1);
-            peer.successes_total = peer.successes_total.saturating_add(1);
             peer.consecutive_failures = 0;
             peer.last_error = None;
-            peer.last_successful = true;
             peer.next_attempt = now + PEER_SUCCESS_REFRESH_DELAY;
         }
     }
@@ -1364,11 +1325,8 @@ impl PeerConnectivityManagerState {
         }
         if let Some(peer) = self.peer_mut(node_id) {
             merge_source(&mut peer.source, source);
-            peer.attempts_total = peer.attempts_total.saturating_add(1);
-            peer.failures_total = peer.failures_total.saturating_add(1);
             peer.consecutive_failures = peer.consecutive_failures.saturating_add(1);
             peer.last_error = Some(error);
-            peer.last_successful = false;
             peer.next_attempt = now + peer_retry_delay(node_id, peer.consecutive_failures);
         }
     }
@@ -1402,13 +1360,8 @@ impl PeerConnectivityManagerState {
             .iter()
             .map(|peer| PeerConnectivityState {
                 node_id: peer.node_id,
-                source: peer.source.clone(),
-                attempts_total: peer.attempts_total,
-                successes_total: peer.successes_total,
-                failures_total: peer.failures_total,
                 consecutive_failures: peer.consecutive_failures,
                 last_error: peer.last_error.clone(),
-                last_successful: peer.last_successful,
                 next_retry_in_secs: Some(
                     peer.next_attempt.saturating_duration_since(now).as_secs(),
                 ),
@@ -1426,12 +1379,8 @@ impl ManagedPeer {
         Self {
             node_id,
             source: source.to_string(),
-            attempts_total: 0,
-            successes_total: 0,
-            failures_total: 0,
             consecutive_failures: 0,
             last_error: None,
-            last_successful: false,
             next_attempt,
         }
     }
@@ -1490,13 +1439,12 @@ async fn peer_connectivity_status(
 #[allow(clippy::too_many_arguments)]
 async fn run_peer_connectivity_manager(
     dht: Arc<DhtHandle>,
-    endpoint: Endpoint,
     address_lookup: MemoryLookup,
     discovery_method: DiscoveryMethod,
     realm_id: RealmId,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     state: Arc<Mutex<PeerConnectivityManagerState>>,
-    diagnostics: Arc<Mutex<BootstrapDiagnosticsState>>,
+    diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
     mut event_rx: mpsc::Receiver<PeerConnectivityEvent>,
     shutdown: CancellationToken,
 ) {
@@ -1506,7 +1454,6 @@ async fn run_peer_connectivity_manager(
         let now = Instant::now();
         let due_peers = state.lock().await.due_peers(now);
         if !due_peers.is_empty() {
-            diagnostics.lock().await.last_attempted_peer_count = due_peers.len();
             for peer in due_peers {
                 if shutdown.is_cancelled() {
                     return;
@@ -1514,7 +1461,6 @@ async fn run_peer_connectivity_manager(
                 let authorized_nodes = dht_signed_authorized_nodes.read().clone();
                 run_peer_connectivity_attempt(
                     &dht,
-                    &endpoint,
                     &address_lookup,
                     &discovery_method,
                     realm_id,
@@ -1583,20 +1529,15 @@ async fn apply_peer_connectivity_event(
 #[allow(clippy::too_many_arguments)]
 async fn run_peer_connectivity_attempt(
     dht: &DhtHandle,
-    endpoint: &Endpoint,
     address_lookup: &MemoryLookup,
     discovery_method: &DiscoveryMethod,
     realm_id: RealmId,
     dht_signed_authorized_nodes: &[NodeId],
     state: &Arc<Mutex<PeerConnectivityManagerState>>,
-    diagnostics: &Arc<Mutex<BootstrapDiagnosticsState>>,
+    diagnostics: &Arc<Mutex<NetworkDiagnosticsState>>,
     peer: NodeId,
 ) {
     let source = state.lock().await.peer_source(peer);
-    {
-        let mut status = diagnostics.lock().await;
-        status.attempts_total = status.attempts_total.saturating_add(1);
-    }
 
     let mut result = dht.bootstrap_nodes(&[peer]).await;
     if result.is_err() {
@@ -1638,11 +1579,9 @@ async fn run_peer_connectivity_attempt(
                 .lock()
                 .await
                 .record_success(peer, "connectivity_probe", Instant::now());
-            let mut status = diagnostics.lock().await;
-            status.successes_total = status.successes_total.saturating_add(1);
-            status.last_error = None;
-            status.last_successful = true;
-            status.routing_table_size = routing_table_size;
+            let mut diagnostics = diagnostics.lock().await;
+            diagnostics.requests.record_success();
+            diagnostics.routing_table_size = routing_table_size;
             debug!(
                 peer = %peer,
                 source = %source,
@@ -1657,101 +1596,123 @@ async fn run_peer_connectivity_attempt(
                 err.to_string(),
                 Instant::now(),
             );
-            let known = known_peer_addresses(endpoint, address_lookup, &[peer]).await;
-            let mut status = diagnostics.lock().await;
-            status.failures_total = status.failures_total.saturating_add(1);
-            status.last_error = Some(format!("peer {peer}: {err}"));
-            status.last_successful = false;
-            status.routing_table_size = routing_table_size;
+            let mut diagnostics = diagnostics.lock().await;
+            diagnostics
+                .requests
+                .record_failure(format!("peer {peer}: {err}"));
+            diagnostics.routing_table_size = routing_table_size;
             warn!(
                 error = %err,
                 peer = %peer,
                 source = %source,
                 routing_table_size = ?routing_table_size,
-                known_peer_addresses = ?known,
                 "Managed peer connectivity check failed; will retry with backoff"
             );
         }
     }
 }
 
-async fn known_peer_addresses(
+async fn peer_connection_states(
     endpoint: &Endpoint,
-    address_lookup: &MemoryLookup,
-    nodes: &[NodeId],
-) -> Vec<KnownPeerAddressState> {
-    let mut peers = unique_peer_nodes(nodes.to_vec(), endpoint.id());
-    let mut states = Vec::new();
+    monitor: &ConnectionMonitorState,
+    peer_connectivity: &[PeerConnectivityState],
+    peer_nodes: &[NodeId],
+    local_id: NodeId,
+) -> Vec<PeerConnectionState> {
+    let mut peers = peer_nodes.to_vec();
+    peers.extend(peer_connectivity.iter().map(|peer| peer.node_id));
+    peers.extend(
+        monitor
+            .open_connections
+            .iter()
+            .map(|connection| connection.remote_id),
+    );
+    let mut peers = unique_peer_nodes(peers, local_id);
+    let mut states = Vec::with_capacity(peers.len());
 
     for peer in peers.drain(..) {
-        let mut sources = Vec::new();
-        let mut addrs = Vec::new();
-        let mut active = 0;
-        let mut inactive = 0;
+        let health = peer_connectivity.iter().find(|state| state.node_id == peer);
+        let open_connections = monitor
+            .open_connections
+            .iter()
+            .filter(|connection| connection.remote_id == peer)
+            .collect::<Vec<_>>();
+        let mut active_addresses = active_address_rows(endpoint, peer).await;
 
-        if let Some(info) = address_lookup.get_endpoint_info(peer) {
-            let endpoint_addr = info.into_endpoint_addr();
-            sources.push("memory_lookup");
-            for addr in endpoint_addr.addrs {
-                push_unique_transport_addr(&mut addrs, addr);
-            }
+        for connection in &open_connections {
+            let address = connection
+                .selected_address
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let row = upsert_address_row(&mut active_addresses, address);
+            merge_rtt(&mut row.rtt_ms, connection.rtt_ms);
+            row.protocol_connections.push(ProtocolConnectionState {
+                connection_id: connection.connection_id,
+                alpn: connection.alpn,
+                side: connection.side,
+            });
         }
 
-        if let Some(remote_info) = endpoint.remote_info(peer).await {
-            sources.push("remote_info");
-            for addr in remote_info.addrs() {
-                match addr.usage() {
-                    TransportAddrUsage::Active => active += 1,
-                    TransportAddrUsage::Inactive => inactive += 1,
-                    _ => inactive += 1,
-                }
-                push_unique_transport_addr(&mut addrs, addr.addr().clone());
-            }
+        for address in &mut active_addresses {
+            address
+                .protocol_connections
+                .sort_unstable_by_key(|connection| connection.connection_id);
         }
+        active_addresses.sort_unstable_by(|a, b| a.address.cmp(&b.address));
 
-        if sources.is_empty() {
-            states.push(peer_address_state(peer, "none", Vec::new(), 0, 0));
+        let status = if !open_connections.is_empty() {
+            PeerConnectionStatus::Connected
+        } else if health.is_some_and(|state| state.consecutive_failures > 0) {
+            PeerConnectionStatus::Unreachable
         } else {
-            states.push(peer_address_state(
-                peer,
-                &sources.join(","),
-                addrs,
-                active,
-                inactive,
-            ));
-        }
+            PeerConnectionStatus::Known
+        };
+
+        states.push(PeerConnectionState {
+            node_id: peer,
+            status,
+            active_addresses,
+            last_error: health.and_then(|state| state.last_error.clone()),
+            next_retry_in_secs: health.and_then(|state| state.next_retry_in_secs),
+        });
     }
 
     states
 }
 
-fn push_unique_transport_addr(addrs: &mut Vec<TransportAddr>, addr: TransportAddr) {
-    if !addrs.iter().any(|existing| existing == &addr) {
-        addrs.push(addr);
+async fn active_address_rows(endpoint: &Endpoint, peer: NodeId) -> Vec<ConnectionAddressState> {
+    let mut rows = Vec::new();
+    if let Some(remote_info) = endpoint.remote_info(peer).await {
+        for addr in remote_info.addrs() {
+            if matches!(addr.usage(), TransportAddrUsage::Active) {
+                upsert_address_row(&mut rows, transport_addr_to_string(addr.addr()));
+            }
+        }
     }
+    rows
 }
 
-fn peer_address_state(
-    node_id: NodeId,
-    source: &str,
-    addrs: Vec<TransportAddr>,
-    active_addresses: usize,
-    inactive_addresses: usize,
-) -> KnownPeerAddressState {
-    let has_direct_ip = addrs.iter().any(TransportAddr::is_ip);
-    let has_relay = addrs.iter().any(TransportAddr::is_relay);
-    let endpoint_addr =
-        (!addrs.is_empty()).then(|| EndpointAddr::from_parts(node_id, addrs.clone()));
-    KnownPeerAddressState {
-        node_id,
-        source: source.to_string(),
-        endpoint_addr,
-        addresses: addrs.iter().map(transport_addr_to_string).collect(),
-        has_direct_ip,
-        has_relay,
-        active_addresses,
-        inactive_addresses,
+fn upsert_address_row(
+    rows: &mut Vec<ConnectionAddressState>,
+    address: String,
+) -> &mut ConnectionAddressState {
+    if let Some(index) = rows.iter().position(|row| row.address == address) {
+        return &mut rows[index];
     }
+
+    rows.push(ConnectionAddressState {
+        address,
+        rtt_ms: None,
+        protocol_connections: Vec::new(),
+    });
+    rows.last_mut().expect("inserted address row")
+}
+
+fn merge_rtt(existing: &mut Option<u64>, candidate: Option<u64>) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    *existing = Some(existing.map_or(candidate, |current| current.min(candidate)));
 }
 
 fn transport_addr_to_string(addr: &TransportAddr) -> String {
@@ -1764,60 +1725,50 @@ fn transport_addr_to_string(addr: &TransportAddr) -> String {
 
 fn net_warnings(
     peer_nodes: &[NodeId],
-    peer_connectivity: &[PeerConnectivityState],
-    known_peer_addresses: &[KnownPeerAddressState],
-    monitor: &ConnectionMonitorState,
-    bootstrap: &BootstrapDiagnosticsState,
+    connections: &[PeerConnectionState],
+    routing_table_size: Option<usize>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
 
-    if let Some(error) = &bootstrap.last_error {
-        warnings.push(format!(
-            "last managed peer connectivity attempt failed: {error}"
-        ));
-    }
-
-    if bootstrap.failures_total > 0
-        && monitor.open_connections.is_empty()
-        && !peer_connectivity.is_empty()
+    if connections
+        .iter()
+        .any(|connection| connection.status == PeerConnectionStatus::Unreachable)
+        && !connections
+            .iter()
+            .any(|connection| connection.status == PeerConnectionStatus::Connected)
     {
         warnings
             .push("no open p2p connections after one or more managed peer failures".to_string());
     }
 
-    if bootstrap.routing_table_size == Some(0) && !peer_nodes.is_empty() {
+    if routing_table_size == Some(0) && !peer_nodes.is_empty() {
         warnings.push("DHT routing table is empty despite configured realm peers".to_string());
     }
 
     for node_id in peer_nodes {
-        let has_known_address = known_peer_addresses
+        let has_active_address = connections
             .iter()
-            .any(|state| state.node_id == *node_id && !state.addresses.is_empty());
-        if !has_known_address {
+            .any(|state| state.node_id == *node_id && !state.active_addresses.is_empty());
+        if !has_active_address {
             warnings.push(format!(
-                "realm peer {node_id} has no known addresses; add peer endpoints or enable realm discovery"
+                "realm peer {node_id} has no active addresses; add peer endpoints or enable realm discovery"
             ));
         }
     }
 
-    for peer in peer_connectivity {
-        if peer.consecutive_failures > 0 {
+    for peer in connections {
+        if peer.status == PeerConnectionStatus::Unreachable {
             let error = peer
                 .last_error
                 .as_deref()
                 .unwrap_or("unknown connection error");
             warnings.push(format!(
-                "managed peer {} unreachable after {} consecutive failures: {}",
-                peer.node_id, peer.consecutive_failures, error
+                "managed peer {} unreachable: {}",
+                peer.node_id, error
             ));
-        }
-
-        let has_known_address = known_peer_addresses
-            .iter()
-            .any(|state| state.node_id == peer.node_id && !state.addresses.is_empty());
-        if !has_known_address {
+        } else if peer.active_addresses.is_empty() {
             warnings.push(format!(
-                "managed peer {} has no known addresses; add peer endpoints or enable realm discovery",
+                "managed peer {} has no active addresses; add peer endpoints or enable realm discovery",
                 peer.node_id
             ));
         }
@@ -2218,35 +2169,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn temporary_bootstrap() -> Result<()> {
-        let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-        let storage = aruna_storage::FjallStorage::open(
-            temp_dir
-                .path()
-                .to_str()
-                .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
-        )
-        .map_err(|e| NetError::Io(e.to_string()))?;
-
-        let handle = NetHandle::new(
-            NetConfig {
-                discovery_method: DiscoveryMethod::None,
-                relay_method: RelayMethod::None,
-                temporary_bootstrap_active: true,
-                ..NetConfig::default()
-            },
-            storage,
-        )
-        .await?;
-
-        let status = handle.get_status().await;
-        assert!(status.bootstrap.temporary_bootstrap_active);
-
-        handle.shutdown().await;
-        Ok(())
-    }
-
     struct HoldingInboundHandler {
         streams: tokio::sync::Mutex<Vec<streams::BiStream>>,
     }
@@ -2294,7 +2216,7 @@ mod tests {
     async fn wait_for_open_connections(handle: &NetHandle, expected: usize) -> NetState {
         for _ in 0..50 {
             let status = handle.get_status().await;
-            if status.monitor.open_connections.len() >= expected {
+            if protocol_connection_count(&status) >= expected {
                 return status;
             }
             sleep(Duration::from_millis(20)).await;
@@ -2306,7 +2228,7 @@ mod tests {
     async fn wait_for_bootstrap_failure(handle: &NetHandle) -> NetState {
         for _ in 0..50 {
             let status = handle.get_status().await;
-            if status.bootstrap.failures_total > 0 {
+            if status.requests.failures > 0 {
                 return status;
             }
             sleep(Duration::from_millis(100)).await;
@@ -2318,17 +2240,24 @@ mod tests {
     async fn wait_for_peer_failure(handle: &NetHandle, peer: NodeId) -> NetState {
         for _ in 0..50 {
             let status = handle.get_status().await;
-            if status
-                .peer_connectivity
-                .iter()
-                .any(|state| state.node_id == peer && state.consecutive_failures > 0)
-            {
+            if status.connections.iter().any(|state| {
+                state.node_id == peer && state.status == PeerConnectionStatus::Unreachable
+            }) {
                 return status;
             }
             sleep(Duration::from_millis(20)).await;
         }
 
         handle.get_status().await
+    }
+
+    fn protocol_connection_count(status: &NetState) -> usize {
+        status
+            .connections
+            .iter()
+            .flat_map(|peer| &peer.active_addresses)
+            .map(|address| address.protocol_connections.len())
+            .sum()
     }
 
     #[tokio::test]
@@ -2342,19 +2271,18 @@ mod tests {
         let _b_to_a = b.open_stream(a.node_id(), Alpn::Bao).await?;
 
         let status = wait_for_open_connections(&a, 2).await;
-        assert!(status.monitor.open_connections.len() >= 2);
-        assert!(status.monitor.observed_connections_total >= 2);
-        assert_eq!(status.monitor.dropped_observations_total, 0);
+        assert!(protocol_connection_count(&status) >= 2);
 
         let mut connection_ids = status
-            .monitor
-            .open_connections
+            .connections
             .iter()
+            .flat_map(|peer| &peer.active_addresses)
+            .flat_map(|address| &address.protocol_connections)
             .map(|connection| connection.connection_id)
             .collect::<Vec<_>>();
         connection_ids.sort_unstable();
         connection_ids.dedup();
-        assert_eq!(connection_ids.len(), status.monitor.open_connections.len());
+        assert_eq!(connection_ids.len(), protocol_connection_count(&status));
 
         a.shutdown().await;
         b.shutdown().await;
@@ -2367,17 +2295,15 @@ mod tests {
         let (b, _b_dir) = test_net_handle().await?;
 
         a.add_peer_addr(b.endpoint_addr()).await;
+        let _stream = a.open_stream(b.node_id(), Alpn::Bao).await?;
 
-        let status = a.get_status().await;
-        assert!(status.peer_nodes.contains(&b.node_id()));
-        assert!(status.known_peer_addresses.iter().any(|peer| {
+        let status = wait_for_open_connections(&a, 1).await;
+        assert!(status.connections.iter().any(|peer| {
             peer.node_id == b.node_id()
-                && peer.source.contains("memory_lookup")
-                && peer.has_direct_ip
-                && peer
-                    .endpoint_addr
-                    .as_ref()
-                    .is_some_and(|addr| addr.id == b.node_id())
+                && peer.status == PeerConnectionStatus::Connected
+                && peer.active_addresses.iter().any(|address| {
+                    !address.address.is_empty() && !address.protocol_connections.is_empty()
+                })
         }));
 
         a.shutdown().await;
@@ -2409,30 +2335,31 @@ mod tests {
         .await?;
 
         let status = wait_for_bootstrap_failure(&handle).await;
-        assert!(status.bootstrap.failures_total > 0);
+        assert!(status.requests.failures > 0);
         assert!(
             status
-                .known_peer_addresses
+                .connections
                 .iter()
-                .any(|peer| peer.node_id == missing_peer && peer.addresses.is_empty())
+                .any(|peer| peer.node_id == missing_peer && peer.active_addresses.is_empty())
         );
         assert!(
             status
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("no known addresses"))
+                .any(|warning| warning.contains("no active addresses"))
         );
         assert!(
             status
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("managed peer connectivity attempt failed"))
+                .any(|warning| warning.contains("managed peer") && warning.contains("unreachable"))
         );
         assert!(
             status
-                .peer_connectivity
+                .connections
                 .iter()
-                .any(|peer| peer.node_id == missing_peer && peer.consecutive_failures > 0)
+                .any(|peer| peer.node_id == missing_peer
+                    && peer.status == PeerConnectionStatus::Unreachable)
         );
 
         handle.shutdown().await;
@@ -2451,11 +2378,10 @@ mod tests {
         let status = wait_for_peer_failure(&handle, missing_peer).await;
 
         assert!(matches!(err, NetError::Connection(_)));
-        assert!(status.peer_connectivity.iter().any(|peer| {
+        assert!(status.connections.iter().any(|peer| {
             peer.node_id == missing_peer
-                && peer.source.contains("stream_target")
-                && peer.source.contains("stream_open")
-                && peer.consecutive_failures > 0
+                && peer.status == PeerConnectionStatus::Unreachable
+                && peer.last_error.is_some()
                 && peer.next_retry_in_secs.is_some()
         }));
         assert!(status.warnings.iter().any(|warning| {
