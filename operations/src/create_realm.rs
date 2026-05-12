@@ -6,6 +6,7 @@ use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     Actor, OidcProviderConfig, Realm, RealmAuthorizationDocument, RealmConfigDocument,
+    RealmNodeKind,
 };
 use smallvec::smallvec;
 use thiserror::Error;
@@ -103,8 +104,9 @@ impl CreateRealmOperation {
             .ok_or_else(|| CreateRealmError::NoTransactionFound)?;
 
         let realm_id = self.config.actor.realm_id;
-        let config_doc =
+        let mut config_doc =
             RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
+        config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
         self.config_doc = Some(config_doc.clone());
 
         let key = (*realm_id.as_bytes()).into();

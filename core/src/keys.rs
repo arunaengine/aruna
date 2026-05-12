@@ -1,4 +1,4 @@
-use crate::id::{DhtKeyId, TopicId};
+use crate::id::{DhtKeyId, NodeId, TopicId};
 use crate::structs::RealmId;
 
 /// Derive a DHT key from arbitrary bytes using BLAKE3.
@@ -36,6 +36,16 @@ pub fn gossip_peer_key(topic: &TopicId) -> DhtKeyId {
 #[inline]
 pub fn realm_presence_key(realm_id: &RealmId) -> DhtKeyId {
     dht_key_from_domain(b"realm-presence", realm_id.as_bytes())
+}
+
+/// Derive a DHT key for a node's realm-scoped endpoint announcement.
+#[must_use]
+#[inline]
+pub fn realm_endpoint_key(realm_id: &RealmId, node_id: &NodeId) -> DhtKeyId {
+    let mut input = Vec::with_capacity(64);
+    input.extend_from_slice(realm_id.as_bytes());
+    input.extend_from_slice(node_id.as_bytes());
+    dht_key_from_domain(b"realm-endpoint-v1", &input)
 }
 
 #[cfg(test)]

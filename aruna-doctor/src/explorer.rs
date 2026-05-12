@@ -431,12 +431,11 @@ impl Serialize for JsonPersistedNodeState {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PersistedNodeState", 7)?;
+        let mut state = serializer.serialize_struct("PersistedNodeState", 6)?;
         state.serialize_field("boot_origin", &self.0.boot_origin)?;
         state.serialize_field("status", &self.0.status)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("net_secret_key", &hex::encode(self.0.net_secret_key))?;
-        state.serialize_field("bootstrap_endpoints", &self.0.bootstrap_endpoints)?;
         state.serialize_field("onboarding_phase", &self.0.onboarding_phase)?;
         state.serialize_field("onboarding_sync_ticket", &self.0.onboarding_sync_ticket)?;
         state.serialize_field("identity", &self.0.identity)?;
@@ -1328,7 +1327,7 @@ mod tests {
             secret_hash: "hash123".to_string(),
             mode: OnboardingMode::Server,
             expires_at: 1234,
-            consumed: false,
+            claimed_node_id: None,
         };
         let value = postcard::to_allocvec(&record).unwrap();
 
@@ -1353,7 +1352,6 @@ mod tests {
             status: PersistedNodeStatus::PendingOnboarding,
             realm_id,
             net_secret_key: [11_u8; 32],
-            bootstrap_endpoints: Vec::new(),
             onboarding_phase: None,
             onboarding_sync_ticket: Some("ticket".to_string()),
             identity: PersistedNodeIdentity::Local,

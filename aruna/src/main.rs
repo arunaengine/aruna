@@ -17,7 +17,7 @@ use aruna_core::structs::Actor;
 use aruna_core::structs::Backend::FileSystem;
 use aruna_core::structs::BackendConfig;
 use aruna_core::structs::NodeCapabilities;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
@@ -56,9 +56,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             bind_addr: config.p2p_socket_addr,
             secret_key: Some(config.net_secret_key.clone()),
             realm_id: config.realm_id,
-            bootstrap_nodes: config.bootstrap_nodes.clone(),
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
+            peer_nodes: config.peer_nodes.clone(),
+            peer_endpoints: config.peer_endpoints.clone(),
+            temporary_bootstrap_active: config.temporary_bootstrap_active,
+            discovery_method: config.discovery_method.clone(),
+            relay_method: config.relay_method.clone(),
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
         },
@@ -99,10 +101,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
-
-    for endpoint in &config.bootstrap_endpoints {
-        net_handle.add_peer_addr(endpoint.clone()).await;
-    }
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {
@@ -155,10 +153,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     driver_ctx.as_ref(),
                     &config.node_state,
                     &config.realm_id,
-                    config
-                        .bootstrap_endpoints
-                        .first()
-                        .map(|endpoint| endpoint.id),
+                    config.peer_endpoints.first().map(|endpoint| endpoint.id),
                 )
                 .await?;
                 mark_onboarding_phase(
@@ -189,7 +184,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             user_id: UserId::nil(config.realm_id),
                             realm_id: config.realm_id,
                         },
-                        bootstrap_peers: config.bootstrap_nodes.clone(),
+                        bootstrap_peers: config.peer_nodes.clone(),
                         default_metadata_replication_factor: config
                             .default_metadata_replication_factor,
                     }),

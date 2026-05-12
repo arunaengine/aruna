@@ -28,8 +28,7 @@ struct ConfigView {
     p2p_socket_addr: String,
     max_concurrent_uni_streams: Option<u64>,
     max_concurrent_bidi_streams: Option<u64>,
-    bootstrap_nodes: Vec<String>,
-    bootstrap_endpoints: Vec<String>,
+    p2p_additional_relay_urls: Vec<String>,
     default_metadata_replication_factor: u32,
     s3_port: u16,
     s3_host: String,
@@ -59,34 +58,65 @@ pub async fn print_info() -> Result<(), CliError> {
     Ok(())
 }
 
-async fn fetch_info(http_socket_addr: SocketAddr) -> Result<InfoResponse, CliError> {
-    let base_url = http_base_url(http_socket_addr);
-    let url = format!("{base_url}/api/v1/info");
+pub(crate) fn default_info_url_from_env() -> Result<String, CliError> {
+    let http_socket_addr: SocketAddr = dotenvy::var("SOCKET_ADDRESS")?.parse()?;
+    Ok(info_url(http_socket_addr))
+}
+
+pub(crate) async fn fetch_info(http_socket_addr: SocketAddr) -> Result<InfoResponse, CliError> {
+    fetch_info_url(&info_url(http_socket_addr)).await
+}
+
+pub(crate) async fn fetch_info_url(url: &str) -> Result<InfoResponse, CliError> {
+    fetch_info_url_with_timeout(url, Duration::from_secs(10)).await
+}
+
+pub(crate) async fn fetch_info_url_with_timeout(
+    url: &str,
+    timeout: Duration,
+) -> Result<InfoResponse, CliError> {
+    let timeout = nonzero_timeout(timeout);
+    let connect_timeout = nonzero_timeout(timeout.min(Duration::from_secs(2)));
     let response = Client::builder()
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(10))
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
         .build()?
-        .get(&url)
+        .get(url)
         .send()
         .await
         .map_err(|source| CliError::InfoRequest {
-            url: url.clone(),
+            url: url.to_string(),
             source,
         })?
         .error_for_status()
         .map_err(|source| CliError::InfoRequest {
-            url: url.clone(),
+            url: url.to_string(),
             source,
         })?;
 
     response
         .json::<InfoResponse>()
         .await
-        .map_err(|source| CliError::InfoRequest { url, source })
+        .map_err(|source| CliError::InfoRequest {
+            url: url.to_string(),
+            source,
+        })
 }
 
 fn http_base_url(addr: SocketAddr) -> String {
     client_base_url_from_bind_address(addr)
+}
+
+fn info_url(addr: SocketAddr) -> String {
+    format!("{}/api/v1/info", http_base_url(addr))
+}
+
+fn nonzero_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        timeout
+    }
 }
 
 impl ConfigView {
@@ -127,8 +157,7 @@ impl ConfigView {
                 .unwrap_or_else(|_| http_socket_addr.to_string()),
             max_concurrent_uni_streams: parse_optional_env("MAX_CONCURRENT_UNI_STREAMS")?,
             max_concurrent_bidi_streams: parse_optional_env("MAX_CONCURRENT_BIDI_STREAMS")?,
-            bootstrap_nodes: parse_list_env("BOOTSTRAP_NODES"),
-            bootstrap_endpoints: parse_list_env("BOOTSTRAP_ENDPOINTS"),
+            p2p_additional_relay_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
             default_metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
                 .unwrap_or(3),
             s3_port: parse_optional_env("S3_PORT")?.unwrap_or_default(),
@@ -263,6 +292,7 @@ mod tests {
             ("S3_HOST", "localhost".to_string()),
             ("S3_ADDRESS", "127.0.0.1".to_string()),
             ("OIDC_PROVIDER_IDS", "".to_string()),
+            ("ONBOARDING_SECRET", "".to_string()),
         ]);
 
         let (config, storage_handle) = load().await.unwrap();
@@ -271,7 +301,7 @@ mod tests {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
                 secret_key: Some(config.net_secret_key.clone()),
                 realm_id: config.realm_id,
-                bootstrap_nodes: Vec::new(),
+                peer_nodes: Vec::new(),
                 discovery_method: DiscoveryMethod::None,
                 relay_method: RelayMethod::None,
                 ..Default::default()
@@ -343,19 +373,20 @@ mod tests {
     }
 
     #[test]
-    fn http_base_url_rewrites_unspecified_ipv4() {
+    fn ipv4_base_url() {
         let addr: std::net::SocketAddr = "0.0.0.0:3000".parse().unwrap();
         assert_eq!(http_base_url(addr), "http://127.0.0.1:3000");
     }
 
     #[test]
-    fn http_base_url_rewrites_unspecified_ipv6() {
+    fn ipv6_base_url() {
         let addr: std::net::SocketAddr = "[::]:3000".parse().unwrap();
         assert_eq!(http_base_url(addr), "http://[::1]:3000");
     }
 
-    #[test]
-    fn config_view_marks_onboarding_secret_presence_without_exposing_secret() {
+    #[tokio::test]
+    async fn onboarding_secret() {
+        let _env_lock = env_lock().lock().await;
         let _guard = TestEnvGuard::set(&[
             ("STORAGE_PATH", "/tmp/storage".to_string()),
             ("ONBOARDING_SECRET", "secret".to_string()),
@@ -367,29 +398,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_info_reads_live_info_endpoint() {
+    async fn doctor_relays() {
+        let _env_lock = env_lock().lock().await;
+        let _guard = TestEnvGuard::set(&[(
+            "P2P_ADDITIONAL_RELAY_URLS",
+            "https://relay-a.example,https://relay-b.example".to_string(),
+        )]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+
+        assert_eq!(
+            view.p2p_additional_relay_urls,
+            vec![
+                "https://relay-a.example".to_string(),
+                "https://relay-b.example".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_info() {
         let _guard = env_lock().lock().await;
         let node = spawn_test_node().await;
 
         let info = fetch_info(node.http_addr).await.unwrap();
 
         assert_eq!(
-            info.net_state.status,
+            info.services.network.status,
             aruna_api::routes::info::ServiceStatus::Available
         );
+        assert!(info.services.network.discovery.is_empty());
+        assert_eq!(info.services.network.relay.as_deref(), Some("none"));
         assert_eq!(
-            info.interface_status.rest.status,
+            info.services.interfaces.rest.status,
             aruna_api::routes::info::ServiceStatus::Available
         );
-        let base_url = format!("http://{}", node.http_addr);
-        let info_url = format!("http://{}/api/v1/info", node.http_addr);
+        let api_url = format!("http://{}/api/v1", node.http_addr);
         assert_eq!(
-            info.interface_status.rest.base_url.as_deref(),
-            Some(base_url.as_str())
-        );
-        assert_eq!(
-            info.interface_status.rest.info_url.as_deref(),
-            Some(info_url.as_str())
+            info.services.interfaces.rest.url.as_deref(),
+            Some(api_url.as_str())
         );
         node.shutdown().await;
     }

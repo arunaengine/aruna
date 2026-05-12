@@ -35,6 +35,8 @@ pub enum CliError {
         #[source]
         source: reqwest::Error,
     },
+    #[error("iroh check failed during {step}: {message}")]
+    IrohCheck { step: &'static str, message: String },
     #[error(transparent)]
     DotenvError(#[from] dotenvy::Error),
     #[error(transparent)]
@@ -71,4 +73,10 @@ pub enum CliError {
     MissingInitialOnboardingSecret,
     #[error("Arbitrary user ids require --unsafe-arbitrary-user-id")]
     UnsafeUserIdRequired,
+    #[error("invalid {key} value {value:?}: {message}")]
+    InvalidConfigValue {
+        key: &'static str,
+        value: String,
+        message: String,
+    },
 }

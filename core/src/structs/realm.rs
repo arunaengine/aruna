@@ -1,3 +1,4 @@
+use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::Actor;
 use crate::structs::group::autosurgeon_role_map;
@@ -11,6 +12,8 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use ulid::Ulid;
+
+pub const REALM_ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RealmId(pub [u8; 32]);
@@ -170,6 +173,86 @@ pub struct RealmConfigDocument {
     pub realm_id: RealmId,
     pub metadata_replication: MetadataReplicationConfig,
     pub oidc_providers: Vec<OidcProviderConfig>,
+    pub discovery: RealmDiscoveryConfig,
+    pub nodes: Vec<RealmNode>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub enum RealmDiscoveryConfig {
+    Static {
+        endpoints: Vec<StaticRealmEndpoint>,
+    },
+    Dynamic {
+        methods: Vec<DynamicDiscoveryMethod>,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub enum DynamicDiscoveryMethod {
+    IrohDns {
+        origins: Vec<String>,
+        relay_policy: RelayPolicy,
+    },
+    DhtSigned {
+        ttl_secs: u64,
+        refresh_after_secs: u64,
+    },
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub enum RelayPolicy {
+    Disabled,
+    Default,
+    Custom { relays: Vec<String> },
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct RealmNode {
+    pub node_id: String,
+    pub kind: RealmNodeKind,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub enum RealmNodeKind {
+    Management,
+    Server,
+    Local,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+pub struct StaticRealmEndpoint {
+    pub node_id: String,
+    pub endpoint_addr: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct RealmEndpointAnnouncement {
+    pub realm_id: RealmId,
+    pub node_id: NodeId,
+    pub endpoint_addr: iroh::EndpointAddr,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub sequence: u64,
+    pub signature: iroh::Signature,
+}
+
+pub fn realm_endpoint_announcement_signing_bytes(
+    realm_id: &RealmId,
+    node_id: &NodeId,
+    endpoint_addr: &iroh::EndpointAddr,
+    issued_at: u64,
+    expires_at: u64,
+    sequence: u64,
+) -> Result<Vec<u8>, postcard::Error> {
+    postcard::to_allocvec(&(
+        REALM_ENDPOINT_ANNOUNCEMENT_DOMAIN,
+        realm_id,
+        node_id,
+        endpoint_addr,
+        issued_at,
+        expires_at,
+        sequence,
+    ))
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
@@ -190,6 +273,8 @@ impl RealmConfigDocument {
             realm_id,
             metadata_replication: MetadataReplicationConfig::new(default_replication_factor),
             oidc_providers,
+            discovery: default_realm_discovery_config(),
+            nodes: Vec::new(),
         }
     }
 
@@ -203,6 +288,21 @@ impl RealmConfigDocument {
 
     pub fn metadata_replication_factor_for(&self, group_id: GroupId, path: Option<&str>) -> usize {
         self.metadata_replication.factor_for(group_id, path)
+    }
+
+    pub fn ensure_node(&mut self, node_id: NodeId, kind: RealmNodeKind) {
+        let node_id = node_id.to_string();
+        if let Some(existing) = self.nodes.iter_mut().find(|node| node.node_id == node_id) {
+            existing.kind = kind;
+            return;
+        }
+
+        self.nodes.push(RealmNode { node_id, kind });
+    }
+
+    pub fn has_node(&self, node_id: NodeId) -> bool {
+        let node_id = node_id.to_string();
+        self.nodes.iter().any(|node| node.node_id == node_id)
     }
 
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
@@ -227,6 +327,21 @@ impl RealmConfigDocument {
         doc.set_actor((&actor).into());
         reconcile(&mut doc, self)?;
         Ok(doc.save())
+    }
+}
+
+pub fn default_realm_discovery_config() -> RealmDiscoveryConfig {
+    RealmDiscoveryConfig::Dynamic {
+        methods: vec![
+            DynamicDiscoveryMethod::IrohDns {
+                origins: vec!["n0".to_string()],
+                relay_policy: RelayPolicy::Default,
+            },
+            DynamicDiscoveryMethod::DhtSigned {
+                ttl_secs: 300,
+                refresh_after_secs: 60,
+            },
+        ],
     }
 }
 
@@ -370,8 +485,9 @@ pub mod autosurgeon_operation_map {
 #[cfg(test)]
 mod test {
     use crate::structs::{
-        Actor, MetadataGroupReplicationOverride, MetadataPathReplicationOverride,
-        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+        Actor, DynamicDiscoveryMethod, MetadataGroupReplicationOverride,
+        MetadataPathReplicationOverride, OidcProviderConfig, RealmAuthorizationDocument,
+        RealmConfigDocument, RealmDiscoveryConfig, RealmId, default_realm_discovery_config,
     };
     use autosurgeon::{hydrate, reconcile};
     use ulid::Ulid;
@@ -419,6 +535,8 @@ mod test {
                 discovery_url: "https://issuer.example/.well-known/openid-configuration"
                     .to_string(),
             }],
+            discovery: default_realm_discovery_config(),
+            nodes: Vec::new(),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[14u8; 32]).public(),
@@ -458,6 +576,8 @@ mod test {
                 ],
             },
             oidc_providers: vec![],
+            discovery: default_realm_discovery_config(),
+            nodes: Vec::new(),
         };
 
         assert_eq!(
@@ -473,5 +593,26 @@ mod test {
             document.metadata_replication_factor_for(group_id, Some("/datasets/important/item")),
             7
         );
+    }
+
+    #[test]
+    pub fn default_discovery() {
+        let discovery = default_realm_discovery_config();
+
+        match discovery {
+            RealmDiscoveryConfig::Dynamic { methods } => {
+                assert!(matches!(
+                    methods.as_slice(),
+                    [
+                        DynamicDiscoveryMethod::IrohDns { .. },
+                        DynamicDiscoveryMethod::DhtSigned {
+                            ttl_secs: 300,
+                            refresh_after_secs: 60,
+                        }
+                    ]
+                ));
+            }
+            other => panic!("unexpected default discovery config: {other:?}"),
+        }
     }
 }

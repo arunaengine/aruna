@@ -9,23 +9,88 @@ pub struct OpenConnection {
     pub alpn: Option<Alpn>,
     pub remote_id: iroh::EndpointId,
     pub side: iroh::endpoint::Side,
+    pub selected_address: Option<String>,
+    pub rtt_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionMonitorState {
+    pub open_connections: Vec<OpenConnection>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RequestSummaryState {
+    pub total: u64,
+    pub failures: u64,
+    pub last_error: Option<String>,
+}
+
+impl RequestSummaryState {
+    pub fn record_success(&mut self) {
+        self.total = self.total.saturating_add(1);
+    }
+
+    pub fn record_failure(&mut self, error: impl ToString) {
+        self.total = self.total.saturating_add(1);
+        self.failures = self.failures.saturating_add(1);
+        self.last_error = Some(error.to_string());
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetworkDiagnosticsState {
+    pub requests: RequestSummaryState,
+    pub routing_table_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerConnectionStatus {
+    Connected,
+    Known,
+    Unreachable,
 }
 
 #[derive(Debug, Clone)]
-pub struct ConnectionMonitorState {
-    pub open_connections: Vec<OpenConnection>,
-    pub observed_connections_total: u64,
-    pub dropped_observations_total: u64,
-    pub closed_connections_total: u64,
-    pub close_task_errors_total: u64,
+pub struct ProtocolConnectionState {
+    pub connection_id: u64,
+    pub alpn: Option<Alpn>,
+    pub side: iroh::endpoint::Side,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionAddressStatus {
+    Active,
+    NotAssigned,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionAddressState {
+    pub status: ConnectionAddressStatus,
+    pub address: String,
+    pub rtt_ms: Option<u64>,
+    pub protocol_connections: Vec<ProtocolConnectionState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PeerConnectionState {
+    pub node_id: NodeId,
+    pub status: PeerConnectionStatus,
+    pub active_addresses: Vec<ConnectionAddressState>,
+    pub last_error: Option<String>,
+    pub next_retry_in_secs: Option<u64>,
 }
 
 pub struct NetState {
     pub realm_id: RealmId,
     pub node_id: NodeId,
-    pub bootstrap_nodes: Vec<NodeId>,
+    pub discovery_methods: Vec<String>,
+    pub relay_method: String,
+    pub relay_urls: Vec<String>,
     pub endpoint_addr: EndpointAddr,
-    pub monitor: ConnectionMonitorState,
+    pub connections: Vec<PeerConnectionState>,
+    pub requests: RequestSummaryState,
+    pub routing_table_size: Option<usize>,
+    pub warnings: Vec<String>,
 }
 
 pub struct BlobState {

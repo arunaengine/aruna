@@ -30,7 +30,7 @@ pub struct OnboardingSecretRecord {
     pub secret_hash: String,
     pub mode: OnboardingMode,
     pub expires_at: u64,
-    pub consumed: bool,
+    pub claimed_node_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +47,7 @@ pub struct BootstrapOnboardingRequest {
 pub struct BootstrapOnboardingResponse {
     pub realm_id: String,
     pub mode: OnboardingMode,
-    pub bootstrap_endpoints: Vec<EndpointAddr>,
+    pub temporary_bootstrap_endpoint: EndpointAddr,
     pub wrapped_realm_private_key: Option<String>,
     pub wrapped_realm_private_key_nonce: Option<String>,
     pub wrapping_public_key: Option<String>,

@@ -43,8 +43,8 @@ pub enum InspectOnboardingSecretError {
     NotFound,
     #[error("onboarding secret expired")]
     Expired,
-    #[error("onboarding secret already consumed")]
-    AlreadyConsumed,
+    #[error("onboarding secret already claimed")]
+    AlreadyClaimed,
     #[error("onboarding secret does not match")]
     InvalidSecret,
     #[error("inspecting onboarding secret did not finish")]
@@ -120,9 +120,7 @@ impl Operation for InspectOnboardingSecretOperation {
                     }
                 };
 
-                let validation = if record.consumed {
-                    Err(InspectOnboardingSecretError::AlreadyConsumed)
-                } else if record.expires_at < self.input.now {
+                let validation = if record.expires_at < self.input.now {
                     Err(InspectOnboardingSecretError::Expired)
                 } else if record.secret_hash != self.input.secret_hash {
                     Err(InspectOnboardingSecretError::InvalidSecret)

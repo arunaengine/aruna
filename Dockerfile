@@ -9,6 +9,7 @@ RUN apk add llvm cmake gcc ca-certificates libc-dev pkgconfig openssl-dev musl-d
 COPY . .
 RUN cargo build --release -p aruna
 RUN cargo build --release -p aruna-doctor
+RUN cargo install --root target iroh-doctor
 
 FROM alpine:3.23
 WORKDIR /run
@@ -17,5 +18,6 @@ RUN apk upgrade
 RUN apk add libgcc gcompat ca-certificates
 COPY --from=builder /build/target/release/aruna .
 COPY --from=builder /build/target/release/aruna-doctor .
+COPY --from=builder /build/target/bin/iroh-doctor .
 
 CMD [ "/run/aruna" ]

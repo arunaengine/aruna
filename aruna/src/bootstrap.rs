@@ -138,7 +138,7 @@ pub async fn ensure_initial_local_onboarding_secret(
         secret_hash: blake3::hash(&onboarding_secret.secret).to_string(),
         mode: OnboardingMode::Local,
         expires_at: u64::MAX,
-        consumed: false,
+        claimed_node_id: None,
     };
 
     drive(

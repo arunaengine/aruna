@@ -15,7 +15,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::trace;
+use tracing::{trace, warn};
 
 use super::constants::{
     DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, MAX_MESSAGE_SIZE, RPC_TIMEOUT,
@@ -294,8 +294,8 @@ impl DhtDriver {
 
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {
-            match read_request_from_stream(&mut recv).await {
-                Ok(request) => {
+            match tokio::time::timeout(RPC_TIMEOUT, read_request_from_stream(&mut recv)).await {
+                Ok(Ok(request)) => {
                     let _ = io_tx
                         .send(DhtIo::InboundRequest {
                             inbound_id,
@@ -304,9 +304,17 @@ impl DhtDriver {
                         })
                         .await;
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let _ = io_tx
                         .send(DhtIo::InboundReadError { inbound_id, error })
+                        .await;
+                }
+                Err(error) => {
+                    let _ = io_tx
+                        .send(DhtIo::InboundReadError {
+                            inbound_id,
+                            error: error.into(),
+                        })
                         .await;
                 }
             }
@@ -407,7 +415,7 @@ impl DhtDriver {
             "Dispatching outbound DHT RPC"
         );
         tokio::spawn(async move {
-            match rpc_request(endpoint, peer, request).await {
+            match rpc_request(endpoint.clone(), peer, request).await {
                 Ok(response) => {
                     let _ = io_tx
                         .send(DhtIo::RpcResponse {
@@ -419,6 +427,19 @@ impl DhtDriver {
                         .await;
                 }
                 Err(error) => {
+                    let remote_info = endpoint.remote_info(peer).await.map(|info| {
+                        info.addrs()
+                            .map(|addr| format!("{:?} ({:?})", addr.addr(), addr.usage()))
+                            .collect::<Vec<_>>()
+                    });
+                    warn!(
+                        op_id,
+                        phase = ?phase,
+                        peer = %peer,
+                        error = %error,
+                        remote_info = ?remote_info,
+                        "Outbound DHT RPC failed"
+                    );
                     let _ = io_tx
                         .send(DhtIo::RpcError {
                             op_id,

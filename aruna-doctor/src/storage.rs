@@ -602,7 +602,7 @@ mod tests {
                     bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
                     secret_key: Some(config.net_secret_key.clone()),
                     realm_id: config.realm_id,
-                    bootstrap_nodes: Vec::new(),
+                    peer_nodes: Vec::new(),
                     discovery_method: DiscoveryMethod::None,
                     relay_method: RelayMethod::None,
                     ..Default::default()
