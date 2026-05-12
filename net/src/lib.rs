@@ -20,9 +20,9 @@ use aruna_core::handle::Handle;
 use aruna_core::id::{NodeId, TopicId};
 use aruna_core::keys::realm_endpoint_key;
 use aruna_core::structs::{
-    ConnectionAddressState, ConnectionMonitorState, NetState, NetworkDiagnosticsState,
-    PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState, RealmEndpointAnnouncement,
-    RealmId, realm_endpoint_announcement_signing_bytes,
+    ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
+    NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
+    RealmEndpointAnnouncement, RealmId, realm_endpoint_announcement_signing_bytes,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
@@ -1640,11 +1640,14 @@ async fn peer_connection_states(
         let mut active_addresses = active_address_rows(endpoint, peer).await;
 
         for connection in &open_connections {
-            let address = connection
-                .selected_address
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            let row = upsert_address_row(&mut active_addresses, address);
+            let (address, status) = match &connection.selected_address {
+                Some(address) => (address.clone(), ConnectionAddressStatus::Active),
+                None => (
+                    "not assigned".to_string(),
+                    ConnectionAddressStatus::NotAssigned,
+                ),
+            };
+            let row = upsert_address_row(&mut active_addresses, address, status);
             merge_rtt(&mut row.rtt_ms, connection.rtt_ms);
             row.protocol_connections.push(ProtocolConnectionState {
                 connection_id: connection.connection_id,
@@ -1685,7 +1688,11 @@ async fn active_address_rows(endpoint: &Endpoint, peer: NodeId) -> Vec<Connectio
     if let Some(remote_info) = endpoint.remote_info(peer).await {
         for addr in remote_info.addrs() {
             if matches!(addr.usage(), TransportAddrUsage::Active) {
-                upsert_address_row(&mut rows, transport_addr_to_string(addr.addr()));
+                upsert_address_row(
+                    &mut rows,
+                    transport_addr_to_string(addr.addr()),
+                    ConnectionAddressStatus::Active,
+                );
             }
         }
     }
@@ -1695,12 +1702,17 @@ async fn active_address_rows(endpoint: &Endpoint, peer: NodeId) -> Vec<Connectio
 fn upsert_address_row(
     rows: &mut Vec<ConnectionAddressState>,
     address: String,
+    status: ConnectionAddressStatus,
 ) -> &mut ConnectionAddressState {
-    if let Some(index) = rows.iter().position(|row| row.address == address) {
+    if let Some(index) = rows
+        .iter()
+        .position(|row| row.address == address && row.status == status)
+    {
         return &mut rows[index];
     }
 
     rows.push(ConnectionAddressState {
+        status,
         address,
         rtt_ms: None,
         protocol_connections: Vec::new(),
@@ -2302,7 +2314,9 @@ mod tests {
             peer.node_id == b.node_id()
                 && peer.status == PeerConnectionStatus::Connected
                 && peer.active_addresses.iter().any(|address| {
-                    !address.address.is_empty() && !address.protocol_connections.is_empty()
+                    address.status == ConnectionAddressStatus::Active
+                        && !address.address.is_empty()
+                        && !address.protocol_connections.is_empty()
                 })
         }));
 

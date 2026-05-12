@@ -1,6 +1,6 @@
 use crate::server_state::ServerState;
 use aruna_core::alpn::Alpn;
-use aruna_core::structs::{PeerConnectionStatus, RequestSummaryState};
+use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
@@ -92,9 +92,18 @@ pub enum PeerStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ConnectionAddressInfo {
+    pub status: AddressStatus,
     pub address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u64>,
     pub protocol_connections: Vec<ProtocolConnectionInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressStatus {
+    Active,
+    NotAssigned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -206,6 +215,7 @@ pub async fn get_info(State(state): State<Arc<ServerState>>) -> (StatusCode, Jso
                             .active_addresses
                             .iter()
                             .map(|address| ConnectionAddressInfo {
+                                status: AddressStatus::from(address.status),
                                 address: address.address.clone(),
                                 rtt_ms: address.rtt_ms,
                                 protocol_connections: address
@@ -358,6 +368,15 @@ impl From<PeerConnectionStatus> for PeerStatus {
             PeerConnectionStatus::Connected => Self::Connected,
             PeerConnectionStatus::Known => Self::Known,
             PeerConnectionStatus::Unreachable => Self::Unreachable,
+        }
+    }
+}
+
+impl From<ConnectionAddressStatus> for AddressStatus {
+    fn from(status: ConnectionAddressStatus) -> Self {
+        match status {
+            ConnectionAddressStatus::Active => Self::Active,
+            ConnectionAddressStatus::NotAssigned => Self::NotAssigned,
         }
     }
 }

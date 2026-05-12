@@ -8,7 +8,7 @@ use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keys::gossip_peer_key;
-use aruna_core::structs::{PeerConnectionStatus, RealmId};
+use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RealmId};
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_net::streams::BiStream;
 use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
@@ -250,7 +250,9 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
             peer.node_id == node_b
                 && peer.status == PeerConnectionStatus::Connected
                 && peer.active_addresses.iter().any(|address| {
-                    !address.address.is_empty() && !address.protocol_connections.is_empty()
+                    address.status == ConnectionAddressStatus::Active
+                        && !address.address.is_empty()
+                        && !address.protocol_connections.is_empty()
                 })
         }) {
             break;
@@ -264,7 +266,9 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
         peer.node_id == node_b
             && peer.status == PeerConnectionStatus::Connected
             && peer.active_addresses.iter().any(|address| {
-                !address.address.is_empty() && !address.protocol_connections.is_empty()
+                address.status == ConnectionAddressStatus::Active
+                    && !address.address.is_empty()
+                    && !address.protocol_connections.is_empty()
             })
     }));
 

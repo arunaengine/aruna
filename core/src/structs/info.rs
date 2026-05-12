@@ -57,8 +57,15 @@ pub struct ProtocolConnectionState {
     pub side: iroh::endpoint::Side,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionAddressStatus {
+    Active,
+    NotAssigned,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectionAddressState {
+    pub status: ConnectionAddressStatus,
     pub address: String,
     pub rtt_ms: Option<u64>,
     pub protocol_connections: Vec<ProtocolConnectionState>,
