@@ -531,14 +531,21 @@ pub fn client_base_url_from_advertised_host(
     bind_address: SocketAddr,
 ) -> String {
     let host = match advertised_host.trim() {
-        "" => client_host_from_ip(bind_address.ip()),
-        host => match host.parse::<std::net::IpAddr>() {
-            Ok(ip) => client_host_from_ip(ip),
-            Err(_) => host.to_string(),
-        },
+        "" => return client_base_url_from_bind_address(bind_address),
+        host => {
+            if let Ok(addr) = host.parse::<SocketAddr>() {
+                return format!("http://{}:{}", client_host_from_ip(addr.ip()), addr.port());
+            }
+
+            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                return format!("http://{}:{}", client_host_from_ip(ip), bind_address.port());
+            }
+
+            host
+        }
     };
 
-    format!("http://{host}:{}", bind_address.port())
+    format!("http://{host}")
 }
 
 fn client_host_from_ip(ip: std::net::IpAddr) -> String {
@@ -575,6 +582,21 @@ mod tests {
         assert_eq!(
             client_base_url_from_advertised_host("::", "[::]:1337".parse().unwrap()),
             "http://[::1]:1337"
+        );
+    }
+
+    #[test]
+    fn s3_base_url_preserves_explicit_authority() {
+        assert_eq!(
+            client_base_url_from_advertised_host("127.0.0.1:1337", "0.0.0.0:9999".parse().unwrap()),
+            "http://127.0.0.1:1337"
+        );
+        assert_eq!(
+            client_base_url_from_advertised_host(
+                "s3.node-1.v3.aruna-engine.org",
+                "0.0.0.0:1337".parse().unwrap()
+            ),
+            "http://s3.node-1.v3.aruna-engine.org"
         );
     }
 }

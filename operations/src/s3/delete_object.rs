@@ -237,7 +237,7 @@ impl DeleteObjectOperation {
         target_version_id: Ulid,
         existing: Option<&CurrentVersionPointer>,
     ) -> Effects {
-        if !existing.is_some_and(|pointer| pointer.version_id == target_version_id) {
+        if existing.is_none_or(|pointer| pointer.version_id != target_version_id) {
             return self.delete_target_version();
         }
 

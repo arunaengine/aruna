@@ -535,7 +535,7 @@ mod tests {
             .register_rest_interface("0.0.0.0:3000".parse().unwrap())
             .await;
         state
-            .register_s3_interface("0.0.0.0:1337".parse().unwrap(), "localhost")
+            .register_s3_interface("0.0.0.0:1337".parse().unwrap(), "127.0.0.1:1337")
             .await;
 
         let (status, Json(response)) = get_info(State(state)).await;
@@ -552,7 +552,7 @@ mod tests {
                 s3: InterfaceStatus {
                     status: ServiceStatus::Available,
                     bind: Some("0.0.0.0:1337".to_string()),
-                    url: Some("http://localhost:1337".to_string()),
+                    url: Some("http://127.0.0.1:1337".to_string()),
                 },
             }
         );

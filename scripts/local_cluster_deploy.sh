@@ -140,9 +140,8 @@ write_node_env() {
     printf 'BLOB_MAX_BUCKET_SIZE=10000\n'
     printf 'SOCKET_ADDRESS=127.0.0.1:%s\n' "$http_port"
     printf 'P2P_SOCKET_ADDRESS=127.0.0.1:%s\n' "$p2p_port"
-    printf 'S3_PORT=%s\n' "$s3_port"
-    printf 'S3_HOST=localhost\n'
-    printf 'S3_ADDRESS=127.0.0.1\n'
+    printf 'S3_HOST=127.0.0.1:%s\n' "$s3_port"
+    printf 'S3_ADDRESS=127.0.0.1:%s\n' "$s3_port"
     printf 'REALM_DESCRIPTION=Test_Deploy_Realm\n'
     printf 'METADATA_REPLICATION_FACTOR=3\n'
     if [[ "$WITH_KEYCLOAK" == "1" ]]; then
@@ -376,7 +375,7 @@ write_summary_file() {
 
   : >"$summary_file"
   for node_index in "${!NODE_NAMES[@]}"; do
-    printf '%s http=%s s3=127.0.0.1:%s dir=%s log=%s\n' \
+    printf '%s http=%s s3=http://127.0.0.1:%s dir=%s log=%s\n' \
       "${NODE_NAMES[$node_index]}" \
       "${NODE_BASE_URLS[$node_index]}" \
       "${NODE_S3_PORTS[$node_index]}" \
