@@ -588,9 +588,8 @@ mod tests {
             ("BLOB_MAX_BUCKET_SIZE", "100000".to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
-            ("S3_PORT", "0".to_string()),
-            ("S3_HOST", "localhost".to_string()),
-            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("S3_HOST", "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS", "127.0.0.1:0".to_string()),
             ("OIDC_PROVIDER_IDS", "".to_string()),
         ]);
 

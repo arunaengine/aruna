@@ -60,7 +60,6 @@ pub struct Config {
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
     pub default_metadata_replication_factor: u32,
-    pub s3_port: u16,
     pub s3_host: String,
     pub s3_address: String,
     pub onboarding_secret: Option<String>,
@@ -236,9 +235,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .transpose()?
         .unwrap_or(3)
         .max(1);
-    let s3_port = dotenvy::var("S3_PORT")?.parse::<u16>()?;
     let s3_host = dotenvy::var("S3_HOST")?;
     let s3_address = dotenvy::var("S3_ADDRESS")?;
+    SocketAddr::from_str(&s3_address)?;
     let realm_description = dotenvy::var("REALM_DESCRIPTION")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -338,7 +337,6 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             discovery_method,
             relay_method,
             default_metadata_replication_factor,
-            s3_port,
             s3_host,
             s3_address,
             onboarding_secret,
@@ -1110,9 +1108,8 @@ mod tests {
             ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
-            ("S3_PORT", "1337".to_string()),
-            ("S3_HOST", "localhost".to_string()),
-            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("S3_HOST", "127.0.0.1:1337".to_string()),
+            ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
             ("OIDC_PROVIDER_IDS", "main".to_string()),
             ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
             ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),
@@ -1125,7 +1122,6 @@ mod tests {
             "STORAGE_PATH",
             "SOCKET_ADDRESS",
             "P2P_SOCKET_ADDRESS",
-            "S3_PORT",
             "S3_HOST",
             "S3_ADDRESS",
             "OIDC_PROVIDER_IDS",
@@ -1216,9 +1212,8 @@ mod tests {
             ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
-            ("S3_PORT", "1337".to_string()),
-            ("S3_HOST", "localhost".to_string()),
-            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("S3_HOST", "127.0.0.1:1337".to_string()),
+            ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
             (
                 "P2P_ADDITIONAL_RELAY_URLS",
                 "https://relay-a.example, https://relay-b.example".to_string(),
@@ -1228,7 +1223,6 @@ mod tests {
             "STORAGE_PATH",
             "SOCKET_ADDRESS",
             "P2P_SOCKET_ADDRESS",
-            "S3_PORT",
             "S3_HOST",
             "S3_ADDRESS",
             "P2P_ADDITIONAL_RELAY_URLS",
@@ -1279,9 +1273,8 @@ mod tests {
             ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
-            ("S3_PORT", "1337".to_string()),
-            ("S3_HOST", "localhost".to_string()),
-            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("S3_HOST", "127.0.0.1:1337".to_string()),
+            ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
             (
                 "ONBOARDING_SECRET",
                 "definitely-not-a-valid-secret".to_string(),
@@ -1331,15 +1324,13 @@ mod tests {
             ("STORAGE_PATH", tempdir.path().to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:3000".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:3001".to_string()),
-            ("S3_PORT", "1337".to_string()),
-            ("S3_HOST", "localhost".to_string()),
-            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("S3_HOST", "127.0.0.1:1337".to_string()),
+            ("S3_ADDRESS", "127.0.0.1:1337".to_string()),
         ];
         let cleanup_keys = [
             "STORAGE_PATH",
             "SOCKET_ADDRESS",
             "P2P_SOCKET_ADDRESS",
-            "S3_PORT",
             "S3_HOST",
             "S3_ADDRESS",
             "ONBOARDING_SECRET",

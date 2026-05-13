@@ -227,11 +227,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server = Server::new(state.clone(), server_config);
 
     // S3 Server
-    let s3_address = format!("{}:{}", config.s3_address, config.s3_port);
-    let s3_host = format!("{}:{}", config.s3_host, config.s3_port);
     let s3_server = S3Server::new(
-        &s3_address,
-        &s3_host,
+        &config.s3_address,
+        &config.s3_host,
         driver_ctx,
         config.realm_id,
         config.node_id,
@@ -239,7 +237,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await
     .unwrap();
 
-    let s3_listener = TcpListener::bind(&s3_address).await.unwrap();
+    let s3_listener = TcpListener::bind(&config.s3_address).await.unwrap();
     let s3_bound_addr = s3_listener.local_addr().unwrap();
     state
         .register_s3_interface(s3_bound_addr, &config.s3_host)

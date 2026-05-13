@@ -30,7 +30,6 @@ struct ConfigView {
     max_concurrent_bidi_streams: Option<u64>,
     p2p_additional_relay_urls: Vec<String>,
     default_metadata_replication_factor: u32,
-    s3_port: u16,
     s3_host: String,
     s3_address: String,
     onboarding_secret_present: bool,
@@ -160,7 +159,6 @@ impl ConfigView {
             p2p_additional_relay_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
             default_metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
                 .unwrap_or(3),
-            s3_port: parse_optional_env("S3_PORT")?.unwrap_or_default(),
             s3_host: dotenvy::var("S3_HOST").unwrap_or_default(),
             s3_address: dotenvy::var("S3_ADDRESS").unwrap_or_default(),
             onboarding_secret_present: dotenvy::var("ONBOARDING_SECRET")
@@ -288,9 +286,8 @@ mod tests {
             ("BLOB_ROOT", blob_root.to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
             ("P2P_SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
-            ("S3_PORT", "0".to_string()),
-            ("S3_HOST", "localhost".to_string()),
-            ("S3_ADDRESS", "127.0.0.1".to_string()),
+            ("S3_HOST", "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS", "127.0.0.1:0".to_string()),
             ("OIDC_PROVIDER_IDS", "".to_string()),
             ("ONBOARDING_SECRET", "".to_string()),
         ]);
