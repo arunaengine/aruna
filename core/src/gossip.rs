@@ -11,7 +11,6 @@ pub struct TopicMessage {
     pub kind: TopicMessageKind,
     pub message_id: Ulid,
     pub node_id: NodeId,
-    pub trace_id: Option<String>,
     pub version: TopicMessageVersion,
 }
 
@@ -20,14 +19,12 @@ impl TopicMessage {
         kind: TopicMessageKind,
         message_id: Ulid,
         node_id: NodeId,
-        trace_id: Option<String>,
         version: TopicMessageVersion,
     ) -> Self {
         Self {
             kind,
             message_id,
             node_id,
-            trace_id,
             version,
         }
     }
@@ -112,7 +109,6 @@ mod tests {
             TopicMessageKind::RealmConfig,
             Ulid::new(),
             make_node(4),
-            None,
             TopicMessageVersion::Automerge {
                 heads: Vec::new(),
                 change_count: 0,
@@ -127,7 +123,6 @@ mod tests {
             },
             Ulid::new(),
             make_node(6),
-            None,
             TopicMessageVersion::Automerge {
                 heads: Vec::new(),
                 change_count: 0,
@@ -142,7 +137,6 @@ mod tests {
             TopicMessageKind::Metadata,
             Ulid::new(),
             make_node(5),
-            None,
             TopicMessageVersion::Metadata {
                 clock: VectorClock(BTreeMap::from([(ActorId::from_bytes([7u8; 32]), 1)])),
             },

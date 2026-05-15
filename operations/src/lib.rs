@@ -43,7 +43,6 @@ pub mod s3;
 pub mod staging;
 pub mod startup;
 pub mod task_incoming;
-pub mod telemetry;
 pub mod update_metadata_document;
 pub mod update_user;
 pub mod user_subject_index;

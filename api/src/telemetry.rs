@@ -4,31 +4,15 @@ use aruna_core::structs::AuthContext;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
-use http::{HeaderMap, Method};
-use opentelemetry::global;
-use opentelemetry::propagation::Extractor;
-use opentelemetry::trace::TraceContextExt;
+use http::Method;
 use tracing::{Instrument, Span, error, field, info_span, trace, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
-
-struct HeaderExtractor<'a>(&'a HeaderMap);
-
-impl Extractor for HeaderExtractor<'_> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|value| value.to_str().ok())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(http::HeaderName::as_str).collect()
-    }
-}
 
 pub async fn request_tracing_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_string();
     let query = request.uri().query().map(str::to_string);
-    let span = make_request_span("http", request.headers(), &method, &path);
+    let span = make_request_span("http", &method, &path);
     let started = Instant::now();
 
     {
@@ -48,14 +32,9 @@ pub async fn request_tracing_middleware(request: Request, next: Next) -> Respons
     response
 }
 
-pub fn make_request_span(
-    protocol: &'static str,
-    headers: &HeaderMap,
-    method: &Method,
-    path: &str,
-) -> Span {
+pub fn make_request_span(protocol: &'static str, method: &Method, path: &str) -> Span {
     let request_id = Ulid::new().to_string();
-    let span = info_span!(
+    info_span!(
         "request",
         protocol = protocol,
         request_id = %request_id,
@@ -64,14 +43,7 @@ pub fn make_request_span(
         status_code = field::Empty,
         user_id = field::Empty,
         realm_id = field::Empty,
-        trace_id = field::Empty,
-    );
-
-    let parent =
-        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(headers)));
-    let _ = span.set_parent(parent);
-    record_trace_id(&span);
-    span
+    )
 }
 
 pub fn record_auth_context(auth_ctx: Option<&AuthContext>) {
@@ -125,9 +97,4 @@ pub fn emit_request_completed(
             "Completed request"
         ),
     }
-}
-
-fn record_trace_id(span: &Span) {
-    let trace_id = span.context().span().span_context().trace_id().to_string();
-    span.record("trace_id", field::display(trace_id));
 }

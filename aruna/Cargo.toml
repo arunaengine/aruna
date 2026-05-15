@@ -24,16 +24,12 @@ dotenvy = { workspace = true }
 ed25519-dalek = { workspace = true }
 iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
-opentelemetry = { workspace = true }
-opentelemetry-otlp = { workspace = true }
-opentelemetry_sdk = { workspace = true }
 postcard = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = { workspace = true }
 tracing-subscriber = { workspace = true }
 ulid = { workspace = true }
 byteview = { workspace = true }

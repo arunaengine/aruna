@@ -13,7 +13,7 @@ use aruna_core::id::{NodeId, TopicId};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use tracing::{Instrument, error, field, info_span, trace, warn};
+use tracing::{Instrument, error, info_span, trace, warn};
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -44,13 +44,7 @@ impl InboundEventHandler for OperationsInboundHandler {
             topic = %topic,
             sender = %sender,
             message_id = ?message.as_ref().map(|message| message.message_id),
-            trace_id = field::Empty,
         );
-        if let Some(message) = message.as_ref()
-            && let Some(trace_id) = message.trace_id.as_ref()
-        {
-            span.record("trace_id", field::display(trace_id));
-        }
 
         async move {
             trace!(

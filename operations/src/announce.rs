@@ -19,7 +19,6 @@ use ulid::Ulid;
 
 use crate::automerge::repository::{automerge_clock, read_effect};
 use crate::metadata::repository::read_registry_by_document_effect;
-use crate::telemetry::current_trace_id;
 
 pub const TOPIC_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 pub const TOPIC_ANNOUNCE_SHORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -210,13 +209,7 @@ impl AnnounceTopicOperation {
         version: TopicMessageVersion,
     ) -> aruna_core::types::Effects {
         let message_id = Ulid::new();
-        let message = TopicMessage::new(
-            kind,
-            message_id,
-            self.local_node_id,
-            current_trace_id(),
-            version,
-        );
+        let message = TopicMessage::new(kind, message_id, self.local_node_id, version);
         let bytes = match postcard::to_allocvec(&message) {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(ConversionError::from(error).into()),
