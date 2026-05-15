@@ -17,6 +17,7 @@ use super::protocol::{DhtIoError, DhtOutputValue};
 use super::state::DhtStateMachine;
 use super::storage::now_unix_secs;
 use crate::error::{NetError, Result};
+use crate::telemetry::current_trace_context;
 
 #[derive(Debug)]
 pub(crate) struct DhtSpawnResources {
@@ -110,6 +111,7 @@ impl DhtHandle {
                 realm_id,
                 value,
                 ttl,
+                trace_context: current_trace_context(),
                 reply,
             })
             .await?
@@ -139,6 +141,7 @@ impl DhtHandle {
             .request(|reply| DriverCmd::Get {
                 key: *key,
                 realm_filter,
+                trace_context: current_trace_context(),
                 reply,
             })
             .await?
@@ -170,6 +173,7 @@ impl DhtHandle {
         match self
             .request(|reply| DriverCmd::Bootstrap {
                 nodes: nodes.to_vec(),
+                trace_context: current_trace_context(),
                 reply,
             })
             .await?

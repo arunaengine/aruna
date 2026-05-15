@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::id::{NodeId, TopicId};
+use crate::trace_context::DistributedTraceContext;
 use crate::types::UserId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +12,7 @@ pub struct TopicMessage {
     pub kind: TopicMessageKind,
     pub message_id: Ulid,
     pub node_id: NodeId,
+    pub trace_context: Option<DistributedTraceContext>,
     pub version: TopicMessageVersion,
 }
 
@@ -25,8 +27,14 @@ impl TopicMessage {
             kind,
             message_id,
             node_id,
+            trace_context: None,
             version,
         }
+    }
+
+    pub fn with_trace_context(mut self, trace_context: Option<DistributedTraceContext>) -> Self {
+        self.trace_context = trace_context;
+        self
     }
 
     pub fn is_valid_for(&self, topic: &TopicId) -> bool {

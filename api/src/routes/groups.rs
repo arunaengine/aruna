@@ -14,7 +14,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::{Instrument, Span, field, info_span, trace};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
@@ -149,6 +149,8 @@ pub async fn create_group(
 ) -> ServerResult<(StatusCode, Json<CreateGroupResponse>)> {
     let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
+    let request_span = Span::current();
+    request_span.record("group_name", field::display(&request.name));
     if auth.realm_id != realm_id {
         return Err(ServerError::Forbidden);
     }
@@ -181,6 +183,14 @@ pub async fn create_group(
         "Authorized group creation request"
     );
 
+    let create_span = info_span!(
+        "group.create",
+        "otel.kind" = "internal",
+        realm_id = %realm_id,
+        user_id = %auth.user_id,
+        group_name = %request.name,
+        group_id = field::Empty,
+    );
     let result = drive(
         CreateGroupOperation::new(CreateGroupConfig {
             actor: Actor {
@@ -192,8 +202,11 @@ pub async fn create_group(
         }),
         &state.get_ctx(),
     )
+    .instrument(create_span.clone())
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    create_span.record("group_id", field::display(result.0.group_id));
+    request_span.record("group_id", field::display(result.0.group_id));
 
     trace!(
         event = "request.group.create.completed",

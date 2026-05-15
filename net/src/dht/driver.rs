@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use aruna_core::DistributedTraceContext;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -15,7 +16,8 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{trace, warn};
+use tracing::{Instrument, info_span, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
     DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, MAX_MESSAGE_SIZE, RPC_TIMEOUT,
@@ -25,11 +27,12 @@ use super::protocol::{
     InboundId, OpId, RpcPhase, StorageStage,
 };
 use super::rpc::{
-    DHT_ALPN, DhtRequest, DhtResponse, ErrorCode, decode_request, decode_response, encode_request,
-    encode_response,
+    DHT_ALPN, DhtRequest, DhtResponse, ErrorCode, decode_request_with_trace_context,
+    decode_response, encode_request_with_trace_context, encode_response,
 };
 use super::state::DhtStateMachine;
 use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, decode_entries, encode_entries};
+use crate::telemetry::extract_trace_context;
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
 pub type InboundDhtStream = (Connection, SendStream, RecvStream, NodeId);
@@ -48,15 +51,18 @@ pub enum DriverCmd {
         realm_id: RealmId,
         value: Vec<u8>,
         ttl: Duration,
+        trace_context: Option<DistributedTraceContext>,
         reply: oneshot::Sender<CallerOutcome>,
     },
     Get {
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        trace_context: Option<DistributedTraceContext>,
         reply: oneshot::Sender<CallerOutcome>,
     },
     Bootstrap {
         nodes: Vec<NodeId>,
+        trace_context: Option<DistributedTraceContext>,
         reply: oneshot::Sender<CallerOutcome>,
     },
     RoutingTableSize {
@@ -211,6 +217,7 @@ impl DhtDriver {
                 realm_id,
                 value,
                 ttl,
+                trace_context,
                 reply,
             } => {
                 let op_id = self.register_caller(reply);
@@ -220,11 +227,13 @@ impl DhtDriver {
                     realm_id,
                     value,
                     ttl,
+                    trace_context,
                 }));
             }
             DriverCmd::Get {
                 key,
                 realm_filter,
+                trace_context,
                 reply,
             } => {
                 let op_id = self.register_caller(reply);
@@ -232,11 +241,20 @@ impl DhtDriver {
                     op_id,
                     key,
                     realm_filter,
+                    trace_context,
                 }));
             }
-            DriverCmd::Bootstrap { nodes, reply } => {
+            DriverCmd::Bootstrap {
+                nodes,
+                trace_context,
+                reply,
+            } => {
                 let op_id = self.register_caller(reply);
-                self.process_input(DhtInput::Cmd(DhtCmd::Bootstrap { op_id, nodes }));
+                self.process_input(DhtInput::Cmd(DhtCmd::Bootstrap {
+                    op_id,
+                    nodes,
+                    trace_context,
+                }));
             }
             DriverCmd::RoutingTableSize { reply } => {
                 let op_id = self.register_caller(reply);
@@ -295,12 +313,13 @@ impl DhtDriver {
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {
             match tokio::time::timeout(RPC_TIMEOUT, read_request_from_stream(&mut recv)).await {
-                Ok(Ok(request)) => {
+                Ok(Ok((trace_context, request))) => {
                     let _ = io_tx
                         .send(DhtIo::InboundRequest {
                             inbound_id,
                             peer,
                             request,
+                            trace_context,
                         })
                         .await;
                 }
@@ -322,13 +341,36 @@ impl DhtDriver {
     }
 
     fn handle_worker_io(&mut self, io: DhtIo) {
-        if let DhtIo::InboundRequest { peer, request, .. } = &io {
+        if let DhtIo::InboundRequest {
+            inbound_id,
+            peer,
+            request,
+            trace_context,
+        } = io
+        {
+            let span = info_span!(
+                "dht.rpc.receive",
+                "otel.kind" = "server",
+                peer = %peer,
+                request = ?request,
+            );
+            if let Some(trace_context) = trace_context.as_ref() {
+                let _ = span.set_parent(extract_trace_context(trace_context));
+            }
+            let _guard = span.enter();
             trace!(
                 event = "dht.rpc.received",
                 peer = %peer,
                 request = ?request,
                 "Received inbound DHT RPC"
             );
+            self.process_input(DhtInput::Io(DhtIo::InboundRequest {
+                inbound_id,
+                peer,
+                request,
+                trace_context,
+            }));
+            return;
         }
 
         if let DhtIo::InboundReadError { inbound_id, error } = io {
@@ -367,7 +409,8 @@ impl DhtDriver {
                 phase,
                 peer,
                 request,
-            } => self.dispatch_rpc_request(op_id, phase, peer, request),
+                trace_context,
+            } => self.dispatch_rpc_request(op_id, phase, peer, request, trace_context),
             DhtIoRequest::RpcResponse {
                 inbound_id,
                 response,
@@ -403,6 +446,7 @@ impl DhtDriver {
         phase: RpcPhase,
         peer: NodeId,
         request: DhtRequest,
+        trace_context: Option<DistributedTraceContext>,
     ) {
         let endpoint = self.endpoint.clone();
         let io_tx = self.io_tx.clone();
@@ -414,43 +458,57 @@ impl DhtDriver {
             request = ?request,
             "Dispatching outbound DHT RPC"
         );
-        tokio::spawn(async move {
-            match rpc_request(endpoint.clone(), peer, request).await {
-                Ok(response) => {
-                    let _ = io_tx
-                        .send(DhtIo::RpcResponse {
+        let span = info_span!(
+            "dht.rpc.request",
+            "otel.kind" = "client",
+            op_id,
+            phase = ?phase,
+            peer = %peer,
+            request = ?request,
+        );
+        if let Some(trace_context) = trace_context.as_ref() {
+            let _ = span.set_parent(extract_trace_context(trace_context));
+        }
+        tokio::spawn(
+            async move {
+                match rpc_request(endpoint.clone(), peer, request, trace_context).await {
+                    Ok(response) => {
+                        let _ = io_tx
+                            .send(DhtIo::RpcResponse {
+                                op_id,
+                                phase,
+                                peer,
+                                response,
+                            })
+                            .await;
+                    }
+                    Err(error) => {
+                        let remote_info = endpoint.remote_info(peer).await.map(|info| {
+                            info.addrs()
+                                .map(|addr| format!("{:?} ({:?})", addr.addr(), addr.usage()))
+                                .collect::<Vec<_>>()
+                        });
+                        warn!(
                             op_id,
-                            phase,
-                            peer,
-                            response,
-                        })
-                        .await;
-                }
-                Err(error) => {
-                    let remote_info = endpoint.remote_info(peer).await.map(|info| {
-                        info.addrs()
-                            .map(|addr| format!("{:?} ({:?})", addr.addr(), addr.usage()))
-                            .collect::<Vec<_>>()
-                    });
-                    warn!(
-                        op_id,
-                        phase = ?phase,
-                        peer = %peer,
-                        error = %error,
-                        remote_info = ?remote_info,
-                        "Outbound DHT RPC failed"
-                    );
-                    let _ = io_tx
-                        .send(DhtIo::RpcError {
-                            op_id,
-                            phase,
-                            peer,
-                            error,
-                        })
-                        .await;
+                            phase = ?phase,
+                            peer = %peer,
+                            error = %error,
+                            remote_info = ?remote_info,
+                            "Outbound DHT RPC failed"
+                        );
+                        let _ = io_tx
+                            .send(DhtIo::RpcError {
+                                op_id,
+                                phase,
+                                peer,
+                                error,
+                            })
+                            .await;
+                    }
                 }
             }
-        });
+            .instrument(span),
+        );
     }
 
     fn dispatch_rpc_response(&mut self, inbound_id: InboundId, response: DhtResponse) {
@@ -686,6 +744,7 @@ async fn rpc_request(
     endpoint: Endpoint,
     peer: NodeId,
     request: DhtRequest,
+    trace_context: Option<DistributedTraceContext>,
 ) -> Result<DhtResponse, DhtIoError> {
     let conn = tokio::time::timeout(RPC_TIMEOUT, endpoint.connect(peer, DHT_ALPN))
         .await?
@@ -693,7 +752,7 @@ async fn rpc_request(
 
     let (mut send, mut recv) = conn.open_bi().await.map_err(DhtIoError::network)?;
 
-    let request_bytes = encode_request(&request)?;
+    let request_bytes = encode_request_with_trace_context(&request, trace_context)?;
     let len = (request_bytes.len() as u32).to_be_bytes();
     send.write_all(&len).await.map_err(DhtIoError::network)?;
     send.write_all(&request_bytes)
@@ -719,7 +778,9 @@ async fn rpc_request(
     Ok(decode_response(&response_bytes)?)
 }
 
-async fn read_request_from_stream(recv: &mut RecvStream) -> Result<DhtRequest, DhtIoError> {
+async fn read_request_from_stream(
+    recv: &mut RecvStream,
+) -> Result<(Option<DistributedTraceContext>, DhtRequest), DhtIoError> {
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf)
         .await
@@ -743,7 +804,7 @@ async fn read_request_from_stream(recv: &mut RecvStream) -> Result<DhtRequest, D
         Err(err) => return Err(DhtIoError::network(err)),
     }
 
-    Ok(decode_request(&req_bytes)?)
+    Ok(decode_request_with_trace_context(&req_bytes)?)
 }
 
 async fn write_response_to_stream(

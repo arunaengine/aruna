@@ -5,6 +5,7 @@ use crate::incoming_automerge::IncomingAutomergeOperation;
 use crate::incoming_gossip::IncomingGossipOperation;
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
+use crate::telemetry::extract_trace_context;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
@@ -14,6 +15,7 @@ use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
 use tracing::{Instrument, error, info_span, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -41,10 +43,19 @@ impl InboundEventHandler for OperationsInboundHandler {
         let message = postcard::from_bytes::<TopicMessage>(&data).ok();
         let span = info_span!(
             "gossip.receive",
+            "otel.kind" = "consumer",
+            "messaging.system" = "iroh-gossip",
             topic = %topic,
             sender = %sender,
             message_id = ?message.as_ref().map(|message| message.message_id),
         );
+        if let Some(trace_context) = message
+            .as_ref()
+            .and_then(|message| message.trace_context.as_ref())
+        {
+            let parent = extract_trace_context(trace_context);
+            let _ = span.set_parent(parent);
+        }
 
         async move {
             trace!(

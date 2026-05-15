@@ -16,8 +16,11 @@ use async_trait::async_trait;
 use automerge::AutoCommit;
 use automerge::sync::{self, SyncDoc};
 use tokio::sync::Mutex;
-use tracing::{trace, warn};
+use tracing::{Instrument, info_span, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
+
+use crate::telemetry::{current_trace_context, extract_trace_context};
 
 use super::protocol::{AutomergeTransportMessage, read_message, write_message};
 
@@ -90,7 +93,7 @@ impl AutomergeHandle {
     async fn start_outbound_sync(
         &self,
         peer: aruna_core::NodeId,
-        init: AutomergeInit,
+        mut init: AutomergeInit,
     ) -> AutomergeEvent {
         let Some(net_handle) = self.inner.net_handle.clone() else {
             return AutomergeEvent::SyncRejected {
@@ -99,6 +102,10 @@ impl AutomergeHandle {
                 error: AutomergeSyncError::Network("network handle unavailable".to_string()),
             };
         };
+
+        if init.trace_context.is_none() {
+            init.trace_context = current_trace_context();
+        }
 
         let sync_id = Ulid::new();
         let document = init.document.clone();
@@ -302,11 +309,25 @@ impl AutomergeHandle {
         };
 
         let before_heads = doc.get_heads();
-        let result = match sync.direction {
-            SyncDirection::Outbound | SyncDirection::Inbound => {
-                run_sync_rounds(&mut sync.stream, &mut doc, &remote_init).await
-            }
-        };
+        let span = info_span!(
+            "automerge.sync",
+            "otel.kind" = match sync.direction {
+                SyncDirection::Outbound => "client",
+                SyncDirection::Inbound => "server",
+            },
+            sync_id = %sync_id,
+            peer = %sync.peer,
+            document = %document.topic_id(),
+        );
+        if matches!(sync.direction, SyncDirection::Inbound)
+            && let Some(trace_context) = remote_init.trace_context.as_ref()
+        {
+            let _ = span.set_parent(extract_trace_context(trace_context));
+        }
+
+        let result = async { run_sync_rounds(&mut sync.stream, &mut doc, &remote_init).await }
+            .instrument(span)
+            .await;
 
         match result {
             Ok(()) => {

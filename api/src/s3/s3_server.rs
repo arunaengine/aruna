@@ -122,7 +122,7 @@ impl Service<Request<Incoming>> for WrappingService {
         let (parts, body) = req.into_parts();
         let method = parts.method.clone();
         let path = parts.uri.path().to_string();
-        let span = make_request_span("s3", &method, &path);
+        let span = make_request_span("s3", &parts.headers, &method, &path);
         let started = Instant::now();
         {
             let _guard = span.enter();

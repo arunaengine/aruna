@@ -24,6 +24,7 @@ chrono = { workspace = true }
 globset = { workspace = true }
 iroh = { workspace = true }
 jsonwebtoken = { workspace = true }
+opentelemetry = { workspace = true }
 postcard = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
@@ -32,6 +33,7 @@ smallvec = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
 ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }

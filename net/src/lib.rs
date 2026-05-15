@@ -7,6 +7,7 @@ pub mod error;
 pub mod gossip;
 mod monitoring;
 pub mod streams;
+mod telemetry;
 
 use std::net::SocketAddr;
 use std::str::FromStr;

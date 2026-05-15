@@ -11,6 +11,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::automerge::repository::{automerge_heads, read_effect, write_effect};
+use crate::telemetry::current_trace_context;
 use crate::user_subject_index::{
     ResolveUserSubjectConflictsInput, ResolveUserSubjectConflictsOperation,
 };
@@ -193,7 +194,8 @@ impl Operation for OutgoingAutomergeOperation {
                     };
                     self.local_document = Some(bytes);
                     self.state = OutgoingAutomergeState::InitializeSession;
-                    let mut init = AutomergeInit::new(self.document.clone(), heads);
+                    let mut init = AutomergeInit::new(self.document.clone(), heads)
+                        .with_trace_context(current_trace_context());
                     if let Some(auth_proof) = self.auth_proof.clone() {
                         init.capabilities
                             .push(aruna_core::automerge::AutomergeSyncFeature::InitAuthProof);
