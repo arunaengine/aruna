@@ -2,10 +2,8 @@ use aruna_core::{
     alpn::Alpn,
     structs::{ConnectionMonitorState, OpenConnection},
 };
-use iroh::TransportAddr;
-use iroh::endpoint::{
-    AfterHandshakeOutcome, BeforeConnectOutcome, ConnectionInfo, EndpointHooks, Side,
-};
+use iroh::endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, EndpointHooks, Side};
+use iroh::{TransportAddr, endpoint::Connection};
 use std::sync::Arc;
 use tokio::{
     sync::{
@@ -31,7 +29,7 @@ struct ObservedConnection {
     alpn: Vec<u8>,
     remote_id: iroh::EndpointId,
     side: Side,
-    handle: ConnectionInfo,
+    handle: Connection,
 }
 
 #[derive(Debug, Clone)]
@@ -40,7 +38,7 @@ struct TrackedConnection {
     alpn: Option<Alpn>,
     remote_id: iroh::EndpointId,
     side: Side,
-    handle: ConnectionInfo,
+    handle: Connection,
 }
 
 impl EndpointHooks for Monitor {
@@ -58,7 +56,7 @@ impl EndpointHooks for Monitor {
         BeforeConnectOutcome::Accept
     }
 
-    async fn after_handshake(&self, conn: &ConnectionInfo) -> AfterHandshakeOutcome {
+    async fn after_handshake(&self, conn: &Connection) -> AfterHandshakeOutcome {
         let info = ObservedConnection {
             alpn: conn.alpn().to_vec(),
             remote_id: conn.remote_id(),
@@ -103,17 +101,14 @@ impl Monitor {
                     conn.lock().await.push(TrackedConnection{ connection_id, alpn: Alpn::from_bytes(&alpn), remote_id, side, handle: handle.clone() });
                     let conn_clone = conn.clone();
                     tasks.spawn(async move {
-                        match handle.closed().await {
-                            Some((error, state)) => {
-                                // We have access to the final stats of the connection!
-                                trace!(%remote_id, ?alpn, ?error, udp_rx=state.udp_rx.bytes, udp_tx=state.udp_tx.bytes, "connection closed");
-                            }
-                            None => {
-                                // The connection was closed before we could register our stats-on-close listener.
-                                trace!(%remote_id, ?alpn, "connection closed before tracking started");
-                            }
-
-                        };
+                        let e = handle.closed().await;
+                        trace!(
+                            connection_id = connection_id,
+                            remote_id = %remote_id,
+                            side = ?side,
+                            err = ?e,
+                            "connection closed"
+                        );
                         conn_clone.lock().await.retain(|mx| mx.connection_id != connection_id);
                     }.instrument(tracing::Span::current()));
                 }
@@ -133,13 +128,15 @@ impl Monitor {
             open_connections: connections
                 .iter()
                 .map(|connection| {
-                    let selected_path = connection.handle.selected_path();
+                    let paths = connection.handle.paths();
+
+                    let selected_path = paths.iter().find(|path| path.is_selected());
                     let selected_address = selected_path
                         .as_ref()
                         .map(|path| transport_addr_to_string(path.remote_addr()));
                     let rtt_ms = selected_path
                         .as_ref()
-                        .and_then(|path| path.rtt())
+                        .map(|path| path.rtt())
                         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64);
 
                     OpenConnection {

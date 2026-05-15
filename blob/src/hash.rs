@@ -3,7 +3,6 @@ use aruna_core::structs::checksum::{
 };
 use sha1::Digest as _;
 use sha1::Sha1;
-use sha2::Digest as _;
 use sha2::Sha256;
 use std::collections::HashMap;
 
