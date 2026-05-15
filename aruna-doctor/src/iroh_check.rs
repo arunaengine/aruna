@@ -6,7 +6,7 @@ use aruna_api::routes::info::{
 use aruna_core::alpn::Alpn;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use iroh::endpoint::presets;
-use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr, Watcher};
+use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use serde::Serialize;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -312,17 +312,15 @@ fn reported_diagnostics(endpoint_info: &InfoResponse) -> ReportedNetDiagnostics 
 }
 
 fn path_statuses(conn: &iroh::endpoint::Connection) -> Vec<IrohPathStatus> {
-    let mut paths = conn.paths();
-    paths.update();
+    let paths = conn.paths();
     paths
-        .peek()
         .iter()
         .map(|path| IrohPathStatus {
             id: format!("{:?}", path.id()),
             remote_addr: transport_addr_to_string(path.remote_addr()),
             selected: path.is_selected(),
-            closed: path.is_closed(),
-            rtt_ms: path.rtt().map(duration_ms),
+            closed: false, // iroh currently does not provide a way to determine if a path is closed
+            rtt_ms: Some(path.rtt().as_millis() as u64),
         })
         .collect()
 }

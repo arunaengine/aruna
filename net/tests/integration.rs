@@ -478,7 +478,7 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
                 "inbound stream closed without data",
             )
         })?;
-    assert_eq!(chunk.bytes.to_vec(), b"hello stream".to_vec());
+    assert_eq!(chunk.to_vec(), b"hello stream".to_vec());
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;
