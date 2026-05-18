@@ -166,6 +166,23 @@ mod tests {
     }
 
     #[test]
+    fn test_request_roundtrip_with_trace_context() {
+        let trace_context = DistributedTraceContext::new(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+            Some("congo=t61rcWkgMzE".to_string()),
+        );
+        let req = DhtRequest::Ping;
+
+        let bytes = encode_request_with_trace_context(&req, Some(trace_context.clone()))
+            .expect("encode request");
+        let (decoded_trace_context, decoded_request) =
+            decode_request_with_trace_context(&bytes).expect("decode request");
+
+        assert_eq!(decoded_trace_context, Some(trace_context));
+        assert!(matches!(decoded_request, DhtRequest::Ping));
+    }
+
+    #[test]
     fn test_get_value_request_roundtrip_with_realm_filter() {
         let key = DhtKeyId::from_data(b"realm-filtered-get");
         let realm_id = RealmId::from_bytes([9u8; 32]);

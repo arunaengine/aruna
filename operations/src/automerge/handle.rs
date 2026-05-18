@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
 use aruna_core::automerge::{
-    AutomergeEffect, AutomergeEvent, AutomergeInit, AutomergeRejectReason, AutomergeSyncError,
-    AutomergeSyncFeature,
+    AutomergeDocumentVariant, AutomergeEffect, AutomergeEvent, AutomergeInit,
+    AutomergeRejectReason, AutomergeSyncError, AutomergeSyncFeature,
 };
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use automerge::AutoCommit;
 use automerge::sync::{self, SyncDoc};
 use tokio::sync::Mutex;
-use tracing::{Instrument, info_span, trace, warn};
+use tracing::{Instrument, Span, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
 
@@ -42,12 +42,33 @@ struct ActiveSync {
     stream: BiStream,
     direction: SyncDirection,
     remote_init: Option<AutomergeInit>,
+    span: Option<Span>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SyncDirection {
     Inbound,
     Outbound,
+}
+
+fn make_sync_span(
+    sync_id: Ulid,
+    direction: SyncDirection,
+    peer: aruna_core::NodeId,
+    document: &AutomergeDocumentVariant,
+) -> Span {
+    info_span!(
+        "automerge.sync",
+        "otel.kind" = match direction {
+            SyncDirection::Outbound => "client",
+            SyncDirection::Inbound => "server",
+        },
+        "otel.status_code" = field::Empty,
+        "otel.status_description" = field::Empty,
+        sync_id = %sync_id,
+        peer = %peer,
+        document = %document.topic_id(),
+    )
 }
 
 impl AutomergeHandle {
@@ -71,6 +92,7 @@ impl AutomergeHandle {
             stream,
             direction: SyncDirection::Inbound,
             remote_init: None,
+            span: None,
         };
         self.store_active_sync(sync_id, sync).await;
         sync_id
@@ -103,87 +125,113 @@ impl AutomergeHandle {
             };
         };
 
-        if init.trace_context.is_none() {
-            init.trace_context = current_trace_context();
-        }
-
         let sync_id = Ulid::new();
         let document = init.document.clone();
-        trace!(
-            event = "automerge.sync.started",
-            sync_id = %sync_id,
-            peer = %peer,
-            document = %document.topic_id(),
-            direction = "outbound",
-            "Starting outbound automerge sync"
-        );
-        let stream = match net_handle.open_stream(peer, Alpn::Automerge).await {
-            Ok(stream) => stream,
-            Err(err) => {
+        let span = make_sync_span(sync_id, SyncDirection::Outbound, peer, &document);
+        let active_span = span.clone();
+
+        async {
+            let existing_trace_context = init.trace_context.take();
+            init.trace_context = current_trace_context().or(existing_trace_context);
+            trace!(
+                event = "automerge.sync.started",
+                sync_id = %sync_id,
+                peer = %peer,
+                document = %document.topic_id(),
+                direction = "outbound",
+                "Starting outbound automerge sync"
+            );
+            let stream = match net_handle.open_stream(peer, Alpn::Automerge).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    Span::current().record("otel.status_code", "ERROR");
+                    Span::current()
+                        .record("otel.status_description", field::display(err.to_string()));
+                    return AutomergeEvent::SyncRejected {
+                        sync_id,
+                        document: Some(document),
+                        error: AutomergeSyncError::Network(err.to_string()),
+                    };
+                }
+            };
+
+            let mut sync = ActiveSync {
+                peer,
+                stream,
+                direction: SyncDirection::Outbound,
+                remote_init: None,
+                span: Some(active_span.clone()),
+            };
+
+            if let Err(error) = write_transport_message(
+                &mut sync.stream,
+                &AutomergeTransportMessage::Init(init.clone()),
+            )
+            .await
+            {
+                Span::current().record("otel.status_code", "ERROR");
+                Span::current().record(
+                    "otel.status_description",
+                    field::display(format!("{error:?}")),
+                );
+                close_stream(&mut sync.stream).await;
                 return AutomergeEvent::SyncRejected {
                     sync_id,
                     document: Some(document),
-                    error: AutomergeSyncError::Network(err.to_string()),
+                    error,
                 };
             }
-        };
 
-        let mut sync = ActiveSync {
-            peer,
-            stream,
-            direction: SyncDirection::Outbound,
-            remote_init: None,
-        };
-
-        if let Err(error) = write_transport_message(
-            &mut sync.stream,
-            &AutomergeTransportMessage::Init(init.clone()),
-        )
+            match read_transport_message(&mut sync.stream).await {
+                Ok(AutomergeTransportMessage::Init(remote_init)) => {
+                    sync.remote_init = Some(remote_init.clone());
+                    self.store_active_sync(sync_id, sync).await;
+                    AutomergeEvent::SyncInitialized {
+                        sync_id,
+                        peer,
+                        remote_init,
+                    }
+                }
+                Ok(AutomergeTransportMessage::Reject(reason)) => {
+                    Span::current().record("otel.status_code", "ERROR");
+                    Span::current().record(
+                        "otel.status_description",
+                        field::display(format!("remote rejected sync: {reason:?}")),
+                    );
+                    close_stream(&mut sync.stream).await;
+                    AutomergeEvent::SyncRejected {
+                        sync_id,
+                        document: Some(document),
+                        error: reject_reason_to_error(reason),
+                    }
+                }
+                Ok(_) => {
+                    Span::current().record("otel.status_code", "ERROR");
+                    Span::current().record("otel.status_description", "invalid remote init");
+                    close_stream(&mut sync.stream).await;
+                    AutomergeEvent::SyncRejected {
+                        sync_id,
+                        document: Some(document),
+                        error: AutomergeSyncError::InvalidInit,
+                    }
+                }
+                Err(error) => {
+                    Span::current().record("otel.status_code", "ERROR");
+                    Span::current().record(
+                        "otel.status_description",
+                        field::display(format!("{error:?}")),
+                    );
+                    close_stream(&mut sync.stream).await;
+                    AutomergeEvent::SyncRejected {
+                        sync_id,
+                        document: Some(document),
+                        error,
+                    }
+                }
+            }
+        }
+        .instrument(span)
         .await
-        {
-            close_stream(&mut sync.stream).await;
-            return AutomergeEvent::SyncRejected {
-                sync_id,
-                document: Some(document),
-                error,
-            };
-        }
-
-        match read_transport_message(&mut sync.stream).await {
-            Ok(AutomergeTransportMessage::Init(remote_init)) => {
-                sync.remote_init = Some(remote_init.clone());
-                self.store_active_sync(sync_id, sync).await;
-                AutomergeEvent::SyncInitialized {
-                    sync_id,
-                    peer,
-                    remote_init,
-                }
-            }
-            Ok(AutomergeTransportMessage::Reject(reason)) => {
-                close_stream(&mut sync.stream).await;
-                AutomergeEvent::SyncRejected {
-                    sync_id,
-                    document: Some(document),
-                    error: reject_reason_to_error(reason),
-                }
-            }
-            Ok(_) => {
-                close_stream(&mut sync.stream).await;
-                AutomergeEvent::SyncRejected {
-                    sync_id,
-                    document: Some(document),
-                    error: AutomergeSyncError::InvalidInit,
-                }
-            }
-            Err(error) => {
-                close_stream(&mut sync.stream).await;
-                AutomergeEvent::SyncRejected {
-                    sync_id,
-                    document: Some(document),
-                    error,
-                }
-            }
-        }
     }
 
     async fn start_inbound_sync(&self, sync_id: Ulid) -> AutomergeEvent {
@@ -201,15 +249,24 @@ impl AutomergeHandle {
         let peer = sync.peer;
         match read_transport_message(&mut sync.stream).await {
             Ok(AutomergeTransportMessage::Init(remote_init)) => {
-                trace!(
-                    event = "automerge.sync.started",
-                    sync_id = %sync_id,
-                    peer = %peer,
-                    document = %remote_init.document.topic_id(),
-                    direction = "inbound",
-                    "Starting inbound automerge sync"
-                );
+                let span =
+                    make_sync_span(sync_id, SyncDirection::Inbound, peer, &remote_init.document);
+                if let Some(trace_context) = remote_init.trace_context.as_ref() {
+                    let _ = span.set_parent(extract_trace_context(trace_context));
+                }
+                {
+                    let _guard = span.enter();
+                    trace!(
+                        event = "automerge.sync.started",
+                        sync_id = %sync_id,
+                        peer = %peer,
+                        document = %remote_init.document.topic_id(),
+                        direction = "inbound",
+                        "Starting inbound automerge sync"
+                    );
+                }
                 sync.remote_init = Some(remote_init.clone());
+                sync.span = Some(span);
                 self.store_active_sync(sync_id, sync).await;
                 AutomergeEvent::SyncInitialized {
                     sync_id,
@@ -275,6 +332,20 @@ impl AutomergeHandle {
             }
         };
 
+        let document = response_init
+            .as_ref()
+            .map(|init| init.document.clone())
+            .unwrap_or_else(|| remote_init.document.clone());
+        let span = sync.span.take().unwrap_or_else(|| {
+            let span = make_sync_span(sync_id, sync.direction, sync.peer, &document);
+            if matches!(sync.direction, SyncDirection::Inbound)
+                && let Some(trace_context) = remote_init.trace_context.as_ref()
+            {
+                let _ = span.set_parent(extract_trace_context(trace_context));
+            }
+            span
+        });
+
         if let Some(local_init) = response_init.as_ref()
             && let Err(error) = write_transport_message(
                 &mut sync.stream,
@@ -282,23 +353,27 @@ impl AutomergeHandle {
             )
             .await
         {
-            let document = Some(local_init.document.clone());
+            span.record("otel.status_code", "ERROR");
+            span.record(
+                "otel.status_description",
+                field::display(format!("{error:?}")),
+            );
             close_stream(&mut sync.stream).await;
             return AutomergeEvent::SyncRejected {
                 sync_id,
-                document,
+                document: Some(local_init.document.clone()),
                 error,
             };
         }
 
-        let document = response_init
-            .as_ref()
-            .map(|init| init.document.clone())
-            .unwrap_or_else(|| remote_init.document.clone());
-
         let mut doc = match load_document(&local_document) {
             Ok(doc) => doc,
             Err(error) => {
+                span.record("otel.status_code", "ERROR");
+                span.record(
+                    "otel.status_description",
+                    field::display(format!("{error:?}")),
+                );
                 close_stream(&mut sync.stream).await;
                 return AutomergeEvent::SyncRejected {
                     sync_id,
@@ -309,28 +384,13 @@ impl AutomergeHandle {
         };
 
         let before_heads = doc.get_heads();
-        let span = info_span!(
-            "automerge.sync",
-            "otel.kind" = match sync.direction {
-                SyncDirection::Outbound => "client",
-                SyncDirection::Inbound => "server",
-            },
-            sync_id = %sync_id,
-            peer = %sync.peer,
-            document = %document.topic_id(),
-        );
-        if matches!(sync.direction, SyncDirection::Inbound)
-            && let Some(trace_context) = remote_init.trace_context.as_ref()
-        {
-            let _ = span.set_parent(extract_trace_context(trace_context));
-        }
-
         let result = async { run_sync_rounds(&mut sync.stream, &mut doc, &remote_init).await }
-            .instrument(span)
+            .instrument(span.clone())
             .await;
 
         match result {
             Ok(()) => {
+                span.record("otel.status_code", "OK");
                 close_stream(&mut sync.stream).await;
                 let after_heads = doc.get_heads();
                 let changed = before_heads != after_heads;
@@ -353,6 +413,11 @@ impl AutomergeHandle {
                 }
             }
             Err(error) => {
+                span.record("otel.status_code", "ERROR");
+                span.record(
+                    "otel.status_description",
+                    field::display(format!("{error:?}")),
+                );
                 close_stream(&mut sync.stream).await;
                 warn!(
                     event = "automerge.sync.rejected",

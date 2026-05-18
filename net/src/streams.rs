@@ -2,11 +2,15 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{Instrument, Span, field, info_span, trace, warn};
 
 use crate::error::{NetError, Result};
+use crate::telemetry::{
+    duration_ms, record_duration_ms, warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
+};
 
 pub use iroh::endpoint::{RecvStream, SendStream};
 
@@ -24,16 +28,123 @@ impl StreamsService {
     }
 
     pub async fn open(&self, node_id: NodeId, alpn: Alpn) -> Result<BiStream> {
-        let conn = self
-            .endpoint
-            .connect(node_id, alpn.as_bytes())
-            .await
-            .map_err(|e| NetError::Connection(e.to_string()))?;
+        let endpoint = self.endpoint.clone();
+        let span = info_span!(
+            "iroh.stream.open",
+            "otel.kind" = "client",
+            "otel.status_code" = field::Empty,
+            "otel.status_description" = field::Empty,
+            "network.transport" = "quic",
+            "iroh.connect_ms" = field::Empty,
+            "iroh.open_bi_ms" = field::Empty,
+            "iroh.total_ms" = field::Empty,
+            "iroh.selected_address" = field::Empty,
+            "iroh.rtt_ms" = field::Empty,
+            peer = %node_id,
+            alpn = %alpn,
+        );
 
-        conn.open_bi()
-            .await
-            .map_err(|e| NetError::Stream(e.to_string()))
+        async move {
+            let span = Span::current();
+            let total_started = Instant::now();
+
+            let connect_started = Instant::now();
+            let conn = match endpoint.connect(node_id, alpn.as_bytes()).await {
+                Ok(conn) => {
+                    let elapsed = connect_started.elapsed();
+                    record_duration_ms(&span, "iroh.connect_ms", elapsed);
+                    warn_if_slow_iroh_phase("stream.open", "connect", elapsed);
+                    trace!(
+                        event = "iroh.stream.open_phase",
+                        peer = %node_id,
+                        alpn = %alpn,
+                        iroh_phase = "connect",
+                        duration_ms = duration_ms(elapsed),
+                        "Completed Iroh stream open phase"
+                    );
+                    conn
+                }
+                Err(error) => {
+                    let elapsed = connect_started.elapsed();
+                    record_duration_ms(&span, "iroh.connect_ms", elapsed);
+                    span.record("otel.status_code", "ERROR");
+                    span.record("otel.status_description", field::display(error.to_string()));
+                    warn!(
+                        event = "iroh.stream.connect_failed",
+                        peer = %node_id,
+                        alpn = %alpn,
+                        duration_ms = duration_ms(elapsed),
+                        error = %error,
+                        "Iroh stream connect failed"
+                    );
+                    return Err(NetError::Connection(error.to_string()));
+                }
+            };
+
+            record_selected_path(&span, &conn);
+
+            let open_started = Instant::now();
+            let stream = match conn.open_bi().await {
+                Ok(stream) => {
+                    let elapsed = open_started.elapsed();
+                    record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
+                    warn_if_slow_iroh_phase("stream.open", "open_bi", elapsed);
+                    trace!(
+                        event = "iroh.stream.open_phase",
+                        peer = %node_id,
+                        alpn = %alpn,
+                        iroh_phase = "open_bi",
+                        duration_ms = duration_ms(elapsed),
+                        "Completed Iroh stream open phase"
+                    );
+                    stream
+                }
+                Err(error) => {
+                    let elapsed = open_started.elapsed();
+                    record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
+                    span.record("otel.status_code", "ERROR");
+                    span.record("otel.status_description", field::display(error.to_string()));
+                    warn!(
+                        event = "iroh.stream.open_bi_failed",
+                        peer = %node_id,
+                        alpn = %alpn,
+                        duration_ms = duration_ms(elapsed),
+                        error = %error,
+                        "Iroh bidirectional stream open failed"
+                    );
+                    return Err(NetError::Stream(error.to_string()));
+                }
+            };
+
+            let total_elapsed = total_started.elapsed();
+            record_duration_ms(&span, "iroh.total_ms", total_elapsed);
+            warn_if_slow_iroh_request("stream.open", total_elapsed);
+            span.record("otel.status_code", "OK");
+            trace!(
+                event = "iroh.stream.open_completed",
+                peer = %node_id,
+                alpn = %alpn,
+                duration_ms = duration_ms(total_elapsed),
+                "Opened Iroh stream"
+            );
+            Ok(stream)
+        }
+        .instrument(span)
+        .await
     }
+}
+
+fn record_selected_path(span: &Span, conn: &Connection) {
+    let paths = conn.paths();
+    let Some(path) = paths.iter().find(|path| path.is_selected()) else {
+        return;
+    };
+
+    span.record(
+        "iroh.selected_address",
+        field::display(format!("{:?}", path.remote_addr())),
+    );
+    span.record("iroh.rtt_ms", duration_ms(path.rtt()));
 }
 
 impl std::fmt::Debug for StreamsService {

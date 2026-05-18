@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aruna_core::DistributedTraceContext;
 use aruna_core::effects::{Effect, StorageEffect};
@@ -16,7 +16,7 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use tokio::sync::oneshot;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, info_span, trace, warn};
+use tracing::{Instrument, Span, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
@@ -32,7 +32,10 @@ use super::rpc::{
 };
 use super::state::DhtStateMachine;
 use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, decode_entries, encode_entries};
-use crate::telemetry::extract_trace_context;
+use crate::telemetry::{
+    current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
+    warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
+};
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
 pub type InboundDhtStream = (Connection, SendStream, RecvStream, NodeId);
@@ -461,6 +464,21 @@ impl DhtDriver {
         let span = info_span!(
             "dht.rpc.request",
             "otel.kind" = "client",
+            "otel.status_code" = field::Empty,
+            "otel.status_description" = field::Empty,
+            "network.transport" = "quic",
+            "rpc.system" = "aruna-dht",
+            "iroh.alpn" = "aruna/dht/1",
+            "iroh.connect_ms" = field::Empty,
+            "iroh.open_bi_ms" = field::Empty,
+            "iroh.write_request_ms" = field::Empty,
+            "iroh.wait_response_header_ms" = field::Empty,
+            "iroh.read_response_body_ms" = field::Empty,
+            "iroh.total_ms" = field::Empty,
+            "iroh.request_bytes" = field::Empty,
+            "iroh.response_bytes" = field::Empty,
+            "iroh.selected_address" = field::Empty,
+            "iroh.rtt_ms" = field::Empty,
             op_id,
             phase = ?phase,
             peer = %peer,
@@ -471,8 +489,19 @@ impl DhtDriver {
         }
         tokio::spawn(
             async move {
-                match rpc_request(endpoint.clone(), peer, request, trace_context).await {
+                let outbound_trace_context = current_trace_context().or(trace_context);
+                match rpc_request(
+                    endpoint.clone(),
+                    op_id,
+                    phase,
+                    peer,
+                    request,
+                    outbound_trace_context,
+                )
+                .await
+                {
                     Ok(response) => {
+                        Span::current().record("otel.status_code", "OK");
                         let _ = io_tx
                             .send(DhtIo::RpcResponse {
                                 op_id,
@@ -483,6 +512,9 @@ impl DhtDriver {
                             .await;
                     }
                     Err(error) => {
+                        let span = Span::current();
+                        span.record("otel.status_code", "ERROR");
+                        span.record("otel.status_description", field::display(error.to_string()));
                         let remote_info = endpoint.remote_info(peer).await.map(|info| {
                             info.addrs()
                                 .map(|addr| format!("{:?} ({:?})", addr.addr(), addr.usage()))
@@ -742,40 +774,243 @@ impl DhtDriver {
 
 async fn rpc_request(
     endpoint: Endpoint,
+    op_id: OpId,
+    phase: RpcPhase,
     peer: NodeId,
     request: DhtRequest,
     trace_context: Option<DistributedTraceContext>,
 ) -> Result<DhtResponse, DhtIoError> {
-    let conn = tokio::time::timeout(RPC_TIMEOUT, endpoint.connect(peer, DHT_ALPN))
-        .await?
-        .map_err(DhtIoError::network)?;
+    let span = Span::current();
+    let total_started = Instant::now();
 
-    let (mut send, mut recv) = conn.open_bi().await.map_err(DhtIoError::network)?;
+    let connect_started = Instant::now();
+    let conn = match tokio::time::timeout(RPC_TIMEOUT, endpoint.connect(peer, DHT_ALPN)).await {
+        Ok(Ok(conn)) => {
+            let elapsed = connect_started.elapsed();
+            record_duration_ms(&span, "iroh.connect_ms", elapsed);
+            warn_if_slow_iroh_phase("dht.rpc", "connect", elapsed);
+            trace!(
+                event = "dht.rpc.iroh_phase",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                iroh_phase = "connect",
+                duration_ms = duration_ms(elapsed),
+                "Completed Iroh DHT RPC phase"
+            );
+            conn
+        }
+        Ok(Err(error)) => {
+            let elapsed = connect_started.elapsed();
+            record_duration_ms(&span, "iroh.connect_ms", elapsed);
+            warn!(
+                event = "dht.rpc.iroh_connect_failed",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                duration_ms = duration_ms(elapsed),
+                error = %error,
+                "Iroh DHT RPC connect failed"
+            );
+            return Err(DhtIoError::network(error));
+        }
+        Err(error) => {
+            let elapsed = connect_started.elapsed();
+            record_duration_ms(&span, "iroh.connect_ms", elapsed);
+            warn!(
+                event = "dht.rpc.iroh_connect_failed",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                duration_ms = duration_ms(elapsed),
+                error = %error,
+                timed_out = true,
+                "Iroh DHT RPC connect timed out"
+            );
+            return Err(error.into());
+        }
+    };
+
+    record_selected_path(&span, &conn);
+
+    let open_started = Instant::now();
+    let (mut send, mut recv) = match conn.open_bi().await {
+        Ok(streams) => {
+            let elapsed = open_started.elapsed();
+            record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
+            warn_if_slow_iroh_phase("dht.rpc", "open_bi", elapsed);
+            trace!(
+                event = "dht.rpc.iroh_phase",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                iroh_phase = "open_bi",
+                duration_ms = duration_ms(elapsed),
+                "Completed Iroh DHT RPC phase"
+            );
+            streams
+        }
+        Err(error) => {
+            let elapsed = open_started.elapsed();
+            record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
+            warn!(
+                event = "dht.rpc.iroh_open_bi_failed",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                duration_ms = duration_ms(elapsed),
+                error = %error,
+                "Iroh DHT RPC bidirectional stream open failed"
+            );
+            return Err(DhtIoError::network(error));
+        }
+    };
 
     let request_bytes = encode_request_with_trace_context(&request, trace_context)?;
+    span.record("iroh.request_bytes", request_bytes.len() as u64);
     let len = (request_bytes.len() as u32).to_be_bytes();
-    send.write_all(&len).await.map_err(DhtIoError::network)?;
-    send.write_all(&request_bytes)
-        .await
-        .map_err(DhtIoError::network)?;
-    send.finish().map_err(DhtIoError::network)?;
+
+    let write_started = Instant::now();
+    if let Err(error) = send.write_all(&len).await {
+        let elapsed = write_started.elapsed();
+        record_duration_ms(&span, "iroh.write_request_ms", elapsed);
+        return Err(DhtIoError::network(error));
+    }
+    if let Err(error) = send.write_all(&request_bytes).await {
+        let elapsed = write_started.elapsed();
+        record_duration_ms(&span, "iroh.write_request_ms", elapsed);
+        return Err(DhtIoError::network(error));
+    }
+    if let Err(error) = send.finish() {
+        let elapsed = write_started.elapsed();
+        record_duration_ms(&span, "iroh.write_request_ms", elapsed);
+        return Err(DhtIoError::network(error));
+    }
+    let elapsed = write_started.elapsed();
+    record_duration_ms(&span, "iroh.write_request_ms", elapsed);
+    warn_if_slow_iroh_phase("dht.rpc", "write_request", elapsed);
+    trace!(
+        event = "dht.rpc.iroh_phase",
+        op_id,
+        phase = ?phase,
+        peer = %peer,
+        iroh_phase = "write_request",
+        duration_ms = duration_ms(elapsed),
+        request_bytes = request_bytes.len(),
+        "Completed Iroh DHT RPC phase"
+    );
 
     let mut len_buf = [0u8; 4];
-    tokio::time::timeout(RPC_TIMEOUT, recv.read_exact(&mut len_buf))
-        .await?
-        .map_err(DhtIoError::network)?;
+    let wait_response_started = Instant::now();
+    match tokio::time::timeout(RPC_TIMEOUT, recv.read_exact(&mut len_buf)).await {
+        Ok(Ok(_)) => {
+            let elapsed = wait_response_started.elapsed();
+            record_duration_ms(&span, "iroh.wait_response_header_ms", elapsed);
+            warn_if_slow_iroh_phase("dht.rpc", "wait_response_header", elapsed);
+            trace!(
+                event = "dht.rpc.iroh_phase",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                iroh_phase = "wait_response_header",
+                duration_ms = duration_ms(elapsed),
+                "Completed Iroh DHT RPC phase"
+            );
+        }
+        Ok(Err(error)) => {
+            let elapsed = wait_response_started.elapsed();
+            record_duration_ms(&span, "iroh.wait_response_header_ms", elapsed);
+            return Err(DhtIoError::network(error));
+        }
+        Err(error) => {
+            let elapsed = wait_response_started.elapsed();
+            record_duration_ms(&span, "iroh.wait_response_header_ms", elapsed);
+            warn!(
+                event = "dht.rpc.iroh_response_timeout",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                duration_ms = duration_ms(elapsed),
+                error = %error,
+                "Timed out waiting for Iroh DHT RPC response header"
+            );
+            return Err(error.into());
+        }
+    }
 
     let response_len = u32::from_be_bytes(len_buf) as usize;
+    span.record("iroh.response_bytes", response_len as u64);
     if response_len > MAX_MESSAGE_SIZE {
         return Err(DhtIoError::invalid_response("response too large"));
     }
 
     let mut response_bytes = vec![0u8; response_len];
-    tokio::time::timeout(RPC_TIMEOUT, recv.read_exact(&mut response_bytes))
-        .await?
-        .map_err(DhtIoError::network)?;
+    let read_body_started = Instant::now();
+    match tokio::time::timeout(RPC_TIMEOUT, recv.read_exact(&mut response_bytes)).await {
+        Ok(Ok(_)) => {
+            let elapsed = read_body_started.elapsed();
+            record_duration_ms(&span, "iroh.read_response_body_ms", elapsed);
+            warn_if_slow_iroh_phase("dht.rpc", "read_response_body", elapsed);
+            trace!(
+                event = "dht.rpc.iroh_phase",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                iroh_phase = "read_response_body",
+                duration_ms = duration_ms(elapsed),
+                response_bytes = response_len,
+                "Completed Iroh DHT RPC phase"
+            );
+        }
+        Ok(Err(error)) => {
+            let elapsed = read_body_started.elapsed();
+            record_duration_ms(&span, "iroh.read_response_body_ms", elapsed);
+            return Err(DhtIoError::network(error));
+        }
+        Err(error) => {
+            let elapsed = read_body_started.elapsed();
+            record_duration_ms(&span, "iroh.read_response_body_ms", elapsed);
+            warn!(
+                event = "dht.rpc.iroh_response_timeout",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                duration_ms = duration_ms(elapsed),
+                error = %error,
+                "Timed out reading Iroh DHT RPC response body"
+            );
+            return Err(error.into());
+        }
+    }
+
+    let total_elapsed = total_started.elapsed();
+    record_duration_ms(&span, "iroh.total_ms", total_elapsed);
+    warn_if_slow_iroh_request("dht.rpc", total_elapsed);
+    trace!(
+        event = "dht.rpc.iroh_completed",
+        op_id,
+        phase = ?phase,
+        peer = %peer,
+        duration_ms = duration_ms(total_elapsed),
+        request_bytes = request_bytes.len(),
+        response_bytes = response_len,
+        "Completed Iroh DHT RPC"
+    );
 
     Ok(decode_response(&response_bytes)?)
+}
+
+fn record_selected_path(span: &Span, conn: &Connection) {
+    let paths = conn.paths();
+    let Some(path) = paths.iter().find(|path| path.is_selected()) else {
+        return;
+    };
+
+    span.record(
+        "iroh.selected_address",
+        field::display(format!("{:?}", path.remote_addr())),
+    );
+    span.record("iroh.rtt_ms", duration_ms(path.rtt()));
 }
 
 async fn read_request_from_stream(
