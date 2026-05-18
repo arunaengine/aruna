@@ -3,6 +3,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -10,9 +11,9 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use async_trait::async_trait;
 use byteview::ByteView;
-use crossfire::{mpsc, oneshot};
+use crossfire::{TrySendError, mpsc, oneshot};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
-use tracing::{Span, debug_span, field};
+use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use crate::errors::StorageLibError;
@@ -25,6 +26,7 @@ enum Txn {
     Write(Box<fjall::OptimisticWriteTx>),
 }
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
+const STORAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Store {
     db: OptimisticTxDatabase,
@@ -137,22 +139,67 @@ impl StorageHandle {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
 
         let (response_tx, response_rx) = crossfire::oneshot::oneshot();
+        let operation = storage_effect_kind(&effect);
+        let active_txn_id = active_txn_id_for_effect(&effect);
         let span = storage_effect_span(&effect);
-        if self
-            .write_channel
-            .send((effect, response_tx, span))
-            .is_err()
-        {
-            return self.observe_storage_event(StorageEvent::Error {
-                error: StorageError::ChannelClosed,
-            });
+        match self.write_channel.try_send((effect, response_tx, span)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                if let Some(txn_id) = active_txn_id {
+                    self.enqueue_abort_transaction(txn_id, "request_queue_full");
+                }
+                return self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::QueueFull,
+                });
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::ChannelClosed,
+                });
+            }
         }
 
-        match response_rx.await {
-            Ok(event) => self.observe_storage_event(event),
-            Err(_) => self.observe_storage_event(StorageEvent::Error {
+        match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok(event)) => self.observe_storage_event(event),
+            Ok(Err(_)) => self.observe_storage_event(StorageEvent::Error {
                 error: StorageError::ChannelClosed,
             }),
+            Err(error) => {
+                if let Some(txn_id) = active_txn_id {
+                    self.enqueue_abort_transaction(txn_id, "request_timeout");
+                }
+                warn!(
+                    event = "storage.request.timeout",
+                    operation,
+                    timeout_ms = STORAGE_REQUEST_TIMEOUT.as_millis() as u64,
+                    error = %error,
+                    "Timed out waiting for storage response"
+                );
+                self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::Timeout,
+                })
+            }
+        }
+    }
+
+    fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
+        let (response_tx, _response_rx) = crossfire::oneshot::oneshot();
+        let effect = StorageEffect::AbortTransaction { txn_id };
+        let span = storage_effect_span(&effect);
+        match self.write_channel.try_send((effect, response_tx, span)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => warn!(
+                event = "storage.transaction.abort_enqueue_full",
+                txn_id = %txn_id,
+                reason,
+                "Failed to enqueue storage transaction abort: queue full"
+            ),
+            Err(TrySendError::Disconnected(_)) => warn!(
+                event = "storage.transaction.abort_enqueue_closed",
+                txn_id = %txn_id,
+                reason,
+                "Failed to enqueue storage transaction abort: channel closed"
+            ),
         }
     }
 
@@ -186,6 +233,44 @@ impl StorageHandle {
         if matches!(error, StorageError::ChannelClosed) {
             self.metrics.channel_closed.store(true, Ordering::Relaxed);
         }
+    }
+}
+
+fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
+    match effect {
+        StorageEffect::Read {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Write {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::BatchWrite {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Delete {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::BatchDelete {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Iter {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::CommitTransaction { txn_id } => Some(*txn_id),
+        StorageEffect::StartTransaction { .. }
+        | StorageEffect::AbortTransaction { .. }
+        | StorageEffect::Read { txn_id: None, .. }
+        | StorageEffect::Write { txn_id: None, .. }
+        | StorageEffect::BatchWrite { txn_id: None, .. }
+        | StorageEffect::Delete { txn_id: None, .. }
+        | StorageEffect::BatchDelete { txn_id: None, .. }
+        | StorageEffect::Iter { txn_id: None, .. } => None,
     }
 }
 
@@ -236,6 +321,33 @@ impl FjallStorage {
             match receiver.recv() {
                 Ok((effect, response_tx, span)) => {
                     let _guard = span.enter();
+                    let operation = storage_effect_kind(&effect);
+                    let active_txn_id = active_txn_id_for_effect(&effect);
+                    let starts_transaction =
+                        matches!(effect, StorageEffect::StartTransaction { .. });
+                    let completes_transaction = matches!(
+                        effect,
+                        StorageEffect::CommitTransaction { .. }
+                            | StorageEffect::AbortTransaction { .. }
+                    );
+
+                    if response_tx.is_disconnected()
+                        && !matches!(effect, StorageEffect::AbortTransaction { .. })
+                    {
+                        if let Some(txn_id) = active_txn_id {
+                            self.cleanup_abandoned_transaction(
+                                txn_id,
+                                operation,
+                                "abandoned_before_processing",
+                            );
+                        }
+                        warn!(
+                            event = "storage.request.abandoned",
+                            operation, "Skipping abandoned storage request"
+                        );
+                        continue;
+                    }
+
                     let event = match effect {
                         StorageEffect::StartTransaction { read } => self.start_transaction(read),
                         StorageEffect::AbortTransaction { txn_id } => {
@@ -274,7 +386,34 @@ impl FjallStorage {
                             txn_id,
                         } => self.iterate(key_space, prefix, start_after, limit, txn_id),
                     };
-                    response_tx.send(event);
+                    if response_tx.is_disconnected() {
+                        let abandoned_txn_id = if starts_transaction {
+                            match &event {
+                                StorageEvent::TransactionStarted { txn_id } => Some(*txn_id),
+                                _ => None,
+                            }
+                        } else if completes_transaction {
+                            None
+                        } else {
+                            active_txn_id
+                        };
+
+                        if let Some(txn_id) = abandoned_txn_id {
+                            self.cleanup_abandoned_transaction(
+                                txn_id,
+                                operation,
+                                "abandoned_after_processing",
+                            );
+                        }
+                        warn!(
+                            event = "storage.response.abandoned",
+                            operation,
+                            result = storage_event_kind(&event),
+                            "Dropping storage response for abandoned request"
+                        );
+                    } else {
+                        response_tx.send(event);
+                    }
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -283,6 +422,39 @@ impl FjallStorage {
                     break;
                 }
             }
+        }
+    }
+
+    fn cleanup_abandoned_transaction(
+        &mut self,
+        txn_id: Ulid,
+        operation: &'static str,
+        reason: &'static str,
+    ) {
+        match self.abort_transaction(txn_id) {
+            StorageEvent::TransactionAborted { .. } => warn!(
+                event = "storage.transaction.aborted",
+                txn_id = %txn_id,
+                operation,
+                reason,
+                "Aborted abandoned storage transaction"
+            ),
+            StorageEvent::Error { error } => warn!(
+                event = "storage.transaction.abort_failed",
+                txn_id = %txn_id,
+                operation,
+                reason,
+                error = %error,
+                "Failed to abort abandoned storage transaction"
+            ),
+            other => warn!(
+                event = "storage.transaction.abort_unexpected",
+                txn_id = %txn_id,
+                operation,
+                reason,
+                result = storage_event_kind(&other),
+                "Unexpected result while aborting abandoned storage transaction"
+            ),
         }
     }
 

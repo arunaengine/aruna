@@ -20,7 +20,7 @@ use tracing::{Instrument, Span, debug_span, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use super::constants::{
-    DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, MAX_MESSAGE_SIZE, RPC_TIMEOUT,
+    DRIVER_IO_EVENT_CAPACITY, DRIVER_TICK_INTERVAL, MAX_MESSAGE_SIZE, RPC_TIMEOUT, STORAGE_TIMEOUT,
 };
 use super::protocol::{
     CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtInput, DhtIo, DhtIoError, DhtIoRequest, DhtOutput,
@@ -542,6 +542,7 @@ impl DhtDriver {
 
         let io_tx = self.io_tx.clone();
         tokio::spawn(async move {
+            let started = Instant::now();
             match tokio::time::timeout(RPC_TIMEOUT, read_request_from_stream(&mut recv)).await {
                 Ok(Ok((trace_context, request))) => {
                     let _ = io_tx
@@ -554,11 +555,28 @@ impl DhtDriver {
                         .await;
                 }
                 Ok(Err(error)) => {
+                    warn!(
+                        event = "dht.rpc.inbound_read_failed",
+                        inbound_id,
+                        peer = %peer,
+                        duration_ms = duration_ms(started.elapsed()),
+                        error = %error,
+                        "Failed to read inbound DHT RPC request"
+                    );
                     let _ = io_tx
                         .send(DhtIo::InboundReadError { inbound_id, error })
                         .await;
                 }
                 Err(error) => {
+                    warn!(
+                        event = "dht.rpc.inbound_read_timeout",
+                        inbound_id,
+                        peer = %peer,
+                        duration_ms = duration_ms(started.elapsed()),
+                        timeout_ms = duration_ms(RPC_TIMEOUT),
+                        error = %error,
+                        "Timed out reading inbound DHT RPC request"
+                    );
                     let _ = io_tx
                         .send(DhtIo::InboundReadError {
                             inbound_id,
@@ -856,8 +874,9 @@ impl DhtDriver {
                     txn_id: None,
                 });
 
-                match storage.send_effect(effect).await {
-                    Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "read").await
+                {
+                    Ok(Event::Storage(StorageEvent::ReadResult { value, .. })) => {
                         let mut entries =
                             value.map(|data| decode_entries(&data)).unwrap_or_default();
                         if let Some(realm_filter) = realm_filter {
@@ -872,7 +891,7 @@ impl DhtDriver {
                             })
                             .await;
                     }
-                    Event::Storage(StorageEvent::Error { error }) => {
+                    Ok(Event::Storage(StorageEvent::Error { error })) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -881,7 +900,7 @@ impl DhtDriver {
                             })
                             .await;
                     }
-                    other => {
+                    Ok(other) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -889,6 +908,15 @@ impl DhtDriver {
                                 error: DhtIoError::storage(format!(
                                     "unexpected storage read event: {other:?}"
                                 )),
+                            })
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = io_tx
+                            .send(DhtIo::StorageError {
+                                op_id,
+                                stage,
+                                error,
                             })
                             .await;
                     }
@@ -933,11 +961,13 @@ impl DhtDriver {
                     txn_id: None,
                 });
 
-                match storage.send_effect(effect).await {
-                    Event::Storage(StorageEvent::WriteResult { .. }) => {
+                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "write")
+                    .await
+                {
+                    Ok(Event::Storage(StorageEvent::WriteResult { .. })) => {
                         let _ = io_tx.send(DhtIo::StorageWriteResult { op_id, stage }).await;
                     }
-                    Event::Storage(StorageEvent::Error { error }) => {
+                    Ok(Event::Storage(StorageEvent::Error { error })) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -946,7 +976,7 @@ impl DhtDriver {
                             })
                             .await;
                     }
-                    other => {
+                    Ok(other) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -954,6 +984,15 @@ impl DhtDriver {
                                 error: DhtIoError::storage(format!(
                                     "unexpected storage write event: {other:?}"
                                 )),
+                            })
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = io_tx
+                            .send(DhtIo::StorageError {
+                                op_id,
+                                stage,
+                                error,
                             })
                             .await;
                     }
@@ -980,13 +1019,15 @@ impl DhtDriver {
                     txn_id: None,
                 });
 
-                match storage.send_effect(effect).await {
-                    Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "delete")
+                    .await
+                {
+                    Ok(Event::Storage(StorageEvent::DeleteResult { .. })) => {
                         let _ = io_tx
                             .send(DhtIo::StorageDeleteResult { op_id, stage })
                             .await;
                     }
-                    Event::Storage(StorageEvent::Error { error }) => {
+                    Ok(Event::Storage(StorageEvent::Error { error })) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -995,7 +1036,7 @@ impl DhtDriver {
                             })
                             .await;
                     }
-                    other => {
+                    Ok(other) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -1003,6 +1044,15 @@ impl DhtDriver {
                                 error: DhtIoError::storage(format!(
                                     "unexpected storage delete event: {other:?}"
                                 )),
+                            })
+                            .await;
+                    }
+                    Err(error) => {
+                        let _ = io_tx
+                            .send(DhtIo::StorageError {
+                                op_id,
+                                stage,
+                                error,
                             })
                             .await;
                     }
@@ -1037,11 +1087,12 @@ impl DhtDriver {
                     txn_id: None,
                 });
 
-                match storage.send_effect(effect).await {
-                    Event::Storage(StorageEvent::IterResult {
+                match send_storage_effect_with_timeout(&storage, effect, op_id, stage, "iter").await
+                {
+                    Ok(Event::Storage(StorageEvent::IterResult {
                         values,
                         next_start_after,
-                    }) => {
+                    })) => {
                         let decoded_values = values
                             .into_iter()
                             .map(|(key, value)| (key.as_ref().to_vec(), decode_entries(&value)))
@@ -1056,7 +1107,7 @@ impl DhtDriver {
                             })
                             .await;
                     }
-                    Event::Storage(StorageEvent::Error { error }) => {
+                    Ok(Event::Storage(StorageEvent::Error { error })) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -1065,7 +1116,7 @@ impl DhtDriver {
                             })
                             .await;
                     }
-                    other => {
+                    Ok(other) => {
                         let _ = io_tx
                             .send(DhtIo::StorageError {
                                 op_id,
@@ -1076,10 +1127,45 @@ impl DhtDriver {
                             })
                             .await;
                     }
+                    Err(error) => {
+                        let _ = io_tx
+                            .send(DhtIo::StorageError {
+                                op_id,
+                                stage,
+                                error,
+                            })
+                            .await;
+                    }
                 }
             }
             .instrument(Span::current()),
         );
+    }
+}
+
+async fn send_storage_effect_with_timeout(
+    storage: &StorageHandle,
+    effect: Effect,
+    op_id: OpId,
+    stage: StorageStage,
+    operation: &'static str,
+) -> Result<Event, DhtIoError> {
+    let started = Instant::now();
+    match tokio::time::timeout(STORAGE_TIMEOUT, storage.send_effect(effect)).await {
+        Ok(event) => Ok(event),
+        Err(error) => {
+            warn!(
+                event = "dht.storage.timeout",
+                op_id,
+                stage = ?stage,
+                operation,
+                duration_ms = duration_ms(started.elapsed()),
+                timeout_ms = duration_ms(STORAGE_TIMEOUT),
+                error = %error,
+                "DHT storage operation timed out"
+            );
+            Err(DhtIoError::Timeout)
+        }
     }
 }
 
@@ -1298,8 +1384,8 @@ async fn rpc_request(
     record_selected_path(&span, &conn);
 
     let open_started = Instant::now();
-    let (mut send, mut recv) = match conn.open_bi().await {
-        Ok(streams) => {
+    let (mut send, mut recv) = match tokio::time::timeout(RPC_TIMEOUT, conn.open_bi()).await {
+        Ok(Ok(streams)) => {
             let elapsed = open_started.elapsed();
             record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
             warn_if_slow_iroh_phase("dht.rpc", "open_bi", elapsed);
@@ -1314,7 +1400,7 @@ async fn rpc_request(
             );
             streams
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             let elapsed = open_started.elapsed();
             record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
             warn!(
@@ -1328,6 +1414,21 @@ async fn rpc_request(
             );
             return Err(DhtIoError::network(error));
         }
+        Err(error) => {
+            let elapsed = open_started.elapsed();
+            record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
+            warn!(
+                event = "dht.rpc.iroh_open_bi_timeout",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                duration_ms = duration_ms(elapsed),
+                timeout_ms = duration_ms(RPC_TIMEOUT),
+                error = %error,
+                "Iroh DHT RPC bidirectional stream open timed out"
+            );
+            return Err(error.into());
+        }
     };
 
     let request_bytes = encode_request_with_trace_context(&request, trace_context)?;
@@ -1335,20 +1436,46 @@ async fn rpc_request(
     let len = (request_bytes.len() as u32).to_be_bytes();
 
     let write_started = Instant::now();
-    if let Err(error) = send.write_all(&len).await {
-        let elapsed = write_started.elapsed();
-        record_duration_ms(&span, "iroh.write_request_ms", elapsed);
-        return Err(DhtIoError::network(error));
-    }
-    if let Err(error) = send.write_all(&request_bytes).await {
-        let elapsed = write_started.elapsed();
-        record_duration_ms(&span, "iroh.write_request_ms", elapsed);
-        return Err(DhtIoError::network(error));
-    }
-    if let Err(error) = send.finish() {
-        let elapsed = write_started.elapsed();
-        record_duration_ms(&span, "iroh.write_request_ms", elapsed);
-        return Err(DhtIoError::network(error));
+    match tokio::time::timeout(RPC_TIMEOUT, async {
+        send.write_all(&len).await.map_err(DhtIoError::network)?;
+        send.write_all(&request_bytes)
+            .await
+            .map_err(DhtIoError::network)?;
+        send.finish().map_err(DhtIoError::network)?;
+        Ok::<(), DhtIoError>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let elapsed = write_started.elapsed();
+            record_duration_ms(&span, "iroh.write_request_ms", elapsed);
+            warn!(
+                event = "dht.rpc.write_request_failed",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                duration_ms = duration_ms(elapsed),
+                error = %error,
+                "Failed to write Iroh DHT RPC request"
+            );
+            return Err(error);
+        }
+        Err(error) => {
+            let elapsed = write_started.elapsed();
+            record_duration_ms(&span, "iroh.write_request_ms", elapsed);
+            warn!(
+                event = "dht.rpc.write_request_timeout",
+                op_id,
+                phase = ?phase,
+                peer = %peer,
+                duration_ms = duration_ms(elapsed),
+                timeout_ms = duration_ms(RPC_TIMEOUT),
+                error = %error,
+                "Timed out writing Iroh DHT RPC request"
+            );
+            return Err(error.into());
+        }
     }
     let elapsed = write_started.elapsed();
     record_duration_ms(&span, "iroh.write_request_ms", elapsed);
@@ -1517,11 +1644,38 @@ async fn write_response_to_stream(
     }
 
     let len = (response_bytes.len() as u32).to_be_bytes();
-    send.write_all(&len).await.map_err(DhtIoError::network)?;
-    send.write_all(&response_bytes)
-        .await
-        .map_err(DhtIoError::network)?;
-    send.finish().map_err(DhtIoError::network)?;
+    let started = Instant::now();
+    match tokio::time::timeout(RPC_TIMEOUT, async {
+        send.write_all(&len).await.map_err(DhtIoError::network)?;
+        send.write_all(&response_bytes)
+            .await
+            .map_err(DhtIoError::network)?;
+        send.finish().map_err(DhtIoError::network)?;
+        Ok::<(), DhtIoError>(())
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(
+                event = "dht.rpc.write_response_failed",
+                duration_ms = duration_ms(started.elapsed()),
+                error = %error,
+                "Failed to write inbound DHT RPC response"
+            );
+            return Err(error);
+        }
+        Err(error) => {
+            warn!(
+                event = "dht.rpc.write_response_timeout",
+                duration_ms = duration_ms(started.elapsed()),
+                timeout_ms = duration_ms(RPC_TIMEOUT),
+                error = %error,
+                "Timed out writing inbound DHT RPC response"
+            );
+            return Err(error.into());
+        }
+    }
 
     let _ = tokio::time::timeout(Duration::from_millis(100), send.stopped()).await;
 

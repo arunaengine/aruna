@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
 use aruna_core::automerge::{
@@ -656,27 +656,53 @@ async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 #[tracing::instrument(name = "automerge.transport.write", level = "trace", skip(stream, message), fields(message = ?message))]
 async fn write_transport_message(
     stream: &mut BiStream,
     message: &AutomergeTransportMessage,
 ) -> Result<(), AutomergeSyncError> {
-    tokio::time::timeout(SYNC_IO_TIMEOUT, write_message(stream, message))
-        .await
-        .map_err(|_| {
-            AutomergeSyncError::Network("timed out writing automerge message".to_string())
-        })?
+    let started = Instant::now();
+    match tokio::time::timeout(SYNC_IO_TIMEOUT, write_message(stream, message)).await {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(
+                event = "automerge.transport.write_timeout",
+                duration_ms = duration_ms(started.elapsed()),
+                timeout_ms = duration_ms(SYNC_IO_TIMEOUT),
+                error = %error,
+                "Timed out writing automerge message"
+            );
+            Err(AutomergeSyncError::Network(
+                "timed out writing automerge message".to_string(),
+            ))
+        }
+    }
 }
 
 #[tracing::instrument(name = "automerge.transport.read", level = "trace", skip(stream))]
 async fn read_transport_message(
     stream: &mut BiStream,
 ) -> Result<AutomergeTransportMessage, AutomergeSyncError> {
-    tokio::time::timeout(SYNC_IO_TIMEOUT, read_message(stream))
-        .await
-        .map_err(|_| {
-            AutomergeSyncError::Network("timed out waiting for automerge message".to_string())
-        })?
+    let started = Instant::now();
+    match tokio::time::timeout(SYNC_IO_TIMEOUT, read_message(stream)).await {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(
+                event = "automerge.transport.read_timeout",
+                duration_ms = duration_ms(started.elapsed()),
+                timeout_ms = duration_ms(SYNC_IO_TIMEOUT),
+                error = %error,
+                "Timed out reading automerge message"
+            );
+            Err(AutomergeSyncError::Network(
+                "timed out waiting for automerge message".to_string(),
+            ))
+        }
+    }
 }
 
 fn reject_reason_to_error(reason: AutomergeRejectReason) -> AutomergeSyncError {

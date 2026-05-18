@@ -2,7 +2,7 @@ use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field, info_span, trace, warn};
@@ -11,6 +11,8 @@ use crate::error::{NetError, Result};
 use crate::telemetry::{
     duration_ms, record_duration_ms, warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
 };
+
+const STREAM_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub use iroh::endpoint::{RecvStream, SendStream};
 
@@ -55,8 +57,13 @@ impl StreamsService {
             let total_started = Instant::now();
 
             let connect_started = Instant::now();
-            let conn = match endpoint.connect(node_id, alpn.as_bytes()).await {
-                Ok(conn) => {
+            let conn = match tokio::time::timeout(
+                STREAM_IO_TIMEOUT,
+                endpoint.connect(node_id, alpn.as_bytes()),
+            )
+            .await
+            {
+                Ok(Ok(conn)) => {
                     let elapsed = connect_started.elapsed();
                     record_duration_ms(&span, "iroh.connect_ms", elapsed);
                     warn_if_slow_iroh_phase("stream.open", "connect", elapsed);
@@ -70,7 +77,7 @@ impl StreamsService {
                     );
                     conn
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let elapsed = connect_started.elapsed();
                     record_duration_ms(&span, "iroh.connect_ms", elapsed);
                     span.record("otel.status_code", "ERROR");
@@ -85,13 +92,29 @@ impl StreamsService {
                     );
                     return Err(NetError::Connection(error.to_string()));
                 }
+                Err(error) => {
+                    let elapsed = connect_started.elapsed();
+                    record_duration_ms(&span, "iroh.connect_ms", elapsed);
+                    span.record("otel.status_code", "ERROR");
+                    span.record("otel.status_description", field::display(error.to_string()));
+                    warn!(
+                        event = "iroh.stream.connect_timeout",
+                        peer = %node_id,
+                        alpn = %alpn,
+                        duration_ms = duration_ms(elapsed),
+                        timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                        error = %error,
+                        "Iroh stream connect timed out"
+                    );
+                    return Err(NetError::Connection(error.to_string()));
+                }
             };
 
             record_selected_path(&span, &conn);
 
             let open_started = Instant::now();
-            let stream = match conn.open_bi().await {
-                Ok(stream) => {
+            let stream = match tokio::time::timeout(STREAM_IO_TIMEOUT, conn.open_bi()).await {
+                Ok(Ok(stream)) => {
                     let elapsed = open_started.elapsed();
                     record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
                     warn_if_slow_iroh_phase("stream.open", "open_bi", elapsed);
@@ -105,7 +128,7 @@ impl StreamsService {
                     );
                     stream
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     let elapsed = open_started.elapsed();
                     record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
                     span.record("otel.status_code", "ERROR");
@@ -117,6 +140,22 @@ impl StreamsService {
                         duration_ms = duration_ms(elapsed),
                         error = %error,
                         "Iroh bidirectional stream open failed"
+                    );
+                    return Err(NetError::Stream(error.to_string()));
+                }
+                Err(error) => {
+                    let elapsed = open_started.elapsed();
+                    record_duration_ms(&span, "iroh.open_bi_ms", elapsed);
+                    span.record("otel.status_code", "ERROR");
+                    span.record("otel.status_description", field::display(error.to_string()));
+                    warn!(
+                        event = "iroh.stream.open_bi_timeout",
+                        peer = %node_id,
+                        alpn = %alpn,
+                        duration_ms = duration_ms(elapsed),
+                        timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                        error = %error,
+                        "Iroh bidirectional stream open timed out"
                     );
                     return Err(NetError::Stream(error.to_string()));
                 }
@@ -187,9 +226,20 @@ pub async fn run_accept_loop(
                         Err(_) => return,
                     };
 
-                    let conn = match accepting.await {
-                        Ok(conn) => conn,
-                        Err(_) => return,
+                    let conn = match tokio::time::timeout(STREAM_IO_TIMEOUT, accepting).await {
+                        Ok(Ok(conn)) => conn,
+                        Ok(Err(err)) => {
+                            warn!(error = %err, "Failed to accept incoming Iroh connection");
+                            return;
+                        }
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                                "Timed out accepting incoming Iroh connection"
+                            );
+                            return;
+                        }
                     };
 
                     let alpn_bytes = conn.alpn().to_vec();
@@ -197,9 +247,26 @@ pub async fn run_accept_loop(
 
                     match Alpn::from_bytes(&alpn_bytes) {
                         Some(Alpn::Dht) => {
-                            let (send, recv) = match conn.accept_bi().await {
-                                Ok(streams) => streams,
-                                Err(_) => return,
+                            let (send, recv) = match tokio::time::timeout(
+                                STREAM_IO_TIMEOUT,
+                                conn.accept_bi(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(streams)) => streams,
+                                Ok(Err(err)) => {
+                                    warn!(node_id = %peer_id, error = %err, "Failed to accept inbound DHT stream");
+                                    return;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        node_id = %peer_id,
+                                        error = %err,
+                                        timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                                        "Timed out accepting inbound DHT stream"
+                                    );
+                                    return;
+                                }
                             };
                             if let Err(err) = dht_handler.send((conn, send, recv, peer_id)).await {
                                 warn!(
@@ -219,9 +286,26 @@ pub async fn run_accept_loop(
                             }
                         }
                         Some(alpn @ (Alpn::Bao | Alpn::Automerge | Alpn::Metadata)) => {
-                            let (send, recv) = match conn.accept_bi().await {
-                                Ok(streams) => streams,
-                                Err(_) => return,
+                            let (send, recv) = match tokio::time::timeout(
+                                STREAM_IO_TIMEOUT,
+                                conn.accept_bi(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(streams)) => streams,
+                                Ok(Err(err)) => {
+                                    warn!(node_id = %peer_id, error = %err, "Failed to accept inbound app stream");
+                                    return;
+                                }
+                                Err(err) => {
+                                    warn!(
+                                        node_id = %peer_id,
+                                        error = %err,
+                                        timeout_ms = duration_ms(STREAM_IO_TIMEOUT),
+                                        "Timed out accepting inbound app stream"
+                                    );
+                                    return;
+                                }
                             };
                             if let Err(err) = stream_handler.send((alpn, send, recv, peer_id)).await {
                                 warn!(
