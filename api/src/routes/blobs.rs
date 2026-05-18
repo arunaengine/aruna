@@ -16,7 +16,7 @@ use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use utoipa::{OpenApi, ToSchema};
 
 #[derive(OpenApi)]
@@ -166,6 +166,13 @@ pub async fn replicate_blob(
 
     tokio::spawn(
         async move {
+            debug!(
+                bucket = %bucket,
+                path = ?path,
+                version_id = ?version_id,
+                target_node = %target_node_id,
+                "Starting on-demand replication task"
+            );
             match drive(ReplicateScopeOperation::new(input), &ctx).await {
                 Ok(Some(Ok(result))) if result.failed == 0 => {
                     info!(bucket,

@@ -11,7 +11,7 @@ use std::any::{type_name, type_name_of_val};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use tracing::{Instrument, debug_span, error, trace};
+use tracing::{Instrument, debug_span, error, trace, debug};
 
 use crate::automerge::AutomergeHandle;
 use crate::metadata::MetadataHandle;
@@ -35,6 +35,12 @@ const MAX_SUBOP_DEPTH: usize = 32;
 
 async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
     let effect_name = effect_kind(&effect);
+    if depth == 0 {
+        tracing::debug!(
+            effect = effect_name,
+            "Dispatching top-level operation effect"
+        );
+    }
     trace!(
         event = "operation.effect.dispatch",
         depth,
@@ -135,6 +141,13 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
         result = event_kind(&event),
         "Received operation event"
     );
+    if depth == 0 {
+        tracing::debug!(
+            effect = effect_name,
+            result = event_kind(&event),
+            "Received top-level operation event"
+        );
+    }
 
     event
 }
@@ -190,6 +203,7 @@ pub async fn drive<O: Operation>(
     let operation_name = type_name::<O>();
     let span = debug_span!("operation", operation = %operation_name);
 
+    debug!("About to enter ");
     async move {
         trace!(
             event = "operation.started",

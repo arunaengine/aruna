@@ -14,7 +14,7 @@ use aruna_core::id::{NodeId, TopicId};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use tracing::{Instrument, error, info_span, trace, warn};
+use tracing::{Instrument, debug, error, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug)]
@@ -102,6 +102,15 @@ impl InboundEventHandler for OperationsInboundHandler {
                             Event::Blob(BlobEvent::MessageReceived { payload, .. }) => {
                                 match VersionReplicationMessage::from_bytes(&payload) {
                                     Ok(VersionReplicationMessage::VersionManifest(manifest)) => {
+                                        debug!(
+                                            peer = %node_id,
+                                            stream_id = %stream_id,
+                                            bucket = %manifest.bucket,
+                                            key = %manifest.key,
+                                            version_id = %manifest.version_id,
+                                            kind = ?manifest.kind,
+                                            "Received inbound version replication manifest"
+                                        );
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),

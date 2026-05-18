@@ -18,6 +18,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, NodeId};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::debug;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,12 +150,29 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn reject_negotiation(&mut self, err: IncomingVersionReplicationError) -> Effects {
+        debug!(
+            bucket = %self.manifest.bucket,
+            key = %self.manifest.key,
+            version_id = %self.manifest.version_id,
+            stream_id = %self.stream_id,
+            reason = %err,
+            "Rejecting incoming version replication negotiation"
+        );
         let reason = err.to_string();
         self.output = Some(Ok(()));
         self.send_negotiation(ReplicationNegotiationResult::Rejected(reason))
     }
 
     fn fail(&mut self, err: IncomingVersionReplicationError) -> Effects {
+        debug!(
+            bucket = %self.manifest.bucket,
+            key = %self.manifest.key,
+            version_id = %self.manifest.version_id,
+            stream_id = %self.stream_id,
+            state = %self.state_name(),
+            error = %err,
+            "Incoming version replication failed"
+        );
         let should_reject = matches!(
             self.negotiation_result,
             Some(
@@ -641,6 +659,18 @@ impl Operation for IncomingVersionReplicationOperation {
                     Err(err) => return self.fail(err.into()),
                 };
 
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    group_id = %bucket_info.group_id,
+                    kind = ?self.manifest.kind,
+                    current_version = self.manifest.current_version,
+                    current_version_generation = ?self.manifest.current_version_generation,
+                    "Loaded destination bucket for incoming replication"
+                );
+
                 self.check_write_permission(bucket_info.group_id)
             }
             IncomingVersionReplicationState::CheckPermissions => {
@@ -654,20 +684,39 @@ impl Operation for IncomingVersionReplicationOperation {
                 };
 
                 match allowed {
-                    Ok(true) => self.read_existing_version(),
+                    Ok(true) => {
+                        debug!(
+                            bucket = %self.manifest.bucket,
+                            key = %self.manifest.key,
+                            version_id = %self.manifest.version_id,
+                            stream_id = %self.stream_id,
+                            "Incoming replication write permission granted"
+                        );
+                        self.read_existing_version()
+                    }
                     Ok(false) => self
                         .reject_negotiation(IncomingVersionReplicationError::WritePermissionDenied),
                     Err(err) => self.reject_negotiation(err.into()),
                 }
             }
             IncomingVersionReplicationState::ReadExistingVersion => {
-                let Event::Storage(StorageEvent::ReadResult { .. }) = event else {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
+
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    existing_version_present = value.is_some(),
+                    kind = ?self.manifest.kind,
+                    "Loaded existing destination version metadata"
+                );
 
                 match self.manifest.kind {
                     ReplicationItemKind::DeleteMarker => {
@@ -689,18 +738,47 @@ impl Operation for IncomingVersionReplicationOperation {
                     match Location::from_bytes(value.as_ref()) {
                         Ok(Location::Real(location)) => {
                             if self.validate_materialized_location(&location).is_err() {
+                                debug!(
+                                    bucket = %self.manifest.bucket,
+                                    key = %self.manifest.key,
+                                    version_id = %self.manifest.version_id,
+                                    stream_id = %self.stream_id,
+                                    existing_blob_size = location.blob_size,
+                                    "Existing destination blob differs; requesting blob and version"
+                                );
                                 return self.send_negotiation(
                                     ReplicationNegotiationResult::NeedBlobAndVersion,
                                 );
                             }
                             self.existing_blob_location = Some(location);
+                            debug!(
+                                bucket = %self.manifest.bucket,
+                                key = %self.manifest.key,
+                                version_id = %self.manifest.version_id,
+                                stream_id = %self.stream_id,
+                                "Existing destination blob matches manifest; requesting version only"
+                            );
                             self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
                         }
                         Ok(Location::Deleted) | Err(_) => {
+                            debug!(
+                                bucket = %self.manifest.bucket,
+                                key = %self.manifest.key,
+                                version_id = %self.manifest.version_id,
+                                stream_id = %self.stream_id,
+                                "Destination blob missing or invalid; requesting blob and version"
+                            );
                             self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion)
                         }
                     }
                 } else {
+                    debug!(
+                        bucket = %self.manifest.bucket,
+                        key = %self.manifest.key,
+                        version_id = %self.manifest.version_id,
+                        stream_id = %self.stream_id,
+                        "Destination blob absent; requesting blob and version"
+                    );
                     self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion)
                 }
             }
@@ -716,8 +794,28 @@ impl Operation for IncomingVersionReplicationOperation {
                 match self.negotiation_result.clone() {
                     Some(ReplicationNegotiationResult::AlreadyReplicatedVersion)
                     | Some(ReplicationNegotiationResult::Rejected(_)) => self.close_connection(),
-                    Some(ReplicationNegotiationResult::NeedVersionOnly) => self.start_transaction(),
-                    Some(ReplicationNegotiationResult::NeedBlobAndVersion) => self.receive_blob(),
+                    Some(ReplicationNegotiationResult::NeedVersionOnly) => {
+                        debug!(
+                            bucket = %self.manifest.bucket,
+                            key = %self.manifest.key,
+                            version_id = %self.manifest.version_id,
+                            stream_id = %self.stream_id,
+                            decision = ?self.negotiation_result,
+                            "Negotiation sent; awaiting version apply"
+                        );
+                        self.start_transaction()
+                    }
+                    Some(ReplicationNegotiationResult::NeedBlobAndVersion) => {
+                        debug!(
+                            bucket = %self.manifest.bucket,
+                            key = %self.manifest.key,
+                            version_id = %self.manifest.version_id,
+                            stream_id = %self.stream_id,
+                            decision = ?self.negotiation_result,
+                            "Negotiation sent; awaiting blob transfer"
+                        );
+                        self.receive_blob()
+                    }
                     None => self.fail(IncomingVersionReplicationError::ReplicationError(
                         ReplicationError::ReplicationFailed,
                     )),
@@ -736,6 +834,15 @@ impl Operation for IncomingVersionReplicationOperation {
                     self.cleanup_blob_location = Some(location);
                     return self.fail(err);
                 }
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    blob_size = location.blob_size,
+                    backend_path = %location.backend_path,
+                    "Received and validated replicated blob"
+                );
                 self.received_blob_location = Some(location.clone());
                 self.cleanup_blob_location = Some(location);
                 self.start_transaction()
@@ -749,6 +856,14 @@ impl Operation for IncomingVersionReplicationOperation {
                     });
                 };
                 self.txn_id = Some(txn_id);
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    txn_id = %txn_id,
+                    "Started incoming replication transaction"
+                );
                 self.write_hash_lookup_or_continue()
             }
             IncomingVersionReplicationState::WriteHashLookup => {
@@ -769,6 +884,29 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                let existing_pointer = value
+                    .as_ref()
+                    .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
+                let incoming_generation = self.manifest.current_version_generation;
+                let pointer_will_update = match (incoming_generation, existing_pointer.as_ref()) {
+                    (Some(incoming_generation), Some(pointer)) => {
+                        (incoming_generation, self.manifest.version_id)
+                            >= (pointer.generation, pointer.version_id)
+                    }
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    existing_generation = existing_pointer.as_ref().map(|pointer| pointer.generation),
+                    existing_version_id = ?existing_pointer.as_ref().map(|pointer| pointer.version_id),
+                    incoming_generation = ?incoming_generation,
+                    pointer_will_update,
+                    "Compared destination current version pointer"
+                );
                 self.write_object_lookup_after_compare(value.as_deref())
             }
             IncomingVersionReplicationState::WriteObjectLookup => {
@@ -789,6 +927,14 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    kind = ?self.manifest.kind,
+                    "Wrote replicated version metadata"
+                );
                 self.write_multipart_metadata_or_continue()
             }
             IncomingVersionReplicationState::WriteMultipartMetadata => {
@@ -799,6 +945,14 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    multipart_parts = self.manifest.multipart.as_ref().map(|m| m.parts.len()).unwrap_or(0),
+                    "Wrote multipart replication metadata"
+                );
                 self.commit_transaction()
             }
             IncomingVersionReplicationState::CommitTransaction => {
@@ -812,6 +966,14 @@ impl Operation for IncomingVersionReplicationOperation {
                 self.txn_id = None;
                 self.cleanup_blob_location = None;
                 self.apply_committed = true;
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    kind = ?self.manifest.kind,
+                    "Committed incoming replication transaction"
+                );
                 match self.manifest.kind {
                     ReplicationItemKind::Materialized => self.register_blob_in_dht_or_continue(),
                     ReplicationItemKind::DeleteMarker => self.send_apply_complete(),
@@ -865,6 +1027,13 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    "Sent incoming replication apply-complete acknowledgement"
+                );
                 self.close_connection()
             }
             IncomingVersionReplicationState::CloseConnection => {
@@ -883,6 +1052,14 @@ impl Operation for IncomingVersionReplicationOperation {
                 if self.output.is_none() {
                     self.output = Some(Ok(()));
                 }
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    state = %self.state_name(),
+                    "Closed incoming replication connection"
+                );
                 smallvec![]
             }
             IncomingVersionReplicationState::Finish => smallvec![],

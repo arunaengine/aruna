@@ -22,6 +22,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::debug;
 use ulid::Ulid;
 
 const ITER_PAGE_SIZE: usize = 512;
@@ -127,12 +128,27 @@ impl ReplicateScopeOperation {
     }
 
     fn fail(&mut self, err: ReplicateScopeError) -> Effects {
+        debug!(
+            bucket = %self.input.bucket,
+            target = ?self.input.target,
+            target_node = %self.input.target_node_id,
+            state = %self.state_name(),
+            error = %err,
+            "Scope replication failed"
+        );
         self.state = ReplicateScopeState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
     fn read_bucket(&mut self) -> Effects {
+        debug!(
+            bucket = %self.input.bucket,
+            target = ?self.input.target,
+            target_node = %self.input.target_node_id,
+            mode = ?self.input.mode,
+            "Entering ReadBucket state"
+        );
         self.state = ReplicateScopeState::ReadBucket;
         smallvec![Effect::Storage(StorageEffect::Read {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -168,6 +184,15 @@ impl ReplicateScopeOperation {
         prefix_filter: Option<String>,
         exact_object_exists: bool,
     ) -> Effects {
+        debug!(
+            bucket = %self.input.bucket,
+            target = ?self.input.target,
+            target_node = %self.input.target_node_id,
+            prefix_filter = ?prefix_filter,
+            exact_object_exists,
+            mode = ?self.input.mode,
+            "Starting scope iteration"
+        );
         self.state = ReplicateScopeState::IterateVersions;
         self.iteration_prefix = prefix_filter;
         self.exact_object_exists = exact_object_exists;
@@ -208,9 +233,24 @@ impl ReplicateScopeOperation {
                 && request.key == version_key.key
                 && request.version_id == version_key.version_id
         }) {
+            debug!(
+                bucket = %version_key.bucket,
+                key = %version_key.key,
+                version_id = %version_key.version_id,
+                target_node = %self.input.target_node_id,
+                "Skipping duplicate replication queue entry"
+            );
             return;
         }
 
+        debug!(
+            bucket = %version_key.bucket,
+            key = %version_key.key,
+            version_id = %version_key.version_id,
+            target_node = %self.input.target_node_id,
+            mode = ?self.input.mode,
+            "Enqueuing version for replication"
+        );
         self.pending_versions.push(VersionReplicationRequest {
             bucket: version_key.bucket,
             key: version_key.key,
@@ -227,11 +267,29 @@ impl ReplicateScopeOperation {
 
     fn run_next_replication(&mut self) -> Effects {
         let Some(request) = self.pending_versions.pop() else {
+            debug!(
+                bucket = %self.input.bucket,
+                target = ?self.input.target,
+                target_node = %self.input.target_node_id,
+                replicated = self.result.replicated,
+                skipped = self.result.skipped,
+                failed = self.result.failed,
+                "Scope replication finished"
+            );
             self.state = ReplicateScopeState::Finish;
             self.output = Some(Ok(self.result.clone()));
             return smallvec![];
         };
 
+        debug!(
+            bucket = %request.bucket,
+            key = %request.key,
+            version_id = %request.version_id,
+            target_node = %request.target_node_id,
+            remaining_pending = self.pending_versions.len(),
+            mode = ?request.mode,
+            "Starting version replication suboperation"
+        );
         self.state = ReplicateScopeState::RunVersionReplication;
         smallvec![Effect::SubOperation(boxed_suboperation(
             ReplicateObjectVersionOperation::new(request),
@@ -270,7 +328,14 @@ impl Operation for ReplicateScopeOperation {
                     Ok(bucket_info) => bucket_info,
                     Err(err) => return self.fail(err.into()),
                 };
-                let _bucket_info = bucket_info;
+                debug!(
+                    bucket = %self.input.bucket,
+                    target = ?self.input.target,
+                    target_node = %self.input.target_node_id,
+                    group_id = %bucket_info.group_id,
+                    mode = ?self.input.mode,
+                    "Loaded source bucket for replication"
+                );
                 self.resolve_target()
             }
             ReplicateScopeState::ResolveObjectTarget => {
@@ -288,7 +353,13 @@ impl Operation for ReplicateScopeOperation {
                         received: event,
                     });
                 };
-                let _current_version_exists = value.is_some();
+                debug!(
+                    bucket = %self.input.bucket,
+                    key = %key,
+                    target_node = %self.input.target_node_id,
+                    current_version_exists = value.is_some(),
+                    "Resolved exact object replication target"
+                );
                 self.start_iteration(Some(key.clone()), true)
             }
             ReplicateScopeState::ReadSingleVersion => {
@@ -309,8 +380,26 @@ impl Operation for ReplicateScopeOperation {
                         Ok(metadata) => metadata,
                         Err(err) => return self.fail(err.into()),
                     };
+                    debug!(
+                        bucket = %version_key.bucket,
+                        key = %version_key.key,
+                        version_id = %version_key.version_id,
+                        target_node = %self.input.target_node_id,
+                        is_materialized = metadata.is_materialized(),
+                        is_deleted = metadata.is_deleted(),
+                        has_source_binding = metadata.source_binding().is_some(),
+                        "Loaded single version for replication"
+                    );
                     if self.should_enqueue_version(&metadata) {
                         self.enqueue_version_request(version_key);
+                    } else {
+                        debug!(
+                            bucket = %version_key.bucket,
+                            key = %version_key.key,
+                            version_id = %version_key.version_id,
+                            target_node = %self.input.target_node_id,
+                            "Filtered single version from replication"
+                        );
                     }
                 }
 
@@ -328,6 +417,9 @@ impl Operation for ReplicateScopeOperation {
                         received: event,
                     });
                 };
+
+                let page_len = values.len();
+                let pending_before = self.pending_versions.len();
 
                 for (key, value) in values {
                     let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
@@ -358,6 +450,16 @@ impl Operation for ReplicateScopeOperation {
                     self.enqueue_version_request(version_key);
                 }
 
+                debug!(
+                    bucket = %self.input.bucket,
+                    target = ?self.input.target,
+                    target_node = %self.input.target_node_id,
+                    page_len,
+                    enqueued_in_page = self.pending_versions.len().saturating_sub(pending_before),
+                    next_page = next_start_after.is_some(),
+                    "Processed replication iteration page"
+                );
+
                 if let Some(cursor) = next_start_after {
                     self.next_start_after = Some(cursor);
                     self.request_iteration_page()
@@ -381,6 +483,17 @@ impl Operation for ReplicateScopeOperation {
                     Ok(ReplicationSuboperationResult::Skipped) => self.result.skipped += 1,
                     Err(_) => self.result.failed += 1,
                 }
+
+                debug!(
+                    bucket = %self.input.bucket,
+                    target = ?self.input.target,
+                    target_node = %self.input.target_node_id,
+                    result = ?result,
+                    replicated = self.result.replicated,
+                    skipped = self.result.skipped,
+                    failed = self.result.failed,
+                    "Completed version replication suboperation"
+                );
 
                 self.run_next_replication()
             }
@@ -508,6 +621,15 @@ impl ReplicateObjectVersionOperation {
     }
 
     fn fail(&mut self, err: ReplicateObjectVersionError) -> Effects {
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            target_node = %self.request.target_node_id,
+            state = %self.state_name(),
+            error = %err,
+            "Version replication failed"
+        );
         self.state = ReplicateObjectVersionState::Error;
         self.result = Err(err);
         self.abort()
@@ -594,6 +716,15 @@ impl ReplicateObjectVersionOperation {
     }
 
     fn skip_version(&mut self) -> Effects {
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            target_node = %self.request.target_node_id,
+            state = %self.state_name(),
+            mode = ?self.request.mode,
+            "Skipping version replication"
+        );
         self.result = Ok(ReplicationSuboperationResult::Skipped);
         self.state = ReplicateObjectVersionState::Finish;
         smallvec![]
@@ -608,6 +739,17 @@ impl ReplicateObjectVersionOperation {
             return self.skip_version();
         };
 
+        debug!(
+            bucket = %self.request.bucket,
+            key = %self.request.key,
+            version_id = %self.request.version_id,
+            target_node = %self.request.target_node_id,
+            strategy = ?source.strategy,
+            source_path = %source.descriptor.source_path,
+            source_kind = %source.descriptor.kind,
+            "Resolving on-demand reference source access"
+        );
+
         self.version_metadata = Some(metadata);
         self.state = ReplicateObjectVersionState::ResolveReferenceAccess;
         smallvec![resolve_version_source_binding_suboperation(
@@ -620,6 +762,24 @@ impl ReplicateObjectVersionOperation {
             Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
                 result: Ok(access),
             }) => {
+                let (source_kind, source_path, source_version) = match &access {
+                    aruna_core::structs::ResolvedSourceAccess::OpenDal {
+                        kind,
+                        path,
+                        version,
+                        ..
+                    } => (*kind, path.clone(), version.clone()),
+                };
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    source_kind = %source_kind,
+                    source_path = %source_path,
+                    source_version = ?source_version,
+                    "Resolved on-demand reference access"
+                );
                 self.state = ReplicateObjectVersionState::ReadReferenceSource;
                 smallvec![Effect::StagingSource(StagingSourceEffect::Read {
                     access,
@@ -628,7 +788,16 @@ impl ReplicateObjectVersionOperation {
             }
             Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved {
                 result: Err(_),
-            }) => self.skip_version(),
+            }) => {
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    "Failed to resolve on-demand reference access; skipping version"
+                );
+                self.skip_version()
+            }
             other => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
@@ -639,10 +808,24 @@ impl ReplicateObjectVersionOperation {
 
     fn handle_reference_source_read(&mut self, event: Event) -> Effects {
         match event {
-            Event::StagingSource(StagingSourceEvent::ReadResult { stream, .. }) => {
+            Event::StagingSource(StagingSourceEvent::ReadResult {
+                metadata: source_metadata,
+                stream,
+            }) => {
                 let Some(metadata) = self.version_metadata.as_ref() else {
                     return self.fail(ReplicateObjectVersionError::VersionNotFound);
                 };
+
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    content_length = source_metadata.content_length,
+                    content_type = ?source_metadata.content_type,
+                    source_version = ?source_metadata.source_version,
+                    "Read on-demand reference source content"
+                );
 
                 self.state = ReplicateObjectVersionState::WriteReferenceBlob;
                 smallvec![Effect::Blob(BlobEffect::Write {
@@ -652,7 +835,17 @@ impl ReplicateObjectVersionOperation {
                     blob: stream,
                 })]
             }
-            Event::StagingSource(StagingSourceEvent::Error { .. }) => self.skip_version(),
+            Event::StagingSource(StagingSourceEvent::Error { error }) => {
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    error = %error,
+                    "Reading on-demand reference source failed; skipping version"
+                );
+                self.skip_version()
+            }
             other => self.fail(ReplicateObjectVersionError::InvalidStateEvent {
                 state: self.state_name(),
                 expected: "Event::StagingSource(StagingSourceEvent::ReadResult)",
@@ -668,6 +861,15 @@ impl ReplicateObjectVersionOperation {
                     return self.fail(ReplicateObjectVersionError::VersionNotFound);
                 };
                 let source = metadata.source_binding().cloned();
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    blob_size = location.blob_size,
+                    temporary_path = %location.backend_path,
+                    "Materialized temporary blob for on-demand reference replication"
+                );
                 self.cleanup_reference_blob = Some(location.clone());
                 self.version_metadata = Some(VersionMetadata::materialized(
                     metadata.version_id,
@@ -752,6 +954,21 @@ impl ReplicateObjectVersionOperation {
             source,
             multipart,
         });
+        if let Some(manifest) = self.manifest.as_ref() {
+            debug!(
+                bucket = %manifest.bucket,
+                key = %manifest.key,
+                version_id = %manifest.version_id,
+                target_node = %self.request.target_node_id,
+                kind = ?manifest.kind,
+                has_blob = manifest.blob.is_some(),
+                blob_size = manifest.blob.as_ref().map(|blob| blob.size),
+                multipart_parts = manifest.multipart.as_ref().map(|m| m.parts.len()).unwrap_or(0),
+                current_version = manifest.current_version,
+                current_version_generation = ?manifest.current_version_generation,
+                "Built version replication manifest"
+            );
+        }
         Ok(())
     }
 
@@ -832,6 +1049,16 @@ impl Operation for ReplicateObjectVersionOperation {
                     Ok(metadata) => metadata,
                     Err(err) => return self.fail(err.into()),
                 };
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    is_materialized = metadata.is_materialized(),
+                    is_deleted = metadata.is_deleted(),
+                    has_source_binding = metadata.source_binding().is_some(),
+                    "Loaded version metadata for replication"
+                );
                 if !metadata.is_materialized() && !metadata.is_deleted() {
                     return self.resolve_reference_or_skip(metadata);
                 }
@@ -916,6 +1143,18 @@ impl Operation for ReplicateObjectVersionOperation {
                 let current_lookup = value
                     .as_ref()
                     .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    current_version_generation = current_lookup.as_ref().map(|pointer| pointer.generation),
+                    current_version_matches = current_lookup
+                        .as_ref()
+                        .map(|pointer| pointer.version_id == self.request.version_id)
+                        .unwrap_or(false),
+                    "Loaded current version pointer before manifest creation"
+                );
                 if let Err(err) = self.build_manifest(current_lookup) {
                     return self.fail(err);
                 }
@@ -933,6 +1172,14 @@ impl Operation for ReplicateObjectVersionOperation {
                     });
                 };
                 self.stream_id = Some(stream_id);
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    stream_id = %stream_id,
+                    "Opened replication connection to target node"
+                );
                 self.send_manifest()
             }
             ReplicateObjectVersionState::SendManifest => {
@@ -943,6 +1190,14 @@ impl Operation for ReplicateObjectVersionOperation {
                         received: event,
                     });
                 };
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    stream_id = ?self.stream_id,
+                    "Sent version replication manifest"
+                );
                 self.await_negotiation()
             }
             ReplicateObjectVersionState::AwaitNegotiation => {
@@ -971,10 +1226,28 @@ impl Operation for ReplicateObjectVersionOperation {
 
                 match result {
                     ReplicationNegotiationResult::AlreadyReplicatedVersion => {
+                        debug!(
+                            bucket = %self.request.bucket,
+                            key = %self.request.key,
+                            version_id = %self.request.version_id,
+                            target_node = %self.request.target_node_id,
+                            decision = ?result,
+                            "Target reported version already replicated"
+                        );
                         self.result = Ok(ReplicationSuboperationResult::Skipped);
                         self.close_connection()
                     }
-                    ReplicationNegotiationResult::NeedVersionOnly => self.await_apply_complete(),
+                    ReplicationNegotiationResult::NeedVersionOnly => {
+                        debug!(
+                            bucket = %self.request.bucket,
+                            key = %self.request.key,
+                            version_id = %self.request.version_id,
+                            target_node = %self.request.target_node_id,
+                            decision = ?result,
+                            "Target requested version metadata only"
+                        );
+                        self.await_apply_complete()
+                    }
                     ReplicationNegotiationResult::NeedBlobAndVersion => {
                         let Some(blob) = self
                             .manifest
@@ -986,6 +1259,16 @@ impl Operation for ReplicateObjectVersionOperation {
                         self.state = ReplicateObjectVersionState::TransferBlob;
                         let replication_id = Ulid::new();
                         self.blob_replication_id = Some(replication_id);
+                        debug!(
+                            bucket = %self.request.bucket,
+                            key = %self.request.key,
+                            version_id = %self.request.version_id,
+                            target_node = %self.request.target_node_id,
+                            decision = ?result,
+                            replication_id = %replication_id,
+                            blob_size = blob.size,
+                            "Target requested blob transfer"
+                        );
                         smallvec![Effect::Blob(BlobEffect::Replicate {
                             replication_id,
                             stream_id: self.stream_id.expect("stream id available"),
@@ -994,6 +1277,14 @@ impl Operation for ReplicateObjectVersionOperation {
                         })]
                     }
                     ReplicationNegotiationResult::Rejected(reason) => {
+                        debug!(
+                            bucket = %self.request.bucket,
+                            key = %self.request.key,
+                            version_id = %self.request.version_id,
+                            target_node = %self.request.target_node_id,
+                            reason = %reason,
+                            "Target rejected version replication"
+                        );
                         self.fail(ReplicationError::ReplicationRejected(reason).into())
                     }
                 }
@@ -1006,6 +1297,14 @@ impl Operation for ReplicateObjectVersionOperation {
                         received: event,
                     });
                 };
+                debug!(
+                    bucket = %self.request.bucket,
+                    key = %self.request.key,
+                    version_id = %self.request.version_id,
+                    target_node = %self.request.target_node_id,
+                    replication_id = ?self.blob_replication_id,
+                    "Finished blob transfer to target node"
+                );
                 self.await_apply_complete()
             }
             ReplicateObjectVersionState::AwaitApplyComplete => {
@@ -1019,6 +1318,13 @@ impl Operation for ReplicateObjectVersionOperation {
 
                 match VersionReplicationMessage::from_bytes(&payload) {
                     Ok(VersionReplicationMessage::VersionApplyComplete) => {
+                        debug!(
+                            bucket = %self.request.bucket,
+                            key = %self.request.key,
+                            version_id = %self.request.version_id,
+                            target_node = %self.request.target_node_id,
+                            "Target completed version apply"
+                        );
                         self.result = Ok(ReplicationSuboperationResult::Replicated);
                         self.cleanup_reference_blob_or_close()
                     }
