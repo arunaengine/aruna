@@ -95,6 +95,7 @@ pub enum StorageStage {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum DhtIoRequest {
     RpcRequest {
         op_id: OpId,

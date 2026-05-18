@@ -1,3 +1,7 @@
+use crate::announce::AnnounceTopicOperation;
+use crate::replicate_automerge_to_realm::{
+    ReplicateAutomergeDocumentsToRealmConfig, ReplicateAutomergeDocumentsToRealmOperation,
+};
 use aruna_core::automerge::AutomergeDocumentVariant;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -5,16 +9,12 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument};
+use aruna_core::types::Effects;
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
-use ulid::Ulid;
-use crate::announce::AnnounceTopicOperation;
-use crate::replicate_automerge_to_realm::{
-    ReplicateAutomergeDocumentsToRealmConfig, ReplicateAutomergeDocumentsToRealmOperation,
-};
-use aruna_core::types::Effects;
 use tracing::trace;
+use ulid::Ulid;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {

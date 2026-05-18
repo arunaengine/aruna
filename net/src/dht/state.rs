@@ -279,6 +279,7 @@ impl DhtStateMachine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_cmd_put(
         &mut self,
         op_id: OpId,
@@ -1488,6 +1489,7 @@ impl DhtStateMachine {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_rpc_pending(
         &self,
         op_id: OpId,
