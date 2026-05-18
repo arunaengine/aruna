@@ -9,13 +9,12 @@ use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 use ulid::Ulid;
-
 use crate::announce::AnnounceTopicOperation;
 use crate::replicate_automerge_to_realm::{
     ReplicateAutomergeDocumentsToRealmConfig, ReplicateAutomergeDocumentsToRealmOperation,
 };
 use aruna_core::types::Effects;
-use tracing::info;
+use tracing::trace;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CreateGroupConfig {
@@ -68,7 +67,7 @@ impl CreateGroupOperation {
 
         self.group = Some(group.clone());
 
-        info!(
+        trace!(
             event = "group.create.started",
             group_id = %group.group_id,
             realm_id = %group.realm_id,
@@ -219,6 +218,13 @@ impl CreateGroupOperation {
             && self.auth_doc.is_some()
         {
             self.state = CreateGroupState::AnnounceGroupDoc;
+            trace!(
+                event = "group.create.announce_group",
+                group_id = %group.group_id,
+                realm_id = %group.realm_id,
+                user_id = %self.config.actor.user_id,
+                "Announcing group"
+            );
             smallvec![Effect::SubOperation(boxed_suboperation(
                 AnnounceTopicOperation::new(
                     AutomergeDocumentVariant::Group {
@@ -253,6 +259,13 @@ impl CreateGroupOperation {
 
         if let Some(group) = &self.group {
             self.state = CreateGroupState::AnnounceAuthDoc;
+            trace!(
+                event = "group.create.announce_auth",
+                group_id = %group.group_id,
+                realm_id = %group.realm_id,
+                user_id = %self.config.actor.user_id,
+                "Announcing authorization document"
+            );
             smallvec![Effect::SubOperation(boxed_suboperation(
                 AnnounceTopicOperation::new(
                     AutomergeDocumentVariant::GroupAuthorization {
@@ -287,6 +300,13 @@ impl CreateGroupOperation {
 
         if let Some(group) = &self.group {
             self.state = CreateGroupState::ReplicateDocuments;
+            trace!(
+                event = "group.create.replicate_documents",
+                group_id = %group.group_id,
+                realm_id = %group.realm_id,
+                user_id = %self.config.actor.user_id,
+                "Replicating documents"
+            );
             smallvec![Effect::SubOperation(boxed_suboperation(
                 ReplicateAutomergeDocumentsToRealmOperation::new(
                     ReplicateAutomergeDocumentsToRealmConfig {
@@ -328,7 +348,7 @@ impl CreateGroupOperation {
         if let Some(group) = &self.group
             && let Some(auth) = &self.auth_doc
         {
-            info!(
+            trace!(
                 event = "group.create.completed",
                 group_id = %group.group_id,
                 realm_id = %group.realm_id,
