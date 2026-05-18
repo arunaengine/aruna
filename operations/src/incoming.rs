@@ -39,6 +39,12 @@ pub fn initialize_net_incoming(context: Arc<DriverContext>) {
 
 #[async_trait]
 impl InboundEventHandler for OperationsInboundHandler {
+    #[tracing::instrument(
+        name = "operations.inbound.gossip",
+        level = "debug",
+        skip(self, data),
+        fields(topic = %topic, sender = %sender, message_len = data.len())
+    )]
     async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>) {
         let message = postcard::from_bytes::<TopicMessage>(&data).ok();
         let span = info_span!(
@@ -81,6 +87,12 @@ impl InboundEventHandler for OperationsInboundHandler {
         .await;
     }
 
+    #[tracing::instrument(
+        name = "operations.inbound.stream",
+        level = "debug",
+        skip(self, stream),
+        fields(peer = %node_id, alpn = ?alpn)
+    )]
     async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
         let span = info_span!("net.incoming_stream", peer = %node_id, alpn = ?alpn);
 

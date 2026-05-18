@@ -27,6 +27,12 @@ impl StreamsService {
         Self { endpoint, shutdown }
     }
 
+    #[tracing::instrument(
+        name = "iroh.stream.open.request",
+        level = "debug",
+        skip(self),
+        fields(peer = %node_id, alpn = %alpn)
+    )]
     pub async fn open(&self, node_id: NodeId, alpn: Alpn) -> Result<BiStream> {
         let endpoint = self.endpoint.clone();
         let span = info_span!(
@@ -153,6 +159,11 @@ impl std::fmt::Debug for StreamsService {
     }
 }
 
+#[tracing::instrument(
+    name = "iroh.stream.accept_loop",
+    level = "debug",
+    skip(endpoint, dht_handler, gossip_handler, stream_handler, shutdown)
+)]
 pub async fn run_accept_loop(
     endpoint: Endpoint,
     dht_handler: mpsc::Sender<(Connection, SendStream, RecvStream, NodeId)>,

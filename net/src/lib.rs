@@ -1794,6 +1794,12 @@ fn net_warnings(
 
 #[async_trait]
 impl Handle for NetHandle {
+    #[tracing::instrument(
+        name = "net.handle.send_effect",
+        level = "debug",
+        skip(self, effect),
+        fields(effect = net_handle_effect_kind(&effect))
+    )]
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
             Effect::Net(net_effect) => {
@@ -1815,6 +1821,23 @@ impl Handle for NetHandle {
             }
             _ => Event::Net(NetEvent::Error(CoreNetError::InvalidEffect)),
         }
+    }
+}
+
+fn net_handle_effect_kind(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::Net(NetEffect::Dht(_)) => "dht",
+        Effect::Net(NetEffect::Gossip(_)) => "gossip",
+        Effect::Net(NetEffect::Stream(_)) => "stream",
+        Effect::Blob(_) => "blob",
+        Effect::StagingSource(_) => "staging_source",
+        Effect::Storage(_) => "storage",
+        Effect::Automerge(_) => "automerge",
+        Effect::Metadata(_) => "metadata",
+        Effect::SubOperation(_) => "suboperation",
+        Effect::Task(_) => "task",
+        Effect::Search() => "search",
+        Effect::Stream() => "stream",
     }
 }
 

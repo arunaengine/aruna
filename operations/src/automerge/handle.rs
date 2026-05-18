@@ -81,6 +81,7 @@ impl AutomergeHandle {
         }
     }
 
+    #[tracing::instrument(name = "automerge.handle.register_inbound", level = "debug", skip(self, stream), fields(peer = %peer))]
     pub async fn register_inbound_stream(
         &self,
         stream: BiStream,
@@ -98,20 +99,29 @@ impl AutomergeHandle {
         sync_id
     }
 
+    #[tracing::instrument(name = "automerge.handle.store_sync", level = "trace", skip(self, sync), fields(sync_id = %sync_id))]
     async fn store_active_sync(&self, sync_id: Ulid, sync: ActiveSync) {
         self.inner.active_syncs.lock().await.insert(sync_id, sync);
     }
 
+    #[tracing::instrument(name = "automerge.handle.take_sync", level = "trace", skip(self), fields(sync_id = %sync_id))]
     async fn take_active_sync(&self, sync_id: Ulid) -> Result<ActiveSync, AutomergeSyncError> {
         self.remove_active_sync(sync_id).await.ok_or_else(|| {
             AutomergeSyncError::Protocol(format!("automerge sync {sync_id} not found"))
         })
     }
 
+    #[tracing::instrument(name = "automerge.handle.remove_sync", level = "trace", skip(self), fields(sync_id = %sync_id))]
     async fn remove_active_sync(&self, sync_id: Ulid) -> Option<ActiveSync> {
         self.inner.active_syncs.lock().await.remove(&sync_id)
     }
 
+    #[tracing::instrument(
+        name = "automerge.handle.start_outbound",
+        level = "debug",
+        skip(self, init),
+        fields(peer = %peer, document = %init.document.topic_id())
+    )]
     async fn start_outbound_sync(
         &self,
         peer: aruna_core::NodeId,
@@ -234,6 +244,7 @@ impl AutomergeHandle {
         .await
     }
 
+    #[tracing::instrument(name = "automerge.handle.start_inbound", level = "debug", skip(self), fields(sync_id = %sync_id))]
     async fn start_inbound_sync(&self, sync_id: Ulid) -> AutomergeEvent {
         let mut sync = match self.take_active_sync(sync_id).await {
             Ok(sync) => sync,
@@ -302,6 +313,12 @@ impl AutomergeHandle {
         }
     }
 
+    #[tracing::instrument(
+        name = "automerge.handle.run_sync",
+        level = "debug",
+        skip(self, local_document, response_init),
+        fields(sync_id = %sync_id, local_document_len = local_document.len(), response_document = ?response_init.as_ref().map(|init| init.document.topic_id()))
+    )]
     async fn run_sync(
         &self,
         sync_id: Ulid,
@@ -436,6 +453,7 @@ impl AutomergeHandle {
         }
     }
 
+    #[tracing::instrument(name = "automerge.handle.reject_sync", level = "debug", skip(self), fields(sync_id = %sync_id, reason = ?reason))]
     async fn reject_sync(&self, sync_id: Ulid, reason: AutomergeRejectReason) -> AutomergeEvent {
         let Some(sync) = self.remove_active_sync(sync_id).await else {
             return AutomergeEvent::SyncRejected {
@@ -459,6 +477,7 @@ impl AutomergeHandle {
         }
     }
 
+    #[tracing::instrument(name = "automerge.handle.close_sync", level = "debug", skip(self), fields(sync_id = %sync_id))]
     async fn close_sync(&self, sync_id: Ulid) -> AutomergeEvent {
         if let Some(sync) = self.remove_active_sync(sync_id).await {
             let mut sync = sync;
@@ -476,6 +495,7 @@ impl std::fmt::Debug for AutomergeHandle {
 
 #[async_trait]
 impl Handle for AutomergeHandle {
+    #[tracing::instrument(name = "automerge.handle.send_effect", level = "debug", skip(self, effect), fields(effect = automerge_effect_kind(&effect)))]
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
             Effect::Automerge(effect) => {
@@ -509,6 +529,31 @@ impl Handle for AutomergeHandle {
     }
 }
 
+fn automerge_effect_kind(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::Automerge(AutomergeEffect::StartOutboundSync { .. }) => "start_outbound_sync",
+        Effect::Automerge(AutomergeEffect::StartInboundSync { .. }) => "start_inbound_sync",
+        Effect::Automerge(AutomergeEffect::RunSync { .. }) => "run_sync",
+        Effect::Automerge(AutomergeEffect::RejectSync { .. }) => "reject_sync",
+        Effect::Automerge(AutomergeEffect::CloseSync { .. }) => "close_sync",
+        Effect::Blob(_) => "blob",
+        Effect::StagingSource(_) => "staging_source",
+        Effect::Storage(_) => "storage",
+        Effect::Net(_) => "net",
+        Effect::Metadata(_) => "metadata",
+        Effect::SubOperation(_) => "suboperation",
+        Effect::Task(_) => "task",
+        Effect::Search() => "search",
+        Effect::Stream() => "stream",
+    }
+}
+
+#[tracing::instrument(
+    name = "automerge.sync.rounds",
+    level = "debug",
+    skip(stream, doc, remote_init),
+    fields(document = %remote_init.document.topic_id(), remote_head_count = remote_init.heads.len())
+)]
 async fn run_sync_rounds(
     stream: &mut BiStream,
     doc: &mut AutoCommit,
@@ -611,6 +656,7 @@ async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
 }
 
+#[tracing::instrument(name = "automerge.transport.write", level = "trace", skip(stream, message), fields(message = ?message))]
 async fn write_transport_message(
     stream: &mut BiStream,
     message: &AutomergeTransportMessage,
@@ -622,6 +668,7 @@ async fn write_transport_message(
         })?
 }
 
+#[tracing::instrument(name = "automerge.transport.read", level = "trace", skip(stream))]
 async fn read_transport_message(
     stream: &mut BiStream,
 ) -> Result<AutomergeTransportMessage, AutomergeSyncError> {

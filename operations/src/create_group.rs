@@ -56,6 +56,7 @@ impl CreateGroupOperation {
             output: None,
         }
     }
+    #[tracing::instrument(name = "group.create.emit_group", level = "debug", skip(self), fields(state = ?self.state, group_name = %self.config.display_name))]
     fn emit_create_group(&mut self) -> Result<Effects, CreateGroupError> {
         let group_id = Ulid::new();
         let group = Group {
@@ -87,6 +88,7 @@ impl CreateGroupOperation {
         })])
     }
 
+    #[tracing::instrument(name = "group.create.emit_auth_doc", level = "debug", skip(self), fields(state = ?self.state))]
     fn emit_create_auth_doc(&mut self) -> Result<Effects, CreateGroupError> {
         self.txn_id.ok_or(CreateGroupError::NoTransactionFound)?;
 
@@ -114,18 +116,21 @@ impl CreateGroupOperation {
         })])
     }
 
+    #[tracing::instrument(name = "group.create.fail", level = "debug", skip(self), fields(state = ?self.state, error = %err))]
     fn fail(&mut self, err: CreateGroupError) -> Effects {
         self.state = CreateGroupState::Error;
         self.output = Some(Err(err));
         smallvec![]
     }
 
+    #[tracing::instrument(name = "group.create.fail_with_cleanup", level = "debug", skip(self, cleanup_effects), fields(state = ?self.state, error = %err))]
     fn fail_with_cleanup(&mut self, err: CreateGroupError, cleanup_effects: Effects) -> Effects {
         self.state = CreateGroupState::Error;
         self.output = Some(Err(err));
         cleanup_effects
     }
 
+    #[tracing::instrument(name = "group.create.unexpected_event", level = "debug", skip(self, got), fields(current_state = ?self.state, expected, got = %got))]
     fn unexpected_event(
         &mut self,
         state: CreateGroupState,
@@ -143,6 +148,7 @@ impl CreateGroupOperation {
         )
     }
 
+    #[tracing::instrument(name = "group.create.fail_on_storage_error", level = "trace", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn fail_on_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
         if let Event::Storage(StorageEvent::Error { error }) = event {
             return Err(self.fail(error.into()));
@@ -151,6 +157,7 @@ impl CreateGroupOperation {
         Ok(event)
     }
 
+    #[tracing::instrument(name = "group.create.handle_start_transaction", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_start_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
@@ -169,6 +176,7 @@ impl CreateGroupOperation {
         }
     }
 
+    #[tracing::instrument(name = "group.create.handle_group_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_create_group(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
@@ -186,6 +194,7 @@ impl CreateGroupOperation {
         }
     }
 
+    #[tracing::instrument(name = "group.create.handle_auth_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_create_roles(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
@@ -204,6 +213,7 @@ impl CreateGroupOperation {
         }
     }
 
+    #[tracing::instrument(name = "group.create.handle_commit", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_commit_transaction(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
@@ -242,6 +252,7 @@ impl CreateGroupOperation {
         }
     }
 
+    #[tracing::instrument(name = "group.create.handle_announce_group", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_announce_group_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
@@ -283,6 +294,7 @@ impl CreateGroupOperation {
         }
     }
 
+    #[tracing::instrument(name = "group.create.handle_announce_auth", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
@@ -331,6 +343,7 @@ impl CreateGroupOperation {
         }
     }
 
+    #[tracing::instrument(name = "group.create.handle_replicate", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_replicate_documents(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) = event else {
@@ -406,6 +419,7 @@ impl Operation for CreateGroupOperation {
 
     type Error = CreateGroupError;
 
+    #[tracing::instrument(name = "group.create.start", level = "debug", skip(self), fields(group_name = %self.config.display_name))]
     fn start(&mut self) -> Effects {
         self.state = CreateGroupState::StartTransaction;
 
@@ -414,6 +428,7 @@ impl Operation for CreateGroupOperation {
         })]
     }
 
+    #[tracing::instrument(name = "group.create.step", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn step(&mut self, event: Event) -> Effects {
         let event = match self.fail_on_storage_error(event) {
             Ok(event) => event,
@@ -441,10 +456,12 @@ impl Operation for CreateGroupOperation {
         )
     }
 
+    #[tracing::instrument(name = "group.create.finalize", level = "debug", skip(self), fields(state = ?self.state))]
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output.ok_or(CreateGroupError::NotFinished)?
     }
 
+    #[tracing::instrument(name = "group.create.abort", level = "debug", skip(self), fields(state = ?self.state, txn_id = ?self.txn_id))]
     fn abort(&mut self) -> Effects {
         match self.txn_id {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],

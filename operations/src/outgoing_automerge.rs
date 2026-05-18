@@ -134,6 +134,12 @@ impl OutgoingAutomergeOperation {
         })
     }
 
+    #[tracing::instrument(
+        name = "automerge.outgoing.resolve_user_conflicts",
+        level = "debug",
+        skip(self, previous_bytes, current_bytes),
+        fields(peer = %self.peer, document = %self.document.topic_id(), state = ?self.state, txn_id = %txn_id, previous_len = previous_bytes.len(), current_len = current_bytes.len())
+    )]
     fn resolve_user_conflicts_effects(
         &mut self,
         previous_bytes: Vec<u8>,
@@ -178,11 +184,13 @@ impl Operation for OutgoingAutomergeOperation {
     type Output = ();
     type Error = OutgoingAutomergeError;
 
+    #[tracing::instrument(name = "automerge.outgoing.start", level = "debug", skip(self), fields(peer = %self.peer, document = %self.document.topic_id()))]
     fn start(&mut self) -> aruna_core::types::Effects {
         self.state = OutgoingAutomergeState::ReadLocal;
         smallvec![read_effect(&self.document, None)]
     }
 
+    #[tracing::instrument(name = "automerge.outgoing.step", level = "debug", skip(self, event), fields(peer = %self.peer, document = %self.document.topic_id(), state = ?self.state, event = ?event))]
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
         match self.state {
             OutgoingAutomergeState::ReadLocal => match event {
@@ -342,10 +350,12 @@ impl Operation for OutgoingAutomergeOperation {
         )
     }
 
+    #[tracing::instrument(name = "automerge.outgoing.finalize", level = "debug", skip(self), fields(peer = %self.peer, document = %self.document.topic_id(), state = ?self.state))]
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output.unwrap_or(Ok(()))
     }
 
+    #[tracing::instrument(name = "automerge.outgoing.abort", level = "debug", skip(self), fields(peer = %self.peer, document = %self.document.topic_id(), state = ?self.state, txn_id = ?self.persist_txn_id))]
     fn abort(&mut self) -> aruna_core::types::Effects {
         match self.persist_txn_id.take() {
             Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],

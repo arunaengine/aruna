@@ -41,6 +41,11 @@ impl std::fmt::Debug for DhtHandle {
 }
 
 impl DhtHandle {
+    #[tracing::instrument(
+        name = "dht.handle.spawn",
+        level = "debug",
+        skip(endpoint, storage, shutdown)
+    )]
     pub(crate) fn spawn(
         endpoint: Endpoint,
         storage: StorageHandle,
@@ -86,10 +91,17 @@ impl DhtHandle {
         self.local_id
     }
 
+    #[tracing::instrument(name = "dht.handle.add_peer", level = "debug", skip(self), fields(node_id = %node_id))]
     pub fn add_peer(&self, node_id: NodeId) -> Result<()> {
         self.try_enqueue(DriverCmd::AddPeer { node_id })
     }
 
+    #[tracing::instrument(
+        name = "dht.handle.put",
+        level = "debug",
+        skip(self, value),
+        fields(key = %key, realm_id = %realm_id, value_len = value.len(), ttl_secs = ttl.as_secs())
+    )]
     pub async fn put(
         &self,
         key: &DhtKeyId,
@@ -126,6 +138,12 @@ impl DhtHandle {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.handle.get",
+        level = "debug",
+        skip(self),
+        fields(key = %key, realm_id = ?realm_filter)
+    )]
     pub async fn get(
         &self,
         key: &DhtKeyId,
@@ -161,6 +179,12 @@ impl DhtHandle {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.handle.bootstrap",
+        level = "debug",
+        skip(self, nodes),
+        fields(node_count = nodes.len())
+    )]
     pub async fn bootstrap(&self, nodes: &[[u8; 32]]) -> Result<()> {
         let node_ids: Vec<NodeId> = nodes
             .iter()
@@ -169,6 +193,12 @@ impl DhtHandle {
         self.bootstrap_nodes(&node_ids).await
     }
 
+    #[tracing::instrument(
+        name = "dht.handle.bootstrap_nodes",
+        level = "debug",
+        skip(self, nodes),
+        fields(node_count = nodes.len())
+    )]
     pub async fn bootstrap_nodes(&self, nodes: &[NodeId]) -> Result<()> {
         match self
             .request(|reply| DriverCmd::Bootstrap {
@@ -185,9 +215,13 @@ impl DhtHandle {
         }
     }
 
+    #[tracing::instrument(name = "dht.handle.routing_table_size", level = "debug", skip(self))]
     pub async fn routing_table_size(&self) -> Result<usize> {
         match self
-            .request(|reply| DriverCmd::RoutingTableSize { reply })
+            .request(|reply| DriverCmd::RoutingTableSize {
+                trace_context: current_trace_context(),
+                reply,
+            })
             .await?
         {
             DhtOutputValue::RoutingTableSize(size) => Ok(size),
@@ -197,11 +231,13 @@ impl DhtHandle {
         }
     }
 
+    #[tracing::instrument(name = "dht.handle.shutdown", level = "debug", skip(self))]
     pub async fn shutdown(&self) -> Result<()> {
         self.shutdown.cancel();
         Ok(())
     }
 
+    #[tracing::instrument(name = "dht.handle.enqueue", level = "trace", skip(self), fields(command = ?cmd))]
     fn try_enqueue(&self, cmd: DriverCmd) -> Result<()> {
         match self.cmd_tx.try_send(cmd) {
             Ok(()) => Ok(()),
@@ -212,6 +248,7 @@ impl DhtHandle {
         }
     }
 
+    #[tracing::instrument(name = "dht.handle.request", level = "debug", skip(self, make_cmd))]
     async fn request<F>(&self, make_cmd: F) -> Result<DhtOutputValue>
     where
         F: FnOnce(oneshot::Sender<CallerOutcome>) -> DriverCmd,
