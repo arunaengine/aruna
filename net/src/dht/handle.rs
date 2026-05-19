@@ -16,6 +16,7 @@ use super::driver::{CallerOutcome, DhtDriver, DriverCmd, DriverCmdSender, Inboun
 use super::protocol::{DhtIoError, DhtOutputValue};
 use super::state::DhtStateMachine;
 use super::storage::now_unix_secs;
+use crate::connection_pool::ConnectionPool;
 use crate::error::{NetError, Result};
 use crate::telemetry::current_trace_context;
 
@@ -49,6 +50,7 @@ impl DhtHandle {
     pub(crate) fn spawn(
         endpoint: Endpoint,
         storage: StorageHandle,
+        connection_pool: ConnectionPool,
         shutdown: CancellationToken,
     ) -> Result<(Self, DhtSpawnResources)> {
         let local_id = endpoint.id();
@@ -63,6 +65,7 @@ impl DhtHandle {
             state,
             endpoint,
             storage,
+            connection_pool,
             cmd_rx,
             inbound_stream_rx,
             shutdown.clone(),

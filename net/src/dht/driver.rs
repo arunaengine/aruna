@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use aruna_core::DistributedTraceContext;
+use aruna_core::alpn::Alpn;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -27,18 +28,19 @@ use super::protocol::{
     DhtOutputValue, InboundId, OpId, RpcPhase, StorageStage,
 };
 use super::rpc::{
-    DHT_ALPN, DhtRequest, DhtResponse, ErrorCode, decode_request_with_trace_context,
-    decode_response, encode_request_with_trace_context, encode_response,
+    DhtRequest, DhtResponse, ErrorCode, decode_request_with_trace_context, decode_response,
+    encode_request_with_trace_context, encode_response,
 };
 use super::state::DhtStateMachine;
 use super::storage::{CLEANUP_PAGE_SIZE, StoredEntry, decode_entries, encode_entries};
+use crate::connection_pool::{ConnectionPool, PoolConnectError};
 use crate::telemetry::{
     current_trace_context, duration_ms, extract_trace_context, record_duration_ms,
     warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
 };
 
 pub type CallerOutcome = std::result::Result<DhtOutputValue, DhtIoError>;
-pub type InboundDhtStream = (Connection, SendStream, RecvStream, NodeId);
+pub type InboundDhtStream = (SendStream, RecvStream, NodeId);
 
 pub type DriverCmdSender = MTx<mpsc::Array<DriverCmd>>;
 pub type DriverCmdReceiver = AsyncRx<mpsc::Array<DriverCmd>>;
@@ -116,6 +118,7 @@ impl std::fmt::Debug for DriverCmd {
 pub struct DhtDriver {
     state: DhtStateMachine,
     endpoint: Endpoint,
+    connection_pool: ConnectionPool,
     storage: StorageHandle,
     cmd_rx: DriverCmdReceiver,
     inbound_rx: InboundReceiver,
@@ -126,7 +129,7 @@ pub struct DhtDriver {
     pending_callers: HashMap<OpId, oneshot::Sender<CallerOutcome>>,
     op_spans: HashMap<OpId, Span>,
     next_op_id: OpId,
-    inbound_contexts: HashMap<InboundId, (Connection, SendStream)>,
+    inbound_contexts: HashMap<InboundId, SendStream>,
     inbound_spans: HashMap<InboundId, Span>,
     next_inbound_id: InboundId,
 }
@@ -146,6 +149,7 @@ impl DhtDriver {
         state: DhtStateMachine,
         endpoint: Endpoint,
         storage: StorageHandle,
+        connection_pool: ConnectionPool,
         cmd_rx: DriverCmdReceiver,
         inbound_rx: InboundReceiver,
         shutdown: CancellationToken,
@@ -155,6 +159,7 @@ impl DhtDriver {
         Self {
             state,
             endpoint,
+            connection_pool,
             storage,
             cmd_rx,
             inbound_rx,
@@ -530,14 +535,14 @@ impl DhtDriver {
         name = "dht.driver.inbound_stream",
         level = "debug",
         skip(self, inbound),
-        fields(peer = %inbound.3)
+        fields(peer = %inbound.2)
     )]
     fn handle_inbound_stream(&mut self, inbound: InboundDhtStream) {
-        let (conn, send, mut recv, peer) = inbound;
+        let (send, mut recv, peer) = inbound;
         let inbound_id = self.next_inbound_id;
         self.next_inbound_id = self.next_inbound_id.saturating_add(1);
 
-        self.inbound_contexts.insert(inbound_id, (conn, send));
+        self.inbound_contexts.insert(inbound_id, send);
         self.process_input_for_io(DhtIo::PeerSeen { peer });
 
         let io_tx = self.io_tx.clone();
@@ -635,15 +640,22 @@ impl DhtDriver {
             let io_tx = self.io_tx.clone();
             let span = self.inbound_spans.get(&inbound_id).cloned();
             let future = async move {
-                if let Some((_conn, mut send)) = maybe_send {
-                    let _ = write_response_to_stream(
+                if let Some(mut send) = maybe_send {
+                    if let Err(error) = write_response_to_stream(
                         &mut send,
                         &DhtResponse::Error {
                             code: ErrorCode::InvalidRequest,
                             message: error.to_string(),
                         },
                     )
-                    .await;
+                    .await
+                    {
+                        warn!(
+                            inbound_id,
+                            error = %error,
+                            "Failed to dispatch inbound DHT read-error response"
+                        );
+                    }
                 }
 
                 let _ = io_tx.send(DhtIo::InboundDropped { inbound_id }).await;
@@ -734,6 +746,7 @@ impl DhtDriver {
             request = ?request,
             "Dispatching outbound DHT RPC"
         );
+        let connection_pool = self.connection_pool.clone();
         let current_parent = Span::current();
         let span = info_span!(
             "dht.rpc.request",
@@ -767,7 +780,7 @@ impl DhtDriver {
             async move {
                 let outbound_trace_context = current_trace_context().or(trace_context);
                 match rpc_request(
-                    endpoint.clone(),
+                    connection_pool,
                     op_id,
                     phase,
                     peer,
@@ -830,8 +843,14 @@ impl DhtDriver {
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {
-                if let Some((_conn, mut send)) = maybe_send {
-                    let _ = write_response_to_stream(&mut send, &response).await;
+                if let Some(mut send) = maybe_send {
+                    if let Err(error) = write_response_to_stream(&mut send, &response).await {
+                        warn!(
+                            inbound_id,
+                            error = %error,
+                            "Failed to dispatch inbound DHT RPC response"
+                        );
+                    }
                 }
                 let _ = io_tx.send(DhtIo::InboundDropped { inbound_id }).await;
             }
@@ -1169,6 +1188,14 @@ async fn send_storage_effect_with_timeout(
     }
 }
 
+fn pool_connect_error(error: PoolConnectError) -> DhtIoError {
+    match error {
+        PoolConnectError::Timeout => DhtIoError::Timeout,
+        PoolConnectError::Shutdown => DhtIoError::Shutdown,
+        other => DhtIoError::network(other),
+    }
+}
+
 fn output_op_id(output: &DhtOutput) -> OpId {
     match output {
         DhtOutput::Completed { op_id, .. } | DhtOutput::Failed { op_id, .. } => *op_id,
@@ -1319,11 +1346,11 @@ fn internal_operation_kind(request: &DhtIoRequest) -> &'static str {
 #[tracing::instrument(
     name = "dht.rpc.request.io",
     level = "debug",
-    skip(endpoint, request, trace_context),
+    skip(connection_pool, request, trace_context),
     fields(op_id, phase = ?phase, peer = %peer, request = ?request)
 )]
 async fn rpc_request(
-    endpoint: Endpoint,
+    connection_pool: ConnectionPool,
     op_id: OpId,
     phase: RpcPhase,
     peer: NodeId,
@@ -1334,8 +1361,8 @@ async fn rpc_request(
     let total_started = Instant::now();
 
     let connect_started = Instant::now();
-    let conn = match tokio::time::timeout(RPC_TIMEOUT, endpoint.connect(peer, DHT_ALPN)).await {
-        Ok(Ok(conn)) => {
+    let conn = match connection_pool.get_or_connect(peer, Alpn::Dht).await {
+        Ok(conn) => {
             let elapsed = connect_started.elapsed();
             record_duration_ms(&span, "iroh.connect_ms", elapsed);
             warn_if_slow_iroh_phase("dht.rpc", "connect", elapsed);
@@ -1350,7 +1377,7 @@ async fn rpc_request(
             );
             conn
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             let elapsed = connect_started.elapsed();
             record_duration_ms(&span, "iroh.connect_ms", elapsed);
             warn!(
@@ -1362,22 +1389,7 @@ async fn rpc_request(
                 error = %error,
                 "Iroh DHT RPC connect failed"
             );
-            return Err(DhtIoError::network(error));
-        }
-        Err(error) => {
-            let elapsed = connect_started.elapsed();
-            record_duration_ms(&span, "iroh.connect_ms", elapsed);
-            warn!(
-                event = "dht.rpc.iroh_connect_failed",
-                op_id,
-                phase = ?phase,
-                peer = %peer,
-                duration_ms = duration_ms(elapsed),
-                error = %error,
-                timed_out = true,
-                "Iroh DHT RPC connect timed out"
-            );
-            return Err(error.into());
+            return Err(pool_connect_error(error));
         }
     };
 
