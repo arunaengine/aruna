@@ -640,8 +640,8 @@ impl DhtDriver {
             let io_tx = self.io_tx.clone();
             let span = self.inbound_spans.get(&inbound_id).cloned();
             let future = async move {
-                if let Some(mut send) = maybe_send {
-                    if let Err(error) = write_response_to_stream(
+                if let Some(mut send) = maybe_send
+                    && let Err(error) = write_response_to_stream(
                         &mut send,
                         &DhtResponse::Error {
                             code: ErrorCode::InvalidRequest,
@@ -656,7 +656,6 @@ impl DhtDriver {
                             "Failed to dispatch inbound DHT read-error response"
                         );
                     }
-                }
 
                 let _ = io_tx.send(DhtIo::InboundDropped { inbound_id }).await;
             };
@@ -843,15 +842,14 @@ impl DhtDriver {
         let io_tx = self.io_tx.clone();
         tokio::spawn(
             async move {
-                if let Some(mut send) = maybe_send {
-                    if let Err(error) = write_response_to_stream(&mut send, &response).await {
+                if let Some(mut send) = maybe_send
+                    && let Err(error) = write_response_to_stream(&mut send, &response).await {
                         warn!(
                             inbound_id,
                             error = %error,
                             "Failed to dispatch inbound DHT RPC response"
                         );
                     }
-                }
                 let _ = io_tx.send(DhtIo::InboundDropped { inbound_id }).await;
             }
             .instrument(Span::current()),
