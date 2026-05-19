@@ -654,6 +654,7 @@ fn load_document(bytes: &[u8]) -> Result<AutoCommit, AutomergeSyncError> {
 
 async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
+    let _ = stream.1.stop(0u32.into());
 }
 
 fn duration_ms(duration: Duration) -> u64 {

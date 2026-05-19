@@ -1702,6 +1702,7 @@ async fn read_transport_message(
 
 async fn close_stream(stream: &mut BiStream) {
     let _ = stream.0.finish();
+    let _ = stream.1.stop(0u32.into());
 }
 
 async fn delete_replica_record(
