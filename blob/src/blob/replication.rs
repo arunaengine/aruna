@@ -61,12 +61,11 @@ impl BlobHandler {
                 }
             };
 
-        let mut connections = self.connections.lock().await;
-        let Some((sx, rx)) = connections.get_mut(&stream_id) else {
-            return BlobEvent::Error(BlobError::ReplicationRejected(
-                "Stream not available".to_string(),
-            ));
+        let stream = match self.connection_handle(stream_id).await {
+            Ok(stream) => stream,
+            Err(event) => return event,
         };
+        let mut stream = stream.lock().await;
 
         let replication_init = ReplicationMessage {
             id: replication_id,
@@ -75,6 +74,7 @@ impl BlobHandler {
                 root: outboard.root,
             },
         };
+        let sx = &mut stream.0;
         if let Err(event) = send_replication_message_with_timeout(
             sx,
             replication_init,
@@ -86,6 +86,7 @@ impl BlobHandler {
             return event;
         }
 
+        let rx = &mut stream.1;
         match read_replication_message_with_timeout(
             rx,
             self.control_plane_io_timeout(),
@@ -101,6 +102,7 @@ impl BlobHandler {
             Err(err) => return err,
         }
 
+        let sx = &mut stream.0;
         let mut sx_wrapper = SendStreamWrapper::new(sx, self.transfer_idle_timeout());
         let ranges = ByteRanges::from(0..location.blob_size);
         let ranges = round_up_to_chunks(&ranges);
@@ -113,8 +115,12 @@ impl BlobHandler {
         }
 
         if !keep_alive {
-            _ = sx.finish();
-            _ = rx.stop(0u32.into());
+            _ = stream.0.finish();
+            _ = stream.1.stop(0u32.into());
+        }
+        drop(stream);
+        if !keep_alive {
+            self.connections.lock().await.remove(&stream_id);
         }
         BlobEvent::ReplicationFinished { location }
     }
@@ -126,15 +132,14 @@ impl BlobHandler {
         keep_alive: bool,
     ) -> BlobEvent {
         let (_replication_id, root, mut location) = {
-            let mut connections = self.connections.lock().await;
-            let Some((sx, rx)) = connections.get_mut(&stream_id) else {
-                return BlobEvent::Error(BlobError::ReplicationRejected(
-                    "Stream not available".to_string(),
-                ));
+            let stream = match self.connection_handle(stream_id).await {
+                Ok(stream) => stream,
+                Err(event) => return event,
             };
+            let mut stream = stream.lock().await;
 
             match read_replication_message_with_timeout(
-                rx,
+                &mut stream.1,
                 self.control_plane_io_timeout(),
                 "waiting for incoming replication tree info",
             )
@@ -148,7 +153,7 @@ impl BlobHandler {
                         };
 
                     if let Err(event) = send_replication_message_with_timeout(
-                        sx,
+                        &mut stream.0,
                         ReplicationMessage::new(replication_id, MessageType::BaoTreeInfoReceived),
                         self.control_plane_io_timeout(),
                         "sending replication tree info acknowledgement",
@@ -183,12 +188,12 @@ impl BlobHandler {
             }
         };
 
-        let mut connections = self.connections.lock().await;
-        let Some((_, rx)) = connections.get_mut(&stream_id) else {
-            return BlobEvent::Error(BlobError::ReplicationRejected(
-                "Stream not available".to_string(),
-            ));
+        let stream = match self.connection_handle(stream_id).await {
+            Ok(stream) => stream,
+            Err(event) => return event,
         };
+        let mut stream = stream.lock().await;
+        let rx = &mut stream.1;
         let rx_wrapper = RecvStreamWrapper::new(rx, self.transfer_idle_timeout());
         let storage_path = match location.get_storage_path() {
             Ok(storage_path) => storage_path,
@@ -219,6 +224,7 @@ impl BlobHandler {
         if let Err(err) = decode_ranges(rx_wrapper, chunk_ranges, &mut writer, &mut ob).await {
             return BlobEvent::Error(BlobError::ReplicationFailed(err.to_string()));
         }
+        drop(stream);
         _ = writer.writer.close().await;
         debug!("Decoded all chunks and wrote them into the backend");
 
@@ -236,11 +242,12 @@ impl BlobHandler {
             BlobEvent::Error(err)
         } else {
             if !keep_alive {
-                let mut connections = self.connections.lock().await;
-                if let Some((sx, rx)) = connections.get_mut(&stream_id) {
-                    _ = sx.finish();
-                    _ = rx.stop(0u32.into());
+                if let Ok(stream) = self.connection_handle(stream_id).await {
+                    let mut stream = stream.lock().await;
+                    _ = stream.0.finish();
+                    _ = stream.1.stop(0u32.into());
                 }
+                self.connections.lock().await.remove(&stream_id);
             }
             BlobEvent::ReplicationFinished { location }
         }
