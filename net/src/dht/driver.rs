@@ -649,13 +649,13 @@ impl DhtDriver {
                         },
                     )
                     .await
-                    {
-                        warn!(
-                            inbound_id,
-                            error = %error,
-                            "Failed to dispatch inbound DHT read-error response"
-                        );
-                    }
+                {
+                    warn!(
+                        inbound_id,
+                        error = %error,
+                        "Failed to dispatch inbound DHT read-error response"
+                    );
+                }
 
                 let _ = io_tx.send(DhtIo::InboundDropped { inbound_id }).await;
             };
@@ -843,13 +843,14 @@ impl DhtDriver {
         tokio::spawn(
             async move {
                 if let Some(mut send) = maybe_send
-                    && let Err(error) = write_response_to_stream(&mut send, &response).await {
-                        warn!(
-                            inbound_id,
-                            error = %error,
-                            "Failed to dispatch inbound DHT RPC response"
-                        );
-                    }
+                    && let Err(error) = write_response_to_stream(&mut send, &response).await
+                {
+                    warn!(
+                        inbound_id,
+                        error = %error,
+                        "Failed to dispatch inbound DHT RPC response"
+                    );
+                }
                 let _ = io_tx.send(DhtIo::InboundDropped { inbound_id }).await;
             }
             .instrument(Span::current()),

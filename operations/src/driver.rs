@@ -21,7 +21,7 @@ use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::TaskEvent;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
@@ -117,7 +117,12 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                     max_depth: MAX_SUBOP_DEPTH,
                 })
             } else {
-                drive_suboperation(sub_operation, context, depth + 1).await
+                let context = context.clone();
+                tokio::spawn(
+                    async move { drive_suboperation(sub_operation, &context, depth + 1).await },
+                )
+                .await
+                .expect("suboperation task panicked or was cancelled")
             }
         }
         Effect::Task(task_effect) => {
