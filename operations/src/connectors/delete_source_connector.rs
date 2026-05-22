@@ -8,10 +8,10 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::connectors::repository::{
-    StorageReadError, iter_connector_reference_versions_effect, parse_connector_read,
-    parse_connector_secret_read, parse_version_metadata_iter, read_connector_effect,
-    read_connector_secret_effect, source_connector_key, source_connector_secret_key,
-    version_metadata_references_connector,
+    StorageReadError, blob_version_references_connector, iter_connector_reference_versions_effect,
+    parse_blob_version_iter, parse_connector_read, parse_connector_secret_read,
+    read_connector_effect, read_connector_secret_effect, source_connector_key,
+    source_connector_secret_key,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,14 +182,15 @@ impl DeleteSourceConnectorOperation {
     }
 
     fn handle_reference_versions_scanned(&mut self, event: Event) -> Effects {
-        let (versions, next_start_after) = match parse_version_metadata_iter(event) {
+        let (versions, next_start_after) = match parse_blob_version_iter(event) {
             Ok(result) => result,
             Err(error) => return self.abort_with_error(error.into()),
         };
 
-        if versions.iter().any(|metadata| {
-            version_metadata_references_connector(metadata, self.input.connector_id)
-        }) {
+        if versions
+            .iter()
+            .any(|version| blob_version_references_connector(version, self.input.connector_id))
+        {
             return self.abort_with_error(DeleteSourceConnectorError::ReferencedByObjectVersion);
         }
 
@@ -351,10 +352,10 @@ mod tests {
     use crate::driver::{DriverContext, drive};
     use crate::staging::descriptor::build_version_source_binding;
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::S3_VERSION_KEYSPACE;
+    use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
     use aruna_core::structs::{
-        ResolvedSourceAccess, SourceConnector, SourceConnectorKind, SourceConnectorSecret,
-        SourceMetadata, StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
+        BlobVersion, ResolvedSourceAccess, SourceConnector, SourceConnectorKind,
+        SourceConnectorSecret, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use aruna_storage::storage;
     use std::collections::HashMap;
@@ -436,8 +437,7 @@ mod tests {
         let key = VersionKey::new("bucket", "key", version_id)
             .to_bytes()
             .unwrap();
-        let value = VersionMetadata::reference(
-            version_id,
+        let value = BlobVersion::reference(
             source,
             source_metadata(),
             SystemTime::UNIX_EPOCH,
@@ -450,7 +450,7 @@ mod tests {
         let event = context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key: key.into(),
                 value: value.into(),
                 txn_id: None,
@@ -471,7 +471,7 @@ mod tests {
         .unwrap()
     }
 
-    fn reference_metadata(connector_id: Ulid) -> VersionMetadata {
+    fn reference_blob_version(connector_id: Ulid) -> BlobVersion {
         let connector = SourceConnector::new(
             connector_id,
             Ulid::new(),
@@ -491,8 +491,7 @@ mod tests {
             Some(connector_id),
         );
 
-        VersionMetadata::reference(
-            Ulid::new(),
+        BlobVersion::reference(
             source,
             source_metadata(),
             SystemTime::UNIX_EPOCH,
@@ -564,7 +563,10 @@ mod tests {
         let effects = operation.step(Event::Storage(StorageEvent::IterResult {
             values: vec![(
                 vec![1].into(),
-                reference_metadata(connector_id).to_bytes().unwrap().into(),
+                reference_blob_version(connector_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
             )],
             next_start_after: None,
         }));
