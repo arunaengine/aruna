@@ -1,7 +1,9 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
-use aruna_core::structs::{AuthContext, Permission};
+use aruna_core::structs::{
+    AuthContext, Permission, blob_bucket_permission_path, blob_object_permission_path,
+};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::replication::protocol::ReplicationMode;
@@ -87,17 +89,21 @@ pub async fn replicate_blob(
         Ok(None) => return Err(ServerError::NotFound),
     };
 
-    let mut permission_path = format!(
-        "/{}/g/{}/data/{}/{}",
-        state.get_realm_id(),
-        bucket_info.group_id,
-        state.get_node_id(),
-        request.bucket
-    );
-    if let Some(path) = request.path.as_deref() {
-        permission_path.push('/');
-        permission_path.push_str(path);
-    }
+    let permission_path = match request.path.as_deref() {
+        Some(path) => blob_object_permission_path(
+            state.get_realm_id(),
+            bucket_info.group_id,
+            state.get_node_id(),
+            &request.bucket,
+            path,
+        ),
+        None => blob_bucket_permission_path(
+            state.get_realm_id(),
+            bucket_info.group_id,
+            state.get_node_id(),
+            &request.bucket,
+        ),
+    };
 
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {

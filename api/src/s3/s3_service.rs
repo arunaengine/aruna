@@ -14,12 +14,12 @@ use crate::s3::util::{
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::S3_VERSION_KEYSPACE;
+use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::{
-    AuthContext, BucketInfo, Permission, RealmId, SourceMetadata, UserAccess, VersionKey,
-    VersionMetadata, VersionState,
+    AuthContext, BlobVersion, BlobVersionState, BucketInfo, Permission, RealmId, SourceMetadata,
+    UserAccess, VersionKey, blob_bucket_permission_path,
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
@@ -132,9 +132,11 @@ impl ArunaS3Service {
                     realm_id: user_access.user_identity.realm_id,
                     path_restrictions: None,
                 },
-                path: format!(
-                    "/{}/g/{}/data/{}/{bucket}",
-                    self.realm_id, bucket_info.group_id, self.node_id
+                path: blob_bucket_permission_path(
+                    self.realm_id,
+                    bucket_info.group_id,
+                    self.node_id,
+                    bucket,
                 ),
                 required_permission: Permission::READ,
             }),
@@ -463,7 +465,7 @@ async fn refresh_reference_metadata(
     let refreshed_value = match context
         .storage_handle
         .send_storage_effect(StorageEffect::Read {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key: version_key.clone().into(),
             txn_id: Some(txn_id),
         })
@@ -472,18 +474,23 @@ async fn refresh_reference_metadata(
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
         }) => {
-            let metadata = match VersionMetadata::from_bytes(value.as_ref()) {
-                Ok(metadata) => metadata,
+            let version = match BlobVersion::from_bytes(value.as_ref()) {
+                Ok(version) => version,
                 Err(err) => {
                     abort_reference_refresh(&context, txn_id).await;
                     return Err(err.to_string());
                 }
             };
-            let VersionState::Reference {
+            let BlobVersion {
+                created_at,
+                created_by,
+                state,
+            } = version;
+            let BlobVersionState::Reference {
                 source,
                 last_refresh,
                 ..
-            } = metadata.state
+            } = state
             else {
                 abort_reference_refresh(&context, txn_id).await;
                 return Ok(());
@@ -492,12 +499,11 @@ async fn refresh_reference_metadata(
                 None
             } else {
                 Some(
-                    match VersionMetadata::reference(
-                        metadata.version_id,
+                    match BlobVersion::reference(
                         source,
                         refresh.metadata,
-                        metadata.created_at,
-                        metadata.created_by,
+                        created_at,
+                        created_by,
                         refresh.refreshed_at,
                     )
                     .to_bytes()
@@ -529,7 +535,7 @@ async fn refresh_reference_metadata(
         match context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key: version_key.into(),
                 value: refreshed_value.into(),
                 txn_id: Some(txn_id),
@@ -1085,6 +1091,9 @@ impl S3 for ArunaS3Service {
             bucket: req.input.bucket,
             key: req.input.key,
             version_id,
+            group_id: user_access.group_id,
+            realm_id: self.realm_id,
+            node_id: self.node_id,
             deleted_by: user_access.user_identity,
         });
 
@@ -1289,8 +1298,7 @@ mod tests {
         cached_metadata: SourceMetadata,
         last_refresh: SystemTime,
     ) {
-        let metadata = VersionMetadata::reference(
-            test.version_id,
+        let version = BlobVersion::reference(
             source_binding(),
             cached_metadata,
             UNIX_EPOCH,
@@ -1301,9 +1309,9 @@ mod tests {
             .context
             .storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key: version_key(test).into(),
-                value: metadata.to_bytes().unwrap().into(),
+                value: version.to_bytes().unwrap().into(),
                 txn_id: None,
             })
             .await;
@@ -1322,7 +1330,7 @@ mod tests {
             .context
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key: version_key(test).into(),
                 txn_id: None,
             })
@@ -1333,12 +1341,12 @@ mod tests {
         else {
             panic!("unexpected version read event: {event:?}");
         };
-        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
-        let VersionState::Reference {
+        let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+        let BlobVersionState::Reference {
             cached_metadata,
             last_refresh,
             ..
-        } = metadata.state
+        } = version.state
         else {
             panic!("version was not a reference");
         };

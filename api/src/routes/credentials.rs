@@ -1,7 +1,7 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::structs::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::{AuthContext, PathRestriction, Permission, blob_group_permission_path};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::create_user_access::{
@@ -85,7 +85,7 @@ pub async fn create_s3_credentials(
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: auth.clone(),
-            path: format!("/{realm_id}/g/{group_id}/data/{}", state.get_node_id()),
+            path: blob_group_permission_path(realm_id, group_id, state.get_node_id()),
             required_permission: Permission::WRITE,
         }),
         &state.get_ctx(),
@@ -167,11 +167,10 @@ pub async fn revoke_s3_credentials(
     let allowed = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: auth,
-            path: format!(
-                "/{}/g/{}/data/{}",
+            path: blob_group_permission_path(
                 state.get_realm_id(),
                 credential.group_id,
-                state.get_node_id()
+                state.get_node_id(),
             ),
             required_permission: Permission::WRITE,
         }),
@@ -220,12 +219,8 @@ async fn build_credential_restrictions(
         return Ok(None);
     };
 
-    let group_root = format!(
-        "/{}/g/{}/data/{}",
-        state.get_realm_id(),
-        group_id,
-        state.get_node_id()
-    );
+    let group_root =
+        blob_group_permission_path(state.get_realm_id(), group_id, state.get_node_id());
     let mut restrictions = Vec::with_capacity(requested_restrictions.len());
     for restriction in requested_restrictions {
         let permission = parse_permission(&restriction.permission)?;
@@ -275,5 +270,42 @@ fn parse_permission(permission: &str) -> ServerResult<Permission> {
         "WRITE" => Ok(Permission::WRITE),
         "DENY" => Ok(Permission::DENY),
         _ => Err(ServerError::BadRequest),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_permission;
+    use aruna_core::structs::RealmId;
+    use aruna_core::structs::blob_group_permission_path;
+    use ulid::Ulid;
+
+    #[test]
+    fn credential_group_root_matches_canonical_blob_group_path() {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+
+        let group_root = blob_group_permission_path(realm_id, group_id, node_id);
+        assert_eq!(
+            group_root,
+            format!("/{realm_id}/g/{group_id}/data/{node_id}")
+        );
+    }
+
+    #[test]
+    fn parse_permission_accepts_known_values_case_insensitively() {
+        assert_eq!(
+            parse_permission("read").unwrap(),
+            aruna_core::structs::Permission::READ
+        );
+        assert_eq!(
+            parse_permission("WRITE").unwrap(),
+            aruna_core::structs::Permission::WRITE
+        );
+        assert_eq!(
+            parse_permission("Deny").unwrap(),
+            aruna_core::structs::Permission::DENY
+        );
     }
 }
