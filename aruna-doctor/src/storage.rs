@@ -503,8 +503,7 @@ mod tests {
     use aruna_blob::blob::BlobHandler;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_STATE_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE,
-        S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
@@ -772,9 +771,6 @@ mod tests {
         assert!(before.contains_key(GROUP_KEYSPACE));
         assert!(before.contains_key(USER_ACCESS_KEYSPACE));
         assert!(before.contains_key(S3_BUCKET_KEYSPACE));
-        assert!(before.contains_key(S3_CURRENT_VERSION_KEYSPACE));
-        assert!(before.contains_key(S3_LOOKUP_KEYSPACE));
-        assert!(before.contains_key(S3_VERSION_KEYSPACE));
 
         let snapshot_stats = snapshot_database(&snapshot_source_db_path, &snapshot_path).unwrap();
         assert!(snapshot_stats.keyspace_count >= 10);

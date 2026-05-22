@@ -5,17 +5,17 @@ use aruna_api::server_state::{
 };
 use aruna_core::id::{DhtKeyId, TopicId};
 use aruna_core::keyspaces::{
-    API_STATE_KEYSPACE, AUTH_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
-    CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
-    GROUP_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
-    S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
+    API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
+    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
-    BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument, Location, LookupKey,
-    Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
-    VersionMetadata,
+    BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument,
+    HashPathIndexKey, Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+    UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
@@ -92,8 +92,10 @@ enum DecodedField {
     CraqleLogKey { value: JsonCraqleLogKey },
     #[serde(rename = "utf8")]
     Utf8 { value: String },
-    #[serde(rename = "lookup_key")]
-    LookupKey { value: LookupKey },
+    #[serde(rename = "blob_head_key")]
+    BlobHeadKey { value: BlobHeadKey },
+    #[serde(rename = "hash_path_index_key")]
+    HashPathIndexKey { value: HashPathIndexKey },
     #[serde(rename = "version_key")]
     VersionKey { value: VersionKey },
     #[serde(rename = "raw")]
@@ -128,11 +130,11 @@ enum DecodedValue {
     CurrentVersionPointer {
         data: CurrentVersionPointer,
     },
-    Location {
-        data: Location,
+    BackendLocation {
+        data: aruna_core::structs::BackendLocation,
     },
-    VersionMetadata {
-        data: VersionMetadata,
+    BlobVersion {
+        data: BlobVersion,
     },
     ApiTokenRevocationList {
         data: HashSet<String>,
@@ -810,10 +812,13 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 18] {
+fn defined_keyspaces() -> [&'static str; 19] {
     [
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
+        BLOB_HEAD_KEYSPACE,
+        BLOB_LOCATIONS_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE,
         CRAQLE_GRAPHS_KEYSPACE,
         CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE,
@@ -821,14 +826,12 @@ fn defined_keyspaces() -> [&'static str; 18] {
         DHT_KEYSPACE,
         GOSSIP_SUBSCRIPTIONS_KEYSPACE,
         GROUP_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE,
         NODE_STATE_KEYSPACE,
         ONBOARDING_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
         REALM_KEYSPACE,
         S3_BUCKET_KEYSPACE,
-        S3_CURRENT_VERSION_KEYSPACE,
-        S3_LOOKUP_KEYSPACE,
-        S3_VERSION_KEYSPACE,
         USER_ACCESS_KEYSPACE,
     ]
 }
@@ -897,10 +900,13 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | NODE_STATE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
         DHT_KEYSPACE => decode_dht_key(key),
-        S3_LOOKUP_KEYSPACE | S3_CURRENT_VERSION_KEYSPACE => LookupKey::from_bytes(key)
-            .map(|value| DecodedField::LookupKey { value })
+        BLOB_HEAD_KEYSPACE => BlobHeadKey::from_bytes(key)
+            .map(|value| DecodedField::BlobHeadKey { value })
             .unwrap_or_else(|_| raw_field(key)),
-        S3_VERSION_KEYSPACE => VersionKey::from_bytes(key)
+        HASH_PATHS_INDEX_KEYSPACE => HashPathIndexKey::from_bytes(key)
+            .map(|value| DecodedField::HashPathIndexKey { value })
+            .unwrap_or_else(|_| raw_field(key)),
+        BLOB_VERSIONS_KEYSPACE => VersionKey::from_bytes(key)
             .map(|value| DecodedField::VersionKey { value })
             .unwrap_or_else(|_| raw_field(key)),
         _ => raw_field(key),
@@ -930,16 +936,16 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         S3_BUCKET_KEYSPACE => decode_value_with(value, BucketInfo::from_bytes, |data| {
             DecodedValue::BucketInfo { data }
         }),
-        S3_CURRENT_VERSION_KEYSPACE => {
-            decode_value_with(value, CurrentVersionPointer::from_bytes, |data| {
-                DecodedValue::CurrentVersionPointer { data }
-            })
-        }
-        S3_LOOKUP_KEYSPACE => decode_value_with(value, Location::from_bytes, |data| {
-            DecodedValue::Location { data }
+        BLOB_HEAD_KEYSPACE => decode_value_with(value, CurrentVersionPointer::from_bytes, |data| {
+            DecodedValue::CurrentVersionPointer { data }
         }),
-        S3_VERSION_KEYSPACE => decode_value_with(value, VersionMetadata::from_bytes, |data| {
-            DecodedValue::VersionMetadata { data }
+        BLOB_LOCATIONS_KEYSPACE => decode_value_with(
+            value,
+            aruna_core::structs::BackendLocation::from_bytes,
+            |data| DecodedValue::BackendLocation { data },
+        ),
+        BLOB_VERSIONS_KEYSPACE => decode_value_with(value, BlobVersion::from_bytes, |data| {
+            DecodedValue::BlobVersion { data }
         }),
         AUTH_KEYSPACE => decode_auth_value(value),
         API_STATE_KEYSPACE => decode_api_state_value(key, value),
@@ -1117,13 +1123,15 @@ mod tests {
     };
     use aruna_core::id::{DhtKeyId, TopicId};
     use aruna_core::keyspaces::{
-        API_STATE_KEYSPACE, AUTH_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE,
-        GROUP_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
-        S3_VERSION_KEYSPACE, USER_ACCESS_KEYSPACE,
+        API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
-    use aruna_core::structs::{Actor, Group, Realm, RealmId};
+    use aruna_core::structs::{
+        Actor, BackendLocation, BlobHeadKey, BlobVersion, Group, HashPathIndexKey, Realm, RealmId,
+    };
     use aruna_net::dht::storage::StoredEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
@@ -1132,6 +1140,7 @@ mod tests {
     };
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
     use std::collections::BTreeMap;
+    use std::collections::HashMap;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -1170,20 +1179,21 @@ mod tests {
         let mut expected_missing = vec![
             API_STATE_KEYSPACE.to_string(),
             AUTH_KEYSPACE.to_string(),
+            BLOB_HEAD_KEYSPACE.to_string(),
+            BLOB_LOCATIONS_KEYSPACE.to_string(),
+            BLOB_VERSIONS_KEYSPACE.to_string(),
             CRAQLE_GRAPHS_KEYSPACE.to_string(),
             CRAQLE_LOG_KEYSPACE.to_string(),
             CRAQLE_QUADS_KEYSPACE.to_string(),
             CRAQLE_TERMS_KEYSPACE.to_string(),
             DHT_KEYSPACE.to_string(),
             GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
+            HASH_PATHS_INDEX_KEYSPACE.to_string(),
             NODE_STATE_KEYSPACE.to_string(),
             ONBOARDING_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
             REALM_KEYSPACE.to_string(),
             S3_BUCKET_KEYSPACE.to_string(),
-            S3_CURRENT_VERSION_KEYSPACE.to_string(),
-            S3_LOOKUP_KEYSPACE.to_string(),
-            S3_VERSION_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),
         ];
         expected_missing.sort();
@@ -1584,5 +1594,116 @@ mod tests {
             } => {}
             other => panic!("expected raw decode fallback, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn decodes_new_blob_keyspaces() {
+        let realm_id = RealmId::from_bytes([1_u8; 32]);
+        let group_id = Ulid::from_bytes([2_u8; 16]);
+        let node_id = iroh::SecretKey::from_bytes(&[3_u8; 32]).public();
+        let created_by = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let head_key = BlobHeadKey::new("bucket", "path/file.txt");
+        let head_value = aruna_core::structs::CurrentVersionPointer::new_with_generation(
+            Ulid::from_bytes([4_u8; 16]),
+            7,
+        )
+        .to_bytes()
+        .unwrap();
+        let location = BackendLocation {
+            root: "/tmp".to_string(),
+            storage_bucket: "blob-bucket".to_string(),
+            backend_path: "path/blob.bin".to_string(),
+            ulid: Ulid::from_bytes([5_u8; 16]),
+            compressed: false,
+            encrypted: false,
+            created_by,
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+            staging: false,
+            partial: false,
+            blob_size: 11,
+            hashes: HashMap::from([("blake3".to_string(), vec![9_u8; 32])]),
+        };
+        let version = BlobVersion::materialized(
+            [9_u8; 32],
+            std::time::SystemTime::UNIX_EPOCH,
+            created_by,
+            None,
+        );
+        let hash_path_key = HashPathIndexKey::new(
+            [9_u8; 32],
+            realm_id,
+            group_id,
+            node_id,
+            "bucket",
+            "path/file.txt",
+        );
+
+        let decoded_head = decode_entry(
+            BLOB_HEAD_KEYSPACE,
+            &head_key.to_bytes().unwrap(),
+            &head_value,
+        );
+        assert_eq!(
+            decoded_head.key,
+            DecodedField::BlobHeadKey { value: head_key }
+        );
+        match decoded_head.value {
+            DecodedValue::CurrentVersionPointer { data } => {
+                assert_eq!(data.version_id, Ulid::from_bytes([4_u8; 16]));
+                assert_eq!(data.generation, 7);
+            }
+            other => panic!("expected current version pointer, got {other:?}"),
+        }
+
+        let decoded_location = decode_entry(
+            BLOB_LOCATIONS_KEYSPACE,
+            &[9_u8; 32],
+            &location.to_bytes().unwrap(),
+        );
+        match decoded_location.value {
+            DecodedValue::BackendLocation { data } => assert_eq!(data, location),
+            other => panic!("expected backend location, got {other:?}"),
+        }
+
+        let version_key = aruna_core::structs::VersionKey::new(
+            "bucket",
+            "path/file.txt",
+            Ulid::from_bytes([6_u8; 16]),
+        );
+        let decoded_version = decode_entry(
+            BLOB_VERSIONS_KEYSPACE,
+            &version_key.to_bytes().unwrap(),
+            &version.to_bytes().unwrap(),
+        );
+        match decoded_version.value {
+            DecodedValue::BlobVersion { data } => assert_eq!(data, version),
+            other => panic!("expected blob version, got {other:?}"),
+        }
+
+        let decoded_index = decode_entry(
+            HASH_PATHS_INDEX_KEYSPACE,
+            &hash_path_key.to_bytes().unwrap(),
+            &[],
+        );
+        assert_eq!(
+            decoded_index.key,
+            DecodedField::HashPathIndexKey {
+                value: hash_path_key.clone()
+            }
+        );
+        match decoded_index.value {
+            DecodedValue::Raw {
+                hex,
+                decode_error: None,
+            } => assert_eq!(hex, ""),
+            other => panic!("expected raw marker value, got {other:?}"),
+        }
+        assert_eq!(
+            hash_path_key.permission_path(),
+            format!(
+                "/{realm_id}/g/{group_id}/data/{}/bucket/path/file.txt",
+                node_id
+            )
+        );
     }
 }
