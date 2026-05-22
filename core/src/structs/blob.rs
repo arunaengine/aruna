@@ -1,7 +1,7 @@
 use crate::errors::{BlobError, ConversionError};
 use crate::structs::checksum::HASH_BLAKE3;
-use crate::structs::{PathRestriction, SourceMetadata, VersionSourceBinding, VersionState};
-use crate::types::UserId;
+use crate::structs::{PathRestriction, RealmId, SourceMetadata, VersionSourceBinding};
+use crate::types::{GroupId, NodeId, UserId};
 use byteview::ByteView;
 use core::fmt;
 use serde::{Deserialize, Serialize};
@@ -183,22 +183,135 @@ impl BucketInfo {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LookupKey {
-    Blake3Hash([u8; 32]),
-    Object { bucket: String, key: String },
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BlobHeadKey {
+    pub bucket: String,
+    pub key: String,
 }
 
-impl LookupKey {
-    pub fn from_blake3_hash(hash: &[u8]) -> Result<Self, ConversionError> {
-        Ok(Self::Blake3Hash(hash.try_into()?))
-    }
+#[derive(Serialize)]
+struct BlobHeadKeyPrefix<'a> {
+    bucket: &'a str,
+}
 
-    pub fn object(bucket: impl Into<String>, key: impl Into<String>) -> Self {
-        Self::Object {
+impl BlobHeadKey {
+    pub fn new(bucket: impl Into<String>, key: impl Into<String>) -> Self {
+        Self {
             bucket: bucket.into(),
             key: key.into(),
         }
+    }
+
+    pub fn bucket_prefix(bucket: &str) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&BlobHeadKeyPrefix { bucket })?)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+pub fn blob_group_permission_path(realm_id: RealmId, group_id: GroupId, node_id: NodeId) -> String {
+    format!("/{realm_id}/g/{group_id}/data/{node_id}")
+}
+
+pub fn blob_bucket_permission_path(
+    realm_id: RealmId,
+    group_id: GroupId,
+    node_id: NodeId,
+    bucket: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        blob_group_permission_path(realm_id, group_id, node_id),
+        bucket
+    )
+}
+
+pub fn blob_object_permission_path(
+    realm_id: RealmId,
+    group_id: GroupId,
+    node_id: NodeId,
+    bucket: &str,
+    key: &str,
+) -> String {
+    format!(
+        "{}/{}",
+        blob_bucket_permission_path(realm_id, group_id, node_id, bucket),
+        key
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HashPathIndexKey {
+    pub blake3_hash: [u8; 32],
+    pub realm_id: RealmId,
+    pub group_id: GroupId,
+    pub node_id: NodeId,
+    pub bucket: String,
+    pub key: String,
+}
+
+#[derive(Serialize)]
+struct HashPathIndexKeyPrefix {
+    blake3_hash: [u8; 32],
+}
+
+impl HashPathIndexKey {
+    pub fn new(
+        blake3_hash: [u8; 32],
+        realm_id: RealmId,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Self {
+        Self {
+            blake3_hash,
+            realm_id,
+            group_id,
+            node_id,
+            bucket: bucket.into(),
+            key: key.into(),
+        }
+    }
+
+    pub fn from_blake3_hash(
+        hash: &[u8],
+        realm_id: RealmId,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<Self, ConversionError> {
+        Ok(Self::new(
+            hash.try_into()?,
+            realm_id,
+            group_id,
+            node_id,
+            bucket,
+            key,
+        ))
+    }
+
+    pub fn hash_prefix(hash: &[u8]) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&HashPathIndexKeyPrefix {
+            blake3_hash: hash.try_into()?,
+        })?)
+    }
+
+    pub fn permission_path(&self) -> String {
+        blob_object_permission_path(
+            self.realm_id,
+            self.group_id,
+            self.node_id,
+            &self.bucket,
+            &self.key,
+        )
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -254,23 +367,6 @@ impl VersionKey {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum Location {
-    Real(BackendLocation),
-    Deleted,
-}
-
-impl Location {
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CurrentVersionPointer {
     pub version_id: Ulid,
@@ -311,40 +407,35 @@ impl CurrentVersionPointer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct VersionMetadata {
-    pub version_id: Ulid,
-    pub state: VersionState,
+pub struct BlobVersion {
     pub created_at: SystemTime,
     pub created_by: UserId,
+    pub state: BlobVersionState,
 }
 
-impl VersionMetadata {
+impl BlobVersion {
     pub fn materialized(
-        version_id: Ulid,
-        location: BackendLocation,
+        blob_hash: [u8; 32],
         created_at: SystemTime,
         created_by: UserId,
         source: Option<VersionSourceBinding>,
     ) -> Self {
         Self {
-            version_id,
-            state: VersionState::Materialized { location, source },
             created_at,
             created_by,
+            state: BlobVersionState::Materialized { blob_hash, source },
         }
     }
 
-    pub fn deleted(version_id: Ulid, created_at: SystemTime, created_by: UserId) -> Self {
+    pub fn deleted(created_at: SystemTime, created_by: UserId) -> Self {
         Self {
-            version_id,
-            state: VersionState::Deleted,
             created_at,
             created_by,
+            state: BlobVersionState::Deleted,
         }
     }
 
     pub fn reference(
-        version_id: Ulid,
         source: VersionSourceBinding,
         cached_metadata: SourceMetadata,
         created_at: SystemTime,
@@ -352,14 +443,13 @@ impl VersionMetadata {
         last_refresh: SystemTime,
     ) -> Self {
         Self {
-            version_id,
-            state: VersionState::Reference {
+            created_at,
+            created_by,
+            state: BlobVersionState::Reference {
                 source,
                 cached_metadata,
                 last_refresh,
             },
-            created_at,
-            created_by,
         }
     }
 
@@ -371,12 +461,8 @@ impl VersionMetadata {
         Ok(postcard::from_bytes(bytes)?)
     }
 
-    pub fn materialized_location(&self) -> Option<&BackendLocation> {
-        self.state.materialized_location()
-    }
-
-    pub fn lookup_location(&self) -> Option<Location> {
-        self.state.lookup_location()
+    pub fn blob_hash(&self) -> Option<&[u8; 32]> {
+        self.state.blob_hash()
     }
 
     pub fn source_binding(&self) -> Option<&VersionSourceBinding> {
@@ -389,6 +475,45 @@ impl VersionMetadata {
 
     pub fn is_materialized(&self) -> bool {
         self.state.is_materialized()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum BlobVersionState {
+    Materialized {
+        blob_hash: [u8; 32],
+        source: Option<VersionSourceBinding>,
+    },
+    Reference {
+        source: VersionSourceBinding,
+        cached_metadata: SourceMetadata,
+        last_refresh: SystemTime,
+    },
+    Deleted,
+}
+
+impl BlobVersionState {
+    pub fn blob_hash(&self) -> Option<&[u8; 32]> {
+        match self {
+            Self::Materialized { blob_hash, .. } => Some(blob_hash),
+            Self::Reference { .. } | Self::Deleted => None,
+        }
+    }
+
+    pub fn source_binding(&self) -> Option<&VersionSourceBinding> {
+        match self {
+            Self::Materialized { source, .. } => source.as_ref(),
+            Self::Reference { source, .. } => Some(source),
+            Self::Deleted => None,
+        }
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        matches!(self, Self::Deleted)
+    }
+
+    pub fn is_materialized(&self) -> bool {
+        matches!(self, Self::Materialized { .. })
     }
 }
 
@@ -437,7 +562,19 @@ impl UserAccess {
 
 #[cfg(test)]
 mod tests {
-    use super::CurrentVersionPointer;
+    use super::{
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey,
+        blob_bucket_permission_path, blob_group_permission_path, blob_object_permission_path,
+    };
+    use crate::NodeId;
+    use crate::structs::{
+        PortableSourceDescriptor, RealmId, SourceConnectorKind, SourceMetadata, StagingStrategy,
+        VersionSourceBinding,
+    };
+    use crate::types::UserId;
+    use std::collections::HashMap;
+    use std::str::FromStr;
+    use std::time::SystemTime;
     use ulid::Ulid;
 
     #[test]
@@ -447,5 +584,120 @@ mod tests {
         let restored = CurrentVersionPointer::from_bytes(&pointer.to_bytes().unwrap()).unwrap();
 
         assert_eq!(pointer, restored);
+    }
+
+    #[test]
+    fn blob_head_key_roundtrip_preserves_fields_and_bucket_prefix() {
+        let key = BlobHeadKey::new("bucket", "nested/path.txt");
+
+        let restored = BlobHeadKey::from_bytes(&key.to_bytes().unwrap()).unwrap();
+        let prefix = BlobHeadKey::bucket_prefix("bucket").unwrap();
+
+        assert_eq!(key, restored);
+        assert!(key.to_bytes().unwrap().starts_with(&prefix));
+    }
+
+    #[test]
+    fn hash_path_index_key_roundtrip_preserves_fields_and_hash_prefix() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let node_id =
+            NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
+                .unwrap();
+        let key = HashPathIndexKey::new(
+            [7u8; 32],
+            realm_id,
+            group_id,
+            node_id,
+            "bucket",
+            "nested/path.txt",
+        );
+
+        let restored = HashPathIndexKey::from_bytes(&key.to_bytes().unwrap()).unwrap();
+        let prefix = HashPathIndexKey::hash_prefix(&[7u8; 32]).unwrap();
+
+        assert_eq!(key, restored);
+        assert!(key.to_bytes().unwrap().starts_with(&prefix));
+        assert_eq!(
+            key.permission_path(),
+            blob_object_permission_path(realm_id, group_id, node_id, "bucket", "nested/path.txt")
+        );
+    }
+
+    #[test]
+    fn blob_permission_path_builders_use_canonical_format() {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let node_id =
+            NodeId::from_str("ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6")
+                .unwrap();
+
+        assert_eq!(
+            blob_group_permission_path(realm_id, group_id, node_id),
+            format!("/{realm_id}/g/{group_id}/data/{node_id}")
+        );
+        assert_eq!(
+            blob_bucket_permission_path(realm_id, group_id, node_id, "bucket"),
+            format!("/{realm_id}/g/{group_id}/data/{node_id}/bucket")
+        );
+        assert_eq!(
+            blob_object_permission_path(realm_id, group_id, node_id, "bucket", "nested/path.txt"),
+            format!("/{realm_id}/g/{group_id}/data/{node_id}/bucket/nested/path.txt")
+        );
+    }
+
+    #[test]
+    fn blob_version_roundtrip_preserves_all_states() {
+        let created_at = SystemTime::UNIX_EPOCH;
+        let created_by = UserId::default();
+        let binding = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::S3,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://s3.example.com".to_string(),
+                )]),
+                source_path: "dataset/run-1/file.txt".to_string(),
+                version_selector: Some("v1".to_string()),
+                capabilities: vec!["versioned".to_string()],
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::from_bytes([9u8; 16])),
+        };
+        let reference_metadata = SourceMetadata {
+            content_length: 42,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("etag".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
+        };
+
+        let versions = vec![
+            BlobVersion::materialized([1u8; 32], created_at, created_by, Some(binding.clone())),
+            BlobVersion::reference(
+                binding.clone(),
+                reference_metadata,
+                created_at,
+                created_by,
+                SystemTime::UNIX_EPOCH,
+            ),
+            BlobVersion::deleted(created_at, created_by),
+        ];
+
+        for version in versions {
+            let restored = BlobVersion::from_bytes(&version.to_bytes().unwrap()).unwrap();
+            assert_eq!(version, restored);
+        }
+
+        let materialized = BlobVersion::materialized([1u8; 32], created_at, created_by, None);
+        assert_eq!(materialized.blob_hash(), Some(&[1u8; 32]));
+        assert!(materialized.is_materialized());
+        assert!(!materialized.is_deleted());
+
+        let deleted = BlobVersion::deleted(created_at, created_by);
+        assert!(deleted.blob_hash().is_none());
+        assert!(!deleted.is_materialized());
+        assert!(deleted.is_deleted());
     }
 }

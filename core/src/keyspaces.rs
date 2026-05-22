@@ -10,15 +10,17 @@ pub const GOSSIP_SUBSCRIPTIONS_KEYSPACE: &str = "gossip_subscriptions";
 pub const USER_KEYSPACE: &str = "users";
 pub const USER_SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";
 
+// Blob + S3 keyspaces
+pub const BLOB_LOCATIONS_KEYSPACE: &str = "blob_locations";
+pub const BLOB_HEAD_KEYSPACE: &str = "blob_heads";
+pub const BLOB_VERSIONS_KEYSPACE: &str = "blob_versions";
+pub const HASH_PATHS_INDEX_KEYSPACE: &str = "hash_paths_index";
 pub const USER_ACCESS_KEYSPACE: &str = "user_access";
 pub const S3_BUCKET_KEYSPACE: &str = "s3_buckets";
 pub const S3_BUCKET_REPLICATION_KEYSPACE: &str = "s3_bucket_replication";
-pub const S3_CURRENT_VERSION_KEYSPACE: &str = "s3_current_versions";
-pub const S3_LOOKUP_KEYSPACE: &str = "s3_lookup";
 pub const S3_MULTIPART_OBJECT_METADATA_KEYSPACE: &str = "s3_multipart_object_metadata";
 pub const S3_MULTIPART_UPLOAD_KEYSPACE: &str = "s3_multipart_uploads";
 pub const S3_MULTIPART_UPLOAD_PART_KEYSPACE: &str = "s3_multipart_upload_parts";
-pub const S3_VERSION_KEYSPACE: &str = "s3_versions";
 
 pub const SOURCE_CONNECTOR_INDEX_KEYSPACE: &str = "source_connector_index";
 pub const SOURCE_CONNECTOR_SECRET_KEYSPACE: &str = "source_connector_secret";
