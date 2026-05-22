@@ -316,13 +316,11 @@ impl GetObjectOperation {
 
         match version.state {
             BlobVersionState::Materialized { blob_hash, .. } => self.read_blob_location(blob_hash),
-            BlobVersionState::Deleted => {
-                return self.emit_error(if explicit_version_request {
-                    GetObjectError::DeleteMarker
-                } else {
-                    GetObjectError::NoSuchKey
-                });
-            }
+            BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
+                GetObjectError::DeleteMarker
+            } else {
+                GetObjectError::NoSuchKey
+            }),
             BlobVersionState::Reference { source, .. } => {
                 self.location = None;
                 self.reference_access = None;

@@ -16,9 +16,9 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
-    CurrentVersionPointer, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
-    ReplicationSuboperationResult, SourceMetadata, VersionKey, VersionSourceBinding,
+    CurrentVersionPointer, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
+    ReplicationItemKind, ReplicationNegotiationResult, ReplicationSuboperationResult,
+    SourceMetadata, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
@@ -1143,12 +1143,13 @@ impl Operation for ReplicateObjectVersionOperation {
 
                 match state {
                     BlobVersionState::Materialized { blob_hash, source } => {
-                        self.pending_materialized_version = Some(PendingMaterializedReplicationVersion {
-                            created_at,
-                            created_by,
-                            blob_hash,
-                            source,
-                        });
+                        self.pending_materialized_version =
+                            Some(PendingMaterializedReplicationVersion {
+                                created_at,
+                                created_by,
+                                blob_hash,
+                                source,
+                            });
                         self.read_blob_location(blob_hash)
                     }
                     BlobVersionState::Deleted => {

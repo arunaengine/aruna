@@ -238,13 +238,11 @@ impl HeadObjectOperation {
                 self.last_refresh = None;
                 self.read_blob_location(blob_hash)
             }
-            BlobVersionState::Deleted => {
-                return self.emit_error(if explicit_version_request {
-                    HeadObjectError::DeleteMarker
-                } else {
-                    HeadObjectError::NoSuchKey
-                });
-            }
+            BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
+                HeadObjectError::DeleteMarker
+            } else {
+                HeadObjectError::NoSuchKey
+            }),
             BlobVersionState::Reference {
                 cached_metadata,
                 last_refresh,

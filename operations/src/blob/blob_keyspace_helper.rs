@@ -1,8 +1,7 @@
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
 };
 use aruna_core::structs::{
     BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, RealmId,

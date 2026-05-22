@@ -14,8 +14,8 @@ use aruna_core::keyspaces::{
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument,
-    HashPathIndexKey, Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-    UserAccess, VersionKey,
+    HashPathIndexKey, Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess,
+    VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
