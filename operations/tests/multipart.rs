@@ -4,14 +4,16 @@ use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    DHT_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::{
-    Backend, BackendConfig, MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
-    MultipartObjectSummary, MultipartUploadChecksumHint, MultipartUploadPartKey, RealmId,
+    Backend, BackendConfig, BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey,
+    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
+    MultipartUploadChecksumHint, MultipartUploadPartKey, RealmId, VersionKey,
 };
 use aruna_net::dht::storage::decode_entries;
 use aruna_net::{NetConfig, NetHandle};
@@ -26,6 +28,7 @@ use aruna_operations::s3::create_multipart_upload::{
     CreateMultipartUploadInput, CreateMultipartUploadOperation,
 };
 use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperation};
+use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation};
 use aruna_storage::storage;
 use base64::Engine;
@@ -119,12 +122,13 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::new(), realm_id);
-
+    let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
+    let group_id = Ulid::new();
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
             bucket: "bucket-a".to_string(),
             key: "big.bin".to_string(),
-            group_id: Ulid::new(),
+            group_id,
             created_by,
             checksum_hint: Some(MultipartUploadChecksumHint {
                 algorithm: Some(ChecksumAlgorithm::Sha256),
@@ -188,7 +192,7 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
             key: "big.bin".to_string(),
             upload_id,
             realm_id,
-            node_id: context.driver.net_handle.as_ref().unwrap().node_id(),
+            node_id,
             completed_parts: vec![
                 CompleteMultipartPart {
                     part_number: 1,
@@ -228,6 +232,53 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         "hello world"
     );
     assert_eq!(complete.checksum_type, MultipartChecksumType::Composite);
+
+    let blob_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
+    let blob_location = read_value(&context.driver, BLOB_LOCATIONS_KEYSPACE, blob_hash.to_vec())
+        .await
+        .expect("missing blob location entry");
+    assert_eq!(
+        aruna_core::structs::BackendLocation::from_bytes(blob_location.as_ref()).unwrap(),
+        complete.location.clone()
+    );
+
+    let blob_head = read_value(
+        &context.driver,
+        BLOB_HEAD_KEYSPACE,
+        BlobHeadKey::new("bucket-a", "big.bin").to_bytes().unwrap(),
+    )
+    .await
+    .expect("missing blob head entry");
+    assert_eq!(
+        CurrentVersionPointer::from_bytes(blob_head.as_ref()).unwrap(),
+        CurrentVersionPointer::new_with_generation(complete.version_id, 1)
+    );
+
+    let blob_version = read_value(
+        &context.driver,
+        BLOB_VERSIONS_KEYSPACE,
+        VersionKey::new("bucket-a", "big.bin", complete.version_id)
+            .to_bytes()
+            .unwrap(),
+    )
+    .await
+    .expect("missing blob version entry");
+    let blob_version = BlobVersion::from_bytes(blob_version.as_ref()).unwrap();
+    assert!(blob_version.is_materialized());
+    assert_eq!(blob_version.blob_hash(), Some(&blob_hash));
+
+    let hash_path = read_value(
+        &context.driver,
+        HASH_PATHS_INDEX_KEYSPACE,
+        HashPathIndexKey::new(
+            blob_hash, realm_id, group_id, node_id, "bucket-a", "big.bin",
+        )
+        .to_bytes()
+        .unwrap(),
+    )
+    .await
+    .expect("missing hash path index entry");
+    assert!(hash_path.is_empty());
 
     assert!(
         read_value(
@@ -407,6 +458,189 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
 }
 
 #[tokio::test]
+async fn completes_multipart_upload_replaces_previous_current_hash_path_index() {
+    let context = setup_context().await;
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let created_by = UserId::local(Ulid::new(), realm_id);
+    let group_id = Ulid::new();
+    let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
+
+    let initial = drive(
+        PutObjectOperation::new(PutObjectConfig {
+            user_id: created_by,
+            group_id,
+            realm_id,
+            node_id,
+            request: PutObjectInput {
+                bucket: "bucket-a".to_string(),
+                key: "replace.bin".to_string(),
+                content_length: Some(5),
+                body: Some(stream_from_bytes(b"first")),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let created = drive(
+        CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "replace.bin".to_string(),
+            group_id,
+            created_by,
+            checksum_hint: None,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let upload_id = created.record.upload_id;
+    let part1 = b"hello ";
+    let part2 = b"world";
+
+    let uploaded_part1 = drive(
+        UploadPartOperation::new(UploadPartInput {
+            bucket: "bucket-a".to_string(),
+            key: "replace.bin".to_string(),
+            upload_id,
+            part_number: 1,
+            content_length: Some(part1.len() as u64),
+            body: Some(stream_from_bytes(part1)),
+            created_by,
+            compressed: false,
+            encrypted: false,
+            expected_checksums: vec![],
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let uploaded_part2 = drive(
+        UploadPartOperation::new(UploadPartInput {
+            bucket: "bucket-a".to_string(),
+            key: "replace.bin".to_string(),
+            upload_id,
+            part_number: 2,
+            content_length: Some(part2.len() as u64),
+            body: Some(stream_from_bytes(part2)),
+            created_by,
+            compressed: false,
+            encrypted: false,
+            expected_checksums: vec![],
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let complete = drive(
+        CompleteMultipartUploadOperation::new(CompleteMultipartUploadInput {
+            bucket: "bucket-a".to_string(),
+            key: "replace.bin".to_string(),
+            upload_id,
+            realm_id,
+            node_id,
+            completed_parts: vec![
+                CompleteMultipartPart {
+                    part_number: 1,
+                    etag: Some(
+                        base64::engine::general_purpose::STANDARD
+                            .encode(uploaded_part1.location.hashes.get("md5").unwrap()),
+                    ),
+                    expected_checksums: vec![],
+                },
+                CompleteMultipartPart {
+                    part_number: 2,
+                    etag: Some(
+                        base64::engine::general_purpose::STANDARD
+                            .encode(uploaded_part2.location.hashes.get("md5").unwrap()),
+                    ),
+                    expected_checksums: vec![],
+                },
+            ],
+            expected_checksums: vec![],
+            checksum_type: MultipartChecksumType::FullObject,
+            object_size: Some((part1.len() + part2.len()) as u64),
+            created_by,
+        }),
+        &context.driver,
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+
+    let initial_hash: [u8; 32] = initial.location.get_blake3().unwrap().try_into().unwrap();
+    let complete_hash: [u8; 32] = complete.location.get_blake3().unwrap().try_into().unwrap();
+
+    let blob_head = read_value(
+        &context.driver,
+        BLOB_HEAD_KEYSPACE,
+        BlobHeadKey::new("bucket-a", "replace.bin")
+            .to_bytes()
+            .unwrap(),
+    )
+    .await
+    .expect("missing blob head entry");
+    assert_eq!(
+        CurrentVersionPointer::from_bytes(blob_head.as_ref()).unwrap(),
+        CurrentVersionPointer::new_with_generation(complete.version_id, 2)
+    );
+
+    assert!(
+        read_value(
+            &context.driver,
+            HASH_PATHS_INDEX_KEYSPACE,
+            HashPathIndexKey::new(
+                initial_hash,
+                realm_id,
+                group_id,
+                node_id,
+                "bucket-a",
+                "replace.bin",
+            )
+            .to_bytes()
+            .unwrap(),
+        )
+        .await
+        .is_none()
+    );
+
+    let new_hash_path = read_value(
+        &context.driver,
+        HASH_PATHS_INDEX_KEYSPACE,
+        HashPathIndexKey::new(
+            complete_hash,
+            realm_id,
+            group_id,
+            node_id,
+            "bucket-a",
+            "replace.bin",
+        )
+        .to_bytes()
+        .unwrap(),
+    )
+    .await
+    .expect("missing replacement hash path index entry");
+    assert!(new_hash_path.is_empty());
+}
+
+#[tokio::test]
 async fn abort_multipart_upload_removes_metadata_and_part_blobs() {
     let context = setup_context().await;
     let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
@@ -550,7 +784,9 @@ async fn upload_part_checksum_mismatch_cleans_up_raw_part() {
 #[tokio::test]
 async fn delete_object_removes_completed_multipart_metadata() {
     let context = setup_context().await;
-    let created_by = UserId::local(Ulid::new(), RealmId::from_bytes([7u8; 32]));
+    let realm_id = RealmId::from_bytes([7u8; 32]);
+    let created_by = UserId::local(Ulid::new(), realm_id);
+    let node_id = context.driver.net_handle.as_ref().unwrap().node_id();
 
     let created = drive(
         CreateMultipartUploadOperation::new(CreateMultipartUploadInput {
@@ -653,6 +889,9 @@ async fn delete_object_removes_completed_multipart_metadata() {
             bucket: "bucket-a".to_string(),
             key: "delete-me.bin".to_string(),
             version_id: Some(complete.version_id),
+            group_id: created.record.group_id,
+            realm_id,
+            node_id,
             deleted_by: created_by,
         }),
         &context.driver,

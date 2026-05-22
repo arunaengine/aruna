@@ -1,18 +1,21 @@
+use crate::blob::blob_keyspace_helper::{
+    HeadAliasContext, add_hash_path_index_effect, delete_hash_path_index_effect,
+    write_blob_head_effect, write_blob_location_effect, write_blob_version_effect,
+};
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE, S3_VERSION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
 use aruna_core::structs::{
-    BackendLocation, CurrentVersionPointer, Location, LookupKey, MultipartChecksumType,
+    BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, MultipartChecksumType,
     MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
     MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId, VersionKey,
-    VersionMetadata,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use base64::Engine;
@@ -33,10 +36,13 @@ pub enum CompleteMultipartUploadState {
     ReadUploadParts,
     ComposeBlob,
     StartFinalizeTransaction,
-    WriteHashLookup,
+    WriteBlobLocation,
     ReadObjectLookup,
-    WriteObjectLookup,
-    WriteVersionRecord,
+    ReadPreviousVersion,
+    WriteBlobHead,
+    DeletePreviousHashPathIndex,
+    WriteHashPathIndex,
+    WriteBlobVersionRecord,
     WriteObjectMetadata,
     DeleteUploadRecords,
     CommitFinalizeTransaction,
@@ -126,6 +132,9 @@ pub struct CompleteMultipartUploadOperation {
     final_location: Option<BackendLocation>,
     composite_hashes: HashMap<String, Vec<u8>>,
     version_id: Option<Ulid>,
+    version_created_at: Option<SystemTime>,
+    existing_pointer: Option<CurrentVersionPointer>,
+    previous_current_hash: Option<[u8; 32]>,
     cleanup_part_index: usize,
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
@@ -142,6 +151,9 @@ impl CompleteMultipartUploadOperation {
             final_location: None,
             composite_hashes: HashMap::new(),
             version_id: None,
+            version_created_at: None,
+            existing_pointer: None,
+            previous_current_hash: None,
             cleanup_part_index: 0,
             pending_error: None,
             output: None,
@@ -192,6 +204,20 @@ impl CompleteMultipartUploadOperation {
             return Err(CompleteMultipartUploadError::UploadNotOpen);
         }
         Ok(())
+    }
+
+    fn alias_context(&self) -> Result<HeadAliasContext, CompleteMultipartUploadError> {
+        let Some(upload_record) = self.upload_record.as_ref() else {
+            return Err(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+
+        Ok(HeadAliasContext::new(
+            self.input.realm_id,
+            upload_record.group_id,
+            self.input.node_id,
+            self.input.bucket.clone(),
+            self.input.key.clone(),
+        ))
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -386,40 +412,57 @@ impl CompleteMultipartUploadOperation {
                 "blake3",
             ));
         };
-        let key = match LookupKey::from_blake3_hash(blake3_hash).and_then(|key| key.to_bytes()) {
-            Ok(key) => key,
-            Err(err) => return self.schedule_error(err.into()),
-        };
-        let value = match Location::Real(location).to_bytes() {
-            Ok(value) => value,
-            Err(err) => return self.schedule_error(err.into()),
-        };
+        let _ = blake3_hash;
 
-        self.state = CompleteMultipartUploadState::WriteHashLookup;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: Some(txn_id),
-        })]
+        self.write_blob_location()
     }
 
-    fn handle_hash_lookup_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
-        };
+    fn write_blob_location(&mut self) -> Effects {
         let Some(_location) = self.final_location.clone() else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
+        let Some(location) = self.final_location.clone() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        let Some(blake3_hash) = location.get_blake3() else {
+            return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
+                "blake3",
+            ));
+        };
+        let effect = match write_blob_location_effect(
+            match blake3_hash.try_into() {
+                Ok(hash) => hash,
+                Err(err) => {
+                    return self
+                        .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
+                }
+            },
+            location,
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+
+        self.state = CompleteMultipartUploadState::WriteBlobLocation;
+        smallvec![effect]
+    }
+
+    fn handle_blob_location_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+
+        let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.schedule_error(err.into()),
         };
 
         self.state = CompleteMultipartUploadState::ReadObjectLookup;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: self.txn_id,
         })]
@@ -437,30 +480,130 @@ impl CompleteMultipartUploadOperation {
             Ok(existing) => existing,
             Err(err) => return self.schedule_error(err.into()),
         };
-        let version_id = *self.version_id.get_or_insert_with(Ulid::new);
-        let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
-            Ok(key) => key,
-            Err(err) => return self.schedule_error(err.into()),
-        };
-        let value = match CurrentVersionPointer::next_for(existing.as_ref(), version_id).to_bytes()
-        {
-            Ok(value) => value,
-            Err(err) => return self.schedule_error(err.into()),
-        };
+        self.existing_pointer = existing;
+        self.previous_current_hash = None;
 
-        self.state = CompleteMultipartUploadState::WriteObjectLookup;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        if let Some(existing_pointer) = self.existing_pointer.as_ref() {
+            let version_key = match VersionKey::new(
+                &self.input.bucket,
+                &self.input.key,
+                existing_pointer.version_id,
+            )
+            .to_bytes()
+            {
+                Ok(key) => key,
+                Err(err) => return self.schedule_error(err.into()),
+            };
+
+            self.state = CompleteMultipartUploadState::ReadPreviousVersion;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: version_key.into(),
+                txn_id: self.txn_id,
+            })];
+        }
+
+        self.write_current_lookup(None)
     }
 
-    fn handle_object_lookup_written(&mut self, event: Event) -> Effects {
+    fn handle_previous_version_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+
+        self.previous_current_hash = value
+            .as_ref()
+            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
+            .and_then(|version| version.blob_hash().copied());
+
+        let existing_pointer = self.existing_pointer.clone();
+        self.write_current_lookup(existing_pointer.as_ref())
+    }
+
+    fn write_current_lookup(&mut self, existing: Option<&CurrentVersionPointer>) -> Effects {
+        let version_id = *self.version_id.get_or_insert_with(Ulid::new);
+        let pointer = CurrentVersionPointer::next_for(existing, version_id);
+        let alias_context = match self.alias_context() {
+            Ok(context) => context,
+            Err(err) => return self.schedule_error(err),
+        };
+        let effect = match write_blob_head_effect(&alias_context, pointer, self.txn_id) {
+            Ok(effect) => effect,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+
+        self.state = CompleteMultipartUploadState::WriteBlobHead;
+        smallvec![effect]
+    }
+
+    fn handle_blob_head_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
+
+        if let Some(previous_hash) = self.previous_current_hash {
+            let alias_context = match self.alias_context() {
+                Ok(context) => context,
+                Err(err) => return self.schedule_error(err),
+            };
+            let effect =
+                match delete_hash_path_index_effect(&alias_context, previous_hash, self.txn_id) {
+                    Ok(effect) => effect,
+                    Err(err) => return self.schedule_error(err.into()),
+                };
+            self.state = CompleteMultipartUploadState::DeletePreviousHashPathIndex;
+            return smallvec![effect];
+        }
+
+        self.write_hash_path_index()
+    }
+
+    fn handle_previous_hash_path_deleted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+
+        self.write_hash_path_index()
+    }
+
+    fn write_hash_path_index(&mut self) -> Effects {
+        let Some(location) = self.final_location.clone() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        let Some(blake3_hash) = location.get_blake3() else {
+            return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
+                "blake3",
+            ));
+        };
+        let alias_context = match self.alias_context() {
+            Ok(context) => context,
+            Err(err) => return self.schedule_error(err),
+        };
+        let effect = match add_hash_path_index_effect(
+            &alias_context,
+            match blake3_hash.try_into() {
+                Ok(hash) => hash,
+                Err(err) => {
+                    return self
+                        .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
+                }
+            },
+            self.txn_id,
+        ) {
+            Ok(effect) => effect,
+            Err(err) => return self.schedule_error(err.into()),
+        };
+
+        self.state = CompleteMultipartUploadState::WriteHashPathIndex;
+        smallvec![effect]
+    }
+
+    fn handle_hash_path_index_written(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+
         let Some(location) = self.final_location.clone() else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -469,37 +612,42 @@ impl CompleteMultipartUploadOperation {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
-        let key = match VersionKey::new(&self.input.bucket, &self.input.key, version_id).to_bytes()
-        {
-            Ok(key) => key,
-            Err(err) => return self.schedule_error(err.into()),
+        let Some(blake3_hash) = location.get_blake3() else {
+            return self.schedule_error(CompleteMultipartUploadError::MissingExpectedChecksum(
+                "blake3",
+            ));
         };
-        let value = match VersionMetadata::materialized(
-            version_id,
-            location,
-            SystemTime::now(),
+        let created_at = self
+            .version_created_at
+            .get_or_insert_with(SystemTime::now)
+            .to_owned();
+        let version = BlobVersion::materialized(
+            match blake3_hash.try_into() {
+                Ok(hash) => hash,
+                Err(err) => {
+                    return self
+                        .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
+                }
+            },
+            created_at,
             self.input.created_by,
             None,
-        )
-        .to_bytes()
-        {
-            Ok(value) => value,
+        );
+        let version_key = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
+            Ok(effect) => effect,
             Err(err) => return self.schedule_error(err.into()),
         };
 
-        self.state = CompleteMultipartUploadState::WriteVersionRecord;
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        self.state = CompleteMultipartUploadState::WriteBlobVersionRecord;
+        smallvec![effect]
     }
 
-    fn handle_version_record_written(&mut self, event: Event) -> Effects {
+    fn handle_blob_version_record_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
+
         let Some(version_id) = self.version_id else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -788,13 +936,22 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::StartFinalizeTransaction => {
                 self.handle_finalize_transaction_started(event)
             }
-            CompleteMultipartUploadState::WriteHashLookup => self.handle_hash_lookup_written(event),
-            CompleteMultipartUploadState::ReadObjectLookup => self.handle_object_lookup_read(event),
-            CompleteMultipartUploadState::WriteObjectLookup => {
-                self.handle_object_lookup_written(event)
+            CompleteMultipartUploadState::WriteBlobLocation => {
+                self.handle_blob_location_written(event)
             }
-            CompleteMultipartUploadState::WriteVersionRecord => {
-                self.handle_version_record_written(event)
+            CompleteMultipartUploadState::ReadObjectLookup => self.handle_object_lookup_read(event),
+            CompleteMultipartUploadState::ReadPreviousVersion => {
+                self.handle_previous_version_read(event)
+            }
+            CompleteMultipartUploadState::WriteBlobHead => self.handle_blob_head_written(event),
+            CompleteMultipartUploadState::DeletePreviousHashPathIndex => {
+                self.handle_previous_hash_path_deleted(event)
+            }
+            CompleteMultipartUploadState::WriteHashPathIndex => {
+                self.handle_hash_path_index_written(event)
+            }
+            CompleteMultipartUploadState::WriteBlobVersionRecord => {
+                self.handle_blob_version_record_written(event)
             }
             CompleteMultipartUploadState::WriteObjectMetadata => {
                 self.handle_object_metadata_written(event)
