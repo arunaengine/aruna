@@ -10,22 +10,53 @@ use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-    S3_VERSION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, LookupKey,
-    MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, ReplicationItemKind,
-    ReplicationNegotiationResult, ReplicationSuboperationResult, VersionKey, VersionMetadata,
+    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo,
+    CurrentVersionPointer, MultipartObjectMetadataKey, MultipartObjectPart,
+    MultipartObjectSummary, ReplicationItemKind, ReplicationNegotiationResult,
+    ReplicationSuboperationResult, SourceMetadata, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, Key, NodeId};
 use smallvec::smallvec;
+use std::time::SystemTime;
 use thiserror::Error;
 use tracing::debug;
 use ulid::Ulid;
 
 const ITER_PAGE_SIZE: usize = 512;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ReplicationVersion {
+    Materialized {
+        created_at: SystemTime,
+        created_by: aruna_core::user_id::UserId,
+        location: BackendLocation,
+        source: Option<VersionSourceBinding>,
+    },
+    Reference {
+        created_at: SystemTime,
+        created_by: aruna_core::user_id::UserId,
+        source: VersionSourceBinding,
+        cached_metadata: SourceMetadata,
+        last_refresh: SystemTime,
+    },
+    Deleted {
+        created_at: SystemTime,
+        created_by: aruna_core::user_id::UserId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingMaterializedReplicationVersion {
+    created_at: SystemTime,
+    created_by: aruna_core::user_id::UserId,
+    blob_hash: [u8; 32],
+    source: Option<VersionSourceBinding>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReplicateScopeTarget {
@@ -163,12 +194,12 @@ impl ReplicateScopeOperation {
             ReplicateScopeTarget::Prefix(prefix) => self.start_iteration(Some(prefix), false),
             ReplicateScopeTarget::Object { key } => {
                 self.state = ReplicateScopeState::ResolveObjectTarget;
-                let lookup = match LookupKey::object(&self.input.bucket, &key).to_bytes() {
+                let lookup = match BlobHeadKey::new(&self.input.bucket, &key).to_bytes() {
                     Ok(lookup) => lookup,
                     Err(err) => return self.fail(err.into()),
                 };
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
                     key: lookup.into(),
                     txn_id: None,
                 })]
@@ -206,7 +237,7 @@ impl ReplicateScopeOperation {
             Err(err) => return self.fail(err.into()),
         };
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
             start_after: self.next_start_after.clone(),
             limit: ITER_PAGE_SIZE,
@@ -221,7 +252,7 @@ impl ReplicateScopeOperation {
             Err(err) => return self.fail(err.into()),
         };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key: version_key.into(),
             txn_id: None,
         })]
@@ -261,8 +292,8 @@ impl ReplicateScopeOperation {
         });
     }
 
-    fn should_enqueue_version(&self, metadata: &VersionMetadata) -> bool {
-        self.input.replicate_delete_markers || !metadata.is_deleted()
+    fn should_enqueue_version(&self, is_deleted: bool) -> bool {
+        self.input.replicate_delete_markers || !is_deleted
     }
 
     fn run_next_replication(&mut self) -> Effects {
@@ -376,8 +407,8 @@ impl Operation for ReplicateScopeOperation {
                         Ok(version_key) => version_key,
                         Err(err) => return self.fail(err.into()),
                     };
-                    let metadata = match VersionMetadata::from_bytes(value.as_ref()) {
-                        Ok(metadata) => metadata,
+                    let version = match BlobVersion::from_bytes(value.as_ref()) {
+                        Ok(version) => version,
                         Err(err) => return self.fail(err.into()),
                     };
                     debug!(
@@ -385,12 +416,12 @@ impl Operation for ReplicateScopeOperation {
                         key = %version_key.key,
                         version_id = %version_key.version_id,
                         target_node = %self.input.target_node_id,
-                        is_materialized = metadata.is_materialized(),
-                        is_deleted = metadata.is_deleted(),
-                        has_source_binding = metadata.source_binding().is_some(),
+                        is_materialized = version.is_materialized(),
+                        is_deleted = version.is_deleted(),
+                        has_source_binding = version.source_binding().is_some(),
                         "Loaded single version for replication"
                     );
-                    if self.should_enqueue_version(&metadata) {
+                    if self.should_enqueue_version(version.is_deleted()) {
                         self.enqueue_version_request(version_key);
                     } else {
                         debug!(
@@ -425,7 +456,7 @@ impl Operation for ReplicateScopeOperation {
                     let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
                         continue;
                     };
-                    let Ok(metadata) = VersionMetadata::from_bytes(value.as_ref()) else {
+                    let Ok(version) = BlobVersion::from_bytes(value.as_ref()) else {
                         continue;
                     };
                     if version_key.bucket != self.input.bucket {
@@ -443,7 +474,7 @@ impl Operation for ReplicateScopeOperation {
                         }
                     }
 
-                    if !self.should_enqueue_version(&metadata) {
+                    if !self.should_enqueue_version(version.is_deleted()) {
                         continue;
                     }
 
@@ -533,6 +564,8 @@ pub enum ReplicateObjectVersionError {
     ReplicationError(#[from] ReplicationError),
     #[error("Version not found")]
     VersionNotFound,
+    #[error("Reference version must be materialized before manifest creation")]
+    UnresolvedReferenceVersion,
     #[error("Missing blob hash")]
     MissingBlobHash,
     #[error("Multipart metadata incomplete: expected {expected} parts, found {actual}")]
@@ -549,6 +582,7 @@ pub enum ReplicateObjectVersionError {
 enum ReplicateObjectVersionState {
     Init,
     ReadVersion,
+    ReadBlobLocation,
     ResolveReferenceAccess,
     ReadReferenceSource,
     WriteReferenceBlob,
@@ -570,7 +604,8 @@ enum ReplicateObjectVersionState {
 pub struct ReplicateObjectVersionOperation {
     request: VersionReplicationRequest,
     state: ReplicateObjectVersionState,
-    version_metadata: Option<VersionMetadata>,
+    pending_materialized_version: Option<PendingMaterializedReplicationVersion>,
+    replication_version: Option<ReplicationVersion>,
     multipart_summary: Option<MultipartObjectSummary>,
     multipart_parts: Vec<MultipartObjectPart>,
     multipart_parts_next_start_after: Option<Key>,
@@ -586,7 +621,8 @@ impl ReplicateObjectVersionOperation {
         Self {
             request,
             state: ReplicateObjectVersionState::Init,
-            version_metadata: None,
+            pending_materialized_version: None,
+            replication_version: None,
             multipart_summary: None,
             multipart_parts: Vec::new(),
             multipart_parts_next_start_after: None,
@@ -602,6 +638,7 @@ impl ReplicateObjectVersionOperation {
         match self.state {
             ReplicateObjectVersionState::Init => "Init",
             ReplicateObjectVersionState::ReadVersion => "ReadVersion",
+            ReplicateObjectVersionState::ReadBlobLocation => "ReadBlobLocation",
             ReplicateObjectVersionState::ResolveReferenceAccess => "ResolveReferenceAccess",
             ReplicateObjectVersionState::ReadReferenceSource => "ReadReferenceSource",
             ReplicateObjectVersionState::WriteReferenceBlob => "WriteReferenceBlob",
@@ -649,8 +686,17 @@ impl ReplicateObjectVersionOperation {
         };
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key: key.into(),
+            txn_id: None,
+        })]
+    }
+
+    fn read_blob_location(&mut self, blob_hash: [u8; 32]) -> Effects {
+        self.state = ReplicateObjectVersionState::ReadBlobLocation;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: blob_hash.to_vec().into(),
             txn_id: None,
         })]
     }
@@ -703,13 +749,13 @@ impl ReplicateObjectVersionOperation {
 
     fn read_current_lookup(&mut self) -> Effects {
         self.state = ReplicateObjectVersionState::ReadCurrentLookup;
-        let key = match LookupKey::object(&self.request.bucket, &self.request.key).to_bytes() {
+        let key = match BlobHeadKey::new(&self.request.bucket, &self.request.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: None,
         })]
@@ -730,14 +776,15 @@ impl ReplicateObjectVersionOperation {
         smallvec![]
     }
 
-    fn resolve_reference_or_skip(&mut self, metadata: VersionMetadata) -> Effects {
+    fn resolve_reference_or_skip(&mut self, version: ReplicationVersion) -> Effects {
         if self.request.mode != ReplicationMode::OnDemand {
             return self.skip_version();
         }
 
-        let Some(source) = metadata.source_binding().cloned() else {
-            return self.skip_version();
+        let ReplicationVersion::Reference { source, .. } = &version else {
+            return self.fail(ReplicateObjectVersionError::VersionNotFound);
         };
+        let source = source.clone();
 
         debug!(
             bucket = %self.request.bucket,
@@ -750,7 +797,7 @@ impl ReplicateObjectVersionOperation {
             "Resolving on-demand reference source access"
         );
 
-        self.version_metadata = Some(metadata);
+        self.replication_version = Some(version);
         self.state = ReplicateObjectVersionState::ResolveReferenceAccess;
         smallvec![resolve_version_source_binding_suboperation(
             ResolveVersionSourceBindingInput { source },
@@ -812,7 +859,9 @@ impl ReplicateObjectVersionOperation {
                 metadata: source_metadata,
                 stream,
             }) => {
-                let Some(metadata) = self.version_metadata.as_ref() else {
+                let Some(ReplicationVersion::Reference { created_by, .. }) =
+                    self.replication_version.as_ref()
+                else {
                     return self.fail(ReplicateObjectVersionError::VersionNotFound);
                 };
 
@@ -831,7 +880,7 @@ impl ReplicateObjectVersionOperation {
                 smallvec![Effect::Blob(BlobEffect::Write {
                     bucket: self.request.bucket.clone(),
                     key: self.request.key.clone(),
-                    created_by: metadata.created_by,
+                    created_by: *created_by,
                     blob: stream,
                 })]
             }
@@ -857,10 +906,18 @@ impl ReplicateObjectVersionOperation {
     fn handle_reference_blob_written(&mut self, event: Event) -> Effects {
         match event {
             Event::Blob(BlobEvent::WriteFinished { location }) => {
-                let Some(metadata) = self.version_metadata.clone() else {
+                let Some(version) = self.replication_version.take() else {
                     return self.fail(ReplicateObjectVersionError::VersionNotFound);
                 };
-                let source = metadata.source_binding().cloned();
+                let ReplicationVersion::Reference {
+                    created_at,
+                    created_by,
+                    source,
+                    ..
+                } = version
+                else {
+                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
+                };
                 debug!(
                     bucket = %self.request.bucket,
                     key = %self.request.key,
@@ -871,13 +928,12 @@ impl ReplicateObjectVersionOperation {
                     "Materialized temporary blob for on-demand reference replication"
                 );
                 self.cleanup_reference_blob = Some(location.clone());
-                self.version_metadata = Some(VersionMetadata::materialized(
-                    metadata.version_id,
+                self.replication_version = Some(ReplicationVersion::Materialized {
+                    created_at,
+                    created_by,
                     location,
-                    metadata.created_at,
-                    metadata.created_by,
-                    source,
-                ));
+                    source: Some(source),
+                });
                 self.read_current_lookup()
             }
             Event::Blob(BlobEvent::Error(_)) => {
@@ -897,34 +953,53 @@ impl ReplicateObjectVersionOperation {
     ) -> Result<(), ReplicateObjectVersionError> {
         self.validate_multipart_parts_complete()?;
 
-        let metadata = self
-            .version_metadata
+        let version = self
+            .replication_version
             .clone()
             .ok_or(ReplicateObjectVersionError::VersionNotFound)?;
         let current_version_pointer = current_lookup
             .as_ref()
-            .filter(|pointer| pointer.version_id == metadata.version_id);
+            .filter(|pointer| pointer.version_id == self.request.version_id);
         let current_version = current_version_pointer.is_some();
-        let blob = if let Some(location) = metadata.materialized_location().cloned() {
-            let hash = location
-                .get_blake3()
-                .ok_or(ReplicateObjectVersionError::MissingBlobHash)?
-                .try_into()
-                .map_err(|_| ReplicateObjectVersionError::MissingBlobHash)?;
-            Some(MaterializedBlobInfo {
-                hash,
-                size: location.blob_size,
-                compressed: location.compressed,
-                encrypted: location.encrypted,
+        let (kind, created_at, created_by, blob, source) = match version {
+            ReplicationVersion::Materialized {
+                created_at,
+                created_by,
                 location,
-            })
-        } else {
-            None
-        };
-        let source = if blob.is_some() {
-            metadata.source_binding().cloned()
-        } else {
-            None
+                source,
+            } => {
+                let hash = location
+                    .get_blake3()
+                    .ok_or(ReplicateObjectVersionError::MissingBlobHash)?
+                    .try_into()
+                    .map_err(|_| ReplicateObjectVersionError::MissingBlobHash)?;
+                (
+                    ReplicationItemKind::Materialized,
+                    created_at,
+                    created_by,
+                    Some(MaterializedBlobInfo {
+                        hash,
+                        size: location.blob_size,
+                        compressed: location.compressed,
+                        encrypted: location.encrypted,
+                        location,
+                    }),
+                    source,
+                )
+            }
+            ReplicationVersion::Deleted {
+                created_at,
+                created_by,
+            } => (
+                ReplicationItemKind::DeleteMarker,
+                created_at,
+                created_by,
+                None,
+                None,
+            ),
+            ReplicationVersion::Reference { .. } => {
+                return Err(ReplicateObjectVersionError::UnresolvedReferenceVersion);
+            }
         };
 
         let multipart =
@@ -940,13 +1015,9 @@ impl ReplicateObjectVersionOperation {
             bucket: self.request.bucket.clone(),
             key: self.request.key.clone(),
             version_id: self.request.version_id,
-            kind: if blob.is_some() {
-                ReplicationItemKind::Materialized
-            } else {
-                ReplicationItemKind::DeleteMarker
-            },
-            created_at: metadata.created_at,
-            created_by: metadata.created_by,
+            kind,
+            created_at,
+            created_by,
             current_version,
             current_version_generation: current_version_pointer.map(|pointer| pointer.generation),
             auth_context: self.request.auth_context.clone(),
@@ -1045,30 +1116,99 @@ impl Operation for ReplicateObjectVersionOperation {
                 let Some(value) = value else {
                     return self.fail(ReplicateObjectVersionError::VersionNotFound);
                 };
-                let metadata = match VersionMetadata::from_bytes(value.as_ref()) {
-                    Ok(metadata) => metadata,
+                self.pending_materialized_version = None;
+                self.replication_version = None;
+                let version = match BlobVersion::from_bytes(value.as_ref()) {
+                    Ok(version) => version,
                     Err(err) => return self.fail(err.into()),
                 };
+                let is_materialized = version.is_materialized();
+                let is_deleted = version.is_deleted();
+                let has_source_binding = version.source_binding().is_some();
                 debug!(
                     bucket = %self.request.bucket,
                     key = %self.request.key,
                     version_id = %self.request.version_id,
                     target_node = %self.request.target_node_id,
-                    is_materialized = metadata.is_materialized(),
-                    is_deleted = metadata.is_deleted(),
-                    has_source_binding = metadata.source_binding().is_some(),
-                    "Loaded version metadata for replication"
+                    is_materialized,
+                    is_deleted,
+                    has_source_binding,
+                    "Loaded blob version for replication"
                 );
-                if !metadata.is_materialized() && !metadata.is_deleted() {
-                    return self.resolve_reference_or_skip(metadata);
+                let BlobVersion {
+                    created_at,
+                    created_by,
+                    state,
+                } = version;
+
+                match state {
+                    BlobVersionState::Materialized { blob_hash, source } => {
+                        self.pending_materialized_version = Some(PendingMaterializedReplicationVersion {
+                            created_at,
+                            created_by,
+                            blob_hash,
+                            source,
+                        });
+                        self.read_blob_location(blob_hash)
+                    }
+                    BlobVersionState::Deleted => {
+                        self.pending_materialized_version = None;
+                        self.replication_version = Some(ReplicationVersion::Deleted {
+                            created_at,
+                            created_by,
+                        });
+                        self.read_current_lookup()
+                    }
+                    BlobVersionState::Reference {
+                        source,
+                        cached_metadata,
+                        last_refresh,
+                    } => {
+                        self.pending_materialized_version = None;
+                        self.resolve_reference_or_skip(ReplicationVersion::Reference {
+                            created_at,
+                            created_by,
+                            source,
+                            cached_metadata,
+                            last_refresh,
+                        })
+                    }
                 }
-                let materialized = metadata.is_materialized();
-                self.version_metadata = Some(metadata);
-                if materialized {
-                    self.read_multipart_summary()
-                } else {
-                    self.read_current_lookup()
+            }
+            ReplicateObjectVersionState::ReadBlobLocation => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+                    return self.fail(ReplicateObjectVersionError::InvalidStateEvent {
+                        state: self.state_name(),
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
+                        received: event,
+                    });
+                };
+                let Some(value) = value else {
+                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
+                };
+                let location = match BackendLocation::from_bytes(value.as_ref()) {
+                    Ok(location) => location,
+                    Err(err) => return self.fail(err.into()),
+                };
+                let Some(PendingMaterializedReplicationVersion {
+                    created_at,
+                    created_by,
+                    blob_hash,
+                    source,
+                }) = self.pending_materialized_version.take()
+                else {
+                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
+                };
+                if location.get_blake3() != Some(blob_hash.as_slice()) {
+                    return self.fail(ReplicateObjectVersionError::VersionNotFound);
                 }
+                self.replication_version = Some(ReplicationVersion::Materialized {
+                    created_at,
+                    created_by,
+                    location,
+                    source,
+                });
+                self.read_multipart_summary()
             }
             ReplicateObjectVersionState::ResolveReferenceAccess => {
                 self.handle_reference_access_resolved(event)
@@ -1402,7 +1542,7 @@ impl Operation for ReplicateObjectVersionOperation {
 mod tests {
     use super::{
         ReplicateObjectVersionError, ReplicateObjectVersionOperation, ReplicateScopeInput,
-        ReplicateScopeOperation, ReplicateScopeTarget,
+        ReplicateScopeOperation, ReplicateScopeTarget, ReplicationVersion,
     };
     use crate::replication::protocol::{
         ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
@@ -1412,15 +1552,15 @@ mod tests {
     use aruna_core::events::{
         BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent,
     };
-    use aruna_core::keyspaces::S3_CURRENT_VERSION_KEYSPACE;
+    use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, MultipartChecksumType,
-        MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
-        PortableSourceDescriptor, RealmId, ReplicationNegotiationResult,
+        AuthContext, BackendLocation, BlobVersion, BucketInfo, CurrentVersionPointer,
+        MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart,
+        MultipartObjectSummary, PortableSourceDescriptor, RealmId, ReplicationNegotiationResult,
         ReplicationSuboperationResult, ResolvedSourceAccess, SourceConnectorKind, SourceMetadata,
-        StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
+        StagingStrategy, VersionKey, VersionSourceBinding,
     };
     use bytes::Bytes;
     use futures_util::stream;
@@ -1470,10 +1610,60 @@ mod tests {
         let key_bytes = VersionKey::new("bucket", key, version_id)
             .to_bytes()
             .unwrap();
-        let value_bytes = VersionMetadata::deleted(version_id, SystemTime::now(), test_user_id())
+        let value_bytes = BlobVersion::deleted(SystemTime::now(), test_user_id())
             .to_bytes()
             .unwrap();
         (key_bytes.into(), value_bytes.into())
+    }
+
+    fn materialized_blob_version(
+        location: &BackendLocation,
+        source: Option<VersionSourceBinding>,
+    ) -> BlobVersion {
+        BlobVersion::materialized(
+            location.get_blake3().unwrap().try_into().unwrap(),
+            location.created_at,
+            location.created_by,
+            source,
+        )
+    }
+
+    fn reference_source_binding() -> VersionSourceBinding {
+        VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: PortableSourceDescriptor {
+                kind: SourceConnectorKind::Http,
+                public_config: HashMap::from([(
+                    "endpoint".to_string(),
+                    "https://example.org".to_string(),
+                )]),
+                source_path: "ref/file.txt".to_string(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+            },
+            connector_id: Some(Ulid::from_bytes([9u8; 16])),
+        }
+    }
+
+    fn reference_cached_metadata() -> SourceMetadata {
+        SourceMetadata {
+            content_length: 42,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("etag-1".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH),
+            source_version: None,
+        }
+    }
+
+    fn reference_blob_version() -> BlobVersion {
+        BlobVersion::reference(
+            reference_source_binding(),
+            reference_cached_metadata(),
+            SystemTime::now(),
+            test_user_id(),
+            SystemTime::now(),
+        )
     }
 
     fn materialized_location() -> BackendLocation {
@@ -1493,37 +1683,6 @@ mod tests {
             blob_size: 42,
             hashes,
         }
-    }
-
-    fn reference_metadata(version_id: Ulid) -> VersionMetadata {
-        VersionMetadata::reference(
-            version_id,
-            VersionSourceBinding {
-                strategy: StagingStrategy::Reference,
-                descriptor: PortableSourceDescriptor {
-                    kind: SourceConnectorKind::Http,
-                    public_config: HashMap::from([(
-                        "endpoint".to_string(),
-                        "https://example.org".to_string(),
-                    )]),
-                    source_path: "ref/file.txt".to_string(),
-                    version_selector: None,
-                    capabilities: Vec::new(),
-                    origin_node_id: None,
-                },
-                connector_id: Some(Ulid::new()),
-            },
-            SourceMetadata {
-                content_length: 42,
-                content_type: Some("text/plain".to_string()),
-                etag: Some("etag-1".to_string()),
-                last_modified: Some(SystemTime::UNIX_EPOCH),
-                source_version: None,
-            },
-            SystemTime::now(),
-            test_user_id(),
-            SystemTime::now(),
-        )
     }
 
     fn version_request_with_mode(
@@ -1641,6 +1800,7 @@ mod tests {
     fn multipart_metadata_paginates_across_multiple_iter_pages() {
         let version_id = Ulid::new();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
+        let location = materialized_location();
 
         let effects = op.start();
         assert!(matches!(
@@ -1651,16 +1811,10 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
             value: Some(
-                VersionMetadata::materialized(
-                    version_id,
-                    materialized_location(),
-                    SystemTime::now(),
-                    test_user_id(),
-                    None,
-                )
-                .to_bytes()
-                .unwrap()
-                .into(),
+                materialized_blob_version(&location, None)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
             ),
         }));
         assert!(matches!(
@@ -1670,6 +1824,15 @@ mod tests {
 
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![2u8].into(),
+            value: Some(location.to_bytes().unwrap().into()),
+        }));
+        assert!(matches!(
+            effects[0],
+            Effect::Storage(StorageEffect::Read { .. })
+        ));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![3u8].into(),
             value: Some(
                 MultipartObjectSummary {
                     checksum_type: MultipartChecksumType::Composite,
@@ -1716,25 +1879,24 @@ mod tests {
     fn multipart_metadata_rejects_incomplete_part_set() {
         let version_id = Ulid::new();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
+        let location = materialized_location();
 
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
             value: Some(
-                VersionMetadata::materialized(
-                    version_id,
-                    materialized_location(),
-                    SystemTime::now(),
-                    test_user_id(),
-                    None,
-                )
-                .to_bytes()
-                .unwrap()
-                .into(),
+                materialized_blob_version(&location, None)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
             ),
         }));
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![2u8].into(),
+            value: Some(location.to_bytes().unwrap().into()),
+        }));
+        op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![3u8].into(),
             value: Some(
                 MultipartObjectSummary {
                     checksum_type: MultipartChecksumType::Composite,
@@ -1766,11 +1928,10 @@ mod tests {
         let version_id = Ulid::new();
         let generation = 42;
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
-        op.version_metadata = Some(VersionMetadata::deleted(
-            version_id,
-            SystemTime::now(),
-            test_user_id(),
-        ));
+        op.replication_version = Some(ReplicationVersion::Deleted {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+        });
 
         op.build_manifest(Some(CurrentVersionPointer::new_with_generation(
             version_id, generation,
@@ -1785,18 +1946,14 @@ mod tests {
     #[test]
     fn manifest_includes_source_binding_for_materialized_version() {
         let version_id = Ulid::new();
-        let source = reference_metadata(version_id)
-            .source_binding()
-            .cloned()
-            .expect("reference metadata has source");
+        let source = reference_source_binding();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
-        op.version_metadata = Some(VersionMetadata::materialized(
-            version_id,
-            materialized_location(),
-            SystemTime::now(),
-            test_user_id(),
-            Some(source.clone()),
-        ));
+        op.replication_version = Some(ReplicationVersion::Materialized {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+            location: materialized_location(),
+            source: Some(source.clone()),
+        });
 
         op.build_manifest(None).unwrap();
 
@@ -1812,11 +1969,10 @@ mod tests {
     fn manifest_omits_source_binding_for_delete_marker() {
         let version_id = Ulid::new();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
-        op.version_metadata = Some(VersionMetadata::deleted(
-            version_id,
-            SystemTime::now(),
-            test_user_id(),
-        ));
+        op.replication_version = Some(ReplicationVersion::Deleted {
+            created_at: SystemTime::now(),
+            created_by: test_user_id(),
+        });
 
         op.build_manifest(None).unwrap();
 
@@ -1829,6 +1985,29 @@ mod tests {
     }
 
     #[test]
+    fn manifest_rejects_unresolved_reference_version() {
+        let version_id = Ulid::new();
+        let source = reference_source_binding();
+        let cached_metadata = reference_cached_metadata();
+        let created_at = SystemTime::now();
+        let created_by = test_user_id();
+        let last_refresh = SystemTime::now();
+        let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
+        op.replication_version = Some(ReplicationVersion::Reference {
+            created_at,
+            created_by,
+            source,
+            cached_metadata,
+            last_refresh,
+        });
+
+        assert_eq!(
+            op.build_manifest(None),
+            Err(ReplicateObjectVersionError::UnresolvedReferenceVersion)
+        );
+    }
+
+    #[test]
     fn reference_versions_are_skipped_without_replication_manifest() {
         let version_id = Ulid::new();
         let mut op = ReplicateObjectVersionOperation::new(version_request(version_id));
@@ -1836,7 +2015,7 @@ mod tests {
         op.start();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
-            value: Some(reference_metadata(version_id).to_bytes().unwrap().into()),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
         }));
 
         assert!(effects.is_empty());
@@ -1850,8 +2029,7 @@ mod tests {
     #[test]
     fn on_demand_reference_replication_materializes_before_manifest() {
         let version_id = Ulid::new();
-        let original_metadata = reference_metadata(version_id);
-        let original_source = original_metadata.source_binding().cloned();
+        let original_source = Some(reference_source_binding());
         let mut op = ReplicateObjectVersionOperation::new(version_request_with_mode(
             version_id,
             ReplicationMode::OnDemand,
@@ -1860,7 +2038,7 @@ mod tests {
         op.start();
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
-            value: Some(original_metadata.to_bytes().unwrap().into()),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
         }));
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
 
@@ -1905,13 +2083,16 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == S3_CURRENT_VERSION_KEYSPACE
+                if key_space == BLOB_HEAD_KEYSPACE
         ));
-        assert!(op.version_metadata.as_ref().unwrap().is_materialized());
-        assert_eq!(
-            op.version_metadata.as_ref().unwrap().source_binding(),
-            original_source.as_ref()
-        );
+        assert!(matches!(
+            op.replication_version.as_ref(),
+            Some(ReplicationVersion::Materialized { .. })
+        ));
+        assert!(matches!(
+            op.replication_version.as_ref(),
+            Some(ReplicationVersion::Materialized { source, .. }) if source.as_ref() == original_source.as_ref()
+        ));
 
         op.build_manifest(None).unwrap();
         assert_eq!(op.manifest.as_ref().unwrap().source, original_source);
@@ -1928,7 +2109,7 @@ mod tests {
         op.start();
         op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![1u8].into(),
-            value: Some(reference_metadata(version_id).to_bytes().unwrap().into()),
+            value: Some(reference_blob_version().to_bytes().unwrap().into()),
         }));
 
         let access = ResolvedSourceAccess::OpenDal {
