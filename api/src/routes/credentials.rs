@@ -154,7 +154,8 @@ fn parse_normalized_restriction(
     pattern: &str,
     permission: Permission,
 ) -> Option<NormalizedRestriction> {
-    DelegationScope::parse_supported(pattern).map(|scope| NormalizedRestriction { scope, permission })
+    DelegationScope::parse_supported(pattern)
+        .map(|scope| NormalizedRestriction { scope, permission })
 }
 
 fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRestriction> {
@@ -197,9 +198,7 @@ pub async fn create_s3_credentials(
         build_credential_restrictions(&auth, &state, group_id, request.path_restrictions.clone())
             .await?;
     authorize_credential_issuance(&auth, &state, &group_root, path_restrictions.as_deref()).await?;
-    let path_restrictions = path_restrictions
-        .as_deref()
-        .map(serialize_restrictions);
+    let path_restrictions = path_restrictions.as_deref().map(serialize_restrictions);
     let expiry = credential_expiry(SystemTime::now(), request.expires_in_seconds)?;
     let result = drive(
         CreateUserAccessOperation::new(CreateUserAccessConfig {
@@ -370,7 +369,10 @@ fn normalize_requested_restrictions(
         } else if restriction.pattern.is_empty() {
             group_root.to_string()
         } else {
-            format!("{group_root}/{}", restriction.pattern.trim_start_matches('/'))
+            format!(
+                "{group_root}/{}",
+                restriction.pattern.trim_start_matches('/')
+            )
         };
         let Some(restriction) = parse_normalized_restriction(&pattern, permission) else {
             return Err(ServerError::BadRequest);
@@ -466,8 +468,13 @@ async fn authorize_credential_issuance(
     };
 
     let Some(effective_restrictions) = effective_restrictions else {
-        return check_permission(&effective_auth, state, group_root.to_string(), Permission::WRITE)
-            .await;
+        return check_permission(
+            &effective_auth,
+            state,
+            group_root.to_string(),
+            Permission::WRITE,
+        )
+        .await;
     };
 
     for restriction in effective_restrictions {
@@ -528,7 +535,7 @@ fn auth_pattern_may_apply_to_group_root(pattern: &str, group_root: &str) -> bool
     }
 
     let literal_prefix = pattern
-        .split(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
+        .split(['*', '?', '[', ']', '{', '}'])
         .next()
         .unwrap_or_default()
         .trim_end_matches('/');
@@ -661,9 +668,7 @@ mod tests {
             )
             .unwrap(),
             Some(vec![NormalizedRestriction {
-                scope: DelegationScope::exact(
-                    "/realm/g/group/data/node/nested/path".to_string()
-                ),
+                scope: DelegationScope::exact("/realm/g/group/data/node/nested/path".to_string()),
                 permission: Permission::WRITE,
             }])
         );
@@ -861,10 +866,7 @@ mod tests {
 
         assert_eq!(
             merge_effective_restrictions(Some(&auth), Some(&requested)),
-            Some(vec![
-                auth[0].clone(),
-                requested[0].clone(),
-            ])
+            Some(vec![auth[0].clone(), requested[0].clone(),])
         );
     }
 }
