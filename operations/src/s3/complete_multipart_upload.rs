@@ -7,8 +7,9 @@ use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffec
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
@@ -36,6 +37,7 @@ pub enum CompleteMultipartUploadState {
     ReadUploadParts,
     ComposeBlob,
     StartFinalizeTransaction,
+    CheckHashLookup,
     WriteBlobLocation,
     ReadObjectLookup,
     ReadPreviousVersion,
@@ -47,6 +49,7 @@ pub enum CompleteMultipartUploadState {
     DeleteUploadRecords,
     CommitFinalizeTransaction,
     RegisterBlobInDht,
+    CleanupDuplicate,
     CleanupPartBlobs,
     ResetUploadTransaction,
     ReadUploadForReset,
@@ -129,6 +132,7 @@ pub struct CompleteMultipartUploadOperation {
     txn_id: Option<TxnId>,
     upload_record: Option<MultipartUpload>,
     resolved_parts: Vec<MultipartUploadPart>,
+    composed_location: Option<BackendLocation>,
     final_location: Option<BackendLocation>,
     composite_hashes: HashMap<String, Vec<u8>>,
     version_id: Option<Ulid>,
@@ -148,6 +152,7 @@ impl CompleteMultipartUploadOperation {
             txn_id: None,
             upload_record: None,
             resolved_parts: Vec::new(),
+            composed_location: None,
             final_location: None,
             composite_hashes: HashMap::new(),
             version_id: None,
@@ -173,13 +178,13 @@ impl CompleteMultipartUploadOperation {
             smallvec![Effect::Storage(StorageEffect::StartTransaction {
                 read: false,
             })]
-        } else if self.final_location.is_some() {
+        } else if self.composed_location.is_some() {
             self.state = CompleteMultipartUploadState::CleanupFailedCompose;
             smallvec![Effect::Blob(BlobEffect::Delete {
                 location: self
-                    .final_location
+                    .composed_location
                     .clone()
-                    .expect("final_location checked above"),
+                    .expect("composed_location checked above"),
             })]
         } else {
             self.emit_pending_error()
@@ -371,7 +376,8 @@ impl CompleteMultipartUploadOperation {
         let Event::Blob(BlobEvent::WriteFinished { location }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
-        self.final_location = Some(location.clone());
+        self.composed_location = Some(location.clone());
+        self.final_location = None;
 
         let hashes = match self.input.checksum_type {
             MultipartChecksumType::FullObject => &location.hashes,
@@ -403,7 +409,7 @@ impl CompleteMultipartUploadOperation {
         };
         self.txn_id = Some(txn_id);
 
-        let Some(location) = self.final_location.clone() else {
+        let Some(location) = self.composed_location.clone() else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
         };
@@ -412,16 +418,38 @@ impl CompleteMultipartUploadOperation {
                 "blake3",
             ));
         };
-        let _ = blake3_hash;
+        self.state = CompleteMultipartUploadState::CheckHashLookup;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: blake3_hash.to_vec().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_hash_lookup_checked(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+
+        let Some(composed_location) = self.composed_location.clone() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+
+        self.final_location = match value {
+            Some(value) => match BackendLocation::from_bytes(value.as_ref()) {
+                Ok(location) => Some(location),
+                Err(err) => {
+                    return self.schedule_error(CompleteMultipartUploadError::ConversionError(err));
+                }
+            },
+            None => Some(composed_location),
+        };
 
         self.write_blob_location()
     }
 
     fn write_blob_location(&mut self) -> Effects {
-        let Some(_location) = self.final_location.clone() else {
-            return self
-                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
-        };
         let Some(location) = self.final_location.clone() else {
             return self
                 .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -775,7 +803,34 @@ impl CompleteMultipartUploadOperation {
         match event {
             Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
             | Event::Net(NetEvent::Dht(DhtEvent::Error { .. }))
-            | Event::Net(NetEvent::Error(_)) => self.begin_cleanup_part_blobs(),
+            | Event::Net(NetEvent::Error(_)) => self.cleanup_duplicate_or_continue(),
+            _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
+        }
+    }
+
+    fn cleanup_duplicate_or_continue(&mut self) -> Effects {
+        let Some(composed_location) = self.composed_location.clone() else {
+            return self.begin_cleanup_part_blobs();
+        };
+        let Some(final_location) = self.final_location.as_ref() else {
+            return self.begin_cleanup_part_blobs();
+        };
+
+        if &composed_location != final_location {
+            self.state = CompleteMultipartUploadState::CleanupDuplicate;
+            return smallvec![Effect::Blob(BlobEffect::Delete {
+                location: composed_location,
+            })];
+        }
+
+        self.begin_cleanup_part_blobs()
+    }
+
+    fn handle_duplicate_cleanup(&mut self, event: Event) -> Effects {
+        match event {
+            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
+                self.begin_cleanup_part_blobs()
+            }
             _ => self.emit_error(CompleteMultipartUploadError::InvalidOperationState),
         }
     }
@@ -790,6 +845,7 @@ impl CompleteMultipartUploadOperation {
     fn cleanup_next_part_blob(&mut self) -> Effects {
         let Some(record) = self.resolved_parts.get(self.cleanup_part_index) else {
             self.state = CompleteMultipartUploadState::Finish;
+            self.composed_location = None;
             let Some(location) = self.final_location.clone() else {
                 return self
                     .emit_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
@@ -869,7 +925,7 @@ impl CompleteMultipartUploadOperation {
             return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
         }
         self.state = CompleteMultipartUploadState::CleanupFailedCompose;
-        if let Some(location) = self.final_location.clone() {
+        if let Some(location) = self.composed_location.clone() {
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.emit_pending_error()
@@ -893,7 +949,7 @@ impl CompleteMultipartUploadOperation {
         };
         self.txn_id = None;
         self.state = CompleteMultipartUploadState::CleanupFailedCompose;
-        if let Some(location) = self.final_location.clone() {
+        if let Some(location) = self.composed_location.clone() {
             smallvec![Effect::Blob(BlobEffect::Delete { location })]
         } else {
             self.emit_pending_error()
@@ -936,6 +992,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::StartFinalizeTransaction => {
                 self.handle_finalize_transaction_started(event)
             }
+            CompleteMultipartUploadState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             CompleteMultipartUploadState::WriteBlobLocation => {
                 self.handle_blob_location_written(event)
             }
@@ -965,6 +1022,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::RegisterBlobInDht => {
                 self.handle_blob_registered_in_dht(event)
             }
+            CompleteMultipartUploadState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
             CompleteMultipartUploadState::CleanupPartBlobs => self.handle_cleanup_part_blob(event),
             CompleteMultipartUploadState::ResetUploadTransaction => {
                 self.handle_reset_transaction_started(event)
