@@ -9,13 +9,16 @@ use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
     CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
     HASH_PATHS_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
+    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    S3_MULTIPART_UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
-    BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, Group, GroupAuthorizationDocument,
-    HashPathIndexKey, Realm, RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess,
-    VersionKey,
+    BlobHeadKey, BlobVersion, BucketInfo, BucketReplicationConfig, CurrentVersionPointer, Group,
+    GroupAuthorizationDocument, HashPathIndexKey, MultipartObjectMetadataKey, MultipartObjectPart,
+    MultipartObjectSummary, MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, Realm,
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId, UserAccess, VersionKey,
 };
 use aruna_net::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
@@ -98,6 +101,10 @@ enum DecodedField {
     HashPathIndexKey { value: HashPathIndexKey },
     #[serde(rename = "version_key")]
     VersionKey { value: VersionKey },
+    #[serde(rename = "multipart_upload_part_key")]
+    MultipartUploadPartKey { value: MultipartUploadPartKey },
+    #[serde(rename = "multipart_object_metadata_key")]
+    MultipartObjectMetadataKey { value: MultipartObjectMetadataKey },
     #[serde(rename = "raw")]
     Raw { hex: String },
 }
@@ -127,6 +134,9 @@ enum DecodedValue {
     BucketInfo {
         data: BucketInfo,
     },
+    BucketReplicationConfig {
+        data: BucketReplicationConfig,
+    },
     CurrentVersionPointer {
         data: CurrentVersionPointer,
     },
@@ -135,6 +145,18 @@ enum DecodedValue {
     },
     BlobVersion {
         data: BlobVersion,
+    },
+    MultipartUpload {
+        data: MultipartUpload,
+    },
+    MultipartUploadPart {
+        data: MultipartUploadPart,
+    },
+    MultipartObjectSummary {
+        data: MultipartObjectSummary,
+    },
+    MultipartObjectPart {
+        data: MultipartObjectPart,
     },
     ApiTokenRevocationList {
         data: HashSet<String>,
@@ -812,7 +834,7 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 19] {
+fn defined_keyspaces() -> [&'static str; 23] {
     [
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
@@ -832,6 +854,10 @@ fn defined_keyspaces() -> [&'static str; 19] {
         REALM_CONFIG_KEYSPACE,
         REALM_KEYSPACE,
         S3_BUCKET_KEYSPACE,
+        S3_BUCKET_REPLICATION_KEYSPACE,
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+        S3_MULTIPART_UPLOAD_KEYSPACE,
+        S3_MULTIPART_UPLOAD_PART_KEYSPACE,
         USER_ACCESS_KEYSPACE,
     ]
 }
@@ -895,10 +921,18 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
             .unwrap_or_else(|_| raw_field(key)),
         USER_ACCESS_KEYSPACE
         | S3_BUCKET_KEYSPACE
+        | S3_BUCKET_REPLICATION_KEYSPACE
         | API_STATE_KEYSPACE
         | GOSSIP_SUBSCRIPTIONS_KEYSPACE
         | NODE_STATE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
+        S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
+        S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartUploadPartKey::from_bytes(key)
+            .map(|value| DecodedField::MultipartUploadPartKey { value })
+            .unwrap_or_else(|_| raw_field(key)),
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE => MultipartObjectMetadataKey::from_bytes(key)
+            .map(|value| DecodedField::MultipartObjectMetadataKey { value })
+            .unwrap_or_else(|_| raw_field(key)),
         DHT_KEYSPACE => decode_dht_key(key),
         BLOB_HEAD_KEYSPACE => BlobHeadKey::from_bytes(key)
             .map(|value| DecodedField::BlobHeadKey { value })
@@ -936,6 +970,11 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         S3_BUCKET_KEYSPACE => decode_value_with(value, BucketInfo::from_bytes, |data| {
             DecodedValue::BucketInfo { data }
         }),
+        S3_BUCKET_REPLICATION_KEYSPACE => {
+            decode_value_with(value, BucketReplicationConfig::from_bytes, |data| {
+                DecodedValue::BucketReplicationConfig { data }
+            })
+        }
         BLOB_HEAD_KEYSPACE => decode_value_with(value, CurrentVersionPointer::from_bytes, |data| {
             DecodedValue::CurrentVersionPointer { data }
         }),
@@ -947,6 +986,17 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         BLOB_VERSIONS_KEYSPACE => decode_value_with(value, BlobVersion::from_bytes, |data| {
             DecodedValue::BlobVersion { data }
         }),
+        S3_MULTIPART_UPLOAD_KEYSPACE => {
+            decode_value_with(value, MultipartUpload::from_bytes, |data| {
+                DecodedValue::MultipartUpload { data }
+            })
+        }
+        S3_MULTIPART_UPLOAD_PART_KEYSPACE => {
+            decode_value_with(value, MultipartUploadPart::from_bytes, |data| {
+                DecodedValue::MultipartUploadPart { data }
+            })
+        }
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE => decode_multipart_object_metadata_value(key, value),
         AUTH_KEYSPACE => decode_auth_value(value),
         API_STATE_KEYSPACE => decode_api_state_value(key, value),
         GOSSIP_SUBSCRIPTIONS_KEYSPACE => decode_gossip_subscriptions_value(value),
@@ -1032,6 +1082,22 @@ fn decode_api_state_value(key: &[u8], value: &[u8]) -> DecodedValue {
             .map(|data| DecodedValue::ApiInitialRealmAdminClaimed { data })
             .unwrap_or_else(|error| raw_value(value, Some(error.to_string()))),
         _ => raw_value(value, Some("unsupported api_state key".to_string())),
+    }
+}
+
+fn decode_multipart_object_metadata_value(key: &[u8], value: &[u8]) -> DecodedValue {
+    match MultipartObjectMetadataKey::from_bytes(key) {
+        Ok(MultipartObjectMetadataKey::Summary { .. }) => {
+            decode_value_with(value, MultipartObjectSummary::from_bytes, |data| {
+                DecodedValue::MultipartObjectSummary { data }
+            })
+        }
+        Ok(MultipartObjectMetadataKey::Part { .. }) => {
+            decode_value_with(value, MultipartObjectPart::from_bytes, |data| {
+                DecodedValue::MultipartObjectPart { data }
+            })
+        }
+        Err(error) => raw_value(value, Some(error.to_string())),
     }
 }
 
@@ -1126,11 +1192,16 @@ mod tests {
         API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
         BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,
+        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+        S3_MULTIPART_UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{
-        Actor, BackendLocation, BlobHeadKey, BlobVersion, Group, HashPathIndexKey, Realm, RealmId,
+        Actor, BackendLocation, BlobHeadKey, BlobVersion, BucketReplicationConfig,
+        BucketReplicationTarget, Group, HashPathIndexKey, MultipartChecksumType,
+        MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary, MultipartUpload,
+        MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, Realm, RealmId,
     };
     use aruna_net::dht::storage::StoredEntry;
     use chrono::{DateTime, Utc};
@@ -1141,6 +1212,7 @@ mod tests {
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
+    use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -1194,10 +1266,45 @@ mod tests {
             REALM_CONFIG_KEYSPACE.to_string(),
             REALM_KEYSPACE.to_string(),
             S3_BUCKET_KEYSPACE.to_string(),
+            S3_BUCKET_REPLICATION_KEYSPACE.to_string(),
+            S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
+            S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
+            S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),
         ];
         expected_missing.sort();
         assert_eq!(missing, expected_missing);
+    }
+
+    #[test]
+    fn decodes_bucket_replication_entry() {
+        let realm_id = RealmId::from_bytes([4_u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
+        let config = BucketReplicationConfig {
+            targets: vec![BucketReplicationTarget {
+                node_id,
+                realm_id,
+                bucket: "replica-bucket".to_string(),
+                arn: format!("arn:aruna:{realm_id}:{node_id}:s3/replica-bucket"),
+                replicate_delete_markers: true,
+            }],
+        };
+
+        let decoded = decode_entry(
+            S3_BUCKET_REPLICATION_KEYSPACE,
+            b"primary-bucket",
+            &config.to_bytes().unwrap(),
+        );
+        assert_eq!(
+            decoded.key,
+            DecodedField::Utf8 {
+                value: "primary-bucket".to_string()
+            }
+        );
+        match decoded.value {
+            DecodedValue::BucketReplicationConfig { data } => assert_eq!(data, config),
+            other => panic!("expected bucket replication config, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1410,6 +1517,144 @@ mod tests {
                 assert_eq!(data[0].0.value, vec![1, 2, 3, 4]);
             }
             other => panic!("expected dht entries, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_multipart_upload_entry() {
+        let realm_id = RealmId::from_bytes([3_u8; 32]);
+        let created_by = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let upload = MultipartUpload {
+            upload_id: Ulid::from_bytes([7_u8; 16]),
+            bucket: "bucket-a".to_string(),
+            key: "parts/big.bin".to_string(),
+            group_id: Ulid::from_bytes([8_u8; 16]),
+            created_by,
+            created_at: SystemTime::UNIX_EPOCH,
+            status: MultipartUploadStatus::Open,
+            checksum_hint: None,
+        };
+
+        let decoded = decode_entry(
+            S3_MULTIPART_UPLOAD_KEYSPACE,
+            &upload.upload_id.to_bytes(),
+            &upload.to_bytes().unwrap(),
+        );
+        assert_eq!(
+            decoded.key,
+            DecodedField::Ulid {
+                value: upload.upload_id.to_string()
+            }
+        );
+        match decoded.value {
+            DecodedValue::MultipartUpload { data } => assert_eq!(data, upload),
+            other => panic!("expected multipart upload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_multipart_upload_part_entry() {
+        let realm_id = RealmId::from_bytes([9_u8; 32]);
+        let created_by = aruna_core::UserId::local(Ulid::new(), realm_id);
+        let key = MultipartUploadPartKey::new(Ulid::from_bytes([2_u8; 16]), 5);
+        let part = MultipartUploadPart {
+            part_number: 5,
+            location: BackendLocation {
+                root: "/tmp".to_string(),
+                storage_bucket: "blob-bucket".to_string(),
+                backend_path: "multipart/part-5.bin".to_string(),
+                ulid: Ulid::from_bytes([4_u8; 16]),
+                compressed: false,
+                encrypted: false,
+                created_by,
+                created_at: SystemTime::UNIX_EPOCH,
+                staging: false,
+                partial: true,
+                blob_size: 42,
+                hashes: HashMap::from([("md5".to_string(), vec![1_u8; 16])]),
+            },
+            created_at: SystemTime::UNIX_EPOCH,
+        };
+
+        let decoded = decode_entry(
+            S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+            &key.to_bytes().unwrap(),
+            &part.to_bytes().unwrap(),
+        );
+        assert_eq!(
+            decoded.key,
+            DecodedField::MultipartUploadPartKey { value: key.clone() }
+        );
+        match decoded.value {
+            DecodedValue::MultipartUploadPart { data } => assert_eq!(data, part),
+            other => panic!("expected multipart upload part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_multipart_object_summary_entry() {
+        let key = MultipartObjectMetadataKey::summary(Ulid::from_bytes([1_u8; 16]));
+        let summary = MultipartObjectSummary {
+            checksum_type: MultipartChecksumType::Composite,
+            part_count: 3,
+        };
+
+        let decoded = decode_entry(
+            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            &key.to_bytes().unwrap(),
+            &summary.to_bytes().unwrap(),
+        );
+        assert_eq!(
+            decoded.key,
+            DecodedField::MultipartObjectMetadataKey { value: key.clone() }
+        );
+        match decoded.value {
+            DecodedValue::MultipartObjectSummary { data } => assert_eq!(data, summary),
+            other => panic!("expected multipart object summary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_multipart_object_part_entry() {
+        let key = MultipartObjectMetadataKey::part(Ulid::from_bytes([5_u8; 16]), 2);
+        let part = MultipartObjectPart {
+            part_number: 2,
+            size: 64,
+            hashes: HashMap::from([
+                ("blake3".to_string(), vec![7_u8; 32]),
+                ("md5".to_string(), vec![8_u8; 16]),
+            ]),
+        };
+
+        let decoded = decode_entry(
+            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            &key.to_bytes().unwrap(),
+            &part.to_bytes().unwrap(),
+        );
+        assert_eq!(
+            decoded.key,
+            DecodedField::MultipartObjectMetadataKey { value: key.clone() }
+        );
+        match decoded.value {
+            DecodedValue::MultipartObjectPart { data } => assert_eq!(data, part),
+            other => panic!("expected multipart object part, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn falls_back_to_raw_for_invalid_multipart_object_metadata_value() {
+        let key = MultipartObjectMetadataKey::summary(Ulid::from_bytes([3_u8; 16]));
+        let decoded = decode_entry(
+            S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+            &key.to_bytes().unwrap(),
+            b"broken",
+        );
+        match decoded.value {
+            DecodedValue::Raw {
+                decode_error: Some(_),
+                ..
+            } => {}
+            other => panic!("expected raw decode fallback, got {other:?}"),
         }
     }
 
