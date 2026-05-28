@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -21,12 +21,16 @@ use tracing::{trace, warn};
 
 use crate::DhtHandle;
 use crate::error::{NetError, Result};
+use crate::telemetry::duration_ms;
 use aruna_core::DhtKeyId;
 use aruna_core::keys::gossip_peer_key;
 
 const GOSSIP_TOPIC_ANNOUNCE_TTL: Duration = Duration::from_secs(60 * 60);
 const GOSSIP_TOPIC_REANNOUNCE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const GOSSIP_RESUBSCRIBE_DELAY: Duration = Duration::from_secs(1);
+const GOSSIP_SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+const GOSSIP_BROADCAST_TIMEOUT: Duration = Duration::from_secs(10);
+const GOSSIP_STORAGE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 struct TopicSubscription {
@@ -87,15 +91,23 @@ impl GossipService {
             txn_id: None,
         });
 
-        if let Event::Storage(StorageEvent::ReadResult {
-            value: Some(data), ..
-        }) = self.storage.send_effect(effect).await
-        {
-            for topic in decode_persisted_subscriptions(&data) {
-                if let Err(error) = self.subscribe(topic.clone()).await {
-                    warn!(topic = %topic, error = %error, "Failed to restore persisted gossip subscription");
+        match tokio::time::timeout(GOSSIP_STORAGE_TIMEOUT, self.storage.send_effect(effect)).await {
+            Ok(Event::Storage(StorageEvent::ReadResult {
+                value: Some(data), ..
+            })) => {
+                for topic in decode_persisted_subscriptions(&data) {
+                    if let Err(error) = self.subscribe(topic.clone()).await {
+                        warn!(topic = %topic, error = %error, "Failed to restore persisted gossip subscription");
+                    }
                 }
             }
+            Ok(_) => {}
+            Err(error) => warn!(
+                event = "gossip.restore_subscriptions.timeout",
+                timeout_ms = duration_ms(GOSSIP_STORAGE_TIMEOUT),
+                error = %error,
+                "Timed out reading persisted gossip subscriptions"
+            ),
         }
 
         Ok(())
@@ -138,10 +150,29 @@ impl GossipService {
             }
         };
 
-        sender
-            .broadcast(Bytes::from(message))
-            .await
-            .map_err(|e| NetError::Gossip(e.to_string()))?;
+        let message_len = message.len();
+        let started = Instant::now();
+        match tokio::time::timeout(
+            GOSSIP_BROADCAST_TIMEOUT,
+            sender.broadcast(Bytes::from(message)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(NetError::Gossip(error.to_string())),
+            Err(error) => {
+                warn!(
+                    event = "gossip.broadcast.timeout",
+                    topic = %topic,
+                    message_len,
+                    duration_ms = duration_ms(started.elapsed()),
+                    timeout_ms = duration_ms(GOSSIP_BROADCAST_TIMEOUT),
+                    error = %error,
+                    "Timed out broadcasting gossip message"
+                );
+                return Err(NetError::Gossip(error.to_string()));
+            }
+        }
 
         Ok(())
     }
@@ -172,7 +203,16 @@ impl GossipService {
             txn_id: None,
         });
 
-        let _ = self.storage.send_effect(effect).await;
+        if let Err(error) =
+            tokio::time::timeout(GOSSIP_STORAGE_TIMEOUT, self.storage.send_effect(effect)).await
+        {
+            warn!(
+                event = "gossip.persist_subscriptions.timeout",
+                timeout_ms = duration_ms(GOSSIP_STORAGE_TIMEOUT),
+                error = %error,
+                "Timed out persisting gossip subscriptions"
+            );
+        }
     }
 }
 
@@ -232,10 +272,28 @@ async fn subscribe_owned(
         let bootstrap_node_count = bootstrap_nodes.len();
 
         let cancel = shutdown.child_token();
-        let gossip_topic = gossip
-            .subscribe(topic.to_iroh_topic(), bootstrap_nodes)
-            .await
-            .map_err(|e| NetError::Gossip(e.to_string()))?;
+        let subscribe_started = Instant::now();
+        let gossip_topic = match tokio::time::timeout(
+            GOSSIP_SUBSCRIBE_TIMEOUT,
+            gossip.subscribe(topic.to_iroh_topic(), bootstrap_nodes),
+        )
+        .await
+        {
+            Ok(Ok(gossip_topic)) => gossip_topic,
+            Ok(Err(error)) => return Err(NetError::Gossip(error.to_string())),
+            Err(error) => {
+                warn!(
+                    event = "gossip.subscribe.timeout",
+                    topic = %topic,
+                    bootstrap_nodes = bootstrap_node_count,
+                    duration_ms = duration_ms(subscribe_started.elapsed()),
+                    timeout_ms = duration_ms(GOSSIP_SUBSCRIBE_TIMEOUT),
+                    error = %error,
+                    "Timed out subscribing to gossip topic"
+                );
+                return Err(NetError::Gossip(error.to_string()));
+            }
+        };
 
         let (sender, mut stream) = gossip_topic.split();
 
@@ -458,7 +516,16 @@ async fn persist_subscriptions(
         txn_id: None,
     });
 
-    let _ = storage.send_effect(effect).await;
+    if let Err(error) =
+        tokio::time::timeout(GOSSIP_STORAGE_TIMEOUT, storage.send_effect(effect)).await
+    {
+        warn!(
+            event = "gossip.persist_subscriptions.timeout",
+            timeout_ms = duration_ms(GOSSIP_STORAGE_TIMEOUT),
+            error = %error,
+            "Timed out persisting gossip subscriptions"
+        );
+    }
 }
 
 async fn announce_topic_subscription(

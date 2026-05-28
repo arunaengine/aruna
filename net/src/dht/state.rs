@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
+use aruna_core::DistributedTraceContext;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId, NodeIdExt};
 use aruna_core::structs::RealmId;
@@ -90,6 +91,18 @@ impl OpState {
             Self::InboundPut(op) => &mut op.pending,
         }
     }
+
+    fn trace_context(&self) -> Option<DistributedTraceContext> {
+        match self {
+            Self::Put(op) => op.trace_context.clone(),
+            Self::Get(op) => op.trace_context.clone(),
+            Self::Bootstrap(op) => op.trace_context.clone(),
+            Self::EvictionPing(_)
+            | Self::MaintenancePing(_)
+            | Self::InboundGet(_)
+            | Self::InboundPut(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -103,6 +116,7 @@ struct PutOp {
     local_write_complete: bool,
     completion_emitted: bool,
     lookup_finished: bool,
+    trace_context: Option<DistributedTraceContext>,
     pending: PendingMap,
 }
 
@@ -113,12 +127,14 @@ struct GetOp {
     values: Vec<DhtEntry>,
     seen_publishers: HashSet<(NodeId, RealmId)>,
     frontier: LookupFrontier,
+    trace_context: Option<DistributedTraceContext>,
     pending: PendingMap,
 }
 
 #[derive(Debug)]
 struct BootstrapOp {
     active_nodes: usize,
+    trace_context: Option<DistributedTraceContext>,
     pending: PendingMap,
 }
 
@@ -220,6 +236,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.step",
+        level = "debug",
+        skip(self, input),
+        fields(input = dht_input_kind(&input))
+    )]
     pub fn step(&mut self, input: DhtInput) -> SmallVec<[DhtEffect; 4]> {
         let mut out = SmallVec::<[DhtEffect; 4]>::new();
 
@@ -232,6 +254,16 @@ impl DhtStateMachine {
         out
     }
 
+    pub(crate) fn contains_op(&self, op_id: OpId) -> bool {
+        self.ops.contains_key(&op_id)
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.cmd",
+        level = "debug",
+        skip(self, cmd, out),
+        fields(command = dht_cmd_kind(&cmd))
+    )]
     fn handle_cmd(&mut self, cmd: DhtCmd, out: &mut SmallVec<[DhtEffect; 4]>) {
         match cmd {
             DhtCmd::Put {
@@ -240,13 +272,19 @@ impl DhtStateMachine {
                 realm_id,
                 value,
                 ttl,
-            } => self.handle_cmd_put(op_id, key, realm_id, value, ttl, out),
+                trace_context,
+            } => self.handle_cmd_put(op_id, key, realm_id, value, ttl, trace_context, out),
             DhtCmd::Get {
                 op_id,
                 key,
                 realm_filter,
-            } => self.handle_cmd_get(op_id, key, realm_filter, out),
-            DhtCmd::Bootstrap { op_id, nodes } => self.handle_cmd_bootstrap(op_id, nodes, out),
+                trace_context,
+            } => self.handle_cmd_get(op_id, key, realm_filter, trace_context, out),
+            DhtCmd::Bootstrap {
+                op_id,
+                nodes,
+                trace_context,
+            } => self.handle_cmd_bootstrap(op_id, nodes, trace_context, out),
             DhtCmd::RoutingTableSize { op_id } => {
                 out.push(DhtEffect::Output(DhtOutput::Completed {
                     op_id,
@@ -257,6 +295,13 @@ impl DhtStateMachine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "dht.state.cmd_put",
+        level = "debug",
+        skip(self, value, trace_context, out),
+        fields(op_id, key = %key, realm_id = %realm_id, value_len = value.len(), ttl_secs = ttl.as_secs())
+    )]
     fn handle_cmd_put(
         &mut self,
         op_id: OpId,
@@ -264,6 +309,7 @@ impl DhtStateMachine {
         realm_id: RealmId,
         value: Vec<u8>,
         ttl: std::time::Duration,
+        trace_context: Option<DistributedTraceContext>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if self.ops.contains_key(&op_id) {
@@ -288,17 +334,25 @@ impl DhtStateMachine {
             local_write_complete: false,
             completion_emitted: false,
             lookup_finished: false,
+            trace_context,
             pending: HashMap::new(),
         });
         self.queue_storage_read(op_id, &mut op, StorageStage::PutLocalRead, key, None, out);
         self.ops.insert(op_id, op);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.cmd_get",
+        level = "debug",
+        skip(self, trace_context, out),
+        fields(op_id, key = %key, realm_id = ?realm_filter)
+    )]
     fn handle_cmd_get(
         &mut self,
         op_id: OpId,
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        trace_context: Option<DistributedTraceContext>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if self.ops.contains_key(&op_id) {
@@ -315,6 +369,7 @@ impl DhtStateMachine {
             values: Vec::new(),
             seen_publishers: HashSet::new(),
             frontier: LookupFrontier::default(),
+            trace_context,
             pending: HashMap::new(),
         });
         self.queue_storage_read(
@@ -328,10 +383,17 @@ impl DhtStateMachine {
         self.ops.insert(op_id, op);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.cmd_bootstrap",
+        level = "debug",
+        skip(self, nodes, trace_context, out),
+        fields(op_id, node_count = nodes.len())
+    )]
     fn handle_cmd_bootstrap(
         &mut self,
         op_id: OpId,
         nodes: Vec<NodeId>,
+        trace_context: Option<DistributedTraceContext>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         if self.ops.contains_key(&op_id) {
@@ -359,6 +421,7 @@ impl DhtStateMachine {
 
         let mut op = OpState::Bootstrap(BootstrapOp {
             active_nodes: 0,
+            trace_context,
             pending: HashMap::new(),
         });
         for node in unique {
@@ -374,6 +437,12 @@ impl DhtStateMachine {
         self.ops.insert(op_id, op);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.io",
+        level = "debug",
+        skip(self, io, out),
+        fields(io = dht_io_kind(&io), op_id = ?dht_io_op_id(&io), inbound_id = ?dht_io_inbound_id(&io))
+    )]
     fn handle_io(&mut self, io: DhtIo, out: &mut SmallVec<[DhtEffect; 4]>) {
         match io {
             DhtIo::RpcResponse {
@@ -392,6 +461,7 @@ impl DhtStateMachine {
                 inbound_id,
                 peer,
                 request,
+                trace_context: _,
             } => {
                 self.insert_peer(peer, out);
                 self.handle_inbound_request(inbound_id, request, out);
@@ -424,6 +494,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.tick",
+        level = "debug",
+        skip(self, out),
+        fields(now_tick)
+    )]
     fn handle_tick(&mut self, now_tick: u64, out: &mut SmallVec<[DhtEffect; 4]>) {
         let previous_tick = self.current_tick;
         self.current_tick = now_tick;
@@ -449,6 +525,12 @@ impl DhtStateMachine {
         self.schedule_cleanup(out);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.rpc_response",
+        level = "debug",
+        skip(self, response, out),
+        fields(op_id, phase = ?phase, peer = %peer, response = ?response)
+    )]
     fn handle_rpc_response(
         &mut self,
         op_id: OpId,
@@ -468,6 +550,12 @@ impl DhtStateMachine {
         self.handle_rpc_response_state(op_id, phase, peer, response, op_state, out);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.rpc_error",
+        level = "debug",
+        skip(self, error, out),
+        fields(op_id, phase = ?phase, peer = %peer, error = %error)
+    )]
     fn handle_rpc_error(
         &mut self,
         op_id: OpId,
@@ -487,6 +575,12 @@ impl DhtStateMachine {
         self.handle_rpc_error_state(op_id, phase, error, op_state, out);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.rpc_response_state",
+        level = "trace",
+        skip(self, response, op_state, out),
+        fields(op_id, phase = ?phase, peer = %peer, response = ?response)
+    )]
     fn handle_rpc_response_state(
         &mut self,
         op_id: OpId,
@@ -687,6 +781,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.rpc_error_state",
+        level = "trace",
+        skip(self, error, op_state, out),
+        fields(op_id, phase = ?phase, error = %error)
+    )]
     fn handle_rpc_error_state(
         &mut self,
         op_id: OpId,
@@ -793,6 +893,12 @@ impl DhtStateMachine {
         let _ = self.routing_table.remove(&op.peer);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.storage_read",
+        level = "debug",
+        skip(self, entries, out),
+        fields(op_id, stage = ?stage, entry_count = entries.len())
+    )]
     fn handle_storage_read(
         &mut self,
         op_id: OpId,
@@ -936,6 +1042,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.storage_write",
+        level = "debug",
+        skip(self, out),
+        fields(op_id, stage = ?stage)
+    )]
     fn handle_storage_write(
         &mut self,
         op_id: OpId,
@@ -1006,6 +1118,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.storage_delete",
+        level = "debug",
+        skip(self, _out),
+        fields(op_id, stage = ?stage)
+    )]
     fn handle_storage_delete(
         &mut self,
         op_id: OpId,
@@ -1023,6 +1141,12 @@ impl DhtStateMachine {
         self.ops.insert(op_id, op_state);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.storage_iter",
+        level = "debug",
+        skip(self, values, next_start_after, out),
+        fields(op_id, stage = ?stage, page_len = values.len(), has_next = next_start_after.is_some())
+    )]
     fn handle_storage_iter(
         &mut self,
         op_id: OpId,
@@ -1065,6 +1189,12 @@ impl DhtStateMachine {
         self.cleanup_inflight = false;
     }
 
+    #[tracing::instrument(
+        name = "dht.state.storage_error",
+        level = "debug",
+        skip(self, error, out),
+        fields(op_id, stage = ?stage, error = %error)
+    )]
     fn handle_storage_error(
         &mut self,
         op_id: OpId,
@@ -1113,6 +1243,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.inbound_request",
+        level = "debug",
+        skip(self, request, out),
+        fields(inbound_id, request = ?request)
+    )]
     fn handle_inbound_request(
         &mut self,
         inbound_id: InboundId,
@@ -1217,6 +1353,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.dispatch_get_requests",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key)
+    )]
     fn dispatch_get_requests(
         &mut self,
         op_id: OpId,
@@ -1238,12 +1380,19 @@ impl DhtStateMachine {
                     key: op.key,
                     realm_filter: op.realm_filter,
                 },
+                op.trace_context.clone(),
                 out,
             );
             op.frontier.sent_queries = op.frontier.sent_queries.saturating_add(1);
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.dispatch_put_lookup_requests",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key)
+    )]
     fn dispatch_put_lookup_requests(
         &mut self,
         op_id: OpId,
@@ -1264,6 +1413,7 @@ impl DhtStateMachine {
                 DhtRequest::FindNode {
                     target: *op.key.as_bytes(),
                 },
+                op.trace_context.clone(),
                 out,
             );
             op.frontier.sent_queries = op.frontier.sent_queries.saturating_add(1);
@@ -1276,6 +1426,12 @@ impl DhtStateMachine {
             && op.frontier.pending_exhausted()
     }
 
+    #[tracing::instrument(
+        name = "dht.state.begin_put_store",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key)
+    )]
     fn begin_put_store(&mut self, op_id: OpId, op: &mut PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
         if op.lookup_finished {
             return;
@@ -1297,11 +1453,18 @@ impl DhtStateMachine {
                     publisher: self.local_id,
                     signature: Some(op.signature),
                 },
+                op.trace_context.clone(),
                 out,
             );
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.maybe_complete_get",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key, value_count = op.values.len())
+    )]
     fn maybe_complete_get(&mut self, op_id: OpId, op: GetOp, out: &mut SmallVec<[DhtEffect; 4]>) {
         if !op.values.is_empty()
             || (pending_rpc_count(&op.pending, RpcPhase::GetLookup) == 0
@@ -1316,6 +1479,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.maybe_complete_put",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key)
+    )]
     fn maybe_complete_put(&mut self, op_id: OpId, op: PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
         let mut op = op;
 
@@ -1337,6 +1506,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.finish_bootstrap",
+        level = "debug",
+        skip(self, op, error, out),
+        fields(op_id, active_nodes = op.active_nodes, error = %error)
+    )]
     fn finish_bootstrap(
         &mut self,
         op_id: OpId,
@@ -1358,6 +1533,12 @@ impl DhtStateMachine {
         }
     }
 
+    #[tracing::instrument(
+        name = "dht.state.schedule_maintenance_ping",
+        level = "trace",
+        skip(self, out),
+        fields(now_tick)
+    )]
     fn schedule_maintenance_ping(&mut self, now_tick: u64, out: &mut SmallVec<[DhtEffect; 4]>) {
         let mut peers = self.routing_table.all_peers();
         if peers.is_empty() {
@@ -1384,6 +1565,7 @@ impl DhtStateMachine {
         self.ops.insert(op_id, op);
     }
 
+    #[tracing::instrument(name = "dht.state.schedule_cleanup", level = "trace", skip(self, out))]
     fn schedule_cleanup(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
         if self.cleanup_inflight {
             return;
@@ -1398,6 +1580,12 @@ impl DhtStateMachine {
         })));
     }
 
+    #[tracing::instrument(
+        name = "dht.state.insert_peer",
+        level = "debug",
+        skip(self, out),
+        fields(node_id = %node_id)
+    )]
     fn insert_peer(&mut self, node_id: NodeId, out: &mut SmallVec<[DhtEffect; 4]>) {
         if node_id == self.local_id {
             return;
@@ -1435,6 +1623,12 @@ impl DhtStateMachine {
         self.ops.insert(op_id, op);
     }
 
+    #[tracing::instrument(
+        name = "dht.state.queue_rpc",
+        level = "debug",
+        skip(self, op, request, out),
+        fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+    )]
     fn queue_rpc(
         &self,
         op_id: OpId,
@@ -1444,9 +1638,25 @@ impl DhtStateMachine {
         request: DhtRequest,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
-        self.queue_rpc_pending(op_id, op.pending_mut(), phase, peer, request, out);
+        let trace_context = op.trace_context();
+        self.queue_rpc_pending(
+            op_id,
+            op.pending_mut(),
+            phase,
+            peer,
+            request,
+            trace_context,
+            out,
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "dht.state.queue_rpc_pending",
+        level = "debug",
+        skip(self, pending, request, trace_context, out),
+        fields(op_id, phase = ?phase, peer = %peer, request = ?request)
+    )]
     fn queue_rpc_pending(
         &self,
         op_id: OpId,
@@ -1454,6 +1664,7 @@ impl DhtStateMachine {
         phase: RpcPhase,
         peer: NodeId,
         request: DhtRequest,
+        trace_context: Option<DistributedTraceContext>,
         out: &mut SmallVec<[DhtEffect; 4]>,
     ) {
         let deadline_tick = self.current_tick.saturating_add(RPC_TIMEOUT_TICKS);
@@ -1469,9 +1680,16 @@ impl DhtStateMachine {
             phase,
             peer,
             request,
+            trace_context,
         })));
     }
 
+    #[tracing::instrument(
+        name = "dht.state.queue_storage_read",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, stage = ?stage, key = %key, realm_id = ?realm_filter)
+    )]
     fn queue_storage_read(
         &self,
         op_id: OpId,
@@ -1496,6 +1714,12 @@ impl DhtStateMachine {
         })));
     }
 
+    #[tracing::instrument(
+        name = "dht.state.queue_storage_write",
+        level = "debug",
+        skip(self, pending, entries, out),
+        fields(op_id, stage = ?stage, key = %key, entry_count = entries.len())
+    )]
     fn queue_storage_write_pending(
         &self,
         op_id: OpId,
@@ -1520,6 +1744,7 @@ impl DhtStateMachine {
         })));
     }
 
+    #[tracing::instrument(name = "dht.state.collect_timeouts", level = "trace", skip(self))]
     fn collect_timed_out_rpc(&self) -> Vec<(OpId, RpcPhase, NodeId)> {
         let mut timed_out = Vec::new();
 
@@ -1539,6 +1764,7 @@ impl DhtStateMachine {
         timed_out
     }
 
+    #[tracing::instrument(name = "dht.state.alloc_internal_op", level = "trace", skip(self))]
     fn alloc_internal_op_id(&mut self) -> OpId {
         let op_id = self.next_internal_op_id;
         self.next_internal_op_id = self.next_internal_op_id.saturating_add(1);
@@ -1587,6 +1813,72 @@ fn rpc_phase_order(phase: RpcPhase) -> u8 {
     }
 }
 
+fn dht_input_kind(input: &DhtInput) -> &'static str {
+    match input {
+        DhtInput::Cmd(cmd) => dht_cmd_kind(cmd),
+        DhtInput::Io(io) => dht_io_kind(io),
+        DhtInput::Tick { .. } => "tick",
+    }
+}
+
+fn dht_cmd_kind(cmd: &DhtCmd) -> &'static str {
+    match cmd {
+        DhtCmd::Put { .. } => "put",
+        DhtCmd::Get { .. } => "get",
+        DhtCmd::Bootstrap { .. } => "bootstrap",
+        DhtCmd::RoutingTableSize { .. } => "routing_table_size",
+        DhtCmd::AddPeer { .. } => "add_peer",
+    }
+}
+
+fn dht_io_kind(io: &DhtIo) -> &'static str {
+    match io {
+        DhtIo::RpcResponse { .. } => "rpc_response",
+        DhtIo::RpcError { .. } => "rpc_error",
+        DhtIo::InboundRequest { .. } => "inbound_request",
+        DhtIo::InboundReadError { .. } => "inbound_read_error",
+        DhtIo::InboundDropped { .. } => "inbound_dropped",
+        DhtIo::StorageReadResult { .. } => "storage_read_result",
+        DhtIo::StorageWriteResult { .. } => "storage_write_result",
+        DhtIo::StorageDeleteResult { .. } => "storage_delete_result",
+        DhtIo::StorageIterResult { .. } => "storage_iter_result",
+        DhtIo::StorageError { .. } => "storage_error",
+        DhtIo::PeerSeen { .. } => "peer_seen",
+    }
+}
+
+fn dht_io_op_id(io: &DhtIo) -> Option<OpId> {
+    match io {
+        DhtIo::RpcResponse { op_id, .. }
+        | DhtIo::RpcError { op_id, .. }
+        | DhtIo::StorageReadResult { op_id, .. }
+        | DhtIo::StorageWriteResult { op_id, .. }
+        | DhtIo::StorageDeleteResult { op_id, .. }
+        | DhtIo::StorageIterResult { op_id, .. }
+        | DhtIo::StorageError { op_id, .. } => Some(*op_id),
+        DhtIo::InboundRequest { .. }
+        | DhtIo::InboundReadError { .. }
+        | DhtIo::InboundDropped { .. }
+        | DhtIo::PeerSeen { .. } => None,
+    }
+}
+
+fn dht_io_inbound_id(io: &DhtIo) -> Option<InboundId> {
+    match io {
+        DhtIo::InboundRequest { inbound_id, .. }
+        | DhtIo::InboundReadError { inbound_id, .. }
+        | DhtIo::InboundDropped { inbound_id } => Some(*inbound_id),
+        DhtIo::RpcResponse { .. }
+        | DhtIo::RpcError { .. }
+        | DhtIo::StorageReadResult { .. }
+        | DhtIo::StorageWriteResult { .. }
+        | DhtIo::StorageDeleteResult { .. }
+        | DhtIo::StorageIterResult { .. }
+        | DhtIo::StorageError { .. }
+        | DhtIo::PeerSeen { .. } => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1601,6 +1893,13 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = seed;
         RealmId::from_bytes(bytes)
+    }
+
+    fn make_trace_context(seed: u8) -> DistributedTraceContext {
+        DistributedTraceContext::new(
+            format!("00-{seed:032x}-{seed:016x}-01"),
+            Some(format!("test={seed}")),
+        )
     }
 
     #[test]
@@ -1649,6 +1948,7 @@ mod tests {
                 realm_id: make_realm(1),
                 value: b"hello".to_vec(),
                 ttl: std::time::Duration::from_secs(30),
+                trace_context: None,
             }),
             DhtInput::Io(DhtIo::StorageReadResult {
                 op_id: 1,
@@ -1683,6 +1983,7 @@ mod tests {
         let effects = state.step(DhtInput::Cmd(DhtCmd::Bootstrap {
             op_id: 5,
             nodes: vec![peer],
+            trace_context: None,
         }));
 
         assert!(effects.iter().any(|effect| {
@@ -1739,6 +2040,7 @@ mod tests {
             op_id: 9,
             key,
             realm_filter: None,
+            trace_context: None,
         }));
 
         let local_read_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -1756,6 +2058,7 @@ mod tests {
                         phase: RpcPhase::GetLookup,
                         peer,
                         request: DhtRequest::GetValue { .. },
+                        ..
                     } if op_id == 9 && peer == first_peer),
                 _ => false,
             }
@@ -1780,10 +2083,83 @@ mod tests {
                         phase: RpcPhase::GetLookup,
                         peer,
                         request: DhtRequest::GetValue { .. },
+                        ..
                 } if op_id == 9 && peer == second_peer),
                 _ => false,
             }
         }));
+    }
+
+    #[test]
+    fn get_trace_context_propagates_to_remote_lookup() {
+        let local_secret = iroh::SecretKey::from_bytes(&[32u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let peer = make_node(3);
+        let key = DhtKeyId::from_data(b"trace-context-get");
+        let trace_context = make_trace_context(1);
+
+        let _ = state.step(DhtInput::Cmd(DhtCmd::AddPeer { node_id: peer }));
+        let _ = state.step(DhtInput::Cmd(DhtCmd::Get {
+            op_id: 10,
+            key,
+            realm_filter: None,
+            trace_context: Some(trace_context.clone()),
+        }));
+
+        let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
+            op_id: 10,
+            stage: StorageStage::GetLocalRead,
+            entries: Vec::new(),
+        }));
+
+        let propagated = effects.iter().find_map(|effect| {
+            if let DhtEffect::IoRequest(inner) = effect
+                && let DhtIoRequest::RpcRequest {
+                    phase: RpcPhase::GetLookup,
+                    trace_context,
+                    ..
+                } = &(**inner)
+            {
+                trace_context.clone()
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(propagated, Some(trace_context));
+    }
+
+    #[test]
+    fn bootstrap_trace_context_propagates_to_ping() {
+        let local_secret = iroh::SecretKey::from_bytes(&[33u8; 32]);
+        let local_id = local_secret.public();
+        let mut state = DhtStateMachine::new(local_id, local_secret, 0);
+
+        let peer = make_node(4);
+        let trace_context = make_trace_context(2);
+        let effects = state.step(DhtInput::Cmd(DhtCmd::Bootstrap {
+            op_id: 10,
+            nodes: vec![peer],
+            trace_context: Some(trace_context.clone()),
+        }));
+
+        let propagated = effects.iter().find_map(|effect| {
+            if let DhtEffect::IoRequest(inner) = effect
+                && let DhtIoRequest::RpcRequest {
+                    phase: RpcPhase::Bootstrap,
+                    trace_context,
+                    ..
+                } = &(**inner)
+            {
+                trace_context.clone()
+            } else {
+                None
+            }
+        });
+
+        assert_eq!(propagated, Some(trace_context));
     }
 
     #[test]
@@ -1799,6 +2175,7 @@ mod tests {
             realm_id: make_realm(1),
             value: b"value".to_vec(),
             ttl: std::time::Duration::from_secs(60),
+            trace_context: None,
         }));
         let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 11,
@@ -1838,6 +2215,7 @@ mod tests {
             realm_id: make_realm(1),
             value: b"value".to_vec(),
             ttl: std::time::Duration::from_secs(60),
+            trace_context: None,
         }));
         let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 12,
@@ -1920,6 +2298,7 @@ mod tests {
             realm_id: make_realm(1),
             value: b"value".to_vec(),
             ttl: std::time::Duration::from_secs(60),
+            trace_context: None,
         }));
         let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 13,
@@ -1979,6 +2358,7 @@ mod tests {
             realm_id: make_realm(1),
             value: b"value".to_vec(),
             ttl: std::time::Duration::from_secs(60),
+            trace_context: None,
         }));
         let _ = state.step(DhtInput::Io(DhtIo::StorageReadResult {
             op_id: 14,
@@ -2085,6 +2465,7 @@ mod tests {
             op_id: 15,
             key,
             realm_filter: None,
+            trace_context: None,
         }));
 
         let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -2133,6 +2514,7 @@ mod tests {
             op_id: 22,
             key,
             realm_filter: Some(make_realm(1)),
+            trace_context: None,
         }));
 
         let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -2173,6 +2555,7 @@ mod tests {
             op_id: 23,
             key,
             realm_filter: Some(realm_filter),
+            trace_context: None,
         }));
 
         let effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -2193,6 +2576,7 @@ mod tests {
                         key: req_key,
                         realm_filter: Some(req_realm_filter),
                     },
+                    ..
                 } if *req_peer == peer && *req_key == key && *req_realm_filter == realm_filter),
                 _ => false,
             }
@@ -2215,6 +2599,7 @@ mod tests {
             op_id: 16,
             key,
             realm_filter: None,
+            trace_context: None,
         }));
 
         let local_effects = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -2302,6 +2687,7 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::Bootstrap {
             op_id: 17,
             nodes: vec![peer_a, peer_b],
+            trace_context: None,
         }));
 
         let first = state.step(DhtInput::Io(DhtIo::RpcResponse {
@@ -2343,6 +2729,7 @@ mod tests {
         let _ = state.step(DhtInput::Cmd(DhtCmd::Bootstrap {
             op_id: 18,
             nodes: vec![peer],
+            trace_context: None,
         }));
 
         let wrong_phase = state.step(DhtInput::Io(DhtIo::RpcResponse {
@@ -2381,6 +2768,7 @@ mod tests {
             op_id: 19,
             key,
             realm_filter: None,
+            trace_context: None,
         }));
 
         let wrong_stage = state.step(DhtInput::Io(DhtIo::StorageReadResult {
@@ -2426,6 +2814,7 @@ mod tests {
                 publisher,
                 signature: None,
             },
+            trace_context: None,
         }));
 
         assert!(effects.iter().any(|effect| {
@@ -2461,6 +2850,7 @@ mod tests {
                 key,
                 realm_filter: Some(realm_filter),
             },
+            trace_context: None,
         }));
 
         let op_id = effects
@@ -2551,6 +2941,7 @@ mod tests {
                 publisher: publisher_secret.public(),
                 signature: Some(invalid_signature),
             },
+            trace_context: None,
         }));
 
         assert!(effects.iter().any(|effect| {
@@ -2596,6 +2987,7 @@ mod tests {
                 publisher: publisher_secret.public(),
                 signature: Some(signature),
             },
+            trace_context: None,
         }));
 
         assert!(effects.iter().any(|effect| {
@@ -2634,12 +3026,13 @@ mod tests {
         assert!(tick_effects.iter().any(|effect| {
             match effect {
                 DhtEffect::IoRequest(inner) => matches!(
-                **inner,
+                &(**inner),
                 DhtIoRequest::RpcRequest {
                     phase: RpcPhase::MaintenancePing,
                     peer: req_peer,
+                    trace_context: None,
                     ..
-                } if req_peer == peer),
+                } if *req_peer == peer),
                 _ => false,
             }
         }));

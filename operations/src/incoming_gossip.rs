@@ -128,13 +128,8 @@ impl IncomingGossipOperation {
         }
     }
 
-    fn trace_fields(&self) -> (Option<Ulid>, Option<String>) {
-        (
-            self.message.as_ref().map(|message| message.message_id),
-            self.message
-                .as_ref()
-                .and_then(|message| message.trace_id.clone()),
-        )
+    fn message_id(&self) -> Option<Ulid> {
+        self.message.as_ref().map(|message| message.message_id)
     }
 }
 
@@ -207,7 +202,7 @@ impl Operation for IncomingGossipOperation {
                         Err(error) => return self.fail(error.into()),
                     };
                     let same_heads = local_clock.heads == *heads;
-                    let (message_id, _trace_id) = self.trace_fields();
+                    let message_id = self.message_id();
 
                     if same_heads && local_clock.change_count == *change_count {
                         trace!(
@@ -457,7 +452,6 @@ mod tests {
             TopicMessageKind::Group,
             Ulid::new(),
             node_id,
-            None,
             TopicMessageVersion::Automerge {
                 heads: clock.heads,
                 change_count: clock.change_count,
@@ -553,7 +547,6 @@ mod tests {
             TopicMessageKind::Metadata,
             Ulid::new(),
             make_node(14),
-            None,
             TopicMessageVersion::Metadata {
                 clock: VectorClock(BTreeMap::<ActorId, u64>::new()),
             },

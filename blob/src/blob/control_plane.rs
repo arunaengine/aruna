@@ -9,6 +9,8 @@ use tokio::io::{AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWr
 use tokio::time::timeout;
 use ulid::Ulid;
 
+const MAX_CONTROL_PLANE_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+
 pub(super) fn control_plane_timeout_event(
     kind: ControlPlaneTimeoutKind,
     action: &'static str,
@@ -82,6 +84,13 @@ pub(super) async fn send_framed_message_with_timeout(
     timeout_duration: Duration,
     action: &'static str,
 ) -> Result<(), BlobEvent> {
+    if payload.len() > MAX_CONTROL_PLANE_MESSAGE_SIZE {
+        return Err(BlobEvent::Error(BlobError::WriteError(format!(
+            "control-plane message exceeds maximum size: {} bytes",
+            payload.len()
+        ))));
+    }
+
     match with_control_plane_timeout(
         async {
             TokioAsyncWriteExt::write_u32(sender, payload.len() as u32).await?;
@@ -108,6 +117,12 @@ pub(super) async fn read_framed_message_with_timeout(
     match with_control_plane_timeout(
         async {
             let msg_len = TokioAsyncReadExt::read_u32(receiver).await?;
+            if msg_len as usize > MAX_CONTROL_PLANE_MESSAGE_SIZE {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("control-plane frame too large: {msg_len} bytes"),
+                ));
+            }
             let mut buf = vec![0; msg_len as usize];
             TokioAsyncReadExt::read_exact(receiver, &mut buf).await?;
             Ok::<Vec<u8>, std::io::Error>(buf)

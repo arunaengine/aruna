@@ -11,6 +11,7 @@ aruna-core = { workspace = true }
 aruna-storage = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
+opentelemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
@@ -25,6 +26,7 @@ byteview = { workspace = true }
 futures = { workspace = true }
 n0-future = { workspace = true }
 tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 smallvec = { workspace = true }
 crossfire = { workspace = true }
 

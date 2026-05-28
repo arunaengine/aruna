@@ -21,7 +21,7 @@ use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::TaskEvent;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
@@ -33,8 +33,20 @@ pub struct DriverContext {
 
 const MAX_SUBOP_DEPTH: usize = 32;
 
+#[tracing::instrument(
+    name = "operation.effect",
+    level = "debug",
+    skip(effect, context),
+    fields(depth, effect = effect_kind(&effect))
+)]
 async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) -> Event {
     let effect_name = effect_kind(&effect);
+    if depth == 0 {
+        tracing::debug!(
+            effect = effect_name,
+            "Dispatching top-level operation effect"
+        );
+    }
     trace!(
         event = "operation.effect.dispatch",
         depth,
@@ -105,7 +117,12 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                     max_depth: MAX_SUBOP_DEPTH,
                 })
             } else {
-                drive_suboperation(sub_operation, context, depth + 1).await
+                let context = context.clone();
+                tokio::spawn(
+                    async move { drive_suboperation(sub_operation, &context, depth + 1).await },
+                )
+                .await
+                .expect("suboperation task panicked or was cancelled")
             }
         }
         Effect::Task(task_effect) => {
@@ -135,6 +152,13 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
         result = event_kind(&event),
         "Received operation event"
     );
+    if depth == 0 {
+        tracing::debug!(
+            effect = effect_name,
+            result = event_kind(&event),
+            "Received top-level operation event"
+        );
+    }
 
     event
 }
@@ -183,53 +207,54 @@ fn drive_suboperation<'a>(
     })
 }
 
+#[tracing::instrument(
+    name = "operation",
+    level = "debug",
+    skip(operation, context),
+    fields(operation = type_name::<O>())
+)]
 pub async fn drive<O: Operation>(
     mut operation: O,
     context: &DriverContext,
 ) -> Result<O::Output, O::Error> {
     let operation_name = type_name::<O>();
-    let span = debug_span!("operation", operation = %operation_name);
 
-    async move {
-        trace!(
-            event = "operation.started",
-            operation = %operation_name,
-            "Starting operation"
-        );
+    trace!(
+        event = "operation.started",
+        operation = %operation_name,
+        "Starting operation"
+    );
 
-        let mut queue: VecDeque<_> = operation.start().into_iter().collect();
+    let mut queue: VecDeque<_> = operation.start().into_iter().collect();
 
-        while !operation.is_complete() {
-            while let Some(effect) = queue.pop_front() {
-                let event = dispatch_effect(effect, context, 0).await;
-                queue.extend(operation.step(event));
-            }
+    while !operation.is_complete() {
+        while let Some(effect) = queue.pop_front() {
+            let event = dispatch_effect(effect, context, 0).await;
+            queue.extend(operation.step(event));
+        }
 
-            if queue.is_empty() && !operation.is_complete() {
-                queue.extend(operation.abort());
-                if queue.is_empty() {
-                    break;
-                }
+        if queue.is_empty() && !operation.is_complete() {
+            queue.extend(operation.abort());
+            if queue.is_empty() {
+                break;
             }
         }
-        let result = operation.finalize();
-        match &result {
-            Ok(_) => trace!(
-                event = "operation.completed",
-                operation = %operation_name,
-                "Completed operation"
-            ),
-            Err(error) => error!(
-                event = "operation.failed",
-                operation = %operation_name,
-                error = ?error,
-                "Operation failed"
-            ),
-        }
-        result
     }
-    .instrument(span)
-    .await
+    let result = operation.finalize();
+    match &result {
+        Ok(_) => trace!(
+            event = "operation.completed",
+            operation = %operation_name,
+            "Completed operation"
+        ),
+        Err(error) => error!(
+            event = "operation.failed",
+            operation = %operation_name,
+            error = ?error,
+            "Operation failed"
+        ),
+    }
+    result
 }
 
 fn effect_kind(effect: &Effect) -> &'static str {

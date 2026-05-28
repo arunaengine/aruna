@@ -1,12 +1,13 @@
 #![warn(missing_debug_implementations, rust_2018_idioms)]
 #![deny(unsafe_code)]
 
+mod connection_pool;
 pub mod dht;
 mod effect_handlers;
 pub mod error;
 pub mod gossip;
-mod monitoring;
 pub mod streams;
+mod telemetry;
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -33,17 +34,19 @@ use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, TransportAddrUsage, VarInt, presets};
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
 use parking_lot::RwLock;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, warn};
 
+pub use connection_pool::Monitor;
 pub use dht::DhtHandle;
 pub use error::{NetError, Result};
 pub use gossip::GossipService;
-pub use monitoring::Monitor;
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
+const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 256;
+use connection_pool::{ConnectionPool, ConnectionPoolOptions};
 pub use streams::StreamsService;
 
 #[derive(Clone)]
@@ -239,6 +242,9 @@ pub fn endpoint_addr_from_config_string(value: &str) -> std::result::Result<Endp
             ));
         }
     }
+    if addrs.is_empty() {
+        return Err("endpoint address must include at least one relay or ip address".to_string());
+    }
     Ok(EndpointAddr::from_parts(node_id, addrs))
 }
 
@@ -348,6 +354,7 @@ struct NetInner {
     dht: Arc<DhtHandle>,
     gossip: Arc<GossipService>,
     streams: Arc<StreamsService>,
+    connection_pool: ConnectionPool,
     peer_connectivity: Arc<Mutex<PeerConnectivityManagerState>>,
     network_diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
     peer_connectivity_tx: mpsc::Sender<PeerConnectivityEvent>,
@@ -469,8 +476,15 @@ impl NetHandle {
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
 
-        let (dht_handle, dht_resources) =
-            DhtHandle::spawn(endpoint.clone(), storage.clone(), shutdown.child_token())?;
+        let connection_pool =
+            ConnectionPool::new(endpoint.clone(), ConnectionPoolOptions::default());
+
+        let (dht_handle, dht_resources) = DhtHandle::spawn(
+            endpoint.clone(),
+            storage.clone(),
+            connection_pool.clone(),
+            shutdown.child_token(),
+        )?;
         let dht = Arc::new(dht_handle);
 
         let gossip = Arc::new(
@@ -488,7 +502,7 @@ impl NetHandle {
         gossip.restore_subscriptions().await?;
 
         let streams = Arc::new(StreamsService::new(
-            endpoint.clone(),
+            connection_pool.clone(),
             shutdown.child_token(),
         ));
 
@@ -527,7 +541,7 @@ impl NetHandle {
         let dht_for_inbound = dht.clone();
         let gossip_for_inbound = gossip.clone();
         let dht_task = tokio::spawn(async move {
-            while let Some((conn, send, recv, peer_id)) = dht_rx.recv().await {
+            while let Some((send, recv, peer_id)) = dht_rx.recv().await {
                 if let Err(err) = dht_for_inbound.add_peer(peer_id) {
                     warn!(
                         node_id = %peer_id,
@@ -536,7 +550,7 @@ impl NetHandle {
                     );
                 }
                 gossip_for_inbound.add_bootstrap_node(peer_id);
-                match dht_inbound_tx.try_send((conn, send, recv, peer_id)) {
+                match dht_inbound_tx.try_send((send, recv, peer_id)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
                         warn!(node_id = %peer_id, "Dropping inbound DHT stream: queue full");
@@ -588,8 +602,9 @@ impl NetHandle {
         let dht_for_streams = dht.clone();
         let gossip_for_streams = gossip.clone();
         let inbound_handler_for_streams = inbound_handler.clone();
+        let inbound_stream_handlers = Arc::new(Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
         let stream_task = tokio::spawn(async move {
-            while let Some((alpn, send, recv, peer_id)) = stream_rx.recv().await {
+            while let Some((alpn, stream, peer_id)) = stream_rx.recv().await {
                 if let Err(err) = dht_for_streams.add_peer(peer_id) {
                     warn!(
                         node_id = %peer_id,
@@ -601,10 +616,17 @@ impl NetHandle {
 
                 let handler = inbound_handler_for_streams.read().clone();
                 if let Some(handler) = handler {
+                    let Ok(permit) = inbound_stream_handlers.clone().try_acquire_owned() else {
+                        warn!(
+                            node_id = %peer_id,
+                            alpn = %alpn,
+                            "Dropping inbound stream: handler limit reached"
+                        );
+                        continue;
+                    };
                     tokio::spawn(async move {
-                        handler
-                            .handle_incoming_stream(alpn, (send, recv), peer_id)
-                            .await;
+                        let _permit = permit;
+                        handler.handle_incoming_stream(alpn, stream, peer_id).await;
                     });
                 } else {
                     warn!(node_id = %peer_id, "Dropping inbound stream without registered handler");
@@ -672,6 +694,7 @@ impl NetHandle {
             dht,
             gossip,
             streams,
+            connection_pool,
             peer_connectivity,
             network_diagnostics,
             peer_connectivity_tx,
@@ -755,6 +778,12 @@ impl NetHandle {
     }
 
     pub async fn open_stream(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
+        if matches!(alpn, Alpn::Dht | Alpn::Gossip) {
+            return Err(NetError::Stream(format!(
+                "{alpn} is an internal network protocol"
+            )));
+        }
+
         if node_id != self.inner.node_id {
             if let Err(err) = self.inner.dht.add_peer(node_id) {
                 warn!(
@@ -872,6 +901,9 @@ impl NetHandle {
         self.inner.shutdown.cancel();
         if let Err(err) = self.inner.gossip.gossip().shutdown().await {
             warn!(error = %err, "Gossip shutdown returned error");
+        }
+        if let Err(err) = self.inner.connection_pool.shutdown().await {
+            warn!(error = %err, "Connection pool shutdown returned error");
         }
         self.inner.endpoint.close().await;
 
@@ -1001,6 +1033,12 @@ async fn publish_realm_endpoint_announcement(
     let expires_at = issued_at.saturating_add(ttl_secs);
     let node_id = endpoint.id();
     let endpoint_addr = local_endpoint_addr(endpoint, configured_relay_urls);
+    if endpoint_addr.addrs.is_empty() {
+        return Err(NetError::Dht(
+            "refusing to publish DHT-signed endpoint announcement without dialable addresses"
+                .to_string(),
+        ));
+    }
     let signing_bytes = realm_endpoint_announcement_signing_bytes(
         &realm_id,
         &node_id,
@@ -1160,6 +1198,9 @@ fn validate_realm_endpoint_announcement(
     if announcement.endpoint_addr.id != requested_peer {
         return Err("announcement endpoint id does not match requested peer".to_string());
     }
+    if announcement.endpoint_addr.addrs.is_empty() {
+        return Err("announcement endpoint address has no dialable addresses".to_string());
+    }
     if announcement.issued_at > announcement.expires_at || announcement.expires_at <= now {
         return Err("announcement is expired or has invalid timestamps".to_string());
     }
@@ -1209,23 +1250,32 @@ fn install_dht_signed_endpoint(
 
 fn local_endpoint_addr(endpoint: &Endpoint, configured_relay_urls: &[String]) -> EndpointAddr {
     let observed = endpoint.addr();
-    let mut addr = EndpointAddr::new(endpoint.id());
+    let mut addrs = Vec::new();
 
-    for relay in observed.relay_urls().cloned() {
-        addr = addr.with_relay_url(relay);
+    for transport in observed.addrs {
+        push_transport_addr(&mut addrs, transport);
     }
     for relay in configured_relay_urls {
         if let Ok(relay) = relay.parse::<iroh::RelayUrl>() {
-            addr = addr.with_relay_url(relay);
+            push_transport_addr(&mut addrs, TransportAddr::Relay(relay));
         }
     }
     for socket in endpoint.bound_sockets() {
         if !socket.ip().is_unspecified() {
-            addr = addr.with_ip_addr(socket);
+            push_transport_addr(&mut addrs, TransportAddr::Ip(socket));
         }
     }
 
-    addr
+    EndpointAddr::from_parts(endpoint.id(), addrs)
+}
+
+fn push_transport_addr(addrs: &mut Vec<TransportAddr>, addr: TransportAddr) {
+    if matches!(&addr, TransportAddr::Ip(socket) if socket.ip().is_unspecified()) {
+        return;
+    }
+    if !addrs.iter().any(|existing| existing == &addr) {
+        addrs.push(addr);
+    }
 }
 
 fn authorize_dht_signed_node(
@@ -1793,6 +1843,12 @@ fn net_warnings(
 
 #[async_trait]
 impl Handle for NetHandle {
+    #[tracing::instrument(
+        name = "net.handle.send_effect",
+        level = "debug",
+        skip(self, effect),
+        fields(effect = net_handle_effect_kind(&effect))
+    )]
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
             Effect::Net(net_effect) => {
@@ -1814,6 +1870,23 @@ impl Handle for NetHandle {
             }
             _ => Event::Net(NetEvent::Error(CoreNetError::InvalidEffect)),
         }
+    }
+}
+
+fn net_handle_effect_kind(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::Net(NetEffect::Dht(_)) => "dht",
+        Effect::Net(NetEffect::Gossip(_)) => "gossip",
+        Effect::Net(NetEffect::Stream(_)) => "stream",
+        Effect::Blob(_) => "blob",
+        Effect::StagingSource(_) => "staging_source",
+        Effect::Storage(_) => "storage",
+        Effect::Automerge(_) => "automerge",
+        Effect::Metadata(_) => "metadata",
+        Effect::SubOperation(_) => "suboperation",
+        Effect::Task(_) => "task",
+        Effect::Search() => "search",
+        Effect::Stream() => "stream",
     }
 }
 
@@ -2117,6 +2190,7 @@ mod tests {
         let status = handle.get_status().await;
         assert!(status.discovery_methods.is_empty());
         assert_eq!(status.relay_method, "none");
+        assert!(!status.endpoint_addr.addrs.is_empty());
         assert!(
             status
                 .endpoint_addr
@@ -2270,6 +2344,74 @@ mod tests {
             .flat_map(|peer| &peer.active_addresses)
             .map(|address| address.protocol_connections.len())
             .sum()
+    }
+
+    fn protocol_connection_count_for(
+        status: &NetState,
+        node_id: NodeId,
+        alpn: Alpn,
+        side: iroh::endpoint::Side,
+    ) -> usize {
+        status
+            .connections
+            .iter()
+            .filter(|peer| peer.node_id == node_id)
+            .flat_map(|peer| &peer.active_addresses)
+            .flat_map(|address| &address.protocol_connections)
+            .filter(|connection| connection.alpn == Some(alpn) && connection.side == side)
+            .count()
+    }
+
+    async fn wait_for_protocol_connection_count(
+        handle: &NetHandle,
+        node_id: NodeId,
+        alpn: Alpn,
+        side: iroh::endpoint::Side,
+        expected: usize,
+    ) -> NetState {
+        for _ in 0..50 {
+            let status = handle.get_status().await;
+            if protocol_connection_count_for(&status, node_id, alpn, side) == expected {
+                return status;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+
+        handle.get_status().await
+    }
+
+    #[tokio::test]
+    async fn outbound_streams_reuse_pooled_connection() -> Result<()> {
+        let (a, _a_dir) = test_net_handle().await?;
+        let (b, _b_dir) = test_net_handle().await?;
+        a.add_peer_addr(b.endpoint_addr()).await;
+        b.add_peer_addr(a.endpoint_addr()).await;
+
+        let _first = a.open_stream(b.node_id(), Alpn::Bao).await?;
+        let _second = a.open_stream(b.node_id(), Alpn::Bao).await?;
+
+        let status = wait_for_protocol_connection_count(
+            &a,
+            b.node_id(),
+            Alpn::Bao,
+            iroh::endpoint::Side::Client,
+            1,
+        )
+        .await;
+
+        assert_eq!(
+            protocol_connection_count_for(
+                &status,
+                b.node_id(),
+                Alpn::Bao,
+                iroh::endpoint::Side::Client,
+            ),
+            1
+        );
+
+        a.shutdown().await;
+        b.shutdown().await;
+        Ok(())
     }
 
     #[tokio::test]

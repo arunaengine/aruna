@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use aruna_core::DistributedTraceContext;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::RealmId;
@@ -29,15 +30,18 @@ pub enum DhtCmd {
         realm_id: RealmId,
         value: Vec<u8>,
         ttl: Duration,
+        trace_context: Option<DistributedTraceContext>,
     },
     Get {
         op_id: OpId,
         key: DhtKeyId,
         realm_filter: Option<RealmId>,
+        trace_context: Option<DistributedTraceContext>,
     },
     Bootstrap {
         op_id: OpId,
         nodes: Vec<NodeId>,
+        trace_context: Option<DistributedTraceContext>,
     },
     RoutingTableSize {
         op_id: OpId,
@@ -91,12 +95,14 @@ pub enum StorageStage {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum DhtIoRequest {
     RpcRequest {
         op_id: OpId,
         phase: RpcPhase,
         peer: NodeId,
         request: DhtRequest,
+        trace_context: Option<DistributedTraceContext>,
     },
     RpcResponse {
         inbound_id: InboundId,
@@ -148,6 +154,7 @@ pub enum DhtIo {
         inbound_id: InboundId,
         peer: NodeId,
         request: DhtRequest,
+        trace_context: Option<DistributedTraceContext>,
     },
     InboundReadError {
         inbound_id: InboundId,

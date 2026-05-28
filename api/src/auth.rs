@@ -2,7 +2,9 @@ use crate::error::{OidcError, ServerError, ServerResult, TokenError};
 use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::ConversionError;
-use aruna_core::structs::{AuthContext, OidcProviderConfig, Permission, RealmId, TokenClaims};
+use aruna_core::structs::{
+    AuthContext, OidcProviderConfig, Permission, RealmId, TokenClaims, blob_object_permission_path,
+};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use axum::extract::Request;
@@ -484,16 +486,21 @@ pub(crate) fn bucket_blob_permission_path(
     bucket: &str,
     key: &str,
 ) -> String {
-    format!(
-        "/{}/g/{group_id}/data/{}/{bucket}/{key}",
+    blob_object_permission_path(
         state.get_realm_id(),
+        group_id,
         state.get_node_id(),
+        bucket,
+        key,
     )
 }
 
 #[cfg(test)]
 mod test {
-    use crate::auth::{OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, extract_auth_context};
+    use crate::auth::{
+        OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, bucket_blob_permission_path,
+        extract_auth_context,
+    };
     use crate::server::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -530,6 +537,47 @@ mod test {
     use tokio::net::TcpListener;
     use tokio::sync::RwLock;
     use ulid::Ulid;
+
+    #[tokio::test]
+    async fn bucket_blob_permission_path_matches_canonical_blob_object_path() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let realm_id = RealmId::from_bytes(
+            *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        let node_id = iroh::SecretKey::generate().public();
+        let state = ServerState::new(
+            Arc::new(DriverContext {
+                storage_handle,
+                net_handle: None,
+                blob_handle: None,
+                automerge_handle: None,
+                metadata_handle: None,
+                task_handle: None,
+            }),
+            realm_id,
+            node_id,
+            NodeCapabilities::local_node(realm_id).unwrap(),
+            false,
+            None,
+        )
+        .await;
+
+        let group_id = Ulid::from_bytes([9u8; 16]);
+        assert_eq!(
+            bucket_blob_permission_path(&state, group_id, "bucket", "nested/file.txt"),
+            aruna_core::structs::blob_object_permission_path(
+                realm_id,
+                group_id,
+                node_id,
+                "bucket",
+                "nested/file.txt",
+            )
+        );
+    }
 
     #[derive(Clone)]
     struct OidcTestServerState {

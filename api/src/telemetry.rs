@@ -7,7 +7,6 @@ use axum::response::Response;
 use http::{HeaderMap, Method};
 use opentelemetry::global;
 use opentelemetry::propagation::Extractor;
-use opentelemetry::trace::TraceContextExt;
 use tracing::{Instrument, Span, error, field, info_span, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ulid::Ulid;
@@ -57,6 +56,11 @@ pub fn make_request_span(
     let request_id = Ulid::new().to_string();
     let span = info_span!(
         "request",
+        "otel.kind" = "server",
+        "otel.status_code" = field::Empty,
+        "otel.status_description" = field::Empty,
+        "http.request.method" = %method,
+        "url.path" = %path,
         protocol = protocol,
         request_id = %request_id,
         method = %method,
@@ -64,13 +68,13 @@ pub fn make_request_span(
         status_code = field::Empty,
         user_id = field::Empty,
         realm_id = field::Empty,
-        trace_id = field::Empty,
+        group_id = field::Empty,
+        group_name = field::Empty,
     );
 
     let parent =
         global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(headers)));
     let _ = span.set_parent(parent);
-    record_trace_id(&span);
     span
 }
 
@@ -100,6 +104,13 @@ pub fn emit_request_completed(
     started: Instant,
 ) {
     span.record("status_code", status_code);
+    if status_code >= 500 {
+        span.record("otel.status_code", "ERROR");
+        span.record(
+            "otel.status_description",
+            field::display(format!("HTTP {status_code}")),
+        );
+    }
     let _guard = span.enter();
     let latency_ms = started.elapsed().as_millis() as u64;
     match status_code {
@@ -125,9 +136,4 @@ pub fn emit_request_completed(
             "Completed request"
         ),
     }
-}
-
-fn record_trace_id(span: &Span) {
-    let trace_id = span.context().span().span_context().trace_id().to_string();
-    span.record("trace_id", field::display(trace_id));
 }

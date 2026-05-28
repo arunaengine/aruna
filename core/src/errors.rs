@@ -119,6 +119,10 @@ pub enum StorageError {
     DeleteError,
     #[error("Channel closed")]
     ChannelClosed,
+    #[error("Queue full")]
+    QueueFull,
+    #[error("Timeout")]
+    Timeout,
     #[error("Invalid effect type")]
     InvalidEffect,
 }

@@ -8,14 +8,15 @@ use aruna_core::errors::{
 };
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    S3_CURRENT_VERSION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::{
-    BackendLocation, CurrentVersionPointer, LookupKey, MultipartChecksumType,
-    MultipartObjectMetadataKey, MultipartObjectSummary, ResolvedSourceAccess, SourceMetadata,
-    VersionKey, VersionMetadata, VersionState,
+    BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer,
+    MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectSummary,
+    ResolvedSourceAccess, SourceMetadata, VersionKey,
 };
 use aruna_core::types::Effects;
 use bytes::Bytes;
@@ -30,6 +31,7 @@ pub enum GetObjectState {
     Init,
     StartTransaction,
     GetVersion,
+    GetBlobLocation,
     GetCurrentVersion,
     ResolveReferenceAccess,
     ReadMultipartSummary,
@@ -215,19 +217,19 @@ impl GetObjectOperation {
                     Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
                 };
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_VERSION_KEYSPACE.to_string(),
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                     key,
                     txn_id: self.txn_id,
                 })]
             } else {
                 self.state = GetObjectState::GetCurrentVersion;
 
-                let key = match LookupKey::object(&self.input.bucket, &self.input.key).to_bytes() {
+                let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
                     Ok(key) => key.into(),
                     Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
                 };
                 smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
                     key,
                     txn_id: self.txn_id,
                 })]
@@ -258,12 +260,16 @@ impl GetObjectOperation {
             });
         };
 
-        let metadata = match VersionMetadata::from_bytes(val.as_ref()) {
-            Ok(metadata) => metadata,
+        let version = match BlobVersion::from_bytes(val.as_ref()) {
+            Ok(version) => version,
             Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
         };
 
-        self.read_version(metadata, self.input.version_id.is_some())
+        let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+
+        self.read_version(version_id, version, self.input.version_id.is_some())
     }
 
     fn handle_received_current_version(&mut self, event: Event) -> Effects {
@@ -294,7 +300,7 @@ impl GetObjectOperation {
         self.resolved_version_id = Some(pointer.version_id);
         self.state = GetObjectState::GetVersion;
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key,
             txn_id: self.txn_id,
         })]
@@ -302,35 +308,61 @@ impl GetObjectOperation {
 
     fn read_version(
         &mut self,
-        metadata: VersionMetadata,
+        version_id: Ulid,
+        version: BlobVersion,
         explicit_version_request: bool,
     ) -> Effects {
-        let version_id = metadata.version_id;
+        self.resolved_version_id = Some(version_id);
 
-        let location = match metadata.state {
-            VersionState::Materialized { location, .. } => location,
-            VersionState::Deleted => {
-                return self.emit_error(if explicit_version_request {
-                    GetObjectError::DeleteMarker
-                } else {
-                    GetObjectError::NoSuchKey
-                });
-            }
-            VersionState::Reference { source, .. } => {
+        match version.state {
+            BlobVersionState::Materialized { blob_hash, .. } => self.read_blob_location(blob_hash),
+            BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
+                GetObjectError::DeleteMarker
+            } else {
+                GetObjectError::NoSuchKey
+            }),
+            BlobVersionState::Reference { source, .. } => {
                 self.location = None;
                 self.reference_access = None;
                 self.reference_stream = None;
                 self.source_metadata = None;
                 self.last_refresh = None;
-                self.resolved_version_id = Some(version_id);
                 self.state = GetObjectState::ResolveReferenceAccess;
-                return smallvec![resolve_version_source_binding_suboperation(
+                smallvec![resolve_version_source_binding_suboperation(
                     ResolveVersionSourceBindingInput { source },
-                )];
+                )]
             }
+        }
+    }
+
+    fn read_blob_location(&mut self, blob_hash: [u8; 32]) -> Effects {
+        self.state = GetObjectState::GetBlobLocation;
+        smallvec![Effect::Storage(StorageEffect::Read {
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: blob_hash.to_vec().into(),
+            txn_id: self.txn_id,
+        })]
+    }
+
+    fn handle_blob_location_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(GetObjectError::InvalidStateEvent {
+                state: self.state.clone(),
+                expected: "Event::Storage(StorageEvent::ReadResult)",
+                received: event,
+            });
         };
 
-        self.read_multipart_summary(location, Some(version_id))
+        let Some(value) = value else {
+            return self.emit_error(GetObjectError::GetObjectFailed);
+        };
+
+        let location = match BackendLocation::from_bytes(value.as_ref()) {
+            Ok(location) => location,
+            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
+        };
+
+        self.read_multipart_summary(location, self.resolved_version_id)
     }
 
     fn handle_resolved_reference_access(&mut self, event: Event) -> Effects {
@@ -598,6 +630,7 @@ impl Operation for GetObjectOperation {
             GetObjectState::Init => self.handle_init(),
             GetObjectState::StartTransaction => self.handle_transaction_started(event),
             GetObjectState::GetVersion => self.handle_received_version(event),
+            GetObjectState::GetBlobLocation => self.handle_blob_location_read(event),
             GetObjectState::GetCurrentVersion => self.handle_received_current_version(event),
             GetObjectState::ResolveReferenceAccess => self.handle_resolved_reference_access(event),
             GetObjectState::ReadMultipartSummary => self.handle_multipart_summary_read(event),
@@ -643,14 +676,14 @@ mod test {
     use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
     use aruna_core::events::{Event, StagingSourceEvent, StorageEvent};
     use aruna_core::keyspaces::{
-        S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE, S3_VERSION_KEYSPACE,
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        Backend, BackendConfig, BackendLocation, CurrentVersionPointer, Location, LookupKey,
-        MultipartChecksumType, PortableSourceDescriptor, RealmId, ResolvedSourceAccess,
-        SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey, VersionMetadata,
-        VersionSourceBinding, VersionState,
+        Backend, BackendConfig, BackendLocation, BlobHeadKey, BlobVersion, BlobVersionState,
+        CurrentVersionPointer, MultipartChecksumType, PortableSourceDescriptor, RealmId,
+        ResolvedSourceAccess, SourceConnectorKind, SourceMetadata, StagingStrategy, VersionKey,
+        VersionSourceBinding,
     };
     use aruna_net::{NetConfig, NetHandle};
     use aruna_storage::storage;
@@ -909,6 +942,7 @@ mod test {
         let content = "Hello, World!";
         let hasher = Hasher::new_with_bytes(content.as_bytes());
         let hashes = hasher.finalize();
+        let blake3_hash: [u8; 32] = hashes.blake3.into();
 
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
@@ -941,43 +975,37 @@ mod test {
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
         {
-            let hash_lookup_key = LookupKey::from_blake3_hash(hashes.blake3.as_slice())
-                .unwrap()
-                .to_bytes()
-                .unwrap();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
-                    key: hash_lookup_key.into(),
-                    value: Location::Real(location.clone()).to_bytes().unwrap().into(),
-                    txn_id: None,
+                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    key: blake3_hash.to_vec().into(),
+                    value: location.clone().to_bytes().unwrap().into(),
+                    txn_id: Some(txn_id),
                 })
                 .await;
 
-            let object_lookup_key = LookupKey::object(&bucket, &key).to_bytes().unwrap();
             let version_id = Ulid::new();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-                    key: object_lookup_key.into(),
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                    key: BlobHeadKey::new(&bucket, &key).to_bytes().unwrap().into(),
                     value: CurrentVersionPointer::new(version_id)
                         .to_bytes()
                         .unwrap()
                         .into(),
-                    txn_id: None,
+                    txn_id: Some(txn_id),
                 })
                 .await;
 
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_VERSION_KEYSPACE.to_string(),
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                     key: VersionKey::new(&bucket, &key, version_id)
                         .to_bytes()
                         .unwrap()
                         .into(),
-                    value: VersionMetadata::materialized(
-                        version_id,
-                        location.clone(),
+                    value: BlobVersion::materialized(
+                        blake3_hash,
                         location.created_at,
                         location.created_by,
                         None,
@@ -985,7 +1013,7 @@ mod test {
                     .to_bytes()
                     .unwrap()
                     .into(),
-                    txn_id: None,
+                    txn_id: Some(txn_id),
                 })
                 .await;
 
@@ -1061,6 +1089,7 @@ mod test {
         let tampered = "Hallo, World!";
         let hasher = Hasher::new_with_bytes(content.as_bytes());
         let hashes = hasher.finalize();
+        let blake3_hash: [u8; 32] = hashes.blake3.into();
 
         let bucket = "s3test".to_string();
         let key = "test.txt".to_string();
@@ -1092,43 +1121,37 @@ mod test {
             .send_storage_effect(StorageEffect::StartTransaction { read: false })
             .await
         {
-            let hash_lookup_key = LookupKey::from_blake3_hash(hashes.blake3.as_slice())
-                .unwrap()
-                .to_bytes()
-                .unwrap();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_LOOKUP_KEYSPACE.to_string(),
-                    key: hash_lookup_key.into(),
-                    value: Location::Real(location.clone()).to_bytes().unwrap().into(),
-                    txn_id: None,
+                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    key: blake3_hash.to_vec().into(),
+                    value: location.clone().to_bytes().unwrap().into(),
+                    txn_id: Some(txn_id),
                 })
                 .await;
 
-            let object_lookup_key = LookupKey::object(&bucket, &key).to_bytes().unwrap();
             let version_id = Ulid::new();
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-                    key: object_lookup_key.into(),
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                    key: BlobHeadKey::new(&bucket, &key).to_bytes().unwrap().into(),
                     value: CurrentVersionPointer::new(version_id)
                         .to_bytes()
                         .unwrap()
                         .into(),
-                    txn_id: None,
+                    txn_id: Some(txn_id),
                 })
                 .await;
 
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
-                    key_space: S3_VERSION_KEYSPACE.to_string(),
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                     key: VersionKey::new(&bucket, &key, version_id)
                         .to_bytes()
                         .unwrap()
                         .into(),
-                    value: VersionMetadata::materialized(
-                        version_id,
-                        location.clone(),
+                    value: BlobVersion::materialized(
+                        blake3_hash,
                         location.created_at,
                         location.created_by,
                         None,
@@ -1136,7 +1159,7 @@ mod test {
                     .to_bytes()
                     .unwrap()
                     .into(),
-                    txn_id: None,
+                    txn_id: Some(txn_id),
                 })
                 .await;
 
@@ -1254,8 +1277,8 @@ mod test {
 
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-                key: LookupKey::object(&bucket, &key).to_bytes().unwrap().into(),
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new(&bucket, &key).to_bytes().unwrap().into(),
                 value: CurrentVersionPointer::new(version_id)
                     .to_bytes()
                     .unwrap()
@@ -1266,13 +1289,12 @@ mod test {
 
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key: VersionKey::new(&bucket, &key, version_id)
                     .to_bytes()
                     .unwrap()
                     .into(),
-                value: VersionMetadata::reference(
-                    version_id,
+                value: BlobVersion::reference(
                     source,
                     cached_metadata,
                     SystemTime::UNIX_EPOCH,
@@ -1325,7 +1347,7 @@ mod test {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = driver_ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key: VersionKey::new("s3test", "test.txt", version_id)
                     .to_bytes()
                     .unwrap()
@@ -1336,8 +1358,8 @@ mod test {
         else {
             panic!("missing version metadata");
         };
-        let metadata = VersionMetadata::from_bytes(value.unwrap().as_ref()).unwrap();
-        let VersionState::Reference {
+        let metadata = BlobVersion::from_bytes(value.unwrap().as_ref()).unwrap();
+        let BlobVersionState::Reference {
             cached_metadata,
             last_refresh,
             ..
@@ -1406,8 +1428,8 @@ mod test {
 
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-                key: LookupKey::object("s3test", "refresh.txt")
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new("s3test", "refresh.txt")
                     .to_bytes()
                     .unwrap()
                     .into(),
@@ -1420,13 +1442,12 @@ mod test {
             .await;
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key: VersionKey::new("s3test", "refresh.txt", version_id)
                     .to_bytes()
                     .unwrap()
                     .into(),
-                value: VersionMetadata::reference(
-                    version_id,
+                value: BlobVersion::reference(
                     source,
                     SourceMetadata {
                         content_length: 1,
@@ -1486,7 +1507,7 @@ mod test {
         let Event::Storage(StorageEvent::ReadResult { value, .. }) = driver_ctx
             .storage_handle
             .send_storage_effect(StorageEffect::Read {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
                 key: VersionKey::new("s3test", "refresh.txt", version_id)
                     .to_bytes()
                     .unwrap()
@@ -1497,8 +1518,8 @@ mod test {
         else {
             panic!("missing version metadata");
         };
-        let metadata = VersionMetadata::from_bytes(value.unwrap().as_ref()).unwrap();
-        let VersionState::Reference {
+        let metadata = BlobVersion::from_bytes(value.unwrap().as_ref()).unwrap();
+        let BlobVersionState::Reference {
             cached_metadata,
             last_refresh,
             ..

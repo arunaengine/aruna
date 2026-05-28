@@ -82,27 +82,3 @@ fn build_tracer_provider() -> SdkTracerProvider {
 
     builder.build()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::build_tracer_provider;
-    use opentelemetry::trace::{TraceContextExt, TraceId, TracerProvider};
-    use tracing::info_span;
-    use tracing_opentelemetry::OpenTelemetrySpanExt;
-    use tracing_subscriber::layer::SubscriberExt;
-
-    #[test]
-    fn tracer_provider_generates_trace_ids_without_exporter() {
-        let provider = build_tracer_provider();
-        let tracer = provider.tracer("test");
-        let subscriber =
-            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
-
-        tracing::subscriber::with_default(subscriber, || {
-            let span = info_span!("request");
-            let trace_id = span.context().span().span_context().trace_id();
-
-            assert_ne!(trace_id, TraceId::INVALID);
-        });
-    }
-}

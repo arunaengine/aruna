@@ -30,7 +30,7 @@ use http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::trace;
+use tracing::error;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
@@ -249,7 +249,7 @@ async fn try_claim_initial_admin(state: &Arc<ServerState>, user_id: UserId) {
         path_restrictions: None,
     };
     if let Err(error) = state.claim_initial_realm_admin(&auth_context).await {
-        trace!(error = %error, "Failed to claim initial realm admin after user registration");
+        error!(error = %error, "Failed to claim initial realm admin after user registration");
     }
 }
 

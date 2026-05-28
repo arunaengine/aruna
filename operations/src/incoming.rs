@@ -5,6 +5,7 @@ use crate::incoming_automerge::IncomingAutomergeOperation;
 use crate::incoming_gossip::IncomingGossipOperation;
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
+use crate::telemetry::extract_trace_context;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
@@ -13,7 +14,8 @@ use aruna_core::id::{NodeId, TopicId};
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
-use tracing::{Instrument, error, field, info_span, trace, warn};
+use tracing::{Instrument, debug, error, info_span, trace, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -37,19 +39,28 @@ pub fn initialize_net_incoming(context: Arc<DriverContext>) {
 
 #[async_trait]
 impl InboundEventHandler for OperationsInboundHandler {
+    #[tracing::instrument(
+        name = "operations.inbound.gossip",
+        level = "debug",
+        skip(self, data),
+        fields(topic = %topic, sender = %sender, message_len = data.len())
+    )]
     async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>) {
         let message = postcard::from_bytes::<TopicMessage>(&data).ok();
         let span = info_span!(
             "gossip.receive",
+            "otel.kind" = "consumer",
+            "messaging.system" = "iroh-gossip",
             topic = %topic,
             sender = %sender,
             message_id = ?message.as_ref().map(|message| message.message_id),
-            trace_id = field::Empty,
         );
-        if let Some(message) = message.as_ref()
-            && let Some(trace_id) = message.trace_id.as_ref()
+        if let Some(trace_context) = message
+            .as_ref()
+            .and_then(|message| message.trace_context.as_ref())
         {
-            span.record("trace_id", field::display(trace_id));
+            let parent = extract_trace_context(trace_context);
+            let _ = span.set_parent(parent);
         }
 
         async move {
@@ -76,6 +87,12 @@ impl InboundEventHandler for OperationsInboundHandler {
         .await;
     }
 
+    #[tracing::instrument(
+        name = "operations.inbound.stream",
+        level = "debug",
+        skip(self, stream),
+        fields(peer = %node_id, alpn = ?alpn)
+    )]
     async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
         let span = info_span!("net.incoming_stream", peer = %node_id, alpn = ?alpn);
 
@@ -97,6 +114,15 @@ impl InboundEventHandler for OperationsInboundHandler {
                             Event::Blob(BlobEvent::MessageReceived { payload, .. }) => {
                                 match VersionReplicationMessage::from_bytes(&payload) {
                                     Ok(VersionReplicationMessage::VersionManifest(manifest)) => {
+                                        debug!(
+                                            peer = %node_id,
+                                            stream_id = %stream_id,
+                                            bucket = %manifest.bucket,
+                                            key = %manifest.key,
+                                            version_id = %manifest.version_id,
+                                            kind = ?manifest.kind,
+                                            "Received inbound version replication manifest"
+                                        );
                                         let op = IncomingVersionReplicationOperation::new(
                                             stream_id,
                                             net_handle.node_id(),

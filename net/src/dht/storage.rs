@@ -2,6 +2,7 @@ use aruna_core::id::NodeId;
 use aruna_core::structs::RealmId;
 use aruna_core::util::unix_timestamp_secs;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 pub const CLEANUP_PAGE_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,7 +15,10 @@ pub struct StoredEntry {
 }
 
 pub fn decode_entries(bytes: &[u8]) -> Vec<StoredEntry> {
-    postcard::from_bytes(bytes).unwrap_or_default()
+    postcard::from_bytes(bytes).unwrap_or_else(|error| {
+        warn!(error = %error, "Failed to decode stored DHT entries");
+        Vec::new()
+    })
 }
 
 pub fn encode_entries(entries: &[StoredEntry]) -> Option<Vec<u8>> {

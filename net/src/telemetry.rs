@@ -1,9 +1,14 @@
+use std::time::Duration;
+
 use aruna_core::DistributedTraceContext;
 use opentelemetry::Context;
 use opentelemetry::global;
 use opentelemetry::propagation::{Extractor, Injector};
-use tracing::Span;
+use tracing::{Span, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+pub(crate) const SLOW_IROH_PHASE_THRESHOLD: Duration = Duration::from_millis(500);
+pub(crate) const SLOW_IROH_REQUEST_THRESHOLD: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct TraceContextCarrier {
@@ -58,14 +63,51 @@ impl Extractor for TraceContextCarrier {
     }
 }
 
-pub fn current_trace_context() -> Option<DistributedTraceContext> {
+pub(crate) fn current_trace_context() -> Option<DistributedTraceContext> {
     let context = Span::current().context();
     let mut carrier = TraceContextCarrier::default();
     global::get_text_map_propagator(|propagator| propagator.inject_context(&context, &mut carrier));
     carrier.into_trace_context()
 }
 
-pub fn extract_trace_context(trace_context: &DistributedTraceContext) -> Context {
+pub(crate) fn extract_trace_context(trace_context: &DistributedTraceContext) -> Context {
     let carrier = TraceContextCarrier::from_trace_context(trace_context);
     global::get_text_map_propagator(|propagator| propagator.extract(&carrier))
+}
+
+pub(crate) fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+pub(crate) fn record_duration_ms(span: &Span, field: &'static str, duration: Duration) {
+    span.record(field, duration_ms(duration));
+}
+
+pub(crate) fn warn_if_slow_iroh_phase(
+    operation: &'static str,
+    phase: &'static str,
+    duration: Duration,
+) {
+    if duration >= SLOW_IROH_PHASE_THRESHOLD {
+        warn!(
+            event = "iroh.network.slow_phase",
+            operation,
+            phase,
+            duration_ms = duration_ms(duration),
+            threshold_ms = duration_ms(SLOW_IROH_PHASE_THRESHOLD),
+            "Slow Iroh network phase"
+        );
+    }
+}
+
+pub(crate) fn warn_if_slow_iroh_request(operation: &'static str, duration: Duration) {
+    if duration >= SLOW_IROH_REQUEST_THRESHOLD {
+        warn!(
+            event = "iroh.network.slow_request",
+            operation,
+            duration_ms = duration_ms(duration),
+            threshold_ms = duration_ms(SLOW_IROH_REQUEST_THRESHOLD),
+            "Slow Iroh network request"
+        );
+    }
 }

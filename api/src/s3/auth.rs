@@ -1,6 +1,9 @@
 use super::util::get_s3_operation_permission;
 use aruna_core::NodeId;
-use aruna_core::structs::{AuthContext, BucketInfo, Permission, RealmId, UserAccess};
+use aruna_core::structs::{
+    AuthContext, BucketInfo, Permission, RealmId, UserAccess, blob_bucket_permission_path,
+    blob_group_permission_path, blob_object_permission_path,
+};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::get_bucket_info::{GetBucketInfoError, GetBucketInfoOperation};
@@ -168,22 +171,15 @@ impl AuthProvider {
             }
         };
 
-        let mut path = self.bucket_path(group_id, &bucket);
-        if let Some(key) = key {
-            path.push('/');
-            path.push_str(&key);
-        }
-        Ok(path)
-    }
-
-    fn bucket_path(&self, group_id: ulid::Ulid, bucket: &str) -> String {
-        format!(
-            "/{}/g/{}/data/{}/{bucket}",
-            self.realm_id, group_id, self.node_id
-        )
+        Ok(match key {
+            Some(key) => {
+                blob_object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key)
+            }
+            None => blob_bucket_permission_path(self.realm_id, group_id, self.node_id, &bucket),
+        })
     }
 
     fn group_data_path(&self, group_id: ulid::Ulid) -> String {
-        format!("/{}/g/{}/data/{}", self.realm_id, group_id, self.node_id)
+        blob_group_permission_path(self.realm_id, group_id, self.node_id)
     }
 }

@@ -7,6 +7,7 @@ pub mod add_user_to_realm_role;
 pub mod announce;
 pub mod announce_realm_presence;
 pub mod automerge;
+pub mod blob;
 pub mod check_permissions;
 pub mod claim_initial_realm_admin;
 pub mod connectors;

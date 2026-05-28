@@ -26,6 +26,7 @@ pub const BAO_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); // 2^16 byt
 pub type EffectHandle = (BlobEffect, oneshot::TxOneshot<BlobEvent>);
 pub type EffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::AsyncRx<mpsc::Array<EffectHandle>>;
+type SharedBiStream = Arc<Mutex<BiStream>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlPlaneTimeoutKind {
@@ -39,7 +40,7 @@ pub struct BlobHandler {
     backend_config: BackendConfig,
     storage: StorageHandle,
     net: NetHandle,
-    connections: Arc<Mutex<HashMap<Ulid, BiStream>>>,
+    connections: Arc<Mutex<HashMap<Ulid, SharedBiStream>>>,
     operator_status: Arc<RwLock<aruna_core::structs::Status>>,
 }
 

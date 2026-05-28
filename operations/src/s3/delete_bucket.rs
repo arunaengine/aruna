@@ -2,11 +2,11 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, S3_VERSION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE,
 };
 use aruna_core::operation::Operation;
-use aruna_core::structs::{BucketInfo, LookupKey, MultipartUpload, VersionKey};
+use aruna_core::structs::{BlobHeadKey, BucketInfo, MultipartUpload, VersionKey};
 use aruna_core::types::{Effects, TxnId};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -114,10 +114,15 @@ impl DeleteBucketOperation {
             return self.emit_error(err.into());
         }
 
+        let prefix = match BlobHeadKey::bucket_prefix(&self.bucket) {
+            Ok(prefix) => prefix,
+            Err(err) => return self.emit_error(err.into()),
+        };
+
         self.state = DeleteBucketState::CheckCurrentObjects;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-            prefix: None,
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
             start_after: None,
             limit: Self::SCAN_LIMIT,
             txn_id: self.txn_id,
@@ -133,19 +138,19 @@ impl DeleteBucketOperation {
             });
         };
 
-        for (key, _) in values {
-            let Ok(lookup_key) = LookupKey::from_bytes(key.as_ref()) else {
-                continue;
-            };
-            if matches!(lookup_key, LookupKey::Object { bucket, .. } if bucket == self.bucket) {
-                return self.emit_error(DeleteBucketError::NotEmpty);
-            }
+        if !values.is_empty() {
+            return self.emit_error(DeleteBucketError::NotEmpty);
         }
+
+        let prefix = match VersionKey::bucket_prefix(&self.bucket) {
+            Ok(prefix) => prefix,
+            Err(err) => return self.emit_error(err.into()),
+        };
 
         self.state = DeleteBucketState::CheckVersions;
         smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
-            prefix: None,
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: Some(prefix.into()),
             start_after: None,
             limit: Self::SCAN_LIMIT,
             txn_id: self.txn_id,
@@ -161,13 +166,8 @@ impl DeleteBucketOperation {
             });
         };
 
-        for (key, _) in values {
-            let Ok(version_key) = VersionKey::from_bytes(key.as_ref()) else {
-                continue;
-            };
-            if version_key.bucket == self.bucket {
-                return self.emit_error(DeleteBucketError::NotEmpty);
-            }
+        if !values.is_empty() {
+            return self.emit_error(DeleteBucketError::NotEmpty);
         }
 
         self.state = DeleteBucketState::CheckMultipartUploads;
@@ -175,7 +175,7 @@ impl DeleteBucketOperation {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             prefix: None,
             start_after: None,
-            limit: Self::SCAN_LIMIT,
+            limit: u64::MAX as usize,
             txn_id: self.txn_id,
         })]
     }
@@ -302,12 +302,14 @@ mod test {
     use crate::driver::{DriverContext, drive};
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::S3_BUCKET_REPLICATION_KEYSPACE;
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+    };
     use aruna_core::structs::{
-        BackendLocation, BucketReplicationConfig, BucketReplicationTarget, RealmId, VersionMetadata,
+        BlobVersion, BucketReplicationConfig, BucketReplicationTarget, CurrentVersionPointer,
+        RealmId,
     };
     use aruna_storage::storage;
-    use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -495,25 +497,12 @@ mod test {
             })
             .await;
 
-        let location = BackendLocation {
-            root: "/tmp".to_string(),
-            storage_bucket: "bucket".to_string(),
-            backend_path: format!("obj/key_{}", Ulid::new()),
-            ulid: Ulid::new(),
-            compressed: false,
-            encrypted: false,
-            created_by: Default::default(),
-            created_at: SystemTime::now(),
-            staging: false,
-            partial: false,
-            blob_size: 1,
-            hashes: HashMap::from([("blake3".to_string(), vec![0u8; 32])]),
-        };
+        let version_id = Ulid::new();
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-                key: LookupKey::object(&bucket, "key").to_bytes().unwrap().into(),
-                value: aruna_core::structs::CurrentVersionPointer::new(Ulid::new())
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new(&bucket, "key").to_bytes().unwrap().into(),
+                value: CurrentVersionPointer::new(version_id)
                     .to_bytes()
                     .unwrap()
                     .into(),
@@ -522,21 +511,64 @@ mod test {
             .await;
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
-                key: VersionKey::new(&bucket, "key", Ulid::new())
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new(&bucket, "key", version_id)
                     .to_bytes()
                     .unwrap()
                     .into(),
-                value: VersionMetadata::materialized(
-                    Ulid::new(),
-                    location,
-                    SystemTime::now(),
-                    Default::default(),
-                    None,
-                )
+                value: BlobVersion::deleted(SystemTime::now(), Default::default())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await;
+
+        let result = drive(DeleteBucketOperation::new(bucket), &driver_ctx).await;
+        assert_eq!(result.unwrap_err(), DeleteBucketError::NotEmpty);
+    }
+
+    #[tokio::test]
+    async fn test_delete_bucket_not_empty_with_versions_only() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let bucket = "bucket-a".to_string();
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: bucket.clone().into(),
+                value: BucketInfo {
+                    group_id: Ulid::new(),
+                    created_at: SystemTime::now(),
+                    created_by: Default::default(),
+                }
                 .to_bytes()
                 .unwrap()
                 .into(),
+                txn_id: None,
+            })
+            .await;
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new(&bucket, "deleted-key", Ulid::new())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: BlobVersion::deleted(SystemTime::now(), Default::default())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
                 txn_id: None,
             })
             .await;

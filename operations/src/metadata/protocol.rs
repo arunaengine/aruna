@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
-const MAX_MESSAGE_SIZE: usize = 128 * 1024 * 1024;
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataTransportMessage {

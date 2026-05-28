@@ -230,12 +230,12 @@ impl BlobHandler {
     }
 
     pub async fn send_message(&mut self, stream_id: Ulid, payload: Vec<u8>) -> BlobEvent {
-        let mut connections = self.connections.lock().await;
-        let Some((sx, _)) = connections.get_mut(&stream_id) else {
-            return BlobEvent::Error(BlobError::ReplicationRejected(
-                "Stream not available".to_string(),
-            ));
+        let stream = match self.connection_handle(stream_id).await {
+            Ok(stream) => stream,
+            Err(event) => return event,
         };
+        let mut stream = stream.lock().await;
+        let sx = &mut stream.0;
 
         if let Err(event) = super::control_plane::send_framed_message_with_timeout(
             sx,
@@ -252,12 +252,12 @@ impl BlobHandler {
     }
 
     pub async fn read_message(&mut self, stream_id: Ulid) -> BlobEvent {
-        let mut connections = self.connections.lock().await;
-        let Some((_, rx)) = connections.get_mut(&stream_id) else {
-            return BlobEvent::Error(BlobError::ReplicationRejected(
-                "Stream not available".to_string(),
-            ));
+        let stream = match self.connection_handle(stream_id).await {
+            Ok(stream) => stream,
+            Err(event) => return event,
         };
+        let mut stream = stream.lock().await;
+        let rx = &mut stream.1;
 
         let buf = match super::control_plane::read_framed_message_with_timeout(
             rx,
@@ -278,19 +278,39 @@ impl BlobHandler {
 
     pub async fn add_connection(&mut self, stream_id: Option<Ulid>, stream: BiStream) -> Ulid {
         let stream_id = stream_id.unwrap_or_default();
-        self.connections.lock().await.insert(stream_id, stream);
+        self.connections
+            .lock()
+            .await
+            .insert(stream_id, Arc::new(Mutex::new(stream)));
         stream_id
     }
 
     pub async fn close_connection(&mut self, stream_id: Ulid) -> BlobEvent {
         let connection = self.connections.lock().await.remove(&stream_id);
-        let Some((mut sx, mut rx)) = connection else {
+        let Some(stream) = connection else {
             return BlobEvent::ConnectionClosed { stream_id };
         };
+        let mut stream = stream.lock().await;
 
-        _ = sx.finish();
-        _ = rx.stop(0u32.into());
+        _ = stream.0.finish();
+        _ = stream.1.stop(0u32.into());
         BlobEvent::ConnectionClosed { stream_id }
+    }
+
+    pub(super) async fn connection_handle(
+        &self,
+        stream_id: Ulid,
+    ) -> Result<Arc<Mutex<BiStream>>, BlobEvent> {
+        self.connections
+            .lock()
+            .await
+            .get(&stream_id)
+            .cloned()
+            .ok_or_else(|| {
+                BlobEvent::Error(BlobError::ReplicationRejected(
+                    "Stream not available".to_string(),
+                ))
+            })
     }
 
     async fn monitor_operator_status(&self) {

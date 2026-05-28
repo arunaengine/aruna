@@ -1,3 +1,6 @@
+use crate::blob::blob_keyspace_helper::{
+    HeadAliasContext, build_head_transition_effects, write_blob_version_effect,
+};
 use crate::connectors::repository::{source_connector_key, source_connector_secret_key};
 use crate::connectors::resolver::secret_fingerprint;
 use crate::driver::{DriverContext, drive};
@@ -5,16 +8,16 @@ use crate::staging::descriptor::build_version_source_binding;
 use crate::staging::head_source::{
     HeadStagingSourceError, HeadStagingSourceInput, HeadStagingSourceOperation,
 };
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    S3_CURRENT_VERSION_KEYSPACE, S3_VERSION_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
     SOURCE_CONNECTOR_SECRET_KEYSPACE,
 };
 use aruna_core::structs::{
-    CurrentVersionPointer, RealmId, SourceConnector, SourceConnectorSecret, SourceMetadata,
-    StagingStrategy, VersionKey, VersionMetadata, VersionSourceBinding,
+    BlobHeadKey, BlobVersion, CurrentVersionPointer, RealmId, SourceConnector,
+    SourceConnectorSecret, SourceMetadata, StagingStrategy, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{GroupId, NodeId, TxnId, UserId};
 use std::time::SystemTime;
@@ -95,71 +98,50 @@ pub async fn materialize_reference(
         )
         .await?;
 
-        let current_key = LookupKey::object(&input.bucket, &input.key).to_bytes()?;
-        let existing_pointer = match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Read {
-                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-                key: current_key.clone().into(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-                .as_ref()
-                .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
-                .transpose()?,
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MaterializeReferenceError::Storage(error));
-            }
-            _ => return Err(MaterializeReferenceError::Storage(StorageError::ReadError)),
-        };
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-                key: current_key.into(),
-                value: CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id)
-                    .to_bytes()?
-                    .into(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MaterializeReferenceError::Storage(error));
-            }
-            _ => return Err(MaterializeReferenceError::Storage(StorageError::WriteError)),
-        }
-
-        let version_key = VersionKey::new(&input.bucket, &input.key, version_id).to_bytes()?;
-        let version_value = VersionMetadata::reference(
-            version_id,
-            version_source.clone(),
-            head_result.metadata.clone(),
-            now,
-            input.user_id,
-            now,
+        let existing_pointer =
+            read_current_pointer(context, txn_id, &input.bucket, &input.key).await?;
+        let previous_current_hash = read_previous_current_materialized_hash(
+            context,
+            txn_id,
+            &input.bucket,
+            &input.key,
+            existing_pointer.as_ref(),
         )
-        .to_bytes()?;
+        .await?;
+        let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id);
 
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: S3_VERSION_KEYSPACE.to_string(),
-                key: version_key.into(),
-                value: version_value.into(),
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => {
-                return Err(MaterializeReferenceError::Storage(error));
-            }
-            _ => return Err(MaterializeReferenceError::Storage(StorageError::WriteError)),
+        for effect in build_head_transition_effects(
+            &HeadAliasContext::new(
+                input.realm_id,
+                input.group_id,
+                input.node_id,
+                &input.bucket,
+                &input.key,
+            ),
+            previous_current_hash,
+            Some(next_pointer),
+            None,
+            Some(txn_id),
+        )? {
+            apply_storage_effect(context, effect).await?;
         }
+
+        let version_key = VersionKey::new(&input.bucket, &input.key, version_id);
+        apply_storage_effect(
+            context,
+            write_blob_version_effect(
+                &version_key,
+                &BlobVersion::reference(
+                    version_source.clone(),
+                    head_result.metadata.clone(),
+                    now,
+                    input.user_id,
+                    now,
+                ),
+                Some(txn_id),
+            )?,
+        )
+        .await?;
 
         match context
             .storage_handle
@@ -192,7 +174,87 @@ pub async fn materialize_reference(
     })
 }
 
-use aruna_core::structs::LookupKey;
+async fn apply_storage_effect(
+    context: &DriverContext,
+    effect: Effect,
+) -> Result<(), MaterializeReferenceError> {
+    let Effect::Storage(storage_effect) = effect else {
+        return Err(MaterializeReferenceError::Storage(
+            StorageError::InvalidEffect,
+        ));
+    };
+
+    match context
+        .storage_handle
+        .send_storage_effect(storage_effect)
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. })
+        | Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        _ => Err(StorageError::WriteError.into()),
+    }
+}
+
+async fn read_current_pointer(
+    context: &DriverContext,
+    txn_id: TxnId,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<CurrentVersionPointer>, MaterializeReferenceError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
+            key: BlobHeadKey::new(bucket, key).to_bytes()?.into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .as_ref()
+            .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(Into::into),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        _ => Err(StorageError::ReadError.into()),
+    }
+}
+
+async fn read_previous_current_materialized_hash(
+    context: &DriverContext,
+    txn_id: TxnId,
+    bucket: &str,
+    key: &str,
+    existing_pointer: Option<&CurrentVersionPointer>,
+) -> Result<Option<[u8; 32]>, MaterializeReferenceError> {
+    let Some(existing_pointer) = existing_pointer else {
+        return Ok(None);
+    };
+
+    let version_key = VersionKey::new(bucket, key, existing_pointer.version_id).to_bytes()?;
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: version_key.into(),
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .as_ref()
+            .map(|value| -> Result<Option<[u8; 32]>, ConversionError> {
+                let version = BlobVersion::from_bytes(value.as_ref())?;
+                Ok(version.blob_hash().copied())
+            })
+            .transpose()
+            .map(Option::flatten)
+            .map_err(Into::into),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        _ => Err(StorageError::ReadError.into()),
+    }
+}
 
 async fn guard_resolved_connector_unchanged(
     context: &DriverContext,
@@ -249,14 +311,25 @@ async fn guard_resolved_connector_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::drive;
+    use crate::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::staging::test_utils::{create_http_connector, setup_driver_context};
+    use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
         SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
     };
-    use aruna_core::structs::{SourceConnectorKind, SourceConnectorSecret};
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::{
+        BlobHeadKey, BlobVersion, CurrentVersionPointer, HashPathIndexKey, SourceConnectorKind,
+        SourceConnectorSecret,
+    };
     use aruna_storage::storage;
+    use axum::{Router, routing::get};
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::{TempDir, tempdir};
+    use tokio::net::TcpListener;
 
     fn test_context() -> (TempDir, DriverContext) {
         let tempdir = tempdir().expect("tempdir must be created");
@@ -379,6 +452,26 @@ mod tests {
         );
     }
 
+    async fn read_value(
+        context: &DriverContext,
+        key_space: &str,
+        key: Vec<u8>,
+    ) -> Option<aruna_core::types::Value> {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: key_space.to_string(),
+                key: key.into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage read result");
+        };
+
+        value
+    }
+
     #[tokio::test]
     async fn reference_guard_fails_when_connector_deleted_after_resolve() {
         let (_tempdir, context) = test_context();
@@ -456,6 +549,125 @@ mod tests {
 
         assert_conflict(
             guard_resolved_connector_unchanged(&context, txn_id, &connector, None).await,
+        );
+    }
+
+    #[tokio::test]
+    async fn materialize_reference_replaces_current_hash_path_and_writes_blob_version() {
+        let test_context = setup_driver_context().await;
+        let context = &test_context.driver_context;
+        let group_id = Ulid::new();
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let node_id = iroh::SecretKey::generate().public();
+
+        let initial = drive(
+            PutObjectOperation::new(PutObjectConfig {
+                user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+                group_id,
+                realm_id,
+                node_id,
+                request: PutObjectInput {
+                    bucket: "bucket-a".to_string(),
+                    key: "object.txt".to_string(),
+                    content_length: Some(5),
+                    body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(
+                        &b"hello"[..],
+                    ))),
+                },
+                expected_checksums: vec![],
+                checksum_type: None,
+                exists: false,
+                version_source: None,
+            }),
+            context,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let initial_hash: [u8; 32] = initial.location.get_blake3().unwrap().try_into().unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/folder/file.txt",
+                get(|| async {
+                    (
+                        [("etag", "etag-1"), ("content-type", "text/plain")],
+                        "ref-data",
+                    )
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let connector = create_http_connector(context, group_id, &format!("http://{addr}")).await;
+
+        let result = materialize_reference(
+            context,
+            MaterializeReferenceInput {
+                group_id,
+                user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+                realm_id,
+                node_id,
+                connector_id: connector.connector_id,
+                source_path: "folder/file.txt".to_string(),
+                bucket: "bucket-a".to_string(),
+                key: "object.txt".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+        let _ = server.await;
+
+        let blob_head_value = read_value(
+            context,
+            BLOB_HEAD_KEYSPACE,
+            BlobHeadKey::new("bucket-a", "object.txt")
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .expect("missing blob head entry");
+        assert_eq!(
+            CurrentVersionPointer::from_bytes(blob_head_value.as_ref()).unwrap(),
+            CurrentVersionPointer::new_with_generation(result.version_id, 2)
+        );
+
+        let blob_version_value = read_value(
+            context,
+            BLOB_VERSIONS_KEYSPACE,
+            VersionKey::new("bucket-a", "object.txt", result.version_id)
+                .to_bytes()
+                .unwrap(),
+        )
+        .await
+        .expect("missing blob version entry");
+        let blob_version = BlobVersion::from_bytes(blob_version_value.as_ref()).unwrap();
+        assert!(!blob_version.is_materialized());
+        assert!(!blob_version.is_deleted());
+        assert_eq!(blob_version.source_binding(), Some(&result.version_source));
+
+        assert!(
+            read_value(
+                context,
+                HASH_PATHS_INDEX_KEYSPACE,
+                HashPathIndexKey::new(
+                    initial_hash,
+                    realm_id,
+                    group_id,
+                    node_id,
+                    "bucket-a",
+                    "object.txt",
+                )
+                .to_bytes()
+                .unwrap(),
+            )
+            .await
+            .is_none()
         );
     }
 }

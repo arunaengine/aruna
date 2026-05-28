@@ -93,6 +93,12 @@ impl ReplicateAutomergeDocumentsToRealmOperation {
         smallvec![]
     }
 
+    #[tracing::instrument(
+        name = "automerge.realm_replication.next",
+        level = "debug",
+        skip(self),
+        fields(realm_id = %self.config.realm_id, state = ?self.state, pending_documents = self.pending_documents.len(), target_count = self.realm_nodes.len())
+    )]
     fn emit_next_replication(&mut self) -> Effects {
         loop {
             if self.current_document.is_none() {
@@ -146,6 +152,12 @@ impl ReplicateAutomergeDocumentsToRealmOperation {
         }
     }
 
+    #[tracing::instrument(
+        name = "automerge.realm_replication.emit",
+        level = "debug",
+        skip(self),
+        fields(realm_id = %self.config.realm_id, state = ?self.state, document = %document.topic_id(), target = ?self.current_target, attempt = self.current_attempt)
+    )]
     fn emit_replication(&mut self, document: AutomergeDocumentVariant) -> Effects {
         let Some(target) = self.current_target else {
             return self.finish_success();
@@ -171,6 +183,7 @@ impl Operation for ReplicateAutomergeDocumentsToRealmOperation {
     type Output = ();
     type Error = ReplicateAutomergeDocumentsToRealmError;
 
+    #[tracing::instrument(name = "automerge.realm_replication.start", level = "debug", skip(self), fields(realm_id = %self.config.realm_id, document_count = self.config.documents.len()))]
     fn start(&mut self) -> Effects {
         self.state = ReplicateAutomergeDocumentsToRealmState::LoadRealmNodes;
         smallvec![aruna_core::effects::Effect::SubOperation(
@@ -189,6 +202,7 @@ impl Operation for ReplicateAutomergeDocumentsToRealmOperation {
         )]
     }
 
+    #[tracing::instrument(name = "automerge.realm_replication.step", level = "debug", skip(self, event), fields(realm_id = %self.config.realm_id, state = ?self.state, event = ?event))]
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
             ReplicateAutomergeDocumentsToRealmState::LoadRealmNodes => match event {
@@ -275,10 +289,12 @@ impl Operation for ReplicateAutomergeDocumentsToRealmOperation {
         )
     }
 
+    #[tracing::instrument(name = "automerge.realm_replication.finalize", level = "debug", skip(self), fields(realm_id = %self.config.realm_id, state = ?self.state))]
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output.unwrap_or(Ok(()))
     }
 
+    #[tracing::instrument(name = "automerge.realm_replication.abort", level = "debug", skip(self), fields(realm_id = %self.config.realm_id, state = ?self.state))]
     fn abort(&mut self) -> Effects {
         smallvec![]
     }

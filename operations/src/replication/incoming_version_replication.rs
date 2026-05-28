@@ -1,23 +1,30 @@
+use crate::blob::blob_keyspace_helper::{
+    HeadAliasContext, build_head_transition_effects, write_blob_location_effect,
+    write_blob_version_effect,
+};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::replication::error::ReplicationError;
 use crate::replication::protocol::{VersionReplicationManifest, VersionReplicationMessage};
-use crate::replication::util::{dht_registration_effect, hash_lookup_write_effect};
+use crate::replication::util::dht_registration_effect;
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    S3_BUCKET_KEYSPACE, S3_CURRENT_VERSION_KEYSPACE, S3_LOOKUP_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_VERSION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{
-    AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, Location, LookupKey,
+    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer,
     MultipartObjectMetadataKey, Permission, RealmId, ReplicationItemKind,
-    ReplicationNegotiationResult, VersionKey, VersionMetadata,
+    ReplicationNegotiationResult, VersionKey, blob_bucket_permission_path,
+    blob_object_permission_path,
 };
-use aruna_core::types::{Effects, NodeId};
+use aruna_core::types::{Effects, GroupId, NodeId};
 use smallvec::smallvec;
+use std::collections::VecDeque;
 use thiserror::Error;
+use tracing::debug;
 use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,10 +37,11 @@ enum IncomingVersionReplicationState {
     SendNegotiation,
     ReceiveBlob,
     StartTransaction,
-    WriteHashLookup,
+    WriteBlobLocation,
     ReadObjectLookup,
-    WriteObjectLookup,
-    WriteVersion,
+    ReadPreviousCurrentVersion,
+    ApplyHeadTransition,
+    WriteBlobVersion,
     WriteMultipartMetadata,
     CommitTransaction,
     SendApplyRejected,
@@ -90,9 +98,15 @@ pub struct IncomingVersionReplicationOperation {
     local_realm_id: RealmId,
     manifest: VersionReplicationManifest,
     txn_id: Option<Ulid>,
+    destination_group_id: Option<GroupId>,
     negotiation_result: Option<ReplicationNegotiationResult>,
     existing_blob_location: Option<BackendLocation>,
     received_blob_location: Option<BackendLocation>,
+    existing_current_pointer: Option<CurrentVersionPointer>,
+    pending_old_current_hash: Option<[u8; 32]>,
+    pending_new_pointer: Option<CurrentVersionPointer>,
+    pending_new_current_hash: Option<[u8; 32]>,
+    pending_head_transition_effects: VecDeque<Effect>,
     cleanup_blob_location: Option<BackendLocation>,
     apply_committed: bool,
     output: Option<Result<(), IncomingVersionReplicationError>>,
@@ -112,9 +126,15 @@ impl IncomingVersionReplicationOperation {
             local_realm_id,
             manifest,
             txn_id: None,
+            destination_group_id: None,
             negotiation_result: None,
             existing_blob_location: None,
             received_blob_location: None,
+            existing_current_pointer: None,
+            pending_old_current_hash: None,
+            pending_new_pointer: None,
+            pending_new_current_hash: None,
+            pending_head_transition_effects: VecDeque::new(),
             cleanup_blob_location: None,
             apply_committed: false,
             output: None,
@@ -131,10 +151,13 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::SendNegotiation => "SendNegotiation",
             IncomingVersionReplicationState::ReceiveBlob => "ReceiveBlob",
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
-            IncomingVersionReplicationState::WriteHashLookup => "WriteHashLookup",
+            IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
-            IncomingVersionReplicationState::WriteObjectLookup => "WriteObjectLookup",
-            IncomingVersionReplicationState::WriteVersion => "WriteVersion",
+            IncomingVersionReplicationState::ReadPreviousCurrentVersion => {
+                "ReadPreviousCurrentVersion"
+            }
+            IncomingVersionReplicationState::ApplyHeadTransition => "ApplyHeadTransition",
+            IncomingVersionReplicationState::WriteBlobVersion => "WriteBlobVersion",
             IncomingVersionReplicationState::WriteMultipartMetadata => "WriteMultipartMetadata",
             IncomingVersionReplicationState::CommitTransaction => "CommitTransaction",
             IncomingVersionReplicationState::SendApplyRejected => "SendApplyRejected",
@@ -149,12 +172,29 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn reject_negotiation(&mut self, err: IncomingVersionReplicationError) -> Effects {
+        debug!(
+            bucket = %self.manifest.bucket,
+            key = %self.manifest.key,
+            version_id = %self.manifest.version_id,
+            stream_id = %self.stream_id,
+            reason = %err,
+            "Rejecting incoming version replication negotiation"
+        );
         let reason = err.to_string();
         self.output = Some(Ok(()));
         self.send_negotiation(ReplicationNegotiationResult::Rejected(reason))
     }
 
     fn fail(&mut self, err: IncomingVersionReplicationError) -> Effects {
+        debug!(
+            bucket = %self.manifest.bucket,
+            key = %self.manifest.key,
+            version_id = %self.manifest.version_id,
+            stream_id = %self.stream_id,
+            state = %self.state_name(),
+            error = %err,
+            "Incoming version replication failed"
+        );
         let should_reject = matches!(
             self.negotiation_result,
             Some(
@@ -193,15 +233,85 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn target_authorization_path(&self, group_id: Ulid) -> String {
-        let mut path = format!(
-            "/{}/g/{}/data/{}/{}",
-            self.local_realm_id, group_id, self.local_node_id, self.manifest.bucket
-        );
-        if !self.manifest.key.is_empty() {
-            path.push('/');
-            path.push_str(&self.manifest.key);
+        if self.manifest.key.is_empty() {
+            blob_bucket_permission_path(
+                self.local_realm_id,
+                group_id,
+                self.local_node_id,
+                &self.manifest.bucket,
+            )
+        } else {
+            blob_object_permission_path(
+                self.local_realm_id,
+                group_id,
+                self.local_node_id,
+                &self.manifest.bucket,
+                &self.manifest.key,
+            )
         }
-        path
+    }
+
+    fn alias_context(&self) -> Result<HeadAliasContext, IncomingVersionReplicationError> {
+        let Some(group_id) = self.destination_group_id else {
+            return Err(IncomingVersionReplicationError::DestinationBucketNotFound);
+        };
+
+        Ok(HeadAliasContext::new(
+            self.local_realm_id,
+            group_id,
+            self.local_node_id,
+            self.manifest.bucket.clone(),
+            self.manifest.key.clone(),
+        ))
+    }
+
+    fn current_materialized_hash_from_manifest(&self) -> Option<[u8; 32]> {
+        if !self.manifest.current_version || self.manifest.kind != ReplicationItemKind::Materialized
+        {
+            return None;
+        }
+
+        self.manifest.blob.as_ref().map(|blob| blob.hash)
+    }
+
+    fn prepare_head_transition(&mut self) -> Effects {
+        let context = match self.alias_context() {
+            Ok(context) => context,
+            Err(err) => return self.fail(err),
+        };
+        let effects = match build_head_transition_effects(
+            &context,
+            self.pending_old_current_hash.take(),
+            self.pending_new_pointer.take(),
+            self.pending_new_current_hash.take(),
+            self.txn_id,
+        ) {
+            Ok(effects) => effects,
+            Err(err) => return self.fail(err.into()),
+        };
+
+        self.pending_head_transition_effects = effects.into_iter().collect();
+        self.state = IncomingVersionReplicationState::ApplyHeadTransition;
+        self.emit_next_head_transition_effect_or_continue()
+    }
+
+    fn emit_next_head_transition_effect_or_continue(&mut self) -> Effects {
+        if let Some(effect) = self.pending_head_transition_effects.pop_front() {
+            return smallvec![effect];
+        }
+
+        self.write_version()
+    }
+
+    fn current_hash_from_version_bytes(
+        existing: Option<&[u8]>,
+    ) -> Result<Option<[u8; 32]>, IncomingVersionReplicationError> {
+        match existing.map(BlobVersion::from_bytes).transpose() {
+            Ok(version) => Ok(version
+                .as_ref()
+                .and_then(|version| version.blob_hash().copied())),
+            Err(err) => Err(err.into()),
+        }
     }
 
     fn read_destination_bucket(&mut self) -> Effects {
@@ -234,7 +344,7 @@ impl IncomingVersionReplicationOperation {
             Err(err) => return self.fail(err.into()),
         };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: None,
         })]
@@ -245,13 +355,9 @@ impl IncomingVersionReplicationOperation {
             return self.fail(IncomingVersionReplicationError::MissingBlobInfo);
         };
         self.state = IncomingVersionReplicationState::ReadExistingBlob;
-        let key = match LookupKey::from_blake3_hash(&blob.hash).and_then(|key| key.to_bytes()) {
-            Ok(key) => key,
-            Err(err) => return self.fail(err.into()),
-        };
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_LOOKUP_KEYSPACE.to_string(),
-            key: key.into(),
+            key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+            key: blob.hash.to_vec().into(),
             txn_id: None,
         })]
     }
@@ -295,15 +401,6 @@ impl IncomingVersionReplicationOperation {
             .ok_or(IncomingVersionReplicationError::MissingBlobLocation)
     }
 
-    fn version_location(&self) -> Result<Location, IncomingVersionReplicationError> {
-        match self.manifest.kind {
-            ReplicationItemKind::Materialized => {
-                Ok(Location::Real(self.effective_materialized_location()?))
-            }
-            ReplicationItemKind::DeleteMarker => Ok(Location::Deleted),
-        }
-    }
-
     fn validate_materialized_location(
         &self,
         location: &BackendLocation,
@@ -331,27 +428,36 @@ impl IncomingVersionReplicationOperation {
     }
 
     fn write_hash_lookup_or_continue(&mut self) -> Effects {
-        if self.received_blob_location.is_none() {
+        if let Some(location) = self.received_blob_location.as_ref()
+            && let Err(err) = self.validate_materialized_location(location)
+        {
+            return self.fail(err);
+        }
+
+        if self.received_blob_location.is_none() && self.existing_blob_location.is_none() {
             return self.write_object_lookup_or_continue();
         }
 
-        let location = match self.effective_materialized_location() {
-            Ok(location) => location,
-            Err(err) => return self.fail(err),
-        };
-        if let Err(err) = self.validate_materialized_location(&location) {
-            return self.fail(err);
-        }
-        let blake3 = location
-            .get_blake3()
-            .map(|hash| hash.to_vec())
-            .unwrap_or_default();
-        if blake3.is_empty() {
-            return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
-        }
+        self.write_blob_location_or_continue()
+    }
 
-        self.state = IncomingVersionReplicationState::WriteHashLookup;
-        let effect = match hash_lookup_write_effect(location, &blake3, self.txn_id) {
+    fn write_blob_location_or_continue(&mut self) -> Effects {
+        let Ok(location) = self.effective_materialized_location() else {
+            return self.write_object_lookup_or_continue();
+        };
+        let Some(blake3_hash) = location.get_blake3() else {
+            return self.write_object_lookup_or_continue();
+        };
+
+        self.state = IncomingVersionReplicationState::WriteBlobLocation;
+        let effect = match write_blob_location_effect(
+            match blake3_hash.try_into() {
+                Ok(hash) => hash,
+                Err(err) => return self.fail(ConversionError::from(err).into()),
+            },
+            location,
+            self.txn_id,
+        ) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
         };
@@ -367,13 +473,13 @@ impl IncomingVersionReplicationOperation {
         }
 
         self.state = IncomingVersionReplicationState::ReadObjectLookup;
-        let key = match LookupKey::object(&self.manifest.bucket, &self.manifest.key).to_bytes() {
+        let key = match BlobHeadKey::new(&self.manifest.bucket, &self.manifest.key).to_bytes() {
             Ok(key) => key,
             Err(err) => return self.fail(err.into()),
         };
 
         smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
+            key_space: BLOB_HEAD_KEYSPACE.to_string(),
             key: key.into(),
             txn_id: self.txn_id,
         })]
@@ -388,7 +494,7 @@ impl IncomingVersionReplicationOperation {
             Ok(pointer) => pointer,
             Err(err) => return self.fail(err.into()),
         };
-        let should_write = match existing_pointer {
+        let should_write = match existing_pointer.as_ref() {
             Some(pointer)
                 if (incoming_generation, self.manifest.version_id)
                     > (pointer.generation, pointer.version_id) =>
@@ -405,71 +511,84 @@ impl IncomingVersionReplicationOperation {
             None => true,
         };
 
+        self.existing_current_pointer = existing_pointer.clone();
+
         if !should_write {
+            self.pending_old_current_hash = None;
+            self.pending_new_pointer = None;
+            self.pending_new_current_hash = None;
             return self.write_version();
         }
 
-        self.state = IncomingVersionReplicationState::WriteObjectLookup;
-        let key = match LookupKey::object(&self.manifest.bucket, &self.manifest.key).to_bytes() {
-            Ok(key) => key,
-            Err(err) => return self.fail(err.into()),
-        };
-        let value = match self.version_location() {
-            Ok(_) => {
-                match CurrentVersionPointer::new_with_generation(
-                    self.manifest.version_id,
-                    incoming_generation,
-                )
-                .to_bytes()
-                {
-                    Ok(bytes) => bytes,
-                    Err(err) => return self.fail(err.into()),
-                }
-            }
-            Err(err) => return self.fail(err),
-        };
+        self.pending_new_pointer = Some(CurrentVersionPointer::new_with_generation(
+            self.manifest.version_id,
+            incoming_generation,
+        ));
+        self.pending_new_current_hash = self.current_materialized_hash_from_manifest();
+        self.pending_old_current_hash = None;
 
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_CURRENT_VERSION_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        if let Some(existing_pointer) = self.existing_current_pointer.as_ref() {
+            self.state = IncomingVersionReplicationState::ReadPreviousCurrentVersion;
+            let key = match VersionKey::new(
+                &self.manifest.bucket,
+                &self.manifest.key,
+                existing_pointer.version_id,
+            )
+            .to_bytes()
+            {
+                Ok(key) => key,
+                Err(err) => return self.fail(err.into()),
+            };
+
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: key.into(),
+                txn_id: self.txn_id,
+            })];
+        }
+
+        self.prepare_head_transition()
     }
 
     fn write_version(&mut self) -> Effects {
-        self.state = IncomingVersionReplicationState::WriteVersion;
-        let key = match self.version_key_bytes() {
-            Ok(key) => key,
-            Err(err) => return self.fail(err.into()),
-        };
-        let value = match match self.version_location() {
-            Ok(Location::Real(location)) => VersionMetadata::materialized(
-                self.manifest.version_id,
-                location,
-                self.manifest.created_at,
-                self.manifest.created_by,
-                self.manifest.source.clone(),
-            )
-            .to_bytes(),
-            Ok(Location::Deleted) => VersionMetadata::deleted(
-                self.manifest.version_id,
-                self.manifest.created_at,
-                self.manifest.created_by,
-            )
-            .to_bytes(),
-            Err(err) => return self.fail(err),
-        } {
-            Ok(value) => value,
-            Err(err) => return self.fail(err.into()),
+        self.write_blob_version()
+    }
+
+    fn write_blob_version(&mut self) -> Effects {
+        self.state = IncomingVersionReplicationState::WriteBlobVersion;
+        let version_key = VersionKey::new(
+            &self.manifest.bucket,
+            &self.manifest.key,
+            self.manifest.version_id,
+        );
+        let version = match self.manifest.kind {
+            ReplicationItemKind::Materialized => {
+                let Ok(location) = self.effective_materialized_location() else {
+                    return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
+                };
+                let Some(blake3_hash) = location.get_blake3() else {
+                    return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
+                };
+                BlobVersion::materialized(
+                    match blake3_hash.try_into() {
+                        Ok(hash) => hash,
+                        Err(err) => return self.fail(ConversionError::from(err).into()),
+                    },
+                    self.manifest.created_at,
+                    self.manifest.created_by,
+                    self.manifest.source.clone(),
+                )
+            }
+            ReplicationItemKind::DeleteMarker => {
+                BlobVersion::deleted(self.manifest.created_at, self.manifest.created_by)
+            }
         };
 
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: S3_VERSION_KEYSPACE.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: self.txn_id,
-        })]
+        let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
+            Ok(effect) => effect,
+            Err(err) => return self.fail(err.into()),
+        };
+        smallvec![effect]
     }
 
     fn write_multipart_metadata_or_continue(&mut self) -> Effects {
@@ -641,6 +760,19 @@ impl Operation for IncomingVersionReplicationOperation {
                     Err(err) => return self.fail(err.into()),
                 };
 
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    group_id = %bucket_info.group_id,
+                    kind = ?self.manifest.kind,
+                    current_version = self.manifest.current_version,
+                    current_version_generation = ?self.manifest.current_version_generation,
+                    "Loaded destination bucket for incoming replication"
+                );
+
+                self.destination_group_id = Some(bucket_info.group_id);
                 self.check_write_permission(bucket_info.group_id)
             }
             IncomingVersionReplicationState::CheckPermissions => {
@@ -654,20 +786,39 @@ impl Operation for IncomingVersionReplicationOperation {
                 };
 
                 match allowed {
-                    Ok(true) => self.read_existing_version(),
+                    Ok(true) => {
+                        debug!(
+                            bucket = %self.manifest.bucket,
+                            key = %self.manifest.key,
+                            version_id = %self.manifest.version_id,
+                            stream_id = %self.stream_id,
+                            "Incoming replication write permission granted"
+                        );
+                        self.read_existing_version()
+                    }
                     Ok(false) => self
                         .reject_negotiation(IncomingVersionReplicationError::WritePermissionDenied),
                     Err(err) => self.reject_negotiation(err.into()),
                 }
             }
             IncomingVersionReplicationState::ReadExistingVersion => {
-                let Event::Storage(StorageEvent::ReadResult { .. }) = event else {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                         state: self.state_name(),
                         expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
+
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    existing_version_present = value.is_some(),
+                    kind = ?self.manifest.kind,
+                    "Loaded existing destination version metadata"
+                );
 
                 match self.manifest.kind {
                     ReplicationItemKind::DeleteMarker => {
@@ -686,21 +837,50 @@ impl Operation for IncomingVersionReplicationOperation {
                 };
 
                 if let Some(value) = value {
-                    match Location::from_bytes(value.as_ref()) {
-                        Ok(Location::Real(location)) => {
+                    match BackendLocation::from_bytes(value.as_ref()) {
+                        Ok(location) => {
                             if self.validate_materialized_location(&location).is_err() {
+                                debug!(
+                                    bucket = %self.manifest.bucket,
+                                    key = %self.manifest.key,
+                                    version_id = %self.manifest.version_id,
+                                    stream_id = %self.stream_id,
+                                    existing_blob_size = location.blob_size,
+                                    "Existing destination blob differs; requesting blob and version"
+                                );
                                 return self.send_negotiation(
                                     ReplicationNegotiationResult::NeedBlobAndVersion,
                                 );
                             }
                             self.existing_blob_location = Some(location);
+                            debug!(
+                                bucket = %self.manifest.bucket,
+                                key = %self.manifest.key,
+                                version_id = %self.manifest.version_id,
+                                stream_id = %self.stream_id,
+                                "Existing destination blob matches manifest; requesting version only"
+                            );
                             self.send_negotiation(ReplicationNegotiationResult::NeedVersionOnly)
                         }
-                        Ok(Location::Deleted) | Err(_) => {
+                        Err(_) => {
+                            debug!(
+                                bucket = %self.manifest.bucket,
+                                key = %self.manifest.key,
+                                version_id = %self.manifest.version_id,
+                                stream_id = %self.stream_id,
+                                "Destination blob missing or invalid; requesting blob and version"
+                            );
                             self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion)
                         }
                     }
                 } else {
+                    debug!(
+                        bucket = %self.manifest.bucket,
+                        key = %self.manifest.key,
+                        version_id = %self.manifest.version_id,
+                        stream_id = %self.stream_id,
+                        "Destination blob absent; requesting blob and version"
+                    );
                     self.send_negotiation(ReplicationNegotiationResult::NeedBlobAndVersion)
                 }
             }
@@ -716,8 +896,28 @@ impl Operation for IncomingVersionReplicationOperation {
                 match self.negotiation_result.clone() {
                     Some(ReplicationNegotiationResult::AlreadyReplicatedVersion)
                     | Some(ReplicationNegotiationResult::Rejected(_)) => self.close_connection(),
-                    Some(ReplicationNegotiationResult::NeedVersionOnly) => self.start_transaction(),
-                    Some(ReplicationNegotiationResult::NeedBlobAndVersion) => self.receive_blob(),
+                    Some(ReplicationNegotiationResult::NeedVersionOnly) => {
+                        debug!(
+                            bucket = %self.manifest.bucket,
+                            key = %self.manifest.key,
+                            version_id = %self.manifest.version_id,
+                            stream_id = %self.stream_id,
+                            decision = ?self.negotiation_result,
+                            "Negotiation sent; awaiting version apply"
+                        );
+                        self.start_transaction()
+                    }
+                    Some(ReplicationNegotiationResult::NeedBlobAndVersion) => {
+                        debug!(
+                            bucket = %self.manifest.bucket,
+                            key = %self.manifest.key,
+                            version_id = %self.manifest.version_id,
+                            stream_id = %self.stream_id,
+                            decision = ?self.negotiation_result,
+                            "Negotiation sent; awaiting blob transfer"
+                        );
+                        self.receive_blob()
+                    }
                     None => self.fail(IncomingVersionReplicationError::ReplicationError(
                         ReplicationError::ReplicationFailed,
                     )),
@@ -736,6 +936,15 @@ impl Operation for IncomingVersionReplicationOperation {
                     self.cleanup_blob_location = Some(location);
                     return self.fail(err);
                 }
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    blob_size = location.blob_size,
+                    backend_path = %location.backend_path,
+                    "Received and validated replicated blob"
+                );
                 self.received_blob_location = Some(location.clone());
                 self.cleanup_blob_location = Some(location);
                 self.start_transaction()
@@ -749,9 +958,17 @@ impl Operation for IncomingVersionReplicationOperation {
                     });
                 };
                 self.txn_id = Some(txn_id);
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    txn_id = %txn_id,
+                    "Started incoming replication transaction"
+                );
                 self.write_hash_lookup_or_continue()
             }
-            IncomingVersionReplicationState::WriteHashLookup => {
+            IncomingVersionReplicationState::WriteBlobLocation => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                         state: self.state_name(),
@@ -769,19 +986,60 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                let existing_pointer = value
+                    .as_ref()
+                    .and_then(|value| CurrentVersionPointer::from_bytes(value.as_ref()).ok());
+                let incoming_generation = self.manifest.current_version_generation;
+                let pointer_will_update = match (incoming_generation, existing_pointer.as_ref()) {
+                    (Some(incoming_generation), Some(pointer)) => {
+                        (incoming_generation, self.manifest.version_id)
+                            >= (pointer.generation, pointer.version_id)
+                    }
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    existing_generation = existing_pointer.as_ref().map(|pointer| pointer.generation),
+                    existing_version_id = ?existing_pointer.as_ref().map(|pointer| pointer.version_id),
+                    incoming_generation = ?incoming_generation,
+                    pointer_will_update,
+                    "Compared destination current version pointer"
+                );
                 self.write_object_lookup_after_compare(value.as_deref())
             }
-            IncomingVersionReplicationState::WriteObjectLookup => {
-                let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            IncomingVersionReplicationState::ReadPreviousCurrentVersion => {
+                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                         state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::WriteResult)",
+                        expected: "Event::Storage(StorageEvent::ReadResult)",
                         received: event,
                     });
                 };
-                self.write_version()
+
+                self.pending_old_current_hash =
+                    match Self::current_hash_from_version_bytes(value.as_deref()) {
+                        Ok(hash) => hash,
+                        Err(err) => return self.fail(err),
+                    };
+
+                self.prepare_head_transition()
             }
-            IncomingVersionReplicationState::WriteVersion => {
+            IncomingVersionReplicationState::ApplyHeadTransition => match event {
+                Event::Storage(StorageEvent::WriteResult { .. })
+                | Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    self.emit_next_head_transition_effect_or_continue()
+                }
+                _ => self.fail(IncomingVersionReplicationError::InvalidStateEvent {
+                    state: self.state_name(),
+                    expected: "Event::Storage(StorageEvent::{WriteResult|DeleteResult})",
+                    received: event,
+                }),
+            },
+            IncomingVersionReplicationState::WriteBlobVersion => {
                 let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
                     return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
                         state: self.state_name(),
@@ -799,6 +1057,14 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    multipart_parts = self.manifest.multipart.as_ref().map(|m| m.parts.len()).unwrap_or(0),
+                    "Wrote multipart replication metadata"
+                );
                 self.commit_transaction()
             }
             IncomingVersionReplicationState::CommitTransaction => {
@@ -812,6 +1078,14 @@ impl Operation for IncomingVersionReplicationOperation {
                 self.txn_id = None;
                 self.cleanup_blob_location = None;
                 self.apply_committed = true;
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    kind = ?self.manifest.kind,
+                    "Committed incoming replication transaction"
+                );
                 match self.manifest.kind {
                     ReplicationItemKind::Materialized => self.register_blob_in_dht_or_continue(),
                     ReplicationItemKind::DeleteMarker => self.send_apply_complete(),
@@ -865,6 +1139,13 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    "Sent incoming replication apply-complete acknowledgement"
+                );
                 self.close_connection()
             }
             IncomingVersionReplicationState::CloseConnection => {
@@ -883,6 +1164,14 @@ impl Operation for IncomingVersionReplicationOperation {
                 if self.output.is_none() {
                     self.output = Some(Ok(()));
                 }
+                debug!(
+                    bucket = %self.manifest.bucket,
+                    key = %self.manifest.key,
+                    version_id = %self.manifest.version_id,
+                    stream_id = %self.stream_id,
+                    state = %self.state_name(),
+                    "Closed incoming replication connection"
+                );
                 smallvec![]
             }
             IncomingVersionReplicationState::Finish => smallvec![],
@@ -936,12 +1225,14 @@ mod tests {
     use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
     use aruna_core::errors::AuthorizationError;
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
-    use aruna_core::keyspaces::{S3_CURRENT_VERSION_KEYSPACE, S3_VERSION_KEYSPACE};
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BucketInfo, CurrentVersionPointer, Location, RealmId,
+        AuthContext, BackendLocation, BlobVersion, BucketInfo, CurrentVersionPointer, RealmId,
         ReplicationItemKind, ReplicationNegotiationResult, SourceConnectorKind, StagingStrategy,
-        VersionMetadata, VersionSourceBinding,
+        VersionSourceBinding,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -1080,6 +1371,11 @@ mod tests {
             IncomingVersionReplicationState::ReadExistingVersion
         );
         assert_eq!(effects.len(), 1);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_VERSIONS_KEYSPACE
+        ));
         effects.remove(0)
     }
 
@@ -1087,13 +1383,14 @@ mod tests {
         let txn_id = Ulid::new();
         op.state = IncomingVersionReplicationState::StartTransaction;
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
+        op.destination_group_id = Some(Ulid::new());
 
         let effects = op.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         assert_eq!(op.state, IncomingVersionReplicationState::ReadObjectLookup);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Read { key_space, txn_id: read_txn_id, .. })]
-                if key_space == S3_CURRENT_VERSION_KEYSPACE && *read_txn_id == Some(txn_id)
+                if key_space == BLOB_HEAD_KEYSPACE && *read_txn_id == Some(txn_id)
         ));
         txn_id
     }
@@ -1110,9 +1407,8 @@ mod tests {
 
         let _effects = advance_to_version_lookup(&mut op, Ulid::new());
 
-        let version = VersionMetadata::materialized(
-            manifest.version_id,
-            make_location(),
+        let version = BlobVersion::materialized(
+            manifest.blob.as_ref().unwrap().hash,
             manifest.created_at,
             manifest.created_by,
             None,
@@ -1124,8 +1420,9 @@ mod tests {
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert_eq!(effects.len(), 1);
         assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_LOCATIONS_KEYSPACE
         ));
     }
 
@@ -1147,11 +1444,11 @@ mod tests {
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
 
-        assert_eq!(op.state, IncomingVersionReplicationState::WriteVersion);
+        assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Write { key_space, txn_id: write_txn_id, .. })]
-                if key_space == S3_VERSION_KEYSPACE && *write_txn_id == Some(txn_id)
+                if key_space == BLOB_VERSIONS_KEYSPACE && *write_txn_id == Some(txn_id)
         ));
     }
 
@@ -1230,11 +1527,11 @@ mod tests {
         }));
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected version metadata write")
+            panic!("expected blob version write")
         };
-        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
-        assert_eq!(metadata.version_id, manifest.version_id);
-        assert!(metadata.is_deleted());
+        let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+        assert!(version.is_deleted());
+        assert_eq!(version.created_by, manifest.created_by);
     }
 
     #[test]
@@ -1255,10 +1552,10 @@ mod tests {
         let effects = op.write_version();
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-            panic!("expected version metadata write")
+            panic!("expected blob version write")
         };
-        let metadata = VersionMetadata::from_bytes(value.as_ref()).unwrap();
-        assert_eq!(metadata.source_binding(), Some(&source));
+        let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(version.source_binding(), Some(&source));
     }
 
     #[test]
@@ -1283,6 +1580,29 @@ mod tests {
         }));
 
         let [
+            Effect::Storage(StorageEffect::Read {
+                key_space,
+                txn_id: read_txn_id,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected previous current version read")
+        };
+        assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+        assert_eq!(*read_txn_id, Some(txn_id));
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8; 4].into(),
+            value: Some(
+                BlobVersion::deleted(SystemTime::now(), test_user_id())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+        }));
+
+        let [
             Effect::Storage(StorageEffect::Write {
                 key_space,
                 value,
@@ -1291,9 +1611,9 @@ mod tests {
             }),
         ] = effects.as_slice()
         else {
-            panic!("expected current pointer write")
+            panic!("expected blob head write")
         };
-        assert_eq!(key_space, S3_CURRENT_VERSION_KEYSPACE);
+        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
         assert_eq!(*write_txn_id, Some(txn_id));
         assert_eq!(
             CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
@@ -1325,15 +1645,30 @@ mod tests {
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
 
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected previous current version read")
+        };
+        assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![1u8; 4].into(),
+            value: Some(
+                BlobVersion::deleted(SystemTime::now(), test_user_id())
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+        }));
+
         let [
             Effect::Storage(StorageEffect::Write {
                 key_space, value, ..
             }),
         ] = effects.as_slice()
         else {
-            panic!("expected current pointer write")
+            panic!("expected blob head write")
         };
-        assert_eq!(key_space, S3_CURRENT_VERSION_KEYSPACE);
+        assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
         assert_eq!(
             CurrentVersionPointer::from_bytes(value.as_ref()).unwrap(),
             CurrentVersionPointer::new_with_generation(incoming_version_id, 7)
@@ -1361,12 +1696,39 @@ mod tests {
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
 
-        assert_eq!(op.state, IncomingVersionReplicationState::WriteVersion);
+        assert_eq!(op.state, IncomingVersionReplicationState::WriteBlobVersion);
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::Write { key_space, .. })]
-                if key_space == S3_VERSION_KEYSPACE
+                if key_space == BLOB_VERSIONS_KEYSPACE
         ));
+    }
+
+    #[test]
+    fn target_authorization_path_uses_canonical_blob_path_format() {
+        let mut manifest = make_manifest(ReplicationItemKind::DeleteMarker);
+        manifest.bucket = "bucket-a".to_string();
+        manifest.key = "nested/file.txt".to_string();
+        let local_node_id = iroh::SecretKey::generate().public();
+        let local_realm_id = RealmId::from_bytes([7u8; 32]);
+        let op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            local_node_id,
+            local_realm_id,
+            manifest,
+        );
+        let group_id = Ulid::from_bytes([4u8; 16]);
+
+        assert_eq!(
+            op.target_authorization_path(group_id),
+            aruna_core::structs::blob_object_permission_path(
+                local_realm_id,
+                group_id,
+                local_node_id,
+                "bucket-a",
+                "nested/file.txt",
+            )
+        );
     }
 
     #[test]
@@ -1386,20 +1748,16 @@ mod tests {
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
         assert!(matches!(
-            effects[0],
-            Effect::Storage(StorageEffect::Read { .. })
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_LOCATIONS_KEYSPACE
         ));
 
         let mut mismatched_location = make_location();
         mismatched_location.blob_size += 1;
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
-            value: Some(
-                Location::Real(mismatched_location)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
+            value: Some(mismatched_location.to_bytes().unwrap().into()),
         }));
         assert_eq!(op.state, IncomingVersionReplicationState::SendNegotiation);
         assert!(matches!(
@@ -1407,6 +1765,30 @@ mod tests {
             VersionReplicationMessage::VersionNegotiationResponse(
                 aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion
             )
+        ));
+    }
+
+    #[test]
+    fn missing_blob_requests_location_lookup_in_new_keyspace() {
+        let manifest = make_manifest(ReplicationItemKind::Materialized);
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest,
+        );
+
+        let _effects = advance_to_version_lookup(&mut op, Ulid::new());
+        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0u8; 4].into(),
+            value: None,
+        }));
+
+        assert_eq!(op.state, IncomingVersionReplicationState::ReadExistingBlob);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Read { key_space, .. })]
+                if key_space == BLOB_LOCATIONS_KEYSPACE
         ));
     }
 
@@ -1627,7 +2009,7 @@ mod tests {
         );
 
         op.negotiation_result = Some(ReplicationNegotiationResult::NeedVersionOnly);
-        op.state = IncomingVersionReplicationState::WriteObjectLookup;
+        op.state = IncomingVersionReplicationState::ApplyHeadTransition;
         op.txn_id = Some(txn_id);
 
         let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
@@ -1666,7 +2048,7 @@ mod tests {
         );
         op.negotiation_result =
             Some(aruna_core::structs::ReplicationNegotiationResult::NeedBlobAndVersion);
-        op.state = IncomingVersionReplicationState::WriteHashLookup;
+        op.state = IncomingVersionReplicationState::WriteBlobLocation;
         op.txn_id = Some(txn_id);
         op.received_blob_location = Some(received.clone());
         op.cleanup_blob_location = Some(received.clone());
@@ -1716,7 +2098,7 @@ mod tests {
         );
         op.negotiation_result =
             Some(aruna_core::structs::ReplicationNegotiationResult::NeedVersionOnly);
-        op.state = IncomingVersionReplicationState::WriteObjectLookup;
+        op.state = IncomingVersionReplicationState::ApplyHeadTransition;
         op.txn_id = Some(txn_id);
 
         let effects = op.step(Event::Blob(BlobEvent::MessageSent { stream_id }));

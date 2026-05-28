@@ -9,9 +9,10 @@ use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keys::gossip_peer_key;
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RealmId};
-use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_net::streams::BiStream;
-use aruna_net::{DiscoveryMethod, InboundEventHandler, NetConfig, NetHandle, RelayMethod};
+use aruna_net::{
+    DiscoveryMethod, InboundEventHandler, NetConfig, NetError, NetHandle, RelayMethod,
+};
 use aruna_storage::FjallStorage;
 use async_trait::async_trait;
 use byteview::ByteView;
@@ -456,19 +457,21 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
-    let (mut send_a, _recv_a) = handle_a.open_stream(handle_b.node_id(), Alpn::Bao).await?;
-    send_a
+    let mut stream = handle_a.open_stream(handle_b.node_id(), Alpn::Bao).await?;
+    stream
+        .0
         .write_all(b"hello stream")
         .await
         .map_err(|e| std::io::Error::other(format!("failed to write outbound stream data: {e}")))?;
 
-    let (incoming_alpn, (_send_b, mut recv_b), _node_id) =
+    let (incoming_alpn, mut incoming_stream, _node_id) =
         tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
             .await?
             .ok_or("expected inbound stream")?;
     assert_eq!(incoming_alpn, Alpn::Bao);
 
-    let chunk = recv_b
+    let chunk = incoming_stream
+        .1
         .read_chunk(1024)
         .await
         .map_err(|e| std::io::Error::other(format!("failed to read inbound stream data: {e}")))?
@@ -486,7 +489,7 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
 }
 
 #[tokio::test]
-async fn test_dht_rpc_ping_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+async fn test_open_stream_rejects_internal_alpn() -> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
     let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
@@ -505,22 +508,11 @@ async fn test_dht_rpc_ping_roundtrip() -> Result<(), Box<dyn std::error::Error>>
     handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
     handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
 
-    let (mut send, mut recv) = handle_a.open_stream(handle_b.node_id(), Alpn::Dht).await?;
-
-    let request = encode_request(&DhtRequest::Ping)?;
-    let len = (request.len() as u32).to_be_bytes();
-    send.write_all(&len).await?;
-    send.write_all(&request).await?;
-    send.finish()?;
-
-    let mut response_len = [0u8; 4];
-    recv.read_exact(&mut response_len).await?;
-    let response_len = u32::from_be_bytes(response_len) as usize;
-
-    let mut response = vec![0u8; response_len];
-    recv.read_exact(&mut response).await?;
-    let response = decode_response(&response)?;
-    assert!(matches!(response, DhtResponse::Pong));
+    let error = handle_a
+        .open_stream(handle_b.node_id(), Alpn::Dht)
+        .await
+        .expect_err("DHT streams are internal to the DHT service");
+    assert!(matches!(error, NetError::Stream(_)));
 
     handle_a.shutdown().await;
     handle_b.shutdown().await;

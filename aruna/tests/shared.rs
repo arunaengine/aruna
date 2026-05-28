@@ -17,7 +17,8 @@ use aruna_core::onboarding::{
     CreateOnboardingSecretRequest, CreateOnboardingSecretResponse, OnboardingMode, OnboardingPhase,
 };
 use aruna_core::structs::{
-    Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, NodeCapabilities, RealmId,
+    Actor, ArunaArn, Backend, BackendConfig, BlobTimeoutConfig, NodeCapabilities, PathRestriction,
+    RealmId, TokenClaims, UserAccess,
 };
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
@@ -33,12 +34,14 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::s3::get_user_access::GetUserAccessOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_storage::{FjallStorage, StorageHandle};
 use aruna_tasks::TaskHandle;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use ed25519_dalek::SigningKey;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use reqwest::StatusCode;
 use std::collections::HashMap;
 use std::future::Future;
@@ -265,6 +268,51 @@ pub(crate) async fn create_bearer_token(
         context,
     )
     .await?)
+}
+
+pub(crate) fn sign_scoped_bearer_token(
+    seed: &SeedNode,
+    user_id: UserId,
+    path_restrictions: Vec<PathRestriction>,
+) -> TestResult<String> {
+    let now = chrono::Utc::now().timestamp() as u64;
+    let claims = TokenClaims {
+        sub: user_id.to_string(),
+        iss: seed.realm_id.to_string(),
+        iat: now,
+        exp: now + 600,
+        jti: Ulid::new().to_string(),
+        restrictions: Some(path_restrictions),
+        issuer_pubkey: None,
+        delegation_signature: None,
+    };
+    let NodeCapabilities::Management {
+        realm_encoding_key, ..
+    } = &seed.capabilities
+    else {
+        return Err(std::io::Error::other("seed node must use management capabilities").into());
+    };
+
+    Ok(encode(
+        &Header::new(Algorithm::EdDSA),
+        &claims,
+        &EncodingKey::from_ed_pem(realm_encoding_key)?,
+    )?)
+}
+
+pub(crate) async fn get_user_access(
+    context: &DriverContext,
+    access_key_id: &str,
+) -> TestResult<UserAccess> {
+    let access = drive(
+        GetUserAccessOperation::new(access_key_id.to_string()),
+        context,
+    )
+    .await?
+    .ok_or_else(|| std::io::Error::other("user access not found"))?
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+    Ok(access)
 }
 
 pub(crate) async fn create_group_via_http(

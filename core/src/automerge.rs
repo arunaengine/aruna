@@ -6,6 +6,7 @@ use crate::gossip::TopicMessageKind;
 use crate::id::{NodeId, TopicId};
 use crate::structs::RealmId;
 use crate::task::TaskKey;
+use crate::trace_context::DistributedTraceContext;
 use crate::types::{GroupId, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -91,6 +92,7 @@ pub struct AutomergeInit {
     pub heads: Vec<ChangeHash>,
     pub capabilities: Vec<AutomergeSyncFeature>,
     pub auth: Option<InitAuthProof>,
+    pub trace_context: Option<DistributedTraceContext>,
 }
 
 impl AutomergeInit {
@@ -103,7 +105,13 @@ impl AutomergeInit {
                 AutomergeSyncFeature::MessageV2,
             ],
             auth: None,
+            trace_context: None,
         }
+    }
+
+    pub fn with_trace_context(mut self, trace_context: Option<DistributedTraceContext>) -> Self {
+        self.trace_context = trace_context;
+        self
     }
 }
 

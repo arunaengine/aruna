@@ -8,6 +8,12 @@ use aruna_core::errors::StreamError;
 use aruna_core::id::DhtKeyId;
 use tracing::{trace, warn};
 
+#[tracing::instrument(
+    name = "net.effect",
+    level = "debug",
+    skip(dht, gossip, effect),
+    fields(effect = net_effect_kind(&effect))
+)]
 pub async fn handle_net_effect(
     dht: &DhtHandle,
     gossip: &GossipService,
@@ -20,6 +26,12 @@ pub async fn handle_net_effect(
     }
 }
 
+#[tracing::instrument(
+    name = "net.effect.dht",
+    level = "debug",
+    skip(dht, effect),
+    fields(effect = dht_effect_kind(&effect))
+)]
 async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
     match effect {
         DhtEffect::Put {
@@ -93,6 +105,12 @@ async fn handle_dht_effect(dht: &DhtHandle, effect: DhtEffect) -> NetEvent {
     }
 }
 
+#[tracing::instrument(
+    name = "net.effect.gossip",
+    level = "debug",
+    skip(gossip, effect),
+    fields(effect = gossip_effect_kind(&effect))
+)]
 async fn handle_gossip_effect(gossip: &GossipService, effect: GossipEffect) -> NetEvent {
     match effect {
         GossipEffect::Subscribe { topic } => {
@@ -160,6 +178,12 @@ async fn handle_gossip_effect(gossip: &GossipService, effect: GossipEffect) -> N
     }
 }
 
+#[tracing::instrument(
+    name = "net.effect.stream",
+    level = "debug",
+    skip(effect),
+    fields(effect = stream_effect_kind(&effect))
+)]
 async fn handle_stream_effect(effect: StreamEffect) -> NetEvent {
     match effect {
         StreamEffect::Open { node_id, .. } => NetEvent::Stream(StreamEvent::Error {
@@ -174,5 +198,35 @@ async fn handle_stream_effect(effect: StreamEffect) -> NetEvent {
                 "Stream effects are unsupported without stream registry".to_string(),
             ),
         }),
+    }
+}
+
+fn net_effect_kind(effect: &NetEffect) -> &'static str {
+    match effect {
+        NetEffect::Dht(_) => "dht",
+        NetEffect::Gossip(_) => "gossip",
+        NetEffect::Stream(_) => "stream",
+    }
+}
+
+fn dht_effect_kind(effect: &DhtEffect) -> &'static str {
+    match effect {
+        DhtEffect::Put { .. } => "put",
+        DhtEffect::Get { .. } => "get",
+    }
+}
+
+fn gossip_effect_kind(effect: &GossipEffect) -> &'static str {
+    match effect {
+        GossipEffect::Subscribe { .. } => "subscribe",
+        GossipEffect::Broadcast { .. } => "broadcast",
+        GossipEffect::Unsubscribe { .. } => "unsubscribe",
+    }
+}
+
+fn stream_effect_kind(effect: &StreamEffect) -> &'static str {
+    match effect {
+        StreamEffect::Open { .. } => "open",
+        StreamEffect::Close { .. } => "close",
     }
 }

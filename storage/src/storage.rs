@@ -3,6 +3,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -10,12 +11,13 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use async_trait::async_trait;
 use byteview::ByteView;
-use crossfire::{mpsc, oneshot};
+use crossfire::{TrySendError, mpsc, oneshot};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use crate::errors::StorageLibError;
-pub type EffectHandle = (StorageEffect, oneshot::TxOneshot<StorageEvent>);
+pub type EffectHandle = (StorageEffect, oneshot::TxOneshot<StorageEvent>, Span);
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
 
@@ -24,6 +26,7 @@ enum Txn {
     Write(Box<fjall::OptimisticWriteTx>),
 }
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
+const STORAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Store {
     db: OptimisticTxDatabase,
@@ -116,28 +119,96 @@ impl StorageHandle {
         }
     }
 
+    #[tracing::instrument(
+        name = "storage.handle.send_storage_effect",
+        level = "debug",
+        skip(self, effect),
+        fields(operation = storage_effect_kind(&effect))
+    )]
     pub async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
         Event::Storage(self.dispatch_storage_effect(effect).await)
     }
 
+    #[tracing::instrument(
+        name = "storage.handle.dispatch",
+        level = "debug",
+        skip(self, effect),
+        fields(operation = storage_effect_kind(&effect))
+    )]
     async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
 
         let (response_tx, response_rx) = crossfire::oneshot::oneshot();
-        if self.write_channel.send((effect, response_tx)).is_err() {
-            return self.observe_storage_event(StorageEvent::Error {
-                error: StorageError::ChannelClosed,
-            });
+        let operation = storage_effect_kind(&effect);
+        let active_txn_id = active_txn_id_for_effect(&effect);
+        let span = storage_effect_span(&effect);
+        match self.write_channel.try_send((effect, response_tx, span)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                if let Some(txn_id) = active_txn_id {
+                    self.enqueue_abort_transaction(txn_id, "request_queue_full");
+                }
+                return self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::QueueFull,
+                });
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                return self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::ChannelClosed,
+                });
+            }
         }
 
-        match response_rx.await {
-            Ok(event) => self.observe_storage_event(event),
-            Err(_) => self.observe_storage_event(StorageEvent::Error {
+        match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok(event)) => self.observe_storage_event(event),
+            Ok(Err(_)) => self.observe_storage_event(StorageEvent::Error {
                 error: StorageError::ChannelClosed,
             }),
+            Err(error) => {
+                if let Some(txn_id) = active_txn_id {
+                    self.enqueue_abort_transaction(txn_id, "request_timeout");
+                }
+                warn!(
+                    event = "storage.request.timeout",
+                    operation,
+                    timeout_ms = STORAGE_REQUEST_TIMEOUT.as_millis() as u64,
+                    error = %error,
+                    "Timed out waiting for storage response"
+                );
+                self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::Timeout,
+                })
+            }
         }
     }
 
+    fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
+        let (response_tx, _response_rx) = crossfire::oneshot::oneshot();
+        let effect = StorageEffect::AbortTransaction { txn_id };
+        let span = storage_effect_span(&effect);
+        match self.write_channel.try_send((effect, response_tx, span)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => warn!(
+                event = "storage.transaction.abort_enqueue_full",
+                txn_id = %txn_id,
+                reason,
+                "Failed to enqueue storage transaction abort: queue full"
+            ),
+            Err(TrySendError::Disconnected(_)) => warn!(
+                event = "storage.transaction.abort_enqueue_closed",
+                txn_id = %txn_id,
+                reason,
+                "Failed to enqueue storage transaction abort: channel closed"
+            ),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "storage.handle.observe_event",
+        level = "trace",
+        skip(self, event),
+        fields(event = storage_event_kind(&event))
+    )]
     fn observe_storage_event(&self, event: StorageEvent) -> StorageEvent {
         if let StorageEvent::Error { error } = &event {
             self.observe_storage_error(error);
@@ -146,6 +217,7 @@ impl StorageHandle {
         event
     }
 
+    #[tracing::instrument(name = "storage.handle.observe_error", level = "debug", skip(self), fields(error = %error))]
     fn observe_storage_error(&self, error: &StorageError) {
         self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
         *self
@@ -164,8 +236,52 @@ impl StorageHandle {
     }
 }
 
+fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
+    match effect {
+        StorageEffect::Read {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Write {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::BatchWrite {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Delete {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::BatchDelete {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Iter {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::CommitTransaction { txn_id } => Some(*txn_id),
+        StorageEffect::StartTransaction { .. }
+        | StorageEffect::AbortTransaction { .. }
+        | StorageEffect::Read { txn_id: None, .. }
+        | StorageEffect::Write { txn_id: None, .. }
+        | StorageEffect::BatchWrite { txn_id: None, .. }
+        | StorageEffect::Delete { txn_id: None, .. }
+        | StorageEffect::BatchDelete { txn_id: None, .. }
+        | StorageEffect::Iter { txn_id: None, .. } => None,
+    }
+}
+
 #[async_trait]
 impl Handle for StorageHandle {
+    #[tracing::instrument(
+        name = "storage.handle.send_effect",
+        level = "debug",
+        skip(self, effect),
+        fields(effect = effect_kind(&effect))
+    )]
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
             Effect::Storage(storage_effect) => {
@@ -182,6 +298,7 @@ impl Handle for StorageHandle {
 }
 
 impl FjallStorage {
+    #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]
     pub fn open(path: &str) -> Result<StorageHandle, StorageLibError> {
         let db = OptimisticTxDatabase::builder(path).open()?;
 
@@ -198,10 +315,39 @@ impl FjallStorage {
         Ok(sender)
     }
 
+    #[tracing::instrument(name = "storage.receive_loop", level = "debug", skip(self, receiver))]
     pub fn receive_loop(&mut self, receiver: EffectReceiver) {
         loop {
             match receiver.recv() {
-                Ok((effect, response_tx)) => {
+                Ok((effect, response_tx, span)) => {
+                    let _guard = span.enter();
+                    let operation = storage_effect_kind(&effect);
+                    let active_txn_id = active_txn_id_for_effect(&effect);
+                    let starts_transaction =
+                        matches!(effect, StorageEffect::StartTransaction { .. });
+                    let completes_transaction = matches!(
+                        effect,
+                        StorageEffect::CommitTransaction { .. }
+                            | StorageEffect::AbortTransaction { .. }
+                    );
+
+                    if response_tx.is_disconnected()
+                        && !matches!(effect, StorageEffect::AbortTransaction { .. })
+                    {
+                        if let Some(txn_id) = active_txn_id {
+                            self.cleanup_abandoned_transaction(
+                                txn_id,
+                                operation,
+                                "abandoned_before_processing",
+                            );
+                        }
+                        warn!(
+                            event = "storage.request.abandoned",
+                            operation, "Skipping abandoned storage request"
+                        );
+                        continue;
+                    }
+
                     let event = match effect {
                         StorageEffect::StartTransaction { read } => self.start_transaction(read),
                         StorageEffect::AbortTransaction { txn_id } => {
@@ -240,7 +386,34 @@ impl FjallStorage {
                             txn_id,
                         } => self.iterate(key_space, prefix, start_after, limit, txn_id),
                     };
-                    response_tx.send(event);
+                    if response_tx.is_disconnected() {
+                        let abandoned_txn_id = if starts_transaction {
+                            match &event {
+                                StorageEvent::TransactionStarted { txn_id } => Some(*txn_id),
+                                _ => None,
+                            }
+                        } else if completes_transaction {
+                            None
+                        } else {
+                            active_txn_id
+                        };
+
+                        if let Some(txn_id) = abandoned_txn_id {
+                            self.cleanup_abandoned_transaction(
+                                txn_id,
+                                operation,
+                                "abandoned_after_processing",
+                            );
+                        }
+                        warn!(
+                            event = "storage.response.abandoned",
+                            operation,
+                            result = storage_event_kind(&event),
+                            "Dropping storage response for abandoned request"
+                        );
+                    } else {
+                        response_tx.send(event);
+                    }
                 }
                 Err(_) => {
                     tracing::warn!(
@@ -252,6 +425,45 @@ impl FjallStorage {
         }
     }
 
+    fn cleanup_abandoned_transaction(
+        &mut self,
+        txn_id: Ulid,
+        operation: &'static str,
+        reason: &'static str,
+    ) {
+        match self.abort_transaction(txn_id) {
+            StorageEvent::TransactionAborted { .. } => warn!(
+                event = "storage.transaction.aborted",
+                txn_id = %txn_id,
+                operation,
+                reason,
+                "Aborted abandoned storage transaction"
+            ),
+            StorageEvent::Error { error } => warn!(
+                event = "storage.transaction.abort_failed",
+                txn_id = %txn_id,
+                operation,
+                reason,
+                error = %error,
+                "Failed to abort abandoned storage transaction"
+            ),
+            other => warn!(
+                event = "storage.transaction.abort_unexpected",
+                txn_id = %txn_id,
+                operation,
+                reason,
+                result = storage_event_kind(&other),
+                "Unexpected result while aborting abandoned storage transaction"
+            ),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "storage.start_transaction",
+        level = "debug",
+        skip(self),
+        fields(read)
+    )]
     fn start_transaction(&mut self, read: bool) -> StorageEvent {
         let txn_id = Ulid::new();
 
@@ -273,6 +485,7 @@ impl FjallStorage {
         StorageEvent::TransactionStarted { txn_id }
     }
 
+    #[tracing::instrument(name = "storage.abort_transaction", level = "debug", skip(self), fields(txn_id = %txn_id))]
     fn abort_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
         let txn = self.txns.remove(&txn_id);
 
@@ -288,6 +501,12 @@ impl FjallStorage {
         }
     }
 
+    #[tracing::instrument(
+        name = "storage.read",
+        level = "debug",
+        skip(self, key),
+        fields(key_space = %key_space, key_len = key.as_ref().len(), txn_id = ?txn_id)
+    )]
     fn read(&mut self, key_space: String, key: ByteView, txn_id: Option<Ulid>) -> StorageEvent {
         let keyspace = match self.store.resolve_keyspace(&key_space) {
             Ok(ks) => ks,
@@ -336,6 +555,12 @@ impl FjallStorage {
         }
     }
 
+    #[tracing::instrument(
+        name = "storage.write",
+        level = "debug",
+        skip(self, key, value),
+        fields(key_space = %key_space, key_len = key.as_ref().len(), value_len = value.as_ref().len(), txn_id = ?txn_id)
+    )]
     fn write(
         &mut self,
         key_space: String,
@@ -367,6 +592,12 @@ impl FjallStorage {
         }
     }
 
+    #[tracing::instrument(
+        name = "storage.batch_write",
+        level = "debug",
+        skip(self, writes),
+        fields(write_count = writes.len(), txn_id = ?txn_id)
+    )]
     fn batch_write(
         &mut self,
         writes: Vec<(String, ByteView, ByteView)>,
@@ -408,6 +639,7 @@ impl FjallStorage {
         StorageEvent::BatchWriteResult { entries }
     }
 
+    #[tracing::instrument(name = "storage.commit_transaction", level = "debug", skip(self), fields(txn_id = %txn_id))]
     fn commit_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
         match self.txns.remove(&txn_id) {
             Some(Txn::Read(_txn)) => {
@@ -427,6 +659,12 @@ impl FjallStorage {
         }
     }
 
+    #[tracing::instrument(
+        name = "storage.delete",
+        level = "debug",
+        skip(self, key),
+        fields(key_space = %key_space, key_len = key.as_ref().len(), txn_id = ?txn_id)
+    )]
     fn delete(&mut self, key_space: String, key: ByteView, txn_id: Option<Ulid>) -> StorageEvent {
         let keyspace = match self.store.resolve_keyspace(&key_space) {
             Ok(ks) => ks,
@@ -452,6 +690,12 @@ impl FjallStorage {
         }
     }
 
+    #[tracing::instrument(
+        name = "storage.batch_delete",
+        level = "debug",
+        skip(self, deletes),
+        fields(delete_count = deletes.len(), txn_id = ?txn_id)
+    )]
     fn batch_delete(
         &mut self,
         deletes: Vec<(String, ByteView)>,
@@ -493,6 +737,12 @@ impl FjallStorage {
         StorageEvent::BatchDeleteResult { entries }
     }
 
+    #[tracing::instrument(
+        name = "storage.iterate",
+        level = "debug",
+        skip(self, prefix, start_after),
+        fields(key_space = %key_space, has_prefix = prefix.is_some(), has_cursor = start_after.is_some(), limit, txn_id = ?txn_id)
+    )]
     fn iterate(
         &mut self,
         key_space: String,
@@ -549,6 +799,140 @@ impl FjallStorage {
             },
             Err(error) => StorageEvent::Error { error },
         }
+    }
+}
+
+fn storage_effect_span(effect: &StorageEffect) -> Span {
+    let span = debug_span!(
+        "storage.effect",
+        "otel.kind" = "internal",
+        operation = storage_effect_kind(effect),
+        key_space = field::Empty,
+        txn_id = field::Empty,
+        key_len = field::Empty,
+        value_len = field::Empty,
+        cursor_len = field::Empty,
+        batch_len = field::Empty,
+        limit = field::Empty,
+        read = field::Empty,
+    );
+    record_storage_effect_fields(&span, effect);
+    span
+}
+
+fn record_storage_effect_fields(span: &Span, effect: &StorageEffect) {
+    match effect {
+        StorageEffect::StartTransaction { read } => {
+            span.record("read", *read);
+        }
+        StorageEffect::CommitTransaction { txn_id }
+        | StorageEffect::AbortTransaction { txn_id } => {
+            span.record("txn_id", field::display(txn_id));
+        }
+        StorageEffect::Read {
+            key_space,
+            key,
+            txn_id,
+        }
+        | StorageEffect::Delete {
+            key_space,
+            key,
+            txn_id,
+        } => {
+            span.record("key_space", field::display(key_space));
+            span.record("key_len", key.as_ref().len() as u64);
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
+        StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id,
+        } => {
+            span.record("key_space", field::display(key_space));
+            span.record("key_len", key.as_ref().len() as u64);
+            span.record("value_len", value.as_ref().len() as u64);
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
+        StorageEffect::BatchWrite { writes, txn_id } => {
+            span.record("batch_len", writes.len() as u64);
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
+        StorageEffect::BatchDelete { deletes, txn_id } => {
+            span.record("batch_len", deletes.len() as u64);
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
+        StorageEffect::Iter {
+            key_space,
+            prefix,
+            start_after,
+            limit,
+            txn_id,
+        } => {
+            span.record("key_space", field::display(key_space));
+            if let Some(prefix) = prefix {
+                span.record("key_len", prefix.as_ref().len() as u64);
+            }
+            if let Some(start_after) = start_after {
+                span.record("cursor_len", start_after.as_ref().len() as u64);
+            }
+            span.record("limit", *limit as u64);
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
+    }
+}
+
+fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
+    match effect {
+        StorageEffect::StartTransaction { .. } => "start_transaction",
+        StorageEffect::CommitTransaction { .. } => "commit_transaction",
+        StorageEffect::Read { .. } => "read",
+        StorageEffect::Write { .. } => "write",
+        StorageEffect::BatchWrite { .. } => "batch_write",
+        StorageEffect::Delete { .. } => "delete",
+        StorageEffect::BatchDelete { .. } => "batch_delete",
+        StorageEffect::AbortTransaction { .. } => "abort_transaction",
+        StorageEffect::Iter { .. } => "iter",
+    }
+}
+
+fn effect_kind(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::Storage(storage_effect) => storage_effect_kind(storage_effect),
+        Effect::Blob(_) => "blob",
+        Effect::StagingSource(_) => "staging_source",
+        Effect::Net(_) => "net",
+        Effect::Automerge(_) => "automerge",
+        Effect::Metadata(_) => "metadata",
+        Effect::SubOperation(_) => "suboperation",
+        Effect::Task(_) => "task",
+        Effect::Search() => "search",
+        Effect::Stream() => "stream",
+    }
+}
+
+fn storage_event_kind(event: &StorageEvent) -> &'static str {
+    match event {
+        StorageEvent::TransactionStarted { .. } => "transaction_started",
+        StorageEvent::TransactionCommitted { .. } => "transaction_committed",
+        StorageEvent::TransactionAborted { .. } => "transaction_aborted",
+        StorageEvent::ReadResult { .. } => "read_result",
+        StorageEvent::WriteResult { .. } => "write_result",
+        StorageEvent::BatchWriteResult { .. } => "batch_write_result",
+        StorageEvent::DeleteResult { .. } => "delete_result",
+        StorageEvent::BatchDeleteResult { .. } => "batch_delete_result",
+        StorageEvent::IterResult { .. } => "iter_result",
+        StorageEvent::Error { .. } => "error",
     }
 }
 
@@ -665,13 +1049,14 @@ mod tests {
     async fn send_effect_counts_conflicts_separately_from_errors() {
         let (handle, receiver) = StorageHandle::new();
         thread::spawn(move || {
-            let (effect, response_tx) = receiver.recv().expect("first effect should arrive");
+            let (effect, response_tx, _span) = receiver.recv().expect("first effect should arrive");
             assert!(matches!(effect, StorageEffect::CommitTransaction { .. }));
             response_tx.send(StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             });
 
-            let (effect, response_tx) = receiver.recv().expect("second effect should arrive");
+            let (effect, response_tx, _span) =
+                receiver.recv().expect("second effect should arrive");
             assert!(matches!(
                 effect,
                 StorageEffect::StartTransaction { read: false }

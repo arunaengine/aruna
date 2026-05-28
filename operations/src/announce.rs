@@ -14,12 +14,12 @@ use aruna_core::types::{Key, UserId};
 use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;
-use tracing::trace;
+use tracing::{info_span, trace};
 use ulid::Ulid;
 
 use crate::automerge::repository::{automerge_clock, read_effect};
 use crate::metadata::repository::read_registry_by_document_effect;
-use crate::telemetry::current_trace_id;
+use crate::telemetry::current_trace_context;
 
 pub const TOPIC_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(30);
 pub const TOPIC_ANNOUNCE_SHORT_INTERVAL: Duration = Duration::from_secs(5);
@@ -175,6 +175,7 @@ impl AnnounceTopicOperation {
         }
     }
 
+    #[tracing::instrument(name = "announce.next_effect", level = "debug", skip(self), fields(topic = %self.topic, state = ?self.state))]
     fn next_effect(&mut self) -> aruna_core::types::Effects {
         self.current = self.pending.pop_front();
         match self.current.clone() {
@@ -204,19 +205,23 @@ impl AnnounceTopicOperation {
         }
     }
 
+    #[tracing::instrument(name = "announce.broadcast_message", level = "debug", skip(self, kind, version), fields(topic = %self.topic, state = ?self.state, kind = ?kind, version = ?version))]
     fn broadcast_message(
         &mut self,
         kind: TopicMessageKind,
         version: TopicMessageVersion,
     ) -> aruna_core::types::Effects {
         let message_id = Ulid::new();
-        let message = TopicMessage::new(
-            kind,
-            message_id,
-            self.local_node_id,
-            current_trace_id(),
-            version,
+        let span = info_span!(
+            "gossip.broadcast",
+            "otel.kind" = "producer",
+            "messaging.system" = "iroh-gossip",
+            topic = %self.topic,
+            message_id = %message_id,
         );
+        let _guard = span.enter();
+        let message = TopicMessage::new(kind, message_id, self.local_node_id, version)
+            .with_trace_context(current_trace_context());
         let bytes = match postcard::to_allocvec(&message) {
             Ok(bytes) => bytes,
             Err(error) => return self.fail(ConversionError::from(error).into()),
@@ -240,6 +245,7 @@ impl Operation for AnnounceTopicOperation {
     type Output = ();
     type Error = AnnounceTopicError;
 
+    #[tracing::instrument(name = "announce.start", level = "debug", skip(self), fields(topic = %self.topic))]
     fn start(&mut self) -> aruna_core::types::Effects {
         self.queue_topic_documents();
         self.state = AnnounceTopicState::ResetTimer;
@@ -249,6 +255,7 @@ impl Operation for AnnounceTopicOperation {
         })]
     }
 
+    #[tracing::instrument(name = "announce.step", level = "debug", skip(self, event), fields(topic = %self.topic, state = ?self.state, event = ?event))]
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
         match self.state {
             AnnounceTopicState::ResetTimer => match event {
@@ -406,10 +413,12 @@ impl Operation for AnnounceTopicOperation {
         )
     }
 
+    #[tracing::instrument(name = "announce.finalize", level = "debug", skip(self), fields(topic = %self.topic, state = ?self.state))]
     fn finalize(self) -> Result<Self::Output, Self::Error> {
         self.output.unwrap_or(Ok(()))
     }
 
+    #[tracing::instrument(name = "announce.abort", level = "debug", skip(self), fields(topic = %self.topic, state = ?self.state))]
     fn abort(&mut self) -> aruna_core::types::Effects {
         smallvec![]
     }

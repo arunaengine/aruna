@@ -1,3 +1,4 @@
+use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::RealmId;
@@ -26,6 +27,12 @@ pub enum DhtRequest {
         /// Optional Ed25519 signature over (key || value || ttl_secs)
         signature: Option<iroh::Signature>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DhtRequestEnvelope {
+    trace_context: Option<DistributedTraceContext>,
+    request: DhtRequest,
 }
 
 /// DHT RPC response messages
@@ -86,12 +93,29 @@ pub fn signed_put_value_bytes(
 
 /// Serialize a request to bytes
 pub fn encode_request(req: &DhtRequest) -> Result<Vec<u8>, postcard::Error> {
-    postcard::to_allocvec(req)
+    encode_request_with_trace_context(req, None)
+}
+
+pub fn encode_request_with_trace_context(
+    req: &DhtRequest,
+    trace_context: Option<DistributedTraceContext>,
+) -> Result<Vec<u8>, postcard::Error> {
+    postcard::to_allocvec(&DhtRequestEnvelope {
+        trace_context,
+        request: req.clone(),
+    })
 }
 
 /// Deserialize a request from bytes
 pub fn decode_request(bytes: &[u8]) -> Result<DhtRequest, postcard::Error> {
-    postcard::from_bytes(bytes)
+    decode_request_with_trace_context(bytes).map(|(_, request)| request)
+}
+
+pub fn decode_request_with_trace_context(
+    bytes: &[u8],
+) -> Result<(Option<DistributedTraceContext>, DhtRequest), postcard::Error> {
+    postcard::from_bytes::<DhtRequestEnvelope>(bytes)
+        .map(|envelope| (envelope.trace_context, envelope.request))
 }
 
 /// Serialize a response to bytes
@@ -139,6 +163,23 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
+    }
+
+    #[test]
+    fn test_request_roundtrip_with_trace_context() {
+        let trace_context = DistributedTraceContext::new(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+            Some("congo=t61rcWkgMzE".to_string()),
+        );
+        let req = DhtRequest::Ping;
+
+        let bytes = encode_request_with_trace_context(&req, Some(trace_context.clone()))
+            .expect("encode request");
+        let (decoded_trace_context, decoded_request) =
+            decode_request_with_trace_context(&bytes).expect("decode request");
+
+        assert_eq!(decoded_trace_context, Some(trace_context));
+        assert!(matches!(decoded_request, DhtRequest::Ping));
     }
 
     #[test]
