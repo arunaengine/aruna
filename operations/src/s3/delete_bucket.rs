@@ -175,7 +175,7 @@ impl DeleteBucketOperation {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             prefix: None,
             start_after: None,
-            limit: Self::SCAN_LIMIT,
+            limit: u64::MAX as usize,
             txn_id: self.txn_id,
         })]
     }

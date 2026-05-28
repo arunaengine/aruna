@@ -261,7 +261,7 @@ impl DeleteObjectOperation {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix),
             start_after: None,
-            limit: 10_000,
+            limit: u64::MAX as usize,
             txn_id: self.txn_id,
         })]
     }
