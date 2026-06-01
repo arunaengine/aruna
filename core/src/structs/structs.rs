@@ -2,8 +2,6 @@ use crate::NodeId;
 use crate::errors::ConversionError;
 use crate::structs::realm::RealmId;
 use crate::types::{RoleId, UserId};
-use crate::types::{autosurgeon_ulid, autosurgeon_user_id};
-use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
 use core::fmt;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -27,7 +25,7 @@ pub fn oidc_subject_key(issuer: &str, subject_id: &str) -> Result<String, Conver
     })?)
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub enum Permission {
     READ,
     WRITE,
@@ -48,13 +46,11 @@ impl fmt::Display for Permission {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct Role {
-    #[autosurgeon(with = "autosurgeon_ulid")]
     pub role_id: RoleId,
     pub name: String,
     pub permissions: HashMap<String, Permission>,
-    #[autosurgeon(with = "autosurgeon_user_id_set")]
     pub assigned_users: HashSet<UserId>,
 }
 
@@ -210,56 +206,14 @@ impl TryFrom<&Actor> for Vec<u8> {
     }
 }
 
-pub mod autosurgeon_user_id_set {
-    use std::collections::{HashMap, HashSet};
-
-    use autosurgeon::reconcile::MapReconciler;
-    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
-
-    use crate::types::UserId;
-    pub fn hydrate<'a, D: ReadDoc>(
-        doc: &D,
-        obj: &automerge::ObjId,
-        prop: Prop<'a>,
-    ) -> Result<HashSet<UserId>, HydrateError> {
-        let inner: HashMap<String, String> = HashMap::hydrate(doc, obj, prop)?;
-        let role_set = inner
-            .keys()
-            .map(|k| UserId::from_string(k))
-            .collect::<Result<HashSet<UserId>, crate::errors::ConversionError>>()
-            .map_err(|e| {
-                HydrateError::unexpected("valid UserId string", format!("Invalid UserId {}", e))
-            })?;
-        Ok(role_set)
-    }
-    pub fn reconcile<R: Reconciler>(
-        ulid: &HashSet<UserId>,
-        mut reconciler: R,
-    ) -> Result<(), R::Error> {
-        let mut map = reconciler.map()?;
-        map.retain(|id, _| {
-            UserId::from_string(id)
-                .ok()
-                .is_some_and(|id| ulid.contains(&id))
-        })?;
-        for id in ulid.iter().map(|k| k.to_string()) {
-            map.put(&id, "")?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hydrate, Reconcile)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct User {
-    #[autosurgeon(with = "autosurgeon_user_id")]
     pub user_id: UserId,
     pub name: String,
     pub subject_ids: Vec<String>,
     #[serde(default)]
-    #[autosurgeon(with = "autosurgeon_user_id_set", missing = "Default::default")]
     pub alias_user_ids: HashSet<UserId>,
     #[serde(default)]
-    #[autosurgeon(missing = "Default::default")]
     pub attributes: HashMap<String, String>,
 }
 
@@ -285,11 +239,8 @@ mod tests {
 }
 
 impl User {
-    pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {
-        let actor = postcard::to_allocvec(actor)?;
-        let mut doc = automerge::AutoCommit::new().with_actor((&actor).into());
-        reconcile(&mut doc, self)?;
-        Ok(doc.save())
+    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn reconcile_bytes(
@@ -297,19 +248,12 @@ impl User {
         current: Option<&[u8]>,
         actor: &Actor,
     ) -> Result<Vec<u8>, ConversionError> {
-        let actor = postcard::to_allocvec(actor)?;
-        let mut doc = match current {
-            Some(bytes) if !bytes.is_empty() => automerge::AutoCommit::load(bytes)?,
-            _ => automerge::AutoCommit::new(),
-        };
-        doc.set_actor((&actor).into());
-        reconcile(&mut doc, self)?;
-        Ok(doc.save())
+        let _ = (current, actor);
+        Ok(postcard::to_allocvec(self)?)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let doc = automerge::AutoCommit::load(bytes)?;
-        Ok(hydrate(&doc)?)
+        Ok(postcard::from_bytes(bytes)?)
     }
 }
 
@@ -317,7 +261,6 @@ impl User {
 mod test {
     use crate::UserId;
     use crate::structs::{Actor, Permission, RealmId, Role, User};
-    use autosurgeon::{hydrate, reconcile};
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
 
@@ -333,13 +276,8 @@ mod test {
             assigned_users: HashSet::from([UserId::new(Ulid::new(), RealmId([1u8; 32]))]),
         };
 
-        let mut automerge_doc = automerge::AutoCommit::new();
-        reconcile(&mut automerge_doc, &role).unwrap();
-
-        let bytes = automerge_doc.save();
-
-        let stored_automerge_doc = automerge::AutoCommit::load(&bytes).unwrap();
-        let hydrated_role: Role = hydrate(&stored_automerge_doc).unwrap();
+        let bytes = postcard::to_allocvec(&role).unwrap();
+        let hydrated_role: Role = postcard::from_bytes(&bytes).unwrap();
 
         assert_eq!(role, hydrated_role);
     }

@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{AuthContext, MetadataRegistryRecord};
@@ -158,6 +157,10 @@ pub enum MetadataEffect {
         graph_iri: String,
         policy: MetadataGraphPolicy,
     },
+    AddGraphPeer {
+        graph_iri: String,
+        node_id: NodeId,
+    },
     GetGraphPolicy {
         graph_iri: String,
     },
@@ -191,31 +194,6 @@ pub enum MetadataEffect {
     ContainsGraph {
         graph_iri: String,
     },
-    VectorClock {
-        graph_iri: String,
-    },
-    CatchupBatches {
-        graph_iri: String,
-        remote_clock: VectorClock,
-    },
-    SyncFromPeer {
-        node_id: NodeId,
-        document_id: Ulid,
-        known_clock: VectorClock,
-    },
-    ReplicateBootstrap {
-        record: MetadataRegistryRecord,
-    },
-    ReplicateBatch {
-        record: MetadataRegistryRecord,
-        batch: MetadataBatch,
-    },
-    ReplicateDelete {
-        record: MetadataRegistryRecord,
-    },
-    ApplyRemoteBatch {
-        batch: MetadataBatch,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,6 +212,10 @@ pub enum MetadataEvent {
     },
     GraphPolicySet {
         graph_iri: String,
+    },
+    GraphPeerAdded {
+        graph_iri: String,
+        node_id: NodeId,
     },
     GraphPolicyResult {
         graph_iri: String,
@@ -266,33 +248,6 @@ pub enum MetadataEvent {
     ContainsGraphResult {
         graph_iri: String,
         exists: bool,
-    },
-    VectorClockResult {
-        graph_iri: String,
-        clock: VectorClock,
-    },
-    CatchupBatchesResult {
-        graph_iri: String,
-        batches: Vec<MetadataBatch>,
-    },
-    PeerSyncApplied {
-        document_id: Ulid,
-        graph_iri: String,
-    },
-    BootstrapReplicated {
-        graph_iri: String,
-        replicated_node_ids: Vec<NodeId>,
-    },
-    BatchReplicated {
-        graph_iri: String,
-        replicated_node_ids: Vec<NodeId>,
-    },
-    DeleteReplicated {
-        graph_iri: String,
-        replicated_node_ids: Vec<NodeId>,
-    },
-    RemoteBatchApplied {
-        graph_iri: String,
     },
     Error {
         graph_iri: Option<String>,
