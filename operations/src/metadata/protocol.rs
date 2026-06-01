@@ -1,20 +1,13 @@
-use aruna_core::metadata::MetadataBatch;
 use aruna_core::metadata::{MetadataQueryResults, MetadataSearchHit};
 use aruna_core::structs::AuthContext;
-use aruna_core::structs::MetadataRegistryRecord;
 use aruna_net::streams::BiStream;
-use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
-use ulid::Ulid;
 
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum MetadataTransportMessage {
-    UpsertRecord {
-        record: MetadataRegistryRecord,
-    },
     QueryGraphs {
         auth_context: Option<AuthContext>,
         graph_iris: Option<Vec<String>>,
@@ -32,21 +25,6 @@ pub enum MetadataTransportMessage {
     SearchResults {
         hits: Vec<MetadataSearchHit>,
     },
-    CatchupFrom {
-        document_id: Ulid,
-        known_clock: VectorClock,
-    },
-    CatchupData {
-        record: MetadataRegistryRecord,
-        batches: Vec<MetadataBatch>,
-    },
-    ApplyBatch {
-        batch: MetadataBatch,
-    },
-    DeleteRecord {
-        record: MetadataRegistryRecord,
-    },
-    Ack,
     Reject(String),
 }
 
