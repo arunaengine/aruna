@@ -5,11 +5,12 @@ mod connection_pool;
 pub mod dht;
 mod effect_handlers;
 pub mod error;
-pub mod gossip;
+pub mod irokle;
 pub mod streams;
 mod telemetry;
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,7 +19,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::{NodeId, TopicId};
+use aruna_core::id::NodeId;
 use aruna_core::keys::realm_endpoint_key;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
@@ -42,7 +43,7 @@ use tracing::{Instrument, Span, debug, warn};
 pub use connection_pool::Monitor;
 pub use dht::DhtHandle;
 pub use error::{NetError, Result};
-pub use gossip::GossipService;
+pub use irokle::IrokleService;
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
 const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 256;
@@ -61,6 +62,7 @@ pub struct NetConfig {
     pub relay_method: RelayMethod,
     pub max_concurrent_uni_streams: Option<u64>,
     pub max_concurrent_bidi_streams: Option<u64>,
+    pub irokle_storage_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,6 +263,7 @@ impl Default for NetConfig {
             relay_method: RelayMethod::N0,
             max_concurrent_bidi_streams: None,
             max_concurrent_uni_streams: None,
+            irokle_storage_path: None,
         }
     }
 }
@@ -332,7 +335,6 @@ enum PeerConnectivityEvent {
 
 #[async_trait]
 pub trait InboundEventHandler: Send + Sync {
-    async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>);
     async fn handle_incoming_stream(&self, alpn: Alpn, stream: streams::BiStream, node_id: NodeId);
 }
 
@@ -352,7 +354,7 @@ struct NetInner {
     relay_method: RelayMethod,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
-    gossip: Arc<GossipService>,
+    irokle: Arc<IrokleService>,
     streams: Arc<StreamsService>,
     connection_pool: ConnectionPool,
     peer_connectivity: Arc<Mutex<PeerConnectivityManagerState>>,
@@ -392,18 +394,19 @@ impl NetHandle {
 
         let monitor = Monitor::new();
 
+        let app_alpns = vec![
+            Alpn::Dht.as_bytes().to_vec(),
+            Alpn::Bao.as_bytes().to_vec(),
+            Alpn::Irokle.as_bytes().to_vec(),
+            Alpn::Metadata.as_bytes().to_vec(),
+        ];
+
         let mut endpoint_builder = Endpoint::builder(presets::Minimal)
             .hooks(monitor.clone())
             .transport_config(transport_config.build())
             .secret_key(secret_key)
             .address_lookup(address_lookup.clone())
-            .alpns(vec![
-                Alpn::Dht.as_bytes().to_vec(),
-                Alpn::Gossip.as_bytes().to_vec(),
-                Alpn::Bao.as_bytes().to_vec(),
-                Alpn::Automerge.as_bytes().to_vec(),
-                Alpn::Metadata.as_bytes().to_vec(),
-            ]);
+            .alpns(app_alpns.clone());
 
         match &config.relay_method {
             RelayMethod::None => {
@@ -472,7 +475,6 @@ impl NetHandle {
         let (peer_connectivity_tx, peer_connectivity_rx) = mpsc::channel(256);
         let shutdown = CancellationToken::new();
 
-        let (gossip_msg_tx, mut gossip_msg_rx) = mpsc::channel::<(TopicId, NodeId, Vec<u8>)>(1024);
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
             Arc::new(RwLock::new(None));
 
@@ -487,19 +489,16 @@ impl NetHandle {
         )?;
         let dht = Arc::new(dht_handle);
 
-        let gossip = Arc::new(
-            GossipService::new(
-                endpoint.clone(),
-                storage.clone(),
-                dht.clone(),
-                config.realm_id,
-                peer_nodes.clone(),
-                shutdown.child_token(),
-                gossip_msg_tx.clone(),
-            )
-            .await?,
-        );
-        gossip.restore_subscriptions().await?;
+        let irokle_path = config.irokle_storage_path.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("aruna-irokle-{}", ulid::Ulid::new()))
+        });
+        let irokle = Arc::new(IrokleService::open(
+            endpoint.clone(),
+            storage.clone(),
+            irokle_path,
+            &peer_nodes,
+            app_alpns,
+        )?);
 
         let streams = Arc::new(StreamsService::new(
             connection_pool.clone(),
@@ -510,7 +509,7 @@ impl NetHandle {
 
         let shutdown_for_effects = shutdown.clone();
         let dht_for_effects = dht.clone();
-        let gossip_for_effects = gossip.clone();
+        let irokle_for_effects = irokle.clone();
         let effect_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -518,11 +517,11 @@ impl NetHandle {
                     maybe_effect = effect_rx.recv() => {
                         let Some((effect, response_tx, span)) = maybe_effect else { break };
                         let dht = dht_for_effects.clone();
-                        let gossip = gossip_for_effects.clone();
+                        let irokle = irokle_for_effects.clone();
                         tokio::spawn(async move {
                             let event = effect_handlers::handle_net_effect(
                                 &dht,
-                                &gossip,
+                                &irokle,
                                 effect,
                             )
                             .await;
@@ -534,12 +533,10 @@ impl NetHandle {
         });
 
         let (dht_tx, mut dht_rx) = mpsc::channel(64);
-        let (gossip_conn_tx, mut gossip_conn_rx) = mpsc::channel(64);
         let (stream_tx, mut stream_rx) = mpsc::channel(64);
 
         let dht_inbound_tx = dht_resources.inbound_stream_tx.clone();
         let dht_for_inbound = dht.clone();
-        let gossip_for_inbound = gossip.clone();
         let dht_task = tokio::spawn(async move {
             while let Some((send, recv, peer_id)) = dht_rx.recv().await {
                 if let Err(err) = dht_for_inbound.add_peer(peer_id) {
@@ -549,7 +546,6 @@ impl NetHandle {
                         "Failed to add inbound DHT peer to routing queue"
                     );
                 }
-                gossip_for_inbound.add_bootstrap_node(peer_id);
                 match dht_inbound_tx.try_send((send, recv, peer_id)) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
@@ -560,47 +556,7 @@ impl NetHandle {
             }
         });
 
-        let dht_for_gossip = dht.clone();
-        let gossip_for_gossip = gossip.clone();
-        let gossip_task = tokio::spawn(async move {
-            while let Some((conn, peer_id)) = gossip_conn_rx.recv().await {
-                if let Err(err) = dht_for_gossip.add_peer(peer_id) {
-                    warn!(
-                        node_id = %peer_id,
-                        error = %err,
-                        "Failed to add gossip peer to routing queue"
-                    );
-                }
-                gossip_for_gossip.add_bootstrap_node(peer_id);
-                if let Err(err) = gossip_for_gossip.gossip().handle_connection(conn).await {
-                    warn!(error = %err, "Failed to hand connection to gossip service");
-                }
-            }
-        });
-
-        let inbound_handler_for_gossip = inbound_handler.clone();
-        let shutdown_for_gossip_events = shutdown.clone();
-        let gossip_event_task = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = shutdown_for_gossip_events.cancelled() => break,
-                    maybe_msg = gossip_msg_rx.recv() => {
-                        let Some((topic, sender, data)) = maybe_msg else { break };
-                        let handler = inbound_handler_for_gossip.read().clone();
-                        if let Some(handler) = handler {
-                            tokio::spawn(async move {
-                                handler.handle_gossip_message(topic, sender, data).await;
-                            });
-                        } else {
-                            warn!(topic = %topic, sender = %sender, "Dropping inbound gossip message without registered handler");
-                        }
-                    }
-                }
-            }
-        });
-
         let dht_for_streams = dht.clone();
-        let gossip_for_streams = gossip.clone();
         let inbound_handler_for_streams = inbound_handler.clone();
         let inbound_stream_handlers = Arc::new(Semaphore::new(MAX_INBOUND_APP_STREAM_HANDLERS));
         let stream_task = tokio::spawn(async move {
@@ -612,8 +568,6 @@ impl NetHandle {
                         "Failed to add inbound stream peer to routing queue"
                     );
                 }
-                gossip_for_streams.add_bootstrap_node(peer_id);
-
                 let handler = inbound_handler_for_streams.read().clone();
                 if let Some(handler) = handler {
                     let Ok(permit) = inbound_stream_handlers.clone().try_acquire_owned() else {
@@ -637,14 +591,8 @@ impl NetHandle {
         let endpoint_for_accept = endpoint.clone();
         let shutdown_for_accept = shutdown.child_token();
         let accept_task = tokio::spawn(async move {
-            streams::run_accept_loop(
-                endpoint_for_accept,
-                dht_tx,
-                gossip_conn_tx,
-                stream_tx,
-                shutdown_for_accept,
-            )
-            .await;
+            streams::run_accept_loop(endpoint_for_accept, dht_tx, stream_tx, shutdown_for_accept)
+                .await;
         });
 
         let peer_connectivity_task = tokio::spawn(run_peer_connectivity_manager(
@@ -675,8 +623,6 @@ impl NetHandle {
         tasks.extend(vec![
             effect_task,
             dht_task,
-            gossip_task,
-            gossip_event_task,
             stream_task,
             accept_task,
             peer_connectivity_task,
@@ -692,7 +638,7 @@ impl NetHandle {
             relay_method,
             dht_signed_authorized_nodes,
             dht,
-            gossip,
+            irokle,
             streams,
             connection_pool,
             peer_connectivity,
@@ -718,6 +664,18 @@ impl NetHandle {
         local_endpoint_addr(&self.inner.endpoint, &self.inner.relay_method.relay_urls())
     }
 
+    pub fn irokle_node(&self) -> ::irokle::Irokle<::irokle::FjallStorage> {
+        self.inner.irokle.node()
+    }
+
+    pub async fn handle_irokle_stream(
+        &self,
+        stream: streams::BiStream,
+        peer: NodeId,
+    ) -> Result<usize> {
+        self.inner.irokle.handle_inbound_stream(stream, peer).await
+    }
+
     pub async fn add_peer_addr(&self, endpoint_addr: EndpointAddr) {
         if endpoint_addr.id == self.inner.node_id {
             return;
@@ -728,6 +686,13 @@ impl NetHandle {
             endpoint_addr.id,
             self.inner.node_id,
         );
+        if let Err(err) = self.inner.irokle.allow_peer_node(endpoint_addr.id) {
+            warn!(
+                node_id = %endpoint_addr.id,
+                error = %err,
+                "Failed to add endpoint address peer to Irokle whitelist"
+            );
+        }
         self.inner
             .address_lookup
             .set_endpoint_info(endpoint_addr.clone());
@@ -739,7 +704,6 @@ impl NetHandle {
                 immediate: true,
             },
         );
-        self.inner.gossip.add_bootstrap_node(endpoint_addr.id);
         if let Err(err) = self.inner.dht.add_peer(endpoint_addr.id) {
             warn!(
                 node_id = %endpoint_addr.id,
@@ -759,6 +723,13 @@ impl NetHandle {
             node_id,
             self.inner.node_id,
         );
+        if let Err(err) = self.inner.irokle.allow_peer_node(node_id) {
+            warn!(
+                node_id = %node_id,
+                error = %err,
+                "Failed to add peer node to Irokle whitelist"
+            );
+        }
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
@@ -767,7 +738,6 @@ impl NetHandle {
                 immediate: true,
             },
         );
-        self.inner.gossip.add_bootstrap_node(node_id);
         if let Err(err) = self.inner.dht.add_peer(node_id) {
             warn!(
                 node_id = %node_id,
@@ -778,7 +748,7 @@ impl NetHandle {
     }
 
     pub async fn open_stream(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
-        if matches!(alpn, Alpn::Dht | Alpn::Gossip) {
+        if matches!(alpn, Alpn::Dht) {
             return Err(NetError::Stream(format!(
                 "{alpn} is an internal network protocol"
             )));
@@ -792,7 +762,6 @@ impl NetHandle {
                     "Failed to add stream target peer to DHT"
                 );
             }
-            self.inner.gossip.add_bootstrap_node(node_id);
             send_peer_connectivity_event(
                 &self.inner.peer_connectivity_tx,
                 PeerConnectivityEvent::ManagePeer {
@@ -833,7 +802,6 @@ impl NetHandle {
                             install_dht_signed_endpoint(
                                 &self.inner.address_lookup,
                                 &self.inner.dht,
-                                &self.inner.gossip,
                                 endpoint_addr,
                             );
                             debug!(
@@ -895,13 +863,11 @@ impl NetHandle {
             return;
         }
 
+        self.inner.shutdown.cancel();
         if let Err(err) = self.inner.dht.shutdown().await {
             warn!(error = %err, "DHT shutdown returned error");
         }
-        self.inner.shutdown.cancel();
-        if let Err(err) = self.inner.gossip.gossip().shutdown().await {
-            warn!(error = %err, "Gossip shutdown returned error");
-        }
+        self.inner.irokle.shutdown().await;
         if let Err(err) = self.inner.connection_pool.shutdown().await {
             warn!(error = %err, "Connection pool shutdown returned error");
         }
@@ -914,7 +880,7 @@ impl NetHandle {
     }
 
     pub async fn get_status(&self) -> NetState {
-        let peer_nodes = self.inner.gossip.get_bootstrap_nodes();
+        let peer_nodes = self.inner.dht_signed_authorized_nodes.read().clone();
         let configured_relay_urls = self.inner.relay_method.relay_urls();
         let monitor = self.monitor.get_status().await;
         let mut diagnostics = self.inner.network_diagnostics.lock().await.clone();
@@ -1233,12 +1199,10 @@ fn validate_realm_endpoint_announcement(
 fn install_dht_signed_endpoint(
     address_lookup: &MemoryLookup,
     dht: &DhtHandle,
-    gossip: &GossipService,
     endpoint_addr: EndpointAddr,
 ) {
     let node_id = endpoint_addr.id;
     address_lookup.set_endpoint_info(endpoint_addr);
-    gossip.add_bootstrap_node(node_id);
     if let Err(err) = dht.add_peer(node_id) {
         debug!(
             node_id = %node_id,
@@ -1509,17 +1473,19 @@ async fn run_peer_connectivity_manager(
                     return;
                 }
                 let authorized_nodes = dht_signed_authorized_nodes.read().clone();
-                run_peer_connectivity_attempt(
-                    &dht,
-                    &address_lookup,
-                    &discovery_method,
-                    realm_id,
-                    &authorized_nodes,
-                    &state,
-                    &diagnostics,
-                    peer,
-                )
-                .await;
+                tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    _ = run_peer_connectivity_attempt(
+                        &dht,
+                        &address_lookup,
+                        &discovery_method,
+                        realm_id,
+                        &authorized_nodes,
+                        &state,
+                        &diagnostics,
+                        peer,
+                    ) => {}
+                }
             }
             continue;
         }
@@ -1876,12 +1842,11 @@ impl Handle for NetHandle {
 fn net_handle_effect_kind(effect: &Effect) -> &'static str {
     match effect {
         Effect::Net(NetEffect::Dht(_)) => "dht",
-        Effect::Net(NetEffect::Gossip(_)) => "gossip",
+        Effect::Net(NetEffect::Irokle(_)) => "irokle",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
-        Effect::Automerge(_) => "automerge",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
         Effect::Task(_) => "task",
@@ -2261,8 +2226,6 @@ mod tests {
 
     #[async_trait]
     impl InboundEventHandler for HoldingInboundHandler {
-        async fn handle_gossip_message(&self, _topic: TopicId, _sender: NodeId, _data: Vec<u8>) {}
-
         async fn handle_incoming_stream(
             &self,
             _alpn: Alpn,
