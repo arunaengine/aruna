@@ -194,13 +194,6 @@ impl TopicId {
             _ => None,
         }
     }
-
-    #[inline]
-    pub fn to_iroh_topic(&self) -> iroh_gossip::TopicId {
-        let bytes = self.to_bytes();
-        let hash = blake3::hash(&bytes);
-        (*hash.as_bytes()).into()
-    }
 }
 
 impl fmt::Debug for TopicId {

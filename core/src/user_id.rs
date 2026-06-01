@@ -80,27 +80,6 @@ impl Default for UserId {
     }
 }
 
-pub mod autosurgeon_user_id {
-    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconciler};
-
-    use super::UserId;
-
-    pub fn hydrate<'a, D: ReadDoc>(
-        doc: &D,
-        obj: &automerge::ObjId,
-        prop: Prop<'a>,
-    ) -> Result<UserId, HydrateError> {
-        let inner = String::hydrate(doc, obj, prop)?;
-        UserId::from_string(&inner).map_err(|err| {
-            HydrateError::unexpected("valid UserId string", format!("Invalid UserId {err}"))
-        })
-    }
-
-    pub fn reconcile<R: Reconciler>(user_id: &UserId, mut reconciler: R) -> Result<(), R::Error> {
-        reconciler.str(user_id.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::UserId;

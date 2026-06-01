@@ -1,5 +1,5 @@
 use crate::NodeId;
-use crate::automerge::{AutomergeDocumentVariant, InitAuthProof};
+use crate::document::DocumentSyncTarget;
 use crate::structs::RealmId;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -66,7 +66,7 @@ pub struct OnboardingSyncTicketPayload {
     pub realm_id: String,
     pub node_id: String,
     pub expires_at: u64,
-    pub documents: Vec<AutomergeDocumentVariant>,
+    pub documents: Vec<DocumentSyncTarget>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -125,7 +125,7 @@ impl OnboardingSyncTicket {
         realm_id: &RealmId,
         node_id: NodeId,
         expires_at: u64,
-        documents: Vec<AutomergeDocumentVariant>,
+        documents: Vec<DocumentSyncTarget>,
     ) -> Result<Self, OnboardingSecretError> {
         let payload = OnboardingSyncTicketPayload {
             realm_id: realm_id.to_string(),
@@ -151,7 +151,7 @@ impl OnboardingSyncTicket {
     pub fn verify(
         &self,
         expected_node_id: NodeId,
-        expected_document: &AutomergeDocumentVariant,
+        expected_document: &DocumentSyncTarget,
         now: u64,
     ) -> Result<(), OnboardingSecretError> {
         if self.payload.node_id != expected_node_id.to_string() {
@@ -180,21 +180,6 @@ impl OnboardingSyncTicket {
             .verify(&payload_bytes, &signature)
             .map_err(|_| OnboardingSecretError::InvalidSignature)
     }
-
-    pub fn into_auth_proof(self) -> InitAuthProof {
-        InitAuthProof {
-            payload: self
-                .encode()
-                .expect("onboarding sync ticket encoding should succeed")
-                .into_bytes(),
-        }
-    }
-
-    pub fn from_auth_proof(auth: &InitAuthProof) -> Result<Self, OnboardingSecretError> {
-        let encoded =
-            std::str::from_utf8(&auth.payload).map_err(|_| OnboardingSecretError::InvalidSecret)?;
-        Self::decode(encoded)
-    }
 }
 
 pub fn bootstrap_node_proof_message(
@@ -220,7 +205,7 @@ pub fn bootstrap_issuer_proof_message(
 #[cfg(test)]
 mod tests {
     use super::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
-    use crate::automerge::AutomergeDocumentVariant;
+    use crate::document::DocumentSyncTarget;
     use crate::structs::RealmId;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
@@ -245,7 +230,7 @@ mod tests {
         let node_signing_key = SigningKey::from_bytes(&[4u8; 32]);
         let node_id = iroh::SecretKey::from_bytes(&node_signing_key.to_bytes()).public();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-        let document = AutomergeDocumentVariant::RealmAuthorization { realm_id };
+        let document = DocumentSyncTarget::RealmAuthorization { realm_id };
 
         let ticket = OnboardingSyncTicket::issue(
             &realm_signing_key,
