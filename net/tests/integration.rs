@@ -3,11 +3,10 @@ use std::time::Duration;
 
 use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{DhtEffect, Effect, GossipEffect, NetEffect, StorageEffect};
-use aruna_core::events::{DhtEvent, Event, GossipEvent, NetEvent, StorageEvent};
+use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
+use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
-use aruna_core::keys::gossip_peer_key;
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RealmId};
 use aruna_net::streams::BiStream;
 use aruna_net::{
@@ -22,18 +21,11 @@ use ulid::Ulid;
 
 #[derive(Clone, Default)]
 struct TestInboundHandler {
-    gossip_tx: Option<mpsc::UnboundedSender<(TopicId, NodeId, Vec<u8>)>>,
     stream_tx: Option<mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>>,
 }
 
 #[async_trait]
 impl InboundEventHandler for TestInboundHandler {
-    async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>) {
-        if let Some(tx) = &self.gossip_tx {
-            let _ = tx.send((topic, sender, data));
-        }
-    }
-
     async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
         if let Some(tx) = &self.stream_tx {
             let _ = tx.send((alpn, stream, node_id));
@@ -224,7 +216,6 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
 
     let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
     handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
-        gossip_tx: None,
         stream_tx: Some(stream_tx),
     }));
 
@@ -281,157 +272,6 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[tokio::test]
-async fn test_multi_node_gossip_message_delivery() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_a = tempdir()?;
-    let temp_b = tempdir()?;
-    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
-
-    let cfg = || NetConfig {
-        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-        discovery_method: DiscoveryMethod::None,
-        relay_method: RelayMethod::None,
-        ..NetConfig::default()
-    };
-
-    let handle_a = NetHandle::new(cfg(), storage_a).await?;
-    let handle_b = NetHandle::new(cfg(), storage_b).await?;
-
-    let (gossip_tx, mut gossip_rx) = mpsc::unbounded_channel();
-    handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
-        gossip_tx: Some(gossip_tx),
-        stream_tx: None,
-    }));
-
-    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
-    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
-
-    let topic = TopicId::realm(RealmId::from_bytes([2u8; 32]));
-
-    let subscribe_a = handle_a
-        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-            topic: topic.clone(),
-        })))
-        .await;
-    let subscribe_b = handle_b
-        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-            topic: topic.clone(),
-        })))
-        .await;
-
-    assert!(
-        matches!(
-            subscribe_a,
-            Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
-        ),
-        "unexpected subscribe_a event: {subscribe_a:?}"
-    );
-    assert!(
-        matches!(
-            subscribe_b,
-            Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
-        ),
-        "unexpected subscribe_b event: {subscribe_b:?}"
-    );
-
-    let payload = b"hello gossip".to_vec();
-    let mut got_message = false;
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    for _ in 0..8 {
-        let broadcast = handle_a
-            .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Broadcast {
-                topic: topic.clone(),
-                message: payload.clone(),
-            })))
-            .await;
-        assert!(matches!(
-            broadcast,
-            Event::Net(NetEvent::Gossip(GossipEvent::BroadcastComplete { .. }))
-        ));
-
-        let maybe = tokio::time::timeout(Duration::from_millis(1200), gossip_rx.recv()).await;
-        if let Ok(Some((recv_topic, _, data))) = maybe
-            && recv_topic == topic
-            && data == payload
-        {
-            got_message = true;
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-
-    assert!(got_message, "expected gossip message on second node");
-
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_automerge_topic_subscription_announces_document_holders()
--> Result<(), Box<dyn std::error::Error>> {
-    let temp_a = tempdir()?;
-    let temp_b = tempdir()?;
-    let storage_a = FjallStorage::open(temp_a.path().to_str().ok_or("invalid temp path")?)?;
-    let storage_b = FjallStorage::open(temp_b.path().to_str().ok_or("invalid temp path")?)?;
-
-    let cfg = || NetConfig {
-        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
-        discovery_method: DiscoveryMethod::None,
-        relay_method: RelayMethod::None,
-        ..NetConfig::default()
-    };
-
-    let handle_a = NetHandle::new(cfg(), storage_a).await?;
-    let handle_b = NetHandle::new(cfg(), storage_b).await?;
-
-    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
-    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
-
-    let topic = TopicId::metadata(Ulid::new());
-    let topic_key = *gossip_peer_key(&topic).as_bytes();
-
-    let subscribe = handle_a
-        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-            topic: topic.clone(),
-        })))
-        .await;
-    assert!(matches!(
-        subscribe,
-        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. }))
-    ));
-
-    let mut found = false;
-    for _ in 0..10 {
-        let get = handle_b
-            .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
-                key: topic_key,
-                realm_filter: None,
-            })))
-            .await;
-
-        if let Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) = get
-            && values
-                .iter()
-                .any(|entry| entry.node_id == handle_a.node_id())
-        {
-            found = true;
-            break;
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-
-    assert!(found, "expected gossip topic DHT entry on second node");
-
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Error>> {
     let temp_a = tempdir()?;
     let temp_b = tempdir()?;
@@ -450,7 +290,6 @@ async fn test_multi_node_stream_send_recv() -> Result<(), Box<dyn std::error::Er
 
     let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
     handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
-        gossip_tx: None,
         stream_tx: Some(stream_tx),
     }));
 
@@ -551,7 +390,4 @@ fn test_topic_id_creation() {
 
     assert_eq!(topic3, topic4);
     assert_ne!(topic3, topic5);
-
-    let iroh_topic = topic1.to_iroh_topic();
-    assert!(iroh_topic.as_bytes().iter().any(|&b| b != 0));
 }
