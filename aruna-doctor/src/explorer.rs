@@ -3,12 +3,12 @@ use aruna::config::PersistedNodeState;
 use aruna_api::server_state::{
     INITIAL_REALM_ADMIN_CLAIMED_KEY, TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY,
 };
-use aruna_core::id::{DhtKeyId, TopicId};
+use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
     BLOB_VERSIONS_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
-    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
-    HASH_PATHS_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+    IROKLE_APPLIED_OPS_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
     REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
     S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
     S3_MULTIPART_UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE,
@@ -166,9 +166,6 @@ enum DecodedValue {
     },
     ApiInitialRealmAdminClaimed {
         data: bool,
-    },
-    GossipSubscriptions {
-        data: Vec<String>,
     },
     NodeState {
         data: JsonPersistedNodeState,
@@ -846,9 +843,9 @@ fn defined_keyspaces() -> [&'static str; 23] {
         CRAQLE_QUADS_KEYSPACE,
         CRAQLE_TERMS_KEYSPACE,
         DHT_KEYSPACE,
-        GOSSIP_SUBSCRIPTIONS_KEYSPACE,
         GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE,
+        IROKLE_APPLIED_OPS_KEYSPACE,
         NODE_STATE_KEYSPACE,
         ONBOARDING_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
@@ -923,7 +920,7 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | S3_BUCKET_KEYSPACE
         | S3_BUCKET_REPLICATION_KEYSPACE
         | API_STATE_KEYSPACE
-        | GOSSIP_SUBSCRIPTIONS_KEYSPACE
+        | IROKLE_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
         | ONBOARDING_KEYSPACE => decode_utf8_key(key),
         S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
@@ -999,7 +996,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE => decode_multipart_object_metadata_value(key, value),
         AUTH_KEYSPACE => decode_auth_value(value),
         API_STATE_KEYSPACE => decode_api_state_value(key, value),
-        GOSSIP_SUBSCRIPTIONS_KEYSPACE => decode_gossip_subscriptions_value(value),
+        IROKLE_APPLIED_OPS_KEYSPACE => raw_value(value, Some("irokle applied op".to_string())),
         NODE_STATE_KEYSPACE => decode_value_with(
             value,
             |bytes| postcard::from_bytes::<PersistedNodeState>(bytes),
@@ -1027,21 +1024,6 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         }),
         _ => raw_value(value, None),
     }
-}
-
-fn decode_gossip_subscriptions_value(value: &[u8]) -> DecodedValue {
-    decode_value_with(
-        value,
-        |bytes| postcard::from_bytes::<Vec<TopicId>>(bytes),
-        |data| {
-            let mut data = data
-                .into_iter()
-                .map(|topic| topic.to_string())
-                .collect::<Vec<_>>();
-            data.sort();
-            DecodedValue::GossipSubscriptions { data }
-        },
-    )
 }
 
 fn decode_auth_value(value: &[u8]) -> DecodedValue {
@@ -1187,12 +1169,12 @@ mod tests {
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
-    use aruna_core::id::{DhtKeyId, TopicId};
+    use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-        BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE, GOSSIP_SUBSCRIPTIONS_KEYSPACE, GROUP_KEYSPACE,
-        HASH_PATHS_INDEX_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-        REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
+        IROKLE_APPLIED_OPS_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
+        REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE,
     };
@@ -1259,8 +1241,8 @@ mod tests {
             CRAQLE_QUADS_KEYSPACE.to_string(),
             CRAQLE_TERMS_KEYSPACE.to_string(),
             DHT_KEYSPACE.to_string(),
-            GOSSIP_SUBSCRIPTIONS_KEYSPACE.to_string(),
             HASH_PATHS_INDEX_KEYSPACE.to_string(),
+            IROKLE_APPLIED_OPS_KEYSPACE.to_string(),
             NODE_STATE_KEYSPACE.to_string(),
             ONBOARDING_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
@@ -1411,29 +1393,6 @@ mod tests {
                 ..
             } => {}
             other => panic!("expected raw decode fallback, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decodes_gossip_subscriptions_value() {
-        let realm_id = RealmId::from_bytes([8_u8; 32]);
-        let group_id = Ulid::new();
-        let value =
-            postcard::to_allocvec(&vec![TopicId::group(group_id), TopicId::realm(realm_id)])
-                .unwrap();
-
-        let decoded = decode_entry(GOSSIP_SUBSCRIPTIONS_KEYSPACE, b"topics", &value);
-        assert_eq!(
-            decoded.key,
-            DecodedField::Utf8 {
-                value: "topics".to_string()
-            }
-        );
-        match decoded.value {
-            DecodedValue::GossipSubscriptions { data } => {
-                assert_eq!(data, vec![format!("g:{group_id}"), format!("r:{realm_id}")]);
-            }
-            other => panic!("expected gossip subscriptions, got {other:?}"),
         }
     }
 

@@ -508,7 +508,6 @@ mod tests {
     use aruna_core::stream::BackendStream;
     use aruna_core::structs::{Actor, Backend, BackendConfig, BucketInfo};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::automerge::AutomergeHandle;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -624,13 +623,10 @@ mod tests {
             )
             .await
             .unwrap();
-            let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
-
             let context = Arc::new(DriverContext {
                 storage_handle: storage_handle.clone(),
                 net_handle: Some(net_handle.clone()),
                 blob_handle: Some(blob_handle.clone()),
-                automerge_handle: Some(automerge_handle.clone()),
                 metadata_handle: None,
                 task_handle: Some(task_handle.clone()),
             });
@@ -751,7 +747,6 @@ mod tests {
 
             drop(server_state);
             drop(context);
-            drop(automerge_handle);
             drop(task_handle);
             drop(blob_handle);
             net_handle.shutdown().await;
