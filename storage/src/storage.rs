@@ -912,7 +912,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::Net(_) => "net",
-        Effect::Automerge(_) => "automerge",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
         Effect::Task(_) => "task",

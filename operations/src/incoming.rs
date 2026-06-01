@@ -1,21 +1,16 @@
 use std::sync::Arc;
 
 use crate::driver::{DriverContext, drive};
-use crate::incoming_automerge::IncomingAutomergeOperation;
-use crate::incoming_gossip::IncomingGossipOperation;
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
-use crate::telemetry::extract_trace_context;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::gossip::TopicMessage;
-use aruna_core::id::{NodeId, TopicId};
+use aruna_core::id::NodeId;
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
 use tracing::{Instrument, debug, error, info_span, trace, warn};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -39,54 +34,6 @@ pub fn initialize_net_incoming(context: Arc<DriverContext>) {
 
 #[async_trait]
 impl InboundEventHandler for OperationsInboundHandler {
-    #[tracing::instrument(
-        name = "operations.inbound.gossip",
-        level = "debug",
-        skip(self, data),
-        fields(topic = %topic, sender = %sender, message_len = data.len())
-    )]
-    async fn handle_gossip_message(&self, topic: TopicId, sender: NodeId, data: Vec<u8>) {
-        let message = postcard::from_bytes::<TopicMessage>(&data).ok();
-        let span = info_span!(
-            "gossip.receive",
-            "otel.kind" = "consumer",
-            "messaging.system" = "iroh-gossip",
-            topic = %topic,
-            sender = %sender,
-            message_id = ?message.as_ref().map(|message| message.message_id),
-        );
-        if let Some(trace_context) = message
-            .as_ref()
-            .and_then(|message| message.trace_context.as_ref())
-        {
-            let parent = extract_trace_context(trace_context);
-            let _ = span.set_parent(parent);
-        }
-
-        async move {
-            trace!(
-                event = "gossip.received",
-                topic = %topic,
-                sender = %sender,
-                message_id = ?message.as_ref().map(|message| message.message_id),
-                "Received inbound gossip message"
-            );
-
-            let local_node_id = self
-                .context
-                .net_handle
-                .as_ref()
-                .map(|net_handle| net_handle.node_id())
-                .unwrap_or(sender);
-            let op = IncomingGossipOperation::new(topic, sender, local_node_id, data);
-            if let Err(err) = drive(op, self.context.as_ref()).await {
-                error!(error = ?err, "Failed to process inbound gossip event");
-            }
-        }
-        .instrument(span)
-        .await;
-    }
-
     #[tracing::instrument(
         name = "operations.inbound.stream",
         level = "debug",
@@ -159,24 +106,28 @@ impl InboundEventHandler for OperationsInboundHandler {
                         error!("Cannot handle incoming bao stream without blob handle");
                     }
                 }
-                Alpn::Automerge => {
-                    let Some(automerge_handle) = self.context.automerge_handle.clone() else {
-                        warn!(node_id = %node_id, "Dropping inbound automerge stream without automerge handle");
-                        return;
-                    };
+                Alpn::Irokle => {
                     let Some(net_handle) = self.context.net_handle.as_ref() else {
-                        warn!(node_id = %node_id, "Dropping inbound automerge stream without net handle");
+                        warn!(node_id = %node_id, "Dropping inbound irokle stream without net handle");
                         return;
                     };
-                    let sync_id = automerge_handle.register_inbound_stream(stream, node_id).await;
-                    let op = IncomingAutomergeOperation::new(
-                        sync_id,
-                        node_id,
-                        net_handle.node_id(),
-                        *net_handle.realm_id(),
-                    );
-                    if let Err(err) = drive(op, self.context.as_ref()).await {
-                        error!(error = ?err, "Failed to process inbound automerge stream event");
+                    match net_handle.handle_irokle_stream(stream, node_id).await {
+                        Ok(applied) => {
+                            debug!(node_id = %node_id, applied, "Reconciled inbound Irokle document events");
+                            if let Some(metadata_handle) = self.context.metadata_handle.as_ref() {
+                                if let Err(error) = metadata_handle.reconcile_irokle().await {
+                                    error!(error = ?error, "Failed to reconcile Craqle Irokle events");
+                                }
+                                match metadata_handle.prune_unregistered_aruna_graphs().await {
+                                    Ok(pruned) if pruned > 0 => {
+                                        debug!(pruned, "Pruned unregistered metadata graphs")
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => error!(error = ?error, "Failed to prune unregistered metadata graphs"),
+                                }
+                            }
+                        }
+                        Err(err) => error!(error = ?err, "Failed to process inbound irokle stream"),
                     }
                 }
                 Alpn::Metadata => {
@@ -188,7 +139,7 @@ impl InboundEventHandler for OperationsInboundHandler {
                         error!(error = ?err, "Failed to process inbound metadata stream");
                     }
                 }
-                Alpn::Dht | Alpn::Gossip => {
+                Alpn::Dht => {
                     warn!(
                         node_id = %node_id,
                         "Ignoring inbound stream for non-stream ALPN"

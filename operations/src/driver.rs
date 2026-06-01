@@ -13,10 +13,7 @@ use std::future::Future;
 use std::pin::Pin;
 use tracing::{Instrument, debug_span, error, trace};
 
-use crate::automerge::AutomergeHandle;
 use crate::metadata::MetadataHandle;
-use aruna_core::automerge::AutomergeEvent;
-use aruna_core::automerge::AutomergeSyncError;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::TaskEvent;
@@ -26,7 +23,6 @@ pub struct DriverContext {
     pub storage_handle: storage::StorageHandle,
     pub net_handle: Option<NetHandle>,
     pub blob_handle: Option<BlobHandle>,
-    pub automerge_handle: Option<AutomergeHandle>,
     pub metadata_handle: Option<MetadataHandle>,
     pub task_handle: Option<TaskHandle>,
 }
@@ -84,19 +80,6 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                 net_handle.send_effect(Effect::Net(net_effect)).await
             } else {
                 Event::Net(NetEvent::Error(NetError::ChannelClosed))
-            }
-        }
-        Effect::Automerge(automerge_effect) => {
-            if let Some(automerge_handle) = &context.automerge_handle {
-                automerge_handle
-                    .send_effect(Effect::Automerge(automerge_effect))
-                    .await
-            } else {
-                Event::Automerge(AutomergeEvent::SyncRejected {
-                    sync_id: ulid::Ulid::new(),
-                    document: None,
-                    error: AutomergeSyncError::Network("automerge handle unavailable".to_string()),
-                })
             }
         }
         Effect::Metadata(metadata_effect) => {
@@ -263,7 +246,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::StagingSource(_) => "staging_source",
         Effect::Storage(_) => "storage",
         Effect::Net(_) => "net",
-        Effect::Automerge(_) => "automerge",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
         Effect::Task(_) => "task",
@@ -278,7 +260,6 @@ fn event_kind(event: &Event) -> &'static str {
         Event::StagingSource(_) => "staging_source",
         Event::Storage(_) => "storage",
         Event::Net(_) => "net",
-        Event::Automerge(_) => "automerge",
         Event::Metadata(_) => "metadata",
         Event::SubOperation(_) => "suboperation",
         Event::Task(_) => "task",
@@ -398,7 +379,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -428,9 +408,10 @@ mod test {
         fn start(&mut self) -> aruna_core::types::Effects {
             smallvec::smallvec![
                 Effect::Task(TaskEffect::CancelTimer {
-                    key: TaskKey::TopicAnnounce(aruna_core::TopicId::group(
-                        ulid::Ulid::from_bytes([0u8; 16]),
-                    )),
+                    key: TaskKey::RealmPresence {
+                        realm_id: aruna_core::structs::RealmId::from_bytes([0u8; 32]),
+                        node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
+                    },
                 }),
                 Effect::Search()
             ]
@@ -467,7 +448,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -562,7 +542,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: Some(blob_handle),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
@@ -627,7 +606,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
