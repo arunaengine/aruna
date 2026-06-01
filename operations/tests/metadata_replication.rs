@@ -257,13 +257,13 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
         net.node_id(),
         storage.clone(),
         Some(net.clone()),
+        Some(net.irokle_node()),
     )?;
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        automerge_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });

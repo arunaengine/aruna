@@ -7,7 +7,6 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::automerge::AutomergeHandle;
 use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_group::{GetGroupConfig, GetGroupOperation};
@@ -105,13 +104,11 @@ async fn spawn_node() -> Result<TestNode, Box<dyn std::error::Error>> {
     )
     .await?;
     let task_handle = TaskHandle::new();
-    let automerge_handle = AutomergeHandle::new(Some(net.clone()));
 
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        automerge_handle: Some(automerge_handle),
         metadata_handle: None,
         task_handle: Some(task_handle.clone()),
     });

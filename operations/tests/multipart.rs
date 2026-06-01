@@ -77,7 +77,6 @@ async fn setup_context() -> TestContext {
             storage_handle,
             net_handle: Some(net_handle),
             blob_handle: Some(blob_handle),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         },

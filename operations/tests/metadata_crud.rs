@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use aruna_core::structs::{Actor, RealmId};
+use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentOperation, CreateMetadataDocumentPayload,
 };
@@ -27,7 +28,7 @@ struct TestContext {
 
 #[tokio::test]
 async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std::error::Error>> {
-    let test = build_context()?;
+    let test = build_context().await?;
     let group_id = Ulid::new();
     let document_id = Ulid::new();
 
@@ -143,17 +144,27 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
         Err(GetMetadataDocumentError::DocumentNotFound)
     ));
 
+    if let Some(net_handle) = &test.context.net_handle {
+        net_handle.shutdown().await;
+    }
+
     Ok(())
 }
 
-fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
+async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     let storage_dir = tempfile::tempdir()?;
     let metadata_dir = tempfile::tempdir()?;
     let storage_handle =
         FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
-    let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
-    let metadata_handle =
-        MetadataHandle::new(metadata_dir.path(), node_id, storage_handle.clone(), None)?;
+    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone()).await?;
+    let node_id = net_handle.node_id();
+    let metadata_handle = MetadataHandle::new(
+        metadata_dir.path(),
+        node_id,
+        storage_handle.clone(),
+        None,
+        None,
+    )?;
     let actor = Actor {
         node_id,
         user_id: aruna_core::UserId::local(Ulid::new(), RealmId([5u8; 32])),
@@ -161,9 +172,8 @@ fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
     };
     let context = Arc::new(DriverContext {
         storage_handle,
-        net_handle: None,
+        net_handle: Some(net_handle),
         blob_handle: None,
-        automerge_handle: None,
         metadata_handle: Some(metadata_handle),
         task_handle: None,
     });
