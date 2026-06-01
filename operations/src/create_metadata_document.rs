@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use aruna_core::NodeId;
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
-use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
+use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::metadata::{
     MetadataCreateCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
@@ -13,7 +13,6 @@ use aruna_core::structs::{
     Actor, MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument,
 };
 use aruna_core::types::{Effects, GroupId, TxnId};
-use aruna_core::{TopicId, events::SubOperationEvent};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use smallvec::smallvec;
@@ -21,7 +20,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::announce::AnnounceTopicOperation;
-use crate::automerge::repository::read_effect;
+use crate::document_repository::read_effect;
 use crate::metadata::repository::{
     read_registry_by_document_effect, write_audit_effect, write_document_index_effect,
     write_holders_effect, write_registry_effect,
@@ -57,6 +56,7 @@ pub struct CreateMetadataDocumentOperation {
     state: CreateMetadataDocumentState,
     selected_replication_factor: usize,
     record: Option<MetadataRegistryRecord>,
+    pending_graph_peers: Vec<NodeId>,
     pending_error: Option<CreateMetadataDocumentError>,
     output: Option<Result<MetadataRegistryRecord, CreateMetadataDocumentError>>,
 }
@@ -68,7 +68,7 @@ enum CreateMetadataDocumentState {
     LoadRealmConfig,
     LoadReplicationTargets,
     CreateGraph,
-    ReplicateGraph,
+    AddGraphPeers,
     StartTransaction,
     WriteRegistry,
     WriteDocumentIndex,
@@ -112,13 +112,14 @@ impl CreateMetadataDocumentOperation {
             state: CreateMetadataDocumentState::Init,
             selected_replication_factor: 1,
             record: None,
+            pending_graph_peers: Vec::new(),
             pending_error: None,
             output: None,
         }
     }
 
-    fn realm_config_ref(&self) -> AutomergeDocumentVariant {
-        AutomergeDocumentVariant::RealmConfig {
+    fn realm_config_ref(&self) -> DocumentSyncTarget {
+        DocumentSyncTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         }
     }
@@ -208,6 +209,26 @@ impl CreateMetadataDocumentOperation {
                     },
                 })
             }
+        }
+    }
+
+    fn start_transaction_effect(&mut self) -> Effects {
+        self.state = CreateMetadataDocumentState::StartTransaction;
+        smallvec![Effect::Storage(StorageEffect::StartTransaction {
+            read: false
+        })]
+    }
+
+    fn next_graph_peer_effect(&mut self) -> Effects {
+        match self.pending_graph_peers.pop() {
+            Some(node_id) => {
+                self.state = CreateMetadataDocumentState::AddGraphPeers;
+                smallvec![Effect::Metadata(MetadataEffect::AddGraphPeer {
+                    graph_iri: self.graph_iri(),
+                    node_id,
+                })]
+            }
+            None => self.start_transaction_effect(),
         }
     }
 
@@ -333,37 +354,32 @@ impl Operation for CreateMetadataDocumentOperation {
             CreateMetadataDocumentState::CreateGraph => match event {
                 Event::Metadata(MetadataEvent::CreateCrateResult { .. })
                 | Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. }) => {
-                    let Some(record) = self.record.clone() else {
+                    let Some(record) = self.record.as_ref() else {
                         return self
                             .fail_without_cleanup(CreateMetadataDocumentError::MissingTransaction);
                     };
-                    self.state = CreateMetadataDocumentState::ReplicateGraph;
-                    smallvec![Effect::Metadata(MetadataEffect::ReplicateBootstrap {
-                        record
-                    })]
+                    self.pending_graph_peers = record
+                        .holder_node_ids
+                        .iter()
+                        .copied()
+                        .filter(|node_id| *node_id != self.config.actor.node_id)
+                        .collect();
+                    self.pending_graph_peers.reverse();
+                    self.next_graph_peer_effect()
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
                     self.fail_without_cleanup(error.into())
                 }
                 other => self.unexpected_event("metadata create result", format!("{other:?}")),
             },
-            CreateMetadataDocumentState::ReplicateGraph => match event {
-                Event::Metadata(MetadataEvent::BootstrapReplicated {
-                    replicated_node_ids,
-                    ..
-                }) => {
-                    if let Some(record) = self.record.as_mut() {
-                        record.holder_node_ids = replicated_node_ids;
-                    }
-                    self.state = CreateMetadataDocumentState::StartTransaction;
-                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                        read: false
-                    })]
+            CreateMetadataDocumentState::AddGraphPeers => match event {
+                Event::Metadata(MetadataEvent::GraphPeerAdded { .. }) => {
+                    self.next_graph_peer_effect()
                 }
-                Event::Metadata(MetadataEvent::Error { error, .. }) => {
-                    self.fail_without_cleanup(error.into())
+                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("metadata graph peer add result", format!("{other:?}"))
                 }
-                other => self.unexpected_event("metadata bootstrap result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -461,13 +477,19 @@ impl Operation for CreateMetadataDocumentOperation {
                             .fail_without_cleanup(CreateMetadataDocumentError::MissingTransaction);
                     };
                     self.state = CreateMetadataDocumentState::AnnounceTopic;
+                    let document = DocumentSyncTarget::MetadataRegistry {
+                        group_id: record.group_id,
+                        document_id: record.document_id,
+                    };
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceTopicOperation::new(
-                            TopicId::metadata(record.document_id),
+                        AnnounceTopicOperation::new_for_document_with_peers(
+                            document.topic_id(),
                             self.config.actor.node_id,
+                            Some(document),
+                            record.holder_node_ids.clone(),
                         ),
                         |result| {
-                            Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+                            Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                                 result: result.map_err(|error| error.to_string()),
                             })
                         },
@@ -480,7 +502,7 @@ impl Operation for CreateMetadataDocumentOperation {
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::AnnounceTopic => match event {
-                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
+                Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
                         Ok(()) => {
                             let Some(record) = self.record.clone() else {
@@ -635,8 +657,8 @@ mod tests {
         assert_eq!(effects.len(), 1);
         assert_eq!(
             effects[0],
-            crate::automerge::repository::read_effect(
-                &aruna_core::automerge::AutomergeDocumentVariant::RealmConfig {
+            crate::document_repository::read_effect(
+                &aruna_core::document::DocumentSyncTarget::RealmConfig {
                     realm_id: actor.realm_id,
                 },
                 None,
@@ -666,7 +688,7 @@ mod tests {
         )));
         assert_eq!(holder_lookup.len(), 1);
 
-        let replicate = operation.step(Event::Metadata(MetadataEvent::CreateCrateResult {
+        let start_txn = operation.step(Event::Metadata(MetadataEvent::CreateCrateResult {
             graph_iri: format!("https://w3id.org/aruna/{document_id}"),
             batch: MetadataBatch {
                 graph_iri: format!("https://w3id.org/aruna/{document_id}"),
@@ -676,12 +698,6 @@ mod tests {
                 ops: vec![],
                 timestamp_millis: 0,
             },
-        }));
-        assert_eq!(replicate.len(), 1);
-
-        let start_txn = operation.step(Event::Metadata(MetadataEvent::BootstrapReplicated {
-            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
-            replicated_node_ids: vec![actor.node_id],
         }));
         assert_eq!(start_txn.len(), 1);
         assert_eq!(

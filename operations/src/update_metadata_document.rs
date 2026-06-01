@@ -1,13 +1,14 @@
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{
-    MetadataApplyRoCrateRequest, MetadataBatch, MetadataEffect, MetadataError, MetadataEvent,
-    MetadataGraphPolicy, MetadataUpsertEntityRequest,
+    MetadataApplyRoCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
+    MetadataUpsertEntityRequest,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, TxnId};
-use aruna_core::{TopicId, events::SubOperationEvent};
 use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -40,7 +41,6 @@ pub struct UpdateMetadataDocumentOperation {
     config: UpdateMetadataDocumentConfig,
     txn_id: Option<TxnId>,
     record: Option<MetadataRegistryRecord>,
-    batch: Option<MetadataBatch>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -55,7 +55,6 @@ enum UpdateMetadataDocumentState {
     WriteDocumentIndex,
     WriteAudit,
     CommitTransaction,
-    ReplicateGraph,
     AnnounceTopic,
     Finish,
     Error,
@@ -89,7 +88,6 @@ impl UpdateMetadataDocumentOperation {
             config,
             txn_id: None,
             record: None,
-            batch: None,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -218,13 +216,12 @@ impl Operation for UpdateMetadataDocumentOperation {
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
             UpdateMetadataDocumentState::ApplyMutation => match event {
-                Event::Metadata(MetadataEvent::ApplyRoCrateResult { batch, .. })
-                | Event::Metadata(MetadataEvent::EntityUpsertResult { batch, .. }) => {
+                Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. })
+                | Event::Metadata(MetadataEvent::EntityUpsertResult { .. }) => {
                     let Some(record) = self.record.take() else {
                         return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
                     };
                     self.record = Some(self.updated_record(record));
-                    self.batch = Some(batch);
                     self.state = UpdateMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
                         read: false
@@ -306,14 +303,24 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let Some(record) = self.record.clone() else {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
-                    let Some(batch) = self.batch.take() else {
-                        return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+                    self.state = UpdateMetadataDocumentState::AnnounceTopic;
+                    let document = DocumentSyncTarget::MetadataRegistry {
+                        group_id: record.group_id,
+                        document_id: record.document_id,
                     };
-                    self.state = UpdateMetadataDocumentState::ReplicateGraph;
-                    smallvec![Effect::Metadata(MetadataEffect::ReplicateBatch {
-                        record,
-                        batch,
-                    })]
+                    smallvec![Effect::SubOperation(boxed_suboperation(
+                        AnnounceTopicOperation::new_for_document_with_peers(
+                            document.topic_id(),
+                            self.config.actor.node_id,
+                            Some(document),
+                            record.holder_node_ids.clone(),
+                        ),
+                        |result| {
+                            Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+                                result: result.map_err(|error| error.to_string()),
+                            })
+                        },
+                    ))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -321,29 +328,8 @@ impl Operation for UpdateMetadataDocumentOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            UpdateMetadataDocumentState::ReplicateGraph => match event {
-                Event::Metadata(MetadataEvent::BatchReplicated { .. }) => {
-                    let Some(record) = self.record.clone() else {
-                        return self.fail(UpdateMetadataDocumentError::MissingTransaction);
-                    };
-                    self.state = UpdateMetadataDocumentState::AnnounceTopic;
-                    smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceTopicOperation::new(
-                            TopicId::metadata(record.document_id),
-                            self.config.actor.node_id,
-                        ),
-                        |result| {
-                            Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
-                                result: result.map_err(|error| error.to_string()),
-                            })
-                        },
-                    ))]
-                }
-                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-                other => self.unexpected_event("metadata replication result", format!("{other:?}")),
-            },
             UpdateMetadataDocumentState::AnnounceTopic => match event {
-                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
+                Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
                         Ok(()) => {
                             let Some(record) = self.record.clone() else {

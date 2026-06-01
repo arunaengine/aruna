@@ -1,12 +1,11 @@
-use aruna_core::effects::{Effect, GossipEffect, NetEffect, StorageEffect};
-use aruna_core::errors::GossipError;
-use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
+use aruna_core::IrokleEffect;
+use aruna_core::document::{DocumentSyncTarget, IrokleEvent};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
-use aruna_core::task::{TaskEffect, TaskEvent};
 use aruna_core::types::Effects;
-use aruna_core::{TaskKey, TopicId};
 use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
@@ -38,9 +37,7 @@ enum DeleteMetadataDocumentState {
     DeleteHolders,
     WriteAudit,
     CommitTransaction,
-    ReplicateDelete,
-    CancelTimer,
-    Unsubscribe,
+    SyncDelete,
     Finish,
     Error,
 }
@@ -57,6 +54,8 @@ pub enum DeleteMetadataDocumentError {
     DocumentNotFound,
     #[error("missing active transaction")]
     MissingTransaction,
+    #[error("document delete sync failed: {0}")]
+    SyncDelete(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -220,8 +219,16 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(record) = self.record.clone() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
-                    self.state = DeleteMetadataDocumentState::ReplicateDelete;
-                    smallvec![Effect::Metadata(MetadataEffect::ReplicateDelete { record })]
+                    self.state = DeleteMetadataDocumentState::SyncDelete;
+                    smallvec![Effect::Net(NetEffect::Irokle(
+                        IrokleEffect::DeleteDocument {
+                            target: DocumentSyncTarget::MetadataRegistry {
+                                group_id: record.group_id,
+                                document_id: record.document_id,
+                            },
+                            peers: record.holder_node_ids,
+                        }
+                    ))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
@@ -229,43 +236,19 @@ impl Operation for DeleteMetadataDocumentOperation {
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
-            DeleteMetadataDocumentState::ReplicateDelete => match event {
-                Event::Metadata(MetadataEvent::DeleteReplicated { .. })
-                | Event::Metadata(MetadataEvent::Error { .. }) => {
-                    self.state = DeleteMetadataDocumentState::CancelTimer;
-                    smallvec![Effect::Task(TaskEffect::CancelTimer {
-                        key: TaskKey::TopicAnnounce(TopicId::metadata(self.document_id)),
-                    })]
-                }
-                other => self
-                    .unexpected_event("metadata delete replication result", format!("{other:?}")),
-            },
-            DeleteMetadataDocumentState::CancelTimer => match event {
-                Event::Task(TaskEvent::TimerCancelled { .. })
-                | Event::Task(TaskEvent::Error { .. }) => {
-                    self.state = DeleteMetadataDocumentState::Unsubscribe;
-                    smallvec![Effect::Net(NetEffect::Gossip(GossipEffect::Unsubscribe {
-                        topic: TopicId::metadata(self.document_id),
-                    }))]
-                }
-                other => self.unexpected_event("task timer result", format!("{other:?}")),
-            },
-            DeleteMetadataDocumentState::Unsubscribe => match event {
-                Event::Net(NetEvent::Gossip(GossipEvent::Unsubscribed { .. }))
-                | Event::Net(NetEvent::Gossip(GossipEvent::Error {
-                    error: GossipError::NotSubscribed,
-                }))
-                | Event::Net(NetEvent::Error(_)) => {
+            DeleteMetadataDocumentState::SyncDelete => match event {
+                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentDeleted { .. })) => {
                     self.state = DeleteMetadataDocumentState::Finish;
                     self.output = Some(Ok(()));
                     smallvec![]
                 }
-                Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => {
-                    self.fail(DeleteMetadataDocumentError::MetadataError(
-                        MetadataError::Backend(error.to_string()),
-                    ))
+                Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
+                    self.fail(DeleteMetadataDocumentError::SyncDelete(error))
                 }
-                other => self.unexpected_event("gossip unsubscribe result", format!("{other:?}")),
+                Event::Net(NetEvent::Error(error)) => self.fail(
+                    DeleteMetadataDocumentError::SyncDelete(format!("{error:?}")),
+                ),
+                other => self.unexpected_event("document delete sync result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::Finish
             | DeleteMetadataDocumentState::Error
