@@ -10,7 +10,7 @@ rust-version.workspace = true
 aruna-core = { workspace = true }
 aruna-storage = { workspace = true }
 iroh = { workspace = true }
-iroh-gossip = { workspace = true }
+irokle = { workspace = true }
 opentelemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -29,6 +29,7 @@ tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 smallvec = { workspace = true }
 crossfire = { workspace = true }
+ulid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

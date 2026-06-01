@@ -14,8 +14,6 @@ aruna-net = { workspace = true }
 aruna-tasks = { workspace = true }
 craqle = { workspace = true }
 async-trait = { workspace = true }
-automerge = { workspace = true }
-autosurgeon = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
@@ -23,6 +21,7 @@ byteview = { workspace = true }
 chrono = { workspace = true }
 globset = { workspace = true }
 iroh = { workspace = true }
+irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
 opentelemetry = { workspace = true }
 postcard = { workspace = true }

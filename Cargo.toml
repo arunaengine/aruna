@@ -35,8 +35,6 @@ aruna-tasks = { path = "tasks" }
 # Third-party crates
 ahash = "0.8.12"
 async-trait = "0.1.89"
-automerge = "0.8.0"
-autosurgeon = "0.11.0"
 aws-config = "1.8.16"
 aws-sdk-s3 = "1.132.0"
 axum = "0.8.9"
@@ -49,7 +47,7 @@ bytes = "1"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 console-subscriber = "0.5.0"
-craqle = { git = "https://github.com/arunaengine/craqle" }
+craqle = { git = "https://github.com/arunaengine/craqle", branch = "feat/irokle", features = ["iroh"] }
 crc-fast = "1.9.0"
 crossfire = "3.1.12"
 crypto_box = "0.9.1"
@@ -74,7 +72,7 @@ hyper-util = { version = "0.1.20", features = [
 ] }
 iroh = "1.0.0-rc.0"
 iroh-base = "1.0.0-rc.0"
-iroh-gossip = "0.99.0"
+irokle = { git = "https://github.com/arunaengine/irokle", branch = "main", features = ["fjall", "iroh"] }
 iroh-io = "0.6.2"
 iroh-quinn = "0.16.1"
 jsonwebtoken = { version = "10.3.0", features = ["rust_crypto"] }
@@ -107,7 +105,7 @@ reqwest = { version = "0.13.3", default-features = false, features = [
 ] }
 s3s = { git = "https://github.com/s3s-project/s3s" }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.1"
