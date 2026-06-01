@@ -2,19 +2,18 @@ use crate::config::PersistedNodeState;
 use aruna_api::server_state::{
     INITIAL_LOCAL_ONBOARDING_SECRET_KEY, load_persisted_state, persist_state,
 };
-use aruna_core::effects::{Effect, GossipEffect, NetEffect, StorageEffect};
-use aruna_core::errors::GossipError;
-use aruna_core::events::{Event, GossipEvent, NetEvent, StorageEvent};
+use aruna_core::document::{DocumentSyncTarget, IrokleEvent};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
-use aruna_core::{NodeId, TopicId};
+use aruna_core::{IrokleEffect, NodeId, TopicId};
 use aruna_operations::announce::AnnounceTopicOperation;
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::outgoing_automerge::OutgoingAutomergeOperation;
 use byteview::ByteView;
 use rand::Rng;
 
@@ -56,34 +55,10 @@ pub async fn announce_core_documents(
     Ok(())
 }
 
-async fn subscribe_topic(
-    driver_ctx: &DriverContext,
-    topic: TopicId,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
-        return Err("net handle unavailable".into());
-    };
-
-    match net_handle
-        .send_effect(Effect::Net(NetEffect::Gossip(GossipEffect::Subscribe {
-            topic,
-        })))
-        .await
-    {
-        Event::Net(NetEvent::Gossip(GossipEvent::Subscribed { .. })) => Ok(()),
-        Event::Net(NetEvent::Gossip(GossipEvent::Error {
-            error: GossipError::AlreadySubscribed,
-        })) => Ok(()),
-        Event::Net(NetEvent::Gossip(GossipEvent::Error { error })) => Err(error.to_string().into()),
-        Event::Net(NetEvent::Error(error)) => Err(format!("{error:?}").into()),
-        other => Err(format!("unexpected gossip subscribe result: {other:?}").into()),
-    }
-}
-
 pub async fn fetch_core_onboarding_documents(
     driver_ctx: &DriverContext,
     node_state: &PersistedNodeState,
-    realm_id: &aruna_core::structs::RealmId,
+    _realm_id: &aruna_core::structs::RealmId,
     bootstrap_peer: Option<NodeId>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bootstrap_peer = bootstrap_peer.ok_or("missing bootstrap peer")?;
@@ -92,26 +67,34 @@ pub async fn fetch_core_onboarding_documents(
         .as_deref()
         .ok_or("missing onboarding sync ticket")?;
     let onboarding_sync_ticket = OnboardingSyncTicket::decode(onboarding_sync_ticket)?;
-    let local_node_id = iroh::SecretKey::from_bytes(&node_state.net_secret_key).public();
-
-    for topic in [TopicId::realm(*realm_id), TopicId::users(*realm_id)] {
-        subscribe_topic(driver_ctx, topic).await?;
-    }
+    let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
+        return Err("net handle unavailable".into());
+    };
 
     for document in onboarding_sync_ticket.payload.documents.clone() {
-        drive(
-            OutgoingAutomergeOperation::new_with_auth_and_local_node(
-                bootstrap_peer,
-                document,
-                Some(onboarding_sync_ticket.clone().into_auth_proof()),
-                local_node_id,
-            ),
-            driver_ctx,
-        )
-        .await?;
+        sync_document_from_peer(net_handle, document, bootstrap_peer).await?;
     }
 
     Ok(())
+}
+
+async fn sync_document_from_peer(
+    net_handle: &aruna_net::NetHandle,
+    document: DocumentSyncTarget,
+    bootstrap_peer: NodeId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match net_handle
+        .send_effect(Effect::Net(NetEffect::Irokle(IrokleEffect::SyncDocument {
+            target: document,
+            peers: vec![bootstrap_peer],
+        })))
+        .await
+    {
+        Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled { .. })) => Ok(()),
+        Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => Err(error.into()),
+        Event::Net(NetEvent::Error(error)) => Err(format!("{error:?}").into()),
+        other => Err(format!("unexpected irokle sync result: {other:?}").into()),
+    }
 }
 
 pub async fn ensure_initial_local_onboarding_secret(

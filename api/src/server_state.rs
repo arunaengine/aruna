@@ -2,7 +2,7 @@ use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::{OidcError, TokenError};
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -10,6 +10,7 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
+use aruna_operations::announce::AnnounceTopicOperation;
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
@@ -247,10 +248,10 @@ impl ServerState {
                 realm_signing_key, ..
             } => {
                 let mut documents = vec![
-                    AutomergeDocumentVariant::RealmAuthorization {
+                    DocumentSyncTarget::RealmAuthorization {
                         realm_id: self.realm_id,
                     },
-                    AutomergeDocumentVariant::RealmConfig {
+                    DocumentSyncTarget::RealmConfig {
                         realm_id: self.realm_id,
                     },
                 ];
@@ -275,11 +276,14 @@ impl ServerState {
                 };
 
                 documents.extend(user_documents.into_iter().filter_map(|(key, _)| {
-                    aruna_core::UserId::from_string(std::str::from_utf8(key.as_ref()).ok()?)
+                    aruna_core::UserId::from_storage_key(&key)
                         .ok()
                         .filter(|user_id| user_id.realm_id == self.realm_id)
-                        .map(|user_id| AutomergeDocumentVariant::User { user_id })
+                        .map(|user_id| DocumentSyncTarget::User { user_id })
                 }));
+
+                self.prepare_onboarding_document_sync(node_id, &documents)
+                    .await?;
 
                 OnboardingSyncTicket::issue(
                     realm_signing_key,
@@ -291,6 +295,35 @@ impl ServerState {
             }
             _ => Err(OnboardingSecretError::InvalidSecret),
         }
+    }
+
+    async fn prepare_onboarding_document_sync(
+        &self,
+        node_id: NodeId,
+        documents: &[DocumentSyncTarget],
+    ) -> Result<(), OnboardingSecretError> {
+        for document in documents {
+            if let Err(error) = drive(
+                AnnounceTopicOperation::new_for_document_with_peers(
+                    document.topic_id(),
+                    self.node_id,
+                    Some(document.clone()),
+                    vec![node_id],
+                ),
+                self.driver_ctx.as_ref(),
+            )
+            .await
+            {
+                warn!(
+                    node_id = %node_id,
+                    document = ?document,
+                    error = ?error,
+                    "Failed to prepare onboarding document sync"
+                );
+                return Err(OnboardingSecretError::InvalidSecret);
+            }
+        }
+        Ok(())
     }
 
     pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {

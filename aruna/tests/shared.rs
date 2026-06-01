@@ -24,7 +24,6 @@ use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::automerge::AutomergeHandle;
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
 };
@@ -602,6 +601,7 @@ async fn spawn_joiner_node_with_mode(
             relay_method: RelayMethod::None,
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
+            irokle_storage_path: Some(config.irokle_storage_path.clone()),
         },
         storage_handle.clone(),
     )
@@ -668,7 +668,6 @@ async fn initialize_context(
     full_storage_config: Option<&FullNodeStorageConfig>,
 ) -> TestResult<Arc<DriverContext>> {
     let task_handle = TaskHandle::new();
-    let automerge_handle = AutomergeHandle::new(Some(net.clone()));
     let metadata_handle = if let Some(config) = full_storage_config {
         config.ensure_directories()?;
         Some(MetadataHandle::new(
@@ -676,6 +675,7 @@ async fn initialize_context(
             net.node_id(),
             storage_handle.clone(),
             Some(net.clone()),
+            Some(net.irokle_node()),
         )?)
     } else {
         None
@@ -696,7 +696,6 @@ async fn initialize_context(
         storage_handle,
         net_handle: Some(net),
         blob_handle,
-        automerge_handle: Some(automerge_handle),
         metadata_handle,
         task_handle: Some(task_handle.clone()),
     });

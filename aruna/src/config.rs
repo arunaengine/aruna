@@ -1,4 +1,4 @@
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::array::TryFromSliceError;
 use std::net::SocketAddr;
 use std::num::ParseIntError;
+use std::path::PathBuf;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -39,6 +40,7 @@ const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
 pub struct Config {
     pub storage_path: String,
     pub metadata_storage_path: String,
+    pub irokle_storage_path: PathBuf,
     pub blob_root: String,
     pub blob_bucket_prefix: Option<String>,
     pub blob_max_bucket_size: Option<u64>,
@@ -185,6 +187,9 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
     let metadata_storage_path =
         dotenvy::var("CRAQLE_STORAGE_PATH").unwrap_or_else(|_| format!("{storage_path}/craqle"));
+    let irokle_storage_path = dotenvy::var("IROKLE_STORAGE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(format!("{storage_path}/irokle")));
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
@@ -316,6 +321,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         Config {
             storage_path,
             metadata_storage_path,
+            irokle_storage_path,
             blob_root,
             blob_bucket_prefix,
             blob_max_bucket_size,
@@ -768,7 +774,7 @@ fn validate_bootstrap_response(
     }
     ticket.verify(
         expected_node_id,
-        &AutomergeDocumentVariant::RealmConfig {
+        &DocumentSyncTarget::RealmConfig {
             realm_id: expected_realm_id,
         },
         unix_timestamp_secs(),

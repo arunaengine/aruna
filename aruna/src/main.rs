@@ -21,7 +21,6 @@ use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
 };
-use aruna_operations::automerge::AutomergeHandle;
 use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
@@ -63,17 +62,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             relay_method: config.relay_method.clone(),
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
+            irokle_storage_path: Some(config.irokle_storage_path.clone()),
         },
         storage_handle.clone(),
     )
     .await?;
     let task_handle = TaskHandle::new();
-    let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
     let metadata_handle = MetadataHandle::new(
         &config.metadata_storage_path,
         config.node_id,
         storage_handle.clone(),
         Some(net_handle.clone()),
+        Some(net_handle.irokle_node()),
     )?;
     let blob_handle = BlobHandler::new(
         BackendConfig {
@@ -94,7 +94,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         storage_handle,
         net_handle: Some(net_handle.clone()),
         blob_handle: Some(blob_handle),
-        automerge_handle: Some(automerge_handle),
         metadata_handle: Some(metadata_handle),
         task_handle: Some(task_handle.clone()),
     });
