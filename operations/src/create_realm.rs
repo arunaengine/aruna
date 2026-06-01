@@ -1,4 +1,4 @@
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -241,15 +241,16 @@ impl CreateRealmOperation {
             && self.config_doc.is_some()
         {
             self.state = CreateRealmState::AnnounceAuthDoc;
+            let document = DocumentSyncTarget::RealmAuthorization {
+                realm_id: realm.realm_id,
+            };
             smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new(
-                    AutomergeDocumentVariant::RealmAuthorization {
-                        realm_id: realm.realm_id,
-                    }
-                    .topic_id(),
+                AnnounceTopicOperation::new_for_document(
+                    document.topic_id(),
                     self.config.actor.node_id,
+                    Some(document),
                 ),
-                |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
             ))]
@@ -260,11 +261,10 @@ impl CreateRealmOperation {
 
     fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
-        else {
+        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 CreateRealmState::AnnounceAuthDoc,
-                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
+                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
                 got,
             );
         };
@@ -275,15 +275,16 @@ impl CreateRealmOperation {
 
         if let Some(realm) = &self.realm {
             self.state = CreateRealmState::AnnounceConfigDoc;
+            let document = DocumentSyncTarget::RealmConfig {
+                realm_id: realm.realm_id,
+            };
             smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new(
-                    AutomergeDocumentVariant::RealmConfig {
-                        realm_id: realm.realm_id,
-                    }
-                    .topic_id(),
+                AnnounceTopicOperation::new_for_document(
+                    document.topic_id(),
                     self.config.actor.node_id,
+                    Some(document),
                 ),
-                |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
             ))]
@@ -294,11 +295,10 @@ impl CreateRealmOperation {
 
     fn handle_announce_config_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
-        else {
+        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 CreateRealmState::AnnounceConfigDoc,
-                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
+                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
                 got,
             );
         };
@@ -443,7 +443,6 @@ mod test {
             storage_handle,
             blob_handle: None,
             net_handle: Some(net_handle.clone()),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle),
         };

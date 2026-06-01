@@ -1,4 +1,4 @@
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -242,15 +242,16 @@ impl AddUserToGroupOperation {
         self.state = AddUserToGroupState::AnnounceAuthDoc {
             auth_doc: auth_doc.clone(),
         };
+        let document = DocumentSyncTarget::GroupAuthorization {
+            group_id: auth_doc.group_id,
+        };
         smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new(
-                AutomergeDocumentVariant::GroupAuthorization {
-                    group_id: auth_doc.group_id,
-                }
-                .topic_id(),
+            AnnounceTopicOperation::new_for_document(
+                document.topic_id(),
                 self.input.actor.node_id,
+                Some(document),
             ),
-            |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                 result: result.map_err(|error| error.to_string()),
             }),
         ))]
@@ -262,11 +263,10 @@ impl AddUserToGroupOperation {
         auth_doc: GroupAuthorizationDocument,
     ) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
-        else {
+        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 self.state.clone(),
-                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
+                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
                 got,
             );
         };
@@ -426,7 +426,6 @@ pub mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: Some(net_handle.clone()),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle),
             blob_handle: None,

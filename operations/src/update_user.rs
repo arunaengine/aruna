@@ -1,5 +1,5 @@
 use aruna_core::USER_KEYSPACE;
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -245,13 +245,14 @@ impl UpdateUserOperation {
         };
         let user_id = user.user_id;
         self.state = UpdateUserState::AnnounceUser { user };
+        let document = DocumentSyncTarget::User { user_id };
         smallvec![Effect::SubOperation(boxed_suboperation(
             AnnounceTopicOperation::new_for_document(
-                AutomergeDocumentVariant::User { user_id }.topic_id(),
+                document.topic_id(),
                 self.input.actor.node_id,
-                Some(AutomergeDocumentVariant::User { user_id }),
+                Some(document),
             ),
-            |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                 result: result.map_err(|error| error.to_string()),
             }),
         ))]
@@ -259,10 +260,9 @@ impl UpdateUserOperation {
 
     fn handle_announce_user(&mut self, event: Event, user: User) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
-        else {
+        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
-                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result })",
+                "Event::SubOperation(SubOperationEvent::DocumentSyncResult { result })",
                 got,
             );
         };
@@ -488,9 +488,9 @@ mod tests {
         }));
         assert!(matches!(effects.first(), Some(Effect::SubOperation(_))));
 
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::TopicAnnouncementResult { result: Ok(()) },
-        ));
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Ok(()),
+        }));
         assert!(effects.is_empty());
         assert_eq!(operation.finalize().unwrap(), updated);
     }

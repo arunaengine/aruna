@@ -1,4 +1,4 @@
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::operation::Operation;
@@ -6,11 +6,11 @@ use aruna_core::structs::{RealmConfigDocument, RealmId};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::automerge::repository::read_effect;
+use crate::document_repository::read_effect;
 
 #[derive(Debug, PartialEq)]
 pub struct GetRealmConfigOperation {
-    document: AutomergeDocumentVariant,
+    document: DocumentSyncTarget,
     state: GetRealmConfigState,
     output: Option<Result<RealmConfigDocument, GetRealmConfigError>>,
 }
@@ -42,7 +42,7 @@ pub enum GetRealmConfigError {
 impl GetRealmConfigOperation {
     pub fn new(realm_id: RealmId) -> Self {
         Self {
-            document: AutomergeDocumentVariant::RealmConfig { realm_id },
+            document: DocumentSyncTarget::RealmConfig { realm_id },
             state: GetRealmConfigState::Init,
             output: None,
         }

@@ -1,4 +1,4 @@
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -8,8 +8,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::announce::AnnounceTopicOperation;
-use crate::automerge::repository::{read_effect, write_effect};
-use crate::outgoing_automerge::OutgoingAutomergeOperation;
+use crate::document_repository::{read_effect, write_effect};
 use aruna_core::NodeId;
 use aruna_core::types::Effects;
 use aruna_core::types::TxnId;
@@ -53,8 +52,8 @@ pub enum EnsureRealmConfigError {
     MissingTransaction,
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
-    #[error("automerge replication failed: {0}")]
-    AutomergeSync(String),
+    #[error("document sync failed: {0}")]
+    DocumentSync(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
@@ -74,8 +73,8 @@ impl EnsureRealmConfigOperation {
         }
     }
 
-    fn document_ref(&self) -> AutomergeDocumentVariant {
-        AutomergeDocumentVariant::RealmConfig {
+    fn document_ref(&self) -> DocumentSyncTarget {
+        DocumentSyncTarget::RealmConfig {
             realm_id: self.config.actor.realm_id,
         }
     }
@@ -133,8 +132,7 @@ impl Operation for EnsureRealmConfigOperation {
                         Err(error) => self.fail(error.into()),
                     },
                     None => {
-                        // The RealmConfig is only created to create an empty automerge document
-                        // for syncing here
+                        // The RealmConfig is only created to seed document sync here.
                         let mut document = RealmConfigDocument::new(
                             self.config.actor.realm_id,
                             Vec::new(),
@@ -171,13 +169,15 @@ impl Operation for EnsureRealmConfigOperation {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
                     self.txn_id = None;
                     self.state = EnsureRealmConfigState::Announce;
+                    let document = self.document_ref();
                     smallvec![Effect::SubOperation(boxed_suboperation(
-                        AnnounceTopicOperation::new(
-                            self.document_ref().topic_id(),
+                        AnnounceTopicOperation::new_for_document(
+                            document.topic_id(),
                             self.config.actor.node_id,
+                            Some(document),
                         ),
                         |result| {
-                            Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+                            Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                                 result: result.map_err(|error| error.to_string()),
                             })
                         },
@@ -190,7 +190,7 @@ impl Operation for EnsureRealmConfigOperation {
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
             },
             EnsureRealmConfigState::Announce => match event {
-                Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) => {
+                Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
                         Ok(()) => {
                             self.replication_targets = self
@@ -212,12 +212,10 @@ impl Operation for EnsureRealmConfigOperation {
                         Err(error) => self.fail(EnsureRealmConfigError::TopicAnnouncement(error)),
                     }
                 }
-                other => {
-                    self.unexpected_event("automerge announcement result", format!("{other:?}"))
-                }
+                other => self.unexpected_event("document sync result", format!("{other:?}")),
             },
             EnsureRealmConfigState::Replicate => match event {
-                Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) => {
+                Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
                         Ok(()) => {
                             if self.replication_targets.is_empty() {
@@ -228,10 +226,10 @@ impl Operation for EnsureRealmConfigOperation {
                                 emit_next_replication(&mut self.replication_targets, document)
                             }
                         }
-                        Err(error) => self.fail(EnsureRealmConfigError::AutomergeSync(error)),
+                        Err(error) => self.fail(EnsureRealmConfigError::DocumentSync(error)),
                     }
                 }
-                other => self.unexpected_event("automerge sync result", format!("{other:?}")),
+                other => self.unexpected_event("document sync result", format!("{other:?}")),
             },
             EnsureRealmConfigState::Finish
             | EnsureRealmConfigState::Error
@@ -263,15 +261,20 @@ impl Operation for EnsureRealmConfigOperation {
     }
 }
 
-fn emit_next_replication(targets: &mut Vec<NodeId>, document: AutomergeDocumentVariant) -> Effects {
+fn emit_next_replication(targets: &mut Vec<NodeId>, document: DocumentSyncTarget) -> Effects {
     let Some(target) = targets.pop() else {
         return smallvec![];
     };
 
     smallvec![Effect::SubOperation(boxed_suboperation(
-        OutgoingAutomergeOperation::new(target, document),
+        AnnounceTopicOperation::new_for_document_with_peers(
+            document.topic_id(),
+            target,
+            Some(document),
+            vec![target],
+        ),
         |result| {
-            Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
+            Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                 result: result.map_err(|error| error.to_string()),
             })
         },

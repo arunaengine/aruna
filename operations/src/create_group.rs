@@ -1,8 +1,8 @@
 use crate::announce::AnnounceTopicOperation;
-use crate::replicate_automerge_to_realm::{
-    ReplicateAutomergeDocumentsToRealmConfig, ReplicateAutomergeDocumentsToRealmOperation,
+use crate::replicate_documents_to_realm::{
+    ReplicateDocumentsToRealmConfig, ReplicateDocumentsToRealmOperation,
 };
-use aruna_core::automerge::AutomergeDocumentVariant;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -235,15 +235,16 @@ impl CreateGroupOperation {
                 user_id = %self.config.actor.user_id,
                 "Announcing group"
             );
+            let document = DocumentSyncTarget::Group {
+                group_id: group.group_id,
+            };
             smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new(
-                    AutomergeDocumentVariant::Group {
-                        group_id: group.group_id,
-                    }
-                    .topic_id(),
+                AnnounceTopicOperation::new_for_document(
+                    document.topic_id(),
                     self.config.actor.node_id,
+                    Some(document),
                 ),
-                |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
             ))]
@@ -255,11 +256,10 @@ impl CreateGroupOperation {
     #[tracing::instrument(name = "group.create.handle_announce_group", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_announce_group_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
-        else {
+        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 CreateGroupState::AnnounceGroupDoc,
-                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
+                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
                 got,
             );
         };
@@ -277,15 +277,16 @@ impl CreateGroupOperation {
                 user_id = %self.config.actor.user_id,
                 "Announcing authorization document"
             );
+            let document = DocumentSyncTarget::GroupAuthorization {
+                group_id: group.group_id,
+            };
             smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new(
-                    AutomergeDocumentVariant::GroupAuthorization {
-                        group_id: group.group_id,
-                    }
-                    .topic_id(),
+                AnnounceTopicOperation::new_for_document(
+                    document.topic_id(),
                     self.config.actor.node_id,
+                    Some(document),
                 ),
-                |result| Event::SubOperation(SubOperationEvent::TopicAnnouncementResult {
+                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
             ))]
@@ -297,11 +298,10 @@ impl CreateGroupOperation {
     #[tracing::instrument(name = "group.create.handle_announce_auth", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::TopicAnnouncementResult { result }) = event
-        else {
+        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 CreateGroupState::AnnounceAuthDoc,
-                "Event::SubOperation(SubOperationEvent::TopicAnnouncementResult)",
+                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
                 got,
             );
         };
@@ -320,21 +320,19 @@ impl CreateGroupOperation {
                 "Replicating documents"
             );
             smallvec![Effect::SubOperation(boxed_suboperation(
-                ReplicateAutomergeDocumentsToRealmOperation::new(
-                    ReplicateAutomergeDocumentsToRealmConfig {
-                        realm_id: self.config.actor.realm_id,
-                        local_node_id: self.config.actor.node_id,
-                        documents: vec![
-                            AutomergeDocumentVariant::Group {
-                                group_id: group.group_id,
-                            },
-                            AutomergeDocumentVariant::GroupAuthorization {
-                                group_id: group.group_id,
-                            },
-                        ],
-                    },
-                ),
-                |result| Event::SubOperation(SubOperationEvent::AutomergeSyncResult {
+                ReplicateDocumentsToRealmOperation::new(ReplicateDocumentsToRealmConfig {
+                    realm_id: self.config.actor.realm_id,
+                    local_node_id: self.config.actor.node_id,
+                    documents: vec![
+                        DocumentSyncTarget::Group {
+                            group_id: group.group_id,
+                        },
+                        DocumentSyncTarget::GroupAuthorization {
+                            group_id: group.group_id,
+                        },
+                    ],
+                }),
+                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                     result: result.map_err(|error| error.to_string()),
                 }),
             ))]
@@ -346,16 +344,16 @@ impl CreateGroupOperation {
     #[tracing::instrument(name = "group.create.handle_replicate", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
     fn handle_replicate_documents(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AutomergeSyncResult { result }) = event else {
+        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
                 CreateGroupState::ReplicateDocuments,
-                "Event::SubOperation(SubOperationEvent::AutomergeSyncResult)",
+                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
                 got,
             );
         };
 
         if let Err(error) = result {
-            return self.fail(CreateGroupError::AutomergeSync(error));
+            return self.fail(CreateGroupError::DocumentSync(error));
         }
 
         if let Some(group) = &self.group
@@ -398,8 +396,8 @@ pub enum CreateGroupError {
     ConversionError(#[from] ConversionError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
-    #[error("automerge replication failed: {0}")]
-    AutomergeSync(String),
+    #[error("document sync failed: {0}")]
+    DocumentSync(String),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("No group found")]
@@ -504,7 +502,6 @@ mod test {
             storage_handle,
             blob_handle: None,
             net_handle: Some(net_handle.clone()),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle),
         };
