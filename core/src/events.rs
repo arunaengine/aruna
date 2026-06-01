@@ -6,11 +6,11 @@ use crate::structs::{
     ResolvedSourceConnector, SourceMetadata,
 };
 use crate::{
-    automerge::AutomergeEvent,
-    errors::{AuthorizationError, DhtError, GossipError, StorageError, StreamError},
+    document::IrokleEvent,
+    errors::{AuthorizationError, DhtError, StorageError, StreamError},
     id::NodeId,
     task::TaskEvent,
-    types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value},
+    types::{DhtKey, Key, KeySpace, TxnId, Value},
 };
 use bytes::Bytes;
 use ulid::Ulid;
@@ -21,7 +21,6 @@ pub enum Event {
     StagingSource(StagingSourceEvent),
     Storage(StorageEvent),
     Net(NetEvent),
-    Automerge(AutomergeEvent),
     Metadata(MetadataEvent),
     SubOperation(SubOperationEvent),
     Task(TaskEvent),
@@ -40,10 +39,7 @@ pub enum SubOperationEvent {
     RealmNodesResult {
         result: Result<Vec<NodeId>, String>,
     },
-    AutomergeSyncResult {
-        result: Result<(), String>,
-    },
-    TopicAnnouncementResult {
+    DocumentSyncResult {
         result: Result<(), String>,
     },
     SourceConnectorResolved {
@@ -146,7 +142,7 @@ pub enum StorageEvent {
 #[derive(Debug, PartialEq)]
 pub enum NetEvent {
     Dht(DhtEvent),
-    Gossip(GossipEvent),
+    Irokle(IrokleEvent),
     Stream(StreamEvent),
     Error(NetError),
 }
@@ -164,14 +160,6 @@ pub struct DhtEntry {
     pub realm_id: RealmId,
     pub value: Vec<u8>,
     pub expires_at: u64,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum GossipEvent {
-    Subscribed { topic: TopicId },
-    BroadcastComplete { topic: TopicId },
-    Unsubscribed { topic: TopicId },
-    Error { error: GossipError },
 }
 
 #[derive(Debug, PartialEq)]

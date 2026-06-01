@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::alpn::Alpn;
-use crate::automerge::AutomergeEffect;
+use crate::document::IrokleEffect;
 use crate::id::NodeId;
 use crate::metadata::MetadataEffect;
 use crate::operation::SubOperation;
@@ -9,7 +9,7 @@ use crate::stream::{BackendStream, StreamError};
 use crate::structs::{BackendLocation, RealmId, ResolvedSourceAccess};
 use crate::task::TaskEffect;
 use crate::types::UserId;
-use crate::types::{DhtKey, Key, KeySpace, TopicId, TxnId, Value};
+use crate::types::{DhtKey, Key, KeySpace, TxnId, Value};
 use bytes::Bytes;
 use std::ops::Range;
 use ulid::Ulid;
@@ -20,7 +20,6 @@ pub enum Effect {
     StagingSource(StagingSourceEffect),
     Storage(StorageEffect),
     Net(NetEffect),
-    Automerge(AutomergeEffect),
     Metadata(MetadataEffect),
     SubOperation(Box<dyn SubOperation>),
     Task(TaskEffect),
@@ -153,7 +152,7 @@ pub enum StorageEffect {
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
-    Gossip(GossipEffect),
+    Irokle(IrokleEffect),
     Stream(StreamEffect),
 }
 
@@ -169,13 +168,6 @@ pub enum DhtEffect {
         key: DhtKey,
         realm_filter: Option<RealmId>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum GossipEffect {
-    Subscribe { topic: TopicId },
-    Broadcast { topic: TopicId, message: Vec<u8> },
-    Unsubscribe { topic: TopicId },
 }
 
 #[derive(Debug, Clone, PartialEq)]
