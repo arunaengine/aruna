@@ -464,7 +464,6 @@ mod test {
             storage_handle,
             blob_handle: None,
             net_handle: Some(net_handle.clone()),
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: Some(task_handle),
         };

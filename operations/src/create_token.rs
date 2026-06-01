@@ -187,7 +187,6 @@ mod test {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         };
