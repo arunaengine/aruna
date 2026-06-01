@@ -384,9 +384,8 @@ impl From<ConnectionAddressStatus> for AddressStatus {
 fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
     alpn.map(|alpn| match alpn {
         Alpn::Dht => "dht".to_string(),
-        Alpn::Gossip => "gossip".to_string(),
         Alpn::Bao => "bao".to_string(),
-        Alpn::Automerge => "automerge".to_string(),
+        Alpn::Irokle => "irokle".to_string(),
         Alpn::Metadata => "metadata".to_string(),
     })
 }
@@ -433,7 +432,6 @@ mod tests {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: None,
             task_handle: None,
         });

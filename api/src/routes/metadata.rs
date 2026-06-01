@@ -2140,14 +2140,18 @@ mod tests {
             user_id,
             realm_id,
         };
-        let metadata_handle =
-            MetadataHandle::new(metadata_dir.path(), node_id, storage_handle.clone(), None)
-                .unwrap();
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage_handle.clone(),
+            None,
+            None,
+        )
+        .unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            automerge_handle: None,
             metadata_handle: Some(metadata_handle),
             task_handle: None,
         });
@@ -2221,7 +2225,6 @@ mod tests {
                     storage_handle,
                     net_handle: None,
                     blob_handle: None,
-                    automerge_handle: None,
                     metadata_handle: None,
                     task_handle: None,
                 }),

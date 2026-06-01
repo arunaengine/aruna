@@ -624,7 +624,6 @@ mod tests {
     use aruna_operations::announce_realm_presence::{
         AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
     };
-    use aruna_operations::automerge::AutomergeHandle;
     use aruna_operations::claim_initial_realm_admin::{
         ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     };
@@ -839,12 +838,10 @@ mod tests {
         .await
         .unwrap();
         let task_handle = TaskHandle::new();
-        let automerge_handle = AutomergeHandle::new(Some(net_handle.clone()));
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: Some(net_handle.clone()),
             blob_handle: None,
-            automerge_handle: Some(automerge_handle),
             metadata_handle: None,
             task_handle: Some(task_handle.clone()),
         });
