@@ -9,6 +9,7 @@ use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use ulid::Ulid;
 
 pub const REALM_ENDPOINT_ANNOUNCEMENT_DOMAIN: &str = "aruna-realm-endpoint-v1";
@@ -288,6 +289,16 @@ impl RealmConfigDocument {
     pub fn has_node(&self, node_id: NodeId) -> bool {
         let node_id = node_id.to_string();
         self.nodes.iter().any(|node| node.node_id == node_id)
+    }
+
+    pub fn node_ids(&self) -> Result<Vec<NodeId>, ConversionError> {
+        self.nodes
+            .iter()
+            .map(|node| {
+                NodeId::from_str(&node.node_id)
+                    .map_err(|error| ConversionError::FromStrError(error.to_string()))
+            })
+            .collect()
     }
 
     pub fn to_bytes(&self, actor: &Actor) -> Result<Vec<u8>, ConversionError> {

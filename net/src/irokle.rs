@@ -20,6 +20,7 @@ use irokle_crate::TopicControl;
 use irokle_crate::oplog::Oplog;
 use irokle_crate::sync::{SyncMessage, SyncRequest};
 use irokle_crate::{EventEnvelope, OpId, PeerId, ReplicationPolicy, TopicGenesis, TopicPayload};
+use parking_lot::RwLock;
 use tokio::task::JoinSet;
 use tracing::{debug, warn};
 
@@ -33,7 +34,7 @@ pub struct IrokleService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: Arc<irokle_crate::net::IrohNet<irokle_crate::FjallStorage>>,
     storage: StorageHandle,
-    default_peers: BTreeSet<PeerId>,
+    default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
     storage_path: PathBuf,
 }
 
@@ -74,7 +75,7 @@ impl IrokleService {
             node,
             net,
             storage,
-            default_peers,
+            default_peers: Arc::new(RwLock::new(default_peers)),
             storage_path,
         })
     }
@@ -91,6 +92,42 @@ impl IrokleService {
         self.node
             .add_peer_to_whitelist(peer_id)
             .map_err(|error| NetError::Bootstrap(error.to_string()))
+    }
+
+    pub fn add_potential_peer_node(&self, node_id: NodeId) -> Result<()> {
+        let peer_id = node_id_to_peer_id(&node_id);
+        if peer_id == self.node.peer_id() {
+            return Ok(());
+        }
+        self.allow_peer_node(node_id)?;
+        self.default_peers.write().insert(peer_id);
+        Ok(())
+    }
+
+    pub fn add_potential_peer_nodes(&self, nodes: impl IntoIterator<Item = NodeId>) -> Result<()> {
+        for node_id in nodes {
+            self.add_potential_peer_node(node_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn refresh_potential_peer_nodes(
+        &self,
+        nodes: impl IntoIterator<Item = NodeId>,
+    ) -> Result<()> {
+        let mut peers = BTreeSet::new();
+        for node_id in nodes {
+            let peer_id = node_id_to_peer_id(&node_id);
+            if peer_id == self.node.peer_id() {
+                continue;
+            }
+            peers.insert(peer_id);
+        }
+        self.node
+            .add_peers_to_whitelist(peers.iter().copied())
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        *self.default_peers.write() = peers;
+        Ok(())
     }
 
     pub async fn shutdown(&self) {
@@ -289,12 +326,14 @@ impl IrokleService {
     }
 
     fn sync_peers(&self, peers: Vec<NodeId>) -> BTreeSet<PeerId> {
-        let mut sync_peers = self.default_peers.clone();
-        sync_peers.extend(
+        let mut sync_peers = if peers.is_empty() {
+            self.default_peers.read().clone()
+        } else {
             peers
                 .into_iter()
-                .map(|node_id| node_id_to_peer_id(&node_id)),
-        );
+                .map(|node_id| node_id_to_peer_id(&node_id))
+                .collect()
+        };
         sync_peers.remove(&self.node.peer_id());
         sync_peers
     }

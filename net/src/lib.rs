@@ -16,15 +16,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
+use aruna_core::document::DocumentSyncTarget;
+use aruna_core::effects::StorageEffect;
 use aruna_core::effects::{Effect, NetEffect};
-use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent};
+use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keys::realm_endpoint_key;
 use aruna_core::structs::{
     ConnectionAddressState, ConnectionAddressStatus, ConnectionMonitorState, NetState,
     NetworkDiagnosticsState, PeerConnectionState, PeerConnectionStatus, ProtocolConnectionState,
-    RealmEndpointAnnouncement, RealmId, realm_endpoint_announcement_signing_bytes,
+    RealmConfigDocument, RealmEndpointAnnouncement, RealmId,
+    realm_endpoint_announcement_signing_bytes,
 };
 use aruna_core::util::unix_timestamp_secs;
 use aruna_storage::StorageHandle;
@@ -346,12 +349,14 @@ pub struct NetHandle {
 
 struct NetInner {
     effect_tx: mpsc::Sender<EffectHandle>,
+    storage: StorageHandle,
     node_id: NodeId,
     realm_id: RealmId,
     endpoint: Endpoint,
     address_lookup: MemoryLookup,
     discovery_method: DiscoveryMethod,
     relay_method: RelayMethod,
+    realm_peers: Arc<RwLock<Vec<NodeId>>>,
     dht_signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
     dht: Arc<DhtHandle>,
     irokle: Arc<IrokleService>,
@@ -463,16 +468,30 @@ impl NetHandle {
         for endpoint_addr in &peer_endpoints {
             address_lookup.set_endpoint_info(endpoint_addr.clone());
         }
-        let mut peer_nodes = config.peer_nodes.clone();
-        peer_nodes.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
-        let peer_nodes = unique_peer_nodes(peer_nodes, node_id);
-        let dht_signed_authorized_nodes = Arc::new(RwLock::new(peer_nodes.clone()));
+        let mut peer_hints = config.peer_nodes.clone();
+        peer_hints.extend(peer_endpoints.iter().map(|endpoint| endpoint.id));
+        let peer_hints = unique_peer_nodes(peer_hints, node_id);
+        let realm_peer_nodes = read_persisted_realm_peer_nodes(&storage, config.realm_id, node_id)
+            .await?
+            .unwrap_or_default();
+        let realm_peers = Arc::new(RwLock::new(realm_peer_nodes.clone()));
+        let dht_signed_authorized_nodes = Arc::new(RwLock::new(realm_peer_nodes.clone()));
         let peer_connectivity = Arc::new(Mutex::new(PeerConnectivityManagerState::new(
-            &peer_nodes,
+            &realm_peer_nodes,
             "realm_config",
         )));
         let network_diagnostics = Arc::new(Mutex::new(NetworkDiagnosticsState::default()));
         let (peer_connectivity_tx, peer_connectivity_rx) = mpsc::channel(256);
+        for node_id in &peer_hints {
+            send_peer_connectivity_event(
+                &peer_connectivity_tx,
+                PeerConnectivityEvent::ManagePeer {
+                    node_id: *node_id,
+                    source: "configured_peer".to_string(),
+                    immediate: true,
+                },
+            );
+        }
         let shutdown = CancellationToken::new();
 
         let inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>> =
@@ -488,6 +507,15 @@ impl NetHandle {
             shutdown.child_token(),
         )?;
         let dht = Arc::new(dht_handle);
+        for node_id in peer_hints.iter().chain(realm_peer_nodes.iter()) {
+            if let Err(err) = dht.add_peer(*node_id) {
+                warn!(
+                    node_id = %node_id,
+                    error = %err,
+                    "Failed to add configured peer to DHT routing queue"
+                );
+            }
+        }
 
         let irokle_path = config.irokle_storage_path.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("aruna-irokle-{}", ulid::Ulid::new()))
@@ -496,7 +524,7 @@ impl NetHandle {
             endpoint.clone(),
             storage.clone(),
             irokle_path,
-            &peer_nodes,
+            &realm_peer_nodes,
             app_alpns,
         )?);
 
@@ -630,12 +658,14 @@ impl NetHandle {
 
         let inner = Arc::new(NetInner {
             effect_tx,
+            storage,
             node_id,
             realm_id: config.realm_id,
             endpoint,
             address_lookup,
             discovery_method,
             relay_method,
+            realm_peers,
             dht_signed_authorized_nodes,
             dht,
             irokle,
@@ -684,7 +714,13 @@ impl NetHandle {
         stream: streams::BiStream,
         peer: NodeId,
     ) -> Result<usize> {
-        self.inner.irokle.handle_inbound_stream(stream, peer).await
+        let applied = self
+            .inner
+            .irokle
+            .handle_inbound_stream(stream, peer)
+            .await?;
+        self.refresh_realm_peers_from_persisted_config().await?;
+        Ok(applied)
     }
 
     pub async fn add_peer_addr(&self, endpoint_addr: EndpointAddr) {
@@ -692,18 +728,6 @@ impl NetHandle {
             return;
         }
 
-        authorize_dht_signed_node(
-            &self.inner.dht_signed_authorized_nodes,
-            endpoint_addr.id,
-            self.inner.node_id,
-        );
-        if let Err(err) = self.inner.irokle.allow_peer_node(endpoint_addr.id) {
-            warn!(
-                node_id = %endpoint_addr.id,
-                error = %err,
-                "Failed to add endpoint address peer to Irokle whitelist"
-            );
-        }
         self.inner
             .address_lookup
             .set_endpoint_info(endpoint_addr.clone());
@@ -729,18 +753,6 @@ impl NetHandle {
             return;
         }
 
-        authorize_dht_signed_node(
-            &self.inner.dht_signed_authorized_nodes,
-            node_id,
-            self.inner.node_id,
-        );
-        if let Err(err) = self.inner.irokle.allow_peer_node(node_id) {
-            warn!(
-                node_id = %node_id,
-                error = %err,
-                "Failed to add peer node to Irokle whitelist"
-            );
-        }
         send_peer_connectivity_event(
             &self.inner.peer_connectivity_tx,
             PeerConnectivityEvent::ManagePeer {
@@ -755,6 +767,121 @@ impl NetHandle {
                 error = %err,
                 "Failed to add peer node to DHT"
             );
+        }
+    }
+
+    pub async fn refresh_realm_peers_from_document(
+        &self,
+        document: &RealmConfigDocument,
+    ) -> Result<Vec<NodeId>> {
+        if document.realm_id != self.inner.realm_id {
+            return Err(NetError::Bootstrap(format!(
+                "realm config {} does not match net realm {}",
+                document.realm_id, self.inner.realm_id
+            )));
+        }
+        let peers = unique_peer_nodes(
+            document
+                .node_ids()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            self.inner.node_id,
+        );
+        self.refresh_realm_peers(peers.clone()).await;
+        Ok(peers)
+    }
+
+    pub async fn refresh_realm_peers_from_bytes(&self, bytes: &[u8]) -> Result<Vec<NodeId>> {
+        let document = RealmConfigDocument::from_bytes(bytes)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.refresh_realm_peers_from_document(&document).await
+    }
+
+    pub async fn refresh_realm_peers_from_persisted_config(&self) -> Result<Option<Vec<NodeId>>> {
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: self.inner.realm_id,
+        };
+        let Some(bytes) = self
+            .read_storage(target.storage_keyspace().to_string(), target.storage_key())
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.refresh_realm_peers_from_bytes(&bytes).await.map(Some)
+    }
+
+    pub async fn realm_peers(&self) -> Vec<NodeId> {
+        self.inner.realm_peers.read().clone()
+    }
+
+    async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
+        *self.inner.realm_peers.write() = peers.clone();
+        replace_dht_signed_authorized_nodes(
+            &self.inner.dht_signed_authorized_nodes,
+            &peers,
+            self.inner.node_id,
+        );
+        if let Err(err) = self
+            .inner
+            .irokle
+            .refresh_potential_peer_nodes(peers.clone())
+        {
+            warn!(
+                error = %err,
+                "Failed to refresh Irokle potential peers from realm config"
+            );
+        }
+        for node_id in peers {
+            self.register_realm_peer(node_id, true).await;
+        }
+    }
+
+    async fn register_realm_peer(&self, node_id: NodeId, immediate: bool) {
+        if node_id == self.inner.node_id {
+            return;
+        }
+
+        authorize_dht_signed_node(
+            &self.inner.dht_signed_authorized_nodes,
+            node_id,
+            self.inner.node_id,
+        );
+        send_peer_connectivity_event(
+            &self.inner.peer_connectivity_tx,
+            PeerConnectivityEvent::ManagePeer {
+                node_id,
+                source: "realm_config".to_string(),
+                immediate,
+            },
+        );
+        if let Err(err) = self.inner.dht.add_peer(node_id) {
+            warn!(
+                node_id = %node_id,
+                error = %err,
+                "Failed to add realm peer to DHT routing queue"
+            );
+        }
+    }
+
+    async fn read_storage(
+        &self,
+        key_space: String,
+        key: aruna_core::types::Key,
+    ) -> Result<Option<aruna_core::types::Value>> {
+        match self
+            .inner
+            .storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+            other => Err(NetError::Dht(format!(
+                "unexpected storage event while reading realm config: {other:?}"
+            ))),
         }
     }
 
@@ -891,7 +1018,7 @@ impl NetHandle {
     }
 
     pub async fn get_status(&self) -> NetState {
-        let peer_nodes = self.inner.dht_signed_authorized_nodes.read().clone();
+        let peer_nodes = self.inner.realm_peers.read().clone();
         let configured_relay_urls = self.inner.relay_method.relay_urls();
         let monitor = self.monitor.get_status().await;
         let mut diagnostics = self.inner.network_diagnostics.lock().await.clone();
@@ -1253,6 +1380,45 @@ fn push_transport_addr(addrs: &mut Vec<TransportAddr>, addr: TransportAddr) {
     }
 }
 
+async fn read_persisted_realm_peer_nodes(
+    storage: &StorageHandle,
+    realm_id: RealmId,
+    local_id: NodeId,
+) -> Result<Option<Vec<NodeId>>> {
+    let target = DocumentSyncTarget::RealmConfig { realm_id };
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space: target.storage_keyspace().to_string(),
+            key: target.storage_key(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| {
+                let document = RealmConfigDocument::from_bytes(&bytes)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                if document.realm_id != realm_id {
+                    return Err(NetError::Bootstrap(format!(
+                        "realm config {} does not match net realm {}",
+                        document.realm_id, realm_id
+                    )));
+                }
+                let nodes = document
+                    .node_ids()
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                Ok(unique_peer_nodes(nodes, local_id))
+            })
+            .transpose(),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(NetError::Bootstrap(error.to_string()))
+        }
+        other => Err(NetError::Bootstrap(format!(
+            "unexpected storage event while reading realm config: {other:?}"
+        ))),
+    }
+}
+
 fn authorize_dht_signed_node(
     authorized_nodes: &Arc<RwLock<Vec<NodeId>>>,
     node_id: NodeId,
@@ -1268,6 +1434,14 @@ fn authorize_dht_signed_node(
     }
     nodes.push(node_id);
     nodes.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+}
+
+fn replace_dht_signed_authorized_nodes(
+    authorized_nodes: &Arc<RwLock<Vec<NodeId>>>,
+    nodes: &[NodeId],
+    local_id: NodeId,
+) {
+    *authorized_nodes.write() = unique_peer_nodes(nodes.to_vec(), local_id);
 }
 
 fn unique_endpoint_addrs(
@@ -2178,7 +2352,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peer_endpoint_only_nodes_are_dht_signed_authorized() -> Result<()> {
+    async fn peer_endpoint_only_nodes_are_not_dht_signed_authorized() -> Result<()> {
         let temp_a = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
         let temp_b = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
         let storage_a = aruna_storage::FjallStorage::open(
@@ -2219,7 +2393,7 @@ mod tests {
         .await?;
 
         assert!(
-            handle
+            !handle
                 .inner
                 .dht_signed_authorized_nodes
                 .read()
@@ -2355,6 +2529,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_realm_peers_uses_realm_config_nodes_as_source_of_truth() -> Result<()> {
+        let (handle, _dir) = test_net_handle().await?;
+        let peer_a = make_secret(11).public();
+        let peer_b = make_secret(12).public();
+        let mut document = RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
+        document.ensure_node(
+            handle.node_id(),
+            aruna_core::structs::RealmNodeKind::Management,
+        );
+        document.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
+        document.ensure_node(peer_a, aruna_core::structs::RealmNodeKind::Server);
+        let expected = unique_peer_nodes(vec![peer_a, peer_b], handle.node_id());
+
+        let peers = handle.refresh_realm_peers_from_document(&document).await?;
+        assert_eq!(peers, expected);
+        assert_eq!(handle.realm_peers().await, expected);
+        assert_eq!(*handle.inner.dht_signed_authorized_nodes.read(), expected);
+
+        let mut replacement =
+            RealmConfigDocument::default_for_realm(*handle.realm_id(), Vec::new());
+        replacement.ensure_node(peer_b, aruna_core::structs::RealmNodeKind::Server);
+
+        let peers = handle
+            .refresh_realm_peers_from_document(&replacement)
+            .await?;
+        assert_eq!(peers, vec![peer_b]);
+        assert_eq!(handle.realm_peers().await, vec![peer_b]);
+        assert_eq!(
+            *handle.inner.dht_signed_authorized_nodes.read(),
+            vec![peer_b]
+        );
+
+        handle.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn outbound_streams_reuse_pooled_connection() -> Result<()> {
         let (a, _a_dir) = test_net_handle().await?;
         let (b, _b_dir) = test_net_handle().await?;
@@ -2471,12 +2682,6 @@ mod tests {
                 .connections
                 .iter()
                 .any(|peer| peer.node_id == missing_peer && peer.active_addresses.is_empty())
-        );
-        assert!(
-            status
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("no active addresses"))
         );
         assert!(
             status

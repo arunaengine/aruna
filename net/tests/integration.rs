@@ -7,7 +7,9 @@ use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
-use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RealmId};
+use aruna_core::structs::{
+    ConnectionAddressStatus, PeerConnectionStatus, RealmConfigDocument, RealmId, RealmNodeKind,
+};
 use aruna_net::streams::BiStream;
 use aruna_net::{
     DiscoveryMethod, InboundEventHandler, NetConfig, NetError, NetHandle, RelayMethod,
@@ -213,6 +215,20 @@ async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
     let handle_a = NetHandle::new(cfg(secret_a, vec![node_b, node_c]), storage_a).await?;
     let handle_b = NetHandle::new(cfg(secret_b, vec![node_a, node_c]), storage_b).await?;
     let handle_c = NetHandle::new(cfg(secret_c, vec![node_a, node_b]), storage_c).await?;
+
+    let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    realm_config.ensure_node(node_a, RealmNodeKind::Management);
+    realm_config.ensure_node(node_b, RealmNodeKind::Management);
+    realm_config.ensure_node(node_c, RealmNodeKind::Management);
+    handle_a
+        .refresh_realm_peers_from_document(&realm_config)
+        .await?;
+    handle_b
+        .refresh_realm_peers_from_document(&realm_config)
+        .await?;
+    handle_c
+        .refresh_realm_peers_from_document(&realm_config)
+        .await?;
 
     let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
     handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
