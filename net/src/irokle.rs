@@ -97,6 +97,16 @@ impl IrokleService {
         self.net.shutdown().await;
     }
 
+    pub async fn sync_topic_with_peers(
+        &self,
+        topic_id: irokle_crate::TopicId,
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        let sync_peers = self.sync_peers(peers);
+        self.allow_sync_peers(&sync_peers)?;
+        self.sync_topic(topic_id, sync_peers).await
+    }
+
     pub async fn handle_inbound_stream(&self, stream: BiStream, peer: NodeId) -> Result<usize> {
         let BiStream(send, recv, _) = stream;
         self.net

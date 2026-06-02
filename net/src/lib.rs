@@ -668,6 +668,17 @@ impl NetHandle {
         self.inner.irokle.node()
     }
 
+    pub async fn sync_irokle_topic_with_peers(
+        &self,
+        topic_id: ::irokle::TopicId,
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        self.inner
+            .irokle
+            .sync_topic_with_peers(topic_id, peers)
+            .await
+    }
+
     pub async fn handle_irokle_stream(
         &self,
         stream: streams::BiStream,

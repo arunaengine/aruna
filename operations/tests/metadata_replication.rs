@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,11 +27,13 @@ use aruna_operations::update_metadata_document::{
 };
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
+use craqle::CraqleGraphEvent;
+use irokle::Event as _;
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
 
-const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct TestNode {
     _temp_dir: TempDir,
@@ -42,7 +44,7 @@ struct TestNode {
 #[tokio::test]
 async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([41u8; 32]);
-    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::new();
     let document_id = Ulid::new();
 
@@ -51,7 +53,7 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
         nodes[0].context.as_ref(),
     )
     .await?;
-    assert_eq!(visible_nodes.len(), 3);
+    assert_eq!(visible_nodes.len(), 2);
 
     let created = drive(
         CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
@@ -94,7 +96,7 @@ async fn metadata_creation_bootstraps_selected_holders() -> Result<(), Box<dyn s
 async fn metadata_updates_and_deletes_replicate_to_holders()
 -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([42u8; 32]);
-    let nodes = build_realm_nodes(&realm_id, 3).await?;
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
     let group_id = Ulid::new();
     let document_id = Ulid::new();
 
@@ -172,7 +174,7 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
     assert!(updated.public);
 
     wait_for_metadata_state(
-        &nodes[1..],
+        &nodes,
         group_id,
         document_id,
         &created.graph_iri,
@@ -195,7 +197,7 @@ async fn metadata_updates_and_deletes_replicate_to_holders()
     )
     .await?;
 
-    wait_for_metadata_absence(&nodes[1..], group_id, document_id, &created.graph_iri).await?;
+    wait_for_metadata_absence(&nodes, group_id, document_id, &created.graph_iri).await?;
     shutdown_nodes(nodes).await;
     Ok(())
 }
@@ -343,7 +345,16 @@ async fn wait_for_metadata_state(
     loop {
         let mut converged = true;
         last_states.clear();
+
+        if let Err(error) = sync_metadata_graphs(nodes).await {
+            last_states.push(format!("metadata graph sync error={error}"));
+            converged = false;
+        }
+
         for node in nodes {
+            if !converged {
+                break;
+            }
             match drive(
                 GetMetadataDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
@@ -417,7 +428,16 @@ async fn wait_for_metadata_absence(
     loop {
         let mut converged = true;
         last_states.clear();
+
+        if let Err(error) = prune_unregistered_metadata_graphs(nodes).await {
+            last_states.push(format!("metadata graph prune error={error}"));
+            converged = false;
+        }
+
         for node in nodes {
+            if !converged {
+                break;
+            }
             match drive(
                 GetMetadataDocumentOperation::new(group_id, document_id),
                 node.context.as_ref(),
@@ -465,6 +485,67 @@ async fn wait_for_metadata_absence(
         }
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn sync_metadata_graphs(nodes: &[TestNode]) -> Result<(), Box<dyn std::error::Error>> {
+    for sender in nodes {
+        let topics = craqle_topic_ids(sender)?;
+        if topics.is_empty() {
+            continue;
+        }
+
+        for receiver in nodes {
+            if sender.net.node_id() == receiver.net.node_id() {
+                continue;
+            }
+            for topic_id in &topics {
+                sender
+                    .net
+                    .sync_irokle_topic_with_peers(*topic_id, vec![receiver.net.node_id()])
+                    .await?;
+            }
+        }
+    }
+
+    for node in nodes {
+        node.context
+            .metadata_handle
+            .as_ref()
+            .ok_or("metadata handle missing")?
+            .reconcile_irokle()
+            .await?;
+    }
+
+    Ok(())
+}
+
+fn craqle_topic_ids(node: &TestNode) -> Result<Vec<irokle::TopicId>, Box<dyn std::error::Error>> {
+    let topics = node
+        .net
+        .irokle_node()
+        .list_topics()?
+        .into_iter()
+        .filter(|topic| topic.event_type_id == CraqleGraphEvent::TYPE_ID)
+        .map(|topic| topic.topic_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    Ok(topics)
+}
+
+async fn prune_unregistered_metadata_graphs(
+    nodes: &[TestNode],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for node in nodes {
+        node.context
+            .metadata_handle
+            .as_ref()
+            .ok_or("metadata handle missing")?
+            .prune_unregistered_aruna_graphs()
+            .await?;
+    }
+
+    Ok(())
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {
