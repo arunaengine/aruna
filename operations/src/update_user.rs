@@ -11,8 +11,8 @@ use smallvec::smallvec;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
-use crate::announce::AnnounceTopicOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
 
 const MAX_USER_NAME_LEN: usize = 256;
 const MAX_USER_ATTRIBUTES: usize = 128;
@@ -246,16 +246,11 @@ impl UpdateUserOperation {
         let user_id = user.user_id;
         self.state = UpdateUserState::AnnounceUser { user };
         let document = DocumentSyncTarget::User { user_id };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document(
-                document.topic_id(),
-                self.input.actor.node_id,
-                Some(document),
-            ),
-            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                result: result.map_err(|error| error.to_string()),
-            }),
-        ))]
+        smallvec![replicate_documents_to_realm_effect(
+            self.input.actor.realm_id,
+            self.input.actor.node_id,
+            vec![document],
+        )]
     }
 
     fn handle_announce_user(&mut self, event: Event, user: User) -> Effects {

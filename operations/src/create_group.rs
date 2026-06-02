@@ -1,13 +1,10 @@
-use crate::announce::AnnounceTopicOperation;
-use crate::replicate_documents_to_realm::{
-    ReplicateDocumentsToRealmConfig, ReplicateDocumentsToRealmOperation,
-};
+use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
@@ -227,7 +224,7 @@ impl CreateGroupOperation {
         if let Some(group) = &self.group
             && self.auth_doc.is_some()
         {
-            self.state = CreateGroupState::AnnounceGroupDoc;
+            self.state = CreateGroupState::ReplicateDocuments;
             trace!(
                 event = "group.create.announce_group",
                 group_id = %group.group_id,
@@ -235,107 +232,18 @@ impl CreateGroupOperation {
                 user_id = %self.config.actor.user_id,
                 "Announcing group"
             );
-            let document = DocumentSyncTarget::Group {
-                group_id: group.group_id,
-            };
-            smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new_for_document(
-                    document.topic_id(),
-                    self.config.actor.node_id,
-                    Some(document),
-                ),
-                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                    result: result.map_err(|error| error.to_string()),
-                }),
-            ))]
-        } else {
-            self.fail(CreateGroupError::GroupNotFound)
-        }
-    }
-
-    #[tracing::instrument(name = "group.create.handle_announce_group", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_announce_group_doc(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::AnnounceGroupDoc,
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                got,
-            );
-        };
-
-        if let Err(error) = result {
-            return self.fail(CreateGroupError::TopicAnnouncement(error));
-        }
-
-        if let Some(group) = &self.group {
-            self.state = CreateGroupState::AnnounceAuthDoc;
-            trace!(
-                event = "group.create.announce_auth",
-                group_id = %group.group_id,
-                realm_id = %group.realm_id,
-                user_id = %self.config.actor.user_id,
-                "Announcing authorization document"
-            );
-            let document = DocumentSyncTarget::GroupAuthorization {
-                group_id: group.group_id,
-            };
-            smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new_for_document(
-                    document.topic_id(),
-                    self.config.actor.node_id,
-                    Some(document),
-                ),
-                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                    result: result.map_err(|error| error.to_string()),
-                }),
-            ))]
-        } else {
-            self.fail(CreateGroupError::GroupNotFound)
-        }
-    }
-
-    #[tracing::instrument(name = "group.create.handle_announce_auth", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
-    fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
-                CreateGroupState::AnnounceAuthDoc,
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                got,
-            );
-        };
-
-        if let Err(error) = result {
-            return self.fail(CreateGroupError::TopicAnnouncement(error));
-        }
-
-        if let Some(group) = &self.group {
-            self.state = CreateGroupState::ReplicateDocuments;
-            trace!(
-                event = "group.create.replicate_documents",
-                group_id = %group.group_id,
-                realm_id = %group.realm_id,
-                user_id = %self.config.actor.user_id,
-                "Replicating documents"
-            );
-            smallvec![Effect::SubOperation(boxed_suboperation(
-                ReplicateDocumentsToRealmOperation::new(ReplicateDocumentsToRealmConfig {
-                    realm_id: self.config.actor.realm_id,
-                    local_node_id: self.config.actor.node_id,
-                    documents: vec![
-                        DocumentSyncTarget::Group {
-                            group_id: group.group_id,
-                        },
-                        DocumentSyncTarget::GroupAuthorization {
-                            group_id: group.group_id,
-                        },
-                    ],
-                }),
-                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                    result: result.map_err(|error| error.to_string()),
-                }),
-            ))]
+            smallvec![replicate_documents_to_realm_effect(
+                self.config.actor.realm_id,
+                self.config.actor.node_id,
+                vec![
+                    DocumentSyncTarget::Group {
+                        group_id: group.group_id,
+                    },
+                    DocumentSyncTarget::GroupAuthorization {
+                        group_id: group.group_id,
+                    },
+                ],
+            )]
         } else {
             self.fail(CreateGroupError::GroupNotFound)
         }
@@ -381,8 +289,6 @@ pub enum CreateGroupState {
     CreateGroup,
     CreateRoles,
     CommitTransaction,
-    AnnounceGroupDoc,
-    AnnounceAuthDoc,
     ReplicateDocuments,
     Finish,
     Error,
@@ -394,8 +300,6 @@ pub enum CreateGroupError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("topic announcement failed: {0}")]
-    TopicAnnouncement(String),
     #[error("document sync failed: {0}")]
     DocumentSync(String),
     #[error("No transaction found")]
@@ -438,8 +342,6 @@ impl Operation for CreateGroupOperation {
             CreateGroupState::CreateGroup => self.handle_create_group(event),
             CreateGroupState::CreateRoles => self.handle_create_roles(event),
             CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
-            CreateGroupState::AnnounceGroupDoc => self.handle_announce_group_doc(event),
-            CreateGroupState::AnnounceAuthDoc => self.handle_announce_auth_doc(event),
             CreateGroupState::ReplicateDocuments => self.handle_replicate_documents(event),
             CreateGroupState::Init | CreateGroupState::Finish | CreateGroupState::Error => {
                 smallvec![]

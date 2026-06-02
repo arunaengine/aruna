@@ -11,8 +11,8 @@ use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::announce::AnnounceTopicOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
 use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,16 +245,11 @@ impl AddUserToRealmRolesOperation {
         let document = DocumentSyncTarget::RealmAuthorization {
             realm_id: auth_doc.realm_id,
         };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document(
-                document.topic_id(),
-                self.input.actor.node_id,
-                Some(document),
-            ),
-            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                result: result.map_err(|error| error.to_string()),
-            }),
-        ))]
+        smallvec![replicate_documents_to_realm_effect(
+            self.input.actor.realm_id,
+            self.input.actor.node_id,
+            vec![document],
+        )]
     }
 
     fn handle_announce_auth_doc(

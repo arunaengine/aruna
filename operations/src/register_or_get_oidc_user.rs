@@ -2,7 +2,7 @@ use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::{Actor, User, oidc_subject_key};
 use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
@@ -10,7 +10,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::announce::AnnounceTopicOperation;
+use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
 use crate::user_subject_index::rewrite_subject_index_effects;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterOrGetOidcUserInput {
@@ -272,16 +272,11 @@ impl RegisterOrGetOidcUserOperation {
         let user_id = user.user_id;
         self.state = RegisterOrGetOidcUserState::AnnounceUser { user };
         let document = DocumentSyncTarget::User { user_id };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document(
-                document.topic_id(),
-                self.input.actor.node_id,
-                Some(document),
-            ),
-            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                result: result.map_err(|error| error.to_string()),
-            }),
-        ))]
+        smallvec![replicate_documents_to_realm_effect(
+            self.input.actor.realm_id,
+            self.input.actor.node_id,
+            vec![document],
+        )]
     }
 
     fn handle_announce_user(&mut self, event: Event, user: User) -> Effects {

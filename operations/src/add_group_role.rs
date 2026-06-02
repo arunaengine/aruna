@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::announce::AnnounceTopicOperation;
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
 use aruna_core::structs::Permission;
 use aruna_core::types::Effects;
 
@@ -337,16 +337,11 @@ impl AddGroupRoleOperation {
         let document = DocumentSyncTarget::Group {
             group_id: group.group_id,
         };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document(
-                document.topic_id(),
-                self.input.actor.node_id,
-                Some(document),
-            ),
-            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                result: result.map_err(|error| error.to_string()),
-            }),
-        ))]
+        smallvec![replicate_documents_to_realm_effect(
+            self.input.actor.realm_id,
+            self.input.actor.node_id,
+            vec![document],
+        )]
     }
 
     fn handle_announce_group_doc(
@@ -373,16 +368,11 @@ impl AddGroupRoleOperation {
         let document = DocumentSyncTarget::GroupAuthorization {
             group_id: group.group_id,
         };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            AnnounceTopicOperation::new_for_document(
-                document.topic_id(),
-                self.input.actor.node_id,
-                Some(document),
-            ),
-            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                result: result.map_err(|error| error.to_string()),
-            }),
-        ))]
+        smallvec![replicate_documents_to_realm_effect(
+            self.input.actor.realm_id,
+            self.input.actor.node_id,
+            vec![document],
+        )]
     }
 
     fn handle_announce_auth_doc(

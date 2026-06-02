@@ -3,7 +3,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::Operation;
 use aruna_core::structs::{
     Actor, OidcProviderConfig, Realm, RealmAuthorizationDocument, RealmConfigDocument,
     RealmNodeKind,
@@ -12,7 +12,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::announce::AnnounceTopicOperation;
+use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
 use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -240,71 +240,36 @@ impl CreateRealmOperation {
             && self.auth_doc.is_some()
             && self.config_doc.is_some()
         {
-            self.state = CreateRealmState::AnnounceAuthDoc;
-            let document = DocumentSyncTarget::RealmAuthorization {
-                realm_id: realm.realm_id,
-            };
-            smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new_for_document(
-                    document.topic_id(),
-                    self.config.actor.node_id,
-                    Some(document),
-                ),
-                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                    result: result.map_err(|error| error.to_string()),
-                }),
-            ))]
+            self.state = CreateRealmState::ReplicateDocuments;
+            smallvec![replicate_documents_to_realm_effect(
+                self.config.actor.realm_id,
+                self.config.actor.node_id,
+                vec![
+                    DocumentSyncTarget::RealmAuthorization {
+                        realm_id: realm.realm_id,
+                    },
+                    DocumentSyncTarget::RealmConfig {
+                        realm_id: realm.realm_id,
+                    },
+                ],
+            )]
         } else {
             self.fail(CreateRealmError::RealmNotFound)
         }
     }
 
-    fn handle_announce_auth_doc(&mut self, event: Event) -> Effects {
+    fn handle_replicate_documents(&mut self, event: Event) -> Effects {
         let got = format!("{event:?}");
         let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
             return self.unexpected_event(
-                CreateRealmState::AnnounceAuthDoc,
+                CreateRealmState::ReplicateDocuments,
                 "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
                 got,
             );
         };
 
         if let Err(error) = result {
-            return self.fail(CreateRealmError::TopicAnnouncement(error));
-        }
-
-        if let Some(realm) = &self.realm {
-            self.state = CreateRealmState::AnnounceConfigDoc;
-            let document = DocumentSyncTarget::RealmConfig {
-                realm_id: realm.realm_id,
-            };
-            smallvec![Effect::SubOperation(boxed_suboperation(
-                AnnounceTopicOperation::new_for_document(
-                    document.topic_id(),
-                    self.config.actor.node_id,
-                    Some(document),
-                ),
-                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                    result: result.map_err(|error| error.to_string()),
-                }),
-            ))]
-        } else {
-            self.fail(CreateRealmError::RealmNotFound)
-        }
-    }
-
-    fn handle_announce_config_doc(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
-                CreateRealmState::AnnounceConfigDoc,
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                got,
-            );
-        };
-
-        if let Err(error) = result {
-            return self.fail(CreateRealmError::TopicAnnouncement(error));
+            return self.fail(CreateRealmError::DocumentSync(error));
         }
 
         if let Some(realm) = &self.realm
@@ -327,8 +292,7 @@ pub enum CreateRealmState {
     CreateAuthDoc,
     CreateConfigDoc,
     CommitTransaction,
-    AnnounceAuthDoc,
-    AnnounceConfigDoc,
+    ReplicateDocuments,
     Finish,
     Error,
 }
@@ -339,8 +303,8 @@ pub enum CreateRealmError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("topic announcement failed: {0}")]
-    TopicAnnouncement(String),
+    #[error("document sync failed: {0}")]
+    DocumentSync(String),
     #[error("No transaction found")]
     NoTransactionFound,
     #[error("No group found")]
@@ -380,8 +344,7 @@ impl Operation for CreateRealmOperation {
             CreateRealmState::CreateAuthDoc => self.handle_create_auth_doc(event),
             CreateRealmState::CreateConfigDoc => self.handle_create_config_doc(event),
             CreateRealmState::CommitTransaction => self.handle_commit_transaction(event),
-            CreateRealmState::AnnounceAuthDoc => self.handle_announce_auth_doc(event),
-            CreateRealmState::AnnounceConfigDoc => self.handle_announce_config_doc(event),
+            CreateRealmState::ReplicateDocuments => self.handle_replicate_documents(event),
             CreateRealmState::Init | CreateRealmState::Finish | CreateRealmState::Error => {
                 smallvec![]
             }
