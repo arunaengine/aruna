@@ -40,6 +40,7 @@ pub mod replication;
 pub mod s3;
 pub mod staging;
 pub mod startup;
+pub mod sync_placement;
 pub mod task_incoming;
 pub mod telemetry;
 pub mod update_metadata_document;

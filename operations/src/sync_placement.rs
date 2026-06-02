@@ -1,0 +1,165 @@
+use std::cmp::Ordering;
+
+use aruna_core::NodeId;
+use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
+use aruna_core::types::Key;
+use aruna_core::util::unix_timestamp_secs;
+use byteview::ByteView;
+
+const SELECTOR_DOMAIN: &[u8] = b"aruna-sync-peer-v1";
+pub const DEFAULT_DOCUMENT_PEER_COUNT: usize = 3;
+
+pub fn desired_peer_count(target: &DocumentSyncTarget) -> usize {
+    match target {
+        DocumentSyncTarget::MetadataRegistry { .. } => 0,
+        _ => DEFAULT_DOCUMENT_PEER_COUNT,
+    }
+}
+
+pub fn select_sync_peers(
+    target: &DocumentSyncTarget,
+    local_node_id: NodeId,
+    candidates: &[NodeId],
+    excluded: &[NodeId],
+    desired_count: usize,
+) -> Vec<NodeId> {
+    if desired_count == 0 {
+        return Vec::new();
+    }
+
+    let topic_id = target.irokle_topic_id().to_string();
+    let mut candidates = candidates
+        .iter()
+        .copied()
+        .filter(|node_id| *node_id != local_node_id)
+        .filter(|node_id| !excluded.contains(node_id))
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    candidates.dedup();
+    candidates.sort_unstable_by(|left, right| {
+        let left_score = selector_score(topic_id.as_bytes(), local_node_id, *left);
+        let right_score = selector_score(topic_id.as_bytes(), local_node_id, *right);
+        left_score
+            .cmp(&right_score)
+            .then_with(|| left.as_bytes().cmp(right.as_bytes()))
+    });
+    candidates.truncate(desired_count);
+    candidates
+}
+
+pub fn placement_key(target: &DocumentSyncTarget) -> Key {
+    ByteView::from(target.irokle_topic_id().to_string().into_bytes())
+}
+
+pub fn pending_placement_record(
+    target: DocumentSyncTarget,
+    desired_peer_count: usize,
+    mut selected_peers: Vec<NodeId>,
+) -> PendingTopicPlacement {
+    selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    selected_peers.dedup();
+    let missing_peer_count = desired_peer_count.saturating_sub(selected_peers.len());
+    PendingTopicPlacement {
+        topic_id: target.irokle_topic_id().to_string(),
+        target,
+        desired_peer_count,
+        selected_peers,
+        missing_peer_count,
+        updated_at: unix_timestamp_secs(),
+    }
+}
+
+pub fn write_pending_placement_effect(
+    record: &PendingTopicPlacement,
+) -> Result<Effect, postcard::Error> {
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
+        key: placement_key(&record.target),
+        value: ByteView::from(postcard::to_allocvec(record)?),
+        txn_id: None,
+    }))
+}
+
+pub fn delete_pending_placement_effect(target: &DocumentSyncTarget) -> Effect {
+    Effect::Storage(StorageEffect::Delete {
+        key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
+        key: placement_key(target),
+        txn_id: None,
+    })
+}
+
+pub fn decode_pending_placement(value: &[u8]) -> Result<PendingTopicPlacement, postcard::Error> {
+    postcard::from_bytes(value)
+}
+
+fn selector_score(topic_id: &[u8], local_node_id: NodeId, candidate_node_id: NodeId) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SELECTOR_DOMAIN);
+    hasher.update(topic_id);
+    hasher.update(local_node_id.as_bytes());
+    hasher.update(candidate_node_id.as_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+pub fn sort_node_ids(nodes: &mut Vec<NodeId>) {
+    nodes.sort_unstable_by(compare_node_ids);
+    nodes.dedup();
+}
+
+fn compare_node_ids(left: &NodeId, right: &NodeId) -> Ordering {
+    left.as_bytes().cmp(right.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::RealmId;
+
+    fn node(seed: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    fn target() -> DocumentSyncTarget {
+        DocumentSyncTarget::RealmConfig {
+            realm_id: RealmId::from_bytes([7u8; 32]),
+        }
+    }
+
+    #[test]
+    fn selector_is_deterministic() {
+        let candidates = vec![node(4), node(2), node(3), node(1)];
+        let first = select_sync_peers(&target(), node(9), &candidates, &[], 3);
+        let second = select_sync_peers(&target(), node(9), &candidates, &[], 3);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 3);
+    }
+
+    #[test]
+    fn selector_excludes_local_and_explicit_nodes() {
+        let local = node(1);
+        let excluded = node(3);
+        let selected = select_sync_peers(
+            &target(),
+            local,
+            &[local, node(2), excluded, node(4)],
+            &[excluded],
+            3,
+        );
+
+        assert!(!selected.contains(&local));
+        assert!(!selected.contains(&excluded));
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn selector_returns_available_candidates_when_under_capacity() {
+        let selected = select_sync_peers(&target(), node(1), &[node(2)], &[], 3);
+
+        assert_eq!(selected, vec![node(2)]);
+    }
+}

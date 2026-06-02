@@ -32,6 +32,16 @@ pub enum DocumentSyncTarget {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingTopicPlacement {
+    pub target: DocumentSyncTarget,
+    pub topic_id: String,
+    pub desired_peer_count: usize,
+    pub selected_peers: Vec<NodeId>,
+    pub missing_peer_count: usize,
+    pub updated_at: u64,
+}
+
 impl DocumentSyncTarget {
     pub fn topic_id(&self) -> TopicId {
         match self {

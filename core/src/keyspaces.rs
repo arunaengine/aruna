@@ -7,6 +7,7 @@ pub const METADATA_DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const IROKLE_APPLIED_OPS_KEYSPACE: &str = "irokle_applied_ops";
+pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
 pub const USER_KEYSPACE: &str = "users";
 pub const USER_SUBJECT_INDEX_KEYSPACE: &str = "user_subject_index";
 
