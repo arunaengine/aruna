@@ -719,7 +719,7 @@ impl NetHandle {
             .irokle
             .handle_inbound_stream(stream, peer)
             .await?;
-        self.refresh_realm_peers_from_persisted_config().await?;
+        self.reload_realm_peers().await?;
         Ok(applied)
     }
 
@@ -796,7 +796,7 @@ impl NetHandle {
         self.refresh_realm_peers_from_document(&document).await
     }
 
-    pub async fn refresh_realm_peers_from_persisted_config(&self) -> Result<Option<Vec<NodeId>>> {
+    pub async fn reload_realm_peers(&self) -> Result<Option<Vec<NodeId>>> {
         let target = DocumentSyncTarget::RealmConfig {
             realm_id: self.inner.realm_id,
         };

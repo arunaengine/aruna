@@ -29,11 +29,11 @@ use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
 use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::process_pending_topic_placements::{
-    ProcessPendingTopicPlacementsConfig, ProcessPendingTopicPlacementsOperation,
+use aruna_operations::process_placements::{
+    PlacementConfig, ProcessPlacementsOperation,
 };
-use aruna_operations::replicate_documents_to_realm::{
-    ReplicateDocumentsToRealmConfig, ReplicateDocumentsToRealmOperation,
+use aruna_operations::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -387,12 +387,12 @@ pub async fn bootstrap_onboarding(
     let ctx = state.get_ctx();
     if let Some(net_handle) = ctx.net_handle.as_ref() {
         net_handle
-            .refresh_realm_peers_from_persisted_config()
+            .reload_realm_peers()
             .await
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
     }
     drive(
-        ReplicateDocumentsToRealmOperation::new(ReplicateDocumentsToRealmConfig {
+        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
             realm_id: state.get_realm_id(),
             local_node_id: state.get_node_id(),
             excluded_peers: vec![node_id],
@@ -405,7 +405,7 @@ pub async fn bootstrap_onboarding(
     .await
     .map_err(|error| ServerError::InternalError(error.to_string()))?;
     if let Err(error) = drive(
-        ProcessPendingTopicPlacementsOperation::new(ProcessPendingTopicPlacementsConfig {
+        ProcessPlacementsOperation::new(PlacementConfig {
             realm_id: state.get_realm_id(),
             local_node_id: state.get_node_id(),
         }),

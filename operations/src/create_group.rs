@@ -1,4 +1,4 @@
-use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
+use crate::replicate_documents::replicate_documents_effect;
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -232,7 +232,7 @@ impl CreateGroupOperation {
                 user_id = %self.config.actor.user_id,
                 "Announcing group"
             );
-            smallvec![replicate_documents_to_realm_effect(
+            smallvec![replicate_documents_effect(
                 self.config.actor.realm_id,
                 self.config.actor.node_id,
                 vec![

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use thiserror::Error;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
+use crate::replicate_documents::replicate_documents_effect;
 use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,7 +245,7 @@ impl AddUserToRealmRolesOperation {
         let document = DocumentSyncTarget::RealmAuthorization {
             realm_id: auth_doc.realm_id,
         };
-        smallvec![replicate_documents_to_realm_effect(
+        smallvec![replicate_documents_effect(
             self.input.actor.realm_id,
             self.input.actor.node_id,
             vec![document],

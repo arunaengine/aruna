@@ -53,7 +53,7 @@ pub fn placement_key(target: &DocumentSyncTarget) -> Key {
     ByteView::from(target.irokle_topic_id().to_string().into_bytes())
 }
 
-pub fn pending_placement_record(
+pub fn new_placement(
     target: DocumentSyncTarget,
     desired_peer_count: usize,
     mut selected_peers: Vec<NodeId>,
@@ -71,7 +71,7 @@ pub fn pending_placement_record(
     }
 }
 
-pub fn write_pending_placement_effect(
+pub fn write_placement_effect(
     record: &PendingTopicPlacement,
 ) -> Result<Effect, postcard::Error> {
     Ok(Effect::Storage(StorageEffect::Write {
@@ -82,7 +82,7 @@ pub fn write_pending_placement_effect(
     }))
 }
 
-pub fn delete_pending_placement_effect(target: &DocumentSyncTarget) -> Effect {
+pub fn delete_placement_effect(target: &DocumentSyncTarget) -> Effect {
     Effect::Storage(StorageEffect::Delete {
         key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
         key: placement_key(target),
@@ -90,7 +90,7 @@ pub fn delete_pending_placement_effect(target: &DocumentSyncTarget) -> Effect {
     })
 }
 
-pub fn decode_pending_placement(value: &[u8]) -> Result<PendingTopicPlacement, postcard::Error> {
+pub fn decode_placement(value: &[u8]) -> Result<PendingTopicPlacement, postcard::Error> {
     postcard::from_bytes(value)
 }
 

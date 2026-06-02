@@ -10,7 +10,7 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
+use crate::replicate_documents::replicate_documents_effect;
 use crate::user_subject_index::rewrite_subject_index_effects;
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegisterOrGetOidcUserInput {
@@ -272,7 +272,7 @@ impl RegisterOrGetOidcUserOperation {
         let user_id = user.user_id;
         self.state = RegisterOrGetOidcUserState::AnnounceUser { user };
         let document = DocumentSyncTarget::User { user_id };
-        smallvec![replicate_documents_to_realm_effect(
+        smallvec![replicate_documents_effect(
             self.input.actor.realm_id,
             self.input.actor.node_id,
             vec![document],

@@ -12,7 +12,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
+use crate::replicate_documents::replicate_documents_effect;
 use aruna_core::structs::Permission;
 use aruna_core::types::Effects;
 
@@ -337,7 +337,7 @@ impl AddGroupRoleOperation {
         let document = DocumentSyncTarget::Group {
             group_id: group.group_id,
         };
-        smallvec![replicate_documents_to_realm_effect(
+        smallvec![replicate_documents_effect(
             self.input.actor.realm_id,
             self.input.actor.node_id,
             vec![document],
@@ -368,7 +368,7 @@ impl AddGroupRoleOperation {
         let document = DocumentSyncTarget::GroupAuthorization {
             group_id: group.group_id,
         };
-        smallvec![replicate_documents_to_realm_effect(
+        smallvec![replicate_documents_effect(
             self.input.actor.realm_id,
             self.input.actor.node_id,
             vec![document],

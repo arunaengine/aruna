@@ -13,31 +13,31 @@ use thiserror::Error;
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    decode_pending_placement, delete_pending_placement_effect, pending_placement_record,
-    select_sync_peers, sort_node_ids, write_pending_placement_effect,
+    decode_placement, delete_placement_effect, new_placement,
+    select_sync_peers, sort_node_ids, write_placement_effect,
 };
 
 const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProcessPendingTopicPlacementsConfig {
+pub struct PlacementConfig {
     pub realm_id: RealmId,
     pub local_node_id: NodeId,
 }
 
 #[derive(Debug, PartialEq)]
-pub struct ProcessPendingTopicPlacementsOperation {
-    config: ProcessPendingTopicPlacementsConfig,
-    state: ProcessPendingTopicPlacementsState,
+pub struct ProcessPlacementsOperation {
+    config: PlacementConfig,
+    state: PlacementState,
     realm_nodes: Vec<NodeId>,
     records: Vec<PendingTopicPlacement>,
     next_start_after: Option<Key>,
     current: Option<CurrentPlacement>,
-    output: Option<Result<(), ProcessPendingTopicPlacementsError>>,
+    output: Option<Result<(), PlacementError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum ProcessPendingTopicPlacementsState {
+enum PlacementState {
     Init,
     LoadRealmConfig,
     ListPending,
@@ -56,7 +56,7 @@ struct CurrentPlacement {
 }
 
 #[derive(Debug, Error, PartialEq)]
-pub enum ProcessPendingTopicPlacementsError {
+pub enum PlacementError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
@@ -77,11 +77,11 @@ pub enum ProcessPendingTopicPlacementsError {
     },
 }
 
-impl ProcessPendingTopicPlacementsOperation {
-    pub fn new(config: ProcessPendingTopicPlacementsConfig) -> Self {
+impl ProcessPlacementsOperation {
+    pub fn new(config: PlacementConfig) -> Self {
         Self {
             config,
-            state: ProcessPendingTopicPlacementsState::Init,
+            state: PlacementState::Init,
             realm_nodes: Vec::new(),
             records: Vec::new(),
             next_start_after: None,
@@ -90,14 +90,14 @@ impl ProcessPendingTopicPlacementsOperation {
         }
     }
 
-    fn fail(&mut self, error: ProcessPendingTopicPlacementsError) -> Effects {
-        self.state = ProcessPendingTopicPlacementsState::Error;
+    fn fail(&mut self, error: PlacementError) -> Effects {
+        self.state = PlacementState::Error;
         self.output = Some(Err(error));
         smallvec![]
     }
 
     fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        self.fail(ProcessPendingTopicPlacementsError::UnexpectedEvent {
+        self.fail(PlacementError::UnexpectedEvent {
             state: format!("{:?}", self.state),
             expected,
             got,
@@ -105,7 +105,7 @@ impl ProcessPendingTopicPlacementsOperation {
     }
 
     fn emit_list_pending(&mut self) -> Effects {
-        self.state = ProcessPendingTopicPlacementsState::ListPending;
+        self.state = PlacementState::ListPending;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
             prefix: None,
@@ -120,7 +120,7 @@ impl ProcessPendingTopicPlacementsOperation {
             if self.next_start_after.is_some() {
                 return self.emit_list_pending();
             }
-            self.state = ProcessPendingTopicPlacementsState::Finish;
+            self.state = PlacementState::Finish;
             self.output = Some(Ok(()));
             return smallvec![];
         };
@@ -143,7 +143,7 @@ impl ProcessPendingTopicPlacementsOperation {
             return self.emit_placement_update();
         }
 
-        self.state = ProcessPendingTopicPlacementsState::Publish;
+        self.state = PlacementState::Publish;
         smallvec![Effect::SubOperation(boxed_suboperation(
             AnnounceTopicOperation::new_for_document_with_peers(
                 record.target.topic_id(),
@@ -164,31 +164,31 @@ impl ProcessPendingTopicPlacementsOperation {
         current.selected_peers.append(&mut current.newly_selected);
         sort_node_ids(&mut current.selected_peers);
 
-        self.state = ProcessPendingTopicPlacementsState::StorePlacement;
+        self.state = PlacementState::StorePlacement;
         if current.selected_peers.len() >= current.desired_peer_count {
-            return smallvec![delete_pending_placement_effect(&current.target)];
+            return smallvec![delete_placement_effect(&current.target)];
         }
 
-        let record = pending_placement_record(
+        let record = new_placement(
             current.target,
             current.desired_peer_count,
             current.selected_peers,
         );
-        match write_pending_placement_effect(&record) {
+        match write_placement_effect(&record) {
             Ok(effect) => smallvec![effect],
-            Err(error) => self.fail(ProcessPendingTopicPlacementsError::Placement(
+            Err(error) => self.fail(PlacementError::Placement(
                 error.to_string(),
             )),
         }
     }
 }
 
-impl Operation for ProcessPendingTopicPlacementsOperation {
+impl Operation for ProcessPlacementsOperation {
     type Output = ();
-    type Error = ProcessPendingTopicPlacementsError;
+    type Error = PlacementError;
 
     fn start(&mut self) -> Effects {
-        self.state = ProcessPendingTopicPlacementsState::LoadRealmConfig;
+        self.state = PlacementState::LoadRealmConfig;
         smallvec![read_effect(
             &DocumentSyncTarget::RealmConfig {
                 realm_id: self.config.realm_id,
@@ -199,10 +199,10 @@ impl Operation for ProcessPendingTopicPlacementsOperation {
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ProcessPendingTopicPlacementsState::LoadRealmConfig => match event {
+            PlacementState::LoadRealmConfig => match event {
                 Event::Storage(StorageEvent::ReadResult { value, .. }) => {
                     let Some(value) = value else {
-                        return self.fail(ProcessPendingTopicPlacementsError::RealmConfigNotFound);
+                        return self.fail(PlacementError::RealmConfigNotFound);
                     };
                     let document = match RealmConfigDocument::from_bytes(&value) {
                         Ok(document) => document,
@@ -220,7 +220,7 @@ impl Operation for ProcessPendingTopicPlacementsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("realm config read result", format!("{other:?}")),
             },
-            ProcessPendingTopicPlacementsState::ListPending => match event {
+            PlacementState::ListPending => match event {
                 Event::Storage(StorageEvent::IterResult {
                     values,
                     next_start_after,
@@ -228,10 +228,10 @@ impl Operation for ProcessPendingTopicPlacementsOperation {
                     self.next_start_after = next_start_after;
                     self.records.clear();
                     for (_, value) in values.into_iter().rev() {
-                        let record = match decode_pending_placement(&value) {
+                        let record = match decode_placement(&value) {
                             Ok(record) => record,
                             Err(error) => {
-                                return self.fail(ProcessPendingTopicPlacementsError::Decode(
+                                return self.fail(PlacementError::Decode(
                                     error.to_string(),
                                 ));
                             }
@@ -245,33 +245,33 @@ impl Operation for ProcessPendingTopicPlacementsOperation {
                     self.unexpected_event("pending placement iter result", format!("{other:?}"))
                 }
             },
-            ProcessPendingTopicPlacementsState::Publish => match event {
+            PlacementState::Publish => match event {
                 Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
                         Ok(()) => self.emit_placement_update(),
                         Err(error) => {
-                            self.fail(ProcessPendingTopicPlacementsError::DocumentSync(error))
+                            self.fail(PlacementError::DocumentSync(error))
                         }
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),
             },
-            ProcessPendingTopicPlacementsState::StorePlacement => match event {
+            PlacementState::StorePlacement => match event {
                 Event::Storage(StorageEvent::WriteResult { .. })
                 | Event::Storage(StorageEvent::DeleteResult { .. }) => self.emit_next_record(),
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
             },
-            ProcessPendingTopicPlacementsState::Init
-            | ProcessPendingTopicPlacementsState::Finish
-            | ProcessPendingTopicPlacementsState::Error => smallvec![],
+            PlacementState::Init
+            | PlacementState::Finish
+            | PlacementState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
         matches!(
             self.state,
-            ProcessPendingTopicPlacementsState::Finish | ProcessPendingTopicPlacementsState::Error
+            PlacementState::Finish | PlacementState::Error
         )
     }
 

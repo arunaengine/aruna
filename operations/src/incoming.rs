@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::driver::{DriverContext, drive};
-use crate::process_pending_topic_placements::{
-    ProcessPendingTopicPlacementsConfig, ProcessPendingTopicPlacementsOperation,
+use crate::process_placements::{
+    PlacementConfig, ProcessPlacementsOperation,
 };
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
@@ -118,8 +118,8 @@ impl InboundEventHandler for OperationsInboundHandler {
                         Ok(applied) => {
                             debug!(node_id = %node_id, applied, "Reconciled inbound Irokle document events");
                             if applied > 0 {
-                                let operation = ProcessPendingTopicPlacementsOperation::new(
-                                    ProcessPendingTopicPlacementsConfig {
+                                let operation = ProcessPlacementsOperation::new(
+                                    PlacementConfig {
                                         realm_id: *net_handle.realm_id(),
                                         local_node_id: net_handle.node_id(),
                                     },

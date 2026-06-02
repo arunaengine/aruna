@@ -26,8 +26,8 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::process_pending_topic_placements::{
-    ProcessPendingTopicPlacementsConfig, ProcessPendingTopicPlacementsOperation,
+use aruna_operations::process_placements::{
+    PlacementConfig, ProcessPlacementsOperation,
 };
 use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
@@ -70,7 +70,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         storage_handle.clone(),
     )
     .await?;
-    if let Err(error) = net_handle.refresh_realm_peers_from_persisted_config().await {
+    if let Err(error) = net_handle.reload_realm_peers().await {
         warn!(error = %error, "Failed to refresh realm peers from persisted config during startup");
     }
     let task_handle = TaskHandle::new();
@@ -167,7 +167,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     OnboardingPhase::CoreDocumentsFetched,
                 )
                 .await?;
-                if let Err(error) = net_handle.refresh_realm_peers_from_persisted_config().await {
+                if let Err(error) = net_handle.reload_realm_peers().await {
                     warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
                 }
             }
@@ -206,7 +206,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     drive(
-        ProcessPendingTopicPlacementsOperation::new(ProcessPendingTopicPlacementsConfig {
+        ProcessPlacementsOperation::new(PlacementConfig {
             realm_id: config.realm_id,
             local_node_id: config.node_id,
         }),

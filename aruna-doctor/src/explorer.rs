@@ -1142,7 +1142,7 @@ fn load_pending_placements(
     for entry in snapshot.iter(&keyspace) {
         let (_, value) = entry.into_inner()?;
         placements.push(
-            aruna_operations::sync_placement::decode_pending_placement(value.as_ref())
+            aruna_operations::sync_placement::decode_placement(value.as_ref())
                 .map_err(|error| ExplorerError::Decode(error.to_string()))?,
         );
     }
@@ -1271,7 +1271,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         ),
         SYNC_PLACEMENT_KEYSPACE => decode_value_with(
             value,
-            aruna_operations::sync_placement::decode_pending_placement,
+            aruna_operations::sync_placement::decode_placement,
             |data| DecodedValue::PendingTopicPlacement {
                 data: JsonPendingTopicPlacement(data),
             },
@@ -1737,7 +1737,7 @@ mod tests {
             realm_id: RealmId::from_bytes([4_u8; 32]),
         };
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
-        let placement = aruna_operations::sync_placement::pending_placement_record(
+        let placement = aruna_operations::sync_placement::new_placement(
             target.clone(),
             3,
             vec![selected_peer],

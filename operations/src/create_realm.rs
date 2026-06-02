@@ -12,7 +12,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
+use crate::replicate_documents::replicate_documents_effect;
 use aruna_core::types::Effects;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -241,7 +241,7 @@ impl CreateRealmOperation {
             && self.config_doc.is_some()
         {
             self.state = CreateRealmState::ReplicateDocuments;
-            smallvec![replicate_documents_to_realm_effect(
+            smallvec![replicate_documents_effect(
                 self.config.actor.realm_id,
                 self.config.actor.node_id,
                 vec![

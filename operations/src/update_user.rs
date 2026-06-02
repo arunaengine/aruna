@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::replicate_documents_to_realm::replicate_documents_to_realm_effect;
+use crate::replicate_documents::replicate_documents_effect;
 
 const MAX_USER_NAME_LEN: usize = 256;
 const MAX_USER_ATTRIBUTES: usize = 128;
@@ -246,7 +246,7 @@ impl UpdateUserOperation {
         let user_id = user.user_id;
         self.state = UpdateUserState::AnnounceUser { user };
         let document = DocumentSyncTarget::User { user_id };
-        smallvec![replicate_documents_to_realm_effect(
+        smallvec![replicate_documents_effect(
             self.input.actor.realm_id,
             self.input.actor.node_id,
             vec![document],

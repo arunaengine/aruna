@@ -105,7 +105,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                         _,
                     ) if refresh_after_commit => {
                         if let Err(error) =
-                            net_handle.refresh_realm_peers_from_persisted_config().await
+                            net_handle.reload_realm_peers().await
                         {
                             warn!(error = %error, "Failed to refresh realm peers after storage commit");
                         }
