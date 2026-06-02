@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use crate::driver::{DriverContext, drive};
+use crate::process_pending_topic_placements::{
+    ProcessPendingTopicPlacementsConfig, ProcessPendingTopicPlacementsOperation,
+};
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
 use aruna_core::alpn::Alpn;
@@ -114,6 +117,17 @@ impl InboundEventHandler for OperationsInboundHandler {
                     match net_handle.handle_irokle_stream(stream, node_id).await {
                         Ok(applied) => {
                             debug!(node_id = %node_id, applied, "Reconciled inbound Irokle document events");
+                            if applied > 0 {
+                                let operation = ProcessPendingTopicPlacementsOperation::new(
+                                    ProcessPendingTopicPlacementsConfig {
+                                        realm_id: *net_handle.realm_id(),
+                                        local_node_id: net_handle.node_id(),
+                                    },
+                                );
+                                if let Err(error) = drive(operation, self.context.as_ref()).await {
+                                    error!(error = ?error, "Failed to process pending topic placements after Irokle reconciliation");
+                                }
+                            }
                             if let Some(metadata_handle) = self.context.metadata_handle.as_ref() {
                                 if let Err(error) = metadata_handle.reconcile_irokle().await {
                                     error!(error = ?error, "Failed to reconcile Craqle Irokle events");

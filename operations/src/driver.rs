@@ -1,8 +1,9 @@
 use aruna_blob::blob::BlobHandle;
-use aruna_core::effects::Effect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, NetEvent, SubOperationEvent};
 use aruna_core::handle::Handle;
+use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::operation::{Operation, SubOperation};
 use aruna_net::NetHandle;
 use aruna_storage::storage;
@@ -11,7 +12,7 @@ use std::any::{type_name, type_name_of_val};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use tracing::{Instrument, debug_span, error, trace};
+use tracing::{Instrument, debug_span, error, trace, warn};
 
 use crate::metadata::MetadataHandle;
 use aruna_core::events::NetError;
@@ -71,10 +72,48 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::Storage(storage_effect) => {
-            context
+            let realm_config_write = match &storage_effect {
+                StorageEffect::Write {
+                    key_space,
+                    value,
+                    txn_id: None,
+                    ..
+                } if key_space == REALM_CONFIG_KEYSPACE => Some(value.clone()),
+                _ => None,
+            };
+            let refresh_after_commit =
+                matches!(&storage_effect, StorageEffect::CommitTransaction { .. });
+            let event = context
                 .storage_handle
                 .send_storage_effect(storage_effect)
-                .await
+                .await;
+            if let Some(net_handle) = context.net_handle.as_ref() {
+                match (&event, realm_config_write) {
+                    (
+                        Event::Storage(aruna_core::events::StorageEvent::WriteResult { .. }),
+                        Some(bytes),
+                    ) => {
+                        if let Err(error) = net_handle.refresh_realm_peers_from_bytes(&bytes).await
+                        {
+                            warn!(error = %error, "Failed to refresh realm peers from written realm config");
+                        }
+                    }
+                    (
+                        Event::Storage(aruna_core::events::StorageEvent::TransactionCommitted {
+                            ..
+                        }),
+                        _,
+                    ) if refresh_after_commit => {
+                        if let Err(error) =
+                            net_handle.refresh_realm_peers_from_persisted_config().await
+                        {
+                            warn!(error = %error, "Failed to refresh realm peers after storage commit");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            event
         }
         Effect::Net(net_effect) => {
             if let Some(net_handle) = &context.net_handle {

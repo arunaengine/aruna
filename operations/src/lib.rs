@@ -34,6 +34,7 @@ pub mod list_metadata_documents;
 pub mod list_onboarding_secrets;
 pub mod list_users;
 pub mod metadata;
+pub mod process_pending_topic_placements;
 pub mod register_or_get_oidc_user;
 pub mod replicate_documents_to_realm;
 pub mod replication;

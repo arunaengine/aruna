@@ -1,19 +1,26 @@
 use aruna_core::NodeId;
-use aruna_core::document::DocumentSyncTarget;
-use aruna_core::events::{Event, SubOperationEvent};
+use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
+use aruna_core::effects::Effect;
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::structs::RealmId;
+use aruna_core::structs::{RealmConfigDocument, RealmId};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::announce::AnnounceTopicOperation;
-use crate::get_realm_nodes::GetRealmNodesOperation;
+use crate::document_repository::read_effect;
+use crate::sync_placement::{
+    delete_pending_placement_effect, desired_peer_count, pending_placement_record,
+    select_sync_peers, sort_node_ids, write_pending_placement_effect,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReplicateDocumentsToRealmConfig {
     pub realm_id: RealmId,
     pub local_node_id: NodeId,
+    pub excluded_peers: Vec<NodeId>,
     pub documents: Vec<DocumentSyncTarget>,
 }
 
@@ -23,30 +30,64 @@ pub struct ReplicateDocumentsToRealmOperation {
     state: ReplicateDocumentsToRealmState,
     pending_documents: Vec<DocumentSyncTarget>,
     realm_nodes: Vec<NodeId>,
+    placement_action: Option<PlacementAction>,
     output: Option<Result<(), ReplicateDocumentsToRealmError>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum ReplicateDocumentsToRealmState {
     Init,
-    LoadRealmNodes,
+    LoadRealmConfig,
     Publish,
+    StorePlacement,
     Finish,
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum PlacementAction {
+    Write(PendingTopicPlacement),
+    Delete(DocumentSyncTarget),
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum ReplicateDocumentsToRealmError {
-    #[error("failed to load realm nodes: {0}")]
-    RealmNodes(String),
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error("realm config document not found")]
+    RealmConfigNotFound,
     #[error("document sync failed: {0}")]
     DocumentSync(String),
+    #[error("placement persistence failed: {0}")]
+    Placement(String),
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
         expected: &'static str,
         got: String,
     },
+}
+
+pub fn replicate_documents_to_realm_effect(
+    realm_id: RealmId,
+    local_node_id: NodeId,
+    documents: Vec<DocumentSyncTarget>,
+) -> Effect {
+    Effect::SubOperation(boxed_suboperation(
+        ReplicateDocumentsToRealmOperation::new(ReplicateDocumentsToRealmConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents,
+        }),
+        |result| {
+            Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+                result: result.map_err(|error| error.to_string()),
+            })
+        },
+    ))
 }
 
 impl ReplicateDocumentsToRealmOperation {
@@ -56,6 +97,7 @@ impl ReplicateDocumentsToRealmOperation {
             config,
             state: ReplicateDocumentsToRealmState::Init,
             realm_nodes: Vec::new(),
+            placement_action: None,
             output: None,
         }
     }
@@ -85,20 +127,64 @@ impl ReplicateDocumentsToRealmOperation {
             return self.finish_success();
         };
 
+        let desired_count = desired_peer_count(&document);
+        if desired_count == 0 {
+            return self.emit_next_publish();
+        }
+
+        let selected_peers = select_sync_peers(
+            &document,
+            self.config.local_node_id,
+            &self.realm_nodes,
+            &self.config.excluded_peers,
+            desired_count,
+        );
+        self.placement_action = if selected_peers.len() < desired_count {
+            Some(PlacementAction::Write(pending_placement_record(
+                document.clone(),
+                desired_count,
+                selected_peers.clone(),
+            )))
+        } else {
+            Some(PlacementAction::Delete(document.clone()))
+        };
+
+        if selected_peers.is_empty() {
+            return match self.emit_placement_update() {
+                Ok(effects) => effects,
+                Err(error) => self.fail(error),
+            };
+        }
+
         self.state = ReplicateDocumentsToRealmState::Publish;
-        smallvec![aruna_core::effects::Effect::SubOperation(
-            boxed_suboperation(
-                AnnounceTopicOperation::new_for_document_with_peers(
-                    document.topic_id(),
-                    self.config.local_node_id,
-                    Some(document),
-                    self.realm_nodes.clone(),
-                ),
-                |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
-                    result: result.map_err(|error| error.to_string()),
-                }),
-            )
-        )]
+        smallvec![Effect::SubOperation(boxed_suboperation(
+            AnnounceTopicOperation::new_for_document_with_peers(
+                document.topic_id(),
+                self.config.local_node_id,
+                Some(document),
+                selected_peers,
+            ),
+            |result| Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+                result: result.map_err(|error| error.to_string()),
+            }),
+        ))]
+    }
+
+    fn emit_placement_update(&mut self) -> Result<Effects, ReplicateDocumentsToRealmError> {
+        let Some(action) = self.placement_action.take() else {
+            return Ok(self.emit_next_publish());
+        };
+        self.state = ReplicateDocumentsToRealmState::StorePlacement;
+        match action {
+            PlacementAction::Write(record) => {
+                Ok(smallvec![write_pending_placement_effect(&record).map_err(
+                    |error| ReplicateDocumentsToRealmError::Placement(error.to_string())
+                )?])
+            }
+            PlacementAction::Delete(target) => {
+                Ok(smallvec![delete_pending_placement_effect(&target)])
+            }
+        }
     }
 }
 
@@ -107,54 +193,58 @@ impl Operation for ReplicateDocumentsToRealmOperation {
     type Error = ReplicateDocumentsToRealmError;
 
     fn start(&mut self) -> Effects {
-        self.state = ReplicateDocumentsToRealmState::LoadRealmNodes;
-        smallvec![aruna_core::effects::Effect::SubOperation(
-            boxed_suboperation(
-                GetRealmNodesOperation::new(self.config.realm_id),
-                |result| Event::SubOperation(SubOperationEvent::RealmNodesResult {
-                    result: result
-                        .map(|nodes| {
-                            let mut nodes: Vec<_> = nodes.into_iter().collect();
-                            nodes.sort_by_key(|node_id| *node_id.as_bytes());
-                            nodes
-                        })
-                        .map_err(|error| error.to_string()),
-                }),
-            )
+        self.state = ReplicateDocumentsToRealmState::LoadRealmConfig;
+        smallvec![read_effect(
+            &DocumentSyncTarget::RealmConfig {
+                realm_id: self.config.realm_id,
+            },
+            None,
         )]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
-            ReplicateDocumentsToRealmState::LoadRealmNodes => match event {
-                Event::SubOperation(SubOperationEvent::RealmNodesResult { result }) => {
-                    let realm_nodes = match result {
-                        Ok(nodes) => nodes,
-                        Err(error) => {
-                            return self.fail(ReplicateDocumentsToRealmError::RealmNodes(error));
-                        }
+            ReplicateDocumentsToRealmState::LoadRealmConfig => match event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    let Some(value) = value else {
+                        self.realm_nodes.clear();
+                        return self.emit_next_publish();
                     };
-                    self.realm_nodes = realm_nodes
-                        .into_iter()
-                        .filter(|node_id| *node_id != self.config.local_node_id)
-                        .collect();
-                    if self.realm_nodes.is_empty() {
-                        return self.finish_success();
-                    }
+                    let document = match RealmConfigDocument::from_bytes(&value) {
+                        Ok(document) => document,
+                        Err(error) => return self.fail(error.into()),
+                    };
+                    let mut nodes = match document.node_ids() {
+                        Ok(nodes) => nodes,
+                        Err(error) => return self.fail(error.into()),
+                    };
+                    nodes.retain(|node_id| *node_id != self.config.local_node_id);
+                    sort_node_ids(&mut nodes);
+                    self.realm_nodes = nodes;
                     self.emit_next_publish()
                 }
-                other => self.unexpected_event("realm node lookup result", format!("{other:?}")),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("realm config read result", format!("{other:?}")),
             },
             ReplicateDocumentsToRealmState::Publish => match event {
                 Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
-                        Ok(()) => self.emit_next_publish(),
+                        Ok(()) => match self.emit_placement_update() {
+                            Ok(effects) => effects,
+                            Err(error) => self.fail(error),
+                        },
                         Err(error) => {
                             self.fail(ReplicateDocumentsToRealmError::DocumentSync(error))
                         }
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),
+            },
+            ReplicateDocumentsToRealmState::StorePlacement => match event {
+                Event::Storage(StorageEvent::WriteResult { .. })
+                | Event::Storage(StorageEvent::DeleteResult { .. }) => self.emit_next_publish(),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("placement storage result", format!("{other:?}")),
             },
             ReplicateDocumentsToRealmState::Init
             | ReplicateDocumentsToRealmState::Finish
