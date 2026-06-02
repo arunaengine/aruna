@@ -26,9 +26,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::process_placements::{
-    PlacementConfig, ProcessPlacementsOperation,
-};
+use aruna_operations::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_tasks::TaskHandle;

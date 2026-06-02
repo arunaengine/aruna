@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use crate::driver::{DriverContext, drive};
-use crate::process_placements::{
-    PlacementConfig, ProcessPlacementsOperation,
-};
+use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
 use aruna_core::alpn::Alpn;

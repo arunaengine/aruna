@@ -29,9 +29,7 @@ use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
 use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
-use aruna_operations::process_placements::{
-    PlacementConfig, ProcessPlacementsOperation,
-};
+use aruna_operations::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use aruna_operations::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };

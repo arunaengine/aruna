@@ -1737,11 +1737,8 @@ mod tests {
             realm_id: RealmId::from_bytes([4_u8; 32]),
         };
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
-        let placement = aruna_operations::sync_placement::new_placement(
-            target.clone(),
-            3,
-            vec![selected_peer],
-        );
+        let placement =
+            aruna_operations::sync_placement::new_placement(target.clone(), 3, vec![selected_peer]);
         let value = postcard::to_allocvec(&placement).unwrap();
 
         let decoded = decode_entry(

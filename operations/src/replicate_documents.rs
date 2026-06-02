@@ -12,8 +12,8 @@ use thiserror::Error;
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    delete_placement_effect, desired_peer_count, new_placement,
-    select_sync_peers, sort_node_ids, write_placement_effect,
+    delete_placement_effect, desired_peer_count, new_placement, select_sync_peers, sort_node_ids,
+    write_placement_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -181,9 +181,7 @@ impl ReplicateDocumentsOperation {
                     |error| ReplicateDocumentsError::Placement(error.to_string())
                 )?])
             }
-            PlacementAction::Delete(target) => {
-                Ok(smallvec![delete_placement_effect(&target)])
-            }
+            PlacementAction::Delete(target) => Ok(smallvec![delete_placement_effect(&target)]),
         }
     }
 }
@@ -233,9 +231,7 @@ impl Operation for ReplicateDocumentsOperation {
                             Ok(effects) => effects,
                             Err(error) => self.fail(error),
                         },
-                        Err(error) => {
-                            self.fail(ReplicateDocumentsError::DocumentSync(error))
-                        }
+                        Err(error) => self.fail(ReplicateDocumentsError::DocumentSync(error)),
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),

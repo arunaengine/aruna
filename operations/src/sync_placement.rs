@@ -71,9 +71,7 @@ pub fn new_placement(
     }
 }
 
-pub fn write_placement_effect(
-    record: &PendingTopicPlacement,
-) -> Result<Effect, postcard::Error> {
+pub fn write_placement_effect(record: &PendingTopicPlacement) -> Result<Effect, postcard::Error> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
         key: placement_key(&record.target),

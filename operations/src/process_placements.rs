@@ -13,8 +13,8 @@ use thiserror::Error;
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    decode_placement, delete_placement_effect, new_placement,
-    select_sync_peers, sort_node_ids, write_placement_effect,
+    decode_placement, delete_placement_effect, new_placement, select_sync_peers, sort_node_ids,
+    write_placement_effect,
 };
 
 const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
@@ -176,9 +176,7 @@ impl ProcessPlacementsOperation {
         );
         match write_placement_effect(&record) {
             Ok(effect) => smallvec![effect],
-            Err(error) => self.fail(PlacementError::Placement(
-                error.to_string(),
-            )),
+            Err(error) => self.fail(PlacementError::Placement(error.to_string())),
         }
     }
 }
@@ -231,9 +229,7 @@ impl Operation for ProcessPlacementsOperation {
                         let record = match decode_placement(&value) {
                             Ok(record) => record,
                             Err(error) => {
-                                return self.fail(PlacementError::Decode(
-                                    error.to_string(),
-                                ));
+                                return self.fail(PlacementError::Decode(error.to_string()));
                             }
                         };
                         self.records.push(record);
@@ -249,9 +245,7 @@ impl Operation for ProcessPlacementsOperation {
                 Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
                         Ok(()) => self.emit_placement_update(),
-                        Err(error) => {
-                            self.fail(PlacementError::DocumentSync(error))
-                        }
+                        Err(error) => self.fail(PlacementError::DocumentSync(error)),
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),
@@ -262,17 +256,12 @@ impl Operation for ProcessPlacementsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
             },
-            PlacementState::Init
-            | PlacementState::Finish
-            | PlacementState::Error => smallvec![],
+            PlacementState::Init | PlacementState::Finish | PlacementState::Error => smallvec![],
         }
     }
 
     fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            PlacementState::Finish | PlacementState::Error
-        )
+        matches!(self.state, PlacementState::Finish | PlacementState::Error)
     }
 
     fn finalize(self) -> Result<Self::Output, Self::Error> {
