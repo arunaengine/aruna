@@ -200,31 +200,29 @@ impl Operation for RestoreTopicSubscriptionsOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iteration result", format!("{other:?}")),
             },
-            RestoreTopicSubscriptionsState::ListMetadata => match event {
-                event => match parse_registry_iter(event) {
-                    Ok((records, _)) => {
-                        for record in records {
-                            self.push_document(DocumentSyncTarget::MetadataRegistry {
-                                group_id: record.group_id,
-                                document_id: record.document_id,
-                            });
-                        }
-                        self.state = RestoreTopicSubscriptionsState::ListUsers;
-                        smallvec![Effect::Storage(StorageEffect::Iter {
-                            key_space: USER_KEYSPACE.to_string(),
-                            prefix: None,
-                            start_after: None,
-                            limit: usize::MAX,
-                            txn_id: None,
-                        })]
+            RestoreTopicSubscriptionsState::ListMetadata => match parse_registry_iter(event) {
+                Ok((records, _)) => {
+                    for record in records {
+                        self.push_document(DocumentSyncTarget::MetadataRegistry {
+                            group_id: record.group_id,
+                            document_id: record.document_id,
+                        });
                     }
-                    Err(crate::metadata::repository::StorageReadError::Storage(error)) => {
-                        self.fail(error.into())
-                    }
-                    Err(crate::metadata::repository::StorageReadError::Conversion(error)) => {
-                        self.fail(error.into())
-                    }
-                },
+                    self.state = RestoreTopicSubscriptionsState::ListUsers;
+                    smallvec![Effect::Storage(StorageEffect::Iter {
+                        key_space: USER_KEYSPACE.to_string(),
+                        prefix: None,
+                        start_after: None,
+                        limit: usize::MAX,
+                        txn_id: None,
+                    })]
+                }
+                Err(crate::metadata::repository::StorageReadError::Storage(error)) => {
+                    self.fail(error.into())
+                }
+                Err(crate::metadata::repository::StorageReadError::Conversion(error)) => {
+                    self.fail(error.into())
+                }
             },
             RestoreTopicSubscriptionsState::ListUsers => match event {
                 Event::Storage(StorageEvent::IterResult { values, .. }) => {

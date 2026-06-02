@@ -43,7 +43,7 @@ pub enum SubOperationEvent {
         result: Result<(), String>,
     },
     SourceConnectorResolved {
-        result: Result<ResolvedSourceConnector, SourceConnectorResolutionError>,
+        result: Box<Result<ResolvedSourceConnector, SourceConnectorResolutionError>>,
     },
     VersionSourceAccessResolved {
         result: Result<ResolvedSourceAccess, SourceConnectorResolutionError>,

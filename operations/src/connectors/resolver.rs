@@ -268,7 +268,11 @@ impl Operation for ResolveVersionSourceBindingOperation {
 pub fn resolve_source_connector_suboperation(input: ResolveSourceConnectorInput) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         ResolveSourceConnectorOperation::new(input),
-        |result| Event::SubOperation(SubOperationEvent::SourceConnectorResolved { result }),
+        |result| {
+            Event::SubOperation(SubOperationEvent::SourceConnectorResolved {
+                result: Box::new(result),
+            })
+        },
     ))
 }
 

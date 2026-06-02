@@ -98,19 +98,19 @@ impl ReadStagingSourceOperation {
 
     fn handle_resolved_connector(&mut self, event: Event) -> Effects {
         match event {
-            Event::SubOperation(SubOperationEvent::SourceConnectorResolved {
-                result: Ok(resolved),
-            }) => {
-                self.connector = Some(resolved.connector);
-                self.state = ReadStagingSourceState::ReadSource;
-                smallvec![Effect::StagingSource(StagingSourceEffect::Read {
-                    access: resolved.access,
-                    range: self.input.range.clone(),
-                })]
+            Event::SubOperation(SubOperationEvent::SourceConnectorResolved { result }) => {
+                match *result {
+                    Ok(resolved) => {
+                        self.connector = Some(resolved.connector);
+                        self.state = ReadStagingSourceState::ReadSource;
+                        smallvec![Effect::StagingSource(StagingSourceEffect::Read {
+                            access: resolved.access,
+                            range: self.input.range.clone(),
+                        })]
+                    }
+                    Err(error) => self.emit_error(error.into()),
+                }
             }
-            Event::SubOperation(SubOperationEvent::SourceConnectorResolved {
-                result: Err(error),
-            }) => self.emit_error(error.into()),
             other => self.emit_unexpected(
                 "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
                 &other,
@@ -267,7 +267,7 @@ mod tests {
 
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Ok(resolved),
+                result: Box::new(Ok(resolved)),
             },
         ));
 
@@ -286,7 +286,7 @@ mod tests {
 
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Err(SourceConnectorResolutionError::InvalidSourcePath),
+                result: Box::new(Err(SourceConnectorResolutionError::InvalidSourcePath)),
             },
         ));
 
@@ -305,7 +305,7 @@ mod tests {
         operation.start();
         operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Ok(sample_resolved_connector()),
+                result: Box::new(Ok(sample_resolved_connector())),
             },
         ));
         let metadata = sample_metadata();
@@ -332,7 +332,7 @@ mod tests {
         operation.start();
         operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Ok(sample_resolved_connector()),
+                result: Box::new(Ok(sample_resolved_connector())),
             },
         ));
 

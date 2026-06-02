@@ -96,19 +96,19 @@ impl HeadStagingSourceOperation {
 
     fn handle_resolved_connector(&mut self, event: Event) -> Effects {
         match event {
-            Event::SubOperation(SubOperationEvent::SourceConnectorResolved {
-                result: Ok(resolved),
-            }) => {
-                self.connector = Some(resolved.connector);
-                self.secret_fingerprint = resolved.secret_fingerprint;
-                self.state = HeadStagingSourceState::HeadSource;
-                smallvec![Effect::StagingSource(StagingSourceEffect::Head {
-                    access: resolved.access,
-                })]
+            Event::SubOperation(SubOperationEvent::SourceConnectorResolved { result }) => {
+                match *result {
+                    Ok(resolved) => {
+                        self.connector = Some(resolved.connector);
+                        self.secret_fingerprint = resolved.secret_fingerprint;
+                        self.state = HeadStagingSourceState::HeadSource;
+                        smallvec![Effect::StagingSource(StagingSourceEffect::Head {
+                            access: resolved.access,
+                        })]
+                    }
+                    Err(error) => self.emit_error(error.into()),
+                }
             }
-            Event::SubOperation(SubOperationEvent::SourceConnectorResolved {
-                result: Err(error),
-            }) => self.emit_error(error.into()),
             other => self.emit_unexpected(
                 "Event::SubOperation(SubOperationEvent::SourceConnectorResolved)",
                 &other,
@@ -257,7 +257,7 @@ mod tests {
 
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Ok(resolved),
+                result: Box::new(Ok(resolved)),
             },
         ));
 
@@ -277,7 +277,7 @@ mod tests {
 
         let effects = operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Err(SourceConnectorResolutionError::NotFound),
+                result: Box::new(Err(SourceConnectorResolutionError::NotFound)),
             },
         ));
 
@@ -299,7 +299,7 @@ mod tests {
         let resolved = sample_resolved_connector();
         operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Ok(resolved),
+                result: Box::new(Ok(resolved)),
             },
         ));
 
@@ -325,7 +325,7 @@ mod tests {
         operation.start();
         operation.step(Event::SubOperation(
             SubOperationEvent::SourceConnectorResolved {
-                result: Ok(sample_resolved_connector()),
+                result: Box::new(Ok(sample_resolved_connector())),
             },
         ));
 

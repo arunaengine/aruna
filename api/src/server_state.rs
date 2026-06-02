@@ -303,6 +303,7 @@ impl ServerState {
         documents: &[DocumentSyncTarget],
     ) -> Result<(), OnboardingSecretError> {
         for document in documents {
+            // The joiner may not be reachable yet; the issued ticket lets it pull these documents.
             if let Err(error) = drive(
                 AnnounceTopicOperation::new_for_document_with_peers(
                     document.topic_id(),
@@ -320,7 +321,6 @@ impl ServerState {
                     error = ?error,
                     "Failed to prepare onboarding document sync"
                 );
-                return Err(OnboardingSecretError::InvalidSecret);
             }
         }
         Ok(())

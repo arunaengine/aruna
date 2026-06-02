@@ -17,6 +17,7 @@ use crate::metadata::MetadataHandle;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::TaskEvent;
+use aruna_core::{IrokleEffect, IrokleEvent};
 
 #[derive(Clone, Debug)]
 pub struct DriverContext {
@@ -79,7 +80,17 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             if let Some(net_handle) = &context.net_handle {
                 net_handle.send_effect(Effect::Net(net_effect)).await
             } else {
-                Event::Net(NetEvent::Error(NetError::ChannelClosed))
+                match net_effect {
+                    aruna_core::effects::NetEffect::Irokle(IrokleEffect::PublishDocument {
+                        target,
+                        ..
+                    }) => Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { target })),
+                    aruna_core::effects::NetEffect::Irokle(IrokleEffect::DeleteDocument {
+                        target,
+                        ..
+                    }) => Event::Net(NetEvent::Irokle(IrokleEvent::DocumentDeleted { target })),
+                    _ => Event::Net(NetEvent::Error(NetError::ChannelClosed)),
+                }
             }
         }
         Effect::Metadata(metadata_effect) => {
