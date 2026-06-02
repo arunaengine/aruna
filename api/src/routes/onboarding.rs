@@ -1,6 +1,7 @@
 use crate::error::{ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::NodeId;
+use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -28,6 +29,12 @@ use aruna_operations::inspect_onboarding_secret::{
     InspectOnboardingSecretError, InspectOnboardingSecretInput, InspectOnboardingSecretOperation,
 };
 use aruna_operations::list_onboarding_secrets::ListOnboardingSecretsOperation;
+use aruna_operations::process_pending_topic_placements::{
+    ProcessPendingTopicPlacementsConfig, ProcessPendingTopicPlacementsOperation,
+};
+use aruna_operations::replicate_documents_to_realm::{
+    ReplicateDocumentsToRealmConfig, ReplicateDocumentsToRealmOperation,
+};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
@@ -42,6 +49,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::Rng;
 use std::str::FromStr;
 use std::sync::Arc;
+use tracing::warn;
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
 
@@ -376,8 +384,36 @@ pub async fn bootstrap_onboarding(
         .bootstrap_endpoint()
         .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
     ensure_realm_node(&state, node_id, record.mode).await?;
-    if let Some(net_handle) = state.get_ctx().net_handle.as_ref() {
-        net_handle.add_peer_node(node_id).await;
+    let ctx = state.get_ctx();
+    if let Some(net_handle) = ctx.net_handle.as_ref() {
+        net_handle
+            .refresh_realm_peers_from_persisted_config()
+            .await
+            .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    }
+    drive(
+        ReplicateDocumentsToRealmOperation::new(ReplicateDocumentsToRealmConfig {
+            realm_id: state.get_realm_id(),
+            local_node_id: state.get_node_id(),
+            excluded_peers: vec![node_id],
+            documents: vec![DocumentSyncTarget::RealmConfig {
+                realm_id: state.get_realm_id(),
+            }],
+        }),
+        ctx.as_ref(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    if let Err(error) = drive(
+        ProcessPendingTopicPlacementsOperation::new(ProcessPendingTopicPlacementsConfig {
+            realm_id: state.get_realm_id(),
+            local_node_id: state.get_node_id(),
+        }),
+        ctx.as_ref(),
+    )
+    .await
+    {
+        warn!(error = ?error, "Failed to process pending topic placements during onboarding");
     }
     let onboarding_sync_ticket = state
         .issue_onboarding_sync_ticket(node_id)

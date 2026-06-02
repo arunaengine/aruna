@@ -26,6 +26,9 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
 use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::process_pending_topic_placements::{
+    ProcessPendingTopicPlacementsConfig, ProcessPendingTopicPlacementsOperation,
+};
 use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_tasks::TaskHandle;
@@ -67,6 +70,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         storage_handle.clone(),
     )
     .await?;
+    if let Err(error) = net_handle.refresh_realm_peers_from_persisted_config().await {
+        warn!(error = %error, "Failed to refresh realm peers from persisted config during startup");
+    }
     let task_handle = TaskHandle::new();
     let metadata_handle = MetadataHandle::new(
         &config.metadata_storage_path,
@@ -161,6 +167,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     OnboardingPhase::CoreDocumentsFetched,
                 )
                 .await?;
+                if let Err(error) = net_handle.refresh_realm_peers_from_persisted_config().await {
+                    warn!(error = %error, "Failed to refresh realm peers after onboarding document fetch");
+                }
             }
             announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
             mark_node_state_complete(&driver_ctx.storage_handle, &config.node_state).await?;
@@ -195,6 +204,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             announce_core_documents(driver_ctx.as_ref(), config.node_id, &config.realm_id).await?;
         }
     }
+
+    drive(
+        ProcessPendingTopicPlacementsOperation::new(ProcessPendingTopicPlacementsConfig {
+            realm_id: config.realm_id,
+            local_node_id: config.node_id,
+        }),
+        driver_ctx.as_ref(),
+    )
+    .await?;
 
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
