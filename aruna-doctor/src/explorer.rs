@@ -3,15 +3,19 @@ use aruna::config::PersistedNodeState;
 use aruna_api::server_state::{
     INITIAL_REALM_ADMIN_CLAIMED_KEY, TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY,
 };
+use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-    BLOB_VERSIONS_KEYSPACE, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE, CRAQLE_QUADS_KEYSPACE,
-    CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-    IROKLE_APPLIED_OPS_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_KEYSPACE,
+    CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, DHT_KEYSPACE, GROUP_KEYSPACE,
+    HASH_PATHS_INDEX_KEYSPACE, IROKLE_APPLIED_OPS_KEYSPACE, METADATA_AUDIT_KEYSPACE,
+    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+    USER_ACCESS_KEYSPACE,
 };
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::{
@@ -49,6 +53,8 @@ pub enum ExplorerError {
     Fjall(#[from] fjall::Error),
     #[error("keyspace not found: {0}")]
     KeyspaceNotFound(String),
+    #[error("decode failed: {0}")]
+    Decode(String),
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -68,6 +74,39 @@ struct EntriesOutput {
     database_path: String,
     keyspace: String,
     entries: Vec<EntryOutput>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TopicsListOutput {
+    database_path: String,
+    topics: Vec<TopicListEntry>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TopicListEntry {
+    topic_id: String,
+    target: JsonDocumentSyncTarget,
+    status: &'static str,
+    desired_peer_count: usize,
+    selected_peer_count: usize,
+    missing_peer_count: usize,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TopicStatusOutput {
+    database_path: String,
+    topic_id: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_placement: Option<JsonPendingTopicPlacement>,
+}
+
+#[derive(Debug, Serialize, PartialEq)]
+struct TopicPlacementsOutput {
+    database_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topic_id: Option<String>,
+    placements: Vec<JsonPendingTopicPlacement>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -169,6 +208,9 @@ enum DecodedValue {
     },
     NodeState {
         data: JsonPersistedNodeState,
+    },
+    PendingTopicPlacement {
+        data: JsonPendingTopicPlacement,
     },
     OnboardingSecretRecord {
         data: OnboardingSecretRecord,
@@ -461,6 +503,88 @@ impl Serialize for JsonPersistedNodeState {
         state.serialize_field("onboarding_sync_ticket", &self.0.onboarding_sync_ticket)?;
         state.serialize_field("identity", &self.0.identity)?;
         state.end()
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct JsonPendingTopicPlacement(PendingTopicPlacement);
+
+impl Serialize for JsonPendingTopicPlacement {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("PendingTopicPlacement", 6)?;
+        state.serialize_field("target", &json_document_sync_target(&self.0.target))?;
+        state.serialize_field("topic_id", &self.0.topic_id)?;
+        state.serialize_field("desired_peer_count", &self.0.desired_peer_count)?;
+        state.serialize_field(
+            "selected_peers",
+            &self
+                .0
+                .selected_peers
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>(),
+        )?;
+        state.serialize_field("missing_peer_count", &self.0.missing_peer_count)?;
+        state.serialize_field("updated_at", &self.0.updated_at)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+enum JsonDocumentSyncTarget {
+    Group {
+        group_id: String,
+    },
+    GroupAuthorization {
+        group_id: String,
+    },
+    RealmAuthorization {
+        realm_id: String,
+    },
+    RealmConfig {
+        realm_id: String,
+    },
+    User {
+        user_id: String,
+    },
+    MetadataRegistry {
+        group_id: String,
+        document_id: String,
+    },
+}
+
+fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTarget {
+    match target {
+        DocumentSyncTarget::Group { group_id } => JsonDocumentSyncTarget::Group {
+            group_id: group_id.to_string(),
+        },
+        DocumentSyncTarget::GroupAuthorization { group_id } => {
+            JsonDocumentSyncTarget::GroupAuthorization {
+                group_id: group_id.to_string(),
+            }
+        }
+        DocumentSyncTarget::RealmAuthorization { realm_id } => {
+            JsonDocumentSyncTarget::RealmAuthorization {
+                realm_id: realm_id.to_string(),
+            }
+        }
+        DocumentSyncTarget::RealmConfig { realm_id } => JsonDocumentSyncTarget::RealmConfig {
+            realm_id: realm_id.to_string(),
+        },
+        DocumentSyncTarget::User { user_id } => JsonDocumentSyncTarget::User {
+            user_id: user_id.to_string(),
+        },
+        DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        } => JsonDocumentSyncTarget::MetadataRegistry {
+            group_id: group_id.to_string(),
+            document_id: document_id.to_string(),
+        },
     }
 }
 
@@ -802,6 +926,51 @@ pub async fn explore_entries(database_path: String, keyspace: String) -> Result<
     Ok(())
 }
 
+pub async fn print_node_state(database_path: String) -> Result<(), CliError> {
+    explore_entries(database_path, NODE_STATE_KEYSPACE.to_string()).await
+}
+
+pub async fn print_topics_list(database_path: String) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        move || topics_list_output(&database_path)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+pub async fn print_topic_status(database_path: String, topic_id: String) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        let topic_id = topic_id.clone();
+        move || topic_status_output(&database_path, &topic_id)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+pub async fn print_topic_placements(
+    database_path: String,
+    topic_id: Option<String>,
+) -> Result<(), CliError> {
+    let output = tokio::task::spawn_blocking({
+        let database_path = database_path.clone();
+        let topic_id = topic_id.clone();
+        move || topic_placements_output(&database_path, topic_id.as_deref())
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
 fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError> {
     let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
     let mut keyspaces = db.list_keyspace_names();
@@ -831,13 +1000,14 @@ fn list_keyspaces(database_path: &str) -> Result<KeyspacesOutput, ExplorerError>
     })
 }
 
-fn defined_keyspaces() -> [&'static str; 23] {
+fn defined_keyspaces() -> [&'static str; 31] {
     [
         API_STATE_KEYSPACE,
         AUTH_KEYSPACE,
         BLOB_HEAD_KEYSPACE,
         BLOB_LOCATIONS_KEYSPACE,
         BLOB_VERSIONS_KEYSPACE,
+        BUCKET_STATS_DB,
         CRAQLE_GRAPHS_KEYSPACE,
         CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE,
@@ -846,6 +1016,10 @@ fn defined_keyspaces() -> [&'static str; 23] {
         GROUP_KEYSPACE,
         HASH_PATHS_INDEX_KEYSPACE,
         IROKLE_APPLIED_OPS_KEYSPACE,
+        METADATA_AUDIT_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_HOLDERS_KEYSPACE,
+        METADATA_INDEX_KEYSPACE,
         NODE_STATE_KEYSPACE,
         ONBOARDING_KEYSPACE,
         REALM_CONFIG_KEYSPACE,
@@ -855,6 +1029,9 @@ fn defined_keyspaces() -> [&'static str; 23] {
         S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
         S3_MULTIPART_UPLOAD_KEYSPACE,
         S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+        SOURCE_CONNECTOR_INDEX_KEYSPACE,
+        SOURCE_CONNECTOR_SECRET_KEYSPACE,
+        SYNC_PLACEMENT_KEYSPACE,
         USER_ACCESS_KEYSPACE,
     ]
 }
@@ -883,6 +1060,93 @@ fn list_entries(database_path: &str, keyspace_name: &str) -> Result<EntriesOutpu
         keyspace: keyspace_name.to_string(),
         entries,
     })
+}
+
+fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerError> {
+    let mut topics = load_pending_placements(database_path)?
+        .into_iter()
+        .map(|placement| TopicListEntry {
+            topic_id: placement.topic_id,
+            target: json_document_sync_target(&placement.target),
+            status: "under_replicated",
+            desired_peer_count: placement.desired_peer_count,
+            selected_peer_count: placement.selected_peers.len(),
+            missing_peer_count: placement.missing_peer_count,
+        })
+        .collect::<Vec<_>>();
+    topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
+
+    Ok(TopicsListOutput {
+        database_path: database_path.to_string(),
+        topics,
+    })
+}
+
+fn topic_status_output(
+    database_path: &str,
+    topic_id: &str,
+) -> Result<TopicStatusOutput, ExplorerError> {
+    let pending_placement = load_pending_placements(database_path)?
+        .into_iter()
+        .find(|placement| placement.topic_id == topic_id)
+        .map(JsonPendingTopicPlacement);
+    let status = if pending_placement.is_some() {
+        "under_replicated"
+    } else {
+        "not_pending"
+    };
+
+    Ok(TopicStatusOutput {
+        database_path: database_path.to_string(),
+        topic_id: topic_id.to_string(),
+        status,
+        pending_placement,
+    })
+}
+
+fn topic_placements_output(
+    database_path: &str,
+    topic_id: Option<&str>,
+) -> Result<TopicPlacementsOutput, ExplorerError> {
+    let mut placements = load_pending_placements(database_path)?;
+    if let Some(topic_id) = topic_id {
+        placements.retain(|placement| placement.topic_id == topic_id);
+    }
+    placements.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
+
+    Ok(TopicPlacementsOutput {
+        database_path: database_path.to_string(),
+        topic_id: topic_id.map(str::to_string),
+        placements: placements
+            .into_iter()
+            .map(JsonPendingTopicPlacement)
+            .collect(),
+    })
+}
+
+fn load_pending_placements(
+    database_path: &str,
+) -> Result<Vec<PendingTopicPlacement>, ExplorerError> {
+    let db = OptimisticTxDatabase::builder(Path::new(database_path)).open()?;
+    let keyspace_names = db.list_keyspace_names();
+    if !keyspace_names
+        .iter()
+        .any(|name| name.as_ref() == SYNC_PLACEMENT_KEYSPACE)
+    {
+        return Ok(Vec::new());
+    }
+
+    let keyspace = db.keyspace(SYNC_PLACEMENT_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let snapshot = db.read_tx();
+    let mut placements = Vec::new();
+    for entry in snapshot.iter(&keyspace) {
+        let (_, value) = entry.into_inner()?;
+        placements.push(
+            aruna_operations::sync_placement::decode_pending_placement(value.as_ref())
+                .map_err(|error| ExplorerError::Decode(error.to_string()))?,
+        );
+    }
+    Ok(placements)
 }
 
 fn decode_entry(keyspace_name: &str, key: &[u8], value: &[u8]) -> EntryOutput {
@@ -922,7 +1186,8 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | API_STATE_KEYSPACE
         | IROKLE_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
-        | ONBOARDING_KEYSPACE => decode_utf8_key(key),
+        | ONBOARDING_KEYSPACE
+        | SYNC_PLACEMENT_KEYSPACE => decode_utf8_key(key),
         S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
         S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartUploadPartKey::from_bytes(key)
             .map(|value| DecodedField::MultipartUploadPartKey { value })
@@ -1002,6 +1267,13 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
             |bytes| postcard::from_bytes::<PersistedNodeState>(bytes),
             |data| DecodedValue::NodeState {
                 data: JsonPersistedNodeState(data),
+            },
+        ),
+        SYNC_PLACEMENT_KEYSPACE => decode_value_with(
+            value,
+            aruna_operations::sync_placement::decode_pending_placement,
+            |data| DecodedValue::PendingTopicPlacement {
+                data: JsonPendingTopicPlacement(data),
             },
         ),
         ONBOARDING_KEYSPACE => decode_value_with(
@@ -1169,14 +1441,18 @@ mod tests {
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
     };
+    use aruna_core::document::DocumentSyncTarget;
     use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE,
-        BLOB_VERSIONS_KEYSPACE, DHT_KEYSPACE, GROUP_KEYSPACE, HASH_PATHS_INDEX_KEYSPACE,
-        IROKLE_APPLIED_OPS_KEYSPACE, NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE,
-        REALM_CONFIG_KEYSPACE, REALM_KEYSPACE, S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE,
-        S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-        S3_MULTIPART_UPLOAD_PART_KEYSPACE, USER_ACCESS_KEYSPACE,
+        BLOB_VERSIONS_KEYSPACE, BUCKET_STATS_DB, DHT_KEYSPACE, GROUP_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE, IROKLE_APPLIED_OPS_KEYSPACE, METADATA_AUDIT_KEYSPACE,
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        NODE_STATE_KEYSPACE, ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE, REALM_KEYSPACE,
+        S3_BUCKET_KEYSPACE, S3_BUCKET_REPLICATION_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+        S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+        SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE, SYNC_PLACEMENT_KEYSPACE,
+        USER_ACCESS_KEYSPACE,
     };
     use aruna_core::onboarding::{OnboardingMode, OnboardingSecretRecord};
     use aruna_core::structs::{
@@ -1236,6 +1512,7 @@ mod tests {
             BLOB_HEAD_KEYSPACE.to_string(),
             BLOB_LOCATIONS_KEYSPACE.to_string(),
             BLOB_VERSIONS_KEYSPACE.to_string(),
+            BUCKET_STATS_DB.to_string(),
             CRAQLE_GRAPHS_KEYSPACE.to_string(),
             CRAQLE_LOG_KEYSPACE.to_string(),
             CRAQLE_QUADS_KEYSPACE.to_string(),
@@ -1243,6 +1520,10 @@ mod tests {
             DHT_KEYSPACE.to_string(),
             HASH_PATHS_INDEX_KEYSPACE.to_string(),
             IROKLE_APPLIED_OPS_KEYSPACE.to_string(),
+            METADATA_AUDIT_KEYSPACE.to_string(),
+            METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+            METADATA_HOLDERS_KEYSPACE.to_string(),
+            METADATA_INDEX_KEYSPACE.to_string(),
             NODE_STATE_KEYSPACE.to_string(),
             ONBOARDING_KEYSPACE.to_string(),
             REALM_CONFIG_KEYSPACE.to_string(),
@@ -1252,6 +1533,9 @@ mod tests {
             S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
             S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
+            SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
+            SOURCE_CONNECTOR_SECRET_KEYSPACE.to_string(),
+            SYNC_PLACEMENT_KEYSPACE.to_string(),
             USER_ACCESS_KEYSPACE.to_string(),
         ];
         expected_missing.sort();
@@ -1444,6 +1728,41 @@ mod tests {
         match decoded.value {
             DecodedValue::NodeState { data } => assert_eq!(data.0, state),
             other => panic!("expected node state, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_pending_topic_placement_value() {
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: RealmId::from_bytes([4_u8; 32]),
+        };
+        let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
+        let placement = aruna_operations::sync_placement::pending_placement_record(
+            target.clone(),
+            3,
+            vec![selected_peer],
+        );
+        let value = postcard::to_allocvec(&placement).unwrap();
+
+        let decoded = decode_entry(
+            SYNC_PLACEMENT_KEYSPACE,
+            placement.topic_id.as_bytes(),
+            &value,
+        );
+        assert_eq!(
+            decoded.key,
+            DecodedField::Utf8 {
+                value: placement.topic_id.clone()
+            }
+        );
+        match decoded.value {
+            DecodedValue::PendingTopicPlacement { data } => {
+                assert_eq!(data.0.target, target);
+                assert_eq!(data.0.desired_peer_count, 3);
+                assert_eq!(data.0.selected_peers, vec![selected_peer]);
+                assert_eq!(data.0.missing_peer_count, 2);
+            }
+            other => panic!("expected pending topic placement, got {other:?}"),
         }
     }
 
