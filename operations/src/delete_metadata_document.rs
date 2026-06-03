@@ -2,17 +2,20 @@ use aruna_core::IrokleEffect;
 use aruna_core::document::{DocumentSyncTarget, IrokleEvent};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
-use aruna_core::metadata::{MetadataEffect, MetadataError, MetadataEvent};
+use aruna_core::metadata::{
+    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphLifecycleRecord,
+};
 use aruna_core::operation::Operation;
 use aruna_core::structs::{MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::metadata::repository::{
     StorageReadError, delete_document_index_effect, delete_holders_effect, delete_registry_effect,
-    parse_registry_read, read_registry_effect, write_audit_effect,
+    parse_registry_read, read_registry_effect, write_audit_effect, write_graph_lifecycle_effect,
 };
 
 #[derive(Debug, PartialEq)]
@@ -21,6 +24,7 @@ pub struct DeleteMetadataDocumentOperation {
     group_id: Ulid,
     document_id: Ulid,
     record: Option<MetadataRegistryRecord>,
+    lifecycle_record: Option<MetadataGraphLifecycleRecord>,
     txn_id: Option<Ulid>,
     state: DeleteMetadataDocumentState,
     output: Option<Result<(), DeleteMetadataDocumentError>>,
@@ -30,13 +34,15 @@ pub struct DeleteMetadataDocumentOperation {
 enum DeleteMetadataDocumentState {
     Init,
     ReadRecord,
-    DeleteGraph,
     StartTransaction,
+    WriteGraphLifecycle,
     DeleteRegistry,
     DeleteDocumentIndex,
     DeleteHolders,
     WriteAudit,
     CommitTransaction,
+    PruneGraph,
+    SyncGraphLifecycleDelete,
     SyncDelete,
     Finish,
     Error,
@@ -71,6 +77,7 @@ impl DeleteMetadataDocumentOperation {
             group_id,
             document_id,
             record: None,
+            lifecycle_record: None,
             txn_id: None,
             state: DeleteMetadataDocumentState::Init,
             output: None,
@@ -90,6 +97,49 @@ impl DeleteMetadataDocumentOperation {
                 .unwrap_or_default(),
             details: Some("delete metadata graph".to_string()),
         }
+    }
+
+    fn lifecycle_record(&self, record: &MetadataRegistryRecord) -> MetadataGraphLifecycleRecord {
+        MetadataGraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default(),
+        )
+    }
+
+    fn graph_lifecycle_sync_effect(&self, record: &MetadataRegistryRecord) -> Effects {
+        let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
+            return smallvec![];
+        };
+        match postcard::to_allocvec(lifecycle_record) {
+            Ok(bytes) => smallvec![Effect::Net(NetEffect::Irokle(
+                IrokleEffect::PublishDocument {
+                    target: DocumentSyncTarget::MetadataGraphLifecycle {
+                        graph_iri: lifecycle_record.graph_iri.clone(),
+                    },
+                    bytes,
+                    peers: record.holder_node_ids.clone(),
+                },
+            ))],
+            Err(error) => {
+                warn!(error = %error, "Failed to serialize metadata graph tombstone; continuing with registry delete sync");
+                smallvec![]
+            }
+        }
+    }
+
+    fn registry_delete_sync_effect(&self, record: &MetadataRegistryRecord) -> Effects {
+        smallvec![Effect::Net(NetEffect::Irokle(
+            IrokleEffect::DeleteDocument {
+                target: DocumentSyncTarget::MetadataRegistry {
+                    group_id: record.group_id,
+                    document_id: record.document_id,
+                },
+                peers: record.holder_node_ids.clone(),
+            }
+        ))]
     }
 
     fn fail(&mut self, error: DeleteMetadataDocumentError) -> Effects {
@@ -122,28 +172,39 @@ impl Operation for DeleteMetadataDocumentOperation {
         match self.state {
             DeleteMetadataDocumentState::ReadRecord => match parse_registry_read(event) {
                 Ok(Some(record)) => {
-                    let graph_iri = record.graph_iri.clone();
+                    self.lifecycle_record = Some(self.lifecycle_record(&record));
                     self.record = Some(record);
-                    self.state = DeleteMetadataDocumentState::DeleteGraph;
-                    smallvec![Effect::Metadata(MetadataEffect::DeleteGraph { graph_iri })]
-                }
-                Ok(None) => self.fail(DeleteMetadataDocumentError::DocumentNotFound),
-                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
-                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
-            },
-            DeleteMetadataDocumentState::DeleteGraph => match event {
-                Event::Metadata(MetadataEvent::GraphDeleted { .. }) => {
                     self.state = DeleteMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
                         read: false
                     })]
                 }
-                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-                other => self.unexpected_event("metadata delete result", format!("{other:?}")),
+                Ok(None) => self.fail(DeleteMetadataDocumentError::DocumentNotFound),
+                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
+                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
             },
             DeleteMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
                     self.txn_id = Some(txn_id);
+                    let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::WriteGraphLifecycle;
+                    match write_graph_lifecycle_effect(lifecycle_record, Some(txn_id)) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => {
+                            self.fail(DeleteMetadataDocumentError::ConversionError(error))
+                        }
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::WriteGraphLifecycle => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
                     self.state = DeleteMetadataDocumentState::DeleteRegistry;
                     smallvec![delete_registry_effect(
                         self.group_id,
@@ -152,7 +213,9 @@ impl Operation for DeleteMetadataDocumentOperation {
                     )]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
+                other => {
+                    self.unexpected_event("graph lifecycle write result", format!("{other:?}"))
+                }
             },
             DeleteMetadataDocumentState::DeleteRegistry => match event {
                 Event::Storage(StorageEvent::DeleteResult { .. }) => {
@@ -219,22 +282,72 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(record) = self.record.clone() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
-                    self.state = DeleteMetadataDocumentState::SyncDelete;
-                    smallvec![Effect::Net(NetEffect::Irokle(
-                        IrokleEffect::DeleteDocument {
-                            target: DocumentSyncTarget::MetadataRegistry {
-                                group_id: record.group_id,
-                                document_id: record.document_id,
-                            },
-                            peers: record.holder_node_ids,
-                        }
-                    ))]
+                    self.state = DeleteMetadataDocumentState::PruneGraph;
+                    smallvec![Effect::Metadata(MetadataEffect::DeleteGraph {
+                        graph_iri: record.graph_iri,
+                    })]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {
                     self.txn_id = None;
                     self.fail(error.into())
                 }
                 other => self.unexpected_event("transaction commit result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::PruneGraph => match event {
+                Event::Metadata(MetadataEvent::GraphDeleted { .. }) => {
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::SyncGraphLifecycleDelete;
+                    let effects = self.graph_lifecycle_sync_effect(record);
+                    if effects.is_empty() {
+                        self.state = DeleteMetadataDocumentState::SyncDelete;
+                        self.registry_delete_sync_effect(record)
+                    } else {
+                        effects
+                    }
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    warn!(error = ?error, "Failed to prune local metadata graph; tombstone remains committed");
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::SyncGraphLifecycleDelete;
+                    let effects = self.graph_lifecycle_sync_effect(record);
+                    if effects.is_empty() {
+                        self.state = DeleteMetadataDocumentState::SyncDelete;
+                        self.registry_delete_sync_effect(record)
+                    } else {
+                        effects
+                    }
+                }
+                other => self.unexpected_event("metadata graph prune result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::SyncGraphLifecycleDelete => match event {
+                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { .. })) => {
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::SyncDelete;
+                    self.registry_delete_sync_effect(record)
+                }
+                Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
+                    warn!(error = %error, "Failed to sync metadata graph tombstone; delete remains committed");
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::SyncDelete;
+                    self.registry_delete_sync_effect(record)
+                }
+                Event::Net(NetEvent::Error(error)) => {
+                    warn!(error = ?error, "Failed to sync metadata graph tombstone; delete remains committed");
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::SyncDelete;
+                    self.registry_delete_sync_effect(record)
+                }
+                other => self.unexpected_event("graph lifecycle sync result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::SyncDelete => match event {
                 Event::Net(NetEvent::Irokle(IrokleEvent::DocumentDeleted { .. })) => {
@@ -243,11 +356,17 @@ impl Operation for DeleteMetadataDocumentOperation {
                     smallvec![]
                 }
                 Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
-                    self.fail(DeleteMetadataDocumentError::SyncDelete(error))
+                    warn!(error = %error, "Failed to sync metadata registry delete; delete remains committed");
+                    self.state = DeleteMetadataDocumentState::Finish;
+                    self.output = Some(Ok(()));
+                    smallvec![]
                 }
-                Event::Net(NetEvent::Error(error)) => self.fail(
-                    DeleteMetadataDocumentError::SyncDelete(format!("{error:?}")),
-                ),
+                Event::Net(NetEvent::Error(error)) => {
+                    warn!(error = ?error, "Failed to sync metadata registry delete; delete remains committed");
+                    self.state = DeleteMetadataDocumentState::Finish;
+                    self.output = Some(Ok(()));
+                    smallvec![]
+                }
                 other => self.unexpected_event("document delete sync result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::Finish

@@ -1,6 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::driver::{DriverContext, drive};
+use crate::metadata::MetadataHandle;
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
@@ -11,7 +13,12 @@ use aruna_core::id::NodeId;
 use aruna_net::InboundEventHandler;
 use aruna_net::streams::BiStream;
 use async_trait::async_trait;
+use tokio::time::sleep;
 use tracing::{Instrument, debug, error, info_span, trace, warn};
+
+const METADATA_IROKLE_MAINTENANCE_ATTEMPTS: usize = 3;
+const METADATA_IROKLE_MAINTENANCE_RETRY_AFTER: Duration = Duration::from_millis(500);
+const METADATA_IROKLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -29,8 +36,12 @@ pub fn initialize_net_incoming(context: Arc<DriverContext>) {
         warn!("Cannot initialize inbound handling without net handle");
         return;
     };
+    let metadata_handle = context.metadata_handle.clone();
 
     net_handle.set_inbound_handler(Arc::new(OperationsInboundHandler::new(context)));
+    if let Some(metadata_handle) = metadata_handle {
+        schedule_periodic_metadata_irokle_maintenance(metadata_handle);
+    }
 }
 
 #[async_trait]
@@ -127,16 +138,9 @@ impl InboundEventHandler for OperationsInboundHandler {
                                 }
                             }
                             if let Some(metadata_handle) = self.context.metadata_handle.as_ref() {
-                                if let Err(error) = metadata_handle.reconcile_irokle().await {
-                                    error!(error = ?error, "Failed to reconcile Craqle Irokle events");
-                                }
-                                match metadata_handle.prune_unregistered_aruna_graphs().await {
-                                    Ok(pruned) if pruned > 0 => {
-                                        debug!(pruned, "Pruned unregistered metadata graphs")
-                                    }
-                                    Ok(_) => {}
-                                    Err(error) => error!(error = ?error, "Failed to prune unregistered metadata graphs"),
-                                }
+                                run_metadata_irokle_maintenance(metadata_handle, "inbound", 0)
+                                    .await;
+                                schedule_metadata_irokle_maintenance(metadata_handle.clone());
                             }
                         }
                         Err(err) => error!(error = ?err, "Failed to process inbound irokle stream"),
@@ -161,5 +165,52 @@ impl InboundEventHandler for OperationsInboundHandler {
         }
         .instrument(span)
         .await;
+    }
+}
+
+fn schedule_periodic_metadata_irokle_maintenance(metadata_handle: MetadataHandle) {
+    tokio::spawn(async move {
+        let mut cycle = 0usize;
+        loop {
+            sleep(METADATA_IROKLE_MAINTENANCE_INTERVAL).await;
+            cycle = cycle.saturating_add(1);
+            run_metadata_irokle_maintenance(&metadata_handle, "periodic", cycle).await;
+        }
+    });
+}
+
+fn schedule_metadata_irokle_maintenance(metadata_handle: MetadataHandle) {
+    tokio::spawn(async move {
+        for attempt in 1..=METADATA_IROKLE_MAINTENANCE_ATTEMPTS {
+            sleep(METADATA_IROKLE_MAINTENANCE_RETRY_AFTER).await;
+            run_metadata_irokle_maintenance(&metadata_handle, "delayed", attempt).await;
+        }
+    });
+}
+
+async fn run_metadata_irokle_maintenance(
+    metadata_handle: &MetadataHandle,
+    source: &'static str,
+    attempt: usize,
+) {
+    if let Err(error) = metadata_handle.reconcile_irokle().await {
+        warn!(
+            source,
+            attempt,
+            error = ?error,
+            "Craqle Irokle reconciliation failed"
+        );
+    }
+    match metadata_handle.prune_deleted_graphs().await {
+        Ok(pruned) if pruned > 0 => {
+            debug!(source, attempt, pruned, "Metadata graph prune completed")
+        }
+        Ok(_) => {}
+        Err(error) => warn!(
+            source,
+            attempt,
+            error = ?error,
+            "Metadata graph prune failed"
+        ),
     }
 }

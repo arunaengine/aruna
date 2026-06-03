@@ -8,18 +8,18 @@ use aruna_core::alpn::Alpn;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_DOCUMENT_INDEX_KEYSPACE;
+use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
-    MetadataEvent, MetadataGraphPolicy, MetadataQuadOp, MetadataQueryResults, MetadataRoCratePage,
-    MetadataSearchHit, MetadataUpsertEntityRequest,
+    MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataQuadOp,
+    MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit, MetadataUpsertEntityRequest,
 };
+use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
-use byteview::ByteView;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleIrokleOptions, CraqleNode,
     CraqleOptions, CreateCrateRequest, CreateEntityRequest, GraphId, GraphPolicy, QueryResults,
@@ -27,8 +27,8 @@ use craqle::{
 };
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
-use tokio::time::timeout;
-use ulid::Ulid;
+use tokio::time::{sleep, timeout};
+use tracing::warn;
 
 use super::protocol::{MetadataTransportMessage, read_message, write_message};
 use super::repository::{iter_all_registry_effect, parse_registry_iter};
@@ -36,6 +36,8 @@ use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation
 use crate::driver::{DriverContext, drive};
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
+const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
+const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub struct MetadataHandle {
@@ -81,7 +83,45 @@ impl MetadataHandle {
 
     pub async fn send_metadata_effect(&self, effect: MetadataEffect) -> Event {
         let graph_iri = effect_graph_iri(&effect);
+        if let Some(graph_iri) = graph_iri.as_deref() {
+            match graph_lifecycle_record(self.inner.storage_handle.clone(), graph_iri).await {
+                Ok(Some(record)) if record.is_deleted() => match &effect {
+                    MetadataEffect::DeleteGraph { .. } => {}
+                    MetadataEffect::SyncGraphBestEffort { graph_iri, peers } => {
+                        return Event::Metadata(MetadataEvent::GraphSyncScheduled {
+                            graph_iri: graph_iri.clone(),
+                            peers: peers.clone(),
+                        });
+                    }
+                    MetadataEffect::ContainsGraph { graph_iri } => {
+                        return Event::Metadata(MetadataEvent::ContainsGraphResult {
+                            graph_iri: graph_iri.clone(),
+                            exists: false,
+                        });
+                    }
+                    _ if effect_rejects_deleted_graph(&effect) => {
+                        return Event::Metadata(MetadataEvent::Error {
+                            graph_iri: Some(graph_iri.to_string()),
+                            error: MetadataError::InvalidInput(format!(
+                                "metadata graph `{graph_iri}` is deleted"
+                            )),
+                        });
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(error) => {
+                    return Event::Metadata(MetadataEvent::Error {
+                        graph_iri: Some(graph_iri.to_string()),
+                        error,
+                    });
+                }
+            }
+        }
         match effect {
+            MetadataEffect::SyncGraphBestEffort { graph_iri, peers } => {
+                Event::Metadata(self.schedule_graph_sync_best_effort(graph_iri, peers))
+            }
             MetadataEffect::QueryGraphs {
                 auth_context,
                 graph_iris,
@@ -130,13 +170,15 @@ impl MetadataHandle {
 
     pub async fn reconcile_irokle(&self) -> Result<usize, MetadataError> {
         let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
+        let applied = tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
             .await
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        self.prune_deleted_graphs().await?;
+        Ok(applied)
     }
 
-    pub async fn prune_unregistered_aruna_graphs(&self) -> Result<usize, MetadataError> {
+    pub async fn prune_deleted_graphs(&self) -> Result<usize, MetadataError> {
         let inner = self.inner.clone();
         let graphs = tokio::task::spawn_blocking(move || inner.node.graphs())
             .await
@@ -145,47 +187,69 @@ impl MetadataHandle {
         let mut pruned = 0usize;
         for graph in graphs {
             let graph_iri = graph.as_str().to_string();
-            let Some(document_id) = document_id_from_aruna_graph_iri(&graph_iri) else {
+            let Some(record) =
+                graph_lifecycle_record(self.inner.storage_handle.clone(), &graph_iri).await?
+            else {
                 continue;
             };
-            if self.registry_document_exists(document_id).await? {
+            if !record.is_deleted() {
                 continue;
             }
-            match self
-                .send_metadata_effect(MetadataEffect::DeleteGraph { graph_iri })
-                .await
-            {
-                Event::Metadata(MetadataEvent::GraphDeleted { .. }) => pruned += 1,
-                Event::Metadata(MetadataEvent::Error { error, .. }) => return Err(error),
-                other => {
-                    return Err(MetadataError::Backend(format!(
-                        "unexpected metadata graph prune result: {other:?}"
-                    )));
-                }
-            }
+            delete_local_graph(self.inner.node.clone(), graph_iri).await?;
+            pruned += 1;
         }
         Ok(pruned)
     }
 
-    async fn registry_document_exists(&self, document_id: Ulid) -> Result<bool, MetadataError> {
-        match self
-            .inner
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
-                key: ByteView::from(document_id.to_bytes().to_vec()),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-            Event::Storage(StorageEvent::Error { error }) => {
-                Err(MetadataError::Backend(error.to_string()))
-            }
-            other => Err(MetadataError::Backend(format!(
-                "unexpected metadata registry read result: {other:?}"
-            ))),
+    fn schedule_graph_sync_best_effort(
+        &self,
+        graph_iri: String,
+        mut peers: Vec<NodeId>,
+    ) -> MetadataEvent {
+        if let Some(net_handle) = self.inner.net_handle.as_ref() {
+            peers.retain(|peer| *peer != net_handle.node_id());
         }
+        peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        peers.dedup();
+        if peers.is_empty() {
+            return MetadataEvent::GraphSyncScheduled { graph_iri, peers };
+        }
+
+        let inner = self.inner.clone();
+        let graph_iri_for_task = graph_iri.clone();
+        let peers_for_task = peers.clone();
+        tokio::spawn(async move {
+            for attempt in 1..=METADATA_GRAPH_SYNC_ATTEMPTS {
+                match sync_graph_once(
+                    inner.clone(),
+                    graph_iri_for_task.clone(),
+                    peers_for_task.clone(),
+                )
+                .await
+                {
+                    Ok(()) => return,
+                    Err(error) => {
+                        warn!(
+                            graph_iri = %graph_iri_for_task,
+                            attempt,
+                            attempts = METADATA_GRAPH_SYNC_ATTEMPTS,
+                            error = ?error,
+                            "Metadata graph sync attempt failed"
+                        );
+                        if attempt < METADATA_GRAPH_SYNC_ATTEMPTS {
+                            sleep(METADATA_GRAPH_SYNC_RETRY_AFTER).await;
+                        }
+                    }
+                }
+            }
+            warn!(
+                graph_iri = %graph_iri_for_task,
+                peer_count = peers_for_task.len(),
+                "Metadata graph sync retries exhausted"
+            );
+        });
+
+        MetadataEvent::GraphSyncScheduled { graph_iri, peers }
     }
 
     pub async fn handle_inbound_stream(
@@ -318,6 +382,66 @@ impl MetadataHandle {
     }
 }
 
+async fn graph_lifecycle_record(
+    storage_handle: StorageHandle,
+    graph_iri: &str,
+) -> Result<Option<MetadataGraphLifecycleRecord>, MetadataError> {
+    match storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key: metadata_graph_lifecycle_key(graph_iri),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| {
+                postcard::from_bytes(&bytes)
+                    .map_err(|error| MetadataError::Backend(error.to_string()))
+            })
+            .transpose(),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(MetadataError::Backend(error.to_string()))
+        }
+        other => Err(MetadataError::Backend(format!(
+            "unexpected metadata graph lifecycle read result: {other:?}"
+        ))),
+    }
+}
+
+async fn metadata_graph_deleted(
+    storage_handle: StorageHandle,
+    graph_iri: &str,
+) -> Result<bool, MetadataError> {
+    Ok(graph_lifecycle_record(storage_handle, graph_iri)
+        .await?
+        .map(|record| record.is_deleted())
+        .unwrap_or(false))
+}
+
+async fn delete_local_graph(node: Arc<CraqleNode>, graph_iri: String) -> Result<(), MetadataError> {
+    tokio::task::spawn_blocking(move || node.delete_graph_unchecked(&GraphId::new(&graph_iri)))
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+        .map_err(metadata_error_from_craqle)
+}
+
+fn effect_rejects_deleted_graph(effect: &MetadataEffect) -> bool {
+    matches!(
+        effect,
+        MetadataEffect::CreateCrate { .. }
+            | MetadataEffect::ApplyRoCrate { .. }
+            | MetadataEffect::UpsertDataEntity { .. }
+            | MetadataEffect::UpsertContextualEntity { .. }
+            | MetadataEffect::SetGraphPolicy { .. }
+            | MetadataEffect::AddGraphPeer { .. }
+            | MetadataEffect::GetGraphPolicy { .. }
+            | MetadataEffect::ExportRoCrate { .. }
+            | MetadataEffect::ExportRoCrateSummary { .. }
+            | MetadataEffect::ExportRoCratePage { .. }
+    )
+}
+
 #[async_trait]
 impl Handle for MetadataHandle {
     async fn send_effect(&self, effect: Effect) -> Event {
@@ -329,6 +453,41 @@ impl Handle for MetadataHandle {
             }),
         }
     }
+}
+
+async fn sync_graph_once(
+    inner: Arc<MetadataInner>,
+    graph_iri: String,
+    peers: Vec<NodeId>,
+) -> Result<(), MetadataError> {
+    if peers.is_empty() {
+        return Ok(());
+    }
+    if metadata_graph_deleted(inner.storage_handle.clone(), &graph_iri).await? {
+        return Ok(());
+    }
+    let net_handle = inner
+        .net_handle
+        .clone()
+        .ok_or(MetadataError::HandleMissing)?;
+    let node = inner.node.clone();
+    let graph_iri_for_blocking = graph_iri.clone();
+    let peers_for_blocking = peers.clone();
+    let topic_id = tokio::task::spawn_blocking(move || {
+        let graph = GraphId::new(&graph_iri_for_blocking);
+        for peer in peers_for_blocking {
+            node.add_irokle_peer(&graph, irokle_peer_id(peer))?;
+        }
+        node.ensure_irokle_topic(&graph)
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    .map_err(metadata_error_from_craqle)?;
+
+    net_handle
+        .sync_irokle_topic_with_peers(topic_id, peers)
+        .await
+        .map_err(|error| MetadataError::Backend(error.to_string()))
 }
 
 fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataEvent {
@@ -401,7 +560,9 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
                 page: metadata_rocrate_page_from_craqle(page),
             })
         }
-        MetadataEffect::SearchGraphs { .. } | MetadataEffect::QueryGraphs { .. } => {
+        MetadataEffect::SearchGraphs { .. }
+        | MetadataEffect::QueryGraphs { .. }
+        | MetadataEffect::SyncGraphBestEffort { .. } => {
             unreachable!("handled asynchronously")
         }
         MetadataEffect::DeleteGraph { graph_iri } => node
@@ -855,6 +1016,7 @@ fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
         | MetadataEffect::UpsertContextualEntity { request } => Some(request.graph_iri.clone()),
         MetadataEffect::SetGraphPolicy { graph_iri, .. }
         | MetadataEffect::AddGraphPeer { graph_iri, .. }
+        | MetadataEffect::SyncGraphBestEffort { graph_iri, .. }
         | MetadataEffect::GetGraphPolicy { graph_iri }
         | MetadataEffect::ExportRoCrate { graph_iri }
         | MetadataEffect::ExportRoCrateSummary { graph_iri }
@@ -898,13 +1060,6 @@ fn craqle_graph_policy(policy: MetadataGraphPolicy) -> GraphPolicy {
 
 fn irokle_peer_id(node_id: NodeId) -> irokle::PeerId {
     irokle::PeerId::from_bytes(*node_id.as_bytes())
-}
-
-fn document_id_from_aruna_graph_iri(graph_iri: &str) -> Option<Ulid> {
-    graph_iri
-        .strip_prefix("https://w3id.org/aruna/")?
-        .parse()
-        .ok()
 }
 
 fn metadata_graph_policy_from_craqle(policy: GraphPolicy) -> MetadataGraphPolicy {
@@ -1109,6 +1264,9 @@ async fn select_authorized_records(
     let allowed_graphs = graph_filter.map(|graphs| graphs.into_iter().collect::<HashSet<_>>());
     let mut visible = Vec::new();
     for record in records {
+        if metadata_graph_deleted(storage_handle.clone(), &record.graph_iri).await? {
+            continue;
+        }
         if let Some(filter) = allowed_graphs.as_ref()
             && !filter.contains(&record.graph_iri)
         {

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,8 +28,6 @@ use aruna_operations::update_metadata_document::{
 };
 use aruna_storage::FjallStorage;
 use aruna_tasks::TaskHandle;
-use craqle::CraqleGraphEvent;
-use irokle::Event as _;
 use tempfile::TempDir;
 use tokio::time::{Instant, sleep};
 use ulid::Ulid;
@@ -385,11 +383,6 @@ async fn wait_for_metadata_state(
         let mut converged = true;
         last_states.clear();
 
-        if let Err(error) = sync_metadata_graphs(nodes).await {
-            last_states.push(format!("metadata graph sync error={error}"));
-            converged = false;
-        }
-
         for node in nodes {
             if !converged {
                 break;
@@ -468,11 +461,6 @@ async fn wait_for_metadata_absence(
         let mut converged = true;
         last_states.clear();
 
-        if let Err(error) = prune_unregistered_metadata_graphs(nodes).await {
-            last_states.push(format!("metadata graph prune error={error}"));
-            converged = false;
-        }
-
         for node in nodes {
             if !converged {
                 break;
@@ -483,7 +471,7 @@ async fn wait_for_metadata_absence(
             )
             .await
             {
-                Err(_) => {
+                Err(error) => {
                     let graph_state = match node
                         .context
                         .metadata_handle
@@ -498,8 +486,10 @@ async fn wait_for_metadata_absence(
                         _ => "graph-present",
                     };
                     if graph_state != "graph-missing" {
-                        last_states
-                            .push(format!("node={} graph still present", node.net.node_id()));
+                        last_states.push(format!(
+                            "node={} error={error:?} graph still present",
+                            node.net.node_id()
+                        ));
                         converged = false;
                         break;
                     }
@@ -524,67 +514,6 @@ async fn wait_for_metadata_absence(
         }
         sleep(Duration::from_millis(50)).await;
     }
-}
-
-async fn sync_metadata_graphs(nodes: &[TestNode]) -> Result<(), Box<dyn std::error::Error>> {
-    for sender in nodes {
-        let topics = craqle_topic_ids(sender)?;
-        if topics.is_empty() {
-            continue;
-        }
-
-        for receiver in nodes {
-            if sender.net.node_id() == receiver.net.node_id() {
-                continue;
-            }
-            for topic_id in &topics {
-                sender
-                    .net
-                    .sync_irokle_topic_with_peers(*topic_id, vec![receiver.net.node_id()])
-                    .await?;
-            }
-        }
-    }
-
-    for node in nodes {
-        node.context
-            .metadata_handle
-            .as_ref()
-            .ok_or("metadata handle missing")?
-            .reconcile_irokle()
-            .await?;
-    }
-
-    Ok(())
-}
-
-fn craqle_topic_ids(node: &TestNode) -> Result<Vec<irokle::TopicId>, Box<dyn std::error::Error>> {
-    let topics = node
-        .net
-        .irokle_node()
-        .list_topics()?
-        .into_iter()
-        .filter(|topic| topic.event_type_id == CraqleGraphEvent::TYPE_ID)
-        .map(|topic| topic.topic_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    Ok(topics)
-}
-
-async fn prune_unregistered_metadata_graphs(
-    nodes: &[TestNode],
-) -> Result<(), Box<dyn std::error::Error>> {
-    for node in nodes {
-        node.context
-            .metadata_handle
-            .as_ref()
-            .ok_or("metadata handle missing")?
-            .prune_unregistered_aruna_graphs()
-            .await?;
-    }
-
-    Ok(())
 }
 
 async fn shutdown_nodes(nodes: Vec<TestNode>) {

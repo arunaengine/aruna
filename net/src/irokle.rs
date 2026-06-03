@@ -7,9 +7,12 @@ use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncEvent, DocumentSyncTarget, IrokleEvent};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    IROKLE_APPLIED_OPS_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+use aruna_core::keyspaces::IROKLE_APPLIED_OPS_KEYSPACE;
+use aruna_core::metadata::MetadataGraphLifecycleRecord;
+use aruna_core::storage_entries::{
+    metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
+    metadata_registry_delete_entries, metadata_registry_write_entries, stale_subject_index_deletes,
+    subject_index_writes,
 };
 use aruna_core::structs::{MetadataRegistryRecord, User};
 use aruna_core::types::Value;
@@ -23,7 +26,7 @@ use irokle_crate::sync::{SyncMessage, SyncRequest};
 use irokle_crate::{EventEnvelope, OpId, PeerId, ReplicationPolicy, TopicGenesis, TopicPayload};
 use parking_lot::RwLock;
 use tokio::task::JoinSet;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 use tracing::{debug, warn};
 
 use crate::error::{NetError, Result};
@@ -32,6 +35,8 @@ use crate::streams::BiStream;
 use ::irokle as irokle_crate;
 
 const IROKLE_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const IROKLE_BACKGROUND_SYNC_ATTEMPTS: usize = 3;
+const IROKLE_BACKGROUND_SYNC_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct IrokleService {
@@ -262,8 +267,38 @@ impl IrokleService {
         oplog
             .create_event_op(topic_id, actor_id, envelope, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        self.sync_topic(topic_id, sync_peers).await?;
+        if let Err(error) = self.sync_topic(topic_id, sync_peers.clone()).await {
+            self.schedule_topic_sync_retry(topic_id, sync_peers);
+            return Err(error);
+        }
         Ok(())
+    }
+
+    fn schedule_topic_sync_retry(&self, topic_id: irokle_crate::TopicId, peers: BTreeSet<PeerId>) {
+        if peers.is_empty() {
+            return;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            for attempt in 1..=IROKLE_BACKGROUND_SYNC_ATTEMPTS {
+                sleep(IROKLE_BACKGROUND_SYNC_RETRY_AFTER).await;
+                match service.sync_topic(topic_id, peers.clone()).await {
+                    Ok(()) => return,
+                    Err(error) => warn!(
+                        %topic_id,
+                        attempt,
+                        attempts = IROKLE_BACKGROUND_SYNC_ATTEMPTS,
+                        error = %error,
+                        "Background Irokle topic sync retry failed"
+                    ),
+                }
+            }
+            warn!(
+                %topic_id,
+                peer_count = peers.len(),
+                "Background Irokle topic sync retries exhausted"
+            );
+        });
     }
 
     fn ensure_topic(
@@ -353,7 +388,8 @@ impl IrokleService {
         topic_id: irokle_crate::TopicId,
         peers: BTreeSet<PeerId>,
     ) -> Result<()> {
-        if peers.is_empty() {
+        let attempted = peers.len();
+        if attempted == 0 {
             return Ok(());
         }
 
@@ -396,12 +432,13 @@ impl IrokleService {
                 }
             }
         }
-        if successes == 0 {
-            return Err(first_error.unwrap_or_else(|| {
-                NetError::Bootstrap(format!(
-                    "failed to sync Irokle topic {topic_id} with any peer"
-                ))
-            }));
+        if successes < attempted {
+            let detail = first_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "unknown sync error".to_string());
+            return Err(NetError::Bootstrap(format!(
+                "synced Irokle topic {topic_id} with {successes}/{attempted} peers; {detail}"
+            )));
         }
         Ok(())
     }
@@ -577,10 +614,31 @@ impl IrokleService {
     }
 
     async fn apply_upsert(&self, target: DocumentSyncTarget, bytes: Vec<u8>) -> Result<()> {
-        if let DocumentSyncTarget::MetadataRegistry { .. } = target {
+        if let DocumentSyncTarget::MetadataRegistry {
+            group_id,
+            document_id,
+        } = target
+        {
             let record: MetadataRegistryRecord = postcard::from_bytes(&bytes)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if record.group_id != group_id || record.document_id != document_id {
+                return Err(NetError::Bootstrap(format!(
+                    "replicated metadata registry target {group_id}/{document_id} does not match payload {}/{}",
+                    record.group_id, record.document_id
+                )));
+            }
             return self.apply_metadata_registry_upsert(record, bytes).await;
+        }
+        if let DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } = target {
+            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if record.graph_iri != graph_iri {
+                return Err(NetError::Bootstrap(format!(
+                    "replicated metadata graph lifecycle target `{graph_iri}` does not match payload graph `{}`",
+                    record.graph_iri
+                )));
+            }
+            return self.apply_metadata_graph_lifecycle(record, bytes).await;
         }
         if let DocumentSyncTarget::User { user_id } = target {
             let user =
@@ -612,36 +670,18 @@ impl IrokleService {
             .transpose()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
 
+        let deletes = stale_subject_index_deletes(previous.as_ref(), Some(&user));
+        if !deletes.is_empty() {
+            self.storage_batch_delete(deletes).await?;
+        }
+
         let mut writes = vec![(
             target.storage_keyspace().to_string(),
             target.storage_key(),
             primary_bytes.into(),
         )];
-        writes.extend(user.subject_ids.iter().map(|subject_id| {
-            (
-                USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                ByteView::from(subject_id.as_bytes().to_vec()),
-                ByteView::from(user.user_id.to_string().into_bytes()),
-            )
-        }));
+        writes.extend(subject_index_writes(&user));
         self.storage_batch_write(writes).await?;
-
-        if let Some(previous) = previous {
-            let deletes = previous
-                .subject_ids
-                .iter()
-                .filter(|subject_id| !user.subject_ids.contains(subject_id))
-                .map(|subject_id| {
-                    (
-                        USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                        ByteView::from(subject_id.as_bytes().to_vec()),
-                    )
-                })
-                .collect::<Vec<_>>();
-            if !deletes.is_empty() {
-                self.storage_batch_delete(deletes).await?;
-            }
-        }
         Ok(())
     }
 
@@ -650,54 +690,67 @@ impl IrokleService {
         record: MetadataRegistryRecord,
         primary_bytes: Vec<u8>,
     ) -> Result<()> {
-        let document_key = ByteView::from(record.document_id.to_bytes().to_vec());
-        let holder_bytes = postcard::to_allocvec(&record.holder_node_ids)
+        if self.metadata_graph_deleted(&record.graph_iri).await? {
+            return self
+                .storage_batch_delete(metadata_registry_delete_entries(
+                    record.group_id,
+                    record.document_id,
+                ))
+                .await;
+        }
+        let mut entries = metadata_registry_write_entries(&record)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        let target = DocumentSyncTarget::MetadataRegistry {
-            group_id: record.group_id,
-            document_id: record.document_id,
+        if let Some((_, _, value)) = entries.first_mut() {
+            *value = primary_bytes.into();
+        }
+        self.storage_batch_write(entries).await
+    }
+
+    async fn apply_metadata_graph_lifecycle(
+        &self,
+        record: MetadataGraphLifecycleRecord,
+        primary_bytes: Vec<u8>,
+    ) -> Result<()> {
+        let (key_space, key, _) = metadata_graph_lifecycle_write_entry(&record)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.storage_write(key_space, key, primary_bytes.into())
+            .await?;
+        if record.is_deleted() {
+            self.storage_batch_delete(metadata_registry_delete_entries(
+                record.group_id,
+                record.document_id,
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn metadata_graph_deleted(&self, graph_iri: &str) -> Result<bool> {
+        let value = self
+            .storage_read(
+                aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                metadata_graph_lifecycle_key(graph_iri),
+            )
+            .await?;
+        let Some(value) = value else {
+            return Ok(false);
         };
-        self.storage_batch_write(vec![
-            (
-                target.storage_keyspace().to_string(),
-                target.storage_key(),
-                primary_bytes.into(),
-            ),
-            (
-                METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
-                document_key,
-                postcard::to_allocvec(&record)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?
-                    .into(),
-            ),
-            (
-                METADATA_HOLDERS_KEYSPACE.to_string(),
-                target.storage_key(),
-                holder_bytes.into(),
-            ),
-        ])
-        .await
+        let record: MetadataGraphLifecycleRecord =
+            postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        Ok(record.is_deleted())
     }
 
     async fn apply_delete(&self, target: DocumentSyncTarget) -> Result<()> {
+        if let DocumentSyncTarget::MetadataGraphLifecycle { .. } = target {
+            return Ok(());
+        }
         if let DocumentSyncTarget::MetadataRegistry {
             group_id,
             document_id,
         } = target
         {
-            let target = DocumentSyncTarget::MetadataRegistry {
-                group_id,
-                document_id,
-            };
             return self
-                .storage_batch_delete(vec![
-                    (target.storage_keyspace().to_string(), target.storage_key()),
-                    (
-                        METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
-                        ByteView::from(document_id.to_bytes().to_vec()),
-                    ),
-                    (METADATA_HOLDERS_KEYSPACE.to_string(), target.storage_key()),
-                ])
+                .storage_batch_delete(metadata_registry_delete_entries(group_id, document_id))
                 .await;
         }
         if let DocumentSyncTarget::User { user_id } = target {
@@ -710,12 +763,7 @@ impl IrokleService {
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
             let mut deletes = vec![(target.storage_keyspace().to_string(), target.storage_key())];
             if let Some(previous) = previous {
-                deletes.extend(previous.subject_ids.iter().map(|subject_id| {
-                    (
-                        USER_SUBJECT_INDEX_KEYSPACE.to_string(),
-                        ByteView::from(subject_id.as_bytes().to_vec()),
-                    )
-                }));
+                deletes.extend(stale_subject_index_deletes(Some(&previous), None));
             }
             return self.storage_batch_delete(deletes).await;
         }
