@@ -109,7 +109,7 @@ impl ListUsersOperation {
         self.state = ListUsersState::ListUsers;
         Ok(smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: USER_KEYSPACE.to_string(),
-            prefix: None,
+            prefix: Some(UserId::storage_prefix(self.input.self_realm_id)),
             start_after: self.start_after_key()?,
             limit: self.input.limit.saturating_add(1),
             txn_id: None,
@@ -305,7 +305,7 @@ mod tests {
                 txn_id,
             }) => {
                 assert_eq!(key_space, aruna_core::USER_KEYSPACE);
-                assert_eq!(prefix, &None);
+                assert_eq!(prefix.as_ref(), Some(&UserId::storage_prefix(realm_id)));
                 assert_eq!(start_after, &None);
                 assert_eq!(*limit, 11);
                 assert_eq!(txn_id, &None);

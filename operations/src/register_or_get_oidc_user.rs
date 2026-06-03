@@ -443,10 +443,7 @@ mod tests {
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => {
                 assert_eq!(writes.len(), 1);
-                assert_eq!(
-                    String::from_utf8(writes[0].2.to_vec()).unwrap(),
-                    user_id.to_string()
-                );
+                assert_eq!(writes[0].2.as_ref(), user_id.to_storage_key().as_slice());
             }
             other => panic!("unexpected subject index write effect: {other:?}"),
         }
@@ -508,7 +505,7 @@ mod tests {
                 .unwrap()
                 .into_bytes()
                 .into(),
-            value: Some(user_id.to_string().into_bytes().into()),
+            value: Some(user_id.to_storage_key().into()),
         }));
         assert!(matches!(
             effects.first().unwrap(),

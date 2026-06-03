@@ -5,6 +5,7 @@ use ulid::Ulid;
 
 use crate::errors::ConversionError;
 use crate::structs::RealmId;
+use crate::types::Key;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct UserId {
@@ -33,7 +34,10 @@ impl UserId {
 
     #[inline]
     pub fn to_storage_key(&self) -> Vec<u8> {
-        self.to_string().into_bytes()
+        let mut bytes = Vec::with_capacity(48);
+        bytes.extend_from_slice(self.realm_id.as_bytes());
+        bytes.extend_from_slice(&self.user_ulid.to_bytes());
+        bytes
     }
 
     #[inline]
@@ -43,9 +47,31 @@ impl UserId {
 
     #[inline]
     pub fn from_storage_key(bytes: &[u8]) -> Result<Self, ConversionError> {
-        let value = std::str::from_utf8(bytes)
-            .map_err(|err| ConversionError::FromStrError(err.to_string()))?;
-        Self::from_str(value)
+        if bytes.len() != 48 {
+            return Err(ConversionError::InvalidLength(format!(
+                "expected 48-byte user storage key, got {} bytes",
+                bytes.len()
+            )));
+        }
+        let realm_id = RealmId::from_bytes(
+            bytes[..32]
+                .try_into()
+                .map_err(|_| ConversionError::InvalidUserId)?,
+        );
+        let user_ulid = Ulid::from_bytes(
+            bytes[32..]
+                .try_into()
+                .map_err(|_| ConversionError::InvalidUserId)?,
+        );
+        Ok(Self {
+            user_ulid,
+            realm_id,
+        })
+    }
+
+    #[inline]
+    pub fn storage_prefix(realm_id: RealmId) -> Key {
+        realm_id.as_bytes().to_vec().into()
     }
 
     #[inline]

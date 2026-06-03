@@ -168,13 +168,13 @@ impl AnnounceTopicOperation {
                 smallvec![document_repository::read_effect(&document, None)]
             }
             Some(PendingDocumentSync::UserPage {
-                realm_id: _,
+                realm_id,
                 start_after,
             }) => {
                 self.state = AnnounceTopicState::ListUsers;
                 smallvec![Effect::Storage(StorageEffect::Iter {
                     key_space: USER_KEYSPACE.to_string(),
-                    prefix: None,
+                    prefix: Some(UserId::storage_prefix(realm_id)),
                     start_after,
                     limit: USER_SYNC_PAGE_SIZE,
                     txn_id: None,

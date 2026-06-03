@@ -215,12 +215,8 @@ async fn ensure_canonical_user_token_subject(
             Event::Storage(StorageEvent::ReadResult {
                 value: Some(bytes), ..
             }) => {
-                let indexed_user_id = std::str::from_utf8(&bytes)
-                    .map_err(|error| ServerError::InternalError(error.to_string()))
-                    .and_then(|value| {
-                        UserId::from_string(value)
-                            .map_err(|error| ServerError::InternalError(error.to_string()))
-                    })?;
+                let indexed_user_id = UserId::from_storage_key(&bytes)
+                    .map_err(|error| ServerError::InternalError(error.to_string()))?;
                 if indexed_user_id != user_id {
                     return Err(ServerError::Forbidden);
                 }

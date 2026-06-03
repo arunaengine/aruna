@@ -159,7 +159,7 @@ async fn read_user(context: &DriverContext, user_id: UserId) -> User {
     }
 }
 
-async fn read_subject_index(context: &DriverContext, subject_key: &str) -> String {
+async fn read_subject_index(context: &DriverContext, subject_key: &str) -> UserId {
     match context
         .storage_handle
         .send_effect(Effect::Storage(StorageEffect::Read {
@@ -171,7 +171,7 @@ async fn read_subject_index(context: &DriverContext, subject_key: &str) -> Strin
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(bytes), ..
-        }) => String::from_utf8(bytes.to_vec()).unwrap(),
+        }) => UserId::from_storage_key(&bytes).unwrap(),
         other => panic!("unexpected subject index read result: {other:?}"),
     }
 }
@@ -305,7 +305,9 @@ async fn oidc_registration_route_creates_user_indexes_and_token() {
     assert_eq!(stored_user.name, "Alice");
     let subject_key = oidc_subject_key(issuer, "subject-123").unwrap();
     assert_eq!(
-        read_subject_index(node.context.as_ref(), &subject_key).await,
+        read_subject_index(node.context.as_ref(), &subject_key)
+            .await
+            .to_string(),
         body.id
     );
     let response = reqwest::Client::new()
