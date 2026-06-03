@@ -5,6 +5,7 @@ use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::task::TaskEvent;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
@@ -145,6 +146,7 @@ impl ReplicateDocumentsOperation {
         );
         self.placement_action = if selected_peers.len() < desired_count {
             Some(PlacementAction::Write(new_placement(
+                self.config.realm_id,
                 document.clone(),
                 desired_count,
                 selected_peers.clone(),
@@ -188,7 +190,10 @@ impl ReplicateDocumentsOperation {
             }
             PlacementAction::Delete(target) => {
                 self.retry_needed = false;
-                Ok(smallvec![delete_placement_effect(&target)])
+                Ok(smallvec![delete_placement_effect(
+                    self.config.realm_id,
+                    &target
+                )])
             }
         }
     }
@@ -204,6 +209,7 @@ impl ReplicateDocumentsOperation {
         warn!(target = ?target, error = %error, "Document sync failed; queued placement retry");
         let desired_count = desired_peer_count(&target);
         self.placement_action = Some(PlacementAction::Write(new_placement(
+            self.config.realm_id,
             target,
             desired_count,
             Vec::new(),
@@ -282,7 +288,12 @@ impl Operation for ReplicateDocumentsOperation {
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
             },
             ReplicateDocumentsState::ScheduleRetry => match event {
-                Event::Task(_) => {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.retry_needed = false;
+                    self.emit_next_publish()
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    warn!(message = %message, "Failed to schedule placement retry; pending placement remains durable");
                     self.retry_needed = false;
                     self.emit_next_publish()
                 }
@@ -307,5 +318,37 @@ impl Operation for ReplicateDocumentsOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::task::TaskEvent;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn task_schedule_error_is_non_blocking_after_placement_write() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node(1),
+            excluded_peers: Vec::new(),
+            documents: Vec::new(),
+        });
+        operation.state = ReplicateDocumentsState::ScheduleRetry;
+        operation.retry_needed = true;
+
+        let effects = operation.step(Event::Task(TaskEvent::Error {
+            key: None,
+            message: "task handle unavailable".to_string(),
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.state, ReplicateDocumentsState::Finish);
+        assert_eq!(operation.finalize(), Ok(()));
     }
 }

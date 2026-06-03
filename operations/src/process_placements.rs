@@ -6,6 +6,7 @@ use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{RealmConfigDocument, RealmId};
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key};
 use smallvec::smallvec;
 use thiserror::Error;
@@ -13,8 +14,8 @@ use thiserror::Error;
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    decode_placement, delete_placement_effect, new_placement, schedule_placement_retry_effect,
-    select_sync_peers, sort_node_ids, write_placement_effect,
+    decode_placement, delete_placement_effect, missing_peer_count, new_placement, placement_prefix,
+    schedule_placement_retry_effect, select_sync_peers, sort_node_ids, write_placement_effect,
 };
 use tracing::warn;
 
@@ -112,7 +113,7 @@ impl ProcessPlacementsOperation {
         self.state = PlacementState::ListPending;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
-            prefix: None,
+            prefix: Some(placement_prefix(self.config.realm_id)),
             start_after: self.next_start_after.take(),
             limit: PENDING_PLACEMENT_PAGE_SIZE,
             txn_id: None,
@@ -128,13 +129,21 @@ impl ProcessPlacementsOperation {
             self.output = Some(Ok(()));
             return smallvec![];
         };
+        if record.realm_id != self.config.realm_id {
+            warn!(
+                record_realm_id = %record.realm_id,
+                config_realm_id = %self.config.realm_id,
+                "Skipping pending placement for a different realm"
+            );
+            return self.emit_next_record();
+        }
 
         let newly_selected = select_sync_peers(
             &record.target,
             self.config.local_node_id,
             &self.realm_nodes,
             &record.selected_peers,
-            record.missing_peer_count,
+            missing_peer_count(&record),
         );
         self.current = Some(CurrentPlacement {
             target: record.target.clone(),
@@ -171,10 +180,14 @@ impl ProcessPlacementsOperation {
         self.state = PlacementState::StorePlacement;
         if current.selected_peers.len() >= current.desired_peer_count {
             self.retry_needed = false;
-            return smallvec![delete_placement_effect(&current.target)];
+            return smallvec![delete_placement_effect(
+                self.config.realm_id,
+                &current.target
+            )];
         }
 
         let record = new_placement(
+            self.config.realm_id,
             current.target,
             current.desired_peer_count,
             current.selected_peers,
@@ -279,7 +292,12 @@ impl Operation for ProcessPlacementsOperation {
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
             },
             PlacementState::ScheduleRetry => match event {
-                Event::Task(_) => {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.retry_needed = false;
+                    self.emit_next_record()
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    warn!(message = %message, "Failed to schedule placement retry; pending placement remains durable");
                     self.retry_needed = false;
                     self.emit_next_record()
                 }
@@ -299,5 +317,34 @@ impl Operation for ProcessPlacementsOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn task_schedule_error_is_non_blocking_after_placement_write() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(1),
+        });
+        operation.state = PlacementState::ScheduleRetry;
+        operation.retry_needed = true;
+
+        let effects = operation.step(Event::Task(TaskEvent::Error {
+            key: None,
+            message: "task handle unavailable".to_string(),
+        }));
+
+        assert!(effects.is_empty());
+        assert_eq!(operation.state, PlacementState::Finish);
+        assert_eq!(operation.finalize(), Ok(()));
     }
 }

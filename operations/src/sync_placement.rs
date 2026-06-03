@@ -53,41 +53,52 @@ pub fn select_sync_peers(
     candidates
 }
 
-pub fn placement_key(target: &DocumentSyncTarget) -> Key {
-    ByteView::from(target.irokle_topic_id().to_string().into_bytes())
+pub fn placement_prefix(realm_id: RealmId) -> Key {
+    ByteView::from(realm_id.as_bytes().to_vec())
+}
+
+pub fn placement_key(realm_id: RealmId, target: &DocumentSyncTarget) -> Key {
+    let mut bytes = realm_id.as_bytes().to_vec();
+    bytes.extend_from_slice(target.irokle_topic_id().to_string().as_bytes());
+    ByteView::from(bytes)
 }
 
 pub fn new_placement(
+    realm_id: RealmId,
     target: DocumentSyncTarget,
     desired_peer_count: usize,
     mut selected_peers: Vec<NodeId>,
 ) -> PendingTopicPlacement {
     selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     selected_peers.dedup();
-    let missing_peer_count = desired_peer_count.saturating_sub(selected_peers.len());
     PendingTopicPlacement {
-        topic_id: target.irokle_topic_id().to_string(),
+        realm_id,
         target,
         desired_peer_count,
         selected_peers,
-        missing_peer_count,
         updated_at: unix_timestamp_secs(),
     }
+}
+
+pub fn missing_peer_count(record: &PendingTopicPlacement) -> usize {
+    record
+        .desired_peer_count
+        .saturating_sub(record.selected_peers.len())
 }
 
 pub fn write_placement_effect(record: &PendingTopicPlacement) -> Result<Effect, postcard::Error> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
-        key: placement_key(&record.target),
+        key: placement_key(record.realm_id, &record.target),
         value: ByteView::from(postcard::to_allocvec(record)?),
         txn_id: None,
     }))
 }
 
-pub fn delete_placement_effect(target: &DocumentSyncTarget) -> Effect {
+pub fn delete_placement_effect(realm_id: RealmId, target: &DocumentSyncTarget) -> Effect {
     Effect::Storage(StorageEffect::Delete {
         key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
-        key: placement_key(target),
+        key: placement_key(realm_id, target),
         txn_id: None,
     })
 }
@@ -173,5 +184,33 @@ mod tests {
         let selected = select_sync_peers(&target(), node(1), &[node(2)], &[], 3);
 
         assert_eq!(selected, vec![node(2)]);
+    }
+
+    #[test]
+    fn placement_key_is_realm_scoped() {
+        let target = target();
+        let first_realm = RealmId::from_bytes([1u8; 32]);
+        let second_realm = RealmId::from_bytes([2u8; 32]);
+
+        let first_key = placement_key(first_realm, &target);
+        let second_key = placement_key(second_realm, &target);
+
+        assert_ne!(first_key, second_key);
+        assert!(first_key.as_ref().starts_with(first_realm.as_bytes()));
+        assert_eq!(
+            placement_prefix(first_realm).as_ref(),
+            first_realm.as_bytes()
+        );
+    }
+
+    #[test]
+    fn placement_deduplicates_peers_and_computes_missing_count() {
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let peer = node(5);
+        let placement = new_placement(realm_id, target(), 3, vec![peer, peer]);
+
+        assert_eq!(placement.realm_id, realm_id);
+        assert_eq!(placement.selected_peers, vec![peer]);
+        assert_eq!(missing_peer_count(&placement), 2);
     }
 }
