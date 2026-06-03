@@ -12,6 +12,7 @@ use aruna_core::types::{Effects, GroupId, TxnId};
 use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::announce::AnnounceTopicOperation;
@@ -50,6 +51,7 @@ enum UpdateMetadataDocumentState {
     Init,
     ReadCurrent,
     ApplyMutation,
+    SyncGraphBestEffort,
     StartTransaction,
     WriteRegistry,
     WriteDocumentIndex,
@@ -170,6 +172,17 @@ impl UpdateMetadataDocumentOperation {
         }
     }
 
+    fn graph_sync_effect(&mut self) -> Effects {
+        let Some(record) = self.record.as_ref() else {
+            return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
+        };
+        self.state = UpdateMetadataDocumentState::SyncGraphBestEffort;
+        smallvec![Effect::Metadata(MetadataEffect::SyncGraphBestEffort {
+            graph_iri: record.graph_iri.clone(),
+            peers: record.holder_node_ids.clone(),
+        })]
+    }
+
     fn fail(&mut self, error: UpdateMetadataDocumentError) -> Effects {
         let cleanup = self.abort();
         self.state = UpdateMetadataDocumentState::Error;
@@ -222,13 +235,27 @@ impl Operation for UpdateMetadataDocumentOperation {
                         return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
                     };
                     self.record = Some(self.updated_record(record));
+                    self.graph_sync_effect()
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+                other => self.unexpected_event("metadata mutation result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::SyncGraphBestEffort => match event {
+                Event::Metadata(MetadataEvent::GraphSyncScheduled { .. }) => {
                     self.state = UpdateMetadataDocumentState::StartTransaction;
                     smallvec![Effect::Storage(StorageEffect::StartTransaction {
                         read: false
                     })]
                 }
-                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
-                other => self.unexpected_event("metadata mutation result", format!("{other:?}")),
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    warn!(error = ?error, "Failed to schedule metadata graph sync; continuing best-effort");
+                    self.state = UpdateMetadataDocumentState::StartTransaction;
+                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
+                        read: false
+                    })]
+                }
+                other => self
+                    .unexpected_event("metadata graph sync schedule result", format!("{other:?}")),
             },
             UpdateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -340,7 +367,13 @@ impl Operation for UpdateMetadataDocumentOperation {
                             smallvec![]
                         }
                         Err(error) => {
-                            self.fail(UpdateMetadataDocumentError::TopicAnnouncement(error))
+                            warn!(error = %error, "Failed to announce metadata registry; update remains committed");
+                            let Some(record) = self.record.clone() else {
+                                return self.fail(UpdateMetadataDocumentError::MissingTransaction);
+                            };
+                            self.state = UpdateMetadataDocumentState::Finish;
+                            self.output = Some(Ok(record));
+                            smallvec![]
                         }
                     }
                 }

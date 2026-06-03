@@ -17,6 +17,7 @@ use chrono::Utc;
 use rand::seq::SliceRandom;
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use crate::announce::AnnounceTopicOperation;
@@ -69,6 +70,7 @@ enum CreateMetadataDocumentState {
     LoadReplicationTargets,
     CreateGraph,
     AddGraphPeers,
+    SyncGraphBestEffort,
     StartTransaction,
     WriteRegistry,
     WriteDocumentIndex,
@@ -228,8 +230,19 @@ impl CreateMetadataDocumentOperation {
                     node_id,
                 })]
             }
-            None => self.start_transaction_effect(),
+            None => self.graph_sync_effect(),
         }
+    }
+
+    fn graph_sync_effect(&mut self) -> Effects {
+        let Some(record) = self.record.as_ref() else {
+            return self.fail_without_cleanup(CreateMetadataDocumentError::MissingTransaction);
+        };
+        self.state = CreateMetadataDocumentState::SyncGraphBestEffort;
+        smallvec![Effect::Metadata(MetadataEffect::SyncGraphBestEffort {
+            graph_iri: record.graph_iri.clone(),
+            peers: record.holder_node_ids.clone(),
+        })]
     }
 
     fn fail(&mut self, error: CreateMetadataDocumentError) -> Effects {
@@ -376,10 +389,24 @@ impl Operation for CreateMetadataDocumentOperation {
                 Event::Metadata(MetadataEvent::GraphPeerAdded { .. }) => {
                     self.next_graph_peer_effect()
                 }
-                Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    warn!(error = ?error, "Failed to add metadata graph peer; continuing best-effort");
+                    self.next_graph_peer_effect()
+                }
                 other => {
                     self.unexpected_event("metadata graph peer add result", format!("{other:?}"))
                 }
+            },
+            CreateMetadataDocumentState::SyncGraphBestEffort => match event {
+                Event::Metadata(MetadataEvent::GraphSyncScheduled { .. }) => {
+                    self.start_transaction_effect()
+                }
+                Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                    warn!(error = ?error, "Failed to schedule metadata graph sync; continuing best-effort");
+                    self.start_transaction_effect()
+                }
+                other => self
+                    .unexpected_event("metadata graph sync schedule result", format!("{other:?}")),
             },
             CreateMetadataDocumentState::StartTransaction => match event {
                 Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
@@ -514,9 +541,17 @@ impl Operation for CreateMetadataDocumentOperation {
                             self.output = Some(Ok(record));
                             smallvec![]
                         }
-                        Err(error) => self.fail_without_cleanup(
-                            CreateMetadataDocumentError::TopicAnnouncement(error),
-                        ),
+                        Err(error) => {
+                            warn!(error = %error, "Failed to announce metadata registry; create remains committed");
+                            let Some(record) = self.record.clone() else {
+                                return self.fail_without_cleanup(
+                                    CreateMetadataDocumentError::MissingTransaction,
+                                );
+                            };
+                            self.state = CreateMetadataDocumentState::Finish;
+                            self.output = Some(Ok(record));
+                            smallvec![]
+                        }
                     }
                 }
                 other => self.unexpected_event("topic announcement result", format!("{other:?}")),
@@ -688,7 +723,7 @@ mod tests {
         )));
         assert_eq!(holder_lookup.len(), 1);
 
-        let start_txn = operation.step(Event::Metadata(MetadataEvent::CreateCrateResult {
+        let graph_sync = operation.step(Event::Metadata(MetadataEvent::CreateCrateResult {
             graph_iri: format!("https://w3id.org/aruna/{document_id}"),
             batch: MetadataBatch {
                 graph_iri: format!("https://w3id.org/aruna/{document_id}"),
@@ -698,6 +733,19 @@ mod tests {
                 ops: vec![],
                 timestamp_millis: 0,
             },
+        }));
+        assert_eq!(graph_sync.len(), 1);
+        assert_eq!(
+            graph_sync[0],
+            Effect::Metadata(aruna_core::metadata::MetadataEffect::SyncGraphBestEffort {
+                graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+                peers: vec![actor.node_id],
+            })
+        );
+
+        let start_txn = operation.step(Event::Metadata(MetadataEvent::GraphSyncScheduled {
+            graph_iri: format!("https://w3id.org/aruna/{document_id}"),
+            peers: vec![actor.node_id],
         }));
         assert_eq!(start_txn.len(), 1);
         assert_eq!(

@@ -6,6 +6,7 @@ use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::{Actor, RealmConfigDocument, RealmNodeKind};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::{read_effect, write_effect};
@@ -208,7 +209,24 @@ impl Operation for EnsureRealmConfigOperation {
                                 emit_next_replication(&mut self.replication_targets, document)
                             }
                         }
-                        Err(error) => self.fail(EnsureRealmConfigError::TopicAnnouncement(error)),
+                        Err(error) => {
+                            warn!(error = %error, "Failed to announce realm config; continuing best-effort");
+                            self.replication_targets = self
+                                .config
+                                .bootstrap_peers
+                                .iter()
+                                .copied()
+                                .filter(|node_id| *node_id != self.config.actor.node_id)
+                                .collect();
+                            if self.replication_targets.is_empty() {
+                                self.state = EnsureRealmConfigState::Finish;
+                                smallvec![]
+                            } else {
+                                self.state = EnsureRealmConfigState::Replicate;
+                                let document = self.document_ref();
+                                emit_next_replication(&mut self.replication_targets, document)
+                            }
+                        }
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),
@@ -225,7 +243,16 @@ impl Operation for EnsureRealmConfigOperation {
                                 emit_next_replication(&mut self.replication_targets, document)
                             }
                         }
-                        Err(error) => self.fail(EnsureRealmConfigError::DocumentSync(error)),
+                        Err(error) => {
+                            warn!(error = %error, "Failed to replicate realm config; continuing best-effort");
+                            if self.replication_targets.is_empty() {
+                                self.state = EnsureRealmConfigState::Finish;
+                                smallvec![]
+                            } else {
+                                let document = self.document_ref();
+                                emit_next_replication(&mut self.replication_targets, document)
+                            }
+                        }
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),
