@@ -8,6 +8,13 @@ use crate::structs::RealmId;
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskKey {
     RealmPresence { realm_id: RealmId, node_id: NodeId },
+    SyncPlacements { realm_id: RealmId, node_id: NodeId },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedTaskTimer {
+    pub key: TaskKey,
+    pub due_at_unix_millis: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

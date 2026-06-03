@@ -43,6 +43,7 @@ pub mod staging;
 pub mod startup;
 pub mod sync_placement;
 pub mod task_incoming;
+pub mod task_persistence;
 pub mod telemetry;
 pub mod update_metadata_document;
 pub mod update_user;

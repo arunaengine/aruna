@@ -15,6 +15,7 @@ use std::pin::Pin;
 use tracing::{Instrument, debug_span, error, trace, warn};
 
 use crate::metadata::MetadataHandle;
+use crate::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
 use aruna_core::task::TaskEvent;
@@ -157,6 +158,7 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::Task(task_effect) => {
+            persist_task_effect(&context.storage_handle, &task_effect).await;
             if let Some(task_handle) = &context.task_handle {
                 task_handle.send_effect(Effect::Task(task_effect)).await
             } else {
