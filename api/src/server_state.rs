@@ -10,7 +10,6 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
-use aruna_operations::announce::AnnounceTopicOperation;
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
@@ -282,9 +281,6 @@ impl ServerState {
                         .map(|user_id| DocumentSyncTarget::User { user_id })
                 }));
 
-                self.prepare_onboarding_document_sync(node_id, &documents)
-                    .await?;
-
                 OnboardingSyncTicket::issue(
                     realm_signing_key,
                     &self.realm_id,
@@ -295,35 +291,6 @@ impl ServerState {
             }
             _ => Err(OnboardingSecretError::InvalidSecret),
         }
-    }
-
-    async fn prepare_onboarding_document_sync(
-        &self,
-        node_id: NodeId,
-        documents: &[DocumentSyncTarget],
-    ) -> Result<(), OnboardingSecretError> {
-        for document in documents {
-            // The joiner may not be reachable yet; the issued ticket lets it pull these documents.
-            if let Err(error) = drive(
-                AnnounceTopicOperation::new_for_document_with_peers(
-                    document.topic_id(),
-                    self.node_id,
-                    Some(document.clone()),
-                    vec![node_id],
-                ),
-                self.driver_ctx.as_ref(),
-            )
-            .await
-            {
-                warn!(
-                    node_id = %node_id,
-                    document = ?document,
-                    error = ?error,
-                    "Failed to prepare onboarding document sync"
-                );
-            }
-        }
-        Ok(())
     }
 
     pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {

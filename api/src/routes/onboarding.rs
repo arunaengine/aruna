@@ -389,30 +389,42 @@ pub async fn bootstrap_onboarding(
             .await
             .map_err(|error| ServerError::InternalError(error.to_string()))?;
     }
-    drive(
-        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
-            realm_id: state.get_realm_id(),
-            local_node_id: state.get_node_id(),
-            excluded_peers: vec![node_id],
-            documents: vec![DocumentSyncTarget::RealmConfig {
-                realm_id: state.get_realm_id(),
-            }],
-        }),
-        ctx.as_ref(),
-    )
-    .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    if let Err(error) = drive(
-        ProcessPlacementsOperation::new(PlacementConfig {
-            realm_id: state.get_realm_id(),
-            local_node_id: state.get_node_id(),
-        }),
-        ctx.as_ref(),
-    )
-    .await
-    {
-        warn!(error = ?error, "Failed to process pending topic placements during onboarding");
-    }
+    let replication_ctx = ctx.clone();
+    let realm_id = state.get_realm_id();
+    let local_node_id = state.get_node_id();
+    tokio::spawn(async move {
+        if let Err(error) = drive(
+            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+                realm_id,
+                local_node_id,
+                excluded_peers: vec![node_id],
+                documents: vec![DocumentSyncTarget::RealmConfig { realm_id }],
+            }),
+            replication_ctx.as_ref(),
+        )
+        .await
+        {
+            warn!(error = ?error, "Failed to queue realm config replication during onboarding");
+        }
+    });
+
+    let placement_ctx = ctx.clone();
+    let realm_id = state.get_realm_id();
+    let local_node_id = state.get_node_id();
+    tokio::spawn(async move {
+        if let Err(error) = drive(
+            ProcessPlacementsOperation::new(PlacementConfig {
+                realm_id,
+                local_node_id,
+            }),
+            placement_ctx.as_ref(),
+        )
+        .await
+        {
+            warn!(error = ?error, "Failed to process pending topic placements during onboarding");
+        }
+    });
+
     let onboarding_sync_ticket = state
         .issue_onboarding_sync_ticket(node_id)
         .await
