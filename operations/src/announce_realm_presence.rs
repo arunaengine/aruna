@@ -14,7 +14,7 @@ use smallvec::smallvec;
 use thiserror::Error;
 
 const REALM_PRESENCE_TTL: Duration = Duration::from_secs(30);
-const REALM_PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
+pub(crate) const REALM_PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnnounceRealmPresenceConfig {
