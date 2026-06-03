@@ -6,16 +6,22 @@ use aruna_core::document::{DocumentSyncTarget, IrokleEvent};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingSecret, OnboardingSyncTicket};
-use aruna_core::{IrokleEffect, NodeId, TopicId};
-use aruna_operations::announce::AnnounceTopicOperation;
+use aruna_core::{IrokleEffect, NodeId, UserId};
 use aruna_operations::create_onboarding_secret::{
     CreateOnboardingSecretInput, CreateOnboardingSecretOperation,
 };
 use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+};
 use byteview::ByteView;
 use rand::Rng;
+use std::time::Duration;
+use tracing::warn;
+
+const ONBOARDING_DOCUMENT_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn realm_bootstrap_exists(
     driver_ctx: &DriverContext,
@@ -48,11 +54,69 @@ pub async fn announce_core_documents(
     node_id: NodeId,
     realm_id: &aruna_core::structs::RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for topic in [TopicId::realm(*realm_id), TopicId::users(*realm_id)] {
-        drive(AnnounceTopicOperation::new(topic, node_id), driver_ctx).await?;
-    }
+    let driver_ctx = driver_ctx.clone();
+    let realm_id = *realm_id;
+    tokio::spawn(async move {
+        let documents = match core_document_targets(&driver_ctx, realm_id).await {
+            Ok(documents) => documents,
+            Err(error) => {
+                warn!(error = %error, "Failed to collect core documents for replication");
+                return;
+            }
+        };
+        if documents.is_empty() {
+            return;
+        }
+        if let Err(error) = drive(
+            ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+                realm_id,
+                local_node_id: node_id,
+                excluded_peers: Vec::new(),
+                documents,
+            }),
+            &driver_ctx,
+        )
+        .await
+        {
+            warn!(error = ?error, "Failed to queue core document replication");
+        }
+    });
 
     Ok(())
+}
+
+async fn core_document_targets(
+    driver_ctx: &DriverContext,
+    realm_id: aruna_core::structs::RealmId,
+) -> Result<Vec<DocumentSyncTarget>, Box<dyn std::error::Error>> {
+    let mut documents = vec![
+        DocumentSyncTarget::RealmAuthorization { realm_id },
+        DocumentSyncTarget::RealmConfig { realm_id },
+    ];
+
+    match driver_ctx
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Iter {
+            key_space: USER_KEYSPACE.to_string(),
+            prefix: None,
+            start_after: None,
+            limit: 10_000,
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => {
+            documents.extend(values.into_iter().filter_map(|(key, _)| {
+                UserId::from_storage_key(&key)
+                    .ok()
+                    .filter(|user_id| user_id.realm_id == realm_id)
+                    .map(|user_id| DocumentSyncTarget::User { user_id })
+            }));
+            Ok(documents)
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(Box::new(error)),
+        other => Err(format!("unexpected user iter result: {other:?}").into()),
+    }
 }
 
 pub async fn fetch_core_onboarding_documents(
@@ -83,13 +147,21 @@ async fn sync_document_from_peer(
     document: DocumentSyncTarget,
     bootstrap_peer: NodeId,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    match net_handle
-        .send_effect(Effect::Net(NetEffect::Irokle(IrokleEffect::SyncDocument {
-            target: document,
-            peers: vec![bootstrap_peer],
-        })))
+    let document_for_error = document.clone();
+    let sync = net_handle.send_effect(Effect::Net(NetEffect::Irokle(IrokleEffect::SyncDocument {
+        target: document,
+        peers: vec![bootstrap_peer],
+    })));
+    let event = tokio::time::timeout(ONBOARDING_DOCUMENT_SYNC_TIMEOUT, sync)
         .await
-    {
+        .map_err(|_| {
+            format!(
+                "timed out after {:?} fetching onboarding document {:?} from bootstrap peer {}",
+                ONBOARDING_DOCUMENT_SYNC_TIMEOUT, document_for_error, bootstrap_peer
+            )
+        })?;
+
+    match event {
         Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled { .. })) => Ok(()),
         Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => Err(error.into()),
         Event::Net(NetEvent::Error(error)) => Err(format!("{error:?}").into()),

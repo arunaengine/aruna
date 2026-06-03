@@ -33,9 +33,12 @@ use std::net::SocketAddr;
 use std::num::ParseIntError;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 use thiserror::Error;
 
 const NODE_STATE_RECORD_KEY: &[u8] = b"node_state";
+const ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Config {
     pub storage_path: String,
@@ -545,7 +548,7 @@ async fn bootstrap_onboarded_node_state(
                 .to_string()
         });
 
-    let response = reqwest::Client::new()
+    let response = onboarding_bootstrap_client()?
         .post(format!(
             "{}/api/v1/onboarding/bootstrap",
             decoded_secret.seed_url.trim_end_matches('/'),
@@ -707,7 +710,7 @@ async fn refresh_onboarding_bootstrap(
                 .to_string()
         });
 
-    let response = reqwest::Client::new()
+    let response = onboarding_bootstrap_client()?
         .post(format!(
             "{}/api/v1/onboarding/bootstrap",
             decoded_secret.seed_url.trim_end_matches('/'),
@@ -744,6 +747,13 @@ async fn refresh_onboarding_bootstrap(
 
     drop(transport_secret_key);
     Ok(response)
+}
+
+fn onboarding_bootstrap_client() -> Result<reqwest::Client, SetupError> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(ONBOARDING_BOOTSTRAP_HTTP_CONNECT_TIMEOUT)
+        .timeout(ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT)
+        .build()?)
 }
 
 fn validate_bootstrap_response(

@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncEvent, DocumentSyncTarget, IrokleEvent};
@@ -22,12 +23,15 @@ use irokle_crate::sync::{SyncMessage, SyncRequest};
 use irokle_crate::{EventEnvelope, OpId, PeerId, ReplicationPolicy, TopicGenesis, TopicPayload};
 use parking_lot::RwLock;
 use tokio::task::JoinSet;
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::error::{NetError, Result};
 use crate::streams::BiStream;
 
 use ::irokle as irokle_crate;
+
+const IROKLE_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct IrokleService {
@@ -358,7 +362,19 @@ impl IrokleService {
         let mut first_error = None;
         for peer in peers {
             let net = self.net.clone();
-            syncs.spawn(async move { (peer, net.sync_peer_now(peer, topic_id).await) });
+            syncs.spawn(async move {
+                let result = match timeout(
+                    IROKLE_PEER_SYNC_TIMEOUT,
+                    net.sync_peer_now(peer, topic_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(NetError::Bootstrap(error.to_string())),
+                    Err(_) => Err(NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT)),
+                };
+                (peer, result)
+            });
         }
         while let Some(result) = syncs.join_next().await {
             match result {
@@ -420,14 +436,16 @@ impl IrokleService {
         peer: PeerId,
     ) -> Result<()> {
         let peer_addr = peer_id_to_endpoint_addr(peer)?;
-        let responses = self
-            .net
-            .sync_with(
+        let responses = timeout(
+            IROKLE_PEER_SYNC_TIMEOUT,
+            self.net.sync_with(
                 peer_addr.clone(),
                 &[SyncMessage::Open(self.node.sync_open(topic_id))],
-            )
-            .await
-            .map_err(NetError::from)?;
+            ),
+        )
+        .await
+        .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+        .map_err(NetError::from)?;
         let summary = responses
             .into_iter()
             .find_map(|response| match response {
@@ -452,17 +470,19 @@ impl IrokleService {
             wants: summary.heads,
             actor_range_hints: Vec::new(),
         };
-        let responses = self
-            .net
-            .sync_with(
+        let responses = timeout(
+            IROKLE_PEER_SYNC_TIMEOUT,
+            self.net.sync_with(
                 peer_addr.clone(),
                 &[
                     SyncMessage::Open(self.node.sync_open(topic_id)),
                     SyncMessage::Request(request),
                 ],
-            )
-            .await
-            .map_err(NetError::from)?;
+            ),
+        )
+        .await
+        .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+        .map_err(NetError::from)?;
 
         let mut followup = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
         for response in responses {
@@ -483,11 +503,13 @@ impl IrokleService {
             }
         }
         if followup.len() > 1 {
-            let responses = self
-                .net
-                .sync_with(peer_addr, &followup)
-                .await
-                .map_err(NetError::from)?;
+            let responses = timeout(
+                IROKLE_PEER_SYNC_TIMEOUT,
+                self.net.sync_with(peer_addr, &followup),
+            )
+            .await
+            .map_err(|_| NetError::Timeout(IROKLE_PEER_SYNC_TIMEOUT))?
+            .map_err(NetError::from)?;
             for response in responses {
                 match response {
                     SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
