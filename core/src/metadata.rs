@@ -3,9 +3,11 @@ use std::collections::BTreeMap;
 use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{AuthContext, MetadataRegistryRecord};
+use crate::structs::{AuthContext, MetadataRegistryRecord, RealmId};
+use crate::types::GroupId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
@@ -132,6 +134,44 @@ pub struct MetadataBatch {
     pub timestamp_millis: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataGraphLifecycleStatus {
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataGraphLifecycleRecord {
+    pub graph_iri: String,
+    pub realm_id: RealmId,
+    pub group_id: GroupId,
+    pub document_id: Ulid,
+    pub status: MetadataGraphLifecycleStatus,
+    pub updated_at_ms: u64,
+}
+
+impl MetadataGraphLifecycleRecord {
+    pub fn deleted(
+        graph_iri: String,
+        realm_id: RealmId,
+        group_id: GroupId,
+        document_id: Ulid,
+        updated_at_ms: u64,
+    ) -> Self {
+        Self {
+            graph_iri,
+            realm_id,
+            group_id,
+            document_id,
+            status: MetadataGraphLifecycleStatus::Deleted,
+            updated_at_ms,
+        }
+    }
+
+    pub fn is_deleted(&self) -> bool {
+        matches!(self.status, MetadataGraphLifecycleStatus::Deleted)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MetadataQueryResults {
     Solutions(Vec<BTreeMap<String, String>>),
@@ -160,6 +200,10 @@ pub enum MetadataEffect {
     AddGraphPeer {
         graph_iri: String,
         node_id: NodeId,
+    },
+    SyncGraphBestEffort {
+        graph_iri: String,
+        peers: Vec<NodeId>,
     },
     GetGraphPolicy {
         graph_iri: String,
@@ -216,6 +260,10 @@ pub enum MetadataEvent {
     GraphPeerAdded {
         graph_iri: String,
         node_id: NodeId,
+    },
+    GraphSyncScheduled {
+        graph_iri: String,
+        peers: Vec<NodeId>,
     },
     GraphPolicyResult {
         graph_iri: String,

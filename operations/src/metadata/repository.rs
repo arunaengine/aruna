@@ -5,6 +5,11 @@ use aruna_core::keyspaces::{
     METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
     METADATA_INDEX_KEYSPACE,
 };
+use aruna_core::metadata::MetadataGraphLifecycleRecord;
+pub use aruna_core::storage_entries::{
+    metadata_document_key, metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
+    metadata_registry_key, metadata_registry_prefix,
+};
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
 use byteview::ByteView;
@@ -12,21 +17,6 @@ use smallvec::smallvec;
 use ulid::Ulid;
 
 pub const LIST_METADATA_PAGE_SIZE: usize = 128;
-
-pub fn metadata_registry_key(group_id: GroupId, document_id: Ulid) -> Key {
-    let mut bytes = Vec::with_capacity(32);
-    bytes.extend_from_slice(&group_id.to_bytes());
-    bytes.extend_from_slice(&document_id.to_bytes());
-    ByteView::from(bytes)
-}
-
-pub fn metadata_registry_prefix(group_id: GroupId) -> Key {
-    ByteView::from(group_id.to_bytes().to_vec())
-}
-
-pub fn metadata_document_key(document_id: Ulid) -> Key {
-    ByteView::from(document_id.to_bytes().to_vec())
-}
 
 pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(48);
@@ -112,7 +102,7 @@ pub fn iter_registry_effect(
 
 pub fn iter_all_registry_effect(start_after: Option<Key>, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Iter {
-        key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+        key_space: METADATA_INDEX_KEYSPACE.to_string(),
         prefix: None,
         start_after,
         limit: LIST_METADATA_PAGE_SIZE,
@@ -128,6 +118,19 @@ pub fn write_holders_effect(
         key_space: METADATA_HOLDERS_KEYSPACE.to_string(),
         key: metadata_registry_key(record.group_id, record.document_id),
         value: postcard::to_allocvec(&record.holder_node_ids)?.into(),
+        txn_id,
+    }))
+}
+
+pub fn write_graph_lifecycle_effect(
+    record: &MetadataGraphLifecycleRecord,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    let (key_space, key, value) = metadata_graph_lifecycle_write_entry(record)?;
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space,
+        key,
+        value,
         txn_id,
     }))
 }
