@@ -174,7 +174,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         StartupMode::Provisioned => {
             drive(
-                RestoreTopicSubscriptionsOperation::new(config.node_id),
+                RestoreTopicSubscriptionsOperation::new(config.node_id, config.realm_id),
                 driver_ctx.as_ref(),
             )
             .await?;

@@ -3,8 +3,10 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
+use crate::storage_entries::metadata_graph_lifecycle_key;
 use crate::structs::RealmId;
 use crate::types::{GroupId, Key, UserId};
 use crate::{NodeId, TopicId};
@@ -30,15 +32,17 @@ pub enum DocumentSyncTarget {
         group_id: GroupId,
         document_id: Ulid,
     },
+    MetadataGraphLifecycle {
+        graph_iri: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingTopicPlacement {
+    pub realm_id: RealmId,
     pub target: DocumentSyncTarget,
-    pub topic_id: String,
     pub desired_peer_count: usize,
     pub selected_peers: Vec<NodeId>,
-    pub missing_peer_count: usize,
     pub updated_at: u64,
 }
 
@@ -53,6 +57,9 @@ impl DocumentSyncTarget {
             }
             Self::User { user_id } => TopicId::users(user_id.realm_id),
             Self::MetadataRegistry { document_id, .. } => TopicId::metadata(*document_id),
+            Self::MetadataGraphLifecycle { graph_iri } => {
+                TopicId::metadata(metadata_graph_lifecycle_topic_id(graph_iri))
+            }
         }
     }
 
@@ -63,6 +70,7 @@ impl DocumentSyncTarget {
             Self::RealmConfig { .. } => REALM_CONFIG_KEYSPACE,
             Self::User { .. } => USER_KEYSPACE,
             Self::MetadataRegistry { .. } => METADATA_INDEX_KEYSPACE,
+            Self::MetadataGraphLifecycle { .. } => METADATA_GRAPH_LIFECYCLE_KEYSPACE,
         }
     }
 
@@ -84,6 +92,7 @@ impl DocumentSyncTarget {
                 bytes.extend_from_slice(&document_id.to_bytes());
                 ByteView::from(bytes)
             }
+            Self::MetadataGraphLifecycle { graph_iri } => metadata_graph_lifecycle_key(graph_iri),
         }
     }
 
@@ -103,9 +112,20 @@ impl DocumentSyncTarget {
                 bytes.extend_from_slice(b"/metadata/");
                 bytes.extend_from_slice(&document_id.to_bytes());
             }
+            Self::MetadataGraphLifecycle { graph_iri } => {
+                bytes.extend_from_slice(b"/metadata-graph-lifecycle/");
+                bytes.extend_from_slice(graph_iri.as_bytes());
+            }
         }
         irokle::TopicId::hash(bytes)
     }
+}
+
+fn metadata_graph_lifecycle_topic_id(graph_iri: &str) -> Ulid {
+    let hash = blake3::hash(graph_iri.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    Ulid::from_bytes(bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]

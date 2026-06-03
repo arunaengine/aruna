@@ -514,9 +514,10 @@ impl Serialize for JsonPendingTopicPlacement {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PendingTopicPlacement", 6)?;
+        let mut state = serializer.serialize_struct("PendingTopicPlacement", 7)?;
+        state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("target", &json_document_sync_target(&self.0.target))?;
-        state.serialize_field("topic_id", &self.0.topic_id)?;
+        state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
         state.serialize_field("desired_peer_count", &self.0.desired_peer_count)?;
         state.serialize_field(
             "selected_peers",
@@ -527,10 +528,20 @@ impl Serialize for JsonPendingTopicPlacement {
                 .map(std::string::ToString::to_string)
                 .collect::<Vec<_>>(),
         )?;
-        state.serialize_field("missing_peer_count", &self.0.missing_peer_count)?;
+        state.serialize_field("missing_peer_count", &placement_missing_peer_count(&self.0))?;
         state.serialize_field("updated_at", &self.0.updated_at)?;
         state.end()
     }
+}
+
+fn placement_topic_id(placement: &PendingTopicPlacement) -> String {
+    placement.target.irokle_topic_id().to_string()
+}
+
+fn placement_missing_peer_count(placement: &PendingTopicPlacement) -> usize {
+    placement
+        .desired_peer_count
+        .saturating_sub(placement.selected_peers.len())
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -554,6 +565,9 @@ enum JsonDocumentSyncTarget {
     MetadataRegistry {
         group_id: String,
         document_id: String,
+    },
+    MetadataGraphLifecycle {
+        graph_iri: String,
     },
 }
 
@@ -585,6 +599,11 @@ fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTar
             group_id: group_id.to_string(),
             document_id: document_id.to_string(),
         },
+        DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {
+            JsonDocumentSyncTarget::MetadataGraphLifecycle {
+                graph_iri: graph_iri.clone(),
+            }
+        }
     }
 }
 
@@ -1066,12 +1085,12 @@ fn topics_list_output(database_path: &str) -> Result<TopicsListOutput, ExplorerE
     let mut topics = load_pending_placements(database_path)?
         .into_iter()
         .map(|placement| TopicListEntry {
-            topic_id: placement.topic_id,
+            topic_id: placement_topic_id(&placement),
             target: json_document_sync_target(&placement.target),
             status: "under_replicated",
             desired_peer_count: placement.desired_peer_count,
             selected_peer_count: placement.selected_peers.len(),
-            missing_peer_count: placement.missing_peer_count,
+            missing_peer_count: placement_missing_peer_count(&placement),
         })
         .collect::<Vec<_>>();
     topics.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
@@ -1088,7 +1107,7 @@ fn topic_status_output(
 ) -> Result<TopicStatusOutput, ExplorerError> {
     let pending_placement = load_pending_placements(database_path)?
         .into_iter()
-        .find(|placement| placement.topic_id == topic_id)
+        .find(|placement| placement_topic_id(placement) == topic_id)
         .map(JsonPendingTopicPlacement);
     let status = if pending_placement.is_some() {
         "under_replicated"
@@ -1110,9 +1129,9 @@ fn topic_placements_output(
 ) -> Result<TopicPlacementsOutput, ExplorerError> {
     let mut placements = load_pending_placements(database_path)?;
     if let Some(topic_id) = topic_id {
-        placements.retain(|placement| placement.topic_id == topic_id);
+        placements.retain(|placement| placement_topic_id(placement) == topic_id);
     }
-    placements.sort_by(|left, right| left.topic_id.cmp(&right.topic_id));
+    placements.sort_by_key(placement_topic_id);
 
     Ok(TopicPlacementsOutput {
         database_path: database_path.to_string(),
@@ -1186,8 +1205,8 @@ fn decode_key(keyspace_name: &str, key: &[u8]) -> DecodedField {
         | API_STATE_KEYSPACE
         | IROKLE_APPLIED_OPS_KEYSPACE
         | NODE_STATE_KEYSPACE
-        | ONBOARDING_KEYSPACE
-        | SYNC_PLACEMENT_KEYSPACE => decode_utf8_key(key),
+        | ONBOARDING_KEYSPACE => decode_utf8_key(key),
+        SYNC_PLACEMENT_KEYSPACE => raw_field(key),
         S3_MULTIPART_UPLOAD_KEYSPACE => decode_ulid_key(key),
         S3_MULTIPART_UPLOAD_PART_KEYSPACE => MultipartUploadPartKey::from_bytes(key)
             .map(|value| DecodedField::MultipartUploadPartKey { value })
@@ -1436,7 +1455,7 @@ mod tests {
         CRAQLE_GRAPHS_KEYSPACE, CRAQLE_LOG_BATCH_PREFIX, CRAQLE_LOG_KEYSPACE,
         CRAQLE_QUADS_KEYSPACE, CRAQLE_TERMS_KEYSPACE, CraqleStoredBatch, CraqleStoredGraphMeta,
         CraqleStoredQuadOp, DecodedField, DecodedValue, decode_entry, list_entries, list_keyspaces,
-        raw_field,
+        placement_missing_peer_count, raw_field,
     };
     use aruna::config::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -1736,28 +1755,31 @@ mod tests {
         let target = DocumentSyncTarget::RealmConfig {
             realm_id: RealmId::from_bytes([4_u8; 32]),
         };
+        let realm_id = RealmId::from_bytes([4_u8; 32]);
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
-        let placement =
-            aruna_operations::sync_placement::new_placement(target.clone(), 3, vec![selected_peer]);
-        let value = postcard::to_allocvec(&placement).unwrap();
-
-        let decoded = decode_entry(
-            SYNC_PLACEMENT_KEYSPACE,
-            placement.topic_id.as_bytes(),
-            &value,
+        let placement = aruna_operations::sync_placement::new_placement(
+            realm_id,
+            target.clone(),
+            3,
+            vec![selected_peer],
         );
+        let value = postcard::to_allocvec(&placement).unwrap();
+        let key = aruna_operations::sync_placement::placement_key(realm_id, &target);
+
+        let decoded = decode_entry(SYNC_PLACEMENT_KEYSPACE, key.as_ref(), &value);
         assert_eq!(
             decoded.key,
-            DecodedField::Utf8 {
-                value: placement.topic_id.clone()
+            DecodedField::Raw {
+                hex: hex::encode(key.as_ref())
             }
         );
         match decoded.value {
             DecodedValue::PendingTopicPlacement { data } => {
+                assert_eq!(data.0.realm_id, realm_id);
                 assert_eq!(data.0.target, target);
                 assert_eq!(data.0.desired_peer_count, 3);
                 assert_eq!(data.0.selected_peers, vec![selected_peer]);
-                assert_eq!(data.0.missing_peer_count, 2);
+                assert_eq!(placement_missing_peer_count(&data.0), 2);
             }
             other => panic!("expected pending topic placement, got {other:?}"),
         }

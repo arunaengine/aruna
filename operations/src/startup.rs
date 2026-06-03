@@ -6,13 +6,16 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    USER_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+    METADATA_GRAPH_LIFECYCLE_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
+use aruna_core::metadata::MetadataGraphLifecycleRecord;
 use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::types::UserId;
+use aruna_core::structs::RealmId;
+use aruna_core::types::{Key, UserId};
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::{
@@ -20,12 +23,17 @@ use crate::document_repository::{
 };
 use crate::metadata::repository::parse_registry_iter;
 
+const STARTUP_DOCUMENT_PAGE_SIZE: usize = 256;
+
 #[derive(Debug, PartialEq)]
 pub struct RestoreTopicSubscriptionsOperation {
+    realm_id: RealmId,
     local_node_id: NodeId,
     state: RestoreTopicSubscriptionsState,
+    scan_state: RestoreTopicSubscriptionsState,
     documents: Vec<DocumentSyncTarget>,
     discovered_documents: HashSet<DocumentSyncTarget>,
+    next_start_after: Option<Key>,
     output: Option<Result<(), RestoreTopicSubscriptionsError>>,
 }
 
@@ -36,6 +44,7 @@ enum RestoreTopicSubscriptionsState {
     ListGroups,
     ListRealmConfig,
     ListMetadata,
+    ListMetadataLifecycle,
     ListUsers,
     WaitAnnouncement,
     Finish,
@@ -59,12 +68,15 @@ pub enum RestoreTopicSubscriptionsError {
 }
 
 impl RestoreTopicSubscriptionsOperation {
-    pub fn new(local_node_id: NodeId) -> Self {
+    pub fn new(local_node_id: NodeId, realm_id: RealmId) -> Self {
         Self {
+            realm_id,
             local_node_id,
             state: RestoreTopicSubscriptionsState::Init,
+            scan_state: RestoreTopicSubscriptionsState::ListAuth,
             documents: Vec::new(),
             discovered_documents: HashSet::new(),
+            next_start_after: None,
             output: None,
         }
     }
@@ -110,16 +122,82 @@ impl RestoreTopicSubscriptionsOperation {
                 },
             ))]
         } else {
-            self.state = RestoreTopicSubscriptionsState::Finish;
-            self.output = Some(Ok(()));
-            smallvec![]
+            self.continue_scan_or_advance(self.scan_state.clone())
+        }
+    }
+
+    fn emit_iter(&mut self, state: RestoreTopicSubscriptionsState) -> aruna_core::types::Effects {
+        let key_space = match state {
+            RestoreTopicSubscriptionsState::ListAuth => AUTH_KEYSPACE,
+            RestoreTopicSubscriptionsState::ListGroups => GROUP_KEYSPACE,
+            RestoreTopicSubscriptionsState::ListRealmConfig => REALM_CONFIG_KEYSPACE,
+            RestoreTopicSubscriptionsState::ListMetadata => METADATA_DOCUMENT_INDEX_KEYSPACE,
+            RestoreTopicSubscriptionsState::ListMetadataLifecycle => {
+                METADATA_GRAPH_LIFECYCLE_KEYSPACE
+            }
+            RestoreTopicSubscriptionsState::ListUsers => USER_KEYSPACE,
+            _ => {
+                self.state = RestoreTopicSubscriptionsState::Finish;
+                self.output = Some(Ok(()));
+                return smallvec![];
+            }
+        };
+        self.scan_state = state.clone();
+        self.state = state;
+        let prefix = if matches!(self.state, RestoreTopicSubscriptionsState::ListUsers) {
+            Some(UserId::storage_prefix(self.realm_id))
+        } else {
+            None
+        };
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix,
+            start_after: self.next_start_after.take(),
+            limit: STARTUP_DOCUMENT_PAGE_SIZE,
+            txn_id: None,
+        })]
+    }
+
+    fn continue_scan_or_advance(
+        &mut self,
+        current: RestoreTopicSubscriptionsState,
+    ) -> aruna_core::types::Effects {
+        if self.next_start_after.is_some() {
+            return self.emit_iter(current);
+        }
+        self.next_start_after = None;
+        match current {
+            RestoreTopicSubscriptionsState::ListAuth => {
+                self.emit_iter(RestoreTopicSubscriptionsState::ListGroups)
+            }
+            RestoreTopicSubscriptionsState::ListGroups => {
+                self.emit_iter(RestoreTopicSubscriptionsState::ListRealmConfig)
+            }
+            RestoreTopicSubscriptionsState::ListRealmConfig => {
+                self.emit_iter(RestoreTopicSubscriptionsState::ListMetadata)
+            }
+            RestoreTopicSubscriptionsState::ListMetadata => {
+                self.emit_iter(RestoreTopicSubscriptionsState::ListMetadataLifecycle)
+            }
+            RestoreTopicSubscriptionsState::ListMetadataLifecycle => {
+                self.emit_iter(RestoreTopicSubscriptionsState::ListUsers)
+            }
+            RestoreTopicSubscriptionsState::ListUsers => {
+                self.state = RestoreTopicSubscriptionsState::Finish;
+                self.output = Some(Ok(()));
+                smallvec![]
+            }
+            _ => smallvec![],
         }
     }
 }
 
 impl Default for RestoreTopicSubscriptionsOperation {
     fn default() -> Self {
-        Self::new(iroh::SecretKey::from_bytes(&[0u8; 32]).public())
+        Self::new(
+            iroh::SecretKey::from_bytes(&[0u8; 32]).public(),
+            RealmId::from_bytes([0u8; 32]),
+        )
     }
 }
 
@@ -128,94 +206,73 @@ impl Operation for RestoreTopicSubscriptionsOperation {
     type Error = RestoreTopicSubscriptionsError;
 
     fn start(&mut self) -> aruna_core::types::Effects {
-        self.state = RestoreTopicSubscriptionsState::ListAuth;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: AUTH_KEYSPACE.to_string(),
-            prefix: None,
-            start_after: None,
-            limit: usize::MAX,
-            txn_id: None,
-        })]
+        self.next_start_after = None;
+        self.emit_iter(RestoreTopicSubscriptionsState::ListAuth)
     }
 
     fn step(&mut self, event: Event) -> aruna_core::types::Effects {
         match self.state {
             RestoreTopicSubscriptionsState::ListAuth => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
                     for (key, _) in values {
                         match parse_auth_document(&key) {
                             Ok(document) => self.push_document(document),
                             Err(error) => return self.fail(error.into()),
                         }
                     }
-                    self.state = RestoreTopicSubscriptionsState::ListGroups;
-                    smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: GROUP_KEYSPACE.to_string(),
-                        prefix: None,
-                        start_after: None,
-                        limit: usize::MAX,
-                        txn_id: None,
-                    })]
+                    self.next_start_after = next_start_after;
+                    self.next_announcement()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iteration result", format!("{other:?}")),
             },
             RestoreTopicSubscriptionsState::ListGroups => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
                     for (key, _) in values {
                         match parse_group_document(&key) {
                             Ok(document) => self.push_document(document),
                             Err(error) => return self.fail(error.into()),
                         }
                     }
-                    self.state = RestoreTopicSubscriptionsState::ListRealmConfig;
-                    smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: REALM_CONFIG_KEYSPACE.to_string(),
-                        prefix: None,
-                        start_after: None,
-                        limit: usize::MAX,
-                        txn_id: None,
-                    })]
+                    self.next_start_after = next_start_after;
+                    self.next_announcement()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iteration result", format!("{other:?}")),
             },
             RestoreTopicSubscriptionsState::ListRealmConfig => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
                     for (key, _) in values {
                         match parse_realm_config_document(&key) {
                             Ok(document) => self.push_document(document),
                             Err(error) => return self.fail(error.into()),
                         }
                     }
-                    self.state = RestoreTopicSubscriptionsState::ListMetadata;
-                    smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
-                        prefix: None,
-                        start_after: None,
-                        limit: usize::MAX,
-                        txn_id: None,
-                    })]
+                    self.next_start_after = next_start_after;
+                    self.next_announcement()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iteration result", format!("{other:?}")),
             },
             RestoreTopicSubscriptionsState::ListMetadata => match parse_registry_iter(event) {
-                Ok((records, _)) => {
+                Ok((records, next_start_after)) => {
                     for record in records {
                         self.push_document(DocumentSyncTarget::MetadataRegistry {
                             group_id: record.group_id,
                             document_id: record.document_id,
                         });
                     }
-                    self.state = RestoreTopicSubscriptionsState::ListUsers;
-                    smallvec![Effect::Storage(StorageEffect::Iter {
-                        key_space: USER_KEYSPACE.to_string(),
-                        prefix: None,
-                        start_after: None,
-                        limit: usize::MAX,
-                        txn_id: None,
-                    })]
+                    self.next_start_after = next_start_after;
+                    self.next_announcement()
                 }
                 Err(crate::metadata::repository::StorageReadError::Storage(error)) => {
                     self.fail(error.into())
@@ -224,14 +281,46 @@ impl Operation for RestoreTopicSubscriptionsOperation {
                     self.fail(error.into())
                 }
             },
+            RestoreTopicSubscriptionsState::ListMetadataLifecycle => match event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    for (_, value) in values {
+                        let record: MetadataGraphLifecycleRecord =
+                            match postcard::from_bytes(&value) {
+                                Ok(record) => record,
+                                Err(error) => {
+                                    return self.fail(ConversionError::from(error).into());
+                                }
+                            };
+                        if record.realm_id == self.realm_id {
+                            self.push_document(DocumentSyncTarget::MetadataGraphLifecycle {
+                                graph_iri: record.graph_iri,
+                            });
+                        }
+                    }
+                    self.next_start_after = next_start_after;
+                    self.next_announcement()
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage iteration result", format!("{other:?}")),
+            },
             RestoreTopicSubscriptionsState::ListUsers => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
                     for (key, _) in values {
                         match UserId::from_storage_key(&key) {
-                            Ok(user_id) => self.push_document(DocumentSyncTarget::User { user_id }),
+                            Ok(user_id) if user_id.realm_id == self.realm_id => {
+                                self.push_document(DocumentSyncTarget::User { user_id })
+                            }
+                            Ok(_) => {}
                             Err(error) => return self.fail(error.into()),
                         }
                     }
+                    self.next_start_after = next_start_after;
                     self.next_announcement()
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
@@ -242,7 +331,8 @@ impl Operation for RestoreTopicSubscriptionsOperation {
                     match result {
                         Ok(()) => self.next_announcement(),
                         Err(error) => {
-                            self.fail(RestoreTopicSubscriptionsError::TopicAnnouncement(error))
+                            warn!(error = %error, "Failed to restore topic subscription; continuing best-effort");
+                            self.next_announcement()
                         }
                     }
                 }
