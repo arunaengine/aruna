@@ -1,6 +1,6 @@
 mod shared;
 
-use aruna::config::StartupMode;
+use aruna::config::{PersistedNodeIdentity, StartupMode};
 use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -77,6 +77,38 @@ async fn onboarding_bootstraps_joiner_over_http_and_syncs_core_documents() -> Te
             .expect("joiner user should be bootstrapped"),
         expected_user
     );
+
+    wait_for_realm_nodes(
+        &[seed.context.as_ref(), joiner.context.as_ref()],
+        &joiner.config.realm_id,
+        2,
+    )
+    .await?;
+
+    joiner.shutdown().await;
+    seed.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_onboarding_bootstraps_joiner_over_http_and_completes() -> TestResult<()> {
+    let seed = spawn_seed_node().await?;
+    sleep(Duration::from_millis(50)).await;
+    let onboarding_secret =
+        create_onboarding_secret_via_http(&seed, OnboardingMode::Server).await?;
+
+    let joiner = spawn_joiner_node(&seed, onboarding_secret).await?;
+
+    assert!(matches!(
+        joiner.config.startup_mode,
+        StartupMode::JoinRealm {
+            phase: OnboardingPhase::Bootstrapped
+        }
+    ));
+    assert!(matches!(
+        joiner.config.node_state.identity,
+        PersistedNodeIdentity::Server { .. }
+    ));
 
     wait_for_realm_nodes(
         &[seed.context.as_ref(), joiner.context.as_ref()],
