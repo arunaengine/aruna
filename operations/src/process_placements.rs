@@ -13,9 +13,10 @@ use thiserror::Error;
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    decode_placement, delete_placement_effect, new_placement, select_sync_peers, sort_node_ids,
-    write_placement_effect,
+    decode_placement, delete_placement_effect, new_placement, schedule_placement_retry_effect,
+    select_sync_peers, sort_node_ids, write_placement_effect,
 };
+use tracing::warn;
 
 const PENDING_PLACEMENT_PAGE_SIZE: usize = 256;
 
@@ -33,6 +34,7 @@ pub struct ProcessPlacementsOperation {
     records: Vec<PendingTopicPlacement>,
     next_start_after: Option<Key>,
     current: Option<CurrentPlacement>,
+    retry_needed: bool,
     output: Option<Result<(), PlacementError>>,
 }
 
@@ -43,6 +45,7 @@ enum PlacementState {
     ListPending,
     Publish,
     StorePlacement,
+    ScheduleRetry,
     Finish,
     Error,
 }
@@ -86,6 +89,7 @@ impl ProcessPlacementsOperation {
             records: Vec::new(),
             next_start_after: None,
             current: None,
+            retry_needed: false,
             output: None,
         }
     }
@@ -166,6 +170,7 @@ impl ProcessPlacementsOperation {
 
         self.state = PlacementState::StorePlacement;
         if current.selected_peers.len() >= current.desired_peer_count {
+            self.retry_needed = false;
             return smallvec![delete_placement_effect(&current.target)];
         }
 
@@ -174,6 +179,7 @@ impl ProcessPlacementsOperation {
             current.desired_peer_count,
             current.selected_peers,
         );
+        self.retry_needed = true;
         match write_placement_effect(&record) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(PlacementError::Placement(error.to_string())),
@@ -245,16 +251,39 @@ impl Operation for ProcessPlacementsOperation {
                 Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) => {
                     match result {
                         Ok(()) => self.emit_placement_update(),
-                        Err(error) => self.fail(PlacementError::DocumentSync(error)),
+                        Err(error) => {
+                            warn!(error = %error, "Document sync failed; keeping placement pending");
+                            if let Some(current) = self.current.as_mut() {
+                                current.newly_selected.clear();
+                            }
+                            self.emit_placement_update()
+                        }
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),
             },
             PlacementState::StorePlacement => match event {
                 Event::Storage(StorageEvent::WriteResult { .. })
-                | Event::Storage(StorageEvent::DeleteResult { .. }) => self.emit_next_record(),
+                | Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    if self.retry_needed {
+                        self.state = PlacementState::ScheduleRetry;
+                        smallvec![schedule_placement_retry_effect(
+                            self.config.realm_id,
+                            self.config.local_node_id,
+                        )]
+                    } else {
+                        self.emit_next_record()
+                    }
+                }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
+            },
+            PlacementState::ScheduleRetry => match event {
+                Event::Task(_) => {
+                    self.retry_needed = false;
+                    self.emit_next_record()
+                }
+                other => self.unexpected_event("task timer schedule result", format!("{other:?}")),
             },
             PlacementState::Init | PlacementState::Finish | PlacementState::Error => smallvec![],
         }

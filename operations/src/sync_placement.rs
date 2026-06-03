@@ -1,15 +1,19 @@
 use std::cmp::Ordering;
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
+use aruna_core::structs::RealmId;
+use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_secs;
 use byteview::ByteView;
 
 const SELECTOR_DOMAIN: &[u8] = b"aruna-sync-peer-v1";
 pub const DEFAULT_DOCUMENT_PEER_COUNT: usize = 3;
+pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 pub fn desired_peer_count(target: &DocumentSyncTarget) -> usize {
     match target {
@@ -85,6 +89,16 @@ pub fn delete_placement_effect(target: &DocumentSyncTarget) -> Effect {
         key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
         key: placement_key(target),
         txn_id: None,
+    })
+}
+
+pub fn schedule_placement_retry_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::SyncPlacements {
+            realm_id,
+            node_id: local_node_id,
+        },
+        after: SYNC_PLACEMENT_RETRY_AFTER,
     })
 }
 

@@ -8,12 +8,13 @@ use aruna_core::structs::{RealmConfigDocument, RealmId};
 use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    delete_placement_effect, desired_peer_count, new_placement, select_sync_peers, sort_node_ids,
-    write_placement_effect,
+    delete_placement_effect, desired_peer_count, new_placement, schedule_placement_retry_effect,
+    select_sync_peers, sort_node_ids, write_placement_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +32,7 @@ pub struct ReplicateDocumentsOperation {
     pending_documents: Vec<DocumentSyncTarget>,
     realm_nodes: Vec<NodeId>,
     placement_action: Option<PlacementAction>,
+    retry_needed: bool,
     output: Option<Result<(), ReplicateDocumentsError>>,
 }
 
@@ -40,6 +42,7 @@ enum ReplicateDocumentsState {
     LoadRealmConfig,
     Publish,
     StorePlacement,
+    ScheduleRetry,
     Finish,
     Error,
 }
@@ -98,6 +101,7 @@ impl ReplicateDocumentsOperation {
             state: ReplicateDocumentsState::Init,
             realm_nodes: Vec::new(),
             placement_action: None,
+            retry_needed: false,
             output: None,
         }
     }
@@ -177,11 +181,36 @@ impl ReplicateDocumentsOperation {
         self.state = ReplicateDocumentsState::StorePlacement;
         match action {
             PlacementAction::Write(record) => {
+                self.retry_needed = true;
                 Ok(smallvec![write_placement_effect(&record).map_err(
                     |error| ReplicateDocumentsError::Placement(error.to_string())
                 )?])
             }
-            PlacementAction::Delete(target) => Ok(smallvec![delete_placement_effect(&target)]),
+            PlacementAction::Delete(target) => {
+                self.retry_needed = false;
+                Ok(smallvec![delete_placement_effect(&target)])
+            }
+        }
+    }
+
+    fn emit_failed_publish_retry(&mut self, error: String) -> Effects {
+        let Some(action) = self.placement_action.take() else {
+            return self.fail(ReplicateDocumentsError::DocumentSync(error));
+        };
+        let target = match action {
+            PlacementAction::Write(record) => record.target,
+            PlacementAction::Delete(target) => target,
+        };
+        warn!(target = ?target, error = %error, "Document sync failed; queued placement retry");
+        let desired_count = desired_peer_count(&target);
+        self.placement_action = Some(PlacementAction::Write(new_placement(
+            target,
+            desired_count,
+            Vec::new(),
+        )));
+        match self.emit_placement_update() {
+            Ok(effects) => effects,
+            Err(error) => self.fail(error),
         }
     }
 }
@@ -231,16 +260,33 @@ impl Operation for ReplicateDocumentsOperation {
                             Ok(effects) => effects,
                             Err(error) => self.fail(error),
                         },
-                        Err(error) => self.fail(ReplicateDocumentsError::DocumentSync(error)),
+                        Err(error) => self.emit_failed_publish_retry(error),
                     }
                 }
                 other => self.unexpected_event("document sync result", format!("{other:?}")),
             },
             ReplicateDocumentsState::StorePlacement => match event {
                 Event::Storage(StorageEvent::WriteResult { .. })
-                | Event::Storage(StorageEvent::DeleteResult { .. }) => self.emit_next_publish(),
+                | Event::Storage(StorageEvent::DeleteResult { .. }) => {
+                    if self.retry_needed {
+                        self.state = ReplicateDocumentsState::ScheduleRetry;
+                        smallvec![schedule_placement_retry_effect(
+                            self.config.realm_id,
+                            self.config.local_node_id,
+                        )]
+                    } else {
+                        self.emit_next_publish()
+                    }
+                }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("placement storage result", format!("{other:?}")),
+            },
+            ReplicateDocumentsState::ScheduleRetry => match event {
+                Event::Task(_) => {
+                    self.retry_needed = false;
+                    self.emit_next_publish()
+                }
+                other => self.unexpected_event("task timer schedule result", format!("{other:?}")),
             },
             ReplicateDocumentsState::Init
             | ReplicateDocumentsState::Finish
