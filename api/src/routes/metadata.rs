@@ -1633,6 +1633,7 @@ mod tests {
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
     use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
     use serde_json::json;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -2148,12 +2149,13 @@ mod tests {
             None,
         )
         .unwrap();
+        let task_handle = TaskHandle::new();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
             metadata_handle: Some(metadata_handle),
-            task_handle: None,
+            task_handle: Some(task_handle),
         });
         let group_id = Ulid::new();
         let group_auth =
