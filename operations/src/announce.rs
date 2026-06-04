@@ -1,20 +1,22 @@
 use std::collections::VecDeque;
 
-use aruna_core::document::{DocumentSyncTarget, IrokleEvent};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
-use aruna_core::{IrokleEffect, NodeId, TopicId, USER_KEYSPACE};
+use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::document_repository;
-use crate::sync_placement::schedule_document_sync_effect;
+use crate::document_sync_outbox::{
+    new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect,
+};
 
 const USER_SYNC_PAGE_SIZE: usize = 256;
 
@@ -44,7 +46,7 @@ enum AnnounceTopicState {
     Init,
     ReadDocument,
     ListUsers,
-    Publish,
+    WriteOutbox,
     ScheduleSync,
     Finish,
     Error,
@@ -212,14 +214,19 @@ impl Operation for AnnounceTopicOperation {
                     let Some(bytes) = value else {
                         return self.next_effect();
                     };
-                    self.state = AnnounceTopicState::Publish;
-                    smallvec![Effect::Net(NetEffect::Irokle(
-                        IrokleEffect::PublishDocument {
-                            target: document,
+                    self.state = AnnounceTopicState::WriteOutbox;
+                    let record = new_outbox_record(
+                        self.local_node_id,
+                        document,
+                        self.peers.clone(),
+                        DocumentSyncOutboxEvent::Upsert {
                             bytes: bytes.to_vec(),
-                            peers: self.peers.clone(),
-                        }
-                    ))]
+                        },
+                    );
+                    match write_outbox_effect(&record) {
+                        Ok(effect) => smallvec![effect],
+                        Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
@@ -257,23 +264,26 @@ impl Operation for AnnounceTopicOperation {
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage iter result", format!("{other:?}")),
             },
-            AnnounceTopicState::Publish => match event {
-                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { target })) => {
+            AnnounceTopicState::WriteOutbox => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(document) = self.current.clone() else {
+                        return self.unexpected_event(
+                            "tracked document sync target",
+                            "missing current document".to_string(),
+                        );
+                    };
                     self.state = AnnounceTopicState::ScheduleSync;
-                    smallvec![schedule_document_sync_effect(
+                    let record = new_outbox_record(
                         self.local_node_id,
-                        target,
+                        document,
                         self.peers.clone(),
-                    )]
+                        DocumentSyncOutboxEvent::Upsert { bytes: Vec::new() },
+                    );
+                    smallvec![schedule_outbox_drain_effect(&record)]
                 }
-                Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
-                    self.fail(AnnounceTopicError::DocumentSync(error))
-                }
-                Event::Net(NetEvent::Error(error)) => {
-                    self.fail(AnnounceTopicError::DocumentSync(format!("{error:?}")))
-                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
-                    self.unexpected_event("irokle document publish result", format!("{other:?}"))
+                    self.unexpected_event("document sync outbox write result", format!("{other:?}"))
                 }
             },
             AnnounceTopicState::ScheduleSync => match event {

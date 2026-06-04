@@ -46,6 +46,31 @@ pub struct PendingTopicPlacement {
     pub updated_at: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentSyncOutboxRecord {
+    pub outbox_id: Ulid,
+    pub node_id: NodeId,
+    pub target: DocumentSyncTarget,
+    pub peers: Vec<NodeId>,
+    pub event: DocumentSyncOutboxEvent,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DocumentSyncOutboxEvent {
+    Upsert { bytes: Vec<u8> },
+    Delete,
+}
+
+impl DocumentSyncOutboxEvent {
+    pub fn kind(&self) -> &'static [u8] {
+        match self {
+            Self::Upsert { .. } => b"upsert",
+            Self::Delete => b"delete",
+        }
+    }
+}
+
 impl DocumentSyncTarget {
     pub fn topic_id(&self) -> TopicId {
         match self {

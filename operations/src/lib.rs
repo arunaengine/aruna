@@ -19,6 +19,7 @@ pub mod create_token;
 pub mod delete_metadata_document;
 pub mod delete_onboarding_secret;
 pub mod document_repository;
+pub mod document_sync_outbox;
 pub mod driver;
 pub mod ensure_realm_config;
 pub mod get_group;

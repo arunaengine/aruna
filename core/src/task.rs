@@ -21,6 +21,9 @@ pub enum TaskKey {
         target: DocumentSyncTarget,
         peers: Vec<NodeId>,
     },
+    DrainDocumentSyncOutbox {
+        prefix: Vec<u8>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

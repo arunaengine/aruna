@@ -1,7 +1,6 @@
-use aruna_core::IrokleEffect;
-use aruna_core::document::{DocumentSyncTarget, IrokleEvent};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{
     MetadataEffect, MetadataError, MetadataEvent, MetadataGraphLifecycleRecord,
 };
@@ -14,11 +13,13 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
+use crate::document_sync_outbox::{
+    new_outbox_record, schedule_outbox_drain_effect, write_outbox_effect_with_txn,
+};
 use crate::metadata::repository::{
     StorageReadError, delete_document_index_effect, delete_holders_effect, delete_registry_effect,
     parse_registry_read, read_registry_effect, write_audit_effect, write_graph_lifecycle_effect,
 };
-use crate::sync_placement::schedule_document_sync_effect;
 
 #[derive(Debug, PartialEq)]
 pub struct DeleteMetadataDocumentOperation {
@@ -42,11 +43,11 @@ enum DeleteMetadataDocumentState {
     DeleteDocumentIndex,
     DeleteHolders,
     WriteAudit,
+    WriteGraphLifecycleOutbox,
+    WriteDeleteOutbox,
     CommitTransaction,
     PruneGraph,
-    SyncGraphLifecycleDelete,
     ScheduleGraphLifecycleSync,
-    SyncDelete,
     ScheduleDeleteSync,
     Finish,
     Error,
@@ -113,24 +114,28 @@ impl DeleteMetadataDocumentOperation {
         )
     }
 
-    fn graph_lifecycle_sync_effect(
+    fn graph_lifecycle_outbox_effect(
         &self,
         record: &MetadataRegistryRecord,
+        txn_id: Ulid,
     ) -> Result<Effects, DeleteMetadataDocumentError> {
         let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
             return Err(DeleteMetadataDocumentError::DocumentNotFound);
         };
         let bytes = postcard::to_allocvec(lifecycle_record)
             .map_err(|error| DeleteMetadataDocumentError::ConversionError(error.into()))?;
-        Ok(smallvec![Effect::Net(NetEffect::Irokle(
-            IrokleEffect::PublishDocument {
-                target: DocumentSyncTarget::MetadataGraphLifecycle {
-                    graph_iri: lifecycle_record.graph_iri.clone(),
-                },
-                bytes,
-                peers: record.holder_node_ids.clone(),
+        let outbox = new_outbox_record(
+            self.actor.node_id,
+            DocumentSyncTarget::MetadataGraphLifecycle {
+                graph_iri: lifecycle_record.graph_iri.clone(),
             },
-        ))])
+            record.holder_node_ids.clone(),
+            DocumentSyncOutboxEvent::Upsert { bytes },
+        );
+        Ok(smallvec![
+            write_outbox_effect_with_txn(&outbox, Some(txn_id))
+                .map_err(|error| { DeleteMetadataDocumentError::ConversionError(error.into()) })?
+        ])
     }
 
     fn graph_lifecycle_schedule_effect(
@@ -140,36 +145,48 @@ impl DeleteMetadataDocumentOperation {
         let Some(lifecycle_record) = self.lifecycle_record.as_ref() else {
             return Err(DeleteMetadataDocumentError::DocumentNotFound);
         };
-        Ok(smallvec![schedule_document_sync_effect(
+        let outbox = new_outbox_record(
             self.actor.node_id,
             DocumentSyncTarget::MetadataGraphLifecycle {
                 graph_iri: lifecycle_record.graph_iri.clone(),
             },
             record.holder_node_ids.clone(),
-        )])
+            DocumentSyncOutboxEvent::Upsert { bytes: Vec::new() },
+        );
+        Ok(smallvec![schedule_outbox_drain_effect(&outbox)])
     }
 
-    fn registry_delete_sync_effect(&self, record: &MetadataRegistryRecord) -> Effects {
-        smallvec![Effect::Net(NetEffect::Irokle(
-            IrokleEffect::DeleteDocument {
-                target: DocumentSyncTarget::MetadataRegistry {
-                    group_id: record.group_id,
-                    document_id: record.document_id,
-                },
-                peers: record.holder_node_ids.clone(),
-            }
-        ))]
-    }
-
-    fn registry_delete_schedule_effect(&self, record: &MetadataRegistryRecord) -> Effects {
-        smallvec![schedule_document_sync_effect(
+    fn registry_delete_outbox_effect(
+        &self,
+        record: &MetadataRegistryRecord,
+        txn_id: Ulid,
+    ) -> Result<Effects, DeleteMetadataDocumentError> {
+        let outbox = new_outbox_record(
             self.actor.node_id,
             DocumentSyncTarget::MetadataRegistry {
                 group_id: record.group_id,
                 document_id: record.document_id,
             },
             record.holder_node_ids.clone(),
-        )]
+            DocumentSyncOutboxEvent::Delete,
+        );
+        Ok(smallvec![
+            write_outbox_effect_with_txn(&outbox, Some(txn_id))
+                .map_err(|error| { DeleteMetadataDocumentError::ConversionError(error.into()) })?
+        ])
+    }
+
+    fn registry_delete_schedule_effect(&self, record: &MetadataRegistryRecord) -> Effects {
+        let outbox = new_outbox_record(
+            self.actor.node_id,
+            DocumentSyncTarget::MetadataRegistry {
+                group_id: record.group_id,
+                document_id: record.document_id,
+            },
+            record.holder_node_ids.clone(),
+            DocumentSyncOutboxEvent::Delete,
+        );
+        smallvec![schedule_outbox_drain_effect(&outbox)]
     }
 
     fn fail(&mut self, error: DeleteMetadataDocumentError) -> Effects {
@@ -300,11 +317,55 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(txn_id) = self.txn_id else {
                         return self.fail(DeleteMetadataDocumentError::MissingTransaction);
                     };
-                    self.state = DeleteMetadataDocumentState::CommitTransaction;
-                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::WriteGraphLifecycleOutbox;
+                    match self.graph_lifecycle_outbox_effect(record, txn_id) {
+                        Ok(effects) => effects,
+                        Err(error) => self.fail(error),
+                    }
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("audit write result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::WriteGraphLifecycleOutbox => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
+                    let Some(record) = self.record.as_ref() else {
+                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
+                    };
+                    self.state = DeleteMetadataDocumentState::WriteDeleteOutbox;
+                    match self.registry_delete_outbox_effect(record, txn_id) {
+                        Ok(effects) => effects,
+                        Err(error) => self.fail(error),
+                    }
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
+                        "metadata graph tombstone outbox write failed: {error}"
+                    )))
+                }
+                other => self
+                    .unexpected_event("graph lifecycle outbox write result", format!("{other:?}")),
+            },
+            DeleteMetadataDocumentState::WriteDeleteOutbox => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {
+                    let Some(txn_id) = self.txn_id else {
+                        return self.fail(DeleteMetadataDocumentError::MissingTransaction);
+                    };
+                    self.state = DeleteMetadataDocumentState::CommitTransaction;
+                    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                }
+                Event::Storage(StorageEvent::Error { error }) => {
+                    self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
+                        "metadata registry delete outbox write failed: {error}"
+                    )))
+                }
+                other => self
+                    .unexpected_event("document delete outbox write result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::CommitTransaction => match event {
                 Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
@@ -328,16 +389,10 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
-                    self.state = DeleteMetadataDocumentState::SyncGraphLifecycleDelete;
-                    let effects = match self.graph_lifecycle_sync_effect(record) {
+                    self.state = DeleteMetadataDocumentState::ScheduleGraphLifecycleSync;
+                    match self.graph_lifecycle_schedule_effect(record) {
                         Ok(effects) => effects,
-                        Err(error) => return self.fail(error),
-                    };
-                    if effects.is_empty() {
-                        self.state = DeleteMetadataDocumentState::SyncDelete;
-                        self.registry_delete_sync_effect(record)
-                    } else {
-                        effects
+                        Err(error) => self.fail(error),
                     }
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
@@ -345,50 +400,21 @@ impl Operation for DeleteMetadataDocumentOperation {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
-                    self.state = DeleteMetadataDocumentState::SyncGraphLifecycleDelete;
-                    let effects = match self.graph_lifecycle_sync_effect(record) {
-                        Ok(effects) => effects,
-                        Err(error) => return self.fail(error),
-                    };
-                    if effects.is_empty() {
-                        self.state = DeleteMetadataDocumentState::SyncDelete;
-                        self.registry_delete_sync_effect(record)
-                    } else {
-                        effects
-                    }
-                }
-                other => self.unexpected_event("metadata graph prune result", format!("{other:?}")),
-            },
-            DeleteMetadataDocumentState::SyncGraphLifecycleDelete => match event {
-                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { .. })) => {
-                    let Some(record) = self.record.as_ref() else {
-                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
-                    };
                     self.state = DeleteMetadataDocumentState::ScheduleGraphLifecycleSync;
                     match self.graph_lifecycle_schedule_effect(record) {
                         Ok(effects) => effects,
-                        Err(error) => return self.fail(error),
+                        Err(error) => self.fail(error),
                     }
                 }
-                Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
-                    self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
-                        "metadata graph tombstone local publish failed: {error}"
-                    )))
-                }
-                Event::Net(NetEvent::Error(error)) => {
-                    self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
-                        "metadata graph tombstone local publish failed: {error:?}"
-                    )))
-                }
-                other => self.unexpected_event("graph lifecycle sync result", format!("{other:?}")),
+                other => self.unexpected_event("metadata graph prune result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::ScheduleGraphLifecycleSync => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
                     let Some(record) = self.record.as_ref() else {
                         return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
                     };
-                    self.state = DeleteMetadataDocumentState::SyncDelete;
-                    self.registry_delete_sync_effect(record)
+                    self.state = DeleteMetadataDocumentState::ScheduleDeleteSync;
+                    self.registry_delete_schedule_effect(record)
                 }
                 Event::Task(TaskEvent::Error { message, .. }) => {
                     self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
@@ -397,26 +423,6 @@ impl Operation for DeleteMetadataDocumentOperation {
                 }
                 other => self
                     .unexpected_event("metadata graph sync timer schedule", format!("{other:?}")),
-            },
-            DeleteMetadataDocumentState::SyncDelete => match event {
-                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentDeleted { .. })) => {
-                    let Some(record) = self.record.as_ref() else {
-                        return self.fail(DeleteMetadataDocumentError::DocumentNotFound);
-                    };
-                    self.state = DeleteMetadataDocumentState::ScheduleDeleteSync;
-                    self.registry_delete_schedule_effect(record)
-                }
-                Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
-                    self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
-                        "metadata registry local delete publish failed: {error}"
-                    )))
-                }
-                Event::Net(NetEvent::Error(error)) => {
-                    self.fail(DeleteMetadataDocumentError::SyncDelete(format!(
-                        "metadata registry local delete publish failed: {error:?}"
-                    )))
-                }
-                other => self.unexpected_event("document delete sync result", format!("{other:?}")),
             },
             DeleteMetadataDocumentState::ScheduleDeleteSync => match event {
                 Event::Task(TaskEvent::TimerScheduled { .. }) => {
