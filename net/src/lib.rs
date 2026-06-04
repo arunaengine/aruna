@@ -43,6 +43,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, debug, warn};
 
+pub use ::irokle::net::IrohRuntimeConfig;
 pub use connection_pool::Monitor;
 pub use dht::DhtHandle;
 pub use error::{NetError, Result};
@@ -66,6 +67,7 @@ pub struct NetConfig {
     pub max_concurrent_uni_streams: Option<u64>,
     pub max_concurrent_bidi_streams: Option<u64>,
     pub irokle_storage_path: Option<PathBuf>,
+    pub irokle_runtime: Option<IrohRuntimeConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,6 +269,7 @@ impl Default for NetConfig {
             max_concurrent_bidi_streams: None,
             max_concurrent_uni_streams: None,
             irokle_storage_path: None,
+            irokle_runtime: None,
         }
     }
 }
@@ -526,6 +529,7 @@ impl NetHandle {
             irokle_path,
             &realm_peer_nodes,
             app_alpns,
+            config.irokle_runtime.unwrap_or_default(),
         )?);
 
         let streams = Arc::new(StreamsService::new(

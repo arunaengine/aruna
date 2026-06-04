@@ -62,6 +62,7 @@ impl IrokleService {
         storage_path: impl AsRef<Path>,
         peer_nodes: &[NodeId],
         alpns: Vec<Vec<u8>>,
+        runtime: irokle_crate::net::IrohRuntimeConfig,
     ) -> Result<Self> {
         let storage_path = storage_path.as_ref().to_path_buf();
         let default_peers: BTreeSet<PeerId> = peer_nodes.iter().map(node_id_to_peer_id).collect();
@@ -73,8 +74,13 @@ impl IrokleService {
             .build()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let net = Arc::new(
-            irokle_crate::net::IrohNet::new_with_alpns(endpoint, node.clone(), alpns)
-                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            irokle_crate::net::IrohNet::new_with_alpns_and_config(
+                endpoint,
+                node.clone(),
+                alpns,
+                runtime,
+            )
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
         );
         net.start_configured_resync_loop()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -270,6 +276,7 @@ impl IrokleService {
         oplog
             .create_event_op(topic_id, actor_id, envelope, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.net.schedule_topic_recheck(topic_id)?;
         Ok(())
     }
 
@@ -310,6 +317,7 @@ impl IrokleService {
                         )
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
                 }
+                self.net.schedule_topic_recheck(topic_id)?;
             }
             return Ok(topic_id);
         }
@@ -324,6 +332,7 @@ impl IrokleService {
         oplog
             .create_topic_genesis(topic_id, actor_id, genesis, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.net.schedule_topic_recheck(topic_id)?;
         Ok(topic_id)
     }
 
@@ -494,6 +503,7 @@ impl IrokleService {
         .map_err(NetError::from)?;
 
         let mut followup = vec![SyncMessage::Open(self.node.sync_open(topic_id))];
+        let mut received_data = false;
         for response in responses {
             match response {
                 SyncMessage::Summary(summary) if summary.topic_id == topic_id => {}
@@ -502,6 +512,7 @@ impl IrokleService {
                         .node
                         .receive_sync_data_from(peer, data)
                         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                    received_data = true;
                     followup.push(SyncMessage::Ack(ack));
                 }
                 other => {
@@ -510,6 +521,9 @@ impl IrokleService {
                     )));
                 }
             }
+        }
+        if received_data {
+            self.net.schedule_topic_recheck(topic_id)?;
         }
         if followup.len() > 1 {
             let responses = timeout(

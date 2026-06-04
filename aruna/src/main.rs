@@ -64,6 +64,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
             irokle_storage_path: Some(config.irokle_storage_path.clone()),
+            irokle_runtime: Some(config.irokle_runtime),
         },
         storage_handle.clone(),
     )

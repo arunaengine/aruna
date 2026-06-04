@@ -14,7 +14,9 @@ use aruna_core::structs::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
 };
 use aruna_core::util::unix_timestamp_secs;
-use aruna_net::{DiscoveryMethod, RelayMethod, endpoint_addr_from_config_string};
+use aruna_net::{
+    DiscoveryMethod, IrohRuntimeConfig, RelayMethod, endpoint_addr_from_config_string,
+};
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
 use byteview::ByteView;
@@ -61,6 +63,7 @@ pub struct Config {
     pub net_secret_key: iroh::SecretKey,
     pub peer_nodes: Vec<iroh::PublicKey>,
     pub peer_endpoints: Vec<EndpointAddr>,
+    pub irokle_runtime: IrohRuntimeConfig,
     pub temporary_bootstrap_active: bool,
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
@@ -193,6 +196,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let irokle_storage_path = dotenvy::var("IROKLE_STORAGE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(format!("{storage_path}/irokle")));
+    let irokle_runtime = load_irokle_runtime_config()?;
     let blob_root =
         dotenvy::var("BLOB_ROOT").unwrap_or_else(|_| format!("{storage_path}/blobstore"));
     let blob_bucket_prefix = dotenvy::var("BLOB_BUCKET_PREFIX").ok();
@@ -342,6 +346,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             net_secret_key,
             peer_nodes,
             peer_endpoints,
+            irokle_runtime,
             temporary_bootstrap_active,
             discovery_method,
             relay_method,
@@ -381,6 +386,41 @@ fn parse_list_env(key: &str) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+fn load_irokle_runtime_config() -> Result<IrohRuntimeConfig, SetupError> {
+    let default = IrohRuntimeConfig::default();
+    Ok(IrohRuntimeConfig {
+        connect_timeout: duration_secs_env("IROKLE_CONNECT_TIMEOUT_SECS", default.connect_timeout)?,
+        sync_io_timeout: duration_secs_env("IROKLE_SYNC_IO_TIMEOUT_SECS", default.sync_io_timeout)?,
+        resync_interval: duration_secs_env("IROKLE_RESYNC_INTERVAL_SECS", default.resync_interval)?,
+        resync_initial_backoff: duration_secs_env(
+            "IROKLE_RESYNC_INITIAL_BACKOFF_SECS",
+            default.resync_initial_backoff,
+        )?,
+        resync_max_backoff: duration_secs_env(
+            "IROKLE_RESYNC_MAX_BACKOFF_SECS",
+            default.resync_max_backoff,
+        )?,
+        full_sweep_interval: duration_secs_env(
+            "IROKLE_FULL_SWEEP_INTERVAL_SECS",
+            default.full_sweep_interval,
+        )?,
+        full_sweep_time_of_day: duration_secs_env(
+            "IROKLE_FULL_SWEEP_TIME_OF_DAY_SECS",
+            default.full_sweep_time_of_day,
+        )?,
+    })
+}
+
+fn duration_secs_env(key: &'static str, default: Duration) -> Result<Duration, SetupError> {
+    let Some(value) = dotenvy::var(key).ok() else {
+        return Ok(default);
+    };
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|error| invalid_config_value(key, value, error))?;
+    Ok(Duration::from_secs(seconds))
 }
 
 fn load_oidc_providers_from_env() -> Result<Vec<OidcProviderConfig>, SetupError> {
