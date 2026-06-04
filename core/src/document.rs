@@ -154,13 +154,15 @@ fn metadata_graph_lifecycle_topic_id(graph_iri: &str) -> Ulid {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, irokle::Event)]
-#[irokle(type_id = "aruna.document.v1")]
+#[irokle(type_id = "aruna.document.v2")]
 pub enum DocumentSyncEvent {
     Upsert {
+        event_id: Ulid,
         target: DocumentSyncTarget,
         bytes: Vec<u8>,
     },
     Delete {
+        event_id: Ulid,
         target: DocumentSyncTarget,
     },
 }
@@ -168,7 +170,13 @@ pub enum DocumentSyncEvent {
 impl DocumentSyncEvent {
     pub fn target(&self) -> &DocumentSyncTarget {
         match self {
-            Self::Upsert { target, .. } | Self::Delete { target } => target,
+            Self::Upsert { target, .. } | Self::Delete { target, .. } => target,
+        }
+    }
+
+    pub fn event_id(&self) -> Ulid {
+        match self {
+            Self::Upsert { event_id, .. } | Self::Delete { event_id, .. } => *event_id,
         }
     }
 }
@@ -176,11 +184,13 @@ impl DocumentSyncEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IrokleEffect {
     PublishDocument {
+        event_id: Ulid,
         target: DocumentSyncTarget,
         bytes: Vec<u8>,
         peers: Vec<NodeId>,
     },
     DeleteDocument {
+        event_id: Ulid,
         target: DocumentSyncTarget,
         peers: Vec<NodeId>,
     },

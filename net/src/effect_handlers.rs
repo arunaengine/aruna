@@ -21,13 +21,20 @@ pub async fn handle_net_effect(
         NetEffect::Dht(dht_effect) => handle_dht_effect(dht, dht_effect).await,
         NetEffect::Irokle(irokle_effect) => match irokle_effect {
             aruna_core::IrokleEffect::PublishDocument {
+                event_id,
                 target,
                 bytes,
                 peers,
-            } => NetEvent::Irokle(irokle.publish_document(target, bytes, peers).await),
-            aruna_core::IrokleEffect::DeleteDocument { target, peers } => {
-                NetEvent::Irokle(irokle.delete_document(target, peers).await)
-            }
+            } => NetEvent::Irokle(
+                irokle
+                    .publish_document(event_id, target, bytes, peers)
+                    .await,
+            ),
+            aruna_core::IrokleEffect::DeleteDocument {
+                event_id,
+                target,
+                peers,
+            } => NetEvent::Irokle(irokle.delete_document(event_id, target, peers).await),
             aruna_core::IrokleEffect::SyncDocument { target, peers } => {
                 NetEvent::Irokle(irokle.sync_document_event(target, peers).await)
             }

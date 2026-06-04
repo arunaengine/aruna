@@ -88,11 +88,13 @@ impl OperationsTaskHandler {
 
         let local_effect = match record.event.clone() {
             DocumentSyncOutboxEvent::Upsert { bytes } => IrokleEffect::PublishDocument {
+                event_id: record.outbox_id,
                 target: record.target.clone(),
                 bytes,
                 peers: record.peers.clone(),
             },
             DocumentSyncOutboxEvent::Delete => IrokleEffect::DeleteDocument {
+                event_id: record.outbox_id,
                 target: record.target.clone(),
                 peers: record.peers.clone(),
             },

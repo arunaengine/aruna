@@ -28,6 +28,7 @@ use parking_lot::RwLock;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, warn};
+use ulid::Ulid;
 
 use crate::error::{NetError, Result};
 use crate::streams::BiStream;
@@ -162,11 +163,13 @@ impl IrokleService {
 
     pub async fn publish_document(
         &self,
+        event_id: Ulid,
         target: DocumentSyncTarget,
         bytes: Vec<u8>,
         peers: Vec<NodeId>,
     ) -> IrokleEvent {
         let event = DocumentSyncEvent::Upsert {
+            event_id,
             target: target.clone(),
             bytes,
         };
@@ -181,10 +184,12 @@ impl IrokleService {
 
     pub async fn delete_document(
         &self,
+        event_id: Ulid,
         target: DocumentSyncTarget,
         peers: Vec<NodeId>,
     ) -> IrokleEvent {
         let event = DocumentSyncEvent::Delete {
+            event_id,
             target: target.clone(),
         };
         match self.publish_event(event, peers).await {
@@ -555,6 +560,7 @@ impl IrokleService {
                 let event = envelope
                     .decode_event::<DocumentSyncEvent>()
                     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                let event_id = event.event_id();
                 let target_topic_id = event.target().irokle_topic_id();
                 if target_topic_id != topic.topic_id {
                     warn!(
@@ -565,7 +571,12 @@ impl IrokleService {
                     self.mark_applied(op.id).await?;
                     continue;
                 }
+                if self.has_applied_event(event_id).await? {
+                    self.mark_applied(op.id).await?;
+                    continue;
+                }
                 self.apply_document_event(event).await?;
+                self.mark_applied_event(event_id).await?;
                 self.mark_applied(op.id).await?;
                 applied += 1;
             }
@@ -575,8 +586,10 @@ impl IrokleService {
 
     async fn apply_document_event(&self, event: DocumentSyncEvent) -> Result<()> {
         match event {
-            DocumentSyncEvent::Upsert { target, bytes } => self.apply_upsert(target, bytes).await,
-            DocumentSyncEvent::Delete { target } => self.apply_delete(target).await,
+            DocumentSyncEvent::Upsert { target, bytes, .. } => {
+                self.apply_upsert(target, bytes).await
+            }
+            DocumentSyncEvent::Delete { target, .. } => self.apply_delete(target).await,
         }
     }
 
@@ -783,6 +796,33 @@ impl IrokleService {
         .await
     }
 
+    async fn has_applied_event(&self, event_id: Ulid) -> Result<bool> {
+        match self
+            .storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: IROKLE_APPLIED_OPS_KEYSPACE.to_string(),
+                key: applied_event_key(event_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
+            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+            other => Err(NetError::Dht(format!(
+                "unexpected storage event while reading applied document sync event: {other:?}"
+            ))),
+        }
+    }
+
+    async fn mark_applied_event(&self, event_id: Ulid) -> Result<()> {
+        self.storage_write(
+            IROKLE_APPLIED_OPS_KEYSPACE.to_string(),
+            applied_event_key(event_id),
+            ByteView::from(vec![1u8]),
+        )
+        .await
+    }
+
     async fn storage_write(&self, key_space: String, key: ByteView, value: Value) -> Result<()> {
         match self
             .storage
@@ -857,6 +897,12 @@ impl IrokleService {
 
 fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
+}
+
+fn applied_event_key(event_id: Ulid) -> ByteView {
+    let mut key = b"document-sync-event/".to_vec();
+    key.extend_from_slice(&event_id.to_bytes());
+    ByteView::from(key)
 }
 
 fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
