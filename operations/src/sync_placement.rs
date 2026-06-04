@@ -22,6 +22,10 @@ pub fn desired_peer_count(target: &DocumentSyncTarget) -> usize {
     }
 }
 
+pub fn desired_remote_peer_count(desired_peer_count: usize) -> usize {
+    desired_peer_count.saturating_sub(1)
+}
+
 pub fn select_sync_peers(
     target: &DocumentSyncTarget,
     local_node_id: NodeId,
@@ -83,7 +87,11 @@ pub fn new_placement(
 pub fn missing_peer_count(record: &PendingTopicPlacement) -> usize {
     record
         .desired_peer_count
-        .saturating_sub(record.selected_peers.len())
+        .saturating_sub(record.selected_peers.len().saturating_add(1))
+}
+
+pub fn placement_satisfied(selected_peer_count: usize, desired_peer_count: usize) -> bool {
+    selected_peer_count.saturating_add(1) >= desired_peer_count
 }
 
 pub fn write_placement_effect(record: &PendingTopicPlacement) -> Result<Effect, postcard::Error> {
@@ -211,6 +219,19 @@ mod tests {
 
         assert_eq!(placement.realm_id, realm_id);
         assert_eq!(placement.selected_peers, vec![peer]);
-        assert_eq!(missing_peer_count(&placement), 2);
+        assert_eq!(missing_peer_count(&placement), 1);
+    }
+
+    #[test]
+    fn placement_counts_local_node_toward_desired_peer_count() {
+        let realm_id = RealmId::from_bytes([4u8; 32]);
+        let placement = new_placement(realm_id, target(), 3, vec![node(5), node(6)]);
+
+        assert_eq!(desired_remote_peer_count(DEFAULT_DOCUMENT_PEER_COUNT), 2);
+        assert_eq!(missing_peer_count(&placement), 0);
+        assert!(placement_satisfied(
+            placement.selected_peers.len(),
+            placement.desired_peer_count
+        ));
     }
 }

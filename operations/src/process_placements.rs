@@ -15,7 +15,8 @@ use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
     decode_placement, delete_placement_effect, missing_peer_count, new_placement, placement_prefix,
-    schedule_placement_retry_effect, select_sync_peers, sort_node_ids, write_placement_effect,
+    placement_satisfied, schedule_placement_retry_effect, select_sync_peers, sort_node_ids,
+    write_placement_effect,
 };
 use tracing::warn;
 
@@ -178,7 +179,7 @@ impl ProcessPlacementsOperation {
         sort_node_ids(&mut current.selected_peers);
 
         self.state = PlacementState::StorePlacement;
-        if current.selected_peers.len() >= current.desired_peer_count {
+        if placement_satisfied(current.selected_peers.len(), current.desired_peer_count) {
             self.retry_needed = false;
             return smallvec![delete_placement_effect(
                 self.config.realm_id,
@@ -323,9 +324,16 @@ impl Operation for ProcessPlacementsOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn group_target(seed: u8) -> DocumentSyncTarget {
+        DocumentSyncTarget::Group {
+            group_id: Ulid::from_bytes([seed; 16]),
+        }
     }
 
     #[test]
@@ -346,5 +354,30 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(operation.state, PlacementState::Finish);
         assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn two_remote_peers_complete_existing_default_pending_placement() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let target = group_target(4);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(1),
+        });
+        operation.current = Some(CurrentPlacement {
+            target: target.clone(),
+            desired_peer_count: 3,
+            selected_peers: vec![node(2), node(3)],
+            newly_selected: Vec::new(),
+        });
+
+        let effects = operation.emit_placement_update();
+
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
+                if key_space == SYNC_PLACEMENT_KEYSPACE
+        ));
+        assert!(!operation.retry_needed);
     }
 }
