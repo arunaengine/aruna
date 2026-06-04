@@ -16,6 +16,7 @@ use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
 };
 use aruna_storage::FjallStorage;
+use aruna_tasks::TaskHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -175,7 +176,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         net_handle: Some(net_handle),
         blob_handle: None,
         metadata_handle: Some(metadata_handle),
-        task_handle: None,
+        task_handle: Some(TaskHandle::new()),
     });
     Ok(TestContext {
         _storage_dir: storage_dir,
