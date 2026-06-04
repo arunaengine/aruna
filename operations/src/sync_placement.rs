@@ -13,6 +13,7 @@ use byteview::ByteView;
 
 const SELECTOR_DOMAIN: &[u8] = b"aruna-sync-peer-v1";
 pub const DEFAULT_DOCUMENT_PEER_COUNT: usize = 3;
+pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 pub fn desired_peer_count(target: &DocumentSyncTarget) -> usize {
@@ -92,6 +93,22 @@ pub fn missing_peer_count(record: &PendingTopicPlacement) -> usize {
 
 pub fn placement_satisfied(selected_peer_count: usize, desired_peer_count: usize) -> bool {
     selected_peer_count.saturating_add(1) >= desired_peer_count
+}
+
+pub fn schedule_document_sync_effect(
+    node_id: NodeId,
+    target: DocumentSyncTarget,
+    mut peers: Vec<NodeId>,
+) -> Effect {
+    sort_node_ids(&mut peers);
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::SyncDocument {
+            node_id,
+            target,
+            peers,
+        },
+        after: Duration::ZERO,
+    })
 }
 
 pub fn write_placement_effect(record: &PendingTopicPlacement) -> Result<Effect, postcard::Error> {

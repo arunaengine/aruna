@@ -367,13 +367,7 @@ impl Operation for UpdateMetadataDocumentOperation {
                             smallvec![]
                         }
                         Err(error) => {
-                            warn!(error = %error, "Failed to announce metadata registry; update remains committed");
-                            let Some(record) = self.record.clone() else {
-                                return self.fail(UpdateMetadataDocumentError::MissingTransaction);
-                            };
-                            self.state = UpdateMetadataDocumentState::Finish;
-                            self.output = Some(Ok(record));
-                            smallvec![]
+                            self.fail(UpdateMetadataDocumentError::TopicAnnouncement(error))
                         }
                     }
                 }

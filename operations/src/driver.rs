@@ -18,7 +18,7 @@ use crate::metadata::MetadataHandle;
 use crate::task_persistence::persist_task_effect;
 use aruna_core::events::NetError;
 use aruna_core::metadata::{MetadataError, MetadataEvent};
-use aruna_core::task::TaskEvent;
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::{IrokleEffect, IrokleEvent};
 
 #[derive(Clone, Debug)]
@@ -158,7 +158,12 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
             }
         }
         Effect::Task(task_effect) => {
-            persist_task_effect(&context.storage_handle, &task_effect).await;
+            if let Err(message) = persist_task_effect(&context.storage_handle, &task_effect).await {
+                return Event::Task(TaskEvent::Error {
+                    key: task_effect_key(&task_effect),
+                    message,
+                });
+            }
             if let Some(task_handle) = &context.task_handle {
                 task_handle.send_effect(Effect::Task(task_effect)).await
             } else {
@@ -194,6 +199,15 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
     }
 
     event
+}
+
+fn task_effect_key(effect: &TaskEffect) -> Option<TaskKey> {
+    match effect {
+        TaskEffect::ResetTimer { key, .. }
+        | TaskEffect::ShortenTimer { key, .. }
+        | TaskEffect::CancelTimer { key }
+        | TaskEffect::AbortRunningHandlers { key } => Some(key.clone()),
+    }
 }
 
 fn drive_suboperation<'a>(

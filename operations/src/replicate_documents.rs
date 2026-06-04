@@ -14,8 +14,9 @@ use tracing::warn;
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    delete_placement_effect, desired_peer_count, new_placement, schedule_placement_retry_effect,
-    select_sync_peers, sort_node_ids, write_placement_effect,
+    delete_placement_effect, desired_peer_count, desired_remote_peer_count, new_placement,
+    placement_satisfied, schedule_placement_retry_effect, select_sync_peers, sort_node_ids,
+    write_placement_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,23 +137,24 @@ impl ReplicateDocumentsOperation {
         if desired_count == 0 {
             return self.emit_next_publish();
         }
+        let desired_remote_count = desired_remote_peer_count(desired_count);
 
         let selected_peers = select_sync_peers(
             &document,
             self.config.local_node_id,
             &self.realm_nodes,
             &self.config.excluded_peers,
-            desired_count,
+            desired_remote_count,
         );
-        self.placement_action = if selected_peers.len() < desired_count {
+        self.placement_action = if placement_satisfied(selected_peers.len(), desired_count) {
+            Some(PlacementAction::Delete(document.clone()))
+        } else {
             Some(PlacementAction::Write(new_placement(
                 self.config.realm_id,
                 document.clone(),
                 desired_count,
                 selected_peers.clone(),
             )))
-        } else {
-            Some(PlacementAction::Delete(document.clone()))
         };
 
         if selected_peers.is_empty() {
@@ -325,9 +327,16 @@ impl Operation for ReplicateDocumentsOperation {
 mod tests {
     use super::*;
     use aruna_core::task::TaskEvent;
+    use ulid::Ulid;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn group_target(seed: u8) -> DocumentSyncTarget {
+        DocumentSyncTarget::Group {
+            group_id: Ulid::from_bytes([seed; 16]),
+        }
     }
 
     #[test]
@@ -350,5 +359,24 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(operation.state, ReplicateDocumentsState::Finish);
         assert_eq!(operation.finalize(), Ok(()));
+    }
+
+    #[test]
+    fn two_remote_peers_satisfy_default_document_placement() {
+        let target = group_target(4);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id: RealmId::from_bytes([7u8; 32]),
+            local_node_id: node(1),
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+        });
+        operation.realm_nodes = vec![node(2), node(3)];
+
+        let effects = operation.emit_next_publish();
+
+        assert!(
+            matches!(operation.placement_action, Some(PlacementAction::Delete(ref delete_target)) if *delete_target == target)
+        );
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
     }
 }

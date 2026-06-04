@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use aruna_core::effects::Effect;
-use aruna_core::events::Event;
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::events::{Event, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::{IrokleEffect, IrokleEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use tracing::{error, warn};
@@ -13,7 +14,7 @@ use crate::announce_realm_presence::{
 };
 use crate::driver::{DriverContext, drive};
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
-use crate::sync_placement::SYNC_PLACEMENT_RETRY_AFTER;
+use crate::sync_placement::{DOCUMENT_SYNC_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER};
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
@@ -33,7 +34,10 @@ impl OperationsTaskHandler {
             key: key.clone(),
             after,
         };
-        persist_task_effect(&self.context.storage_handle, &effect).await;
+        if let Err(message) = persist_task_effect(&self.context.storage_handle, &effect).await {
+            warn!(key = ?key, message = %message, "Failed to persist timer re-arm");
+            return;
+        }
         let Some(task_handle) = self.context.task_handle.as_ref() else {
             warn!(key = ?key, "Cannot re-arm failed timer without task handle");
             return;
@@ -88,6 +92,47 @@ impl InboundTaskHandler for OperationsTaskHandler {
                         SYNC_PLACEMENT_RETRY_AFTER,
                     )
                     .await;
+                }
+            }
+            TaskKey::SyncDocument {
+                node_id,
+                target,
+                peers,
+            } => {
+                let retry_key = TaskKey::SyncDocument {
+                    node_id,
+                    target: target.clone(),
+                    peers: peers.clone(),
+                };
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!(key = ?retry_key, "Cannot sync document without net handle");
+                    self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
+                        .await;
+                    return;
+                };
+                let event = net_handle
+                    .send_effect(Effect::Net(NetEffect::Irokle(IrokleEffect::SyncDocument {
+                        target,
+                        peers,
+                    })))
+                    .await;
+                match event {
+                    Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled { .. })) => {}
+                    Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
+                        warn!(key = ?retry_key, error = %error, "Failed to process durable document sync timer event");
+                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
+                            .await;
+                    }
+                    Event::Net(NetEvent::Error(error)) => {
+                        warn!(key = ?retry_key, error = ?error, "Failed to process durable document sync timer event");
+                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
+                            .await;
+                    }
+                    other => {
+                        warn!(key = ?retry_key, event = ?other, "Unexpected durable document sync timer result");
+                        self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
+                            .await;
+                    }
                 }
             }
         }

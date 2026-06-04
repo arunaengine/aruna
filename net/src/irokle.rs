@@ -26,7 +26,7 @@ use irokle_crate::sync::{SyncMessage, SyncRequest};
 use irokle_crate::{EventEnvelope, OpId, PeerId, ReplicationPolicy, TopicGenesis, TopicPayload};
 use parking_lot::RwLock;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout};
+use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::error::{NetError, Result};
@@ -35,8 +35,6 @@ use crate::streams::BiStream;
 use ::irokle as irokle_crate;
 
 const IROKLE_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-const IROKLE_BACKGROUND_SYNC_ATTEMPTS: usize = 3;
-const IROKLE_BACKGROUND_SYNC_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct IrokleService {
@@ -267,38 +265,7 @@ impl IrokleService {
         oplog
             .create_event_op(topic_id, actor_id, envelope, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        if let Err(error) = self.sync_topic(topic_id, sync_peers.clone()).await {
-            self.schedule_topic_sync_retry(topic_id, sync_peers);
-            return Err(error);
-        }
         Ok(())
-    }
-
-    fn schedule_topic_sync_retry(&self, topic_id: irokle_crate::TopicId, peers: BTreeSet<PeerId>) {
-        if peers.is_empty() {
-            return;
-        }
-        let service = self.clone();
-        tokio::spawn(async move {
-            for attempt in 1..=IROKLE_BACKGROUND_SYNC_ATTEMPTS {
-                sleep(IROKLE_BACKGROUND_SYNC_RETRY_AFTER).await;
-                match service.sync_topic(topic_id, peers.clone()).await {
-                    Ok(()) => return,
-                    Err(error) => warn!(
-                        %topic_id,
-                        attempt,
-                        attempts = IROKLE_BACKGROUND_SYNC_ATTEMPTS,
-                        error = %error,
-                        "Background Irokle topic sync retry failed"
-                    ),
-                }
-            }
-            warn!(
-                %topic_id,
-                peer_count = peers.len(),
-                "Background Irokle topic sync retries exhausted"
-            );
-        });
     }
 
     fn ensure_topic(

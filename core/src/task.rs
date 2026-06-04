@@ -2,13 +2,25 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::document::DocumentSyncTarget;
 use crate::id::NodeId;
 use crate::structs::RealmId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskKey {
-    RealmPresence { realm_id: RealmId, node_id: NodeId },
-    SyncPlacements { realm_id: RealmId, node_id: NodeId },
+    RealmPresence {
+        realm_id: RealmId,
+        node_id: NodeId,
+    },
+    SyncPlacements {
+        realm_id: RealmId,
+        node_id: NodeId,
+    },
+    SyncDocument {
+        node_id: NodeId,
+        target: DocumentSyncTarget,
+        peers: Vec<NodeId>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -7,12 +7,14 @@ use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::Operation;
 use aruna_core::structs::RealmId;
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
 use aruna_core::{IrokleEffect, NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::document_repository;
+use crate::sync_placement::schedule_document_sync_effect;
 
 const USER_SYNC_PAGE_SIZE: usize = 256;
 
@@ -29,6 +31,7 @@ enum PendingDocumentSync {
 pub struct AnnounceTopicOperation {
     topic: TopicId,
     document: Option<DocumentSyncTarget>,
+    local_node_id: NodeId,
     peers: Vec<NodeId>,
     state: AnnounceTopicState,
     pending: VecDeque<PendingDocumentSync>,
@@ -42,6 +45,7 @@ enum AnnounceTopicState {
     ReadDocument,
     ListUsers,
     Publish,
+    ScheduleSync,
     Finish,
     Error,
 }
@@ -79,13 +83,14 @@ impl AnnounceTopicOperation {
 
     pub fn new_for_document_with_peers(
         topic: TopicId,
-        _local_node_id: NodeId,
+        local_node_id: NodeId,
         document: Option<DocumentSyncTarget>,
         peers: Vec<NodeId>,
     ) -> Self {
         Self {
             topic,
             document,
+            local_node_id,
             peers,
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
@@ -253,9 +258,13 @@ impl Operation for AnnounceTopicOperation {
                 other => self.unexpected_event("storage iter result", format!("{other:?}")),
             },
             AnnounceTopicState::Publish => match event {
-                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { .. })) => {
-                    self.current = None;
-                    self.next_effect()
+                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { target })) => {
+                    self.state = AnnounceTopicState::ScheduleSync;
+                    smallvec![schedule_document_sync_effect(
+                        self.local_node_id,
+                        target,
+                        self.peers.clone(),
+                    )]
                 }
                 Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
                     self.fail(AnnounceTopicError::DocumentSync(error))
@@ -265,6 +274,20 @@ impl Operation for AnnounceTopicOperation {
                 }
                 other => {
                     self.unexpected_event("irokle document publish result", format!("{other:?}"))
+                }
+            },
+            AnnounceTopicState::ScheduleSync => match event {
+                Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                    self.current = None;
+                    self.next_effect()
+                }
+                Event::Task(TaskEvent::Error { message, .. }) => {
+                    self.fail(AnnounceTopicError::DocumentSync(format!(
+                        "durable document sync scheduling failed: {message}"
+                    )))
+                }
+                other => {
+                    self.unexpected_event("document sync timer schedule", format!("{other:?}"))
                 }
             },
             AnnounceTopicState::Finish | AnnounceTopicState::Error | AnnounceTopicState::Init => {

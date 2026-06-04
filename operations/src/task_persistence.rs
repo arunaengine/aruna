@@ -12,16 +12,15 @@ use tracing::warn;
 
 const TASK_TIMER_RESTORE_PAGE_SIZE: usize = 256;
 
-pub(crate) async fn persist_task_effect(storage: &StorageHandle, effect: &TaskEffect) {
-    let result = match effect {
+pub(crate) async fn persist_task_effect(
+    storage: &StorageHandle,
+    effect: &TaskEffect,
+) -> Result<(), String> {
+    match effect {
         TaskEffect::ResetTimer { key, after } => write_timer(storage, key, *after).await,
         TaskEffect::ShortenTimer { key, after } => shorten_timer(storage, key, *after).await,
         TaskEffect::CancelTimer { key } => delete_timer(storage, key).await,
         TaskEffect::AbortRunningHandlers { .. } => Ok(()),
-    };
-
-    if let Err(error) = result {
-        warn!(error = %error, effect = ?effect, "Failed to persist task timer effect");
     }
 }
 
@@ -242,7 +241,8 @@ mod tests {
                 after: Duration::from_millis(1),
             },
         )
-        .await;
+        .await
+        .expect("timer persists");
 
         let task_handle = TaskHandle::new();
         let observed = Arc::new(Mutex::new(None));

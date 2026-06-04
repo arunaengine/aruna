@@ -541,17 +541,9 @@ impl Operation for CreateMetadataDocumentOperation {
                             self.output = Some(Ok(record));
                             smallvec![]
                         }
-                        Err(error) => {
-                            warn!(error = %error, "Failed to announce metadata registry; create remains committed");
-                            let Some(record) = self.record.clone() else {
-                                return self.fail_without_cleanup(
-                                    CreateMetadataDocumentError::MissingTransaction,
-                                );
-                            };
-                            self.state = CreateMetadataDocumentState::Finish;
-                            self.output = Some(Ok(record));
-                            smallvec![]
-                        }
+                        Err(error) => self.fail_without_cleanup(
+                            CreateMetadataDocumentError::TopicAnnouncement(error),
+                        ),
                     }
                 }
                 other => self.unexpected_event("topic announcement result", format!("{other:?}")),
