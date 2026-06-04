@@ -602,6 +602,7 @@ async fn spawn_joiner_node_with_mode(
             max_concurrent_uni_streams: config.max_concurrent_uni_streams,
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
             irokle_storage_path: Some(config.irokle_storage_path.clone()),
+            irokle_runtime: Some(config.irokle_runtime),
         },
         storage_handle.clone(),
     )
