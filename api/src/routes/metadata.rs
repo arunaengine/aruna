@@ -17,6 +17,7 @@ use aruna_operations::create_metadata_document::{
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
+use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::repository::{
     parse_registry_read, read_registry_by_document_effect,
@@ -45,6 +46,7 @@ use utoipa::{OpenApi, ToSchema};
     components(schemas(MetadataRoCrateView)),
     paths(
         create_metadata_document,
+        list_all_metadata_documents,
         list_metadata_documents,
         get_metadata_document,
         delete_metadata_document,
@@ -61,7 +63,10 @@ pub struct MetadataApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/metadata", post(create_metadata_document))
+        .route(
+            "/metadata",
+            get(list_all_metadata_documents).post(create_metadata_document),
+        )
         .route("/metadata/search", get(search_metadata))
         .route("/metadata/sparql/query", post(query_all_metadata))
         .route("/groups/{group_id}/metadata", get(list_metadata_documents))
@@ -138,7 +143,39 @@ pub struct CreateMetadataResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ListMetadataResponse {
-    pub documents: Vec<MetadataDocumentSummary>,
+    pub documents: Vec<MetadataDocumentListItem>,
+    pub limit: usize,
+    pub offset: usize,
+    pub total_returned: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataDocumentListItem {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    pub public: bool,
+    pub replicas: usize,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub rocrate_summary: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ListMetadataQuery {
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub include: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -207,6 +244,14 @@ pub struct MetadataSearchResponse {
     pub hits: Vec<MetadataSearchHitResponse>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetadataIncludeFlags {
+    summary: bool,
+}
+
+const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
+const MAX_LIST_METADATA_LIMIT: usize = 1_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SparqlQueryRequest {
     /// SPARQL query string. Only `SELECT` and `ASK` queries are supported.
@@ -250,6 +295,22 @@ impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
             replicas: record.holder_node_ids.len(),
             created_at: format_timestamp_ms(record.created_at_ms),
             updated_at: format_timestamp_ms(record.updated_at_ms),
+        }
+    }
+}
+
+impl MetadataDocumentListItem {
+    fn from_record(record: &MetadataRegistryRecord, rocrate_summary: Option<Value>) -> Self {
+        Self {
+            document_id: record.document_id.to_string(),
+            group_id: record.group_id.to_string(),
+            document_path: record.document_path.clone(),
+            graph_iri: record.graph_iri.clone(),
+            public: record.public,
+            replicas: record.holder_node_ids.len(),
+            created_at: format_timestamp_ms(record.created_at_ms),
+            updated_at: format_timestamp_ms(record.updated_at_ms),
+            rocrate_summary,
         }
     }
 }
@@ -398,9 +459,59 @@ pub async fn create_metadata_document(
 
 #[utoipa::path(
     get,
+    path = "/metadata",
+    tag = "metadata",
+    params(
+        ("group_id" = Option<String>, Query, description = "Optional group id filter"),
+        ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
+        ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports summary"),
+        ("limit" = Option<usize>, Query, description = "Maximum documents to return"),
+        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip")
+    ),
+    responses(
+        (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
+        (status = 400, description = "Invalid query", body = ErrorResponse)
+    )
+)]
+pub async fn list_all_metadata_documents(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<ListMetadataQuery>,
+) -> ServerResult<(StatusCode, Json<ListMetadataResponse>)> {
+    if let Some(group_id) = query.group_id.as_deref() {
+        let group_id = parse_group_id(group_id)?;
+        let records = load_group_metadata_records(&state, group_id).await?;
+        return Ok((
+            StatusCode::OK,
+            Json(build_metadata_list_response(&state, auth.as_ref(), records, &query).await?),
+        ));
+    }
+
+    let groups = drive(ListGroupOperation::new(), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let mut records = Vec::new();
+    for group in groups {
+        records.extend(load_group_metadata_records(&state, group.group_id).await?);
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(build_metadata_list_response(&state, auth.as_ref(), records, &query).await?),
+    ))
+}
+
+#[utoipa::path(
+    get,
     path = "/groups/{group_id}/metadata",
     tag = "metadata",
-    params(("group_id" = String, Path, description = "Group id")),
+    params(
+        ("group_id" = String, Path, description = "Group id"),
+        ("path_prefix" = Option<String>, Query, description = "Normalized metadata path prefix, for example profiles/"),
+        ("include" = Option<String>, Query, description = "Comma-separated includes. Currently supports summary"),
+        ("limit" = Option<usize>, Query, description = "Maximum documents to return"),
+        ("offset" = Option<usize>, Query, description = "Number of filtered documents to skip")
+    ),
     responses(
         (status = 200, description = "Visible metadata documents", body = ListMetadataResponse),
         (status = 400, description = "Invalid group id", body = ErrorResponse)
@@ -410,25 +521,14 @@ pub async fn list_metadata_documents(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
     Path(group_id): Path<String>,
+    Query(query): Query<ListMetadataQuery>,
 ) -> ServerResult<(StatusCode, Json<ListMetadataResponse>)> {
     let group_id = parse_group_id(&group_id)?;
-    let records = drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
-
-    let mut visible = Vec::new();
-    for record in records {
-        if can_read_record(&state, auth.as_ref(), &record).await? {
-            visible.push(MetadataDocumentSummary::from(&record));
-        }
-    }
+    let records = load_group_metadata_records(&state, group_id).await?;
 
     Ok((
         StatusCode::OK,
-        Json(ListMetadataResponse { documents: visible }),
+        Json(build_metadata_list_response(&state, auth.as_ref(), records, &query).await?),
     ))
 }
 
@@ -1015,6 +1115,102 @@ pub async fn search_metadata(
 
 fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
+}
+
+async fn load_group_metadata_records(
+    state: &ServerState,
+    group_id: Ulid,
+) -> ServerResult<Vec<MetadataRegistryRecord>> {
+    drive(
+        ListMetadataDocumentsOperation::new(group_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.to_string()))
+}
+
+async fn build_metadata_list_response(
+    state: &ServerState,
+    auth: Option<&AuthContext>,
+    records: Vec<MetadataRegistryRecord>,
+    query: &ListMetadataQuery,
+) -> ServerResult<ListMetadataResponse> {
+    let include = parse_metadata_include_flags(query.include.as_deref())?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_LIST_METADATA_LIMIT)
+        .clamp(1, MAX_LIST_METADATA_LIMIT);
+    let offset = query.offset.unwrap_or(0);
+
+    let mut visible = Vec::new();
+    for record in records {
+        if !metadata_record_matches_filters(&record, query) {
+            continue;
+        }
+        if can_read_record(state, auth, &record).await? {
+            visible.push(record);
+        }
+    }
+
+    let selected = visible.into_iter().skip(offset).take(limit);
+    let mut documents = Vec::new();
+    for record in selected {
+        let rocrate_summary = if include.summary {
+            Some(export_rocrate_summary_jsonld(state, &record.graph_iri).await?)
+        } else {
+            None
+        };
+        documents.push(MetadataDocumentListItem::from_record(
+            &record,
+            rocrate_summary,
+        ));
+    }
+    let total_returned = documents.len();
+
+    Ok(ListMetadataResponse {
+        documents,
+        limit,
+        offset,
+        total_returned,
+    })
+}
+
+fn metadata_record_matches_filters(
+    record: &MetadataRegistryRecord,
+    query: &ListMetadataQuery,
+) -> bool {
+    query
+        .path_prefix
+        .as_deref()
+        .map(|path_prefix| metadata_path_matches_prefix(&record.document_path, path_prefix))
+        .unwrap_or(true)
+}
+
+fn metadata_path_matches_prefix(document_path: &str, path_prefix: &str) -> bool {
+    let normalized_path = MetadataRegistryRecord::normalize_document_path(document_path);
+    let normalized_prefix = MetadataRegistryRecord::normalize_document_path(path_prefix);
+    normalized_prefix.is_empty()
+        || normalized_path == normalized_prefix
+        || normalized_path
+            .strip_prefix(&normalized_prefix)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn parse_metadata_include_flags(include: Option<&str>) -> ServerResult<MetadataIncludeFlags> {
+    let mut flags = MetadataIncludeFlags::default();
+    let Some(include) = include else {
+        return Ok(flags);
+    };
+    for value in include.split(',').map(str::trim) {
+        if value.is_empty() {
+            continue;
+        }
+        match value {
+            "summary" => flags.summary = true,
+            _ => return Err(ServerError::BadRequest),
+        }
+    }
+    Ok(flags)
 }
 
 fn format_timestamp_ms(timestamp_ms: u64) -> String {
@@ -1672,6 +1868,7 @@ mod tests {
             State(test.state.clone()),
             Extension(None),
             Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
         )
         .await
         .unwrap();
@@ -1929,6 +2126,7 @@ mod tests {
             State(test.state.clone()),
             Extension(None),
             Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
         )
         .await
         .unwrap();

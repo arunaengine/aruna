@@ -1,18 +1,22 @@
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::errors::AuthorizationError;
-use aruna_core::structs::{AuthContext, PathRestriction, Permission, blob_group_permission_path};
+use aruna_core::structs::{
+    AuthContext, PathRestriction, Permission, UserAccess, blob_group_permission_path,
+};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::create_user_access::{
     CreateUserAccessConfig, CreateUserAccessOperation, DEFAULT_CREDENTIAL_TTL,
 };
 use aruna_operations::s3::get_user_access::{GetUserAccessError, GetUserAccessOperation};
+use aruna_operations::s3::list_user_access::{ListUserAccessInput, ListUserAccessOperation};
 use aruna_operations::s3::revoke_user_access::{RevokeUserAccessError, RevokeUserAccessOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::{delete, post};
+use axum::routing::{delete, get};
 use axum::{Extension, Json, Router};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use std::{str::FromStr, sync::Arc};
@@ -22,13 +26,16 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "credentials", description = "User credential management")),
-    paths(create_s3_credentials, revoke_s3_credentials)
+    paths(list_s3_credentials, create_s3_credentials, revoke_s3_credentials)
 )]
 pub struct CredentialsApiDoc;
 
 pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
-        .route("/users/credentials", post(create_s3_credentials))
+        .route(
+            "/users/credentials",
+            get(list_s3_credentials).post(create_s3_credentials),
+        )
         .route(
             "/users/credentials/{access_key_id}",
             delete(revoke_s3_credentials),
@@ -52,6 +59,36 @@ pub struct CreateS3CredentialsRequest {
 pub struct CreateS3CredentialsResponse {
     pub access_key_id: String,
     pub access_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct S3PathRestrictionResponse {
+    pub pattern: String,
+    pub permission: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStatusResponse {
+    Active,
+    Expired,
+    Revoked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct S3CredentialSummaryResponse {
+    pub access_key_id: String,
+    pub group_id: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+    pub issued_by: String,
+    pub path_restrictions: Vec<S3PathRestrictionResponse>,
+    pub status: CredentialStatusResponse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListS3CredentialsResponse {
+    pub credentials: Vec<S3CredentialSummaryResponse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +200,46 @@ fn serialize_restrictions(restrictions: &[NormalizedRestriction]) -> Vec<PathRes
         .iter()
         .map(NormalizedRestriction::to_path_restriction)
         .collect()
+}
+
+#[utoipa::path(
+    get,
+    path = "/users/credentials",
+    tag = "credentials",
+    responses(
+        (status = 200, description = "Credentials listed", body = ListS3CredentialsResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_s3_credentials(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+) -> ServerResult<(StatusCode, Json<ListS3CredentialsResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    if auth.realm_id != state.get_realm_id() {
+        return Err(ServerError::Forbidden);
+    }
+
+    let credentials = drive(
+        ListUserAccessOperation::new(ListUserAccessInput {
+            user_identity: auth.user_id,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ListS3CredentialsResponse {
+            credentials: credentials
+                .into_iter()
+                .map(map_user_access_redacted)
+                .collect(),
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -288,6 +365,50 @@ pub async fn revoke_s3_credentials(
         | Err(RevokeUserAccessError::NotFound) => Err(ServerError::NotFound),
         Ok(Some(Err(err))) | Err(err) => Err(ServerError::InternalError(err.to_string())),
     }
+}
+
+fn map_user_access_redacted(access: UserAccess) -> S3CredentialSummaryResponse {
+    let now = SystemTime::now();
+    let status = credential_status(&access, now);
+    let expires_at = format_system_time(access.expiry);
+    let revoked_at = access.revoked_at.map(format_system_time);
+    S3CredentialSummaryResponse {
+        access_key_id: access.access_key,
+        group_id: access.group_id.to_string(),
+        expires_at,
+        revoked_at,
+        issued_by: format_node_id(access.issued_by),
+        path_restrictions: access
+            .path_restrictions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|restriction| S3PathRestrictionResponse {
+                pattern: restriction.pattern,
+                permission: restriction.permission.to_string(),
+            })
+            .collect(),
+        status,
+    }
+}
+
+fn credential_status(access: &UserAccess, now: SystemTime) -> CredentialStatusResponse {
+    if access.is_revoked() {
+        CredentialStatusResponse::Revoked
+    } else if access.is_expired(now) {
+        CredentialStatusResponse::Expired
+    } else {
+        CredentialStatusResponse::Active
+    }
+}
+
+fn format_system_time(value: SystemTime) -> String {
+    DateTime::<Utc>::from(value).to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn format_node_id(bytes: [u8; 32]) -> String {
+    iroh::PublicKey::from_bytes(&bytes)
+        .map(|node_id| node_id.to_string())
+        .unwrap_or_else(|_| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn credential_expiry(now: SystemTime, expires_in_seconds: Option<u64>) -> ServerResult<SystemTime> {
