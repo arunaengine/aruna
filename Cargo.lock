@@ -188,7 +188,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "ahash",
  "aruna-core",
@@ -269,7 +269,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "aruna-core",
  "aruna-net",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "async-trait",
  "base64",
@@ -325,7 +325,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "ahash",
  "aruna",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -393,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -432,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.1"
+version = "3.0.0-alpha.20"
 dependencies = [
  "aruna-core",
  "async-trait",
