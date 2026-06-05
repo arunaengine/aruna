@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
@@ -28,7 +28,7 @@ use craqle::{
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
 use tokio::time::{sleep, timeout};
-use tracing::warn;
+use tracing::{Instrument, Span, debug_span, field, warn};
 
 use super::protocol::{MetadataTransportMessage, read_message, write_message};
 use super::repository::{iter_all_registry_effect, parse_registry_iter};
@@ -38,6 +38,7 @@ use crate::driver::{DriverContext, drive};
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
 const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
+const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
 pub struct MetadataHandle {
@@ -82,35 +83,56 @@ impl MetadataHandle {
     }
 
     pub async fn send_metadata_effect(&self, effect: MetadataEffect) -> Event {
+        let effect_name = metadata_effect_kind(&effect);
         let graph_iri = effect_graph_iri(&effect);
         if let Some(graph_iri) = graph_iri.as_deref() {
-            match graph_lifecycle_record(self.inner.storage_handle.clone(), graph_iri).await {
-                Ok(Some(record)) if record.is_deleted() => match &effect {
-                    MetadataEffect::DeleteGraph { .. } => {}
-                    MetadataEffect::SyncGraphBestEffort { graph_iri, peers } => {
-                        return Event::Metadata(MetadataEvent::GraphSyncScheduled {
-                            graph_iri: graph_iri.clone(),
-                            peers: peers.clone(),
-                        });
+            let span = debug_span!(
+                "metadata.graph_lifecycle.read_before_effect",
+                effect = effect_name,
+                graph_iri,
+                deleted = field::Empty,
+                elapsed_ms = field::Empty,
+            );
+            let started = Instant::now();
+            let result = graph_lifecycle_record(self.inner.storage_handle.clone(), graph_iri)
+                .instrument(span.clone())
+                .await;
+            match result {
+                Ok(Some(record)) if record.is_deleted() => {
+                    span.record("deleted", true);
+                    record_elapsed(&span, "elapsed_ms", started);
+                    match &effect {
+                        MetadataEffect::DeleteGraph { .. } => {}
+                        MetadataEffect::SyncGraphBestEffort { graph_iri, peers } => {
+                            return Event::Metadata(MetadataEvent::GraphSyncScheduled {
+                                graph_iri: graph_iri.clone(),
+                                peers: peers.clone(),
+                            });
+                        }
+                        MetadataEffect::ContainsGraph { graph_iri } => {
+                            return Event::Metadata(MetadataEvent::ContainsGraphResult {
+                                graph_iri: graph_iri.clone(),
+                                exists: false,
+                            });
+                        }
+                        _ if effect_rejects_deleted_graph(&effect) => {
+                            return Event::Metadata(MetadataEvent::Error {
+                                graph_iri: Some(graph_iri.to_string()),
+                                error: MetadataError::InvalidInput(format!(
+                                    "metadata graph `{graph_iri}` is deleted"
+                                )),
+                            });
+                        }
+                        _ => {}
                     }
-                    MetadataEffect::ContainsGraph { graph_iri } => {
-                        return Event::Metadata(MetadataEvent::ContainsGraphResult {
-                            graph_iri: graph_iri.clone(),
-                            exists: false,
-                        });
-                    }
-                    _ if effect_rejects_deleted_graph(&effect) => {
-                        return Event::Metadata(MetadataEvent::Error {
-                            graph_iri: Some(graph_iri.to_string()),
-                            error: MetadataError::InvalidInput(format!(
-                                "metadata graph `{graph_iri}` is deleted"
-                            )),
-                        });
-                    }
-                    _ => {}
-                },
-                Ok(_) => {}
+                }
+                Ok(_) => {
+                    span.record("deleted", false);
+                    record_elapsed(&span, "elapsed_ms", started);
+                }
                 Err(error) => {
+                    record_error(&span, &error.to_string());
+                    record_elapsed(&span, "elapsed_ms", started);
                     return Event::Metadata(MetadataEvent::Error {
                         graph_iri: Some(graph_iri.to_string()),
                         error,
@@ -157,13 +179,32 @@ impl MetadataHandle {
             ),
             other => {
                 let inner = self.inner.clone();
-                match tokio::task::spawn_blocking(move || handle_effect(inner, other)).await {
-                    Ok(event) => Event::Metadata(event),
-                    Err(error) => Event::Metadata(MetadataEvent::Error {
-                        graph_iri,
-                        error: MetadataError::TaskJoin(error.to_string()),
-                    }),
-                }
+                let span = debug_span!(
+                    "metadata.backend.blocking_task",
+                    effect = metadata_effect_kind(&other),
+                    graph_iri = graph_iri.as_deref().unwrap_or("<none>"),
+                    elapsed_ms = field::Empty,
+                    result = field::Empty,
+                );
+                let blocking_span = span.clone();
+                let started = Instant::now();
+                let metadata_event = match tokio::task::spawn_blocking(move || {
+                    blocking_span.in_scope(|| handle_effect(inner, other))
+                })
+                .await
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        record_error(&span, &error.to_string());
+                        MetadataEvent::Error {
+                            graph_iri,
+                            error: MetadataError::TaskJoin(error.to_string()),
+                        }
+                    }
+                };
+                record_elapsed(&span, "elapsed_ms", started);
+                span.record("result", metadata_event_kind(&metadata_event));
+                Event::Metadata(metadata_event)
             }
         }
     }
@@ -252,13 +293,34 @@ impl MetadataHandle {
         MetadataEvent::GraphSyncScheduled { graph_iri, peers }
     }
 
+    #[tracing::instrument(
+        name = "metadata.remote.inbound",
+        level = "debug",
+        skip(self, stream),
+        fields(
+            peer = ?_peer,
+            request = field::Empty,
+            response = field::Empty,
+            read_ms = field::Empty,
+            process_ms = field::Empty,
+            drain_ms = field::Empty,
+            write_ms = field::Empty,
+            elapsed_ms = field::Empty,
+        )
+    )]
     pub async fn handle_inbound_stream(
         &self,
         mut stream: BiStream,
         _peer: NodeId,
     ) -> Result<(), MetadataError> {
+        let total_started = Instant::now();
+        let read_started = Instant::now();
         let message = read_transport_message(&mut stream).await?;
+        let span = Span::current();
+        record_elapsed(&span, "read_ms", read_started);
+        span.record("request", metadata_transport_message_kind(&message));
 
+        let process_started = Instant::now();
         let response = match message {
             MetadataTransportMessage::QueryGraphs {
                 auth_context,
@@ -294,14 +356,30 @@ impl MetadataHandle {
                 MetadataTransportMessage::Reject("unexpected metadata control message".to_string())
             }
         };
+        record_elapsed(&span, "process_ms", process_started);
 
+        let drain_started = Instant::now();
         drain_request_stream(&mut stream).await?;
+        record_elapsed(&span, "drain_ms", drain_started);
 
+        let write_started = Instant::now();
         let _ = write_transport_message(&mut stream, &response).await;
+        record_elapsed(&span, "write_ms", write_started);
         close_stream(&mut stream).await;
+        record_elapsed(&span, "elapsed_ms", total_started);
+        span.record("response", metadata_transport_message_kind(&response));
         Ok(())
     }
 
+    #[tracing::instrument(
+        name = "metadata.query.local_authorized",
+        level = "debug",
+        skip(self, auth_context, sparql),
+        fields(
+            query_len = sparql.len() as u64,
+            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+        )
+    )]
     pub async fn query_authorized_local(
         &self,
         auth_context: Option<AuthContext>,
@@ -311,6 +389,16 @@ impl MetadataHandle {
         query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql).await
     }
 
+    #[tracing::instrument(
+        name = "metadata.search.local_authorized",
+        level = "debug",
+        skip(self, auth_context, query),
+        fields(
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+        )
+    )]
     pub async fn search_authorized_local(
         &self,
         auth_context: Option<AuthContext>,
@@ -329,6 +417,20 @@ impl MetadataHandle {
             .map_err(metadata_error_from_craqle)
     }
 
+    #[tracing::instrument(
+        name = "metadata.query.remote",
+        level = "debug",
+        skip(self, auth_context, sparql),
+        fields(
+            peer = ?node_id,
+            query_len = sparql.len() as u64,
+            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            row_count = field::Empty,
+            triple_count = field::Empty,
+        )
+    )]
     pub async fn request_remote_query_graphs(
         &self,
         node_id: NodeId,
@@ -336,10 +438,13 @@ impl MetadataHandle {
         graph_iris: Option<Vec<String>>,
         sparql: String,
     ) -> Result<MetadataQueryResults, MetadataError> {
+        let started = Instant::now();
+        let span = Span::current();
         let Some(net_handle) = self.inner.net_handle.clone() else {
+            record_error(&span, "metadata net handle missing");
             return Err(MetadataError::HandleMissing);
         };
-        match send_request(
+        let result = match send_request(
             &net_handle,
             node_id,
             MetadataTransportMessage::QueryGraphs {
@@ -355,9 +460,32 @@ impl MetadataHandle {
             other => Err(MetadataError::Backend(format!(
                 "unexpected metadata query response: {other:?}"
             ))),
+        };
+        record_elapsed(&span, "elapsed_ms", started);
+        match &result {
+            Ok(results) => {
+                span.record("result", metadata_query_result_kind(results));
+                record_metadata_query_result_counts(&span, results);
+            }
+            Err(error) => record_error(&span, &error.to_string()),
         }
+        result
     }
 
+    #[tracing::instrument(
+        name = "metadata.search.remote",
+        level = "debug",
+        skip(self, auth_context, query),
+        fields(
+            peer = ?node_id,
+            query_len = query.len() as u64,
+            limit = limit as u64,
+            graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+            elapsed_ms = field::Empty,
+            result = field::Empty,
+            hit_count = field::Empty,
+        )
+    )]
     pub async fn request_remote_search_graphs(
         &self,
         node_id: NodeId,
@@ -366,10 +494,13 @@ impl MetadataHandle {
         query: String,
         limit: usize,
     ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+        let started = Instant::now();
+        let span = Span::current();
         let Some(net_handle) = self.inner.net_handle.clone() else {
+            record_error(&span, "metadata net handle missing");
             return Err(MetadataError::HandleMissing);
         };
-        match send_request(
+        let result = match send_request(
             &net_handle,
             node_id,
             MetadataTransportMessage::SearchGraphs {
@@ -386,7 +517,16 @@ impl MetadataHandle {
             other => Err(MetadataError::Backend(format!(
                 "unexpected metadata search response: {other:?}"
             ))),
+        };
+        record_elapsed(&span, "elapsed_ms", started);
+        match &result {
+            Ok(hits) => {
+                span.record("result", "ok");
+                span.record("hit_count", hits.len() as u64);
+            }
+            Err(error) => record_error(&span, &error.to_string()),
         }
+        result
     }
 }
 
@@ -463,11 +603,25 @@ impl Handle for MetadataHandle {
     }
 }
 
+#[tracing::instrument(
+    name = "metadata.graph_sync.once",
+    level = "debug",
+    skip(inner),
+    fields(
+        graph_iri = %graph_iri,
+        peer_count = peers.len() as u64,
+        local_peer_setup_ms = field::Empty,
+        network_sync_ms = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
 async fn sync_graph_once(
     inner: Arc<MetadataInner>,
     graph_iri: String,
     peers: Vec<NodeId>,
 ) -> Result<(), MetadataError> {
+    let span = Span::current();
+    let total_started = Instant::now();
     if peers.is_empty() {
         return Ok(());
     }
@@ -481,116 +635,442 @@ async fn sync_graph_once(
     let node = inner.node.clone();
     let graph_iri_for_blocking = graph_iri.clone();
     let peers_for_blocking = peers.clone();
+    let setup_span = debug_span!(
+        "metadata.backend.craqle.ensure_irokle_topic",
+        graph_iri = %graph_iri_for_blocking,
+        peer_count = peers_for_blocking.len() as u64,
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+    );
+    let blocking_span = setup_span.clone();
+    let setup_started = Instant::now();
     let topic_id = tokio::task::spawn_blocking(move || {
-        let graph = GraphId::new(&graph_iri_for_blocking);
-        for peer in peers_for_blocking {
-            node.add_irokle_peer(&graph, irokle_peer_id(peer))?;
-        }
-        node.ensure_irokle_topic(&graph)
+        blocking_span.in_scope(|| {
+            let graph = GraphId::new(&graph_iri_for_blocking);
+            for peer in peers_for_blocking {
+                node.add_irokle_peer(&graph, irokle_peer_id(peer))?;
+            }
+            node.ensure_irokle_topic(&graph)
+        })
     })
     .await
-    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-    .map_err(metadata_error_from_craqle)?;
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?;
+    record_elapsed(&setup_span, "elapsed_ms", setup_started);
+    record_elapsed(&span, "local_peer_setup_ms", setup_started);
+    match &topic_id {
+        Ok(_) => {
+            setup_span.record("result", "ok");
+        }
+        Err(error) => record_error(&setup_span, &error.to_string()),
+    }
+    let topic_id = topic_id.map_err(metadata_error_from_craqle)?;
 
+    let sync_started = Instant::now();
     net_handle
         .sync_irokle_topic_with_peers(topic_id, peers)
         .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))
+        .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    record_elapsed(&span, "network_sync_ms", sync_started);
+    record_elapsed(&span, "elapsed_ms", total_started);
+    Ok(())
 }
 
 fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataEvent {
+    let effect_name = metadata_effect_kind(&effect);
     let auth = AllowAllAuthorizer;
     let graph_iri = effect_graph_iri(&effect);
     let node = inner.node.clone();
-    let result = match effect {
-        MetadataEffect::CreateCrate { request } => node
-            .create_crate(&auth, craqle_create_request(request.clone()))
-            .map(|batch| MetadataEvent::CreateCrateResult {
+    let effect_span = debug_span!(
+        "metadata.backend.effect",
+        effect = effect_name,
+        graph_iri = graph_iri.as_deref().unwrap_or("<none>"),
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+    );
+    let effect_started = Instant::now();
+    let result = effect_span.in_scope(|| match effect {
+        MetadataEffect::CreateCrate { request } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.create_crate",
+                graph_iri = %request.graph_iri,
+                name_len = request.name.len() as u64,
+                description_len = request.description.len() as u64,
+                public = request.policy.public,
+                permission_path_count = request.policy.permission_paths.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                batch_ops = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.create_crate(&auth, craqle_create_request(request.clone())));
+            record_craqle_call_result(
+                &call_span,
+                "create_crate",
+                Some(&request.graph_iri),
+                started,
+                &result,
+            );
+            if let Ok(batch) = &result {
+                call_span.record("batch_ops", batch.ops.len() as u64);
+            }
+            result.map(|batch| MetadataEvent::CreateCrateResult {
                 graph_iri: request.graph_iri,
                 batch: metadata_batch_from_craqle(batch),
-            }),
-        MetadataEffect::ApplyRoCrate { request } => node
-            .apply_rocrate_document_checked_with_policy(
-                &auth,
-                GraphId::new(&request.graph_iri),
-                &request.jsonld,
-                craqle_graph_policy(request.policy),
-            )
-            .map(|batch| MetadataEvent::ApplyRoCrateResult {
-                graph_iri: request.graph_iri,
+            })
+        }
+        MetadataEffect::ApplyRoCrate { request } => {
+            let graph_iri = request.graph_iri.clone();
+            let policy = request.policy;
+            let jsonld = request.jsonld;
+            let call_span = debug_span!(
+                "metadata.backend.craqle.apply_rocrate",
+                graph_iri = %graph_iri,
+                jsonld_len = jsonld.len() as u64,
+                public = policy.public,
+                permission_path_count = policy.permission_paths.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                batch_ops = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span.in_scope(|| {
+                node.apply_rocrate_document_checked_with_policy(
+                    &auth,
+                    GraphId::new(&graph_iri),
+                    &jsonld,
+                    craqle_graph_policy(policy),
+                )
+            });
+            record_craqle_call_result(
+                &call_span,
+                "apply_rocrate",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            if let Ok(batch) = &result {
+                call_span.record("batch_ops", batch.ops.len() as u64);
+            }
+            result.map(|batch| MetadataEvent::ApplyRoCrateResult {
+                graph_iri,
                 batch: metadata_batch_from_craqle(batch),
-            }),
-        MetadataEffect::UpsertDataEntity { request } => upsert_data_entity(&node, &auth, request)
-            .map(|batch| MetadataEvent::EntityUpsertResult {
-                graph_iri: batch.graph_iri.clone(),
-                batch,
-            }),
-        MetadataEffect::UpsertContextualEntity { request } => {
-            upsert_contextual_entity(&node, &auth, request).map(|batch| {
+            })
+        }
+        MetadataEffect::UpsertDataEntity { request } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.upsert_data_entity",
+                graph_iri = %request.graph_iri,
+                jsonld_len = request.jsonld.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                batch_ops = field::Empty,
+            );
+            let graph_iri = request.graph_iri.clone();
+            let started = Instant::now();
+            let result = call_span.in_scope(|| upsert_data_entity(&node, &auth, request));
+            let converted = result.map(|batch| {
+                call_span.record("batch_ops", batch.ops.len() as u64);
                 MetadataEvent::EntityUpsertResult {
                     graph_iri: batch.graph_iri.clone(),
                     batch,
                 }
-            })
+            });
+            record_metadata_result(
+                &call_span,
+                "upsert_data_entity",
+                Some(&graph_iri),
+                started,
+                &converted,
+            );
+            converted
         }
-        MetadataEffect::SetGraphPolicy { graph_iri, policy } => node
-            .import_graph_policy(&GraphId::new(&graph_iri), craqle_graph_policy(policy))
-            .map(|_| MetadataEvent::GraphPolicySet { graph_iri }),
-        MetadataEffect::AddGraphPeer { graph_iri, node_id } => node
-            .add_irokle_peer(&GraphId::new(&graph_iri), irokle_peer_id(node_id))
-            .map(|_| MetadataEvent::GraphPeerAdded { graph_iri, node_id }),
-        MetadataEffect::GetGraphPolicy { graph_iri } => node
-            .graph_policy(&GraphId::new(&graph_iri))
-            .map(|policy| MetadataEvent::GraphPolicyResult {
-                graph_iri,
-                policy: metadata_graph_policy_from_craqle(policy),
-            }),
-        MetadataEffect::ExportRoCrate { graph_iri } => node
-            .export_rocrate(&auth, &GraphId::new(&graph_iri))
-            .map(|jsonld| MetadataEvent::RoCrateExportResult { graph_iri, jsonld }),
-        MetadataEffect::ExportRoCrateSummary { graph_iri } => node
-            .export_rocrate_summary(&auth, &GraphId::new(&graph_iri))
-            .map(|jsonld| MetadataEvent::RoCrateSummaryResult { graph_iri, jsonld }),
+        MetadataEffect::UpsertContextualEntity { request } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.upsert_contextual_entity",
+                graph_iri = %request.graph_iri,
+                jsonld_len = request.jsonld.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                batch_ops = field::Empty,
+            );
+            let graph_iri = request.graph_iri.clone();
+            let started = Instant::now();
+            let result = call_span.in_scope(|| upsert_contextual_entity(&node, &auth, request));
+            let converted = result.map(|batch| {
+                call_span.record("batch_ops", batch.ops.len() as u64);
+                MetadataEvent::EntityUpsertResult {
+                    graph_iri: batch.graph_iri.clone(),
+                    batch,
+                }
+            });
+            record_metadata_result(
+                &call_span,
+                "upsert_contextual_entity",
+                Some(&graph_iri),
+                started,
+                &converted,
+            );
+            converted
+        }
+        MetadataEffect::SetGraphPolicy { graph_iri, policy } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.set_graph_policy",
+                graph_iri = %graph_iri,
+                public = policy.public,
+                permission_path_count = policy.permission_paths.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| {
+                    node.import_graph_policy(&GraphId::new(&graph_iri), craqle_graph_policy(policy))
+                })
+                .map(|_| MetadataEvent::GraphPolicySet {
+                    graph_iri: graph_iri.clone(),
+                });
+            record_metadata_result(
+                &call_span,
+                "set_graph_policy",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::AddGraphPeer { graph_iri, node_id } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.add_graph_peer",
+                graph_iri = %graph_iri,
+                peer = ?node_id,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| {
+                    node.add_irokle_peer(&GraphId::new(&graph_iri), irokle_peer_id(node_id))
+                })
+                .map(|_| MetadataEvent::GraphPeerAdded {
+                    graph_iri: graph_iri.clone(),
+                    node_id,
+                });
+            record_metadata_result(
+                &call_span,
+                "add_graph_peer",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::GetGraphPolicy { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.get_graph_policy",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.graph_policy(&GraphId::new(&graph_iri)))
+                .map(|policy| MetadataEvent::GraphPolicyResult {
+                    graph_iri: graph_iri.clone(),
+                    policy: metadata_graph_policy_from_craqle(policy),
+                });
+            record_metadata_result(
+                &call_span,
+                "get_graph_policy",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::ExportRoCrate { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.export_rocrate",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                jsonld_len = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.export_rocrate(&auth, &GraphId::new(&graph_iri)))
+                .map(|jsonld| {
+                    call_span.record("jsonld_len", jsonld.len() as u64);
+                    MetadataEvent::RoCrateExportResult {
+                        graph_iri: graph_iri.clone(),
+                        jsonld,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "export_rocrate",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::ExportRoCrateSummary { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.export_rocrate_summary",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                jsonld_len = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.export_rocrate_summary(&auth, &GraphId::new(&graph_iri)))
+                .map(|jsonld| {
+                    call_span.record("jsonld_len", jsonld.len() as u64);
+                    MetadataEvent::RoCrateSummaryResult {
+                        graph_iri: graph_iri.clone(),
+                        jsonld,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "export_rocrate_summary",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
         MetadataEffect::ExportRoCratePage {
             graph_iri,
             offset,
             after,
             limit,
         } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.export_rocrate_page",
+                graph_iri = %graph_iri,
+                offset = offset.unwrap_or(0) as u64,
+                after_present = after.is_some(),
+                limit = limit as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                returned_data_entities = field::Empty,
+                total_data_entities = field::Empty,
+            );
+            let started = Instant::now();
             let graph = GraphId::new(&graph_iri);
-            let page = if let Some(after) = after.as_deref() {
-                node.export_rocrate_page_after(&auth, &graph, Some(after), limit)
-            } else {
-                node.export_rocrate_page(&auth, &graph, offset.unwrap_or(0), limit)
-            };
-            page.map(|page| MetadataEvent::RoCratePageResult {
-                graph_iri,
-                page: metadata_rocrate_page_from_craqle(page),
-            })
+            let page = call_span.in_scope(|| {
+                if let Some(after) = after.as_deref() {
+                    node.export_rocrate_page_after(&auth, &graph, Some(after), limit)
+                } else {
+                    node.export_rocrate_page(&auth, &graph, offset.unwrap_or(0), limit)
+                }
+            });
+            let result = page.map(|page| {
+                call_span.record("returned_data_entities", page.returned_data_entities as u64);
+                call_span.record("total_data_entities", page.total_data_entities as u64);
+                MetadataEvent::RoCratePageResult {
+                    graph_iri: graph_iri.clone(),
+                    page: metadata_rocrate_page_from_craqle(page),
+                }
+            });
+            record_metadata_result(
+                &call_span,
+                "export_rocrate_page",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
         }
         MetadataEffect::SearchGraphs { .. }
         | MetadataEffect::QueryGraphs { .. }
         | MetadataEffect::SyncGraphBestEffort { .. } => {
             unreachable!("handled asynchronously")
         }
-        MetadataEffect::DeleteGraph { graph_iri } => node
-            .delete_graph_unchecked(&GraphId::new(&graph_iri))
-            .map(|_| MetadataEvent::GraphDeleted { graph_iri }),
-        MetadataEffect::ListGraphs => node.graphs().map(|graphs| MetadataEvent::GraphListResult {
-            graph_iris: graphs
-                .into_iter()
-                .map(|graph| graph.as_str().to_string())
-                .collect(),
-        }),
-        MetadataEffect::ContainsGraph { graph_iri } => node
-            .contains_graph(&GraphId::new(&graph_iri))
-            .map(|exists| MetadataEvent::ContainsGraphResult { graph_iri, exists }),
-    };
+        MetadataEffect::DeleteGraph { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.delete_graph",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.delete_graph_unchecked(&GraphId::new(&graph_iri)))
+                .map(|_| MetadataEvent::GraphDeleted {
+                    graph_iri: graph_iri.clone(),
+                });
+            record_metadata_result(
+                &call_span,
+                "delete_graph",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::ListGraphs => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.list_graphs",
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                graph_count = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span.in_scope(|| node.graphs()).map(|graphs| {
+                call_span.record("graph_count", graphs.len() as u64);
+                MetadataEvent::GraphListResult {
+                    graph_iris: graphs
+                        .into_iter()
+                        .map(|graph| graph.as_str().to_string())
+                        .collect(),
+                }
+            });
+            record_metadata_result(&call_span, "list_graphs", None, started, &result);
+            result
+        }
+        MetadataEffect::ContainsGraph { graph_iri } => {
+            let call_span = debug_span!(
+                "metadata.backend.craqle.contains_graph",
+                graph_iri = %graph_iri,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+                exists = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.contains_graph(&GraphId::new(&graph_iri)))
+                .map(|exists| {
+                    call_span.record("exists", exists);
+                    MetadataEvent::ContainsGraphResult {
+                        graph_iri: graph_iri.clone(),
+                        exists,
+                    }
+                });
+            record_metadata_result(
+                &call_span,
+                "contains_graph",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+    });
 
-    result.unwrap_or_else(|error| MetadataEvent::Error {
+    record_elapsed(&effect_span, "elapsed_ms", effect_started);
+    let event = result.unwrap_or_else(|error| MetadataEvent::Error {
         graph_iri,
         error: metadata_error_from_craqle(error),
-    })
+    });
+    effect_span.record("result", metadata_event_kind(&event));
+    if let MetadataEvent::Error { error, .. } = &event {
+        record_error(&effect_span, &error.to_string());
+    }
+    event
 }
 
 fn upsert_data_entity(
@@ -1016,6 +1496,145 @@ fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
     }
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_duration(span: &Span, field: &'static str, duration: Duration) {
+    span.record(field, duration_ms(duration));
+}
+
+fn record_elapsed(span: &Span, field: &'static str, started: Instant) {
+    record_duration(span, field, started.elapsed());
+}
+
+fn record_error(span: &Span, error: &str) {
+    span.record("result", "error");
+    span.record("error", field::display(error));
+    span.record("otel.status_code", "ERROR");
+    span.record("otel.status_description", field::display(error));
+}
+
+fn warn_if_slow_metadata_backend(
+    operation: &'static str,
+    graph_iri: Option<&str>,
+    duration: Duration,
+) {
+    if duration >= SLOW_METADATA_BACKEND_THRESHOLD {
+        warn!(
+            event = "metadata.backend.slow_call",
+            operation,
+            graph_iri = graph_iri.unwrap_or("<none>"),
+            duration_ms = duration_ms(duration),
+            threshold_ms = duration_ms(SLOW_METADATA_BACKEND_THRESHOLD),
+            "Slow metadata backend call"
+        );
+    }
+}
+
+fn record_craqle_call_result<T>(
+    span: &Span,
+    operation: &'static str,
+    graph_iri: Option<&str>,
+    started: Instant,
+    result: &Result<T, CraqleError>,
+) {
+    let duration = started.elapsed();
+    record_duration(span, "elapsed_ms", duration);
+    match result {
+        Ok(_) => {
+            span.record("result", "ok");
+            span.record("otel.status_code", "OK");
+        }
+        Err(error) => record_error(span, &error.to_string()),
+    }
+    warn_if_slow_metadata_backend(operation, graph_iri, duration);
+}
+
+fn record_metadata_result(
+    span: &Span,
+    operation: &'static str,
+    graph_iri: Option<&str>,
+    started: Instant,
+    result: &Result<MetadataEvent, CraqleError>,
+) {
+    record_craqle_call_result(span, operation, graph_iri, started, result);
+}
+
+fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
+    match effect {
+        MetadataEffect::CreateCrate { .. } => "create_crate",
+        MetadataEffect::ApplyRoCrate { .. } => "apply_rocrate",
+        MetadataEffect::UpsertDataEntity { .. } => "upsert_data_entity",
+        MetadataEffect::UpsertContextualEntity { .. } => "upsert_contextual_entity",
+        MetadataEffect::SetGraphPolicy { .. } => "set_graph_policy",
+        MetadataEffect::AddGraphPeer { .. } => "add_graph_peer",
+        MetadataEffect::SyncGraphBestEffort { .. } => "sync_graph_best_effort",
+        MetadataEffect::GetGraphPolicy { .. } => "get_graph_policy",
+        MetadataEffect::ExportRoCrate { .. } => "export_rocrate",
+        MetadataEffect::ExportRoCrateSummary { .. } => "export_rocrate_summary",
+        MetadataEffect::ExportRoCratePage { .. } => "export_rocrate_page",
+        MetadataEffect::SearchGraphs { .. } => "search_graphs",
+        MetadataEffect::QueryGraphs { .. } => "query_graphs",
+        MetadataEffect::DeleteGraph { .. } => "delete_graph",
+        MetadataEffect::ListGraphs => "list_graphs",
+        MetadataEffect::ContainsGraph { .. } => "contains_graph",
+    }
+}
+
+fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
+    match event {
+        MetadataEvent::CreateCrateResult { .. } => "create_crate_result",
+        MetadataEvent::ApplyRoCrateResult { .. } => "apply_rocrate_result",
+        MetadataEvent::EntityUpsertResult { .. } => "entity_upsert_result",
+        MetadataEvent::GraphPolicySet { .. } => "graph_policy_set",
+        MetadataEvent::GraphPeerAdded { .. } => "graph_peer_added",
+        MetadataEvent::GraphSyncScheduled { .. } => "graph_sync_scheduled",
+        MetadataEvent::GraphPolicyResult { .. } => "graph_policy_result",
+        MetadataEvent::RoCrateExportResult { .. } => "rocrate_export_result",
+        MetadataEvent::RoCrateSummaryResult { .. } => "rocrate_summary_result",
+        MetadataEvent::RoCratePageResult { .. } => "rocrate_page_result",
+        MetadataEvent::SearchResult { .. } => "search_result",
+        MetadataEvent::QueryResult { .. } => "query_result",
+        MetadataEvent::GraphDeleted { .. } => "graph_deleted",
+        MetadataEvent::GraphListResult { .. } => "graph_list_result",
+        MetadataEvent::ContainsGraphResult { .. } => "contains_graph_result",
+        MetadataEvent::Error { .. } => "error",
+    }
+}
+
+fn metadata_query_result_kind(results: &MetadataQueryResults) -> &'static str {
+    match results {
+        MetadataQueryResults::Solutions(_) => "solutions",
+        MetadataQueryResults::Boolean(_) => "boolean",
+        MetadataQueryResults::Graph(_) => "graph",
+    }
+}
+
+fn record_metadata_query_result_counts(span: &Span, results: &MetadataQueryResults) {
+    match results {
+        MetadataQueryResults::Solutions(rows) => {
+            span.record("row_count", rows.len() as u64);
+        }
+        MetadataQueryResults::Boolean(_) => {
+            span.record("row_count", 1u64);
+        }
+        MetadataQueryResults::Graph(triples) => {
+            span.record("triple_count", triples.len() as u64);
+        }
+    }
+}
+
+fn metadata_transport_message_kind(message: &MetadataTransportMessage) -> &'static str {
+    match message {
+        MetadataTransportMessage::QueryGraphs { .. } => "query_graphs",
+        MetadataTransportMessage::QueryResults { .. } => "query_results",
+        MetadataTransportMessage::SearchGraphs { .. } => "search_graphs",
+        MetadataTransportMessage::SearchResults { .. } => "search_results",
+        MetadataTransportMessage::Reject(_) => "reject",
+    }
+}
+
 fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
     match effect {
         MetadataEffect::CreateCrate { request } => Some(request.graph_iri.clone()),
@@ -1167,11 +1786,24 @@ fn metadata_search_hit_from_craqle(
     }
 }
 
+#[tracing::instrument(
+    name = "metadata.registry.list_local",
+    level = "debug",
+    skip(storage_handle),
+    fields(
+        page_count = field::Empty,
+        record_count = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
 async fn list_local_registry_records(
     storage_handle: StorageHandle,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataError> {
+    let started = Instant::now();
+    let span = Span::current();
     let mut records = Vec::new();
     let mut start_after = None;
+    let mut page_count = 0usize;
     loop {
         let event = storage_handle
             .send_effect(iter_all_registry_effect(start_after.clone(), None))
@@ -1179,22 +1811,52 @@ async fn list_local_registry_records(
         let (mut page, next_start_after) = parse_registry_iter(event).map_err(|error| {
             MetadataError::Backend(format!("metadata registry iteration failed: {error:?}"))
         })?;
+        page_count += 1;
         records.append(&mut page);
+        span.record("page_count", page_count as u64);
+        span.record("record_count", records.len() as u64);
         if let Some(cursor) = next_start_after {
             start_after = Some(cursor);
         } else {
+            record_elapsed(&span, "elapsed_ms", started);
             return Ok(records);
         }
     }
 }
 
+#[tracing::instrument(
+    name = "metadata.query.local",
+    level = "debug",
+    skip(inner, auth_context, sparql),
+    fields(
+        query_len = sparql.len() as u64,
+        graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+        registry_records = field::Empty,
+        authorized_graphs = field::Empty,
+        registry_ms = field::Empty,
+        authorization_ms = field::Empty,
+        craqle_query_ms = field::Empty,
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+        row_count = field::Empty,
+        triple_count = field::Empty,
+    )
+)]
 async fn query_local_graphs(
     inner: Arc<MetadataInner>,
     auth_context: Option<AuthContext>,
     graph_iris: Option<Vec<String>>,
     sparql: String,
 ) -> Result<MetadataQueryResults, MetadataError> {
+    let span = Span::current();
+    let total_started = Instant::now();
+
+    let registry_started = Instant::now();
     let records = list_local_registry_records(inner.storage_handle.clone()).await?;
+    record_elapsed(&span, "registry_ms", registry_started);
+    span.record("registry_records", records.len() as u64);
+
+    let authorization_started = Instant::now();
     let allowed = select_authorized_graphs(
         inner.storage_handle.clone(),
         auth_context,
@@ -1202,17 +1864,72 @@ async fn query_local_graphs(
         graph_iris,
     )
     .await?;
-    tokio::task::spawn_blocking(move || {
-        inner
-            .node
-            .query_graphs(&graph_ids(&allowed), &sparql)
-            .map(metadata_query_results_from_craqle)
-            .map_err(|error| MetadataError::Backend(error.to_string()))
+    record_elapsed(&span, "authorization_ms", authorization_started);
+    span.record("authorized_graphs", allowed.len() as u64);
+
+    let query_span = debug_span!(
+        "metadata.backend.craqle.query_graphs",
+        graph_count = allowed.len() as u64,
+        query_len = sparql.len() as u64,
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+        row_count = field::Empty,
+        triple_count = field::Empty,
+    );
+    let blocking_span = query_span.clone();
+    let query_started = Instant::now();
+    let result = match tokio::task::spawn_blocking(move || {
+        blocking_span.in_scope(|| {
+            inner
+                .node
+                .query_graphs(&graph_ids(&allowed), &sparql)
+                .map(metadata_query_results_from_craqle)
+                .map_err(|error| MetadataError::Backend(error.to_string()))
+        })
     })
     .await
-    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    {
+        Ok(result) => result,
+        Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
+    };
+    let query_elapsed = query_started.elapsed();
+    record_duration(&query_span, "elapsed_ms", query_elapsed);
+    record_duration(&span, "craqle_query_ms", query_elapsed);
+    match &result {
+        Ok(results) => {
+            query_span.record("result", metadata_query_result_kind(results));
+            span.record("result", metadata_query_result_kind(results));
+            record_metadata_query_result_counts(&query_span, results);
+            record_metadata_query_result_counts(&span, results);
+        }
+        Err(error) => {
+            record_error(&query_span, &error.to_string());
+            record_error(&span, &error.to_string());
+        }
+    }
+    warn_if_slow_metadata_backend("query_graphs", None, query_elapsed);
+    record_elapsed(&span, "elapsed_ms", total_started);
+    result
 }
 
+#[tracing::instrument(
+    name = "metadata.search.local",
+    level = "debug",
+    skip(inner, auth_context, query),
+    fields(
+        query_len = query.len() as u64,
+        limit = limit as u64,
+        graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+        registry_records = field::Empty,
+        authorized_graphs = field::Empty,
+        registry_ms = field::Empty,
+        authorization_ms = field::Empty,
+        craqle_search_ms = field::Empty,
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+        hit_count = field::Empty,
+    )
+)]
 async fn search_local_graphs(
     inner: Arc<MetadataInner>,
     auth_context: Option<AuthContext>,
@@ -1220,7 +1937,15 @@ async fn search_local_graphs(
     query: String,
     limit: usize,
 ) -> Result<Vec<MetadataSearchHit>, MetadataError> {
+    let span = Span::current();
+    let total_started = Instant::now();
+
+    let registry_started = Instant::now();
     let records = list_local_registry_records(inner.storage_handle.clone()).await?;
+    record_elapsed(&span, "registry_ms", registry_started);
+    span.record("registry_records", records.len() as u64);
+
+    let authorization_started = Instant::now();
     let allowed_records = select_authorized_records(
         inner.storage_handle.clone(),
         auth_context,
@@ -1228,24 +1953,61 @@ async fn search_local_graphs(
         graph_iris,
     )
     .await?;
-    tokio::task::spawn_blocking(move || {
-        let by_graph: HashMap<_, _> = allowed_records
-            .into_iter()
-            .map(|record| (record.graph_iri.clone(), record))
-            .collect();
-        inner
-            .node
-            .search(&AllowAllAuthorizer, &query, limit)
-            .map(|hits| {
-                hits.into_iter()
-                    .filter_map(|hit| by_graph.get(&hit.graph_id).map(|record| (hit, record)))
-                    .map(|(hit, record)| metadata_search_hit_from_craqle(hit, record))
-                    .collect()
-            })
-            .map_err(|error| MetadataError::Backend(error.to_string()))
+    record_elapsed(&span, "authorization_ms", authorization_started);
+    span.record("authorized_graphs", allowed_records.len() as u64);
+
+    let search_span = debug_span!(
+        "metadata.backend.craqle.search",
+        graph_count = allowed_records.len() as u64,
+        query_len = query.len() as u64,
+        limit = limit as u64,
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+        hit_count = field::Empty,
+    );
+    let blocking_span = search_span.clone();
+    let search_started = Instant::now();
+    let result = match tokio::task::spawn_blocking(move || {
+        blocking_span.in_scope(|| {
+            let by_graph: HashMap<_, _> = allowed_records
+                .into_iter()
+                .map(|record| (record.graph_iri.clone(), record))
+                .collect();
+            inner
+                .node
+                .search(&AllowAllAuthorizer, &query, limit)
+                .map(|hits| {
+                    hits.into_iter()
+                        .filter_map(|hit| by_graph.get(&hit.graph_id).map(|record| (hit, record)))
+                        .map(|(hit, record)| metadata_search_hit_from_craqle(hit, record))
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|error| MetadataError::Backend(error.to_string()))
+        })
     })
     .await
-    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    {
+        Ok(result) => result,
+        Err(error) => Err(MetadataError::TaskJoin(error.to_string())),
+    };
+    let search_elapsed = search_started.elapsed();
+    record_duration(&search_span, "elapsed_ms", search_elapsed);
+    record_duration(&span, "craqle_search_ms", search_elapsed);
+    match &result {
+        Ok(hits) => {
+            search_span.record("result", "ok");
+            span.record("result", "ok");
+            search_span.record("hit_count", hits.len() as u64);
+            span.record("hit_count", hits.len() as u64);
+        }
+        Err(error) => {
+            record_error(&search_span, &error.to_string());
+            record_error(&span, &error.to_string());
+        }
+    }
+    warn_if_slow_metadata_backend("search", None, search_elapsed);
+    record_elapsed(&span, "elapsed_ms", total_started);
+    result
 }
 
 async fn select_authorized_graphs(
@@ -1263,27 +2025,66 @@ async fn select_authorized_graphs(
     )
 }
 
+#[tracing::instrument(
+    name = "metadata.authorization.select_records",
+    level = "debug",
+    skip(storage_handle, auth_context, records, graph_filter),
+    fields(
+        record_count = records.len() as u64,
+        graph_filter_count = graph_filter.as_ref().map_or(0, Vec::len) as u64,
+        visible_count = field::Empty,
+        deleted_count = field::Empty,
+        filtered_count = field::Empty,
+        public_count = field::Empty,
+        private_checked_count = field::Empty,
+        denied_count = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
 async fn select_authorized_records(
     storage_handle: StorageHandle,
     auth_context: Option<AuthContext>,
     records: Vec<MetadataRegistryRecord>,
     graph_filter: Option<Vec<String>>,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataError> {
+    let span = Span::current();
+    let started = Instant::now();
     let allowed_graphs = graph_filter.map(|graphs| graphs.into_iter().collect::<HashSet<_>>());
     let mut visible = Vec::new();
+    let mut deleted_count = 0usize;
+    let mut filtered_count = 0usize;
+    let mut public_count = 0usize;
+    let mut private_checked_count = 0usize;
+    let mut denied_count = 0usize;
     for record in records {
         if metadata_graph_deleted(storage_handle.clone(), &record.graph_iri).await? {
+            deleted_count += 1;
             continue;
         }
         if let Some(filter) = allowed_graphs.as_ref()
             && !filter.contains(&record.graph_iri)
         {
+            filtered_count += 1;
             continue;
+        }
+        if record.public {
+            public_count += 1;
+        } else {
+            private_checked_count += 1;
         }
         if can_read_record_locally(storage_handle.clone(), auth_context.clone(), &record).await? {
             visible.push(record);
+        } else {
+            denied_count += 1;
         }
     }
+    span.record("visible_count", visible.len() as u64);
+    span.record("deleted_count", deleted_count as u64);
+    span.record("filtered_count", filtered_count as u64);
+    span.record("public_count", public_count as u64);
+    span.record("private_checked_count", private_checked_count as u64);
+    span.record("denied_count", denied_count as u64);
+    record_elapsed(&span, "elapsed_ms", started);
     Ok(visible)
 }
 
@@ -1321,22 +2122,57 @@ async fn can_read_record_locally(
     .map_err(|error| MetadataError::Backend(error.to_string()))
 }
 
+#[tracing::instrument(
+    name = "metadata.remote.request",
+    level = "debug",
+    skip(net_handle, message),
+    fields(
+        peer = ?node_id,
+        request = metadata_transport_message_kind(&message),
+        response = field::Empty,
+        open_stream_ms = field::Empty,
+        write_ms = field::Empty,
+        finish_ms = field::Empty,
+        read_ms = field::Empty,
+        close_ms = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
 async fn send_request(
     net_handle: &NetHandle,
     node_id: NodeId,
     message: MetadataTransportMessage,
 ) -> Result<MetadataTransportMessage, MetadataError> {
+    let span = Span::current();
+    let total_started = Instant::now();
+
+    let open_started = Instant::now();
     let mut stream = net_handle
         .open_stream(node_id, Alpn::Metadata)
         .await
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    record_elapsed(&span, "open_stream_ms", open_started);
+
+    let write_started = Instant::now();
     write_transport_message(&mut stream, &message).await?;
+    record_elapsed(&span, "write_ms", write_started);
+
+    let finish_started = Instant::now();
     stream
         .0
         .finish()
         .map_err(|error| MetadataError::Backend(error.to_string()))?;
+    record_elapsed(&span, "finish_ms", finish_started);
+
+    let read_started = Instant::now();
     let response = read_transport_message(&mut stream).await?;
+    record_elapsed(&span, "read_ms", read_started);
+
+    let close_started = Instant::now();
     close_stream(&mut stream).await;
+    record_elapsed(&span, "close_ms", close_started);
+    record_elapsed(&span, "elapsed_ms", total_started);
+    span.record("response", metadata_transport_message_kind(&response));
     Ok(response)
 }
 

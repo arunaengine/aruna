@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tracing::warn;
+use std::time::Instant;
+use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 use url::form_urlencoded::Serializer;
 use utoipa::{OpenApi, ToSchema};
@@ -1576,6 +1577,22 @@ fn map_query_results(results: MetadataQueryResults) -> ServerResult<MetadataQuer
     }
 }
 
+fn api_duration_ms(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn record_api_elapsed(span: &Span, field: &'static str, started: Instant) {
+    span.record(field, api_duration_ms(started.elapsed()));
+}
+
+fn metadata_query_result_kind(results: &MetadataQueryResults) -> &'static str {
+    match results {
+        MetadataQueryResults::Solutions(_) => "solutions",
+        MetadataQueryResults::Boolean(_) => "boolean",
+        MetadataQueryResults::Graph(_) => "graph",
+    }
+}
+
 async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
     let nodes = match drive(
         GetRealmNodesOperation::new(state.get_realm_id()),
@@ -1599,6 +1616,20 @@ async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::N
     Ok(nodes)
 }
 
+#[tracing::instrument(
+    name = "metadata.api.query_distributed",
+    level = "debug",
+    skip(state, auth, query),
+    fields(
+        mode = ?mode,
+        query_len = query.len() as u64,
+        graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+        node_count = field::Empty,
+        discovery_ms = field::Empty,
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+    )
+)]
 async fn run_query_distributed(
     state: &ServerState,
     auth: Option<AuthContext>,
@@ -1606,6 +1637,8 @@ async fn run_query_distributed(
     query: String,
     mode: Option<MetadataQueryMode>,
 ) -> ServerResult<MetadataQueryResults> {
+    let span = Span::current();
+    let total_started = Instant::now();
     ensure_supported_query_mode(&mode)?;
     let handle = state
         .get_ctx()
@@ -1617,19 +1650,49 @@ async fn run_query_distributed(
     let mut parts = Vec::new();
     match mode.unwrap_or(MetadataQueryMode::Distributed) {
         MetadataQueryMode::Local => {
-            parts.push(
-                handle
-                    .query_authorized_local(auth, graph_iris, query)
-                    .await
-                    .map_err(|err| ServerError::InternalError(err.to_string()))?,
+            let node_span = debug_span!(
+                "metadata.api.query_node",
+                peer = ?state.get_node_id(),
+                local = true,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
             );
+            let node_started = Instant::now();
+            let result = handle
+                .query_authorized_local(auth, graph_iris, query)
+                .instrument(node_span.clone())
+                .await;
+            record_api_elapsed(&node_span, "elapsed_ms", node_started);
+            match result {
+                Ok(result) => {
+                    node_span.record("result", metadata_query_result_kind(&result));
+                    parts.push(result);
+                }
+                Err(error) => {
+                    node_span.record("result", "error");
+                    return Err(ServerError::InternalError(error.to_string()));
+                }
+            }
         }
         MetadataQueryMode::Distributed => {
+            let discovery_started = Instant::now();
             let nodes = load_realm_nodes(state).await?;
+            record_api_elapsed(&span, "discovery_ms", discovery_started);
+            span.record("node_count", nodes.len() as u64);
             for node_id in nodes {
-                let result = if node_id == state.get_node_id() {
+                let local = node_id == state.get_node_id();
+                let node_span = debug_span!(
+                    "metadata.api.query_node",
+                    peer = ?node_id,
+                    local,
+                    elapsed_ms = field::Empty,
+                    result = field::Empty,
+                );
+                let node_started = Instant::now();
+                let result = if local {
                     handle
                         .query_authorized_local(auth.clone(), graph_iris.clone(), query.clone())
+                        .instrument(node_span.clone())
                         .await
                 } else {
                     handle
@@ -1639,23 +1702,56 @@ async fn run_query_distributed(
                             graph_iris.clone(),
                             query.clone(),
                         )
+                        .instrument(node_span.clone())
                         .await
                 };
+                record_api_elapsed(&node_span, "elapsed_ms", node_started);
                 match result {
-                    Ok(result) => parts.push(result),
-                    Err(error) => warn!(
-                        node_id = ?node_id,
-                        error = %error,
-                        "distributed metadata query skipped failed node result"
-                    ),
+                    Ok(result) => {
+                        node_span.record("result", metadata_query_result_kind(&result));
+                        parts.push(result);
+                    }
+                    Err(error) => {
+                        node_span.record("result", "error");
+                        warn!(
+                            node_id = ?node_id,
+                            error = %error,
+                            "distributed metadata query skipped failed node result"
+                        );
+                    }
                 }
             }
         }
     }
 
-    aggregate_query_results(parts, query_form)
+    let result = aggregate_query_results(parts, query_form);
+    record_api_elapsed(&span, "elapsed_ms", total_started);
+    match &result {
+        Ok(results) => {
+            span.record("result", metadata_query_result_kind(results));
+        }
+        Err(_) => {
+            span.record("result", "error");
+        }
+    }
+    result
 }
 
+#[tracing::instrument(
+    name = "metadata.api.search_distributed",
+    level = "debug",
+    skip(state, auth, query),
+    fields(
+        mode = ?mode,
+        query_len = query.len() as u64,
+        limit = limit as u64,
+        graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
+        node_count = field::Empty,
+        discovery_ms = field::Empty,
+        elapsed_ms = field::Empty,
+        hit_count = field::Empty,
+    )
+)]
 async fn run_search_distributed(
     state: &ServerState,
     auth: Option<AuthContext>,
@@ -1664,6 +1760,8 @@ async fn run_search_distributed(
     limit: usize,
     mode: Option<MetadataQueryMode>,
 ) -> ServerResult<Vec<MetadataSearchHit>> {
+    let span = Span::current();
+    let total_started = Instant::now();
     ensure_supported_query_mode(&mode)?;
     let handle = state
         .get_ctx()
@@ -1674,17 +1772,44 @@ async fn run_search_distributed(
     let mut hits = Vec::new();
     match mode.unwrap_or(MetadataQueryMode::Distributed) {
         MetadataQueryMode::Local => {
-            hits.extend(
-                handle
-                    .search_authorized_local(auth, graph_iris, query, limit)
-                    .await
-                    .map_err(|err| ServerError::InternalError(err.to_string()))?,
+            let node_span = debug_span!(
+                "metadata.api.search_node",
+                peer = ?state.get_node_id(),
+                local = true,
+                elapsed_ms = field::Empty,
+                hit_count = field::Empty,
             );
+            let node_started = Instant::now();
+            let result = handle
+                .search_authorized_local(auth, graph_iris, query, limit)
+                .instrument(node_span.clone())
+                .await;
+            record_api_elapsed(&node_span, "elapsed_ms", node_started);
+            match result {
+                Ok(result) => {
+                    node_span.record("hit_count", result.len() as u64);
+                    hits.extend(result);
+                }
+                Err(error) => return Err(ServerError::InternalError(error.to_string())),
+            }
         }
         MetadataQueryMode::Distributed => {
+            let discovery_started = Instant::now();
             let nodes = load_realm_nodes(state).await?;
+            record_api_elapsed(&span, "discovery_ms", discovery_started);
+            span.record("node_count", nodes.len() as u64);
             for node_id in nodes {
-                let result = if node_id == state.get_node_id() {
+                let local = node_id == state.get_node_id();
+                let node_span = debug_span!(
+                    "metadata.api.search_node",
+                    peer = ?node_id,
+                    local,
+                    elapsed_ms = field::Empty,
+                    hit_count = field::Empty,
+                    result = field::Empty,
+                );
+                let node_started = Instant::now();
+                let result = if local {
                     handle
                         .search_authorized_local(
                             auth.clone(),
@@ -1692,6 +1817,7 @@ async fn run_search_distributed(
                             query.clone(),
                             limit,
                         )
+                        .instrument(node_span.clone())
                         .await
                 } else {
                     handle
@@ -1702,21 +1828,33 @@ async fn run_search_distributed(
                             query.clone(),
                             limit,
                         )
+                        .instrument(node_span.clone())
                         .await
                 };
+                record_api_elapsed(&node_span, "elapsed_ms", node_started);
                 match result {
-                    Ok(result) => hits.extend(result),
-                    Err(error) => warn!(
-                        node_id = ?node_id,
-                        error = %error,
-                        "distributed metadata search skipped failed node result"
-                    ),
+                    Ok(result) => {
+                        node_span.record("result", "ok");
+                        node_span.record("hit_count", result.len() as u64);
+                        hits.extend(result);
+                    }
+                    Err(error) => {
+                        node_span.record("result", "error");
+                        warn!(
+                            node_id = ?node_id,
+                            error = %error,
+                            "distributed metadata search skipped failed node result"
+                        );
+                    }
                 }
             }
         }
     }
 
-    Ok(deduplicate_search_hits(hits, limit))
+    let hits = deduplicate_search_hits(hits, limit);
+    span.record("hit_count", hits.len() as u64);
+    record_api_elapsed(&span, "elapsed_ms", total_started);
+    Ok(hits)
 }
 
 fn aggregate_query_results(
