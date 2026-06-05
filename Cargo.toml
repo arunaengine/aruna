@@ -74,7 +74,7 @@ hyper-util = { version = "0.1.20", features = [
 ] }
 iroh = "1.0.0-rc.1"
 iroh-base = "1.0.0-rc.1"
-irokle = { git = "https://github.com/arunaengine/irokle", branch = "main", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", branch = "main", features = [
     "fjall",
     "iroh",
 ] }
