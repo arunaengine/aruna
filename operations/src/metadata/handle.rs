@@ -321,6 +321,14 @@ impl MetadataHandle {
         search_local_graphs(self.inner.clone(), auth_context, graph_iris, query, limit).await
     }
 
+    pub async fn flush_search_updates(&self) -> Result<(), MetadataError> {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || inner.node.flush_search_updates())
+            .await
+            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+            .map_err(metadata_error_from_craqle)
+    }
+
     pub async fn request_remote_query_graphs(
         &self,
         node_id: NodeId,

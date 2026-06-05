@@ -2001,6 +2001,15 @@ mod tests {
         .unwrap();
         assert!(matches!(result, MetadataQueryResponse::Boolean(true)));
 
+        test.state
+            .get_ctx()
+            .metadata_handle
+            .as_ref()
+            .unwrap()
+            .flush_search_updates()
+            .await
+            .unwrap();
+
         let (_, Json(search)) = search_metadata(
             State(test.state.clone()),
             Extension(None),
