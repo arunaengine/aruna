@@ -49,6 +49,7 @@ struct MetadataInner {
     node: Arc<CraqleNode>,
     storage_handle: StorageHandle,
     net_handle: Option<NetHandle>,
+    irokle_db: Option<fjall::OptimisticTxDatabase>,
 }
 
 impl std::fmt::Debug for MetadataHandle {
@@ -64,6 +65,7 @@ impl MetadataHandle {
         storage_handle: StorageHandle,
         net_handle: Option<NetHandle>,
         irokle_node: Option<irokle::Irokle<irokle::FjallStorage>>,
+        irokle_db: Option<fjall::OptimisticTxDatabase>,
     ) -> Result<Self, MetadataError> {
         let actor = ActorId::from_bytes(*node_id.as_bytes());
         let options = CraqleOptions::new().with_actor(actor);
@@ -78,6 +80,7 @@ impl MetadataHandle {
                 node: Arc::new(node),
                 storage_handle,
                 net_handle,
+                irokle_db,
             }),
         })
     }
@@ -679,6 +682,7 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     let effect_name = metadata_effect_kind(&effect);
     let auth = AllowAllAuthorizer;
     let graph_iri = effect_graph_iri(&effect);
+    let persist_irokle_after_success = metadata_effect_persists_irokle(&effect);
     let node = inner.node.clone();
     let effect_span = debug_span!(
         "metadata.backend.effect",
@@ -1061,16 +1065,71 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
         }
     });
 
+    let persist_error = if persist_irokle_after_success && result.is_ok() {
+        persist_irokle_journal(&inner, effect_name, graph_iri.as_deref()).err()
+    } else {
+        None
+    };
     record_elapsed(&effect_span, "elapsed_ms", effect_started);
-    let event = result.unwrap_or_else(|error| MetadataEvent::Error {
-        graph_iri,
-        error: metadata_error_from_craqle(error),
-    });
+    let event = match (result, persist_error) {
+        (_, Some(error)) => MetadataEvent::Error { graph_iri, error },
+        (Ok(event), None) => event,
+        (Err(error), None) => MetadataEvent::Error {
+            graph_iri,
+            error: metadata_error_from_craqle(error),
+        },
+    };
     effect_span.record("result", metadata_event_kind(&event));
     if let MetadataEvent::Error { error, .. } = &event {
         record_error(&effect_span, &error.to_string());
     }
     event
+}
+
+fn persist_irokle_journal(
+    inner: &MetadataInner,
+    effect_name: &'static str,
+    graph_iri: Option<&str>,
+) -> Result<(), MetadataError> {
+    let Some(db) = &inner.irokle_db else {
+        return Ok(());
+    };
+    let span = debug_span!(
+        "metadata.backend.irokle.persist",
+        effect = effect_name,
+        graph_iri = graph_iri.unwrap_or("<none>"),
+        mode = "sync_data",
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+    );
+    let started = Instant::now();
+    let result = span.in_scope(|| db.persist(fjall::PersistMode::SyncData));
+    record_elapsed(&span, "elapsed_ms", started);
+    match result {
+        Ok(()) => {
+            span.record("result", "ok");
+            Ok(())
+        }
+        Err(error) => {
+            record_error(&span, &error.to_string());
+            Err(MetadataError::Backend(format!(
+                "failed to persist irokle journal: {error}"
+            )))
+        }
+    }
+}
+
+fn metadata_effect_persists_irokle(effect: &MetadataEffect) -> bool {
+    matches!(
+        effect,
+        MetadataEffect::CreateCrate { .. }
+            | MetadataEffect::ApplyRoCrate { .. }
+            | MetadataEffect::UpsertDataEntity { .. }
+            | MetadataEffect::UpsertContextualEntity { .. }
+            | MetadataEffect::SetGraphPolicy { .. }
+            | MetadataEffect::AddGraphPeer { .. }
+            | MetadataEffect::DeleteGraph { .. }
+    )
 }
 
 fn upsert_data_entity(

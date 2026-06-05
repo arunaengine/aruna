@@ -79,6 +79,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         storage_handle.clone(),
         Some(net_handle.clone()),
         Some(net_handle.irokle_node()),
+        Some(net_handle.irokle_database()),
     )?;
     let blob_handle = BlobHandler::new(
         BackendConfig {

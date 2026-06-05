@@ -1,6 +1,8 @@
 use crate::error::CliError;
 use blake3::Hasher;
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use fjall::{
+    KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
+};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
@@ -167,7 +169,9 @@ pub fn import_snapshot_into_new_database(
     let mut reader = BufReader::new(file);
     let snapshot_created_at_unix_seconds = read_header(&mut reader)?;
 
-    let db = OptimisticTxDatabase::builder(target_db_path).open()?;
+    let db = OptimisticTxDatabase::builder(target_db_path)
+        .manual_journal_persist(true)
+        .open()?;
     let mut hasher = Hasher::new();
     let mut seen_keyspaces = HashSet::new();
     let mut keyspace_state: Option<ImportKeyspaceState> = None;
@@ -264,6 +268,7 @@ pub fn import_snapshot_into_new_database(
                 }
 
                 ensure_reader_exhausted(&mut reader)?;
+                db.persist(PersistMode::SyncData)?;
                 return Ok(ImportStats {
                     snapshot_created_at_unix_seconds,
                     keyspace_count,
@@ -303,7 +308,7 @@ impl ImportKeyspaceState {
         value: Vec<u8>,
     ) -> Result<(), SnapshotError> {
         if self.pending_txn.is_none() {
-            self.pending_txn = Some(db.write_tx()?);
+            self.pending_txn = Some(db.write_tx()?.durability(Some(PersistMode::Buffer)));
         }
 
         if let Some(txn) = self.pending_txn.as_mut() {

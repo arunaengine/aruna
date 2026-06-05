@@ -2492,6 +2492,7 @@ mod tests {
             storage_handle.clone(),
             None,
             None,
+            None,
         )
         .unwrap();
         let task_handle = TaskHandle::new();

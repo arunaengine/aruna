@@ -116,6 +116,8 @@ pub enum StorageError {
     WriteError,
     #[error("Delete error")]
     DeleteError,
+    #[error("Persist error: {0}")]
+    PersistError(String),
     #[error("Channel closed")]
     ChannelClosed,
     #[error("Queue full")]

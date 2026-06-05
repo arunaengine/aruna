@@ -41,6 +41,7 @@ const IROKLE_PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct IrokleService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: Arc<irokle_crate::net::IrohNet<irokle_crate::FjallStorage>>,
+    db: fjall::OptimisticTxDatabase,
     storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
     storage_path: PathBuf,
@@ -66,10 +67,14 @@ impl IrokleService {
     ) -> Result<Self> {
         let storage_path = storage_path.as_ref().to_path_buf();
         let default_peers: BTreeSet<PeerId> = peer_nodes.iter().map(node_id_to_peer_id).collect();
+        let db = fjall::OptimisticTxDatabase::builder(&storage_path)
+            .manual_journal_persist(true)
+            .open()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let node = irokle_crate::Irokle::builder()
             .with_iroh_secret_key(endpoint.secret_key())
             .with_peer_whitelist(default_peers.clone())
-            .with_fjall_path(&storage_path)
+            .with_fjall_database_and_persist_mode(db.clone(), fjall::PersistMode::Buffer)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
             .build()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -88,6 +93,7 @@ impl IrokleService {
         Ok(Self {
             node,
             net,
+            db,
             storage,
             default_peers: Arc::new(RwLock::new(default_peers)),
             storage_path,
@@ -98,6 +104,10 @@ impl IrokleService {
         self.node.clone()
     }
 
+    pub fn database(&self) -> fjall::OptimisticTxDatabase {
+        self.db.clone()
+    }
+
     pub fn allow_peer_node(&self, node_id: NodeId) -> Result<()> {
         let peer_id = node_id_to_peer_id(&node_id);
         if peer_id == self.node.peer_id() {
@@ -105,7 +115,8 @@ impl IrokleService {
         }
         self.node
             .add_peer_to_whitelist(peer_id)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.persist_database()
     }
 
     pub fn add_potential_peer_node(&self, node_id: NodeId) -> Result<()> {
@@ -141,6 +152,7 @@ impl IrokleService {
             .add_peers_to_whitelist(peers.iter().copied())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         *self.default_peers.write() = peers;
+        self.persist_database()?;
         Ok(())
     }
 
@@ -155,7 +167,8 @@ impl IrokleService {
     ) -> Result<()> {
         let sync_peers = self.sync_peers(peers);
         self.allow_sync_peers(&sync_peers)?;
-        self.sync_topic(topic_id, sync_peers).await
+        self.sync_topic(topic_id, sync_peers).await?;
+        self.persist_database()
     }
 
     pub async fn handle_inbound_stream(&self, stream: BiStream, peer: NodeId) -> Result<usize> {
@@ -164,6 +177,7 @@ impl IrokleService {
             .handle_stream(peer, recv, send)
             .await
             .map_err(|error| NetError::Stream(error.to_string()))?;
+        self.persist_database()?;
         self.reconcile_documents().await
     }
 
@@ -254,6 +268,12 @@ impl IrokleService {
                 };
             }
         }
+        if let Err(error) = self.persist_database() {
+            return IrokleEvent::Error {
+                target: Some(target),
+                error: error.to_string(),
+            };
+        }
         match self.reconcile_documents().await {
             Ok(applied) => IrokleEvent::DocumentsReconciled { applied },
             Err(error) => IrokleEvent::Error {
@@ -277,7 +297,14 @@ impl IrokleService {
             .create_event_op(topic_id, actor_id, envelope, self.node.signer())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         self.net.schedule_topic_recheck(topic_id)?;
+        self.persist_database()?;
         Ok(())
+    }
+
+    fn persist_database(&self) -> Result<()> {
+        self.db
+            .persist(fjall::PersistMode::SyncData)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))
     }
 
     fn ensure_topic(

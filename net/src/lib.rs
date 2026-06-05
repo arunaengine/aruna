@@ -702,6 +702,10 @@ impl NetHandle {
         self.inner.irokle.node()
     }
 
+    pub fn irokle_database(&self) -> fjall::OptimisticTxDatabase {
+        self.inner.irokle.database()
+    }
+
     pub async fn sync_irokle_topic_with_peers(
         &self,
         topic_id: ::irokle::TopicId,

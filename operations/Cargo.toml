@@ -20,6 +20,7 @@ bytes = { workspace = true }
 byteview = { workspace = true }
 chrono = { workspace = true }
 globset = { workspace = true }
+fjall = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }

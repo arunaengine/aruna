@@ -11,6 +11,7 @@ aruna-core = { workspace = true }
 aruna-storage = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
+fjall = { workspace = true }
 opentelemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

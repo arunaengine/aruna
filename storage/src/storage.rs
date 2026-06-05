@@ -12,7 +12,9 @@ use aruna_core::handle::Handle;
 use async_trait::async_trait;
 use byteview::ByteView;
 use crossfire::{TrySendError, mpsc, oneshot};
-use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
+use fjall::{
+    KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode, Readable,
+};
 use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
@@ -300,7 +302,9 @@ impl Handle for StorageHandle {
 impl FjallStorage {
     #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]
     pub fn open(path: &str) -> Result<StorageHandle, StorageLibError> {
-        let db = OptimisticTxDatabase::builder(path).open()?;
+        let db = OptimisticTxDatabase::builder(path)
+            .manual_journal_persist(true)
+            .open()?;
 
         let (sender, receiver) = StorageHandle::new();
 
@@ -458,6 +462,29 @@ impl FjallStorage {
         }
     }
 
+    fn persist_journal(&self) -> Result<(), StorageError> {
+        self.store
+            .db
+            .persist(PersistMode::SyncData)
+            .map_err(|error| StorageError::PersistError(error.to_string()))
+    }
+
+    fn buffered_write_tx(&self) -> Result<fjall::OptimisticWriteTx, StorageError> {
+        self.store
+            .db
+            .write_tx()
+            .map(|tx| tx.durability(Some(PersistMode::Buffer)))
+            .map_err(|_| StorageError::WriteError)
+    }
+
+    fn commit_buffered_write_tx(&self, tx: fjall::OptimisticWriteTx) -> Result<(), StorageError> {
+        match tx.commit() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(StorageError::TransactionConflict),
+            Err(_) => Err(StorageError::WriteError),
+        }
+    }
+
     #[tracing::instrument(
         name = "storage.start_transaction",
         level = "debug",
@@ -473,6 +500,7 @@ impl FjallStorage {
         } else {
             match self.store.db.write_tx() {
                 Ok(txn) => {
+                    let txn = txn.durability(Some(PersistMode::Buffer));
                     self.txns.insert(txn_id, Txn::Write(Box::new(txn)));
                 }
                 Err(_e) => {
@@ -583,12 +611,18 @@ impl FjallStorage {
                 }
             }
         } else {
-            match keyspace.insert(key.clone(), value) {
-                Ok(_) => StorageEvent::WriteResult { key },
-                Err(_e) => StorageEvent::Error {
-                    error: StorageError::WriteError,
-                },
+            let mut tx = match self.buffered_write_tx() {
+                Ok(tx) => tx,
+                Err(error) => return StorageEvent::Error { error },
+            };
+            tx.insert(keyspace, key.clone(), value);
+            if let Err(error) = self.commit_buffered_write_tx(tx) {
+                return StorageEvent::Error { error };
             }
+            if let Err(error) = self.persist_journal() {
+                return StorageEvent::Error { error };
+            }
+            StorageEvent::WriteResult { key }
         }
     }
 
@@ -621,18 +655,28 @@ impl FjallStorage {
                 entries.push((key_space, key));
             }
         } else {
+            let mut resolved = Vec::with_capacity(writes.len());
             for (key_space, key, value) in writes {
                 let keyspace = match self.store.resolve_keyspace(&key_space) {
                     Ok(ks) => ks,
                     Err(error) => return StorageEvent::Error { error },
                 };
+                resolved.push((keyspace, key_space, key, value));
+            }
 
-                if keyspace.insert(key.clone(), value).is_err() {
-                    return StorageEvent::Error {
-                        error: StorageError::WriteError,
-                    };
-                }
+            let mut tx = match self.buffered_write_tx() {
+                Ok(tx) => tx,
+                Err(error) => return StorageEvent::Error { error },
+            };
+            for (keyspace, key_space, key, value) in resolved {
+                tx.insert(keyspace, key.clone(), value);
                 entries.push((key_space, key));
+            }
+            if let Err(error) = self.commit_buffered_write_tx(tx) {
+                return StorageEvent::Error { error };
+            }
+            if let Err(error) = self.persist_journal() {
+                return StorageEvent::Error { error };
             }
         }
 
@@ -648,7 +692,15 @@ impl FjallStorage {
             }
 
             Some(Txn::Write(txn)) => match txn.commit() {
-                Ok(_) => StorageEvent::TransactionCommitted { txn_id },
+                Ok(Ok(())) => {
+                    if let Err(error) = self.persist_journal() {
+                        return StorageEvent::Error { error };
+                    }
+                    StorageEvent::TransactionCommitted { txn_id }
+                }
+                Ok(Err(_)) => StorageEvent::Error {
+                    error: StorageError::TransactionConflict,
+                },
                 Err(_e) => StorageEvent::Error {
                     error: StorageError::TransactionConflict,
                 },
@@ -681,12 +733,18 @@ impl FjallStorage {
                 }
             }
         } else {
-            match keyspace.remove(key.clone()) {
-                Ok(_) => StorageEvent::DeleteResult { key },
-                Err(_e) => StorageEvent::Error {
-                    error: StorageError::DeleteError,
-                },
+            let mut tx = match self.buffered_write_tx() {
+                Ok(tx) => tx,
+                Err(error) => return StorageEvent::Error { error },
+            };
+            tx.remove(keyspace, key.clone());
+            if let Err(error) = self.commit_buffered_write_tx(tx) {
+                return StorageEvent::Error { error };
             }
+            if let Err(error) = self.persist_journal() {
+                return StorageEvent::Error { error };
+            }
+            StorageEvent::DeleteResult { key }
         }
     }
 
@@ -719,18 +777,28 @@ impl FjallStorage {
                 entries.push((key_space, key));
             }
         } else {
+            let mut resolved = Vec::with_capacity(deletes.len());
             for (key_space, key) in deletes {
                 let keyspace = match self.store.resolve_keyspace(&key_space) {
                     Ok(ks) => ks,
                     Err(error) => return StorageEvent::Error { error },
                 };
+                resolved.push((keyspace, key_space, key));
+            }
 
-                if keyspace.remove(key.clone()).is_err() {
-                    return StorageEvent::Error {
-                        error: StorageError::DeleteError,
-                    };
-                }
+            let mut tx = match self.buffered_write_tx() {
+                Ok(tx) => tx,
+                Err(error) => return StorageEvent::Error { error },
+            };
+            for (keyspace, key_space, key) in resolved {
+                tx.remove(keyspace, key.clone());
                 entries.push((key_space, key));
+            }
+            if let Err(error) = self.commit_buffered_write_tx(tx) {
+                return StorageEvent::Error { error };
+            }
+            if let Err(error) = self.persist_journal() {
+                return StorageEvent::Error { error };
             }
         }
 
