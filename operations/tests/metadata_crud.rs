@@ -165,6 +165,7 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         storage_handle.clone(),
         None,
         None,
+        None,
     )?;
     let actor = Actor {
         node_id,

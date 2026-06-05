@@ -261,6 +261,7 @@ async fn spawn_node(realm_id: RealmId) -> Result<TestNode, Box<dyn std::error::E
         storage.clone(),
         Some(net.clone()),
         Some(net.irokle_node()),
+        Some(net.irokle_database()),
     )?;
 
     let context = Arc::new(DriverContext {

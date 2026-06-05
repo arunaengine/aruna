@@ -677,6 +677,7 @@ async fn initialize_context(
             storage_handle.clone(),
             Some(net.clone()),
             Some(net.irokle_node()),
+            Some(net.irokle_database()),
         )?)
     } else {
         None
