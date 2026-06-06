@@ -67,8 +67,47 @@ pub enum DhtOutput {
 #[derive(Debug, Clone)]
 pub enum DhtOutputValue {
     Unit,
-    GetValues(Vec<DhtEntry>),
+    GetValues {
+        values: Vec<DhtEntry>,
+        stats: DhtGetStats,
+    },
     RoutingTableSize(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhtGetCompletedReason {
+    LocalValue,
+    RemoteValue,
+    LookupExhausted,
+}
+
+impl DhtGetCompletedReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalValue => "local_value",
+            Self::RemoteValue => "remote_value",
+            Self::LookupExhausted => "lookup_exhausted",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DhtPeerError {
+    pub peer: NodeId,
+    pub error: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DhtGetStats {
+    pub completed_reason: DhtGetCompletedReason,
+    pub local_value_count: usize,
+    pub remote_value_count: usize,
+    pub queried_peer_count: usize,
+    pub queried_peers: Vec<NodeId>,
+    pub queried_peers_truncated: bool,
+    pub peer_error_count: usize,
+    pub peer_errors: Vec<DhtPeerError>,
+    pub peer_errors_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

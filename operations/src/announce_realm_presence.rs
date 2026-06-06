@@ -13,7 +13,7 @@ use aruna_core::types::Effects;
 use smallvec::smallvec;
 use thiserror::Error;
 
-const REALM_PRESENCE_TTL: Duration = Duration::from_secs(30);
+const REALM_PRESENCE_TTL: Duration = Duration::from_secs(60);
 pub(crate) const REALM_PRESENCE_REFRESH_AFTER: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,6 +160,25 @@ impl Operation for AnnounceRealmPresenceOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presence_ttl_outlives_refresh_and_dht_tick() {
+        let realm_id = RealmId([1u8; 32]);
+        let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut op = AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
+            realm_id,
+            node_id,
+            schedule_refresh: true,
+        });
+
+        let effects = op.start();
+
+        let [Effect::Net(NetEffect::Dht(DhtEffect::Put { ttl, .. }))] = effects.as_slice() else {
+            panic!("expected one DHT put effect");
+        };
+        assert!(*ttl > REALM_PRESENCE_REFRESH_AFTER);
+        assert!(*ttl > aruna_net::dht::constants::DRIVER_TICK_INTERVAL);
+    }
 
     #[test]
     fn dht_put_error_fails_operation() {

@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aruna_core::events::DhtEntry;
 use aruna_core::id::{DhtKeyId, NodeId};
@@ -9,7 +9,7 @@ use iroh::Endpoint;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::trace;
+use tracing::{info, trace, warn};
 
 use super::constants::{CMD_CHANNEL_CAPACITY, INBOUND_STREAM_CAPACITY};
 use super::driver::{CallerOutcome, DhtDriver, DriverCmd, DriverCmdSender, InboundSender};
@@ -18,7 +18,7 @@ use super::state::DhtStateMachine;
 use super::storage::now_unix_secs;
 use crate::connection_pool::ConnectionPool;
 use crate::error::{NetError, Result};
-use crate::telemetry::current_trace_context;
+use crate::telemetry::{current_trace_context, duration_ms};
 
 #[derive(Debug)]
 pub(crate) struct DhtSpawnResources {
@@ -152,33 +152,66 @@ impl DhtHandle {
         key: &DhtKeyId,
         realm_filter: Option<RealmId>,
     ) -> Result<Vec<DhtEntry>> {
+        let started = Instant::now();
         trace!(
             event = "dht.get.started",
             key = %key,
             realm_id = ?realm_filter,
             "Starting DHT get"
         );
-        match self
+        let result = self
             .request(|reply| DriverCmd::Get {
                 key: *key,
                 realm_filter,
                 trace_context: current_trace_context(),
                 reply,
             })
-            .await?
-        {
-            DhtOutputValue::GetValues(values) => {
-                trace!(
+            .await;
+
+        match result {
+            Ok(DhtOutputValue::GetValues { values, stats }) => {
+                info!(
                     event = "dht.get.completed",
                     key = %key,
+                    realm_id = ?realm_filter,
+                    elapsed_ms = duration_ms(started.elapsed()),
+                    completed_reason = stats.completed_reason.as_str(),
+                    local_value_count = stats.local_value_count,
+                    remote_value_count = stats.remote_value_count,
                     result_count = values.len(),
+                    queried_peer_count = stats.queried_peer_count,
+                    queried_peers = ?stats.queried_peers,
+                    queried_peers_truncated = stats.queried_peers_truncated,
+                    peer_error_count = stats.peer_error_count,
+                    peer_errors = ?stats.peer_errors,
+                    peer_errors_truncated = stats.peer_errors_truncated,
                     "Completed DHT get"
                 );
                 Ok(values)
             }
-            other => Err(NetError::Dht(format!(
-                "unexpected DHT get output: {other:?}"
-            ))),
+            Ok(other) => {
+                let message = format!("unexpected DHT get output: {other:?}");
+                warn!(
+                    event = "dht.get.failed",
+                    key = %key,
+                    realm_id = ?realm_filter,
+                    elapsed_ms = duration_ms(started.elapsed()),
+                    error = %message,
+                    "DHT get returned unexpected output"
+                );
+                Err(NetError::Dht(message))
+            }
+            Err(error) => {
+                warn!(
+                    event = "dht.get.failed",
+                    key = %key,
+                    realm_id = ?realm_filter,
+                    elapsed_ms = duration_ms(started.elapsed()),
+                    error = %error,
+                    "DHT get failed"
+                );
+                Err(error)
+            }
         }
     }
 
