@@ -249,6 +249,7 @@ pub fn blob_object_permission_path(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HashPathIndexKey {
     pub blake3_hash: [u8; 32],
+    pub version_id: Ulid,
     pub realm_id: RealmId,
     pub group_id: GroupId,
     pub node_id: NodeId,
@@ -264,6 +265,7 @@ struct HashPathIndexKeyPrefix {
 impl HashPathIndexKey {
     pub fn new(
         blake3_hash: [u8; 32],
+        version_id: Ulid,
         realm_id: RealmId,
         group_id: GroupId,
         node_id: NodeId,
@@ -272,6 +274,7 @@ impl HashPathIndexKey {
     ) -> Self {
         Self {
             blake3_hash,
+            version_id,
             realm_id,
             group_id,
             node_id,
@@ -282,6 +285,7 @@ impl HashPathIndexKey {
 
     pub fn from_blake3_hash(
         hash: &[u8],
+        version_id: Ulid,
         realm_id: RealmId,
         group_id: GroupId,
         node_id: NodeId,
@@ -290,6 +294,7 @@ impl HashPathIndexKey {
     ) -> Result<Self, ConversionError> {
         Ok(Self::new(
             hash.try_into()?,
+            version_id,
             realm_id,
             group_id,
             node_id,
@@ -606,6 +611,7 @@ mod tests {
                 .unwrap();
         let key = HashPathIndexKey::new(
             [7u8; 32],
+            Ulid::from_bytes([8u8; 16]),
             realm_id,
             group_id,
             node_id,
@@ -617,6 +623,7 @@ mod tests {
         let prefix = HashPathIndexKey::hash_prefix(&[7u8; 32]).unwrap();
 
         assert_eq!(key, restored);
+        assert_eq!(restored.version_id, Ulid::from_bytes([8u8; 16]));
         assert!(key.to_bytes().unwrap().starts_with(&prefix));
         assert_eq!(
             key.permission_path(),

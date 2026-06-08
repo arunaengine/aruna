@@ -1,6 +1,6 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, build_head_transition_effects, write_blob_location_effect,
-    write_blob_version_effect,
+    HeadAliasContext, MaterializedHeadAlias, build_head_transition_effects,
+    write_blob_location_effect, write_blob_version_effect,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::replication::error::ReplicationError;
@@ -281,7 +281,16 @@ impl IncomingVersionReplicationOperation {
         };
         let effects = match build_head_transition_effects(
             &context,
-            self.pending_old_current_hash.take(),
+            self.pending_old_current_hash
+                .take()
+                .map(|blake3_hash| MaterializedHeadAlias {
+                    blake3_hash,
+                    version_id: self
+                        .existing_current_pointer
+                        .as_ref()
+                        .expect("pending old current hash requires current pointer")
+                        .version_id,
+                }),
             self.pending_new_pointer.take(),
             self.pending_new_current_hash.take(),
             self.txn_id,
