@@ -1,6 +1,6 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, MaterializedHeadAlias, build_head_transition_effects,
-    delete_blob_version_effect, delete_hash_path_index_effect, write_blob_version_effect,
+    HeadAliasContext, build_head_transition_effects, delete_blob_version_effect,
+    delete_hash_path_index_effect, write_blob_version_effect,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -27,7 +27,6 @@ pub enum DeleteObjectState {
     ReadTargetVersion,
     ReadAllVersions,
     ReadCurrentLookup,
-    ReadCurrentVersionForTombstone,
     ApplyHeadTransition,
     DeleteTargetHashPathIndex,
     DeleteTargetVersion,
@@ -110,7 +109,6 @@ pub struct DeleteObjectOperation {
     latest_remaining: Option<VersionSummary>,
     existing_pointer: Option<CurrentVersionPointer>,
     pending_current_version_id: Option<Ulid>,
-    pending_old_current_hash: Option<[u8; 32]>,
     pending_new_pointer: Option<CurrentVersionPointer>,
     pending_new_current_hash: Option<[u8; 32]>,
     pending_head_transition_effects: VecDeque<Effect>,
@@ -132,7 +130,6 @@ impl DeleteObjectOperation {
             latest_remaining: None,
             existing_pointer: None,
             pending_current_version_id: None,
-            pending_old_current_hash: None,
             pending_new_pointer: None,
             pending_new_current_hash: None,
             pending_head_transition_effects: VecDeque::new(),
@@ -170,16 +167,6 @@ impl DeleteObjectOperation {
     fn prepare_head_transition(&mut self, next: HeadTransitionContinuation) -> Effects {
         let effects = match build_head_transition_effects(
             &self.alias_context(),
-            self.pending_old_current_hash
-                .take()
-                .map(|blake3_hash| MaterializedHeadAlias {
-                    blake3_hash,
-                    version_id: self
-                        .existing_pointer
-                        .as_ref()
-                        .expect("pending old current hash requires current pointer")
-                        .version_id,
-                }),
             self.pending_new_pointer.take(),
             self.pending_new_current_hash.take(),
             self.txn_id,
@@ -343,52 +330,9 @@ impl DeleteObjectOperation {
         if let Some(target_version_id) = self.input.version_id {
             self.handle_version_delete_current_lookup(target_version_id, existing.as_ref())
         } else {
-            self.pending_new_pointer = Some(CurrentVersionPointer::next_for(
-                existing.as_ref(),
-                version_id,
-            ));
             self.pending_new_current_hash = None;
-
-            if let Some(existing_pointer) = existing.as_ref() {
-                self.state = DeleteObjectState::ReadCurrentVersionForTombstone;
-                let key = match VersionKey::new(
-                    &self.input.bucket,
-                    &self.input.key,
-                    existing_pointer.version_id,
-                )
-                .to_bytes()
-                {
-                    Ok(key) => key.into(),
-                    Err(err) => return self.emit_error(err.into()),
-                };
-
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                    key,
-                    txn_id: self.txn_id,
-                })]
-            } else {
-                self.pending_old_current_hash = None;
-                self.write_tombstone_current_lookup(version_id, existing.as_ref())
-            }
+            self.write_tombstone_current_lookup(version_id, existing.as_ref())
         }
-    }
-
-    fn handle_current_version_for_tombstone_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(DeleteObjectError::InvalidOperationState);
-        };
-
-        self.pending_old_current_hash = value
-            .as_ref()
-            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
-            .and_then(|version| version.blob_hash().copied());
-
-        let Some(version_id) = self.version_id else {
-            return self.emit_error(DeleteObjectError::InvalidOperationState);
-        };
-        let existing_pointer = self.existing_pointer.clone();
-        self.write_tombstone_current_lookup(version_id, existing_pointer.as_ref())
     }
 
     fn handle_version_delete_current_lookup(
@@ -399,11 +343,6 @@ impl DeleteObjectOperation {
         if existing.is_none_or(|pointer| pointer.version_id != target_version_id) {
             return self.delete_target_version();
         }
-
-        self.pending_old_current_hash = self
-            .target_version
-            .as_ref()
-            .and_then(|summary| summary.materialized_hash);
 
         match self
             .latest_remaining
@@ -668,9 +607,6 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::ReadTargetVersion => self.handle_target_version_read(event),
             DeleteObjectState::ReadAllVersions => self.handle_all_versions_read(event),
             DeleteObjectState::ReadCurrentLookup => self.handle_current_lookup_read(event),
-            DeleteObjectState::ReadCurrentVersionForTombstone => {
-                self.handle_current_version_for_tombstone_read(event)
-            }
             DeleteObjectState::ApplyHeadTransition => self.handle_head_transition_applied(event),
             DeleteObjectState::DeleteTargetHashPathIndex => {
                 self.handle_target_hash_path_deleted(event)

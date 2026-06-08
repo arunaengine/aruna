@@ -5,7 +5,7 @@ use crate::blob::blob_keyspace_helper::{
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
@@ -28,7 +28,6 @@ pub enum PutObjectState {
     CheckHashLookup,
     CreateBlobLocation,
     ReadObjectLookup,
-    ReadPreviousVersion,
     WriteBlobHead,
     WriteHashPathIndex,
     CreateBlobVersionRecord,
@@ -293,40 +292,6 @@ impl PutObjectOperation {
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
         self.existing_pointer = existing;
-        if let Some(existing_pointer) = self.existing_pointer.as_ref() {
-            let version_key = match VersionKey::new(
-                self.config.request.bucket.clone(),
-                self.config.request.key.clone(),
-                existing_pointer.version_id,
-            )
-            .to_bytes()
-            {
-                Ok(key) => key,
-                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-            };
-
-            let version_value = match self.txn_id {
-                Some(txn_id) => smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                    key: version_key.into(),
-                    txn_id: Some(txn_id),
-                })],
-                None => return self.emit_error(PutObjectError::NoTransactionFound),
-            };
-            self.state = PutObjectState::ReadPreviousVersion;
-            return version_value;
-        }
-
-        self.write_current_lookup(None)
-    }
-
-    fn handle_previous_version_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-
-        let _ = value;
-
         let existing_pointer = self.existing_pointer.clone();
         self.write_current_lookup(existing_pointer.as_ref())
     }
@@ -562,7 +527,6 @@ impl Operation for PutObjectOperation {
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             PutObjectState::CreateBlobLocation => self.handle_blob_location_created(event),
             PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
-            PutObjectState::ReadPreviousVersion => self.handle_previous_version_read(event),
             PutObjectState::WriteBlobHead => self.handle_blob_head_written(event),
             PutObjectState::WriteHashPathIndex => self.handle_hash_path_index_created(event),
             PutObjectState::CreateBlobVersionRecord => {
@@ -1058,31 +1022,10 @@ mod test {
         }));
         op.txn_id = Some(Ulid::new());
         let existing = CurrentVersionPointer::new_with_generation(Ulid::new(), 4);
-        let previous_version_id = existing.version_id;
 
         let effects = op.handle_object_lookup_read(Event::Storage(StorageEvent::ReadResult {
             key: vec![0].into(),
             value: Some(existing.to_bytes().unwrap().into()),
-        }));
-
-        let [Effect::Storage(StorageEffect::Read { key_space, key, .. })] = effects.as_slice()
-        else {
-            panic!("expected previous version read")
-        };
-        assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
-        assert_eq!(
-            VersionKey::from_bytes(key.as_ref()).unwrap(),
-            VersionKey::new("mybucket", "some-file.txt", previous_version_id)
-        );
-
-        let effects = op.handle_previous_version_read(Event::Storage(StorageEvent::ReadResult {
-            key: vec![0].into(),
-            value: Some(
-                BlobVersion::deleted(std::time::SystemTime::now(), op.config.user_id)
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
         }));
 
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {

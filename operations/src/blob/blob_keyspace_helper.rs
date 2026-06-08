@@ -12,12 +12,6 @@ use byteview::ByteView;
 use smallvec::smallvec;
 use ulid::Ulid;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaterializedHeadAlias {
-    pub blake3_hash: [u8; 32],
-    pub version_id: Ulid,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeadAliasContext {
     pub realm_id: RealmId,
@@ -200,14 +194,11 @@ pub fn iter_hash_path_index_effect(
 
 pub fn build_head_transition_effects(
     context: &HeadAliasContext,
-    old_current: Option<MaterializedHeadAlias>,
     new_pointer: Option<CurrentVersionPointer>,
     new_current_hash: Option<[u8; 32]>,
     txn_id: Option<TxnId>,
 ) -> Result<Effects, ConversionError> {
     let mut effects = smallvec![];
-
-    let _ = old_current;
 
     match new_pointer.as_ref() {
         Some(pointer) => effects.push(write_blob_head_effect(context, pointer.clone(), txn_id)?),
@@ -231,8 +222,8 @@ pub fn build_head_transition_effects(
 #[cfg(test)]
 mod tests {
     use super::{
-        HeadAliasContext, MaterializedHeadAlias, add_hash_path_index_effect,
-        build_head_transition_effects, iter_hash_path_index_effect,
+        HeadAliasContext, add_hash_path_index_effect, build_head_transition_effects,
+        iter_hash_path_index_effect,
     };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::structs::{CurrentVersionPointer, HashPathIndexKey, RealmId};
@@ -282,10 +273,6 @@ mod tests {
         let context = alias_context();
         let effects = build_head_transition_effects(
             &context,
-            Some(MaterializedHeadAlias {
-                blake3_hash: [4u8; 32],
-                version_id: Ulid::from_bytes([4u8; 16]),
-            }),
             Some(CurrentVersionPointer::new_with_generation(
                 Ulid::from_bytes([5u8; 16]),
                 11,
@@ -309,17 +296,7 @@ mod tests {
     #[test]
     fn build_head_transition_effects_can_delete_head_without_new_alias() {
         let context = alias_context();
-        let effects = build_head_transition_effects(
-            &context,
-            Some(MaterializedHeadAlias {
-                blake3_hash: [4u8; 32],
-                version_id: Ulid::from_bytes([4u8; 16]),
-            }),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let effects = build_head_transition_effects(&context, None, None, None).unwrap();
 
         assert_eq!(effects.len(), 1);
         assert!(matches!(

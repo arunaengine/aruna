@@ -7,9 +7,8 @@ use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffec
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
@@ -40,7 +39,6 @@ pub enum CompleteMultipartUploadState {
     CheckHashLookup,
     WriteBlobLocation,
     ReadObjectLookup,
-    ReadPreviousVersion,
     WriteBlobHead,
     WriteHashPathIndex,
     WriteBlobVersionRecord,
@@ -506,37 +504,6 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
         self.existing_pointer = existing;
-
-        if let Some(existing_pointer) = self.existing_pointer.as_ref() {
-            let version_key = match VersionKey::new(
-                &self.input.bucket,
-                &self.input.key,
-                existing_pointer.version_id,
-            )
-            .to_bytes()
-            {
-                Ok(key) => key,
-                Err(err) => return self.schedule_error(err.into()),
-            };
-
-            self.state = CompleteMultipartUploadState::ReadPreviousVersion;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: version_key.into(),
-                txn_id: self.txn_id,
-            })];
-        }
-
-        self.write_current_lookup(None)
-    }
-
-    fn handle_previous_version_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
-        };
-
-        let _ = value;
-
         let existing_pointer = self.existing_pointer.clone();
         self.write_current_lookup(existing_pointer.as_ref())
     }
@@ -976,9 +943,6 @@ impl Operation for CompleteMultipartUploadOperation {
                 self.handle_blob_location_written(event)
             }
             CompleteMultipartUploadState::ReadObjectLookup => self.handle_object_lookup_read(event),
-            CompleteMultipartUploadState::ReadPreviousVersion => {
-                self.handle_previous_version_read(event)
-            }
             CompleteMultipartUploadState::WriteBlobHead => self.handle_blob_head_written(event),
             CompleteMultipartUploadState::WriteHashPathIndex => {
                 self.handle_hash_path_index_written(event)
