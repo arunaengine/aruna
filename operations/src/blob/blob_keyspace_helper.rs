@@ -205,15 +205,15 @@ pub fn build_head_transition_effects(
         None => effects.push(delete_blob_head_effect(context, txn_id)?),
     }
 
-    if let Some(new_hash) = new_current_hash {
-        if let Some(pointer) = new_pointer.as_ref() {
-            effects.push(add_hash_path_index_effect(
-                context,
-                new_hash,
-                pointer.version_id,
-                txn_id,
-            )?);
-        }
+    if let Some(new_hash) = new_current_hash
+        && let Some(pointer) = new_pointer.as_ref()
+    {
+        effects.push(add_hash_path_index_effect(
+            context,
+            new_hash,
+            pointer.version_id,
+            txn_id,
+        )?);
     }
 
     Ok(effects)

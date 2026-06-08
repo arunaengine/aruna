@@ -1565,7 +1565,12 @@ mod tests {
             value: Some(existing_pointer.to_bytes().unwrap().into()),
         }));
 
-        let [Effect::Storage(StorageEffect::Write { key_space, value, .. })] = effects.as_slice() else {
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space, value, ..
+            }),
+        ] = effects.as_slice()
+        else {
             panic!("expected blob head write")
         };
         assert_eq!(key_space, BLOB_HEAD_KEYSPACE);

@@ -172,6 +172,7 @@ struct ResolvedObject {
     source_metadata: Option<SourceMetadata>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ResolveOutcome {
     Found(ResolvedObject),
     Denied,
@@ -299,9 +300,8 @@ pub async fn post_objects(
     for object_id in body.object_ids {
         let result = match resolve_object(state.as_ref(), auth.as_ref(), &object_id).await {
             Ok(ResolveOutcome::Found(resolved)) => {
-                serde_json::to_value(build_object_response(&headers, &resolved)).unwrap_or_else(
-                    |_| json!({ "status": 500, "message": "serialization failed" }),
-                )
+                serde_json::to_value(build_object_response(&headers, &resolved))
+                    .unwrap_or_else(|_| json!({ "status": 500, "message": "serialization failed" }))
             }
             Ok(ResolveOutcome::Denied) => json!({ "status": 403, "message": "Forbidden" }),
             Ok(ResolveOutcome::NotFound) => {
