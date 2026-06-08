@@ -268,7 +268,7 @@ pub fn import_snapshot_into_new_database(
                 }
 
                 ensure_reader_exhausted(&mut reader)?;
-                db.persist(PersistMode::SyncData)?;
+                db.persist(PersistMode::Buffer)?;
                 return Ok(ImportStats {
                     snapshot_created_at_unix_seconds,
                     keyspace_count,

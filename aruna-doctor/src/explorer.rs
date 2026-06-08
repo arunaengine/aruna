@@ -566,6 +566,10 @@ enum JsonDocumentSyncTarget {
         group_id: String,
         document_id: String,
     },
+    MetadataCreateEvent {
+        document_id: String,
+        event_id: String,
+    },
     MetadataGraphLifecycle {
         graph_iri: String,
     },
@@ -598,6 +602,13 @@ fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTar
         } => JsonDocumentSyncTarget::MetadataRegistry {
             group_id: group_id.to_string(),
             document_id: document_id.to_string(),
+        },
+        DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id,
+        } => JsonDocumentSyncTarget::MetadataCreateEvent {
+            document_id: document_id.to_string(),
+            event_id: event_id.to_string(),
         },
         DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {
             JsonDocumentSyncTarget::MetadataGraphLifecycle {
