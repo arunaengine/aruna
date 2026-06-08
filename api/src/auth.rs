@@ -125,6 +125,15 @@ impl OidcValidator {
         })
     }
 
+    pub async fn issuers(&self) -> Vec<String> {
+        self.provider_metadata_cache
+            .read()
+            .await
+            .values()
+            .map(|metadata| metadata.issuer.clone())
+            .collect()
+    }
+
     async fn fetch_provider_metadata(
         &self,
         provider: &OidcProviderConfig,

@@ -29,6 +29,7 @@ impl ApiDoc {
         openapi.merge(crate::routes::metadata::MetadataApiDoc::openapi());
         openapi.merge(crate::routes::credentials::CredentialsApiDoc::openapi());
         openapi.merge(crate::routes::blobs::BlobsApiDoc::openapi());
+        openapi.merge(crate::routes::drs::DrsApiDoc::openapi());
         openapi.merge(crate::routes::info::InfoApiDoc::openapi());
         openapi.merge(crate::routes::onboarding::OnboardingApiDoc::openapi());
         openapi.merge(crate::routes::users::UsersApiDoc::openapi());
