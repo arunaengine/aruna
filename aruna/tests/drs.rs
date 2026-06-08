@@ -17,11 +17,10 @@ use shared::{
 };
 use ulid::Ulid;
 
-fn fixture_bytes() -> TestResult<Vec<u8>> {
-    Ok(std::fs::read(format!(
-        "{}/tests/data/t8.shakespeare.txt",
-        env!("CARGO_MANIFEST_DIR")
-    ))?)
+const FIXTURE_BYTES: &[u8] = b"drs placeholder fixture bytes";
+
+fn fixture_bytes() -> Vec<u8> {
+    FIXTURE_BYTES.to_vec()
 }
 
 async fn iter_hash_path_index(
@@ -89,7 +88,7 @@ async fn drs_get_object_content_hash_arn_returns_404_on_non_owner_node() -> Test
 
         let bucket = "drs-hash-lookup-e2e";
         let key = "fixtures/t8.shakespeare.txt";
-        let body = fixture_bytes()?;
+        let body = fixture_bytes();
         let hash = *blake3::hash(&body).as_bytes();
         let hash_hex = hex::encode(hash);
         let object_id = format!(
@@ -224,7 +223,7 @@ async fn drs_historical_materialized_hash_resolves_non_current_version() -> Test
 
         let bucket = "drs-historical-hash-e2e";
         let key = "fixtures/versioned.txt";
-        let old_body = fixture_bytes()?;
+        let old_body = fixture_bytes();
         let new_body = b"historical drs replacement body".to_vec();
         let old_hash = *blake3::hash(&old_body).as_bytes();
         let new_hash = *blake3::hash(&new_body).as_bytes();
