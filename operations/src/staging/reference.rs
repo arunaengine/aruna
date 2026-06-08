@@ -1,5 +1,6 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, build_head_transition_effects, write_blob_version_effect,
+    HeadAliasContext, MaterializedHeadAlias, build_head_transition_effects,
+    write_blob_version_effect,
 };
 use crate::connectors::repository::{source_connector_key, source_connector_secret_key};
 use crate::connectors::resolver::secret_fingerprint;
@@ -118,7 +119,13 @@ pub async fn materialize_reference(
                 &input.bucket,
                 &input.key,
             ),
-            previous_current_hash,
+            previous_current_hash.map(|blake3_hash| MaterializedHeadAlias {
+                blake3_hash,
+                version_id: existing_pointer
+                    .as_ref()
+                    .expect("materialized current hash requires current pointer")
+                    .version_id,
+            }),
             Some(next_pointer),
             None,
             Some(txn_id),
@@ -553,7 +560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_reference_replaces_current_hash_path_and_writes_blob_version() {
+    async fn materialize_reference_retains_historical_hash_path_and_writes_blob_version() {
         let test_context = setup_driver_context().await;
         let context = &test_context.driver_context;
         let group_id = Ulid::new();
@@ -651,23 +658,23 @@ mod tests {
         assert!(!blob_version.is_deleted());
         assert_eq!(blob_version.source_binding(), Some(&result.version_source));
 
-        assert!(
-            read_value(
-                context,
-                HASH_PATHS_INDEX_KEYSPACE,
-                HashPathIndexKey::new(
-                    initial_hash,
-                    realm_id,
-                    group_id,
-                    node_id,
-                    "bucket-a",
-                    "object.txt",
-                )
-                .to_bytes()
-                .unwrap(),
+        let historical_hash_path = read_value(
+            context,
+            HASH_PATHS_INDEX_KEYSPACE,
+            HashPathIndexKey::new(
+                initial_hash,
+                initial.version_id,
+                realm_id,
+                group_id,
+                node_id,
+                "bucket-a",
+                "object.txt",
             )
-            .await
-            .is_none()
-        );
+            .to_bytes()
+            .unwrap(),
+        )
+        .await
+        .expect("missing historical materialized hash path entry");
+        assert!(historical_hash_path.is_empty());
     }
 }

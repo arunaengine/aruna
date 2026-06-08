@@ -1,6 +1,6 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, add_hash_path_index_effect, delete_hash_path_index_effect,
-    write_blob_head_effect, write_blob_location_effect, write_blob_version_effect,
+    HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
+    write_blob_location_effect, write_blob_version_effect,
 };
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -30,7 +30,6 @@ pub enum PutObjectState {
     ReadObjectLookup,
     ReadPreviousVersion,
     WriteBlobHead,
-    DeletePreviousHashPathIndex,
     WriteHashPathIndex,
     CreateBlobVersionRecord,
     CommitTransaction,
@@ -102,7 +101,6 @@ pub struct PutObjectOperation {
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
     existing_pointer: Option<CurrentVersionPointer>,
-    previous_current_hash: Option<[u8; 32]>,
     pending_error: Option<PutObjectError>,
     output: Option<Result<BackendLocation, PutObjectError>>,
 }
@@ -117,7 +115,6 @@ impl PutObjectOperation {
             written_location: None,
             cleanup_location: None,
             existing_pointer: None,
-            previous_current_hash: None,
             pending_error: None,
             output: None,
         }
@@ -296,7 +293,6 @@ impl PutObjectOperation {
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
         self.existing_pointer = existing;
-        self.previous_current_hash = None;
         if let Some(existing_pointer) = self.existing_pointer.as_ref() {
             let version_key = match VersionKey::new(
                 self.config.request.bucket.clone(),
@@ -329,10 +325,7 @@ impl PutObjectOperation {
             return self.emit_error(PutObjectError::InvalidOperationState);
         };
 
-        self.previous_current_hash = value
-            .as_ref()
-            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
-            .and_then(|version| version.blob_hash().copied());
+        let _ = value;
 
         let existing_pointer = self.existing_pointer.clone();
         self.write_current_lookup(existing_pointer.as_ref())
@@ -360,26 +353,6 @@ impl PutObjectOperation {
 
     fn handle_blob_head_written(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
-            if let Some(previous_hash) = self.previous_current_hash {
-                let effect = match delete_hash_path_index_effect(
-                    &self.alias_context(),
-                    previous_hash,
-                    self.txn_id,
-                ) {
-                    Ok(effect) => effect,
-                    Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
-                };
-                self.state = PutObjectState::DeletePreviousHashPathIndex;
-                return smallvec![effect];
-            }
-            self.write_hash_path_index()
-        } else {
-            self.emit_error(PutObjectError::InvalidOperationState)
-        }
-    }
-
-    fn handle_previous_hash_path_deleted(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::DeleteResult { .. }) = event {
             self.write_hash_path_index()
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
@@ -398,6 +371,10 @@ impl PutObjectOperation {
             match blake3_hash.try_into() {
                 Ok(hash) => hash,
                 Err(err) => return self.emit_error(PutObjectError::ConversionError(err.into())),
+            },
+            match self.version_id {
+                Some(version_id) => version_id,
+                None => return self.emit_error(PutObjectError::PutObjectFailed),
             },
             self.txn_id,
         ) {
@@ -587,9 +564,6 @@ impl Operation for PutObjectOperation {
             PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
             PutObjectState::ReadPreviousVersion => self.handle_previous_version_read(event),
             PutObjectState::WriteBlobHead => self.handle_blob_head_written(event),
-            PutObjectState::DeletePreviousHashPathIndex => {
-                self.handle_previous_hash_path_deleted(event)
-            }
             PutObjectState::WriteHashPathIndex => self.handle_hash_path_index_created(event),
             PutObjectState::CreateBlobVersionRecord => {
                 self.handle_blob_version_record_created(event)
@@ -844,6 +818,7 @@ mod test {
                 key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
                 key: HashPathIndexKey::new(
                     result.location.get_blake3().unwrap().try_into().unwrap(),
+                    result.version_id,
                     realm_id,
                     group_id,
                     node_id,
@@ -1028,9 +1003,17 @@ mod test {
             let hash_path_value = read_value(
                 &context,
                 HASH_PATHS_INDEX_KEYSPACE,
-                HashPathIndexKey::new(blob_hash, realm_id, group_id, node_id, "mybucket", key)
-                    .to_bytes()
-                    .unwrap(),
+                HashPathIndexKey::new(
+                    blob_hash,
+                    expected_version_id,
+                    realm_id,
+                    group_id,
+                    node_id,
+                    "mybucket",
+                    key,
+                )
+                .to_bytes()
+                .unwrap(),
             )
             .await
             .expect("missing hash path index entry");
@@ -1112,7 +1095,7 @@ mod test {
     }
 
     #[tokio::test]
-    pub async fn test_put_object_overwrite_replaces_current_hash_path_index() {
+    pub async fn test_put_object_overwrite_retains_historical_hash_path_index() {
         let temp_handle = tempdir().unwrap();
         let temp_root = temp_handle.path().to_str().unwrap();
         let blob_root = format!("{temp_root}/blobstore");
@@ -1222,30 +1205,31 @@ mod test {
             CurrentVersionPointer::new_with_generation(second.version_id, 2)
         );
 
-        assert!(
-            read_value(
-                &context,
-                HASH_PATHS_INDEX_KEYSPACE,
-                HashPathIndexKey::new(
-                    first_hash,
-                    realm_id,
-                    group_id,
-                    node_id,
-                    "mybucket",
-                    "same-key.txt",
-                )
-                .to_bytes()
-                .unwrap(),
+        let historical_hash_path = read_value(
+            &context,
+            HASH_PATHS_INDEX_KEYSPACE,
+            HashPathIndexKey::new(
+                first_hash,
+                first.version_id,
+                realm_id,
+                group_id,
+                node_id,
+                "mybucket",
+                "same-key.txt",
             )
-            .await
-            .is_none()
-        );
+            .to_bytes()
+            .unwrap(),
+        )
+        .await
+        .expect("missing historical hash path entry");
+        assert!(historical_hash_path.is_empty());
 
         let new_hash_path = read_value(
             &context,
             HASH_PATHS_INDEX_KEYSPACE,
             HashPathIndexKey::new(
                 second_hash,
+                second.version_id,
                 realm_id,
                 group_id,
                 node_id,

@@ -1,6 +1,6 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, build_head_transition_effects, delete_blob_version_effect,
-    write_blob_version_effect,
+    HeadAliasContext, MaterializedHeadAlias, build_head_transition_effects,
+    delete_blob_version_effect, delete_hash_path_index_effect, write_blob_version_effect,
 };
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
@@ -29,6 +29,7 @@ pub enum DeleteObjectState {
     ReadCurrentLookup,
     ReadCurrentVersionForTombstone,
     ApplyHeadTransition,
+    DeleteTargetHashPathIndex,
     DeleteTargetVersion,
     DeleteMultipartSummary,
     ReadMultipartParts,
@@ -169,7 +170,16 @@ impl DeleteObjectOperation {
     fn prepare_head_transition(&mut self, next: HeadTransitionContinuation) -> Effects {
         let effects = match build_head_transition_effects(
             &self.alias_context(),
-            self.pending_old_current_hash.take(),
+            self.pending_old_current_hash
+                .take()
+                .map(|blake3_hash| MaterializedHeadAlias {
+                    blake3_hash,
+                    version_id: self
+                        .existing_pointer
+                        .as_ref()
+                        .expect("pending old current hash requires current pointer")
+                        .version_id,
+                }),
             self.pending_new_pointer.take(),
             self.pending_new_current_hash.take(),
             self.txn_id,
@@ -433,6 +443,27 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
+        if let Some(target_version) = self.target_version.as_ref()
+            && let Some(materialized_hash) = target_version.materialized_hash
+        {
+            self.state = DeleteObjectState::DeleteTargetHashPathIndex;
+            let effect = match delete_hash_path_index_effect(
+                &self.alias_context(),
+                materialized_hash,
+                version_id,
+                self.txn_id,
+            ) {
+                Ok(effect) => effect,
+                Err(err) => return self.emit_error(err.into()),
+            };
+
+            return smallvec![effect];
+        }
+
+        self.delete_target_version_record(version_id)
+    }
+
+    fn delete_target_version_record(&mut self, version_id: Ulid) -> Effects {
         self.state = DeleteObjectState::DeleteTargetVersion;
         let effect = match delete_blob_version_effect(
             &VersionKey::new(&self.input.bucket, &self.input.key, version_id),
@@ -443,6 +474,18 @@ impl DeleteObjectOperation {
         };
 
         smallvec![effect]
+    }
+
+    fn handle_target_hash_path_deleted(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+
+        let Some(version_id) = self.input.version_id else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+
+        self.delete_target_version_record(version_id)
     }
 
     fn handle_target_version_deleted(&mut self, event: Event) -> Effects {
@@ -629,6 +672,9 @@ impl Operation for DeleteObjectOperation {
                 self.handle_current_version_for_tombstone_read(event)
             }
             DeleteObjectState::ApplyHeadTransition => self.handle_head_transition_applied(event),
+            DeleteObjectState::DeleteTargetHashPathIndex => {
+                self.handle_target_hash_path_deleted(event)
+            }
             DeleteObjectState::DeleteTargetVersion => self.handle_target_version_deleted(event),
             DeleteObjectState::DeleteMultipartSummary => {
                 self.handle_multipart_summary_deleted(event)
@@ -990,29 +1036,29 @@ mod test {
         assert!(blob_tombstone.is_deleted());
         assert_eq!(blob_tombstone.created_by, user_id);
 
-        assert!(
-            read_value(
-                &context,
-                HASH_PATHS_INDEX_KEYSPACE,
-                HashPathIndexKey::new(
-                    put_result
-                        .location
-                        .get_blake3()
-                        .unwrap()
-                        .try_into()
-                        .unwrap(),
-                    realm_id,
-                    group_id,
-                    node_id,
-                    "mybucket",
-                    "to-delete.txt",
-                )
-                .to_bytes()
-                .unwrap(),
+        let historical_hash_path = read_value(
+            &context,
+            HASH_PATHS_INDEX_KEYSPACE,
+            HashPathIndexKey::new(
+                put_result
+                    .location
+                    .get_blake3()
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+                put_result.version_id,
+                realm_id,
+                group_id,
+                node_id,
+                "mybucket",
+                "to-delete.txt",
             )
-            .await
-            .is_none()
-        );
+            .to_bytes()
+            .unwrap(),
+        )
+        .await
+        .expect("missing historical materialized hash path entry");
+        assert!(historical_hash_path.is_empty());
 
         let get_result = drive(
             GetObjectOperation::new(GetObjectInput {
@@ -1155,6 +1201,7 @@ mod test {
                     .unwrap()
                     .try_into()
                     .unwrap(),
+                put_result.version_id,
                 realm_id,
                 group_id,
                 node_id,
@@ -1266,6 +1313,32 @@ mod test {
                         .unwrap()
                         .try_into()
                         .unwrap(),
+                    put_result.version_id,
+                    realm_id,
+                    group_id,
+                    node_id,
+                    "mybucket",
+                    "versioned.txt",
+                )
+                .to_bytes()
+                .unwrap(),
+            )
+            .await
+            .is_none()
+        );
+
+        assert!(
+            read_value(
+                &context,
+                HASH_PATHS_INDEX_KEYSPACE,
+                HashPathIndexKey::new(
+                    put_result
+                        .location
+                        .get_blake3()
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                    put_result.version_id,
                     realm_id,
                     group_id,
                     node_id,
