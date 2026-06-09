@@ -43,24 +43,29 @@ use aruna_operations::s3::get_object::{
 };
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
+use aruna_operations::s3::list_objects_v2::{ListObjectsV2Input as LOV2I, ListObjectsV2Operation};
 use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutObjectResult};
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use s3s::dto::{
-    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CompleteMultipartUploadInput,
-    CompleteMultipartUploadOutput, CreateBucketInput, CreateBucketOutput,
-    CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput, DeleteBucketOutput,
-    DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteMarkerReplication,
-    DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput, Destination, ETag,
-    GetBucketReplicationInput, GetBucketReplicationOutput, GetObjectAttributesInput,
-    GetObjectAttributesOutput, GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput,
-    LastModified, ListBucketsInput, ListBucketsOutput, PutBucketReplicationInput,
+    AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
+    CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
+    CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
+    DeleteBucketOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput,
+    DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput,
+    Destination, ETag, GetBucketReplicationInput, GetBucketReplicationOutput,
+    GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
+    HeadObjectInput, HeadObjectOutput, LastModified, ListBucketsInput, ListBucketsOutput,
+    ListObjectsV2Input, ListObjectsV2Output, Object, PutBucketReplicationInput,
     PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
     ReplicationRule, ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -425,6 +430,20 @@ impl ArunaS3Service {
                 .and_then(|metadata| self.source_metadata_headers(metadata, last_refresh)),
         }
     }
+
+    fn decode_list_objects_v2_continuation_token(token: Option<&str>) -> S3Result<Option<Vec<u8>>> {
+        token
+            .map(|token| {
+                STANDARD
+                    .decode(token)
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+            })
+            .transpose()
+    }
+
+    fn encode_list_objects_v2_continuation_token(token: Option<&[u8]>) -> Option<String> {
+        token.map(|token| STANDARD.encode(token))
+    }
 }
 
 fn reference_metadata_refresh(
@@ -658,6 +677,163 @@ impl S3 for ArunaS3Service {
             continuation_token: result.continuation_token,
             owner: None,
             prefix: req.input.prefix,
+        }))
+    }
+
+    #[tracing::instrument(err, skip(self, req))]
+    async fn list_objects_v2(
+        &self,
+        req: S3Request<ListObjectsV2Input>,
+    ) -> S3Result<S3Response<ListObjectsV2Output>> {
+        debug!("Received LIST OBJECTS V2 Request: {:#?}", req);
+
+        let user_access = req.extensions.get::<UserAccess>().cloned().ok_or_else(|| {
+            error!(error = "Missing user context");
+            s3_error!(UnexpectedContent, "Missing user context")
+        })?;
+        let bucket_info = req.extensions.get::<BucketInfo>().cloned();
+        let requested_continuation_token = req.input.continuation_token.clone();
+        let mut continuation_token = Self::decode_list_objects_v2_continuation_token(
+            requested_continuation_token.as_deref(),
+        )?;
+        let max_keys = req
+            .input
+            .max_keys
+            .and_then(|max_keys| usize::try_from(max_keys).ok())
+            .unwrap_or(1_000);
+        let bucket = req.input.bucket.clone();
+        let prefix = req.input.prefix.clone();
+        let delimiter = req.input.delimiter.clone();
+        let start_after = req.input.start_after.clone();
+
+        let mut contents = Vec::new();
+        let mut common_prefixes = BTreeSet::new();
+
+        let group_id = bucket_info
+            .as_ref()
+            .map(|bucket_info| bucket_info.group_id)
+            .unwrap_or(user_access.group_id);
+        let mut next_continuation_token = None;
+
+        loop {
+            let result = drive(
+                ListObjectsV2Operation::new(LOV2I {
+                    bucket: bucket.clone(),
+                    group_id,
+                    continuation_token: continuation_token.clone(),
+                    max_keys: Some(max_keys),
+                    prefix: prefix.clone(),
+                }),
+                &self.state,
+            )
+            .await
+            .and_then(|result| result.transpose())
+            .map_err(IntoS3Error::into_s3_error)?
+            .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
+
+            let page_next_continuation_token = result.continuation_token.clone();
+            let page_len = result.objects.len();
+
+            for (index, object) in result.objects.into_iter().enumerate() {
+                let head_bytes = object
+                    .head
+                    .to_bytes()
+                    .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
+                let key = object.head.key;
+
+                if continuation_token.is_none() && start_after
+                    .as_ref()
+                    .is_some_and(|start_after| key.as_str() <= start_after.as_str())
+                {
+                    continue;
+                }
+
+                if let Some(delimiter) = delimiter.as_ref() {
+                    let prefix_start = prefix.as_ref().map(|prefix| prefix.len()).unwrap_or(0);
+                    if let Some(relative_match) = key[prefix_start..].find(delimiter) {
+                        let group_end = prefix_start + relative_match + delimiter.len();
+                        common_prefixes.insert(key[..group_end].to_string());
+                        if contents.len() + common_prefixes.len() >= max_keys {
+                            next_continuation_token = if index + 1 < page_len {
+                                Some(head_bytes)
+                            } else {
+                                page_next_continuation_token.clone()
+                            };
+                            break;
+                        }
+                        continue;
+                    }
+                }
+
+                let response_fields = self.build_object_response_fields(
+                    object.location.as_ref(),
+                    object.source_metadata.as_ref(),
+                    object.last_refresh,
+                );
+                contents.push(Object {
+                    e_tag: response_fields.e_tag,
+                    key: Some(key),
+                    last_modified: response_fields.last_modified,
+                    owner: None,
+                    size: response_fields.content_length,
+                    ..Default::default()
+                });
+                if contents.len() + common_prefixes.len() >= max_keys {
+                    next_continuation_token = if index + 1 < page_len {
+                        Some(head_bytes)
+                    } else {
+                        page_next_continuation_token.clone()
+                    };
+                    break;
+                }
+            }
+
+            if contents.len() + common_prefixes.len() >= max_keys {
+                break;
+            }
+
+            next_continuation_token = page_next_continuation_token.clone();
+            if next_continuation_token.is_none() {
+                break;
+            }
+
+            continuation_token = next_continuation_token.clone();
+        }
+
+        let is_truncated = next_continuation_token.is_some();
+        if contents.len() > max_keys {
+            contents.truncate(max_keys);
+        }
+        let remaining_common_prefixes = max_keys.saturating_sub(contents.len());
+        let common_prefixes: Vec<_> = common_prefixes
+            .into_iter()
+            .take(remaining_common_prefixes)
+            .collect();
+        let key_count = contents.len() + common_prefixes.len();
+        let next_continuation_token =
+            Self::encode_list_objects_v2_continuation_token(next_continuation_token.as_deref());
+
+        Ok(S3Response::new(ListObjectsV2Output {
+            name: Some(bucket),
+            prefix,
+            max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
+            key_count: Some(i32::try_from(key_count).unwrap_or(i32::MAX)),
+            continuation_token: requested_continuation_token,
+            is_truncated: Some(is_truncated),
+            next_continuation_token,
+            contents: Some(contents),
+            common_prefixes: Some(
+                common_prefixes
+                    .into_iter()
+                    .map(|prefix| CommonPrefix {
+                        prefix: Some(prefix),
+                    })
+                    .collect(),
+            ),
+            delimiter,
+            encoding_type: req.input.encoding_type,
+            start_after,
+            ..Default::default()
         }))
     }
 
