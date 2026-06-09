@@ -271,7 +271,7 @@ pub async fn get_object(
             drs_json_response(StatusCode::OK, build_object_response(&headers, &resolved))
         }
         Ok(ResolveOutcome::Denied) => DrsError::forbidden("Forbidden").into_response(),
-        Ok(ResolveOutcome::NotFound) => drs_error(StatusCode::NOT_FOUND, "DRS object not found"),
+        Ok(ResolveOutcome::NotFound) => DrsError::not_found("DRS object not found").into_response(),
         Err(error) => error.into_response(),
     }
 }
@@ -335,8 +335,9 @@ pub async fn download_object(
     };
     let resolved = match resolve_object(state.as_ref(), Some(&auth), &query.object_id).await {
         Ok(ResolveOutcome::Found(resolved)) => resolved,
-        Ok(ResolveOutcome::Denied | ResolveOutcome::NotFound) => {
-            return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
+        Ok(ResolveOutcome::Denied) => return DrsError::forbidden("Forbidden").into_response(),
+        Ok(ResolveOutcome::NotFound) => {
+            return DrsError::not_found("DRS object not found").into_response();
         }
         Err(error) => return error.into_response(),
     };
@@ -657,6 +658,13 @@ impl DrsError {
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
     }
