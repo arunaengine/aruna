@@ -194,6 +194,12 @@ struct BlobHeadKeyPrefix<'a> {
     bucket: &'a str,
 }
 
+#[derive(Serialize)]
+struct BlobHeadKeyObjectPrefix<'a> {
+    bucket: &'a str,
+    key: &'a str,
+}
+
 impl BlobHeadKey {
     pub fn new(bucket: impl Into<String>, key: impl Into<String>) -> Self {
         Self {
@@ -204,6 +210,10 @@ impl BlobHeadKey {
 
     pub fn bucket_prefix(bucket: &str) -> Result<Vec<u8>, ConversionError> {
         Ok(postcard::to_allocvec(&BlobHeadKeyPrefix { bucket })?)
+    }
+
+    pub fn object_prefix(bucket: &str, key: &str) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(&BlobHeadKeyObjectPrefix { bucket, key })?)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -600,6 +610,20 @@ mod tests {
 
         assert_eq!(key, restored);
         assert!(key.to_bytes().unwrap().starts_with(&prefix));
+    }
+
+    #[test]
+    fn blob_head_key_object_prefix_roundtrip() {
+        let prefix = BlobHeadKey::object_prefix("bucket", "rare/").unwrap();
+        let key = BlobHeadKey::new("bucket", "rare/").to_bytes().unwrap();
+        assert_eq!(prefix, key);
+    }
+
+    #[test]
+    fn blob_head_key_object_prefix_rejects_wrong_bucket() {
+        let key = BlobHeadKey::new("bucket_b", "docs/file.txt").to_bytes().unwrap();
+        let prefix = BlobHeadKey::object_prefix("bucket_a", "docs/").unwrap();
+        assert!(!key.starts_with(&prefix));
     }
 
     #[test]
