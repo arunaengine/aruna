@@ -385,7 +385,13 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
         &context.driver,
         HASH_PATHS_INDEX_KEYSPACE,
         HashPathIndexKey::new(
-            blob_hash, realm_id, group_id, node_id, "bucket-a", "big.bin",
+            blob_hash,
+            complete.version_id,
+            realm_id,
+            group_id,
+            node_id,
+            "bucket-a",
+            "big.bin",
         )
         .to_bytes()
         .unwrap(),
@@ -572,7 +578,7 @@ async fn upload_part_overwrites_existing_part_and_cleans_old_blob() {
 }
 
 #[tokio::test]
-async fn completes_multipart_upload_replaces_previous_current_hash_path_index() {
+async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
     let context = setup_context().await;
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let created_by = UserId::local(Ulid::new(), realm_id);
@@ -716,30 +722,32 @@ async fn completes_multipart_upload_replaces_previous_current_hash_path_index() 
         CurrentVersionPointer::new_with_generation(complete.version_id, 2)
     );
 
-    assert!(
-        read_value(
-            &context.driver,
-            HASH_PATHS_INDEX_KEYSPACE,
-            HashPathIndexKey::new(
-                initial_hash,
-                realm_id,
-                group_id,
-                node_id,
-                "bucket-a",
-                "replace.bin",
-            )
-            .to_bytes()
-            .unwrap(),
+    // Verify that the old hash path entry still exists (historical access preserved)
+    let old_hash_path = read_value(
+        &context.driver,
+        HASH_PATHS_INDEX_KEYSPACE,
+        HashPathIndexKey::new(
+            initial_hash,
+            initial.version_id,
+            realm_id,
+            group_id,
+            node_id,
+            "bucket-a",
+            "replace.bin",
         )
-        .await
-        .is_none()
-    );
+        .to_bytes()
+        .unwrap(),
+    )
+    .await
+    .expect("missing old hash path index entry");
+    assert!(old_hash_path.is_empty());
 
     let new_hash_path = read_value(
         &context.driver,
         HASH_PATHS_INDEX_KEYSPACE,
         HashPathIndexKey::new(
             complete_hash,
+            complete.version_id,
             realm_id,
             group_id,
             node_id,

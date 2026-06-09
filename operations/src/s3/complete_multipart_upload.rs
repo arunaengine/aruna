@@ -1,15 +1,14 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, add_hash_path_index_effect, delete_hash_path_index_effect,
-    write_blob_head_effect, write_blob_location_effect, write_blob_version_effect,
+    HeadAliasContext, add_hash_path_index_effect, write_blob_head_effect,
+    write_blob_location_effect, write_blob_version_effect,
 };
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
-    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
@@ -40,9 +39,7 @@ pub enum CompleteMultipartUploadState {
     CheckHashLookup,
     WriteBlobLocation,
     ReadObjectLookup,
-    ReadPreviousVersion,
     WriteBlobHead,
-    DeletePreviousHashPathIndex,
     WriteHashPathIndex,
     WriteBlobVersionRecord,
     WriteObjectMetadata,
@@ -138,7 +135,6 @@ pub struct CompleteMultipartUploadOperation {
     version_id: Option<Ulid>,
     version_created_at: Option<SystemTime>,
     existing_pointer: Option<CurrentVersionPointer>,
-    previous_current_hash: Option<[u8; 32]>,
     cleanup_part_index: usize,
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
@@ -158,7 +154,6 @@ impl CompleteMultipartUploadOperation {
             version_id: None,
             version_created_at: None,
             existing_pointer: None,
-            previous_current_hash: None,
             cleanup_part_index: 0,
             pending_error: None,
             output: None,
@@ -509,41 +504,6 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
         self.existing_pointer = existing;
-        self.previous_current_hash = None;
-
-        if let Some(existing_pointer) = self.existing_pointer.as_ref() {
-            let version_key = match VersionKey::new(
-                &self.input.bucket,
-                &self.input.key,
-                existing_pointer.version_id,
-            )
-            .to_bytes()
-            {
-                Ok(key) => key,
-                Err(err) => return self.schedule_error(err.into()),
-            };
-
-            self.state = CompleteMultipartUploadState::ReadPreviousVersion;
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: version_key.into(),
-                txn_id: self.txn_id,
-            })];
-        }
-
-        self.write_current_lookup(None)
-    }
-
-    fn handle_previous_version_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
-        };
-
-        self.previous_current_hash = value
-            .as_ref()
-            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
-            .and_then(|version| version.blob_hash().copied());
-
         let existing_pointer = self.existing_pointer.clone();
         self.write_current_lookup(existing_pointer.as_ref())
     }
@@ -566,28 +526,6 @@ impl CompleteMultipartUploadOperation {
 
     fn handle_blob_head_written(&mut self, event: Event) -> Effects {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
-        };
-
-        if let Some(previous_hash) = self.previous_current_hash {
-            let alias_context = match self.alias_context() {
-                Ok(context) => context,
-                Err(err) => return self.schedule_error(err),
-            };
-            let effect =
-                match delete_hash_path_index_effect(&alias_context, previous_hash, self.txn_id) {
-                    Ok(effect) => effect,
-                    Err(err) => return self.schedule_error(err.into()),
-                };
-            self.state = CompleteMultipartUploadState::DeletePreviousHashPathIndex;
-            return smallvec![effect];
-        }
-
-        self.write_hash_path_index()
-    }
-
-    fn handle_previous_hash_path_deleted(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::DeleteResult { .. }) = event else {
             return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
         };
 
@@ -615,6 +553,14 @@ impl CompleteMultipartUploadOperation {
                 Err(err) => {
                     return self
                         .schedule_error(CompleteMultipartUploadError::ConversionError(err.into()));
+                }
+            },
+            match self.version_id {
+                Some(version_id) => version_id,
+                None => {
+                    return self.schedule_error(
+                        CompleteMultipartUploadError::CompleteMultipartUploadFailed,
+                    );
                 }
             },
             self.txn_id,
@@ -997,13 +943,7 @@ impl Operation for CompleteMultipartUploadOperation {
                 self.handle_blob_location_written(event)
             }
             CompleteMultipartUploadState::ReadObjectLookup => self.handle_object_lookup_read(event),
-            CompleteMultipartUploadState::ReadPreviousVersion => {
-                self.handle_previous_version_read(event)
-            }
             CompleteMultipartUploadState::WriteBlobHead => self.handle_blob_head_written(event),
-            CompleteMultipartUploadState::DeletePreviousHashPathIndex => {
-                self.handle_previous_hash_path_deleted(event)
-            }
             CompleteMultipartUploadState::WriteHashPathIndex => {
                 self.handle_hash_path_index_written(event)
             }

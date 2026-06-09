@@ -12,8 +12,7 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE,
-    SOURCE_CONNECTOR_SECRET_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, SOURCE_CONNECTOR_INDEX_KEYSPACE, SOURCE_CONNECTOR_SECRET_KEYSPACE,
 };
 use aruna_core::structs::{
     BlobHeadKey, BlobVersion, CurrentVersionPointer, RealmId, SourceConnector,
@@ -100,14 +99,6 @@ pub async fn materialize_reference(
 
         let existing_pointer =
             read_current_pointer(context, txn_id, &input.bucket, &input.key).await?;
-        let previous_current_hash = read_previous_current_materialized_hash(
-            context,
-            txn_id,
-            &input.bucket,
-            &input.key,
-            existing_pointer.as_ref(),
-        )
-        .await?;
         let next_pointer = CurrentVersionPointer::next_for(existing_pointer.as_ref(), version_id);
 
         for effect in build_head_transition_effects(
@@ -118,7 +109,6 @@ pub async fn materialize_reference(
                 &input.bucket,
                 &input.key,
             ),
-            previous_current_hash,
             Some(next_pointer),
             None,
             Some(txn_id),
@@ -215,41 +205,6 @@ async fn read_current_pointer(
             .as_ref()
             .map(|value| CurrentVersionPointer::from_bytes(value.as_ref()))
             .transpose()
-            .map_err(Into::into),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        _ => Err(StorageError::ReadError.into()),
-    }
-}
-
-async fn read_previous_current_materialized_hash(
-    context: &DriverContext,
-    txn_id: TxnId,
-    bucket: &str,
-    key: &str,
-    existing_pointer: Option<&CurrentVersionPointer>,
-) -> Result<Option<[u8; 32]>, MaterializeReferenceError> {
-    let Some(existing_pointer) = existing_pointer else {
-        return Ok(None);
-    };
-
-    let version_key = VersionKey::new(bucket, key, existing_pointer.version_id).to_bytes()?;
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key: version_key.into(),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .as_ref()
-            .map(|value| -> Result<Option<[u8; 32]>, ConversionError> {
-                let version = BlobVersion::from_bytes(value.as_ref())?;
-                Ok(version.blob_hash().copied())
-            })
-            .transpose()
-            .map(Option::flatten)
             .map_err(Into::into),
         Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
         _ => Err(StorageError::ReadError.into()),
@@ -553,7 +508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_reference_replaces_current_hash_path_and_writes_blob_version() {
+    async fn materialize_reference_retains_historical_hash_path_and_writes_blob_version() {
         let test_context = setup_driver_context().await;
         let context = &test_context.driver_context;
         let group_id = Ulid::new();
@@ -651,23 +606,23 @@ mod tests {
         assert!(!blob_version.is_deleted());
         assert_eq!(blob_version.source_binding(), Some(&result.version_source));
 
-        assert!(
-            read_value(
-                context,
-                HASH_PATHS_INDEX_KEYSPACE,
-                HashPathIndexKey::new(
-                    initial_hash,
-                    realm_id,
-                    group_id,
-                    node_id,
-                    "bucket-a",
-                    "object.txt",
-                )
-                .to_bytes()
-                .unwrap(),
+        let historical_hash_path = read_value(
+            context,
+            HASH_PATHS_INDEX_KEYSPACE,
+            HashPathIndexKey::new(
+                initial_hash,
+                initial.version_id,
+                realm_id,
+                group_id,
+                node_id,
+                "bucket-a",
+                "object.txt",
             )
-            .await
-            .is_none()
-        );
+            .to_bytes()
+            .unwrap(),
+        )
+        .await
+        .expect("missing historical materialized hash path entry");
+        assert!(historical_hash_path.is_empty());
     }
 }

@@ -1876,6 +1876,7 @@ mod tests {
         );
         let hash_path_key = HashPathIndexKey::new(
             [9_u8; 32],
+            Ulid::from_bytes([4_u8; 16]),
             realm_id,
             group_id,
             node_id,

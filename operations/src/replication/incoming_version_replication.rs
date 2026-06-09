@@ -39,7 +39,6 @@ enum IncomingVersionReplicationState {
     StartTransaction,
     WriteBlobLocation,
     ReadObjectLookup,
-    ReadPreviousCurrentVersion,
     ApplyHeadTransition,
     WriteBlobVersion,
     WriteMultipartMetadata,
@@ -103,7 +102,6 @@ pub struct IncomingVersionReplicationOperation {
     existing_blob_location: Option<BackendLocation>,
     received_blob_location: Option<BackendLocation>,
     existing_current_pointer: Option<CurrentVersionPointer>,
-    pending_old_current_hash: Option<[u8; 32]>,
     pending_new_pointer: Option<CurrentVersionPointer>,
     pending_new_current_hash: Option<[u8; 32]>,
     pending_head_transition_effects: VecDeque<Effect>,
@@ -131,7 +129,6 @@ impl IncomingVersionReplicationOperation {
             existing_blob_location: None,
             received_blob_location: None,
             existing_current_pointer: None,
-            pending_old_current_hash: None,
             pending_new_pointer: None,
             pending_new_current_hash: None,
             pending_head_transition_effects: VecDeque::new(),
@@ -153,9 +150,6 @@ impl IncomingVersionReplicationOperation {
             IncomingVersionReplicationState::StartTransaction => "StartTransaction",
             IncomingVersionReplicationState::WriteBlobLocation => "WriteBlobLocation",
             IncomingVersionReplicationState::ReadObjectLookup => "ReadObjectLookup",
-            IncomingVersionReplicationState::ReadPreviousCurrentVersion => {
-                "ReadPreviousCurrentVersion"
-            }
             IncomingVersionReplicationState::ApplyHeadTransition => "ApplyHeadTransition",
             IncomingVersionReplicationState::WriteBlobVersion => "WriteBlobVersion",
             IncomingVersionReplicationState::WriteMultipartMetadata => "WriteMultipartMetadata",
@@ -281,7 +275,6 @@ impl IncomingVersionReplicationOperation {
         };
         let effects = match build_head_transition_effects(
             &context,
-            self.pending_old_current_hash.take(),
             self.pending_new_pointer.take(),
             self.pending_new_current_hash.take(),
             self.txn_id,
@@ -301,17 +294,6 @@ impl IncomingVersionReplicationOperation {
         }
 
         self.write_version()
-    }
-
-    fn current_hash_from_version_bytes(
-        existing: Option<&[u8]>,
-    ) -> Result<Option<[u8; 32]>, IncomingVersionReplicationError> {
-        match existing.map(BlobVersion::from_bytes).transpose() {
-            Ok(version) => Ok(version
-                .as_ref()
-                .and_then(|version| version.blob_hash().copied())),
-            Err(err) => Err(err.into()),
-        }
     }
 
     fn read_destination_bucket(&mut self) -> Effects {
@@ -514,7 +496,6 @@ impl IncomingVersionReplicationOperation {
         self.existing_current_pointer = existing_pointer.clone();
 
         if !should_write {
-            self.pending_old_current_hash = None;
             self.pending_new_pointer = None;
             self.pending_new_current_hash = None;
             return self.write_version();
@@ -525,27 +506,6 @@ impl IncomingVersionReplicationOperation {
             incoming_generation,
         ));
         self.pending_new_current_hash = self.current_materialized_hash_from_manifest();
-        self.pending_old_current_hash = None;
-
-        if let Some(existing_pointer) = self.existing_current_pointer.as_ref() {
-            self.state = IncomingVersionReplicationState::ReadPreviousCurrentVersion;
-            let key = match VersionKey::new(
-                &self.manifest.bucket,
-                &self.manifest.key,
-                existing_pointer.version_id,
-            )
-            .to_bytes()
-            {
-                Ok(key) => key,
-                Err(err) => return self.fail(err.into()),
-            };
-
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                key: key.into(),
-                txn_id: self.txn_id,
-            })];
-        }
 
         self.prepare_head_transition()
     }
@@ -1010,23 +970,6 @@ impl Operation for IncomingVersionReplicationOperation {
                     "Compared destination current version pointer"
                 );
                 self.write_object_lookup_after_compare(value.as_deref())
-            }
-            IncomingVersionReplicationState::ReadPreviousCurrentVersion => {
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return self.fail(IncomingVersionReplicationError::InvalidStateEvent {
-                        state: self.state_name(),
-                        expected: "Event::Storage(StorageEvent::ReadResult)",
-                        received: event,
-                    });
-                };
-
-                self.pending_old_current_hash =
-                    match Self::current_hash_from_version_bytes(value.as_deref()) {
-                        Ok(hash) => hash,
-                        Err(err) => return self.fail(err),
-                    };
-
-                self.prepare_head_transition()
             }
             IncomingVersionReplicationState::ApplyHeadTransition => match event {
                 Event::Storage(StorageEvent::WriteResult { .. })
@@ -1580,29 +1523,6 @@ mod tests {
         }));
 
         let [
-            Effect::Storage(StorageEffect::Read {
-                key_space,
-                txn_id: read_txn_id,
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected previous current version read")
-        };
-        assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
-        assert_eq!(*read_txn_id, Some(txn_id));
-
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8; 4].into(),
-            value: Some(
-                BlobVersion::deleted(SystemTime::now(), test_user_id())
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
-        }));
-
-        let [
             Effect::Storage(StorageEffect::Write {
                 key_space,
                 value,
@@ -1643,21 +1563,6 @@ mod tests {
         let effects = op.step(Event::Storage(StorageEvent::ReadResult {
             key: vec![0u8; 4].into(),
             value: Some(existing_pointer.to_bytes().unwrap().into()),
-        }));
-
-        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
-            panic!("expected previous current version read")
-        };
-        assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
-
-        let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8; 4].into(),
-            value: Some(
-                BlobVersion::deleted(SystemTime::now(), test_user_id())
-                    .to_bytes()
-                    .unwrap()
-                    .into(),
-            ),
         }));
 
         let [

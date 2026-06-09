@@ -10,6 +10,7 @@ use aruna_core::structs::{
 use aruna_core::types::{Effects, GroupId, NodeId, TxnId};
 use byteview::ByteView;
 use smallvec::smallvec;
+use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeadAliasContext {
@@ -41,9 +42,10 @@ impl HeadAliasContext {
         BlobHeadKey::new(self.bucket.clone(), self.key.clone())
     }
 
-    pub fn hash_path_index_key(&self, blake3_hash: [u8; 32]) -> HashPathIndexKey {
+    pub fn hash_path_index_key(&self, blake3_hash: [u8; 32], version_id: Ulid) -> HashPathIndexKey {
         HashPathIndexKey::new(
             blake3_hash,
+            version_id,
             self.realm_id,
             self.group_id,
             self.node_id,
@@ -147,11 +149,15 @@ pub fn delete_blob_version_effect(
 pub fn add_hash_path_index_effect(
     context: &HeadAliasContext,
     blake3_hash: [u8; 32],
+    version_id: Ulid,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Write {
         key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
-        key: context.hash_path_index_key(blake3_hash).to_bytes()?.into(),
+        key: context
+            .hash_path_index_key(blake3_hash, version_id)
+            .to_bytes()?
+            .into(),
         value: ByteView::from(Vec::<u8>::new()),
         txn_id,
     }))
@@ -160,11 +166,15 @@ pub fn add_hash_path_index_effect(
 pub fn delete_hash_path_index_effect(
     context: &HeadAliasContext,
     blake3_hash: [u8; 32],
+    version_id: Ulid,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     Ok(Effect::Storage(StorageEffect::Delete {
         key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
-        key: context.hash_path_index_key(blake3_hash).to_bytes()?.into(),
+        key: context
+            .hash_path_index_key(blake3_hash, version_id)
+            .to_bytes()?
+            .into(),
         txn_id,
     }))
 }
@@ -184,24 +194,26 @@ pub fn iter_hash_path_index_effect(
 
 pub fn build_head_transition_effects(
     context: &HeadAliasContext,
-    old_current_hash: Option<[u8; 32]>,
     new_pointer: Option<CurrentVersionPointer>,
     new_current_hash: Option<[u8; 32]>,
     txn_id: Option<TxnId>,
 ) -> Result<Effects, ConversionError> {
     let mut effects = smallvec![];
 
-    if let Some(old_hash) = old_current_hash {
-        effects.push(delete_hash_path_index_effect(context, old_hash, txn_id)?);
-    }
-
-    match new_pointer {
-        Some(pointer) => effects.push(write_blob_head_effect(context, pointer, txn_id)?),
+    match new_pointer.as_ref() {
+        Some(pointer) => effects.push(write_blob_head_effect(context, pointer.clone(), txn_id)?),
         None => effects.push(delete_blob_head_effect(context, txn_id)?),
     }
 
-    if let Some(new_hash) = new_current_hash {
-        effects.push(add_hash_path_index_effect(context, new_hash, txn_id)?);
+    if let Some(new_hash) = new_current_hash
+        && let Some(pointer) = new_pointer.as_ref()
+    {
+        effects.push(add_hash_path_index_effect(
+            context,
+            new_hash,
+            pointer.version_id,
+            txn_id,
+        )?);
     }
 
     Ok(effects)
@@ -230,7 +242,8 @@ mod tests {
     #[test]
     fn add_hash_path_index_effect_writes_structured_key_with_marker_value() {
         let context = alias_context();
-        let effect = add_hash_path_index_effect(&context, [9u8; 32], None).unwrap();
+        let version_id = Ulid::from_bytes([4u8; 16]);
+        let effect = add_hash_path_index_effect(&context, [9u8; 32], version_id, None).unwrap();
 
         let Effect::Storage(StorageEffect::Write { key, value, .. }) = effect else {
             panic!("expected storage write effect");
@@ -238,6 +251,7 @@ mod tests {
 
         let decoded_key = HashPathIndexKey::from_bytes(key.as_ref()).unwrap();
         assert_eq!(decoded_key.blake3_hash, [9u8; 32]);
+        assert_eq!(decoded_key.version_id, version_id);
         assert!(value.is_empty());
     }
 
@@ -255,11 +269,10 @@ mod tests {
     }
 
     #[test]
-    fn build_head_transition_effects_orders_old_delete_head_write_new_insert() {
+    fn build_head_transition_effects_orders_head_write_before_new_insert() {
         let context = alias_context();
         let effects = build_head_transition_effects(
             &context,
-            Some([4u8; 32]),
             Some(CurrentVersionPointer::new_with_generation(
                 Ulid::from_bytes([5u8; 16]),
                 11,
@@ -269,17 +282,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(effects.len(), 3);
+        assert_eq!(effects.len(), 2);
         assert!(matches!(
             effects[0],
-            Effect::Storage(StorageEffect::Delete { .. })
-        ));
-        assert!(matches!(
-            effects[1],
             Effect::Storage(StorageEffect::Write { .. })
         ));
         assert!(matches!(
-            effects[2],
+            effects[1],
             Effect::Storage(StorageEffect::Write { .. })
         ));
     }
@@ -287,16 +296,11 @@ mod tests {
     #[test]
     fn build_head_transition_effects_can_delete_head_without_new_alias() {
         let context = alias_context();
-        let effects =
-            build_head_transition_effects(&context, Some([4u8; 32]), None, None, None).unwrap();
+        let effects = build_head_transition_effects(&context, None, None, None).unwrap();
 
-        assert_eq!(effects.len(), 2);
+        assert_eq!(effects.len(), 1);
         assert!(matches!(
             effects[0],
-            Effect::Storage(StorageEffect::Delete { .. })
-        ));
-        assert!(matches!(
-            effects[1],
             Effect::Storage(StorageEffect::Delete { .. })
         ));
     }
