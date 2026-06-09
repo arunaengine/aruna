@@ -158,12 +158,21 @@ impl ListObjectsV2Operation {
         self.continuation_token = None;
 
         let has_prefix = self.input.prefix.as_ref().is_some_and(|p| !p.is_empty());
+        let raw_count = values.len();
 
         if !has_prefix {
-            // Original index-based logic for bucket-only iteration
+            // Track the key of the last pushed item as the continuation
+            // token.  Since the Iter effect uses an *exclusive* start_after
+            // bound, using the first excluded item (index == max_keys) would
+            // skip it on the next page.
+            //
+            // Only set the token when the storage returned a full page
+            // (more than max_keys items), which is our signal that more
+            // items likely exist.  When fewer items are returned we are
+            // at the end and there is nothing left to page.
+            let mut continuation = None;
             for (index, (key, value)) in values.into_iter().enumerate() {
                 if index >= max_keys {
-                    self.continuation_token = Some(key.to_vec());
                     break;
                 }
                 let head = match BlobHeadKey::from_bytes(key.as_ref()) {
@@ -177,7 +186,11 @@ impl ListObjectsV2Operation {
                 if head.bucket != self.input.bucket {
                     continue;
                 }
+                continuation = Some(key.to_vec());
                 self.pending.push((head, pointer.version_id));
+            }
+            if raw_count > max_keys {
+                self.continuation_token = continuation;
             }
         } else {
             // Prefix filter: collect all matching keys; use non-matching
