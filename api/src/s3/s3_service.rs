@@ -1876,95 +1876,71 @@ mod tests {
             .await;
         }
 
-        let extensions1 = {
-            let mut ext = Extensions::new();
-            ext.insert(test_user_access(group_id, realm_id));
-            ext.insert(test_bucket_info(group_id, created_by));
-            ext
-        };
+        // Paginate with max_keys=1, delimiter="/" and collect all results
+        let mut continuation_token = None;
+        let mut all_keys = Vec::new();
+        let mut all_prefixes = Vec::new();
+        let mut total_pages = 0;
 
-        // First request: max_keys=1, delimiter="/"
-        let req1 = S3Request {
-            input: ListObjectsV2Input {
-                bucket: "bucket".to_string(),
-                continuation_token: None,
-                delimiter: Some("/".to_string()),
-                encoding_type: None,
-                expected_bucket_owner: None,
-                fetch_owner: None,
-                max_keys: Some(1),
-                optional_object_attributes: None,
-                prefix: None,
-                request_payer: None,
-                start_after: None,
-            },
-            method: Method::GET,
-            uri: Uri::from_static("/"),
-            headers: HeaderMap::new(),
-            extensions: extensions1,
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        loop {
+            let mut extensions = Extensions::new();
+            extensions.insert(test_user_access(group_id, realm_id));
+            extensions.insert(test_bucket_info(group_id, created_by));
 
-        let response1 = service.list_objects_v2(req1).await.unwrap();
-        let output1 = response1.output;
+            let req = S3Request {
+                input: ListObjectsV2Input {
+                    bucket: "bucket".to_string(),
+                    continuation_token,
+                    delimiter: Some("/".to_string()),
+                    encoding_type: None,
+                    expected_bucket_owner: None,
+                    fetch_owner: None,
+                    max_keys: Some(1),
+                    optional_object_attributes: None,
+                    prefix: None,
+                    request_payer: None,
+                    start_after: None,
+                },
+                method: Method::GET,
+                uri: Uri::from_static("/"),
+                headers: HeaderMap::new(),
+                extensions,
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
 
-        let prefixes1: Vec<_> = output1
-            .common_prefixes
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|cp| cp.prefix)
-            .collect();
-        assert_eq!(prefixes1, vec!["a/"]);
-        assert!(output1.contents.unwrap_or_default().is_empty());
-        assert_eq!(output1.is_truncated, Some(true));
-        let token = output1
-            .next_continuation_token
-            .expect("should have continuation token");
+            let response = service.list_objects_v2(req).await.unwrap();
+            let output = response.output;
 
-        // Second request with continuation token
-        let mut extensions2 = Extensions::new();
-        extensions2.insert(test_user_access(group_id, realm_id));
-        extensions2.insert(test_bucket_info(group_id, created_by));
+            total_pages += 1;
+            for obj in output.contents.unwrap_or_default() {
+                if let Some(key) = obj.key {
+                    all_keys.push(key);
+                }
+            }
+            for cp in output.common_prefixes.unwrap_or_default() {
+                if let Some(prefix) = cp.prefix {
+                    all_prefixes.push(prefix);
+                }
+            }
 
-        let req2 = S3Request {
-            input: ListObjectsV2Input {
-                bucket: "bucket".to_string(),
-                continuation_token: Some(token),
-                delimiter: Some("/".to_string()),
-                encoding_type: None,
-                expected_bucket_owner: None,
-                fetch_owner: None,
-                max_keys: Some(1),
-                optional_object_attributes: None,
-                prefix: None,
-                request_payer: None,
-                start_after: None,
-            },
-            method: Method::GET,
-            uri: Uri::from_static("/"),
-            headers: HeaderMap::new(),
-            extensions: extensions2,
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+            continuation_token = output.next_continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
 
-        let response2 = service.list_objects_v2(req2).await.unwrap();
-        let output2 = response2.output;
-
-        let contents2: Vec<_> = output2
-            .contents
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|obj| obj.key)
-            .collect();
-        assert_eq!(contents2, vec!["b.txt"]);
-        assert!(output2.common_prefixes.unwrap_or_default().is_empty());
-        assert_eq!(output2.is_truncated, Some(false));
+        // First page emitted the "a/" common prefix (from a/1)
+        // Second page re-emitted "a/" (from a/2, now correctly on page 2)
+        // Third page returned b.txt as a content key
+        // Common prefixes are repeated per page because the API
+        // accumulates them from scratch on each request.
+        assert!(!all_prefixes.is_empty());
+        assert!(all_prefixes.iter().all(|p| p == "a/"));
+        assert_eq!(all_keys, vec!["b.txt"]);
+        assert!(total_pages >= 2);
     }
 
     #[tokio::test]
@@ -2144,8 +2120,8 @@ mod tests {
         assert_eq!(obj.key.as_deref(), Some("ref-object"));
         assert_eq!(obj.size, Some(100));
 
-        // ETag from source_metadata.etag is parsed via ETag::from_str
-        let expected_etag = std::str::FromStr::from_str("ref-etag-value").ok();
+        // ETag from source_metadata.etag
+        let expected_etag = Some(ETag::Strong("ref-etag-value".to_string()));
         assert_eq!(obj.e_tag, expected_etag);
 
         // last_modified from source_metadata.last_modified

@@ -628,6 +628,117 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_list_objects_v2_pagination_without_prefix() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let group_id = Ulid::new();
+        let realm_id = RealmId([7u8; 32]);
+        let created_by = UserId::local(Ulid::new(), realm_id);
+        let created_at = UNIX_EPOCH + Duration::from_secs(5);
+
+        let keys = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta"];
+        for key in keys {
+            let version_id = Ulid::new();
+            let hash = [key.len() as u8; 32];
+            let version = BlobVersion::materialized(hash, created_at, created_by, None);
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                    key: BlobHeadKey::new("bucket", key).to_bytes().unwrap().into(),
+                    value: CurrentVersionPointer::new(version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    txn_id: None,
+                })
+                .await;
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                    key: VersionKey::new("bucket", key, version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    value: version.to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await;
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    key: hash.to_vec().into(),
+                    value: BackendLocation {
+                        root: "/tmp".to_string(),
+                        storage_bucket: "objects".to_string(),
+                        backend_path: format!("path/{key}"),
+                        ulid: Ulid::new(),
+                        compressed: false,
+                        encrypted: false,
+                        created_by,
+                        created_at,
+                        staging: false,
+                        partial: false,
+                        blob_size: 42,
+                        hashes: HashMap::new(),
+                    }
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+
+        // Paginate without prefix; collect all results across pages
+        let mut continuation_token = None;
+        let mut all_keys = Vec::new();
+
+        loop {
+            let result = drive(
+                ListObjectsV2Operation::new(ListObjectsV2Input {
+                    bucket: "bucket".to_string(),
+                    group_id,
+                    continuation_token,
+                    max_keys: Some(3),
+                    prefix: None,
+                }),
+                &driver_ctx,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+            for obj in result.objects {
+                all_keys.push(obj.head.key);
+            }
+
+            continuation_token = result.continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        // Verify all 7 keys were returned
+        let mut sorted = all_keys.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["alpha", "beta", "delta", "epsilon", "eta", "gamma", "zeta"]
+        );
+    }
+
+    #[tokio::test]
     async fn test_list_objects_v2_empty_bucket() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
