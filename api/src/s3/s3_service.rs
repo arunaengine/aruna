@@ -115,6 +115,8 @@ impl Debug for ArunaS3Service {
 }
 
 impl ArunaS3Service {
+    const LIST_OBJECTS_V2_MAX_PAGES: usize = 100;
+
     #[tracing::instrument(level = "trace", skip(driver_ctx))]
     pub async fn new(driver_ctx: Arc<DriverContext>, realm_id: RealmId, node_id: NodeId) -> Self {
         ArunaS3Service {
@@ -714,6 +716,7 @@ impl S3 for ArunaS3Service {
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
         let mut next_continuation_token = None;
+        let mut backend_pages_scanned = 0usize;
 
         loop {
             let result = drive(
@@ -733,6 +736,7 @@ impl S3 for ArunaS3Service {
 
             let page_next_continuation_token = result.continuation_token.clone();
             let page_len = result.objects.len();
+            backend_pages_scanned += 1;
 
             for (index, object) in result.objects.into_iter().enumerate() {
                 let head_bytes = object
@@ -741,9 +745,10 @@ impl S3 for ArunaS3Service {
                     .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
                 let key = object.head.key;
 
-                if continuation_token.is_none() && start_after
-                    .as_ref()
-                    .is_some_and(|start_after| key.as_str() <= start_after.as_str())
+                if continuation_token.is_none()
+                    && start_after
+                        .as_ref()
+                        .is_some_and(|start_after| key.as_str() <= start_after.as_str())
                 {
                     continue;
                 }
@@ -789,6 +794,22 @@ impl S3 for ArunaS3Service {
             }
 
             if contents.len() + common_prefixes.len() >= max_keys {
+                break;
+            }
+
+            if backend_pages_scanned >= Self::LIST_OBJECTS_V2_MAX_PAGES
+                && page_next_continuation_token.is_some()
+            {
+                warn!(
+                    bucket = %bucket,
+                    prefix = ?prefix,
+                    delimiter = ?delimiter,
+                    max_keys = %max_keys,
+                    visible_count = contents.len() + common_prefixes.len(),
+                    pages = backend_pages_scanned,
+                    "ListObjectsV2 pagination guard triggered; returning truncated response"
+                );
+                next_continuation_token = page_next_continuation_token.clone();
                 break;
             }
 
