@@ -10,6 +10,7 @@ pub mod get_object;
 pub mod get_user_access;
 pub mod head_object;
 pub mod list_buckets;
+pub mod list_objects_v2;
 pub mod put_bucket_replication;
 pub mod put_object;
 pub mod revoke_user_access;
