@@ -389,7 +389,10 @@ mod test {
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     };
-    use aruna_core::structs::{BlobVersion, CurrentVersionPointer, RealmId};
+    use aruna_core::structs::{
+        BlobVersion, CurrentVersionPointer, PortableSourceDescriptor, RealmId, SourceConnectorKind,
+        StagingStrategy, VersionSourceBinding,
+    };
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
@@ -524,15 +527,11 @@ mod test {
         for key in keys {
             let version_id = Ulid::new();
             let hash = [key.len() as u8; 32];
-            let version =
-                BlobVersion::materialized(hash, created_at, created_by, None);
+            let version = BlobVersion::materialized(hash, created_at, created_by, None);
             let _ = storage_handle
                 .send_storage_effect(StorageEffect::Write {
                     key_space: BLOB_HEAD_KEYSPACE.to_string(),
-                    key: BlobHeadKey::new("bucket", key)
-                        .to_bytes()
-                        .unwrap()
-                        .into(),
+                    key: BlobHeadKey::new("bucket", key).to_bytes().unwrap().into(),
                     value: CurrentVersionPointer::new(version_id)
                         .to_bytes()
                         .unwrap()
@@ -613,5 +612,140 @@ mod test {
         let mut sorted = all_keys.clone();
         sorted.sort();
         assert_eq!(sorted, vec!["rare/1", "rare/2", "rare/3"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_empty_bucket() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let group_id = Ulid::new();
+
+        let result = drive(
+            ListObjectsV2Operation::new(ListObjectsV2Input {
+                bucket: "empty-bucket".to_string(),
+                group_id,
+                continuation_token: None,
+                max_keys: Some(10),
+                prefix: None,
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert!(result.objects.is_empty());
+        assert!(result.continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_reference_object() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let group_id = Ulid::new();
+        let realm_id = RealmId([7u8; 32]);
+        let created_by = UserId::local(Ulid::new(), realm_id);
+        let version_id = Ulid::new();
+        let created_at = UNIX_EPOCH + Duration::from_secs(5);
+        let last_refresh = UNIX_EPOCH + Duration::from_secs(20);
+
+        let source_metadata = SourceMetadata {
+            content_length: 42,
+            content_type: Some("text/plain".to_string()),
+            etag: Some("ref-etag-1".to_string()),
+            last_modified: Some(UNIX_EPOCH + Duration::from_secs(10)),
+            source_version: None,
+        };
+
+        let version = BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::Http,
+                    public_config: HashMap::new(),
+                    source_path: "source/path".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                },
+                connector_id: None,
+            },
+            source_metadata.clone(),
+            created_at,
+            created_by,
+            last_refresh,
+        );
+
+        // Write head entry
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new("bucket", "ref-object")
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: CurrentVersionPointer::new(version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                txn_id: None,
+            })
+            .await;
+
+        // Write version entry (reference — no location)
+        let _ = storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new("bucket", "ref-object", version_id)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                value: version.to_bytes().unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+
+        let result = drive(
+            ListObjectsV2Operation::new(ListObjectsV2Input {
+                bucket: "bucket".to_string(),
+                group_id,
+                continuation_token: None,
+                max_keys: Some(10),
+                prefix: None,
+            }),
+            &driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.objects.len(), 1);
+        assert_eq!(result.objects[0].head.key, "ref-object");
+        assert_eq!(result.objects[0].location, None);
+        assert_eq!(result.objects[0].source_metadata, Some(source_metadata));
+        assert_eq!(result.objects[0].last_refresh, Some(last_refresh));
+        assert!(result.continuation_token.is_none());
     }
 }

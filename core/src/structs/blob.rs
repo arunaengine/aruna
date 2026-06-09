@@ -213,7 +213,10 @@ impl BlobHeadKey {
     }
 
     pub fn object_prefix(bucket: &str, key: &str) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&BlobHeadKeyObjectPrefix { bucket, key })?)
+        Ok(postcard::to_allocvec(&BlobHeadKeyObjectPrefix {
+            bucket,
+            key,
+        })?)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -621,7 +624,9 @@ mod tests {
 
     #[test]
     fn blob_head_key_object_prefix_rejects_wrong_bucket() {
-        let key = BlobHeadKey::new("bucket_b", "docs/file.txt").to_bytes().unwrap();
+        let key = BlobHeadKey::new("bucket_b", "docs/file.txt")
+            .to_bytes()
+            .unwrap();
         let prefix = BlobHeadKey::object_prefix("bucket_a", "docs/").unwrap();
         assert!(!key.starts_with(&prefix));
     }
