@@ -17,6 +17,7 @@ use aruna_core::util::unix_timestamp_secs;
 use aruna_net::{
     DiscoveryMethod, IrohRuntimeConfig, RelayMethod, endpoint_addr_from_config_string,
 };
+use aruna_operations::metadata::MetadataSearchStorage;
 use aruna_storage::{FjallStorage, StorageHandle, errors::StorageLibError};
 use base64::Engine;
 use byteview::ByteView;
@@ -45,6 +46,7 @@ const ONBOARDING_BOOTSTRAP_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Config {
     pub storage_path: String,
     pub metadata_storage_path: String,
+    pub metadata_search_storage: MetadataSearchStorage,
     pub irokle_storage_path: PathBuf,
     pub blob_root: String,
     pub blob_bucket_prefix: Option<String>,
@@ -193,6 +195,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
     let storage_path = dotenvy::var("STORAGE_PATH")?;
     let metadata_storage_path =
         dotenvy::var("CRAQLE_STORAGE_PATH").unwrap_or_else(|_| format!("{storage_path}/craqle"));
+    let metadata_search_storage = metadata_search_storage_env()?;
     let irokle_storage_path = dotenvy::var("IROKLE_STORAGE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(format!("{storage_path}/irokle")));
@@ -328,6 +331,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         Config {
             storage_path,
             metadata_storage_path,
+            metadata_search_storage,
             irokle_storage_path,
             blob_root,
             blob_bucket_prefix,
@@ -375,6 +379,23 @@ fn invalid_config_value(
         key,
         value: value.into(),
         message: message.to_string(),
+    }
+}
+
+fn metadata_search_storage_env() -> Result<MetadataSearchStorage, SetupError> {
+    const KEY: &str = "CRAQLE_SEARCH_STORAGE";
+    let Some(value) = dotenvy::var(KEY).ok() else {
+        return Ok(MetadataSearchStorage::Disk);
+    };
+
+    match normalize_env_value(&value).as_str() {
+        "disk" => Ok(MetadataSearchStorage::Disk),
+        "memory" | "in_memory" | "ram" => Ok(MetadataSearchStorage::Memory),
+        _ => Err(invalid_config_value(
+            KEY,
+            value,
+            "expected one of: disk, memory",
+        )),
     }
 }
 

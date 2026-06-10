@@ -7,7 +7,7 @@ use ulid::Ulid;
 
 use crate::NodeId;
 use crate::structs::{AuthContext, MetadataRegistryRecord, RealmId};
-use crate::types::GroupId;
+use crate::types::{GroupId, UserId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataGraphPolicy {
@@ -23,6 +23,13 @@ impl MetadataGraphPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataRequestDurability {
+    #[default]
+    Durable,
+    WalAlreadyDurable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataCreateCrateRequest {
     pub graph_iri: String,
@@ -31,6 +38,93 @@ pub struct MetadataCreateCrateRequest {
     pub date_published: String,
     pub license: String,
     pub policy: MetadataGraphPolicy,
+    #[serde(default)]
+    pub durability: MetadataRequestDurability,
+    #[serde(default)]
+    pub deterministic_actor: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataCreateEventPayload {
+    Scaffold {
+        name: String,
+        description: String,
+        date_published: String,
+        license: String,
+    },
+    RoCrate {
+        jsonld: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataCreateEventRecord {
+    pub event_id: Ulid,
+    pub record: MetadataRegistryRecord,
+    pub user_id: UserId,
+    pub node_id: NodeId,
+    pub payload: MetadataCreateEventPayload,
+    pub occurred_at_ms: u64,
+}
+
+/// CRDT actor used when materializing `event_id` into the local graph store,
+/// identical on every holder so replayed materializations dedupe exactly.
+pub fn deterministic_materialization_actor(event_id: Ulid) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-metadata-materialization-v1\0");
+    hasher.update(&event_id.to_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataMaterializationState {
+    Pending,
+    Materialized,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataMaterializationStatusRecord {
+    pub document_id: Ulid,
+    pub event_id: Ulid,
+    pub graph_iri: String,
+    pub state: MetadataMaterializationState,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+impl MetadataMaterializationStatusRecord {
+    pub fn pending(event: &MetadataCreateEventRecord, updated_at_ms: u64) -> Self {
+        Self {
+            document_id: event.record.document_id,
+            event_id: event.event_id,
+            graph_iri: event.record.graph_iri.clone(),
+            state: MetadataMaterializationState::Pending,
+            attempts: 0,
+            last_error: None,
+            updated_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataMaterializationJobRecord {
+    pub document_id: Ulid,
+    pub event_id: Ulid,
+    pub due_at_ms: u64,
+    pub attempts: u32,
+}
+
+impl MetadataMaterializationJobRecord {
+    pub fn new(event: &MetadataCreateEventRecord, due_at_ms: u64) -> Self {
+        Self {
+            document_id: event.record.document_id,
+            event_id: event.event_id,
+            due_at_ms,
+            attempts: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +132,10 @@ pub struct MetadataApplyRoCrateRequest {
     pub graph_iri: String,
     pub jsonld: String,
     pub policy: MetadataGraphPolicy,
+    #[serde(default)]
+    pub durability: MetadataRequestDurability,
+    #[serde(default)]
+    pub deterministic_actor: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,6 +279,12 @@ pub enum MetadataQueryResults {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEffect {
+    ValidateCreateCrate {
+        request: MetadataCreateCrateRequest,
+    },
+    ValidateRoCrate {
+        request: MetadataApplyRoCrateRequest,
+    },
     CreateCrate {
         request: MetadataCreateCrateRequest,
     },
@@ -242,6 +346,9 @@ pub enum MetadataEffect {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum MetadataEvent {
+    ValidationResult {
+        graph_iri: String,
+    },
     CreateCrateResult {
         graph_iri: String,
         batch: MetadataBatch,
@@ -315,6 +422,8 @@ pub enum MetadataError {
     TaskJoin(String),
     #[error("invalid metadata input: {0}")]
     InvalidInput(String),
+    #[error("metadata graph not found")]
+    GraphNotFound,
     #[error("metadata backend error: {0}")]
     Backend(String),
 }

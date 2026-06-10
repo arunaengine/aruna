@@ -17,6 +17,7 @@ pub struct MetadataRegistryRecord {
     pub holder_node_ids: Vec<NodeId>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+    pub last_event_id: Ulid,
 }
 
 impl MetadataRegistryRecord {

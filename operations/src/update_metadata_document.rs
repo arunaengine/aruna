@@ -3,7 +3,8 @@ use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{
-    MetadataApplyRoCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy,
+    MetadataApplyRoCrateRequest, MetadataCreateEventPayload, MetadataCreateEventRecord,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataGraphPolicy, MetadataRequestDurability,
     MetadataUpsertEntityRequest,
 };
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -18,7 +19,7 @@ use ulid::Ulid;
 use crate::announce::AnnounceTopicOperation;
 use crate::metadata::repository::{
     StorageReadError, parse_registry_read, read_registry_effect, write_audit_effect,
-    write_document_index_effect, write_registry_effect,
+    write_create_event_effect, write_document_index_effect, write_registry_effect,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +43,7 @@ pub struct UpdateMetadataDocumentOperation {
     config: UpdateMetadataDocumentConfig,
     txn_id: Option<TxnId>,
     record: Option<MetadataRegistryRecord>,
+    update_event: Option<MetadataCreateEventRecord>,
     state: UpdateMetadataDocumentState,
     output: Option<Result<MetadataRegistryRecord, UpdateMetadataDocumentError>>,
 }
@@ -51,6 +53,7 @@ enum UpdateMetadataDocumentState {
     Init,
     ReadCurrent,
     ApplyMutation,
+    AppendUpdateEvent,
     SyncGraphBestEffort,
     StartTransaction,
     WriteRegistry,
@@ -90,6 +93,7 @@ impl UpdateMetadataDocumentOperation {
             config,
             txn_id: None,
             record: None,
+            update_event: None,
             state: UpdateMetadataDocumentState::Init,
             output: None,
         }
@@ -111,6 +115,32 @@ impl UpdateMetadataDocumentOperation {
         record.public = self.config.public;
         record.updated_at_ms = Self::current_timestamp_ms();
         record
+    }
+
+    fn update_event_record(
+        &self,
+        record: &MetadataRegistryRecord,
+    ) -> Option<MetadataCreateEventRecord> {
+        match &self.config.mutation {
+            UpdateMetadataDocumentMutation::ReplaceRoCrate { jsonld } => Some({
+                let event_id = Ulid::new();
+                let mut record = record.clone();
+                record.last_event_id = event_id;
+                let occurred_at_ms = record.updated_at_ms;
+                MetadataCreateEventRecord {
+                    event_id,
+                    record,
+                    user_id: self.config.actor.user_id,
+                    node_id: self.config.actor.node_id,
+                    payload: MetadataCreateEventPayload::RoCrate {
+                        jsonld: jsonld.clone(),
+                    },
+                    occurred_at_ms,
+                }
+            }),
+            UpdateMetadataDocumentMutation::UpsertDataEntity { .. }
+            | UpdateMetadataDocumentMutation::UpsertContextualEntity { .. } => None,
+        }
     }
 
     fn audit_record(&self, record: &MetadataRegistryRecord) -> MetadataAuditRecord {
@@ -150,6 +180,8 @@ impl UpdateMetadataDocumentOperation {
                         graph_iri,
                         jsonld: jsonld.clone(),
                         policy: self.graph_policy(record),
+                        durability: MetadataRequestDurability::Durable,
+                        deterministic_actor: None,
                     },
                 })
             }
@@ -234,11 +266,28 @@ impl Operation for UpdateMetadataDocumentOperation {
                     let Some(record) = self.record.take() else {
                         return self.fail(UpdateMetadataDocumentError::DocumentNotFound);
                     };
-                    self.record = Some(self.updated_record(record));
-                    self.graph_sync_effect()
+                    let record = self.updated_record(record);
+                    self.update_event = self.update_event_record(&record);
+                    self.record = Some(record);
+                    if let Some(event) = self.update_event.as_ref() {
+                        self.state = UpdateMetadataDocumentState::AppendUpdateEvent;
+                        match write_create_event_effect(event) {
+                            Ok(effect) => smallvec![effect],
+                            Err(error) => self.fail(error.into()),
+                        }
+                    } else {
+                        self.graph_sync_effect()
+                    }
                 }
                 Event::Metadata(MetadataEvent::Error { error, .. }) => self.fail(error.into()),
                 other => self.unexpected_event("metadata mutation result", format!("{other:?}")),
+            },
+            UpdateMetadataDocumentState::AppendUpdateEvent => match event {
+                Event::Storage(StorageEvent::WriteResult { .. }) => self.graph_sync_effect(),
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => {
+                    self.unexpected_event("metadata update event append", format!("{other:?}"))
+                }
             },
             UpdateMetadataDocumentState::SyncGraphBestEffort => match event {
                 Event::Metadata(MetadataEvent::GraphSyncScheduled { .. }) => {
@@ -331,22 +380,45 @@ impl Operation for UpdateMetadataDocumentOperation {
                         return self.fail(UpdateMetadataDocumentError::MissingTransaction);
                     };
                     self.state = UpdateMetadataDocumentState::AnnounceTopic;
-                    let document = DocumentSyncTarget::MetadataRegistry {
-                        group_id: record.group_id,
-                        document_id: record.document_id,
-                    };
-                    smallvec![Effect::SubOperation(boxed_suboperation(
+                    let operation = if let Some(event) = self.update_event.as_ref() {
+                        let document = DocumentSyncTarget::MetadataCreateEvent {
+                            document_id: event.record.document_id,
+                            event_id: event.event_id,
+                        };
+                        match postcard::to_allocvec(event) {
+                            Ok(bytes) => {
+                                AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
+                                    document.topic_id(),
+                                    self.config.actor.node_id,
+                                    document,
+                                    record.holder_node_ids.clone(),
+                                    bytes,
+                                )
+                            }
+                            Err(error) => {
+                                return self
+                                    .fail(aruna_core::errors::ConversionError::from(error).into());
+                            }
+                        }
+                    } else {
+                        let document = DocumentSyncTarget::MetadataRegistry {
+                            group_id: record.group_id,
+                            document_id: record.document_id,
+                        };
                         AnnounceTopicOperation::new_for_document_with_peers(
                             document.topic_id(),
                             self.config.actor.node_id,
                             Some(document),
                             record.holder_node_ids.clone(),
-                        ),
+                        )
+                    };
+                    smallvec![Effect::SubOperation(boxed_suboperation(
+                        operation,
                         |result| {
                             Event::SubOperation(SubOperationEvent::DocumentSyncResult {
                                 result: result.map_err(|error| error.to_string()),
                             })
-                        },
+                        }
                     ))]
                 }
                 Event::Storage(StorageEvent::Error { error }) => {

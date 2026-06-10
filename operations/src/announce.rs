@@ -22,7 +22,10 @@ const USER_SYNC_PAGE_SIZE: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 enum PendingDocumentSync {
-    Document(DocumentSyncTarget),
+    Document {
+        document: DocumentSyncTarget,
+        bytes: Option<Vec<u8>>,
+    },
     UserPage {
         realm_id: RealmId,
         start_after: Option<Key>,
@@ -35,6 +38,7 @@ pub struct AnnounceTopicOperation {
     document: Option<DocumentSyncTarget>,
     local_node_id: NodeId,
     peers: Vec<NodeId>,
+    document_bytes: Option<Vec<u8>>,
     state: AnnounceTopicState,
     pending: VecDeque<PendingDocumentSync>,
     current: Option<DocumentSyncTarget>,
@@ -94,6 +98,27 @@ impl AnnounceTopicOperation {
             document,
             local_node_id,
             peers,
+            document_bytes: None,
+            state: AnnounceTopicState::Init,
+            pending: VecDeque::new(),
+            current: None,
+            output: None,
+        }
+    }
+
+    pub fn new_for_document_with_peers_and_bytes(
+        topic: TopicId,
+        local_node_id: NodeId,
+        document: DocumentSyncTarget,
+        peers: Vec<NodeId>,
+        bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            topic,
+            document: Some(document),
+            local_node_id,
+            peers,
+            document_bytes: Some(bytes),
             state: AnnounceTopicState::Init,
             pending: VecDeque::new(),
             current: None,
@@ -130,34 +155,41 @@ impl AnnounceTopicOperation {
         }
 
         if let Some(document) = self.document.clone() {
-            self.pending
-                .push_back(PendingDocumentSync::Document(document));
+            self.pending.push_back(PendingDocumentSync::Document {
+                document,
+                bytes: self.document_bytes.take(),
+            });
             return;
         }
 
         match &self.topic {
             TopicId::Realm(realm_id) => {
-                self.pending.push_back(PendingDocumentSync::Document(
-                    DocumentSyncTarget::RealmAuthorization {
+                self.pending.push_back(PendingDocumentSync::Document {
+                    document: DocumentSyncTarget::RealmAuthorization {
                         realm_id: *realm_id,
                     },
-                ));
-                self.pending.push_back(PendingDocumentSync::Document(
-                    DocumentSyncTarget::RealmConfig {
+                    bytes: None,
+                });
+                self.pending.push_back(PendingDocumentSync::Document {
+                    document: DocumentSyncTarget::RealmConfig {
                         realm_id: *realm_id,
                     },
-                ));
+                    bytes: None,
+                });
             }
             TopicId::Group(group_id) => {
-                self.pending
-                    .push_back(PendingDocumentSync::Document(DocumentSyncTarget::Group {
-                        group_id: *group_id,
-                    }));
-                self.pending.push_back(PendingDocumentSync::Document(
-                    DocumentSyncTarget::GroupAuthorization {
+                self.pending.push_back(PendingDocumentSync::Document {
+                    document: DocumentSyncTarget::Group {
                         group_id: *group_id,
                     },
-                ));
+                    bytes: None,
+                });
+                self.pending.push_back(PendingDocumentSync::Document {
+                    document: DocumentSyncTarget::GroupAuthorization {
+                        group_id: *group_id,
+                    },
+                    bytes: None,
+                });
             }
             TopicId::Users(realm_id) => self.pending.push_back(PendingDocumentSync::UserPage {
                 realm_id: *realm_id,
@@ -167,12 +199,35 @@ impl AnnounceTopicOperation {
         }
     }
 
+    fn write_document_outbox_effect(
+        &mut self,
+        document: DocumentSyncTarget,
+        bytes: Vec<u8>,
+    ) -> Effects {
+        self.current = Some(document.clone());
+        self.state = AnnounceTopicState::WriteOutbox;
+        let record = new_outbox_record(
+            self.local_node_id,
+            document,
+            self.peers.clone(),
+            DocumentSyncOutboxEvent::Upsert { bytes },
+        );
+        match write_outbox_effect(&record) {
+            Ok(effect) => smallvec![effect],
+            Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),
+        }
+    }
+
     fn next_effect(&mut self) -> Effects {
         match self.pending.pop_front() {
-            Some(PendingDocumentSync::Document(document)) => {
-                self.current = Some(document.clone());
-                self.state = AnnounceTopicState::ReadDocument;
-                smallvec![document_repository::read_effect(&document, None)]
+            Some(PendingDocumentSync::Document { document, bytes }) => {
+                if let Some(bytes) = bytes {
+                    self.write_document_outbox_effect(document, bytes)
+                } else {
+                    self.current = Some(document.clone());
+                    self.state = AnnounceTopicState::ReadDocument;
+                    smallvec![document_repository::read_effect(&document, None)]
+                }
             }
             Some(PendingDocumentSync::UserPage {
                 realm_id,
@@ -214,19 +269,7 @@ impl Operation for AnnounceTopicOperation {
                     let Some(bytes) = value else {
                         return self.next_effect();
                     };
-                    self.state = AnnounceTopicState::WriteOutbox;
-                    let record = new_outbox_record(
-                        self.local_node_id,
-                        document,
-                        self.peers.clone(),
-                        DocumentSyncOutboxEvent::Upsert {
-                            bytes: bytes.to_vec(),
-                        },
-                    );
-                    match write_outbox_effect(&record) {
-                        Ok(effect) => smallvec![effect],
-                        Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),
-                    }
+                    self.write_document_outbox_effect(document, bytes.to_vec())
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
@@ -248,9 +291,10 @@ impl Operation for AnnounceTopicOperation {
                             Err(error) => return self.fail(error.into()),
                         };
                         if user_id.realm_id == realm_id {
-                            self.pending.push_back(PendingDocumentSync::Document(
-                                DocumentSyncTarget::User { user_id },
-                            ));
+                            self.pending.push_back(PendingDocumentSync::Document {
+                                document: DocumentSyncTarget::User { user_id },
+                                bytes: None,
+                            });
                         }
                     }
                     if let Some(start_after) = next_start_after {
@@ -266,20 +310,14 @@ impl Operation for AnnounceTopicOperation {
             },
             AnnounceTopicState::WriteOutbox => match event {
                 Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    let Some(document) = self.current.clone() else {
+                    if self.current.is_none() {
                         return self.unexpected_event(
                             "tracked document sync target",
                             "missing current document".to_string(),
                         );
-                    };
+                    }
                     self.state = AnnounceTopicState::ScheduleSync;
-                    let record = new_outbox_record(
-                        self.local_node_id,
-                        document,
-                        self.peers.clone(),
-                        DocumentSyncOutboxEvent::Upsert { bytes: Vec::new() },
-                    );
-                    smallvec![schedule_outbox_drain_effect(&record)]
+                    smallvec![schedule_outbox_drain_effect()]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => {
@@ -319,5 +357,53 @@ impl Operation for AnnounceTopicOperation {
 
     fn abort(&mut self) -> Effects {
         smallvec![]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use aruna_core::document::DocumentSyncOutboxRecord;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::types::GroupId;
+    use ulid::Ulid;
+
+    #[test]
+    fn provided_document_bytes_skip_readback_before_outbox_write() {
+        let local_node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let document = DocumentSyncTarget::MetadataRegistry {
+            group_id: GroupId::new(),
+            document_id: Ulid::new(),
+        };
+        let bytes = vec![1, 2, 3, 4];
+        let mut operation = AnnounceTopicOperation::new_for_document_with_peers_and_bytes(
+            document.topic_id(),
+            local_node_id,
+            document.clone(),
+            Vec::new(),
+            bytes.clone(),
+        );
+
+        let effects = operation.start();
+
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                value,
+                txn_id,
+                ..
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected one outbox write");
+        };
+        assert_eq!(key_space, DOCUMENT_SYNC_OUTBOX_KEYSPACE);
+        assert_eq!(txn_id, &None);
+        let record: DocumentSyncOutboxRecord =
+            postcard::from_bytes(value.as_ref()).expect("outbox record decodes");
+        assert_eq!(record.target, document);
+        assert_eq!(record.event, DocumentSyncOutboxEvent::Upsert { bytes });
     }
 }

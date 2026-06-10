@@ -129,6 +129,7 @@ impl ServerState {
         state.persist_trusted_realms().await;
         state
     }
+
     pub fn get_ctx(&self) -> Arc<DriverContext> {
         self.driver_ctx.clone()
     }
