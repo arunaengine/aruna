@@ -123,6 +123,15 @@ async fn dispatch_effect(effect: Effect, context: &DriverContext, depth: usize) 
                         target,
                         ..
                     }) => Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { target })),
+                    aruna_core::effects::NetEffect::Irokle(IrokleEffect::PublishDocuments {
+                        documents,
+                        ..
+                    }) => Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsPublished {
+                        targets: documents
+                            .into_iter()
+                            .map(|document| document.target().clone())
+                            .collect(),
+                    })),
                     aruna_core::effects::NetEffect::Irokle(IrokleEffect::DeleteDocument {
                         target,
                         ..

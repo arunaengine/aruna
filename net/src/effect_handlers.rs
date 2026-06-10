@@ -30,6 +30,9 @@ pub async fn handle_net_effect(
                     .publish_document(event_id, target, bytes, peers)
                     .await,
             ),
+            aruna_core::IrokleEffect::PublishDocuments { documents, peers } => {
+                NetEvent::Irokle(irokle.publish_documents(documents, peers).await)
+            }
             aruna_core::IrokleEffect::DeleteDocument {
                 event_id,
                 target,
@@ -37,6 +40,9 @@ pub async fn handle_net_effect(
             } => NetEvent::Irokle(irokle.delete_document(event_id, target, peers).await),
             aruna_core::IrokleEffect::SyncDocument { target, peers } => {
                 NetEvent::Irokle(irokle.sync_document_event(target, peers).await)
+            }
+            aruna_core::IrokleEffect::SyncDocuments { targets, peers } => {
+                NetEvent::Irokle(irokle.sync_documents_event(targets, peers).await)
             }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
