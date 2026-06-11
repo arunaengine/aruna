@@ -196,6 +196,7 @@ impl ListObjectsV2Operation {
             // Prefix filter: collect all matching keys; use non-matching
             // keys as continuation points so no matches are skipped
             let prefix = self.input.prefix.as_ref().unwrap();
+            let mut continuation = None;
             for (key, value) in values {
                 let head = match BlobHeadKey::from_bytes(key.as_ref()) {
                     Ok(head) => head,
@@ -209,11 +210,14 @@ impl ListObjectsV2Operation {
                     continue;
                 }
                 if head.key.starts_with(prefix.as_str()) {
-                    self.pending.push((head, pointer.version_id));
-                } else if self.pending.len() >= max_keys {
-                    self.continuation_token = Some(key.to_vec());
-                    break;
+                    if self.pending.len() < max_keys {
+                        self.pending.push((head, pointer.version_id));
+                        continuation = Some(key.to_vec());
+                    }
                 }
+            }
+            if self.pending.len() >= max_keys {
+                self.continuation_token = continuation;
             }
         }
 
@@ -260,7 +264,7 @@ impl ListObjectsV2Operation {
         };
 
         let Some(value) = value else {
-            return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+            return self.read_next_version_or_finish();
         };
 
         let version = match BlobVersion::from_bytes(value.as_ref()) {
@@ -308,7 +312,7 @@ impl ListObjectsV2Operation {
         };
 
         let Some(value) = value else {
-            return self.emit_error(ListObjectsV2Error::ListObjectsV2Failed);
+            return self.read_next_version_or_finish();
         };
 
         let location = match BackendLocation::from_bytes(value.as_ref()) {
