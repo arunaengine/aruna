@@ -36,6 +36,7 @@ pub mod list_onboarding_secrets;
 pub mod list_users;
 pub mod metadata;
 pub mod process_placements;
+pub mod queue_lag;
 pub mod register_or_get_oidc_user;
 pub mod replicate_documents;
 pub mod replication;

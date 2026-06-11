@@ -26,3 +26,5 @@ ed25519-dalek = { workspace = true }
 globset = { workspace = true }
 oxrdf = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

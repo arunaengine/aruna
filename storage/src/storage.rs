@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::telemetry::{LatencyAggregator, record_stage};
 use async_trait::async_trait;
 use byteview::ByteView;
 use crossfire::{TrySendError, mpsc, oneshot};
@@ -19,9 +20,16 @@ use tracing::{Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use crate::errors::StorageLibError;
-pub type EffectHandle = (StorageEffect, oneshot::TxOneshot<StorageEvent>, Span);
+pub type EffectHandle = (
+    StorageEffect,
+    oneshot::TxOneshot<StorageEvent>,
+    Span,
+    Instant,
+);
 pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
 pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
+
+const STORAGE_EFFECT_QUEUE_CAPACITY: usize = 65_536;
 
 enum Txn {
     Read(fjall::Snapshot),
@@ -29,29 +37,84 @@ enum Txn {
 }
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
 const STORAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SLOW_STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
+const SLOW_QUEUE_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
+// Unbiased queue-wait vs service histograms for every storage effect, keyed
+// by operation kind and keyspace, flushed as `latency.summary` INFO lines.
+static STORAGE_LATENCY: LazyLock<LatencyAggregator> =
+    LazyLock::new(|| LatencyAggregator::new("storage"));
+
+fn record_storage_call(
+    operation: &'static str,
+    key_space: Option<&str>,
+    queue_wait: Duration,
+    service: Duration,
+) {
+    match key_space {
+        Some(key_space) => STORAGE_LATENCY.record_split(
+            &format!("{operation}:{key_space}"),
+            queue_wait,
+            service,
+        ),
+        None => STORAGE_LATENCY.record_split(operation, queue_wait, service),
+    }
+}
+
+fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
+    match effect {
+        StorageEffect::Read { key_space, .. }
+        | StorageEffect::Write { key_space, .. }
+        | StorageEffect::Delete { key_space, .. }
+        | StorageEffect::Iter { key_space, .. } => Some(key_space),
+        StorageEffect::BatchWrite { writes, .. } => {
+            writes.first().map(|(key_space, _, _)| key_space.as_str())
+        }
+        StorageEffect::BatchDelete { deletes, .. } => {
+            deletes.first().map(|(key_space, _)| key_space.as_str())
+        }
+        StorageEffect::StartTransaction { .. }
+        | StorageEffect::CommitTransaction { .. }
+        | StorageEffect::AbortTransaction { .. } => None,
+    }
+}
+const MAX_GROUP_COMMIT: usize = 256;
+const READ_POOL_THREADS: usize = 4;
+
+#[derive(Clone)]
 struct Store {
     db: OptimisticTxDatabase,
-    keyspaces: HashMap<String, OptimisticTxKeyspace>,
+    keyspaces: Arc<Mutex<HashMap<String, OptimisticTxKeyspace>>>,
 }
 
 impl Store {
     fn new(db: OptimisticTxDatabase) -> Self {
         Self {
             db,
-            keyspaces: HashMap::new(),
+            keyspaces: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    fn resolve_keyspace(&mut self, name: &str) -> Result<OptimisticTxKeyspace, StorageError> {
-        if let Some(ks) = self.keyspaces.get(name) {
+    fn resolve_keyspace(&self, name: &str) -> Result<OptimisticTxKeyspace, StorageError> {
+        if let Some(ks) = self
+            .keyspaces
+            .lock()
+            .expect("storage keyspace cache mutex poisoned")
+            .get(name)
+        {
             return Ok(ks.clone());
         }
 
         match self.db.keyspace(name, KeyspaceCreateOptions::default) {
             Ok(ks) => {
-                self.keyspaces.insert(name.to_string(), ks.clone());
-                Ok(ks)
+                let mut keyspaces = self
+                    .keyspaces
+                    .lock()
+                    .expect("storage keyspace cache mutex poisoned");
+                Ok(keyspaces
+                    .entry(name.to_string())
+                    .or_insert_with(|| ks.clone())
+                    .clone())
             }
             Err(_) => Err(StorageError::KeyspaceError),
         }
@@ -61,6 +124,8 @@ impl Store {
 pub struct FjallStorage {
     store: Store,
     txns: HashMap<Ulid, Txn>,
+    read_pool: Vec<EffectSender>,
+    next_reader: usize,
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +133,7 @@ struct StorageMetrics {
     requests_total: AtomicU64,
     errors_total: AtomicU64,
     conflicts_total: AtomicU64,
+    in_flight: AtomicU64,
     channel_closed: AtomicBool,
     last_error: Mutex<Option<String>>,
 }
@@ -90,7 +156,7 @@ pub struct StorageHandle {
 
 impl StorageHandle {
     pub fn new() -> (Self, EffectReceiver) {
-        let (sender, receiver) = mpsc::bounded_blocking(2048);
+        let (sender, receiver) = mpsc::bounded_blocking(STORAGE_EFFECT_QUEUE_CAPACITY);
         (
             StorageHandle {
                 write_channel: sender,
@@ -102,6 +168,11 @@ impl StorageHandle {
 
     pub fn get_errors(&self) -> u64 {
         self.metrics.errors_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of storage effects currently enqueued or being processed.
+    pub fn in_flight(&self) -> u64 {
+        self.metrics.in_flight.load(Ordering::Relaxed)
     }
 
     pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
@@ -139,12 +210,21 @@ impl StorageHandle {
     )]
     async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        let event = self.dispatch_queued_storage_effect(effect).await;
+        record_stage("storage", started.elapsed());
+        event
+    }
 
+    async fn dispatch_queued_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         let (response_tx, response_rx) = crossfire::oneshot::oneshot();
         let operation = storage_effect_kind(&effect);
         let active_txn_id = active_txn_id_for_effect(&effect);
         let span = storage_effect_span(&effect);
-        match self.write_channel.try_send((effect, response_tx, span)) {
+        match self
+            .write_channel
+            .try_send((effect, response_tx, span, Instant::now()))
+        {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 if let Some(txn_id) = active_txn_id {
@@ -161,7 +241,8 @@ impl StorageHandle {
             }
         }
 
-        match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
+        self.metrics.in_flight.fetch_add(1, Ordering::Relaxed);
+        let event = match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
             Ok(Ok(event)) => self.observe_storage_event(event),
             Ok(Err(_)) => self.observe_storage_event(StorageEvent::Error {
                 error: StorageError::ChannelClosed,
@@ -181,14 +262,19 @@ impl StorageHandle {
                     error: StorageError::Timeout,
                 })
             }
-        }
+        };
+        self.metrics.in_flight.fetch_sub(1, Ordering::Relaxed);
+        event
     }
 
     fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
         let (response_tx, _response_rx) = crossfire::oneshot::oneshot();
         let effect = StorageEffect::AbortTransaction { txn_id };
         let span = storage_effect_span(&effect);
-        match self.write_channel.try_send((effect, response_tx, span)) {
+        match self
+            .write_channel
+            .try_send((effect, response_tx, span, Instant::now()))
+        {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => warn!(
                 event = "storage.transaction.abort_enqueue_full",
@@ -307,11 +393,15 @@ impl FjallStorage {
             .open()?;
 
         let (sender, receiver) = StorageHandle::new();
+        let store = Store::new(db);
+        let read_pool = spawn_read_pool(store.clone(), READ_POOL_THREADS);
 
         thread::spawn(move || {
             let mut storage = FjallStorage {
-                store: Store::new(db),
+                store,
                 txns: HashMap::new(),
+                read_pool,
+                next_reader: 0,
             };
             storage.receive_loop(receiver);
         });
@@ -319,113 +409,282 @@ impl FjallStorage {
         Ok(sender)
     }
 
+    fn process_effect(&mut self, effect: StorageEffect) -> StorageEvent {
+        match effect {
+            StorageEffect::StartTransaction { read } => self.start_transaction(read),
+            StorageEffect::AbortTransaction { txn_id } => self.abort_transaction(txn_id),
+            StorageEffect::Read {
+                key_space,
+                key,
+                txn_id,
+            } => self.read(key_space, key, txn_id),
+            StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id,
+            } => self.write(key_space, key, value, txn_id),
+            StorageEffect::BatchWrite { writes, txn_id } => self.batch_write(writes, txn_id),
+            StorageEffect::CommitTransaction { txn_id } => self.commit_transaction(txn_id),
+            StorageEffect::Delete {
+                key_space,
+                key,
+                txn_id,
+            } => self.delete(key_space, key, txn_id),
+            StorageEffect::BatchDelete { deletes, txn_id } => self.batch_delete(deletes, txn_id),
+            StorageEffect::Iter {
+                key_space,
+                prefix,
+                start_after,
+                limit,
+                txn_id,
+            } => self.iterate(key_space, prefix, start_after, limit, txn_id),
+        }
+    }
+
     #[tracing::instrument(name = "storage.receive_loop", level = "debug", skip(self, receiver))]
     pub fn receive_loop(&mut self, receiver: EffectReceiver) {
+        let mut slow_queue = SlowQueueAggregator::default();
+        let mut group: Vec<EffectHandle> = Vec::new();
         loop {
-            match receiver.recv() {
-                Ok((effect, response_tx, span)) => {
+            let Ok(first) = receiver.recv() else {
+                tracing::warn!("Storage receiver channel closed, shutting down storage thread.");
+                break;
+            };
+            let mut pending = Vec::with_capacity(8);
+            pending.push(first);
+            while pending.len() < MAX_GROUP_COMMIT {
+                match receiver.try_recv() {
+                    Ok(item) => pending.push(item),
+                    Err(_) => break,
+                }
+            }
+
+            for item in pending {
+                if is_groupable_write(&item.0) {
+                    group.push(item);
+                    continue;
+                }
+                if is_poolable_read(&item.0) {
+                    self.forward_to_read_pool(item, &mut slow_queue);
+                    continue;
+                }
+                self.flush_write_group(&mut group, &mut slow_queue);
+                self.process_single(item, &mut slow_queue);
+            }
+            self.flush_write_group(&mut group, &mut slow_queue);
+        }
+    }
+
+    fn forward_to_read_pool(&mut self, item: EffectHandle, slow_queue: &mut SlowQueueAggregator) {
+        let reader = self.next_reader % self.read_pool.len();
+        self.next_reader = self.next_reader.wrapping_add(1);
+        match self.read_pool[reader].try_send(item) {
+            Ok(()) => {}
+            Err(TrySendError::Full(item)) | Err(TrySendError::Disconnected(item)) => {
+                self.process_single(item, slow_queue);
+            }
+        }
+    }
+
+    fn process_single(&mut self, item: EffectHandle, slow_queue: &mut SlowQueueAggregator) {
+        let (effect, response_tx, span, enqueued_at) = item;
+        let _guard = span.enter();
+        let operation = storage_effect_kind(&effect);
+        let key_space = storage_effect_key_space(&effect).map(str::to_string);
+        let active_txn_id = active_txn_id_for_effect(&effect);
+        let queue_wait = enqueued_at.elapsed();
+        span.record("queue_wait_ms", duration_ms(queue_wait));
+        let starts_transaction = matches!(effect, StorageEffect::StartTransaction { .. });
+        let completes_transaction = matches!(
+            effect,
+            StorageEffect::CommitTransaction { .. } | StorageEffect::AbortTransaction { .. }
+        );
+
+        if response_tx.is_disconnected()
+            && !matches!(effect, StorageEffect::AbortTransaction { .. })
+        {
+            if let Some(txn_id) = active_txn_id {
+                self.cleanup_abandoned_transaction(
+                    txn_id,
+                    operation,
+                    "abandoned_before_processing",
+                );
+            }
+            warn!(
+                event = "storage.request.abandoned",
+                operation, "Skipping abandoned storage request"
+            );
+            return;
+        }
+
+        let service_started = Instant::now();
+        let event = self.process_effect(effect);
+        let service_elapsed = service_started.elapsed();
+        let total_elapsed = enqueued_at.elapsed();
+        let result = storage_event_kind(&event);
+        span.record("service_ms", duration_ms(service_elapsed));
+        span.record("total_elapsed_ms", duration_ms(total_elapsed));
+        span.record("result", result);
+        slow_queue.observe(
+            operation,
+            key_space.as_deref(),
+            queue_wait,
+            service_elapsed,
+            result,
+        );
+        if response_tx.is_disconnected() {
+            let abandoned_txn_id = if starts_transaction {
+                match &event {
+                    StorageEvent::TransactionStarted { txn_id } => Some(*txn_id),
+                    _ => None,
+                }
+            } else if completes_transaction {
+                None
+            } else {
+                active_txn_id
+            };
+
+            if let Some(txn_id) = abandoned_txn_id {
+                self.cleanup_abandoned_transaction(txn_id, operation, "abandoned_after_processing");
+            }
+            warn!(
+                event = "storage.response.abandoned",
+                operation,
+                result = storage_event_kind(&event),
+                "Dropping storage response for abandoned request"
+            );
+        } else {
+            response_tx.send(event);
+        }
+    }
+
+    fn flush_write_group(
+        &mut self,
+        group: &mut Vec<EffectHandle>,
+        slow_queue: &mut SlowQueueAggregator,
+    ) {
+        if group.is_empty() {
+            return;
+        }
+        if group.len() == 1 {
+            let item = group.pop().expect("group has one item");
+            self.process_single(item, slow_queue);
+            return;
+        }
+
+        let members = std::mem::take(group);
+        let service_started = Instant::now();
+        let tx = match self.buffered_write_tx() {
+            Ok(tx) => tx,
+            Err(_) => {
+                for item in members {
+                    self.process_single(item, slow_queue);
+                }
+                return;
+            }
+        };
+
+        let mut tx = tx;
+        let mut prepared = Vec::with_capacity(members.len());
+        for item in members {
+            match self.apply_group_member(&mut tx, &item.0) {
+                Ok(event) => prepared.push((item, Ok(event))),
+                Err(error) => prepared.push((item, Err(error))),
+            }
+        }
+
+        let commit_result = self
+            .commit_buffered_write_tx(tx)
+            .and_then(|()| self.persist_journal());
+
+        match commit_result {
+            Ok(()) => {
+                let service_elapsed = service_started.elapsed();
+                for ((effect, response_tx, span, enqueued_at), outcome) in prepared {
                     let _guard = span.enter();
-                    let operation = storage_effect_kind(&effect);
-                    let active_txn_id = active_txn_id_for_effect(&effect);
-                    let starts_transaction =
-                        matches!(effect, StorageEffect::StartTransaction { .. });
-                    let completes_transaction = matches!(
-                        effect,
-                        StorageEffect::CommitTransaction { .. }
-                            | StorageEffect::AbortTransaction { .. }
-                    );
-
-                    if response_tx.is_disconnected()
-                        && !matches!(effect, StorageEffect::AbortTransaction { .. })
-                    {
-                        if let Some(txn_id) = active_txn_id {
-                            self.cleanup_abandoned_transaction(
-                                txn_id,
-                                operation,
-                                "abandoned_before_processing",
-                            );
-                        }
-                        warn!(
-                            event = "storage.request.abandoned",
-                            operation, "Skipping abandoned storage request"
-                        );
-                        continue;
-                    }
-
-                    let event = match effect {
-                        StorageEffect::StartTransaction { read } => self.start_transaction(read),
-                        StorageEffect::AbortTransaction { txn_id } => {
-                            self.abort_transaction(txn_id)
-                        }
-                        StorageEffect::Read {
-                            key_space,
-                            key,
-                            txn_id,
-                        } => self.read(key_space, key, txn_id),
-                        StorageEffect::Write {
-                            key_space,
-                            key,
-                            value,
-                            txn_id,
-                        } => self.write(key_space, key, value, txn_id),
-                        StorageEffect::BatchWrite { writes, txn_id } => {
-                            self.batch_write(writes, txn_id)
-                        }
-                        StorageEffect::CommitTransaction { txn_id } => {
-                            self.commit_transaction(txn_id)
-                        }
-                        StorageEffect::Delete {
-                            key_space,
-                            key,
-                            txn_id,
-                        } => self.delete(key_space, key, txn_id),
-                        StorageEffect::BatchDelete { deletes, txn_id } => {
-                            self.batch_delete(deletes, txn_id)
-                        }
-                        StorageEffect::Iter {
-                            key_space,
-                            prefix,
-                            start_after,
-                            limit,
-                            txn_id,
-                        } => self.iterate(key_space, prefix, start_after, limit, txn_id),
+                    let queue_wait = enqueued_at.elapsed().saturating_sub(service_elapsed);
+                    let event = match outcome {
+                        Ok(event) => event,
+                        Err(error) => StorageEvent::Error { error },
                     };
-                    if response_tx.is_disconnected() {
-                        let abandoned_txn_id = if starts_transaction {
-                            match &event {
-                                StorageEvent::TransactionStarted { txn_id } => Some(*txn_id),
-                                _ => None,
-                            }
-                        } else if completes_transaction {
-                            None
-                        } else {
-                            active_txn_id
-                        };
-
-                        if let Some(txn_id) = abandoned_txn_id {
-                            self.cleanup_abandoned_transaction(
-                                txn_id,
-                                operation,
-                                "abandoned_after_processing",
-                            );
-                        }
-                        warn!(
-                            event = "storage.response.abandoned",
-                            operation,
-                            result = storage_event_kind(&event),
-                            "Dropping storage response for abandoned request"
-                        );
-                    } else {
+                    let result = storage_event_kind(&event);
+                    span.record("queue_wait_ms", duration_ms(queue_wait));
+                    span.record("service_ms", duration_ms(service_elapsed));
+                    span.record("result", result);
+                    span.record("path", "group_commit");
+                    slow_queue.observe(
+                        storage_effect_kind(&effect),
+                        storage_effect_key_space(&effect),
+                        queue_wait,
+                        service_elapsed,
+                        result,
+                    );
+                    if !response_tx.is_disconnected() {
                         response_tx.send(event);
                     }
                 }
-                Err(_) => {
-                    tracing::warn!(
-                        "Storage receiver channel closed, shutting down storage thread."
-                    );
-                    break;
+            }
+            Err(_) => {
+                // Conflict with a held transaction: retry each member alone so
+                // only genuinely conflicting writes fail.
+                for (item, _) in prepared {
+                    self.process_single(item, slow_queue);
                 }
             }
+        }
+    }
+
+    fn apply_group_member(
+        &self,
+        tx: &mut fjall::OptimisticWriteTx,
+        effect: &StorageEffect,
+    ) -> Result<StorageEvent, StorageError> {
+        match effect {
+            StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            } => {
+                let keyspace = self.store.resolve_keyspace(key_space)?;
+                tx.insert(keyspace, key.clone(), value.clone());
+                Ok(StorageEvent::WriteResult { key: key.clone() })
+            }
+            StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            } => {
+                let mut entries = Vec::with_capacity(writes.len());
+                for (key_space, key, value) in writes {
+                    let keyspace = self.store.resolve_keyspace(key_space)?;
+                    tx.insert(keyspace, key.clone(), value.clone());
+                    entries.push((key_space.clone(), key.clone()));
+                }
+                Ok(StorageEvent::BatchWriteResult { entries })
+            }
+            StorageEffect::Delete {
+                key_space,
+                key,
+                txn_id: None,
+            } => {
+                let keyspace = self.store.resolve_keyspace(key_space)?;
+                tx.remove(keyspace, key.clone());
+                Ok(StorageEvent::DeleteResult { key: key.clone() })
+            }
+            StorageEffect::BatchDelete {
+                deletes,
+                txn_id: None,
+            } => {
+                let mut entries = Vec::with_capacity(deletes.len());
+                for (key_space, key) in deletes {
+                    let keyspace = self.store.resolve_keyspace(key_space)?;
+                    tx.remove(keyspace, key.clone());
+                    entries.push((key_space.clone(), key.clone()));
+                }
+                Ok(StorageEvent::BatchDeleteResult { entries })
+            }
+            _ => Err(StorageError::InvalidEffect),
         }
     }
 
@@ -463,10 +722,13 @@ impl FjallStorage {
     }
 
     fn persist_journal(&self) -> Result<(), StorageError> {
+        let persist_started = Instant::now();
         self.store
             .db
-            .persist(PersistMode::SyncData)
-            .map_err(|error| StorageError::PersistError(error.to_string()))
+            .persist(PersistMode::Buffer)
+            .map_err(|error| StorageError::PersistError(error.to_string()))?;
+        Span::current().record("persist_ms", duration_ms(persist_started.elapsed()));
+        Ok(())
     }
 
     fn buffered_write_tx(&self) -> Result<fjall::OptimisticWriteTx, StorageError> {
@@ -478,10 +740,20 @@ impl FjallStorage {
     }
 
     fn commit_buffered_write_tx(&self, tx: fjall::OptimisticWriteTx) -> Result<(), StorageError> {
+        let commit_started = Instant::now();
         match tx.commit() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(StorageError::TransactionConflict),
-            Err(_) => Err(StorageError::WriteError),
+            Ok(Ok(())) => {
+                Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
+                Ok(())
+            }
+            Ok(Err(_)) => {
+                Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
+                Err(StorageError::TransactionConflict)
+            }
+            Err(_) => {
+                Span::current().record("commit_ms", duration_ms(commit_started.elapsed()));
+                Err(StorageError::WriteError)
+            }
         }
     }
 
@@ -494,30 +766,30 @@ impl FjallStorage {
     fn start_transaction(&mut self, read: bool) -> StorageEvent {
         let txn_id = Ulid::new();
 
-        if read {
+        let txn = if read {
             let txn = self.store.db.read_tx();
-            self.txns.insert(txn_id, Txn::Read(txn));
+            Txn::Read(txn)
         } else {
             match self.store.db.write_tx() {
                 Ok(txn) => {
                     let txn = txn.durability(Some(PersistMode::Buffer));
-                    self.txns.insert(txn_id, Txn::Write(Box::new(txn)));
+                    Txn::Write(Box::new(txn))
                 }
                 Err(_e) => {
                     return StorageEvent::Error {
                         error: StorageError::TransactionConflict,
                     };
                 }
-            };
-        }
+            }
+        };
+
+        self.txns.insert(txn_id, txn);
         StorageEvent::TransactionStarted { txn_id }
     }
 
     #[tracing::instrument(name = "storage.abort_transaction", level = "debug", skip(self), fields(txn_id = %txn_id))]
     fn abort_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
-        let txn = self.txns.remove(&txn_id);
-
-        match txn {
+        match self.txns.remove(&txn_id) {
             Some(Txn::Write(txn)) => {
                 txn.rollback();
                 StorageEvent::TransactionAborted { txn_id }
@@ -542,44 +814,31 @@ impl FjallStorage {
         };
 
         if let Some(txn_id) = txn_id {
-            if let Some(txn) = self.txns.get(&txn_id) {
-                match txn {
-                    Txn::Read(txn) => match txn.get(keyspace, &key) {
-                        Ok(value_opt) => StorageEvent::ReadResult {
-                            key,
-                            value: value_opt.map(|v| v.into()),
-                        },
-                        Err(_e) => StorageEvent::Error {
-                            error: StorageError::ReadError,
-                        },
+            match self.txns.get(&txn_id) {
+                Some(Txn::Read(txn)) => match txn.get(keyspace, &key) {
+                    Ok(value_opt) => StorageEvent::ReadResult {
+                        key,
+                        value: value_opt.map(|v| v.into()),
                     },
-                    Txn::Write(txn) => match txn.get(keyspace, &key) {
-                        Ok(value_opt) => StorageEvent::ReadResult {
-                            key,
-                            value: value_opt.map(|v| v.into()),
-                        },
-                        Err(_e) => StorageEvent::Error {
-                            error: StorageError::ReadError,
-                        },
+                    Err(_e) => StorageEvent::Error {
+                        error: StorageError::ReadError,
                     },
-                }
-            } else {
-                StorageEvent::Error {
+                },
+                Some(Txn::Write(txn)) => match txn.get(keyspace, &key) {
+                    Ok(value_opt) => StorageEvent::ReadResult {
+                        key,
+                        value: value_opt.map(|v| v.into()),
+                    },
+                    Err(_e) => StorageEvent::Error {
+                        error: StorageError::ReadError,
+                    },
+                },
+                None => StorageEvent::Error {
                     error: StorageError::TransactionNotFound,
-                }
+                },
             }
         } else {
-            // Non-transactional read
-            let snapshot = self.store.db.read_tx();
-            match snapshot.get(&keyspace, &key) {
-                Ok(value_opt) => StorageEvent::ReadResult {
-                    key,
-                    value: value_opt.map(|v| v.into()),
-                },
-                Err(_e) => StorageEvent::Error {
-                    error: StorageError::ReadError,
-                },
-            }
+            store_read(&self.store, keyspace, key)
         }
     }
 
@@ -611,15 +870,12 @@ impl FjallStorage {
                 }
             }
         } else {
-            let mut tx = match self.buffered_write_tx() {
-                Ok(tx) => tx,
-                Err(error) => return StorageEvent::Error { error },
-            };
-            tx.insert(keyspace, key.clone(), value);
-            if let Err(error) = self.commit_buffered_write_tx(tx) {
-                return StorageEvent::Error { error };
-            }
-            if let Err(error) = self.persist_journal() {
+            let result = self.buffered_write_tx().and_then(|mut tx| {
+                tx.insert(keyspace, key.clone(), value);
+                self.commit_buffered_write_tx(tx)?;
+                self.persist_journal()
+            });
+            if let Err(error) = result {
                 return StorageEvent::Error { error };
             }
             StorageEvent::WriteResult { key }
@@ -638,6 +894,14 @@ impl FjallStorage {
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
         let mut entries = Vec::with_capacity(writes.len());
+        let mut resolved = Vec::with_capacity(writes.len());
+        for (key_space, key, value) in writes {
+            let keyspace = match self.store.resolve_keyspace(&key_space) {
+                Ok(ks) => ks,
+                Err(error) => return StorageEvent::Error { error },
+            };
+            resolved.push((keyspace, key_space, key, value));
+        }
 
         if let Some(txn_id) = txn_id {
             let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) else {
@@ -646,24 +910,11 @@ impl FjallStorage {
                 };
             };
 
-            for (key_space, key, value) in writes {
-                let keyspace = match self.store.resolve_keyspace(&key_space) {
-                    Ok(ks) => ks,
-                    Err(error) => return StorageEvent::Error { error },
-                };
+            for (keyspace, key_space, key, value) in resolved {
                 txn.insert(keyspace, key.clone(), value);
                 entries.push((key_space, key));
             }
         } else {
-            let mut resolved = Vec::with_capacity(writes.len());
-            for (key_space, key, value) in writes {
-                let keyspace = match self.store.resolve_keyspace(&key_space) {
-                    Ok(ks) => ks,
-                    Err(error) => return StorageEvent::Error { error },
-                };
-                resolved.push((keyspace, key_space, key, value));
-            }
-
             let mut tx = match self.buffered_write_tx() {
                 Ok(tx) => tx,
                 Err(error) => return StorageEvent::Error { error },
@@ -672,10 +923,10 @@ impl FjallStorage {
                 tx.insert(keyspace, key.clone(), value);
                 entries.push((key_space, key));
             }
-            if let Err(error) = self.commit_buffered_write_tx(tx) {
-                return StorageEvent::Error { error };
-            }
-            if let Err(error) = self.persist_journal() {
+            if let Err(error) = self
+                .commit_buffered_write_tx(tx)
+                .and_then(|()| self.persist_journal())
+            {
                 return StorageEvent::Error { error };
             }
         }
@@ -760,6 +1011,14 @@ impl FjallStorage {
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
         let mut entries = Vec::with_capacity(deletes.len());
+        let mut resolved = Vec::with_capacity(deletes.len());
+        for (key_space, key) in deletes {
+            let keyspace = match self.store.resolve_keyspace(&key_space) {
+                Ok(ks) => ks,
+                Err(error) => return StorageEvent::Error { error },
+            };
+            resolved.push((keyspace, key_space, key));
+        }
 
         if let Some(txn_id) = txn_id {
             let Some(Txn::Write(txn)) = self.txns.get_mut(&txn_id) else {
@@ -768,24 +1027,11 @@ impl FjallStorage {
                 };
             };
 
-            for (key_space, key) in deletes {
-                let keyspace = match self.store.resolve_keyspace(&key_space) {
-                    Ok(ks) => ks,
-                    Err(error) => return StorageEvent::Error { error },
-                };
+            for (keyspace, key_space, key) in resolved {
                 txn.remove(keyspace, key.clone());
                 entries.push((key_space, key));
             }
         } else {
-            let mut resolved = Vec::with_capacity(deletes.len());
-            for (key_space, key) in deletes {
-                let keyspace = match self.store.resolve_keyspace(&key_space) {
-                    Ok(ks) => ks,
-                    Err(error) => return StorageEvent::Error { error },
-                };
-                resolved.push((keyspace, key_space, key));
-            }
-
             let mut tx = match self.buffered_write_tx() {
                 Ok(tx) => tx,
                 Err(error) => return StorageEvent::Error { error },
@@ -794,10 +1040,10 @@ impl FjallStorage {
                 tx.remove(keyspace, key.clone());
                 entries.push((key_space, key));
             }
-            if let Err(error) = self.commit_buffered_write_tx(tx) {
-                return StorageEvent::Error { error };
-            }
-            if let Err(error) = self.persist_journal() {
+            if let Err(error) = self
+                .commit_buffered_write_tx(tx)
+                .and_then(|()| self.persist_journal())
+            {
                 return StorageEvent::Error { error };
             }
         }
@@ -850,14 +1096,7 @@ impl FjallStorage {
                 }
             }
         } else {
-            let snapshot = self.store.db.read_tx();
-            iterate_page(
-                &snapshot,
-                &keyspace,
-                prefix.as_ref(),
-                start_after.as_ref(),
-                limit,
-            )
+            return store_iterate(&self.store, keyspace, prefix, start_after, limit);
         };
 
         match result {
@@ -866,6 +1105,185 @@ impl FjallStorage {
                 next_start_after,
             },
             Err(error) => StorageEvent::Error { error },
+        }
+    }
+}
+
+fn store_read(store: &Store, keyspace: OptimisticTxKeyspace, key: ByteView) -> StorageEvent {
+    let snapshot = store.db.read_tx();
+    match snapshot.get(&keyspace, &key) {
+        Ok(value_opt) => StorageEvent::ReadResult {
+            key,
+            value: value_opt.map(|v| v.into()),
+        },
+        Err(_e) => StorageEvent::Error {
+            error: StorageError::ReadError,
+        },
+    }
+}
+
+fn store_iterate(
+    store: &Store,
+    keyspace: OptimisticTxKeyspace,
+    prefix: Option<ByteView>,
+    start_after: Option<ByteView>,
+    limit: usize,
+) -> StorageEvent {
+    let snapshot = store.db.read_tx();
+    match iterate_page(
+        &snapshot,
+        &keyspace,
+        prefix.as_ref(),
+        start_after.as_ref(),
+        limit,
+    ) {
+        Ok((values, next_start_after)) => StorageEvent::IterResult {
+            values,
+            next_start_after,
+        },
+        Err(error) => StorageEvent::Error { error },
+    }
+}
+
+fn is_groupable_write(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::Write { txn_id: None, .. }
+            | StorageEffect::BatchWrite { txn_id: None, .. }
+            | StorageEffect::Delete { txn_id: None, .. }
+            | StorageEffect::BatchDelete { txn_id: None, .. }
+    )
+}
+
+fn is_poolable_read(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::Read { txn_id: None, .. } | StorageEffect::Iter { txn_id: None, .. }
+    )
+}
+
+fn spawn_read_pool(store: Store, threads: usize) -> Vec<EffectSender> {
+    let mut senders = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let (sender, receiver) = mpsc::bounded_blocking(STORAGE_EFFECT_QUEUE_CAPACITY);
+        let store = store.clone();
+        thread::spawn(move || read_pool_loop(store, receiver));
+        senders.push(sender);
+    }
+    senders
+}
+
+fn read_pool_loop(store: Store, receiver: EffectReceiver) {
+    while let Ok((effect, response_tx, span, enqueued_at)) = receiver.recv() {
+        let _guard = span.enter();
+        if response_tx.is_disconnected() {
+            continue;
+        }
+        let operation = storage_effect_kind(&effect);
+        let key_space = storage_effect_key_space(&effect).map(str::to_string);
+        let queue_wait = enqueued_at.elapsed();
+        let service_started = Instant::now();
+        let event = match effect {
+            StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            } => match store.resolve_keyspace(&key_space) {
+                Ok(keyspace) => store_read(&store, keyspace, key),
+                Err(error) => StorageEvent::Error { error },
+            },
+            StorageEffect::Iter {
+                key_space,
+                prefix,
+                start_after,
+                limit,
+                txn_id: None,
+            } => match store.resolve_keyspace(&key_space) {
+                Ok(keyspace) => {
+                    if limit == 0 {
+                        StorageEvent::IterResult {
+                            values: Vec::new(),
+                            next_start_after: None,
+                        }
+                    } else {
+                        store_iterate(&store, keyspace, prefix, start_after, limit)
+                    }
+                }
+                Err(error) => StorageEvent::Error { error },
+            },
+            _ => StorageEvent::Error {
+                error: StorageError::InvalidEffect,
+            },
+        };
+        let service_elapsed = service_started.elapsed();
+        span.record("queue_wait_ms", duration_ms(queue_wait));
+        span.record("service_ms", duration_ms(service_elapsed));
+        span.record("result", storage_event_kind(&event));
+        span.record("path", "read_pool");
+        record_storage_call(operation, key_space.as_deref(), queue_wait, service_elapsed);
+        if service_elapsed >= SLOW_STORAGE_EFFECT_THRESHOLD {
+            warn!(
+                event = "storage.effect.slow",
+                operation = storage_event_kind(&event),
+                service_ms = duration_ms(service_elapsed),
+                queue_wait_ms = duration_ms(queue_wait),
+                "Slow storage read"
+            );
+        }
+        if !response_tx.is_disconnected() {
+            response_tx.send(event);
+        }
+    }
+}
+
+#[derive(Default)]
+struct SlowQueueAggregator {
+    queued_count: u64,
+    max_queue_wait: Duration,
+    last_flush: Option<Instant>,
+}
+
+impl SlowQueueAggregator {
+    fn observe(
+        &mut self,
+        operation: &'static str,
+        key_space: Option<&str>,
+        queue_wait: Duration,
+        service_elapsed: Duration,
+        result: &'static str,
+    ) {
+        record_storage_call(operation, key_space, queue_wait, service_elapsed);
+        if service_elapsed >= SLOW_STORAGE_EFFECT_THRESHOLD {
+            warn!(
+                event = "storage.effect.slow",
+                operation,
+                result,
+                queue_wait_ms = duration_ms(queue_wait),
+                service_ms = duration_ms(service_elapsed),
+                threshold_ms = duration_ms(SLOW_STORAGE_EFFECT_THRESHOLD),
+                "Slow storage effect"
+            );
+        }
+        if queue_wait < SLOW_STORAGE_EFFECT_THRESHOLD {
+            return;
+        }
+        self.queued_count += 1;
+        self.max_queue_wait = self.max_queue_wait.max(queue_wait);
+        let now = Instant::now();
+        let due = self
+            .last_flush
+            .is_none_or(|last| now.duration_since(last) >= SLOW_QUEUE_LOG_INTERVAL);
+        if due {
+            warn!(
+                event = "storage.queue.backlog",
+                slow_queued_effects = self.queued_count,
+                max_queue_wait_ms = duration_ms(self.max_queue_wait),
+                threshold_ms = duration_ms(SLOW_STORAGE_EFFECT_THRESHOLD),
+                "Storage effects waited longer than threshold in queue"
+            );
+            self.queued_count = 0;
+            self.max_queue_wait = Duration::ZERO;
+            self.last_flush = Some(now);
         }
     }
 }
@@ -883,6 +1301,14 @@ fn storage_effect_span(effect: &StorageEffect) -> Span {
         batch_len = field::Empty,
         limit = field::Empty,
         read = field::Empty,
+        queue_wait_ms = field::Empty,
+        service_ms = field::Empty,
+        total_elapsed_ms = field::Empty,
+        path = field::Empty,
+        persist_mode = field::Empty,
+        commit_ms = field::Empty,
+        persist_ms = field::Empty,
+        result = field::Empty,
     );
     record_storage_effect_fields(&span, effect);
     span
@@ -1003,6 +1429,10 @@ fn storage_event_kind(event: &StorageEvent) -> &'static str {
     }
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 fn iterate_page<R: Readable>(
     reader: &R,
     keyspace: &OptimisticTxKeyspace,
@@ -1085,6 +1515,196 @@ mod tests {
     use tempfile::tempdir;
     use ulid::Ulid;
 
+    fn assert_write_result(event: Event, expected_key: &[u8]) {
+        match event {
+            Event::Storage(StorageEvent::WriteResult { key }) => {
+                assert_eq!(key.as_ref(), expected_key);
+            }
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    fn assert_batch_write_result(event: Event, expected: &[(&str, &[u8])]) {
+        match event {
+            Event::Storage(StorageEvent::BatchWriteResult { entries }) => {
+                let actual = entries
+                    .iter()
+                    .map(|(key_space, key)| (key_space.as_str(), key.as_ref()))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    fn assert_read_result(event: Event, expected_key: &[u8], expected_value: &[u8]) {
+        match event {
+            Event::Storage(StorageEvent::ReadResult {
+                key,
+                value: Some(value),
+            }) => {
+                assert_eq!(key.as_ref(), expected_key);
+                assert_eq!(value.as_ref(), expected_value);
+            }
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    async fn start_write_transaction(handle: &StorageHandle) -> Ulid {
+        match handle
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_transactional_raw_write_round_trips() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        assert_write_result(
+            handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: "raw_write".to_string(),
+                    key: b"key".to_vec().into(),
+                    value: b"value".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"key",
+        );
+
+        assert_read_result(
+            handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: "raw_write".to_string(),
+                    key: b"key".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"key",
+            b"value",
+        );
+    }
+
+    #[tokio::test]
+    async fn non_transactional_raw_batch_write_round_trips_in_order() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        assert_batch_write_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes: vec![
+                        (
+                            "raw_batch".to_string(),
+                            b"a".to_vec().into(),
+                            b"1".to_vec().into(),
+                        ),
+                        (
+                            "raw_batch".to_string(),
+                            b"b".to_vec().into(),
+                            b"2".to_vec().into(),
+                        ),
+                    ],
+                    txn_id: None,
+                })
+                .await,
+            &[("raw_batch", b"a"), ("raw_batch", b"b")],
+        );
+
+        assert_read_result(
+            handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: "raw_batch".to_string(),
+                    key: b"a".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"a",
+            b"1",
+        );
+        assert_read_result(
+            handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: "raw_batch".to_string(),
+                    key: b"b".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"b",
+            b"2",
+        );
+    }
+
+    #[tokio::test]
+    async fn non_transactional_write_works_while_write_transaction_is_active() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        assert_write_result(
+            handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: "raw_conflict".to_string(),
+                    key: b"key".to_vec().into(),
+                    value: b"before".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"key",
+        );
+
+        let txn_id = start_write_transaction(&handle).await;
+        assert_write_result(
+            handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: "raw_conflict".to_string(),
+                    key: b"txn-key".to_vec().into(),
+                    value: b"txn".to_vec().into(),
+                    txn_id: Some(txn_id),
+                })
+                .await,
+            b"txn-key",
+        );
+
+        assert_write_result(
+            handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: "raw_conflict".to_string(),
+                    key: b"key".to_vec().into(),
+                    value: b"after".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"key",
+        );
+
+        match handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }) => {
+                assert_eq!(committed, txn_id);
+            }
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+
+        assert_read_result(
+            handle
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: "raw_conflict".to_string(),
+                    key: b"txn-key".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"txn-key",
+            b"txn",
+        );
+    }
+
     #[tokio::test]
     async fn send_storage_effect_counts_requests_and_errors() {
         let dir = tempdir().unwrap();
@@ -1116,13 +1736,14 @@ mod tests {
     async fn send_effect_counts_conflicts_separately_from_errors() {
         let (handle, receiver) = StorageHandle::new();
         thread::spawn(move || {
-            let (effect, response_tx, _span) = receiver.recv().expect("first effect should arrive");
+            let (effect, response_tx, _span, _enqueued_at) =
+                receiver.recv().expect("first effect should arrive");
             assert!(matches!(effect, StorageEffect::CommitTransaction { .. }));
             response_tx.send(StorageEvent::Error {
                 error: StorageError::TransactionNotFound,
             });
 
-            let (effect, response_tx, _span) =
+            let (effect, response_tx, _span, _enqueued_at) =
                 receiver.recv().expect("second effect should arrive");
             assert!(matches!(
                 effect,

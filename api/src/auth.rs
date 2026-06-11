@@ -427,7 +427,8 @@ pub async fn auth_middleware(
     // Extract and validate token, get Option<AuthContext>
     // We clone headers to avoid borrowing issues with the async function
     let headers = request.headers().clone();
-    let auth_ctx: Option<AuthContext> = extract_auth_context(&state, &headers).await;
+    let auth_ctx: Option<AuthContext> =
+        aruna_core::telemetry::time_stage("auth", extract_auth_context(&state, &headers)).await;
     record_auth_context(auth_ctx.as_ref());
 
     // Always insert (Some or None) - handlers decide if auth is required
@@ -462,13 +463,16 @@ pub(crate) async fn ensure_permission(
     path: String,
     required_permission: Permission,
 ) -> ServerResult<()> {
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth.clone(),
-            path,
-            required_permission,
-        }),
-        &state.get_ctx(),
+    let allowed = aruna_core::telemetry::time_stage(
+        "permission",
+        drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: auth.clone(),
+                path,
+                required_permission,
+            }),
+            &state.get_ctx(),
+        ),
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
