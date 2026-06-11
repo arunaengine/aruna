@@ -2,6 +2,7 @@ use crate::auth::{parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::effects::Effect;
+use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{
@@ -31,11 +32,13 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use chrono::{TimeZone, Utc};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 use url::form_urlencoded::Serializer;
@@ -243,6 +246,11 @@ pub struct MetadataSearchHitResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataSearchResponse {
     pub hits: Vec<MetadataSearchHitResponse>,
+    /// Number of node partitions this search was executed against.
+    pub nodes_queried: usize,
+    /// Number of node partitions that failed or timed out; a non-zero value
+    /// means the result is partial.
+    pub nodes_failed: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -252,6 +260,33 @@ struct MetadataIncludeFlags {
 
 const DEFAULT_LIST_METADATA_LIMIT: usize = 50;
 const MAX_LIST_METADATA_LIMIT: usize = 1_000;
+const METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT: usize = 8;
+const METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT: Duration = Duration::from_secs(10);
+const METADATA_REALM_NODES_CACHE_TTL: Duration = Duration::from_secs(5);
+const METADATA_PROJECTION_DEBOUNCE_AFTER: Duration = Duration::from_millis(100);
+
+static METADATA_REALM_NODES_CACHE: OnceLock<
+    Mutex<HashMap<RealmNodesCacheKey, RealmNodesCacheEntry>>,
+> = OnceLock::new();
+static METADATA_PROJECTION_BATCHES: OnceLock<Mutex<HashMap<[u8; 32], MetadataProjectionBatch>>> =
+    OnceLock::new();
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RealmNodesCacheKey {
+    realm_id: [u8; 32],
+    local_node_id: [u8; 32],
+}
+
+struct RealmNodesCacheEntry {
+    nodes: Vec<aruna_core::NodeId>,
+    expires_at: Instant,
+}
+
+struct MetadataProjectionBatch {
+    ctx: Weak<DriverContext>,
+    pending: Vec<(Ulid, Ulid)>,
+    scheduled: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SparqlQueryRequest {
@@ -260,7 +295,9 @@ pub struct SparqlQueryRequest {
     /// Query execution scope. Omit to use `distributed`.
     ///
     /// `local` runs only against metadata indexed on the current node.
-    /// `distributed` fans out to all known realm nodes and merges the results.
+    /// `distributed` fans out to all known realm nodes for all-metadata queries,
+    /// or to the document's registry holder nodes for document-scoped queries,
+    /// and merges the results.
     /// Distributed mode is best-effort and may return partial results if realm
     /// node discovery or remote requests fail.
     #[serde(default)]
@@ -279,8 +316,19 @@ pub enum MetadataQueryMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataQueryResponse {
+    #[serde(flatten)]
+    pub result: MetadataQueryResult,
+    /// Number of node partitions this query was executed against.
+    pub nodes_queried: usize,
+    /// Number of node partitions that failed or timed out; a non-zero value
+    /// means the result is partial.
+    pub nodes_failed: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", content = "value")]
-pub enum MetadataQueryResponse {
+pub enum MetadataQueryResult {
     Solutions(Vec<HashMap<String, String>>),
     Boolean(bool),
 }
@@ -432,23 +480,31 @@ pub async fn create_metadata_document(
     }
     ensure_metadata_write_scope(&state, &auth, group_id).await?;
 
-    let result = drive(
-        CreateMetadataDocumentOperation::new(CreateMetadataDocumentConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
+    let ctx = state.get_ctx();
+    let created = drive(
+        CreateMetadataDocumentOperation::new_for_generated_document_id(
+            CreateMetadataDocumentConfig {
+                actor: Actor {
+                    node_id: state.get_node_id(),
+                    user_id: auth.user_id,
+                    realm_id: state.get_realm_id(),
+                },
+                group_id,
+                document_id: Ulid::new(),
+                document_path: path,
+                public,
+                payload,
             },
-            group_id,
-            document_id: Ulid::new(),
-            document_path: path,
-            public,
-            payload,
-        }),
-        &state.get_ctx(),
+        ),
+        ctx.as_ref(),
     )
     .await
     .map_err(map_create_metadata_error)?;
+    let result = created.record;
+    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
+        metadata_handle.cache_accepted_create(result.clone());
+    }
+    wake_metadata_create_projection(ctx, result.document_id, created.event_id);
 
     Ok((
         StatusCode::CREATED,
@@ -988,7 +1044,7 @@ pub async fn add_metadata_contextual_entity(
     params(("document_id" = String, Path, description = "Metadata document id")),
     request_body(
         content = SparqlQueryRequest,
-        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries all known realm nodes and merges the results. Distributed mode is best-effort and may return partial results if realm node discovery or remote requests fail. Omitting `mode` defaults to `distributed`.",
+        description = "Run a SPARQL `SELECT` or `ASK` query against one metadata document. `mode=local` only queries the current node, while `mode=distributed` queries the document's registry holder nodes and merges the results. Distributed mode is best-effort and may return partial results if holder requests fail. Omitting `mode` defaults to `distributed`.",
         examples(
             (
                 "DocumentAsk" = (
@@ -1027,15 +1083,19 @@ pub async fn query_metadata_document(
     ensure_supported_query_form(&request.query)?;
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_readable(&state, auth.as_ref(), &record).await?;
-    let results = run_query_distributed(
+    let (results, fanout) = run_query_distributed(
         &state,
         auth,
         Some(vec![record.graph_iri.clone()]),
         request.query,
         request.mode,
+        Some(document_query_target_nodes(&record, state.get_node_id())),
     )
     .await?;
-    Ok((StatusCode::OK, Json(map_query_results(results)?)))
+    let serialize_started = Instant::now();
+    let response = map_query_results(results, fanout)?;
+    aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -1077,8 +1137,12 @@ pub async fn query_all_metadata(
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     ensure_supported_query_form(&request.query)?;
-    let results = run_query_distributed(&state, auth, None, request.query, request.mode).await?;
-    Ok((StatusCode::OK, Json(map_query_results(results)?)))
+    let (results, fanout) =
+        run_query_distributed(&state, auth, None, request.query, request.mode, None).await?;
+    let serialize_started = Instant::now();
+    let response = map_query_results(results, fanout)?;
+    aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
+    Ok((StatusCode::OK, Json(response)))
 }
 
 #[utoipa::path(
@@ -1105,11 +1169,14 @@ pub async fn search_metadata(
         return Err(ServerError::BadRequest);
     }
     let limit = params.limit.unwrap_or(25).clamp(1, 250);
-    let hits = run_search_distributed(&state, auth, None, params.q, limit, params.mode).await?;
+    let (hits, fanout) =
+        run_search_distributed(&state, auth, None, params.q, limit, params.mode).await?;
     Ok((
         StatusCode::OK,
         Json(MetadataSearchResponse {
             hits: hits.into_iter().map(map_search_hit).collect(),
+            nodes_queried: fanout.nodes_queried,
+            nodes_failed: fanout.nodes_failed,
         }),
     ))
 }
@@ -1261,6 +1328,16 @@ fn map_update_metadata_error(error: UpdateMetadataDocumentError) -> ServerError 
 fn map_metadata_error(error: MetadataError) -> ServerError {
     match error {
         MetadataError::InvalidInput(_) => ServerError::BadRequest,
+        MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
+        other => ServerError::InternalError(other.to_string()),
+    }
+}
+
+// Pending graph materialization surfaces as GraphNotFound on read paths; the
+// document is known to exist, so signal retry instead of failure.
+fn map_metadata_event_error(error: MetadataError) -> ServerError {
+    match error {
+        MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
         other => ServerError::InternalError(other.to_string()),
     }
 }
@@ -1323,13 +1400,16 @@ async fn can_read_record(
         return Ok(false);
     }
 
-    match drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth,
-            path: record.permission_path.clone(),
-            required_permission: Permission::READ,
-        }),
-        &state.get_ctx(),
+    match aruna_core::telemetry::time_stage(
+        "permission",
+        drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: auth,
+                path: record.permission_path.clone(),
+                required_permission: Permission::READ,
+            }),
+            &state.get_ctx(),
+        ),
     )
     .await
     {
@@ -1347,16 +1427,25 @@ async fn ensure_permission(
     if auth.realm_id != state.get_realm_id() {
         return Err(ServerError::Forbidden);
     }
-    let allowed = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth,
-            path,
-            required_permission,
-        }),
-        &state.get_ctx(),
+    let allowed = aruna_core::telemetry::time_stage(
+        "permission",
+        drive(
+            CheckPermissionsOperation::new(CheckPermissionsConfig {
+                auth_context: auth,
+                path,
+                required_permission,
+            }),
+            &state.get_ctx(),
+        ),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| match err {
+        AuthorizationError::InvalidRealmId
+        | AuthorizationError::InvalidGroupId
+        | AuthorizationError::GroupNotFound
+        | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
+        _ => ServerError::InternalError(err.to_string()),
+    })?;
     if allowed {
         Ok(())
     } else {
@@ -1400,9 +1489,7 @@ async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerRe
         .await
     {
         Event::Metadata(MetadataEvent::RoCrateExportResult { jsonld, .. }) => parse_jsonld(jsonld),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
+        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(map_metadata_event_error(error)),
         other => Err(ServerError::InternalError(format!(
             "unexpected metadata export event: {other:?}"
         ))),
@@ -1425,9 +1512,7 @@ async fn export_rocrate_summary_jsonld(
         .await
     {
         Event::Metadata(MetadataEvent::RoCrateSummaryResult { jsonld, .. }) => parse_jsonld(jsonld),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
+        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(map_metadata_event_error(error)),
         other => Err(ServerError::InternalError(format!(
             "unexpected metadata summary event: {other:?}"
         ))),
@@ -1458,9 +1543,7 @@ async fn export_rocrate_page(
         .await
     {
         Event::Metadata(MetadataEvent::RoCratePageResult { page, .. }) => Ok(page),
-        Event::Metadata(MetadataEvent::Error { error, .. }) => {
-            Err(ServerError::InternalError(error.to_string()))
-        }
+        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(map_metadata_event_error(error)),
         other => Err(ServerError::InternalError(format!(
             "unexpected metadata page event: {other:?}"
         ))),
@@ -1565,16 +1648,24 @@ fn ensure_supported_query_form(query: &str) -> ServerResult<()> {
     }
 }
 
-fn map_query_results(results: MetadataQueryResults) -> ServerResult<MetadataQueryResponse> {
-    match results {
-        MetadataQueryResults::Solutions(rows) => Ok(MetadataQueryResponse::Solutions(
+fn map_query_results(
+    results: MetadataQueryResults,
+    fanout: DistributedFanout,
+) -> ServerResult<MetadataQueryResponse> {
+    let result = match results {
+        MetadataQueryResults::Solutions(rows) => MetadataQueryResult::Solutions(
             rows.into_iter()
                 .map(|row| row.into_iter().collect::<HashMap<_, _>>())
                 .collect(),
-        )),
-        MetadataQueryResults::Boolean(value) => Ok(MetadataQueryResponse::Boolean(value)),
-        MetadataQueryResults::Graph(_) => Err(ServerError::BadRequest),
-    }
+        ),
+        MetadataQueryResults::Boolean(value) => MetadataQueryResult::Boolean(value),
+        MetadataQueryResults::Graph(_) => return Err(ServerError::BadRequest),
+    };
+    Ok(MetadataQueryResponse {
+        result,
+        nodes_queried: fanout.nodes_queried,
+        nodes_failed: fanout.nodes_failed,
+    })
 }
 
 fn api_duration_ms(duration: std::time::Duration) -> u64 {
@@ -1594,6 +1685,27 @@ fn metadata_query_result_kind(results: &MetadataQueryResults) -> &'static str {
 }
 
 async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
+    let cache_key = RealmNodesCacheKey {
+        realm_id: *state.get_realm_id().as_bytes(),
+        local_node_id: *state.get_node_id().as_bytes(),
+    };
+    let cache = METADATA_REALM_NODES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    if let Some(nodes) = {
+        let mut cache = cache.lock().unwrap_or_else(|lock| lock.into_inner());
+        match cache.get(&cache_key) {
+            Some(entry) if entry.expires_at > now => Some(entry.nodes.clone()),
+            Some(_) => {
+                cache.remove(&cache_key);
+                None
+            }
+            None => None,
+        }
+    } {
+        return Ok(nodes);
+    }
+
+    let mut discovery_succeeded = true;
     let nodes = match drive(
         GetRealmNodesOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -1602,6 +1714,7 @@ async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::N
     {
         Ok(nodes) => nodes,
         Err(error) => {
+            discovery_succeeded = false;
             warn!(
                 error = %error,
                 "realm node discovery failed, using best-effort local-only metadata results"
@@ -1613,13 +1726,49 @@ async fn load_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::N
     if !nodes.contains(&state.get_node_id()) {
         nodes.push(state.get_node_id());
     }
+    if discovery_succeeded {
+        let mut cache = cache.lock().unwrap_or_else(|lock| lock.into_inner());
+        cache.insert(
+            cache_key,
+            RealmNodesCacheEntry {
+                nodes: nodes.clone(),
+                expires_at: Instant::now() + METADATA_REALM_NODES_CACHE_TTL,
+            },
+        );
+    }
     Ok(nodes)
+}
+
+fn document_query_target_nodes(
+    record: &MetadataRegistryRecord,
+    local_node_id: aruna_core::NodeId,
+) -> Vec<aruna_core::NodeId> {
+    let nodes = deduplicate_node_ids(record.holder_node_ids.clone());
+    if nodes.is_empty() {
+        vec![local_node_id]
+    } else {
+        nodes
+    }
+}
+
+fn deduplicate_node_ids(nodes: Vec<aruna_core::NodeId>) -> Vec<aruna_core::NodeId> {
+    let mut seen = HashSet::with_capacity(nodes.len());
+    nodes
+        .into_iter()
+        .filter(|node_id| seen.insert(*node_id))
+        .collect()
+}
+
+fn short_node_id(node_id: aruna_core::NodeId) -> String {
+    let mut id = node_id.to_string();
+    id.truncate(8);
+    id
 }
 
 #[tracing::instrument(
     name = "metadata.api.query_distributed",
     level = "debug",
-    skip(state, auth, query),
+    skip(state, auth, query, target_nodes),
     fields(
         mode = ?mode,
         query_len = query.len() as u64,
@@ -1636,7 +1785,8 @@ async fn run_query_distributed(
     graph_iris: Option<Vec<String>>,
     query: String,
     mode: Option<MetadataQueryMode>,
-) -> ServerResult<MetadataQueryResults> {
+    target_nodes: Option<Vec<aruna_core::NodeId>>,
+) -> ServerResult<(MetadataQueryResults, DistributedFanout)> {
     let span = Span::current();
     let total_started = Instant::now();
     ensure_supported_query_mode(&mode)?;
@@ -1646,8 +1796,13 @@ async fn run_query_distributed(
         .clone()
         .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
     let query_form = query_form(&query).ok_or(ServerError::BadRequest)?;
+    let select_limit = match query_form {
+        QueryForm::Select => query_select_limit(&query),
+        QueryForm::Ask => None,
+    };
 
     let mut parts = Vec::new();
+    let mut fanout = DistributedFanout::default();
     match mode.unwrap_or(MetadataQueryMode::Distributed) {
         MetadataQueryMode::Local => {
             let node_span = debug_span!(
@@ -1663,6 +1818,7 @@ async fn run_query_distributed(
                 .instrument(node_span.clone())
                 .await;
             record_api_elapsed(&node_span, "elapsed_ms", node_started);
+            fanout.nodes_queried = 1;
             match result {
                 Ok(result) => {
                     node_span.record("result", metadata_query_result_kind(&result));
@@ -1670,49 +1826,101 @@ async fn run_query_distributed(
                 }
                 Err(error) => {
                     node_span.record("result", "error");
-                    return Err(ServerError::InternalError(error.to_string()));
+                    return Err(map_metadata_event_error(error));
                 }
             }
         }
         MetadataQueryMode::Distributed => {
-            let discovery_started = Instant::now();
-            let nodes = load_realm_nodes(state).await?;
-            record_api_elapsed(&span, "discovery_ms", discovery_started);
+            let nodes = match target_nodes {
+                Some(nodes) => {
+                    span.record("discovery_ms", 0u64);
+                    deduplicate_node_ids(nodes)
+                }
+                None => {
+                    let discovery_started = Instant::now();
+                    let nodes =
+                        aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state))
+                            .await?;
+                    record_api_elapsed(&span, "discovery_ms", discovery_started);
+                    nodes
+                }
+            };
             span.record("node_count", nodes.len() as u64);
-            for node_id in nodes {
-                let local = node_id == state.get_node_id();
-                let node_span = debug_span!(
-                    "metadata.api.query_node",
-                    peer = ?node_id,
-                    local,
-                    elapsed_ms = field::Empty,
-                    result = field::Empty,
-                );
-                let node_started = Instant::now();
-                let result = if local {
-                    handle
-                        .query_authorized_local(auth.clone(), graph_iris.clone(), query.clone())
-                        .instrument(node_span.clone())
-                        .await
-                } else {
-                    handle
-                        .request_remote_query_graphs(
-                            node_id,
-                            auth.clone(),
-                            graph_iris.clone(),
-                            query.clone(),
-                        )
-                        .instrument(node_span.clone())
-                        .await
+            fanout.nodes_queried = nodes.len();
+            let fanout_started = Instant::now();
+            let local_node_id = state.get_node_id();
+            let mut node_iter = nodes.into_iter().enumerate();
+            let mut pending = FuturesUnordered::new();
+            let mut node_parts = Vec::new();
+
+            loop {
+                while pending.len() < METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT {
+                    let Some((node_index, node_id)) = node_iter.next() else {
+                        break;
+                    };
+                    let handle = handle.clone();
+                    let auth = auth.clone();
+                    let graph_iris = graph_iris.clone();
+                    let query = query.clone();
+                    let local = node_id == local_node_id;
+                    pending.push(async move {
+                        let node_span = debug_span!(
+                            "metadata.api.query_node",
+                            peer = ?node_id,
+                            local,
+                            elapsed_ms = field::Empty,
+                            result = field::Empty,
+                        );
+                        let node_started = Instant::now();
+                        // The coordinator's own partition runs in-process like
+                        // mode=local; only remote partitions go over the wire
+                        // and carry the per-node timeout.
+                        let result = if local {
+                            handle
+                                .query_authorized_local(auth, graph_iris, query)
+                                .instrument(node_span.clone())
+                                .await
+                        } else {
+                            match tokio::time::timeout(
+                                METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+                                handle
+                                    .request_remote_query_graphs(node_id, auth, graph_iris, query)
+                                    .instrument(node_span.clone()),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(MetadataError::Backend(format!(
+                                    "distributed metadata query node timed out after {}ms",
+                                    METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT.as_millis()
+                                ))),
+                            }
+                        };
+                        record_api_elapsed(&node_span, "elapsed_ms", node_started);
+                        aruna_core::telemetry::record_stage_detail(
+                            "fanout_node",
+                            || short_node_id(node_id),
+                            node_started.elapsed(),
+                        );
+                        match &result {
+                            Ok(result) => {
+                                node_span.record("result", metadata_query_result_kind(result));
+                            }
+                            Err(_) => {
+                                node_span.record("result", "error");
+                            }
+                        }
+                        (node_index, node_id, result)
+                    });
+                }
+
+                let Some((node_index, node_id, result)) = pending.next().await else {
+                    break;
                 };
-                record_api_elapsed(&node_span, "elapsed_ms", node_started);
                 match result {
-                    Ok(result) => {
-                        node_span.record("result", metadata_query_result_kind(&result));
-                        parts.push(result);
-                    }
+                    Ok(result) => node_parts.push((node_index, result)),
                     Err(error) => {
-                        node_span.record("result", "error");
+                        fanout.nodes_failed += 1;
                         warn!(
                             node_id = ?node_id,
                             error = %error,
@@ -1721,10 +1929,14 @@ async fn run_query_distributed(
                     }
                 }
             }
+
+            node_parts.sort_by_key(|(node_index, _)| *node_index);
+            parts.extend(node_parts.into_iter().map(|(_, result)| result));
+            aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
         }
     }
 
-    let result = aggregate_query_results(parts, query_form);
+    let result = aggregate_query_results(parts, query_form, select_limit);
     record_api_elapsed(&span, "elapsed_ms", total_started);
     match &result {
         Ok(results) => {
@@ -1734,7 +1946,7 @@ async fn run_query_distributed(
             span.record("result", "error");
         }
     }
-    result
+    result.map(|results| (results, fanout))
 }
 
 #[tracing::instrument(
@@ -1759,7 +1971,7 @@ async fn run_search_distributed(
     query: String,
     limit: usize,
     mode: Option<MetadataQueryMode>,
-) -> ServerResult<Vec<MetadataSearchHit>> {
+) -> ServerResult<(Vec<MetadataSearchHit>, DistributedFanout)> {
     let span = Span::current();
     let total_started = Instant::now();
     ensure_supported_query_mode(&mode)?;
@@ -1770,6 +1982,7 @@ async fn run_search_distributed(
         .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
 
     let mut hits = Vec::new();
+    let mut fanout = DistributedFanout::default();
     match mode.unwrap_or(MetadataQueryMode::Distributed) {
         MetadataQueryMode::Local => {
             let node_span = debug_span!(
@@ -1785,6 +1998,7 @@ async fn run_search_distributed(
                 .instrument(node_span.clone())
                 .await;
             record_api_elapsed(&node_span, "elapsed_ms", node_started);
+            fanout.nodes_queried = 1;
             match result {
                 Ok(result) => {
                     node_span.record("hit_count", result.len() as u64);
@@ -1795,51 +2009,88 @@ async fn run_search_distributed(
         }
         MetadataQueryMode::Distributed => {
             let discovery_started = Instant::now();
-            let nodes = load_realm_nodes(state).await?;
+            let nodes =
+                aruna_core::telemetry::time_stage("discovery", load_realm_nodes(state)).await?;
             record_api_elapsed(&span, "discovery_ms", discovery_started);
             span.record("node_count", nodes.len() as u64);
-            for node_id in nodes {
-                let local = node_id == state.get_node_id();
-                let node_span = debug_span!(
-                    "metadata.api.search_node",
-                    peer = ?node_id,
-                    local,
-                    elapsed_ms = field::Empty,
-                    hit_count = field::Empty,
-                    result = field::Empty,
-                );
-                let node_started = Instant::now();
-                let result = if local {
-                    handle
-                        .search_authorized_local(
-                            auth.clone(),
-                            graph_iris.clone(),
-                            query.clone(),
-                            limit,
-                        )
-                        .instrument(node_span.clone())
-                        .await
-                } else {
-                    handle
-                        .request_remote_search_graphs(
-                            node_id,
-                            auth.clone(),
-                            graph_iris.clone(),
-                            query.clone(),
-                            limit,
-                        )
-                        .instrument(node_span.clone())
-                        .await
+            fanout.nodes_queried = nodes.len();
+            let fanout_started = Instant::now();
+            let local_node_id = state.get_node_id();
+            let mut node_iter = nodes.into_iter();
+            let mut pending = FuturesUnordered::new();
+
+            loop {
+                while pending.len() < METADATA_DISTRIBUTED_QUERY_FANOUT_LIMIT {
+                    let Some(node_id) = node_iter.next() else {
+                        break;
+                    };
+                    let handle = handle.clone();
+                    let auth = auth.clone();
+                    let graph_iris = graph_iris.clone();
+                    let query = query.clone();
+                    let local = node_id == local_node_id;
+                    pending.push(async move {
+                        let node_span = debug_span!(
+                            "metadata.api.search_node",
+                            peer = ?node_id,
+                            local,
+                            elapsed_ms = field::Empty,
+                            hit_count = field::Empty,
+                            result = field::Empty,
+                        );
+                        let node_started = Instant::now();
+                        // The coordinator's own partition runs in-process like
+                        // mode=local; only remote partitions go over the wire
+                        // and carry the per-node timeout.
+                        let result = if local {
+                            handle
+                                .search_authorized_local(auth, graph_iris, query, limit)
+                                .instrument(node_span.clone())
+                                .await
+                        } else {
+                            match tokio::time::timeout(
+                                METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
+                                handle
+                                    .request_remote_search_graphs(
+                                        node_id, auth, graph_iris, query, limit,
+                                    )
+                                    .instrument(node_span.clone()),
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(MetadataError::Backend(format!(
+                                    "distributed metadata search node timed out after {}ms",
+                                    METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT.as_millis()
+                                ))),
+                            }
+                        };
+                        record_api_elapsed(&node_span, "elapsed_ms", node_started);
+                        aruna_core::telemetry::record_stage_detail(
+                            "fanout_node",
+                            || short_node_id(node_id),
+                            node_started.elapsed(),
+                        );
+                        match &result {
+                            Ok(result) => {
+                                node_span.record("result", "ok");
+                                node_span.record("hit_count", result.len() as u64);
+                            }
+                            Err(_) => {
+                                node_span.record("result", "error");
+                            }
+                        }
+                        (node_id, result)
+                    });
+                }
+
+                let Some((node_id, result)) = pending.next().await else {
+                    break;
                 };
-                record_api_elapsed(&node_span, "elapsed_ms", node_started);
                 match result {
-                    Ok(result) => {
-                        node_span.record("result", "ok");
-                        node_span.record("hit_count", result.len() as u64);
-                        hits.extend(result);
-                    }
+                    Ok(result) => hits.extend(result),
                     Err(error) => {
-                        node_span.record("result", "error");
+                        fanout.nodes_failed += 1;
                         warn!(
                             node_id = ?node_id,
                             error = %error,
@@ -1848,18 +2099,20 @@ async fn run_search_distributed(
                     }
                 }
             }
+            aruna_core::telemetry::record_stage("fanout", fanout_started.elapsed());
         }
     }
 
     let hits = deduplicate_search_hits(hits, limit);
     span.record("hit_count", hits.len() as u64);
     record_api_elapsed(&span, "elapsed_ms", total_started);
-    Ok(hits)
+    Ok((hits, fanout))
 }
 
 fn aggregate_query_results(
     results: Vec<MetadataQueryResults>,
     query_form: QueryForm,
+    select_limit: Option<usize>,
 ) -> ServerResult<MetadataQueryResults> {
     match query_form {
         QueryForm::Ask => {
@@ -1882,9 +2135,28 @@ fn aggregate_query_results(
                     }
                 }
             }
+            // Each node applies the query LIMIT independently, so the merged
+            // set can hold up to nodes x LIMIT rows; re-apply it after dedup.
+            if let Some(limit) = select_limit {
+                merged.truncate(limit);
+            }
             Ok(MetadataQueryResults::Solutions(merged))
         }
     }
+}
+
+// Reads the outermost LIMIT of a SELECT query so distributed aggregation can
+// re-apply it; sub-select slices sit deeper in the algebra and are not picked
+// up here.
+fn query_select_limit(query: &str) -> Option<usize> {
+    let parsed = spargebra::SparqlParser::new().parse_query(query).ok()?;
+    let spargebra::Query::Select { pattern, .. } = parsed else {
+        return None;
+    };
+    let spargebra::algebra::GraphPattern::Slice { length, .. } = pattern else {
+        return None;
+    };
+    length
 }
 
 fn deduplicate_search_hits(hits: Vec<MetadataSearchHit>, limit: usize) -> Vec<MetadataSearchHit> {
@@ -1928,6 +2200,12 @@ enum QueryForm {
     Ask,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct DistributedFanout {
+    nodes_queried: usize,
+    nodes_failed: usize,
+}
+
 fn query_form(query: &str) -> Option<QueryForm> {
     let mut remaining = query.trim_start();
     loop {
@@ -1966,6 +2244,8 @@ mod tests {
     };
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
+    use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
+    use aruna_operations::metadata::projector::replay_metadata_event_log;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use serde_json::json;
@@ -2014,6 +2294,7 @@ mod tests {
         assert_eq!(listed.documents[0].document_id, created.summary.document_id);
 
         let document_id = created.summary.document_id.clone();
+        drain_metadata_background(test.state.as_ref()).await;
         let paged_jsonld = format!(
             r#"{{
   "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -2137,7 +2418,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(result, MetadataQueryResponse::Boolean(true)));
+        assert!(matches!(result.result, MetadataQueryResult::Boolean(true)));
+        assert_eq!(result.nodes_queried, 1);
+        assert_eq!(result.nodes_failed, 0);
 
         test.state
             .get_ctx()
@@ -2160,6 +2443,8 @@ mod tests {
         .await
         .unwrap();
         assert!(!search.hits.is_empty());
+        assert_eq!(search.nodes_queried, 1);
+        assert_eq!(search.nodes_failed, 0);
     }
 
     #[tokio::test]
@@ -2203,6 +2488,7 @@ mod tests {
         assert_eq!(created.summary.document_path, "datasets/rocrate-dataset");
         assert!(created.summary.created_at.ends_with('Z'));
         assert!(created.summary.updated_at.ends_with('Z'));
+        drain_metadata_background(test.state.as_ref()).await;
 
         let _ = add_metadata_contextual_entity(
             State(test.state.clone()),
@@ -2316,6 +2602,38 @@ mod tests {
         assert_eq!(nodes, vec![state.get_node_id()]);
     }
 
+    #[test]
+    fn document_query_target_nodes_use_deduplicated_holders() {
+        let local_node_id = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
+        let remote_node_id = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
+        let document_id = Ulid::new();
+        let record = MetadataRegistryRecord {
+            realm_id: RealmId([3u8; 32]),
+            group_id: Ulid::new(),
+            document_id,
+            document_path: "datasets/query-targets".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: "/metadata/query-targets".to_string(),
+            holder_node_ids: vec![remote_node_id, local_node_id, remote_node_id],
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_event_id: Ulid::nil(),
+        };
+
+        assert_eq!(
+            document_query_target_nodes(&record, local_node_id),
+            vec![remote_node_id, local_node_id]
+        );
+
+        let mut empty_holders = record;
+        empty_holders.holder_node_ids.clear();
+        assert_eq!(
+            document_query_target_nodes(&empty_holders, local_node_id),
+            vec![local_node_id]
+        );
+    }
+
     #[tokio::test]
     async fn load_metadata_record_by_document_returns_internal_error_on_storage_failure() {
         let state = setup_state_with_closed_storage().await;
@@ -2326,6 +2644,66 @@ mod tests {
             result,
             Err(ServerError::InternalError(message)) if message == "Channel closed"
         ));
+    }
+
+    #[tokio::test]
+    async fn ensure_permission_returns_forbidden_for_nonexistent_group() {
+        let test = setup_state().await;
+        let missing_group = Ulid::new();
+        let path = format!("/{}/g/{missing_group}/meta/**", test.state.get_realm_id());
+
+        let result = ensure_permission(
+            test.state.as_ref(),
+            test.auth.clone(),
+            path,
+            Permission::WRITE,
+        )
+        .await;
+
+        assert!(matches!(result, Err(ServerError::Forbidden)));
+    }
+
+    #[tokio::test]
+    async fn export_returns_service_unavailable_while_materialization_pending() {
+        let test = setup_state().await;
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/pending-dataset".to_string(),
+                    name: "Pending Dataset".to_string(),
+                    description: "Not yet materialized".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        // No drain_metadata_background: the craqle graph does not exist yet.
+        let result = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(created.summary.document_id.clone()),
+            Query(MetadataRoCrateExportParams::default()),
+        )
+        .await;
+        assert!(matches!(result, Err(ServerError::ServiceUnavailable)));
+
+        drain_metadata_background(test.state.as_ref()).await;
+        let result = export_metadata_rocrate(
+            State(test.state.clone()),
+            Extension(None),
+            Path(created.summary.document_id),
+            Query(MetadataRoCrateExportParams::default()),
+        )
+        .await;
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -2427,6 +2805,7 @@ mod tests {
                 )])]),
             ],
             QueryForm::Select,
+            None,
         )
         .unwrap();
 
@@ -2434,6 +2813,175 @@ mod tests {
             panic!("expected solutions");
         };
         assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn reapplies_select_limit_after_distributed_merge() {
+        let results = aggregate_query_results(
+            vec![
+                MetadataQueryResults::Solutions(vec![
+                    BTreeMap::from([(String::from("s"), String::from("<urn:a>"))]),
+                    BTreeMap::from([(String::from("s"), String::from("<urn:b>"))]),
+                ]),
+                MetadataQueryResults::Solutions(vec![
+                    BTreeMap::from([(String::from("s"), String::from("<urn:c>"))]),
+                    BTreeMap::from([(String::from("s"), String::from("<urn:d>"))]),
+                ]),
+            ],
+            QueryForm::Select,
+            Some(3),
+        )
+        .unwrap();
+
+        let MetadataQueryResults::Solutions(rows) = results else {
+            panic!("expected solutions");
+        };
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn query_select_limit_reads_outermost_limit_only() {
+        assert_eq!(
+            query_select_limit("SELECT ?s WHERE { ?s ?p ?o } LIMIT 5"),
+            Some(5)
+        );
+        assert_eq!(
+            query_select_limit("SELECT ?s WHERE { ?s ?p ?o } LIMIT 7 OFFSET 3"),
+            Some(7)
+        );
+        assert_eq!(query_select_limit("SELECT ?s WHERE { ?s ?p ?o }"), None);
+        assert_eq!(
+            query_select_limit(
+                "SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } LIMIT 5 } ?s ?p ?o }"
+            ),
+            None
+        );
+        assert_eq!(query_select_limit("ASK WHERE { ?s ?p ?o }"), None);
+        assert_eq!(query_select_limit("not sparql"), None);
+    }
+
+    #[test]
+    fn query_response_serializes_envelope_with_partiality_fields() {
+        let response = MetadataQueryResponse {
+            result: MetadataQueryResult::Boolean(true),
+            nodes_queried: 3,
+            nodes_failed: 1,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["kind"], json!("Boolean"));
+        assert_eq!(value["value"], json!(true));
+        assert_eq!(value["nodes_queried"], json!(3));
+        assert_eq!(value["nodes_failed"], json!(1));
+
+        let roundtrip: MetadataQueryResponse = serde_json::from_value(value).unwrap();
+        assert!(matches!(roundtrip.result, MetadataQueryResult::Boolean(true)));
+        assert_eq!(roundtrip.nodes_queried, 3);
+        assert_eq!(roundtrip.nodes_failed, 1);
+    }
+
+    #[tokio::test]
+    async fn distributed_query_executes_local_partition_in_process() {
+        let test = setup_state().await;
+
+        let _ = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/local-partition".to_string(),
+                    name: "Local Partition Dataset".to_string(),
+                    description: "Coordinator partition".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        // The test state has no remote realm nodes and no net handle, so a
+        // distributed query only succeeds if the coordinator partition runs
+        // in-process instead of going over the wire.
+        let (_, Json(result)) = query_all_metadata(
+            State(test.state.clone()),
+            Extension(None),
+            Json(SparqlQueryRequest {
+                query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 10"
+                    .to_string(),
+                mode: Some(MetadataQueryMode::Distributed),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.nodes_queried, 1);
+        assert_eq!(result.nodes_failed, 0);
+        let MetadataQueryResult::Solutions(rows) = result.result else {
+            panic!("expected solutions");
+        };
+        assert!(rows.iter().any(|row| {
+            row.values()
+                .any(|value| value.contains("Local Partition Dataset"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn query_all_metadata_applies_lazy_per_caller_visibility() {
+        let test = setup_state().await;
+
+        for (path, name, public) in [
+            ("datasets/lazy-public", "Lazy Public Dataset", true),
+            ("datasets/lazy-private", "Lazy Private Dataset", false),
+        ] {
+            let _ = create_metadata_document(
+                State(test.state.clone()),
+                Extension(Some(test.auth.clone())),
+                Json(CreateMetadataRequest::Scaffold(
+                    CreateMetadataScaffoldRequest {
+                        group_id: test.group_id.to_string(),
+                        path: path.to_string(),
+                        name: name.to_string(),
+                        description: "Lazy visibility".to_string(),
+                        date_published: "2026-01-01".to_string(),
+                        license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                        public,
+                    },
+                )),
+            )
+            .await
+            .unwrap();
+        }
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let query_names = async |auth: Option<AuthContext>| {
+            let (_, Json(result)) = query_all_metadata(
+                State(test.state.clone()),
+                Extension(auth),
+                Json(SparqlQueryRequest {
+                    query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
+                    mode: Some(MetadataQueryMode::Local),
+                }),
+            )
+            .await
+            .unwrap();
+            let MetadataQueryResult::Solutions(rows) = result.result else {
+                panic!("expected solutions");
+            };
+            rows.into_iter()
+                .flat_map(|row| row.into_values())
+                .collect::<Vec<_>>()
+        };
+
+        let anonymous = query_names(None).await;
+        assert!(anonymous.iter().any(|name| name.contains("Lazy Public")));
+        assert!(!anonymous.iter().any(|name| name.contains("Lazy Private")));
+
+        let authorized = query_names(Some(test.auth.clone())).await;
+        assert!(authorized.iter().any(|name| name.contains("Lazy Public")));
+        assert!(authorized.iter().any(|name| name.contains("Lazy Private")));
     }
 
     #[test]
@@ -2559,6 +3107,14 @@ mod tests {
             group_id,
             state,
         }
+    }
+
+    async fn drain_metadata_background(state: &ServerState) {
+        let ctx = state.get_ctx();
+        replay_metadata_event_log(ctx.as_ref()).await.unwrap();
+        process_metadata_materialization_batch(ctx.as_ref())
+            .await
+            .unwrap();
     }
 
     async fn setup_state_with_closed_storage() -> Arc<ServerState> {

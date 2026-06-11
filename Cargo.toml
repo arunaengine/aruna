@@ -116,6 +116,7 @@ serde_json = "1.0.150"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 smallvec = "1.15.1"
+spargebra = "0.4.6"
 tempfile = "3.27.0"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full", "tracing"] }
