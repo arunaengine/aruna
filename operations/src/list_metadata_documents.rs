@@ -1,23 +1,24 @@
+use std::collections::HashSet;
+
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::MetadataGraphLifecycleRecord;
 use aruna_core::operation::Operation;
-use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::MetadataRegistryRecord;
 use aruna_core::types::{Effects, GroupId, Key};
 use smallvec::smallvec;
 use thiserror::Error;
 
-use crate::metadata::repository::{StorageReadError, iter_registry_effect, parse_registry_iter};
+use crate::metadata::repository::{
+    LIST_METADATA_PAGE_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
+};
 
 #[derive(Debug, PartialEq)]
 pub struct ListMetadataDocumentsOperation {
     group_id: GroupId,
     documents: Vec<MetadataRegistryRecord>,
-    pending_documents: Vec<MetadataRegistryRecord>,
-    pending_document: Option<MetadataRegistryRecord>,
-    next_start_after: Option<Key>,
+    deleted_graph_iris: HashSet<String>,
     state: ListMetadataDocumentsState,
     output: Option<Result<Vec<MetadataRegistryRecord>, ListMetadataDocumentsError>>,
 }
@@ -25,8 +26,8 @@ pub struct ListMetadataDocumentsOperation {
 #[derive(Debug, Clone, PartialEq)]
 enum ListMetadataDocumentsState {
     Init,
+    ListDeleted,
     ListDocuments,
-    CheckLifecycle,
     Finish,
     Error,
 }
@@ -50,9 +51,7 @@ impl ListMetadataDocumentsOperation {
         Self {
             group_id,
             documents: Vec::new(),
-            pending_documents: Vec::new(),
-            pending_document: None,
-            next_start_after: None,
+            deleted_graph_iris: HashSet::new(),
             state: ListMetadataDocumentsState::Init,
             output: None,
         }
@@ -77,26 +76,14 @@ impl ListMetadataDocumentsOperation {
         iter_registry_effect(self.group_id, start_after, None)
     }
 
-    fn next_lifecycle_check(&mut self) -> Effects {
-        if let Some(record) = self.pending_documents.pop() {
-            self.state = ListMetadataDocumentsState::CheckLifecycle;
-            let graph_iri = record.graph_iri.clone();
-            self.pending_document = Some(record);
-            return smallvec![Effect::Storage(StorageEffect::Read {
-                key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-                key: metadata_graph_lifecycle_key(&graph_iri),
-                txn_id: None,
-            })];
-        }
-
-        if let Some(cursor) = self.next_start_after.take() {
-            self.state = ListMetadataDocumentsState::ListDocuments;
-            return smallvec![self.iter_effect(Some(cursor))];
-        }
-
-        self.state = ListMetadataDocumentsState::Finish;
-        self.output = Some(Ok(std::mem::take(&mut self.documents)));
-        smallvec![]
+    fn lifecycle_iter_effect(start_after: Option<Key>) -> Effect {
+        Effect::Storage(StorageEffect::Iter {
+            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            prefix: None,
+            start_after,
+            limit: LIST_METADATA_PAGE_SIZE,
+            txn_id: None,
+        })
     }
 }
 
@@ -105,51 +92,57 @@ impl Operation for ListMetadataDocumentsOperation {
     type Error = ListMetadataDocumentsError;
 
     fn start(&mut self) -> Effects {
-        self.state = ListMetadataDocumentsState::ListDocuments;
-        smallvec![self.iter_effect(None)]
+        self.state = ListMetadataDocumentsState::ListDeleted;
+        smallvec![Self::lifecycle_iter_effect(None)]
     }
 
     fn step(&mut self, event: Event) -> Effects {
         match self.state {
+            ListMetadataDocumentsState::ListDeleted => match event {
+                Event::Storage(StorageEvent::IterResult {
+                    values,
+                    next_start_after,
+                }) => {
+                    for (_, value) in values {
+                        match postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value) {
+                            Ok(lifecycle) => {
+                                if lifecycle.is_deleted() {
+                                    self.deleted_graph_iris.insert(lifecycle.graph_iri);
+                                }
+                            }
+                            Err(error) => {
+                                return self
+                                    .fail(aruna_core::errors::ConversionError::from(error).into());
+                            }
+                        }
+                    }
+                    if next_start_after.is_some() {
+                        return smallvec![Self::lifecycle_iter_effect(next_start_after)];
+                    }
+                    self.state = ListMetadataDocumentsState::ListDocuments;
+                    smallvec![self.iter_effect(None)]
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event(
+                    "metadata graph lifecycle iter result",
+                    format!("{other:?}"),
+                ),
+            },
             ListMetadataDocumentsState::ListDocuments => match parse_registry_iter(event) {
-                Ok((mut page, next_start_after)) => {
-                    page.reverse();
-                    self.pending_documents = page;
-                    self.next_start_after = next_start_after;
-                    self.next_lifecycle_check()
+                Ok((page, next_start_after)) => {
+                    self.documents.extend(
+                        page.into_iter()
+                            .filter(|record| !self.deleted_graph_iris.contains(&record.graph_iri)),
+                    );
+                    if next_start_after.is_some() {
+                        return smallvec![self.iter_effect(next_start_after)];
+                    }
+                    self.state = ListMetadataDocumentsState::Finish;
+                    self.output = Some(Ok(std::mem::take(&mut self.documents)));
+                    smallvec![]
                 }
                 Err(StorageReadError::Storage(error)) => self.fail(error.into()),
                 Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
-            },
-            ListMetadataDocumentsState::CheckLifecycle => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    let Some(record) = self.pending_document.take() else {
-                        return self.unexpected_event(
-                            "metadata graph lifecycle read result",
-                            "missing pending document".to_string(),
-                        );
-                    };
-                    let deleted = match value {
-                        Some(value) => {
-                            match postcard::from_bytes::<MetadataGraphLifecycleRecord>(&value) {
-                                Ok(lifecycle) => lifecycle.is_deleted(),
-                                Err(error) => {
-                                    return self.fail(
-                                        aruna_core::errors::ConversionError::from(error).into(),
-                                    );
-                                }
-                            }
-                        }
-                        None => false,
-                    };
-                    if !deleted {
-                        self.documents.push(record);
-                    }
-                    self.next_lifecycle_check()
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self
-                    .unexpected_event("metadata graph lifecycle read result", format!("{other:?}")),
             },
             ListMetadataDocumentsState::Finish
             | ListMetadataDocumentsState::Error
@@ -178,9 +171,11 @@ mod tests {
     use super::*;
 
     use aruna_core::handle::Handle;
+    use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
     use aruna_core::metadata::MetadataGraphLifecycleRecord;
     use aruna_core::structs::{MetadataRegistryRecord, RealmId};
     use aruna_storage::FjallStorage;
+    use byteview::ByteView;
     use tempfile::tempdir;
     use ulid::Ulid;
 
@@ -212,6 +207,7 @@ mod tests {
                 holder_node_ids: Vec::new(),
                 created_at_ms: now,
                 updated_at_ms: now,
+                last_event_id: Ulid::nil(),
             };
             let event = storage_handle
                 .send_effect(write_registry_effect(&record, None).unwrap())
@@ -295,6 +291,63 @@ mod tests {
         assert_eq!(result, vec![active]);
     }
 
+    #[test]
+    fn filters_deleted_documents_without_per_record_reads() {
+        let realm_id = RealmId([6u8; 32]);
+        let group_id = Ulid::new();
+        let active = metadata_record(realm_id, group_id, Ulid::new(), "docs/active");
+        let deleted = metadata_record(realm_id, group_id, Ulid::new(), "docs/deleted");
+        let lifecycle = MetadataGraphLifecycleRecord::deleted(
+            deleted.graph_iri.clone(),
+            realm_id,
+            group_id,
+            deleted.document_id,
+            1,
+        );
+
+        let mut operation = ListMetadataDocumentsOperation::new(group_id);
+        let effects = operation.start();
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter {
+                key_space,
+                prefix: None,
+                start_after: None,
+                ..
+            })] if key_space == METADATA_GRAPH_LIFECYCLE_KEYSPACE
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                ByteView::from(vec![1u8]),
+                ByteView::from(postcard::to_allocvec(&lifecycle).unwrap()),
+            )],
+            next_start_after: None,
+        }));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
+                if key_space == METADATA_INDEX_KEYSPACE
+        ));
+
+        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+            values: vec![
+                (
+                    ByteView::from(vec![2u8]),
+                    ByteView::from(postcard::to_allocvec(&active).unwrap()),
+                ),
+                (
+                    ByteView::from(vec![3u8]),
+                    ByteView::from(postcard::to_allocvec(&deleted).unwrap()),
+                ),
+            ],
+            next_start_after: None,
+        }));
+        assert!(effects.is_empty());
+        assert!(operation.is_complete());
+        assert_eq!(operation.finalize().unwrap(), vec![active]);
+    }
+
     fn metadata_record(
         realm_id: RealmId,
         group_id: Ulid,
@@ -317,6 +370,7 @@ mod tests {
             holder_node_ids: Vec::new(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            last_event_id: Ulid::nil(),
         }
     }
 }
