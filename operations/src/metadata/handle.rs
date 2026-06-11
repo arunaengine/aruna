@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
@@ -12,37 +14,85 @@ use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataQuadOp,
-    MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit, MetadataUpsertEntityRequest,
+    MetadataQueryResults, MetadataRequestDurability, MetadataRoCratePage, MetadataSearchHit,
+    MetadataUpsertEntityRequest,
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
-use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission};
+use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission, RealmId};
+use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use craqle::{
     ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleIrokleOptions, CraqleNode,
-    CraqleOptions, CreateCrateRequest, CreateEntityRequest, GraphId, GraphPolicy, QueryResults,
-    RoCrateError, vocab,
+    CraqleOptions, CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, GraphId,
+    GraphPolicy, QueryResults, RoCrateError, SearchStorage, vocab,
 };
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
 use serde_json::Value;
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug_span, field, warn};
+use ulid::Ulid;
 
 use super::protocol::{MetadataTransportMessage, read_message, write_message};
-use super::repository::{iter_all_registry_effect, parse_registry_iter};
+use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
+use crate::list_groups::ListGroupOperation;
 
 const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
 const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
 const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
 
+// Unbiased per-call-kind craqle latency histograms; every backend call is
+// recorded, not just the ones above the slow-call threshold.
+static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
+    LazyLock::new(|| aruna_core::telemetry::LatencyAggregator::new("craqle"));
+const METADATA_VISIBILITY_CACHE_TTL: Duration = Duration::from_secs(30);
+const ACCEPTED_CREATE_CACHE_CAPACITY: usize = 1024;
+
 #[derive(Clone)]
 pub struct MetadataHandle {
     inner: Arc<MetadataInner>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MetadataHandleOptions {
+    pub search_storage: MetadataSearchStorage,
+    /// Size of the craqle mutation and read permit pools. Defaults to the
+    /// host parallelism; set explicitly when cgroup limits make
+    /// `available_parallelism` unrepresentative.
+    pub backend_pool_size: Option<usize>,
+}
+
+impl MetadataHandleOptions {
+    pub fn with_search_storage(mut self, search_storage: MetadataSearchStorage) -> Self {
+        self.search_storage = search_storage;
+        self
+    }
+
+    pub fn with_backend_pool_size(mut self, backend_pool_size: usize) -> Self {
+        self.backend_pool_size = Some(backend_pool_size.max(1));
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataSearchStorage {
+    #[default]
+    Disk,
+    Memory,
+}
+
+impl From<MetadataSearchStorage> for SearchStorage {
+    fn from(search_storage: MetadataSearchStorage) -> Self {
+        match search_storage {
+            MetadataSearchStorage::Disk => SearchStorage::Disk,
+            MetadataSearchStorage::Memory => SearchStorage::Memory,
+        }
+    }
 }
 
 struct MetadataInner {
@@ -50,6 +100,255 @@ struct MetadataInner {
     storage_handle: StorageHandle,
     net_handle: Option<NetHandle>,
     irokle_db: Option<fjall::OptimisticTxDatabase>,
+    visibility_cache: MetadataVisibilityCache,
+    accepted_create_cache: Mutex<AcceptedCreateCache>,
+    craqle_permits: Arc<tokio::sync::Semaphore>,
+    craqle_read_permits: Arc<tokio::sync::Semaphore>,
+    deferred_persist_requested: AtomicBool,
+    deferred_persist_running: AtomicBool,
+}
+
+#[derive(Default)]
+struct AcceptedCreateCache {
+    by_document: HashMap<Ulid, MetadataRegistryRecord>,
+    order: VecDeque<Ulid>,
+}
+
+impl AcceptedCreateCache {
+    fn insert(&mut self, record: MetadataRegistryRecord) {
+        if !self.by_document.contains_key(&record.document_id) {
+            self.order.push_back(record.document_id);
+        }
+        self.by_document.insert(record.document_id, record);
+        while self.by_document.len() > ACCEPTED_CREATE_CACHE_CAPACITY {
+            let Some(document_id) = self.order.pop_front() else {
+                break;
+            };
+            self.by_document.remove(&document_id);
+        }
+    }
+
+    fn get(&self, document_id: Ulid) -> Option<MetadataRegistryRecord> {
+        self.by_document.get(&document_id).cloned()
+    }
+
+    fn list_group(&self, group_id: ulid::Ulid) -> Vec<MetadataRegistryRecord> {
+        self.by_document
+            .values()
+            .filter(|record| record.group_id == group_id)
+            .cloned()
+            .collect()
+    }
+
+    fn remove(&mut self, document_id: Ulid) {
+        self.by_document.remove(&document_id);
+    }
+}
+
+struct MetadataVisibilityCache {
+    registry: Mutex<Option<RegistryCacheEntry>>,
+    registry_fill: Arc<tokio::sync::Mutex<()>>,
+    lifecycle_deleted: Mutex<HashMap<String, LifecycleDeletedCacheEntry>>,
+}
+
+struct RegistryCacheEntry {
+    records: BTreeMap<Ulid, MetadataRegistryRecord>,
+    snapshot: Option<Arc<Vec<MetadataRegistryRecord>>>,
+    expires_at: Instant,
+}
+
+impl RegistryCacheEntry {
+    fn snapshot(&mut self) -> Arc<Vec<MetadataRegistryRecord>> {
+        self.snapshot
+            .get_or_insert_with(|| Arc::new(self.records.values().cloned().collect()))
+            .clone()
+    }
+}
+
+struct LifecycleDeletedCacheEntry {
+    deleted: bool,
+    expires_at: Instant,
+}
+
+struct MetadataGraphDeletedRead {
+    deleted: bool,
+    cache_hit: bool,
+}
+
+impl MetadataVisibilityCache {
+    fn new() -> Self {
+        Self {
+            registry: Mutex::new(None),
+            registry_fill: Arc::new(tokio::sync::Mutex::new(())),
+            lifecycle_deleted: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn registry_records(&self) -> Option<Arc<Vec<MetadataRegistryRecord>>> {
+        match self.registry_records_any() {
+            Some((records, true)) => Some(records),
+            _ => None,
+        }
+    }
+
+    // Expired entries are kept so readers can be served stale data while a
+    // background refill replaces the entry; the bool flags freshness.
+    fn registry_records_any(&self) -> Option<(Arc<Vec<MetadataRegistryRecord>>, bool)> {
+        let now = Instant::now();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        registry
+            .as_mut()
+            .map(|entry| (entry.snapshot(), entry.expires_at > now))
+    }
+
+    fn store_registry_records(&self, records: Arc<Vec<MetadataRegistryRecord>>) {
+        let map: BTreeMap<_, _> = records
+            .iter()
+            .map(|record| (record.document_id, record.clone()))
+            .collect();
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        *registry = Some(RegistryCacheEntry {
+            records: map,
+            snapshot: Some(records),
+            expires_at: Instant::now() + METADATA_VISIBILITY_CACHE_TTL,
+        });
+    }
+
+    fn lifecycle_deleted(&self, graph_iri: &str) -> Option<bool> {
+        match self.lifecycle_deleted_any(graph_iri) {
+            Some((deleted, true)) => Some(deleted),
+            _ => None,
+        }
+    }
+
+    fn lifecycle_deleted_any(&self, graph_iri: &str) -> Option<(bool, bool)> {
+        let now = Instant::now();
+        let lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        lifecycle
+            .get(graph_iri)
+            .map(|entry| (entry.deleted, entry.expires_at > now))
+    }
+
+    fn store_lifecycle_deleted(&self, graph_iri: String, deleted: bool) {
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        lifecycle.insert(
+            graph_iri,
+            LifecycleDeletedCacheEntry {
+                deleted,
+                expires_at: Instant::now() + METADATA_VISIBILITY_CACHE_TTL,
+            },
+        );
+    }
+
+    // Bulk refresh after a registry fill: re-stamps every supplied graph and
+    // drops expired leftovers (graphs no longer in the registry) so the map
+    // stays bounded.
+    fn refresh_lifecycle_deleted(&self, entries: impl IntoIterator<Item = (String, bool)>) {
+        let now = Instant::now();
+        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        for (graph_iri, deleted) in entries {
+            lifecycle.insert(
+                graph_iri,
+                LifecycleDeletedCacheEntry {
+                    deleted,
+                    expires_at,
+                },
+            );
+        }
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+    }
+
+    // Incremental maintenance keeps the cached registry usable under writes;
+    // entries never outlive their fill TTL, so a missed update converges to
+    // storage truth within one TTL via the periodic refill.
+    fn upsert_registry_records(&self, updates: &[MetadataRegistryRecord]) {
+        if updates.is_empty() {
+            return;
+        }
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let Some(entry) = registry.as_mut() else {
+            return;
+        };
+        for update in updates {
+            entry.records.insert(update.document_id, update.clone());
+        }
+        entry.snapshot = None;
+    }
+
+    fn remove_registry_record(&self, document_id: Ulid) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let Some(entry) = registry.as_mut() else {
+            return;
+        };
+        if entry.records.remove(&document_id).is_some() {
+            entry.snapshot = None;
+        }
+    }
+
+    fn remove_registry_records_by_graph(&self, graph_iri: &str) {
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let Some(entry) = registry.as_mut() else {
+            return;
+        };
+        let before = entry.records.len();
+        entry.records.retain(|_, record| record.graph_iri != graph_iri);
+        if entry.records.len() != before {
+            entry.snapshot = None;
+        }
+    }
+
+    fn remove_lifecycle_entry(&self, graph_iri: &str) {
+        self.lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .remove(graph_iri);
+    }
+
+    fn expire_now(&self) {
+        let expired = Instant::now() - Duration::from_secs(1);
+        if let Some(entry) = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .as_mut()
+        {
+            entry.expires_at = expired;
+        }
+        for entry in self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .values_mut()
+        {
+            entry.expires_at = expired;
+        }
+    }
 }
 
 impl std::fmt::Debug for MetadataHandle {
@@ -67,28 +366,155 @@ impl MetadataHandle {
         irokle_node: Option<irokle::Irokle<irokle::FjallStorage>>,
         irokle_db: Option<fjall::OptimisticTxDatabase>,
     ) -> Result<Self, MetadataError> {
+        Self::new_with_options(
+            path,
+            node_id,
+            storage_handle,
+            net_handle,
+            irokle_node,
+            irokle_db,
+            MetadataHandleOptions::default(),
+        )
+    }
+
+    pub fn new_with_options(
+        path: impl AsRef<Path>,
+        node_id: NodeId,
+        storage_handle: StorageHandle,
+        net_handle: Option<NetHandle>,
+        irokle_node: Option<irokle::Irokle<irokle::FjallStorage>>,
+        irokle_db: Option<fjall::OptimisticTxDatabase>,
+        metadata_options: MetadataHandleOptions,
+    ) -> Result<Self, MetadataError> {
         let actor = ActorId::from_bytes(*node_id.as_bytes());
-        let options = CraqleOptions::new().with_actor(actor);
+        let options = CraqleOptions::new()
+            .with_actor(actor)
+            .with_search_storage(metadata_options.search_storage.into());
         let options = match irokle_node {
             Some(irokle_node) => options.with_irokle(irokle_node, CraqleIrokleOptions::new()),
             None => options,
         };
         let node = CraqleNode::open_with_options(path, options)
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        let pool_size = metadata_options.backend_pool_size.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|cores| cores.get())
+                .unwrap_or(4)
+                .max(4)
+        });
         Ok(Self {
             inner: Arc::new(MetadataInner {
                 node: Arc::new(node),
                 storage_handle,
                 net_handle,
                 irokle_db,
+                visibility_cache: MetadataVisibilityCache::new(),
+                accepted_create_cache: Mutex::new(AcceptedCreateCache::default()),
+                craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+                craqle_read_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
+                deferred_persist_requested: AtomicBool::new(false),
+                deferred_persist_running: AtomicBool::new(false),
             }),
         })
     }
 
+    pub fn cache_accepted_create(&self, record: MetadataRegistryRecord) {
+        self.inner
+            .accepted_create_cache
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .insert(record);
+    }
+
+    pub fn cached_accepted_create(&self, document_id: Ulid) -> Option<MetadataRegistryRecord> {
+        self.inner
+            .accepted_create_cache
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .get(document_id)
+    }
+
+    pub fn cached_accepted_creates_for_group(
+        &self,
+        group_id: ulid::Ulid,
+    ) -> Vec<MetadataRegistryRecord> {
+        self.inner
+            .accepted_create_cache
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .list_group(group_id)
+    }
+
+    pub fn remove_cached_accepted_create(&self, document_id: Ulid) {
+        self.inner
+            .accepted_create_cache
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner())
+            .remove(document_id);
+    }
+
+    pub fn upsert_visible_registry_record(&self, record: MetadataRegistryRecord) {
+        self.inner
+            .visibility_cache
+            .upsert_registry_records(std::slice::from_ref(&record));
+    }
+
+    pub fn upsert_visible_registry_records(&self, records: &[MetadataRegistryRecord]) {
+        self.inner.visibility_cache.upsert_registry_records(records);
+    }
+
+    pub fn remove_visible_registry_record(&self, document_id: Ulid) {
+        self.inner.visibility_cache.remove_registry_record(document_id);
+    }
+
+    /// Test hook: marks all visibility cache entries as expired so the next
+    /// read exercises the stale-serving + background-refill path.
+    #[doc(hidden)]
+    pub fn expire_visibility_caches(&self) {
+        self.inner.visibility_cache.expire_now();
+    }
+
+    /// Primes the visibility cache and craqle query indexes so the first
+    /// query after boot finds everything warm.
+    pub async fn warm_caches(&self) -> Result<(), MetadataError> {
+        let node = self.inner.node.clone();
+        tokio::task::spawn_blocking(move || node.ensure_query_indexes())
+            .await
+            .map_err(|error| MetadataError::TaskJoin(error.to_string()))?;
+        if self.inner.visibility_cache.registry_records_any().is_none() {
+            let _fill = self
+                .inner
+                .visibility_cache
+                .registry_fill
+                .clone()
+                .lock_owned()
+                .await;
+            if self.inner.visibility_cache.registry_records_any().is_none() {
+                fill_visibility_caches(&self.inner).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn send_metadata_effect(&self, effect: MetadataEffect) -> Event {
+        let started = Instant::now();
+        let event = self.send_metadata_effect_inner(effect).await;
+        aruna_core::telemetry::record_stage("craqle", started.elapsed());
+        event
+    }
+
+    async fn send_metadata_effect_inner(&self, effect: MetadataEffect) -> Event {
         let effect_name = metadata_effect_kind(&effect);
         let graph_iri = effect_graph_iri(&effect);
-        if let Some(graph_iri) = graph_iri.as_deref() {
+        if let MetadataEffect::DeleteGraph { graph_iri } = &effect {
+            self.inner
+                .visibility_cache
+                .remove_registry_records_by_graph(graph_iri);
+            self.inner.visibility_cache.remove_lifecycle_entry(graph_iri);
+        }
+        if let Some(graph_iri) = graph_iri.as_deref()
+            && !metadata_effect_skips_lifecycle_read(&effect)
+        {
             let span = debug_span!(
                 "metadata.graph_lifecycle.read_before_effect",
                 effect = effect_name,
@@ -97,11 +523,11 @@ impl MetadataHandle {
                 elapsed_ms = field::Empty,
             );
             let started = Instant::now();
-            let result = graph_lifecycle_record(self.inner.storage_handle.clone(), graph_iri)
+            let result = metadata_graph_deleted(self.inner.clone(), graph_iri)
                 .instrument(span.clone())
                 .await;
             match result {
-                Ok(Some(record)) if record.is_deleted() => {
+                Ok(read) if read.deleted => {
                     span.record("deleted", true);
                     record_elapsed(&span, "elapsed_ms", started);
                     match &effect {
@@ -145,7 +571,7 @@ impl MetadataHandle {
         }
         match effect {
             MetadataEffect::SyncGraphBestEffort { graph_iri, peers } => {
-                Event::Metadata(self.schedule_graph_sync_best_effort(graph_iri, peers))
+                Event::Metadata(self.sync_graph_best_effort(graph_iri, peers).await)
             }
             MetadataEffect::QueryGraphs {
                 auth_context,
@@ -191,6 +617,14 @@ impl MetadataHandle {
                 );
                 let blocking_span = span.clone();
                 let started = Instant::now();
+                // Heavy mutations and cheap reads queue on separate pools so
+                // trivial reads never wait behind long materializations.
+                let permits = if metadata_effect_mutates_graph(&other) {
+                    self.inner.craqle_permits.clone()
+                } else {
+                    self.inner.craqle_read_permits.clone()
+                };
+                let _permit = permits.acquire_owned().await.ok();
                 let metadata_event = match tokio::task::spawn_blocking(move || {
                     blocking_span.in_scope(|| handle_effect(inner, other))
                 })
@@ -214,12 +648,24 @@ impl MetadataHandle {
 
     pub async fn reconcile_irokle(&self) -> Result<usize, MetadataError> {
         let inner = self.inner.clone();
-        let applied = tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
+        tokio::task::spawn_blocking(move || inner.node.reconcile_irokle())
             .await
             .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        self.prune_deleted_graphs().await?;
-        Ok(applied)
+            .map_err(|error| MetadataError::Backend(error.to_string()))
+    }
+
+    pub async fn prune_graph_if_deleted(&self, graph_iri: String) -> Result<bool, MetadataError> {
+        if !graph_lifecycle_deleted(self.inner.storage_handle.clone(), &graph_iri).await? {
+            return Ok(false);
+        }
+        self.inner
+            .visibility_cache
+            .remove_registry_records_by_graph(&graph_iri);
+        self.inner
+            .visibility_cache
+            .store_lifecycle_deleted(graph_iri.clone(), true);
+        delete_local_graph(self.inner.node.clone(), graph_iri).await?;
+        Ok(true)
     }
 
     pub async fn prune_deleted_graphs(&self) -> Result<usize, MetadataError> {
@@ -230,22 +676,17 @@ impl MetadataHandle {
             .map_err(|error| MetadataError::Backend(error.to_string()))?;
         let mut pruned = 0usize;
         for graph in graphs {
-            let graph_iri = graph.as_str().to_string();
-            let Some(record) =
-                graph_lifecycle_record(self.inner.storage_handle.clone(), &graph_iri).await?
-            else {
-                continue;
-            };
-            if !record.is_deleted() {
-                continue;
+            if self
+                .prune_graph_if_deleted(graph.as_str().to_string())
+                .await?
+            {
+                pruned += 1;
             }
-            delete_local_graph(self.inner.node.clone(), graph_iri).await?;
-            pruned += 1;
         }
         Ok(pruned)
     }
 
-    fn schedule_graph_sync_best_effort(
+    async fn sync_graph_best_effort(
         &self,
         graph_iri: String,
         mut peers: Vec<NodeId>,
@@ -260,21 +701,17 @@ impl MetadataHandle {
         }
 
         let inner = self.inner.clone();
-        let graph_iri_for_task = graph_iri.clone();
-        let peers_for_task = peers.clone();
+        let task_graph_iri = graph_iri.clone();
+        let task_peers = peers.clone();
         tokio::spawn(async move {
             for attempt in 1..=METADATA_GRAPH_SYNC_ATTEMPTS {
-                match sync_graph_once(
-                    inner.clone(),
-                    graph_iri_for_task.clone(),
-                    peers_for_task.clone(),
-                )
-                .await
+                match sync_graph_once(inner.clone(), task_graph_iri.clone(), task_peers.clone())
+                    .await
                 {
                     Ok(()) => return,
                     Err(error) => {
                         warn!(
-                            graph_iri = %graph_iri_for_task,
+                            graph_iri = %task_graph_iri,
                             attempt,
                             attempts = METADATA_GRAPH_SYNC_ATTEMPTS,
                             error = ?error,
@@ -286,9 +723,10 @@ impl MetadataHandle {
                     }
                 }
             }
+
             warn!(
-                graph_iri = %graph_iri_for_task,
-                peer_count = peers_for_task.len(),
+                graph_iri = %task_graph_iri,
+                peer_count = task_peers.len(),
                 "Metadata graph sync retries exhausted"
             );
         });
@@ -561,6 +999,50 @@ async fn graph_lifecycle_record(
 }
 
 async fn metadata_graph_deleted(
+    inner: Arc<MetadataInner>,
+    graph_iri: &str,
+) -> Result<MetadataGraphDeletedRead, MetadataError> {
+    if let Some(deleted) = inner.visibility_cache.lifecycle_deleted(graph_iri) {
+        return Ok(MetadataGraphDeletedRead {
+            deleted,
+            cache_hit: true,
+        });
+    }
+
+    let deleted = graph_lifecycle_deleted(inner.storage_handle.clone(), graph_iri).await?;
+    inner
+        .visibility_cache
+        .store_lifecycle_deleted(graph_iri.to_string(), deleted);
+    Ok(MetadataGraphDeletedRead {
+        deleted,
+        cache_hit: false,
+    })
+}
+
+// Read-path variant: serves expired entries instead of blocking on storage;
+// the background visibility fill re-stamps them within one TTL.
+async fn metadata_graph_deleted_allow_stale(
+    inner: &Arc<MetadataInner>,
+    graph_iri: &str,
+) -> Result<MetadataGraphDeletedRead, MetadataError> {
+    if let Some((deleted, _fresh)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
+        return Ok(MetadataGraphDeletedRead {
+            deleted,
+            cache_hit: true,
+        });
+    }
+
+    let deleted = graph_lifecycle_deleted(inner.storage_handle.clone(), graph_iri).await?;
+    inner
+        .visibility_cache
+        .store_lifecycle_deleted(graph_iri.to_string(), deleted);
+    Ok(MetadataGraphDeletedRead {
+        deleted,
+        cache_hit: false,
+    })
+}
+
+async fn graph_lifecycle_deleted(
     storage_handle: StorageHandle,
     graph_iri: &str,
 ) -> Result<bool, MetadataError> {
@@ -577,10 +1059,25 @@ async fn delete_local_graph(node: Arc<CraqleNode>, graph_iri: String) -> Result<
         .map_err(metadata_error_from_craqle)
 }
 
-fn effect_rejects_deleted_graph(effect: &MetadataEffect) -> bool {
+fn metadata_effect_mutates_graph(effect: &MetadataEffect) -> bool {
     matches!(
         effect,
         MetadataEffect::CreateCrate { .. }
+            | MetadataEffect::ApplyRoCrate { .. }
+            | MetadataEffect::UpsertDataEntity { .. }
+            | MetadataEffect::UpsertContextualEntity { .. }
+            | MetadataEffect::SetGraphPolicy { .. }
+            | MetadataEffect::AddGraphPeer { .. }
+            | MetadataEffect::DeleteGraph { .. }
+    )
+}
+
+fn effect_rejects_deleted_graph(effect: &MetadataEffect) -> bool {
+    matches!(
+        effect,
+        MetadataEffect::ValidateCreateCrate { .. }
+            | MetadataEffect::ValidateRoCrate { .. }
+            | MetadataEffect::CreateCrate { .. }
             | MetadataEffect::ApplyRoCrate { .. }
             | MetadataEffect::UpsertDataEntity { .. }
             | MetadataEffect::UpsertContextualEntity { .. }
@@ -628,7 +1125,7 @@ async fn sync_graph_once(
     if peers.is_empty() {
         return Ok(());
     }
-    if metadata_graph_deleted(inner.storage_handle.clone(), &graph_iri).await? {
+    if graph_lifecycle_deleted(inner.storage_handle.clone(), &graph_iri).await? {
         return Ok(());
     }
     let net_handle = inner
@@ -682,7 +1179,14 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     let effect_name = metadata_effect_kind(&effect);
     let auth = AllowAllAuthorizer;
     let graph_iri = effect_graph_iri(&effect);
+    let reads_existing_graph = matches!(
+        effect,
+        MetadataEffect::ExportRoCrate { .. }
+            | MetadataEffect::ExportRoCrateSummary { .. }
+            | MetadataEffect::ExportRoCratePage { .. }
+    );
     let persist_irokle_after_success = metadata_effect_persists_irokle(&effect);
+    let deferred_persist_after_success = metadata_effect_defers_persist(&effect);
     let node = inner.node.clone();
     let effect_span = debug_span!(
         "metadata.backend.effect",
@@ -693,6 +1197,68 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     );
     let effect_started = Instant::now();
     let result = effect_span.in_scope(|| match effect {
+        MetadataEffect::ValidateCreateCrate { request } => {
+            let graph_iri = request.graph_iri.clone();
+            let call_span = debug_span!(
+                "metadata.backend.craqle.validate_create_crate",
+                graph_iri = %graph_iri,
+                name_len = request.name.len() as u64,
+                description_len = request.description.len() as u64,
+                public = request.policy.public,
+                permission_path_count = request.policy.permission_paths.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| node.validate_create_crate(&auth, craqle_create_request(request)))
+                .map(|_| MetadataEvent::ValidationResult {
+                    graph_iri: graph_iri.clone(),
+                });
+            record_metadata_result(
+                &call_span,
+                "validate_create_crate",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
+        MetadataEffect::ValidateRoCrate { request } => {
+            let graph_iri = request.graph_iri.clone();
+            let policy = request.policy;
+            let jsonld = request.jsonld;
+            let call_span = debug_span!(
+                "metadata.backend.craqle.validate_rocrate",
+                graph_iri = %graph_iri,
+                jsonld_len = jsonld.len() as u64,
+                public = policy.public,
+                permission_path_count = policy.permission_paths.len() as u64,
+                elapsed_ms = field::Empty,
+                result = field::Empty,
+            );
+            let started = Instant::now();
+            let result = call_span
+                .in_scope(|| {
+                    node.validate_rocrate_document_checked_with_policy(
+                        &auth,
+                        GraphId::new(&graph_iri),
+                        &jsonld,
+                        craqle_graph_policy(policy),
+                    )
+                })
+                .map(|_| MetadataEvent::ValidationResult {
+                    graph_iri: graph_iri.clone(),
+                });
+            record_metadata_result(
+                &call_span,
+                "validate_rocrate",
+                Some(&graph_iri),
+                started,
+                &result,
+            );
+            result
+        }
         MetadataEffect::CreateCrate { request } => {
             let call_span = debug_span!(
                 "metadata.backend.craqle.create_crate",
@@ -701,13 +1267,35 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
                 description_len = request.description.len() as u64,
                 public = request.policy.public,
                 permission_path_count = request.policy.permission_paths.len() as u64,
+                durability = ?request.durability,
                 elapsed_ms = field::Empty,
                 result = field::Empty,
                 batch_ops = field::Empty,
             );
             let started = Instant::now();
-            let result = call_span
-                .in_scope(|| node.create_crate(&auth, craqle_create_request(request.clone())));
+            let durability = request.durability;
+            let actor = request.deterministic_actor.map(ActorId::from_bytes);
+            // Event-log materialization (deterministic actor + WAL-durable
+            // request) replays payloads validated at the origin.
+            let prevalidated =
+                actor.is_some() && durability == MetadataRequestDurability::WalAlreadyDurable;
+            let result = call_span.in_scope(|| {
+                if prevalidated {
+                    node.create_crate_prevalidated_with_durability_as(
+                        &auth,
+                        craqle_create_request(request.clone()),
+                        craqle_request_durability(durability),
+                        actor,
+                    )
+                } else {
+                    node.create_crate_with_durability_as(
+                        &auth,
+                        craqle_create_request(request.clone()),
+                        craqle_request_durability(durability),
+                        actor,
+                    )
+                }
+            });
             record_craqle_call_result(
                 &call_span,
                 "create_crate",
@@ -727,24 +1315,42 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             let graph_iri = request.graph_iri.clone();
             let policy = request.policy;
             let jsonld = request.jsonld;
+            let durability = request.durability;
+            let actor = request.deterministic_actor.map(ActorId::from_bytes);
             let call_span = debug_span!(
                 "metadata.backend.craqle.apply_rocrate",
                 graph_iri = %graph_iri,
                 jsonld_len = jsonld.len() as u64,
                 public = policy.public,
                 permission_path_count = policy.permission_paths.len() as u64,
+                durability = ?durability,
                 elapsed_ms = field::Empty,
                 result = field::Empty,
                 batch_ops = field::Empty,
             );
             let started = Instant::now();
+            let prevalidated =
+                actor.is_some() && durability == MetadataRequestDurability::WalAlreadyDurable;
             let result = call_span.in_scope(|| {
-                node.apply_rocrate_document_checked_with_policy(
-                    &auth,
-                    GraphId::new(&graph_iri),
-                    &jsonld,
-                    craqle_graph_policy(policy),
-                )
+                if prevalidated {
+                    node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+                        &auth,
+                        GraphId::new(&graph_iri),
+                        &jsonld,
+                        craqle_graph_policy(policy),
+                        craqle_request_durability(durability),
+                        actor,
+                    )
+                } else {
+                    node.apply_rocrate_document_checked_with_policy_and_durability_as(
+                        &auth,
+                        GraphId::new(&graph_iri),
+                        &jsonld,
+                        craqle_graph_policy(policy),
+                        craqle_request_durability(durability),
+                        actor,
+                    )
+                }
             });
             record_craqle_call_result(
                 &call_span,
@@ -1066,18 +1672,32 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     });
 
     let persist_error = if persist_irokle_after_success && result.is_ok() {
-        persist_irokle_journal(&inner, effect_name, graph_iri.as_deref()).err()
+        flush_irokle_journal(&inner, effect_name, graph_iri.as_deref()).err()
     } else {
         None
     };
+    if result.is_ok() && persist_error.is_none() && deferred_persist_after_success {
+        schedule_deferred_metadata_persist(inner.clone(), effect_name, graph_iri.clone());
+    }
     record_elapsed(&effect_span, "elapsed_ms", effect_started);
     let event = match (result, persist_error) {
         (_, Some(error)) => MetadataEvent::Error { graph_iri, error },
         (Ok(event), None) => event,
-        (Err(error), None) => MetadataEvent::Error {
-            graph_iri,
-            error: metadata_error_from_craqle(error),
-        },
+        (Err(error), None) => {
+            // Craqle has no public typed missing-graph error on the export
+            // path, so probe graph existence to distinguish a pending
+            // materialization from a genuine backend failure.
+            let error = if reads_existing_graph
+                && graph_iri
+                    .as_deref()
+                    .is_some_and(|iri| matches!(node.contains_graph(&GraphId::new(iri)), Ok(false)))
+            {
+                MetadataError::GraphNotFound
+            } else {
+                metadata_error_from_craqle(error)
+            };
+            MetadataEvent::Error { graph_iri, error }
+        }
     };
     effect_span.record("result", metadata_event_kind(&event));
     if let MetadataEvent::Error { error, .. } = &event {
@@ -1086,7 +1706,7 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
     event
 }
 
-fn persist_irokle_journal(
+fn flush_irokle_journal(
     inner: &MetadataInner,
     effect_name: &'static str,
     graph_iri: Option<&str>,
@@ -1095,15 +1715,15 @@ fn persist_irokle_journal(
         return Ok(());
     };
     let span = debug_span!(
-        "metadata.backend.irokle.persist",
+        "metadata.backend.irokle.flush",
         effect = effect_name,
         graph_iri = graph_iri.unwrap_or("<none>"),
-        mode = "sync_data",
+        mode = "buffer",
         elapsed_ms = field::Empty,
         result = field::Empty,
     );
     let started = Instant::now();
-    let result = span.in_scope(|| db.persist(fjall::PersistMode::SyncData));
+    let result = span.in_scope(|| db.persist(fjall::PersistMode::Buffer));
     record_elapsed(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {
@@ -1113,23 +1733,166 @@ fn persist_irokle_journal(
         Err(error) => {
             record_error(&span, &error.to_string());
             Err(MetadataError::Backend(format!(
-                "failed to persist irokle journal: {error}"
+                "failed to flush irokle journal: {error}"
             )))
         }
     }
 }
 
 fn metadata_effect_persists_irokle(effect: &MetadataEffect) -> bool {
-    matches!(
-        effect,
-        MetadataEffect::CreateCrate { .. }
-            | MetadataEffect::ApplyRoCrate { .. }
-            | MetadataEffect::UpsertDataEntity { .. }
-            | MetadataEffect::UpsertContextualEntity { .. }
-            | MetadataEffect::SetGraphPolicy { .. }
-            | MetadataEffect::AddGraphPeer { .. }
-            | MetadataEffect::DeleteGraph { .. }
-    )
+    match effect {
+        MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. } => {
+            false
+        }
+        MetadataEffect::CreateCrate { request } => {
+            metadata_request_persists_irokle(request.durability)
+        }
+        MetadataEffect::ApplyRoCrate { request } => {
+            metadata_request_persists_irokle(request.durability)
+        }
+        MetadataEffect::UpsertDataEntity { .. }
+        | MetadataEffect::UpsertContextualEntity { .. }
+        | MetadataEffect::SetGraphPolicy { .. }
+        | MetadataEffect::AddGraphPeer { .. }
+        | MetadataEffect::DeleteGraph { .. } => true,
+        MetadataEffect::SyncGraphBestEffort { .. }
+        | MetadataEffect::QueryGraphs { .. }
+        | MetadataEffect::SearchGraphs { .. }
+        | MetadataEffect::GetGraphPolicy { .. }
+        | MetadataEffect::ExportRoCrate { .. }
+        | MetadataEffect::ExportRoCrateSummary { .. }
+        | MetadataEffect::ExportRoCratePage { .. }
+        | MetadataEffect::ListGraphs
+        | MetadataEffect::ContainsGraph { .. } => false,
+    }
+}
+
+fn metadata_effect_defers_persist(effect: &MetadataEffect) -> bool {
+    match effect {
+        MetadataEffect::CreateCrate { request } => {
+            request.durability == MetadataRequestDurability::WalAlreadyDurable
+        }
+        MetadataEffect::ApplyRoCrate { request } => {
+            request.durability == MetadataRequestDurability::WalAlreadyDurable
+        }
+        _ => false,
+    }
+}
+
+fn metadata_effect_skips_lifecycle_read(effect: &MetadataEffect) -> bool {
+    match effect {
+        MetadataEffect::ValidateCreateCrate { .. } | MetadataEffect::ValidateRoCrate { .. } => true,
+        MetadataEffect::CreateCrate { request } => {
+            request.durability == MetadataRequestDurability::WalAlreadyDurable
+        }
+        MetadataEffect::ApplyRoCrate { request } => {
+            request.durability == MetadataRequestDurability::WalAlreadyDurable
+        }
+        _ => false,
+    }
+}
+
+fn schedule_deferred_metadata_persist(
+    inner: Arc<MetadataInner>,
+    effect_name: &'static str,
+    graph_iri: Option<String>,
+) {
+    inner
+        .deferred_persist_requested
+        .store(true, Ordering::Release);
+    if inner.deferred_persist_running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    let worker_inner = inner.clone();
+    let worker_graph_iri = graph_iri.clone();
+    let spawn_result = thread::Builder::new()
+        .name("metadata-deferred-persist".to_string())
+        .spawn(move || {
+            loop {
+                while worker_inner
+                    .deferred_persist_requested
+                    .swap(false, Ordering::AcqRel)
+                {
+                    run_deferred_metadata_flush(
+                        &worker_inner,
+                        effect_name,
+                        worker_graph_iri.as_deref(),
+                    );
+                }
+
+                worker_inner
+                    .deferred_persist_running
+                    .store(false, Ordering::Release);
+                if !worker_inner
+                    .deferred_persist_requested
+                    .load(Ordering::Acquire)
+                {
+                    break;
+                }
+                if worker_inner
+                    .deferred_persist_running
+                    .swap(true, Ordering::AcqRel)
+                {
+                    break;
+                }
+            }
+        });
+
+    if let Err(error) = spawn_result {
+        inner
+            .deferred_persist_running
+            .store(false, Ordering::Release);
+        warn!(
+            event = "metadata.backend.deferred_persist.spawn_failed",
+            effect = effect_name,
+            error = %error,
+            "Failed to spawn deferred metadata persist"
+        );
+    }
+}
+
+fn run_deferred_metadata_flush(
+    inner: &MetadataInner,
+    effect_name: &'static str,
+    graph_iri: Option<&str>,
+) {
+    let span = debug_span!(
+        "metadata.backend.deferred_persist",
+        effect = effect_name,
+        graph_iri = graph_iri.unwrap_or("<none>"),
+        elapsed_ms = field::Empty,
+        result = field::Empty,
+    );
+    let started = Instant::now();
+    let result = span.in_scope(|| -> Result<(), MetadataError> {
+        inner
+            .node
+            .persist_fjall()
+            .map_err(metadata_error_from_craqle)?;
+        flush_irokle_journal(inner, effect_name, graph_iri)?;
+        Ok(())
+    });
+    record_elapsed(&span, "elapsed_ms", started);
+    match result {
+        Ok(()) => {
+            span.record("result", "ok");
+        }
+        Err(error) => {
+            record_error(&span, &error.to_string());
+            warn!(
+                event = "metadata.backend.deferred_persist.failed",
+                effect = effect_name,
+                graph_iri = graph_iri.unwrap_or("<none>"),
+                error = %error,
+                "Deferred metadata persist failed"
+            );
+        }
+    }
+}
+
+fn metadata_request_persists_irokle(durability: MetadataRequestDurability) -> bool {
+    matches!(durability, MetadataRequestDurability::Durable)
 }
 
 fn upsert_data_entity(
@@ -1551,6 +2314,9 @@ fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
         CraqleError::MultiGraphUpdateUnsupported => {
             MetadataError::InvalidInput("unsupported update across multiple graphs".to_string())
         }
+        CraqleError::Update(craqle::UpdateError::ValidationFailed(violations)) => {
+            MetadataError::InvalidInput(format!("validation failed: {violations:?}"))
+        }
         other => MetadataError::Backend(other.to_string()),
     }
 }
@@ -1579,6 +2345,7 @@ fn warn_if_slow_metadata_backend(
     graph_iri: Option<&str>,
     duration: Duration,
 ) {
+    CRAQLE_LATENCY.record(operation, duration);
     if duration >= SLOW_METADATA_BACKEND_THRESHOLD {
         warn!(
             event = "metadata.backend.slow_call",
@@ -1622,6 +2389,8 @@ fn record_metadata_result(
 
 fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
     match effect {
+        MetadataEffect::ValidateCreateCrate { .. } => "validate_create_crate",
+        MetadataEffect::ValidateRoCrate { .. } => "validate_rocrate",
         MetadataEffect::CreateCrate { .. } => "create_crate",
         MetadataEffect::ApplyRoCrate { .. } => "apply_rocrate",
         MetadataEffect::UpsertDataEntity { .. } => "upsert_data_entity",
@@ -1643,6 +2412,7 @@ fn metadata_effect_kind(effect: &MetadataEffect) -> &'static str {
 
 fn metadata_event_kind(event: &MetadataEvent) -> &'static str {
     match event {
+        MetadataEvent::ValidationResult { .. } => "validation_result",
         MetadataEvent::CreateCrateResult { .. } => "create_crate_result",
         MetadataEvent::ApplyRoCrateResult { .. } => "apply_rocrate_result",
         MetadataEvent::EntityUpsertResult { .. } => "entity_upsert_result",
@@ -1696,6 +2466,8 @@ fn metadata_transport_message_kind(message: &MetadataTransportMessage) -> &'stat
 
 fn effect_graph_iri(effect: &MetadataEffect) -> Option<String> {
     match effect {
+        MetadataEffect::ValidateCreateCrate { request } => Some(request.graph_iri.clone()),
+        MetadataEffect::ValidateRoCrate { request } => Some(request.graph_iri.clone()),
         MetadataEffect::CreateCrate { request } => Some(request.graph_iri.clone()),
         MetadataEffect::ApplyRoCrate { request } => Some(request.graph_iri.clone()),
         MetadataEffect::UpsertDataEntity { request }
@@ -1735,6 +2507,13 @@ fn craqle_create_request(request: MetadataCreateCrateRequest) -> CreateCrateRequ
         request.license,
         craqle_graph_policy(request.policy),
     )
+}
+
+fn craqle_request_durability(durability: MetadataRequestDurability) -> CraqleRequestDurability {
+    match durability {
+        MetadataRequestDurability::Durable => CraqleRequestDurability::Durable,
+        MetadataRequestDurability::WalAlreadyDurable => CraqleRequestDurability::WalAlreadyDurable,
+    }
 }
 
 fn craqle_graph_policy(policy: MetadataGraphPolicy) -> GraphPolicy {
@@ -1848,39 +2627,191 @@ fn metadata_search_hit_from_craqle(
 #[tracing::instrument(
     name = "metadata.registry.list_local",
     level = "debug",
-    skip(storage_handle),
+    skip(inner),
     fields(
-        page_count = field::Empty,
+        cache_hit = field::Empty,
+        stale = field::Empty,
         record_count = field::Empty,
         elapsed_ms = field::Empty,
     )
 )]
 async fn list_local_registry_records(
-    storage_handle: StorageHandle,
-) -> Result<Vec<MetadataRegistryRecord>, MetadataError> {
+    inner: Arc<MetadataInner>,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
     let started = Instant::now();
     let span = Span::current();
+    match inner.visibility_cache.registry_records_any() {
+        Some((records, fresh)) => {
+            if !fresh {
+                spawn_visibility_cache_refill(inner.clone());
+            }
+            span.record("cache_hit", true);
+            span.record("stale", !fresh);
+            span.record("record_count", records.len() as u64);
+            record_elapsed(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+        None => {
+            // Cold start only: block until the first fill completes.
+            let _fill = inner
+                .visibility_cache
+                .registry_fill
+                .clone()
+                .lock_owned()
+                .await;
+            if let Some((records, true)) = inner.visibility_cache.registry_records_any() {
+                span.record("cache_hit", true);
+                span.record("stale", false);
+                span.record("record_count", records.len() as u64);
+                record_elapsed(&span, "elapsed_ms", started);
+                return Ok(records);
+            }
+            span.record("cache_hit", false);
+            let records = fill_visibility_caches(&inner).await?;
+            span.record("record_count", records.len() as u64);
+            record_elapsed(&span, "elapsed_ms", started);
+            Ok(records)
+        }
+    }
+}
+
+// Single-flight background refill; readers keep being served the stale entry
+// until the new Arc is swapped in.
+fn spawn_visibility_cache_refill(inner: Arc<MetadataInner>) {
+    let Ok(guard) = inner.visibility_cache.registry_fill.clone().try_lock_owned() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _guard = guard;
+        if let Some((_, true)) = inner.visibility_cache.registry_records_any() {
+            return;
+        }
+        if let Err(error) = fill_visibility_caches(&inner).await {
+            warn!(
+                event = "metadata.visibility.refill_failed",
+                error = %error,
+                "Background metadata visibility cache refill failed; serving stale entries"
+            );
+        }
+    });
+}
+
+#[tracing::instrument(
+    name = "metadata.visibility.fill",
+    level = "debug",
+    skip(inner),
+    fields(
+        registry_pages = field::Empty,
+        lifecycle_pages = field::Empty,
+        record_count = field::Empty,
+        deleted_count = field::Empty,
+        elapsed_ms = field::Empty,
+    )
+)]
+async fn fill_visibility_caches(
+    inner: &Arc<MetadataInner>,
+) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
+    let started = Instant::now();
+    let span = Span::current();
+
     let mut records = Vec::new();
     let mut start_after = None;
-    let mut page_count = 0usize;
+    let mut registry_pages = 0usize;
     loop {
-        let event = storage_handle
-            .send_effect(iter_all_registry_effect(start_after.clone(), None))
+        let event = inner
+            .storage_handle
+            .send_effect(iter_all_registry_effect(start_after, None))
             .await;
         let (mut page, next_start_after) = parse_registry_iter(event).map_err(|error| {
             MetadataError::Backend(format!("metadata registry iteration failed: {error:?}"))
         })?;
-        page_count += 1;
+        registry_pages += 1;
         records.append(&mut page);
-        span.record("page_count", page_count as u64);
-        span.record("record_count", records.len() as u64);
-        if let Some(cursor) = next_start_after {
-            start_after = Some(cursor);
-        } else {
-            record_elapsed(&span, "elapsed_ms", started);
-            return Ok(records);
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
         }
     }
+    span.record("registry_pages", registry_pages as u64);
+    span.record("record_count", records.len() as u64);
+    // The registry keyspace iterates in (group, document) order; snapshot
+    // consumers binary-search by document id (registry_record_for_graph).
+    records.sort_unstable_by_key(|record| record.document_id);
+
+    // Lifecycle records are deletion tombstones, so one keyspace sweep
+    // refreshes the deleted-state of every registry graph without per-graph
+    // point reads.
+    let (deleted_graphs, lifecycle_pages) = list_deleted_graph_iris(inner).await?;
+    span.record("lifecycle_pages", lifecycle_pages as u64);
+    span.record("deleted_count", deleted_graphs.len() as u64);
+
+    let lifecycle_entries = records
+        .iter()
+        .map(|record| {
+            (
+                record.graph_iri.clone(),
+                deleted_graphs.contains(&record.graph_iri),
+            )
+        })
+        .collect::<Vec<_>>();
+    let records = Arc::new(records);
+    inner
+        .visibility_cache
+        .refresh_lifecycle_deleted(lifecycle_entries);
+    inner
+        .visibility_cache
+        .store_registry_records(records.clone());
+    record_elapsed(&span, "elapsed_ms", started);
+    Ok(records)
+}
+
+async fn list_deleted_graph_iris(
+    inner: &Arc<MetadataInner>,
+) -> Result<(HashSet<String>, usize), MetadataError> {
+    let mut deleted = HashSet::new();
+    let mut start_after = None;
+    let mut pages = 0usize;
+    loop {
+        let event = inner
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Iter {
+                key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+                prefix: None,
+                start_after,
+                limit: REGISTRY_FILL_PAGE_SIZE,
+                txn_id: None,
+            }))
+            .await;
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(MetadataError::Backend(format!(
+                    "metadata graph lifecycle iteration failed: {error:?}"
+                )));
+            }
+            other => {
+                return Err(MetadataError::Backend(format!(
+                    "unexpected metadata graph lifecycle iteration result: {other:?}"
+                )));
+            }
+        };
+        pages += 1;
+        for (_, value) in values {
+            let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&value)
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+            if record.is_deleted() {
+                deleted.insert(record.graph_iri);
+            }
+        }
+        match next_start_after {
+            Some(cursor) => start_after = Some(cursor),
+            None => break,
+        }
+    }
+    Ok((deleted, pages))
 }
 
 #[tracing::instrument(
@@ -1892,6 +2823,7 @@ async fn list_local_registry_records(
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
         registry_records = field::Empty,
         authorized_graphs = field::Empty,
+        readable_groups = field::Empty,
         registry_ms = field::Empty,
         authorization_ms = field::Empty,
         craqle_query_ms = field::Empty,
@@ -1911,39 +2843,65 @@ async fn query_local_graphs(
     let total_started = Instant::now();
 
     let registry_started = Instant::now();
-    let records = list_local_registry_records(inner.storage_handle.clone()).await?;
+    let records = list_local_registry_records(inner.clone()).await?;
     record_elapsed(&span, "registry_ms", registry_started);
     span.record("registry_records", records.len() as u64);
 
     let authorization_started = Instant::now();
-    let allowed = select_authorized_graphs(
-        inner.storage_handle.clone(),
-        auth_context,
-        records,
-        graph_iris,
-    )
-    .await?;
+    // Document-scoped queries keep the eager per-record selection; the
+    // all-metadata path defers per-graph visibility to query evaluation.
+    let scope = match graph_iris {
+        Some(graph_iris) => LocalReadScope::Eager(
+            select_authorized_graphs(inner.clone(), auth_context, records, Some(graph_iris))
+                .await?,
+        ),
+        None => LocalReadScope::Lazy(
+            resolve_graph_visibility_scope(&inner, auth_context, records).await?,
+        ),
+    };
     record_elapsed(&span, "authorization_ms", authorization_started);
-    span.record("authorized_graphs", allowed.len() as u64);
+    let lazy = match &scope {
+        LocalReadScope::Eager(allowed) => {
+            span.record("authorized_graphs", allowed.len() as u64);
+            false
+        }
+        LocalReadScope::Lazy(scope) => {
+            span.record("readable_groups", scope.readable_groups.len() as u64);
+            true
+        }
+    };
 
     let query_span = debug_span!(
         "metadata.backend.craqle.query_graphs",
-        graph_count = allowed.len() as u64,
+        lazy,
+        graph_count = field::Empty,
         query_len = sparql.len() as u64,
         elapsed_ms = field::Empty,
         result = field::Empty,
         row_count = field::Empty,
         triple_count = field::Empty,
     );
+    if let LocalReadScope::Eager(allowed) = &scope {
+        query_span.record("graph_count", allowed.len() as u64);
+    }
     let blocking_span = query_span.clone();
     let query_started = Instant::now();
+    // Queries are reads: take from the read pool so they never queue behind
+    // long-running materializations holding the mutation permits.
+    let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
     let result = match tokio::task::spawn_blocking(move || {
         blocking_span.in_scope(|| {
-            inner
-                .node
-                .query_graphs(&graph_ids(&allowed), &sparql)
-                .map(metadata_query_results_from_craqle)
-                .map_err(|error| MetadataError::Backend(error.to_string()))
+            match scope {
+                LocalReadScope::Eager(allowed) => {
+                    inner.node.query_graphs(&graph_ids(&allowed), &sparql)
+                }
+                LocalReadScope::Lazy(scope) => inner.node.query_graphs_with(
+                    |graph| scope.graph_visible(&inner.visibility_cache, graph.as_str()),
+                    &sparql,
+                ),
+            }
+            .map(metadata_query_results_from_craqle)
+            .map_err(|error| MetadataError::Backend(error.to_string()))
         })
     })
     .await
@@ -1981,6 +2939,7 @@ async fn query_local_graphs(
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
         registry_records = field::Empty,
         authorized_graphs = field::Empty,
+        readable_groups = field::Empty,
         registry_ms = field::Empty,
         authorization_ms = field::Empty,
         craqle_search_ms = field::Empty,
@@ -2000,48 +2959,77 @@ async fn search_local_graphs(
     let total_started = Instant::now();
 
     let registry_started = Instant::now();
-    let records = list_local_registry_records(inner.storage_handle.clone()).await?;
+    let records = list_local_registry_records(inner.clone()).await?;
     record_elapsed(&span, "registry_ms", registry_started);
     span.record("registry_records", records.len() as u64);
 
     let authorization_started = Instant::now();
-    let allowed_records = select_authorized_records(
-        inner.storage_handle.clone(),
-        auth_context,
-        records,
-        graph_iris,
-    )
-    .await?;
+    // Graph-scoped searches keep the eager per-record selection; the
+    // all-metadata path authorizes per hit against the visibility scope.
+    let scope = match graph_iris {
+        Some(graph_iris) => LocalReadScope::Eager(
+            select_authorized_records(inner.clone(), auth_context, records, Some(graph_iris))
+                .await?,
+        ),
+        None => LocalReadScope::Lazy(
+            resolve_graph_visibility_scope(&inner, auth_context, records).await?,
+        ),
+    };
     record_elapsed(&span, "authorization_ms", authorization_started);
-    span.record("authorized_graphs", allowed_records.len() as u64);
+    let lazy = match &scope {
+        LocalReadScope::Eager(allowed_records) => {
+            span.record("authorized_graphs", allowed_records.len() as u64);
+            false
+        }
+        LocalReadScope::Lazy(scope) => {
+            span.record("readable_groups", scope.readable_groups.len() as u64);
+            true
+        }
+    };
 
     let search_span = debug_span!(
         "metadata.backend.craqle.search",
-        graph_count = allowed_records.len() as u64,
+        lazy,
+        graph_count = field::Empty,
         query_len = query.len() as u64,
         limit = limit as u64,
         elapsed_ms = field::Empty,
         result = field::Empty,
         hit_count = field::Empty,
     );
+    if let LocalReadScope::Eager(allowed_records) = &scope {
+        search_span.record("graph_count", allowed_records.len() as u64);
+    }
     let blocking_span = search_span.clone();
     let search_started = Instant::now();
+    let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
     let result = match tokio::task::spawn_blocking(move || {
         blocking_span.in_scope(|| {
-            let by_graph: HashMap<_, _> = allowed_records
-                .into_iter()
-                .map(|record| (record.graph_iri.clone(), record))
-                .collect();
-            inner
+            let hits = inner
                 .node
                 .search(&AllowAllAuthorizer, &query, limit)
-                .map(|hits| {
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+            Ok(match scope {
+                LocalReadScope::Eager(allowed_records) => {
+                    let by_graph: HashMap<_, _> = allowed_records
+                        .into_iter()
+                        .map(|record| (record.graph_iri.clone(), record))
+                        .collect();
                     hits.into_iter()
                         .filter_map(|hit| by_graph.get(&hit.graph_id).map(|record| (hit, record)))
                         .map(|(hit, record)| metadata_search_hit_from_craqle(hit, record))
                         .collect::<Vec<_>>()
-                })
-                .map_err(|error| MetadataError::Backend(error.to_string()))
+                }
+                LocalReadScope::Lazy(scope) => hits
+                    .into_iter()
+                    .filter_map(|hit| {
+                        scope
+                            .record_for_graph(&hit.graph_id)
+                            .filter(|record| scope.record_visible(&inner.visibility_cache, record))
+                            .map(|record| metadata_search_hit_from_craqle(hit, record))
+                    })
+                    .collect(),
+            })
         })
     })
     .await
@@ -2070,13 +3058,13 @@ async fn search_local_graphs(
 }
 
 async fn select_authorized_graphs(
-    storage_handle: StorageHandle,
+    inner: Arc<MetadataInner>,
     auth_context: Option<AuthContext>,
-    records: Vec<MetadataRegistryRecord>,
+    records: Arc<Vec<MetadataRegistryRecord>>,
     graph_filter: Option<Vec<String>>,
 ) -> Result<Vec<String>, MetadataError> {
     Ok(
-        select_authorized_records(storage_handle, auth_context, records, graph_filter)
+        select_authorized_records(inner, auth_context, records, graph_filter)
             .await?
             .into_iter()
             .map(|record| record.graph_iri)
@@ -2087,13 +3075,16 @@ async fn select_authorized_graphs(
 #[tracing::instrument(
     name = "metadata.authorization.select_records",
     level = "debug",
-    skip(storage_handle, auth_context, records, graph_filter),
+    skip(inner, auth_context, records, graph_filter),
     fields(
         record_count = records.len() as u64,
         graph_filter_count = graph_filter.as_ref().map_or(0, Vec::len) as u64,
         visible_count = field::Empty,
         deleted_count = field::Empty,
         filtered_count = field::Empty,
+        lifecycle_cache_hits = field::Empty,
+        lifecycle_cache_misses = field::Empty,
+        lifecycle_reads = field::Empty,
         public_count = field::Empty,
         private_checked_count = field::Empty,
         denied_count = field::Empty,
@@ -2101,9 +3092,9 @@ async fn select_authorized_graphs(
     )
 )]
 async fn select_authorized_records(
-    storage_handle: StorageHandle,
+    inner: Arc<MetadataInner>,
     auth_context: Option<AuthContext>,
-    records: Vec<MetadataRegistryRecord>,
+    records: Arc<Vec<MetadataRegistryRecord>>,
     graph_filter: Option<Vec<String>>,
 ) -> Result<Vec<MetadataRegistryRecord>, MetadataError> {
     let span = Span::current();
@@ -2112,18 +3103,26 @@ async fn select_authorized_records(
     let mut visible = Vec::new();
     let mut deleted_count = 0usize;
     let mut filtered_count = 0usize;
+    let mut lifecycle_cache_hits = 0usize;
+    let mut lifecycle_cache_misses = 0usize;
     let mut public_count = 0usize;
     let mut private_checked_count = 0usize;
     let mut denied_count = 0usize;
-    for record in records {
-        if metadata_graph_deleted(storage_handle.clone(), &record.graph_iri).await? {
-            deleted_count += 1;
-            continue;
-        }
+    for record in records.iter() {
         if let Some(filter) = allowed_graphs.as_ref()
             && !filter.contains(&record.graph_iri)
         {
             filtered_count += 1;
+            continue;
+        }
+        let deleted = metadata_graph_deleted_allow_stale(&inner, &record.graph_iri).await?;
+        if deleted.cache_hit {
+            lifecycle_cache_hits += 1;
+        } else {
+            lifecycle_cache_misses += 1;
+        }
+        if deleted.deleted {
+            deleted_count += 1;
             continue;
         }
         if record.public {
@@ -2131,8 +3130,10 @@ async fn select_authorized_records(
         } else {
             private_checked_count += 1;
         }
-        if can_read_record_locally(storage_handle.clone(), auth_context.clone(), &record).await? {
-            visible.push(record);
+        if can_read_record_locally(inner.storage_handle.clone(), auth_context.clone(), record)
+            .await?
+        {
+            visible.push(record.clone());
         } else {
             denied_count += 1;
         }
@@ -2140,6 +3141,9 @@ async fn select_authorized_records(
     span.record("visible_count", visible.len() as u64);
     span.record("deleted_count", deleted_count as u64);
     span.record("filtered_count", filtered_count as u64);
+    span.record("lifecycle_cache_hits", lifecycle_cache_hits as u64);
+    span.record("lifecycle_cache_misses", lifecycle_cache_misses as u64);
+    span.record("lifecycle_reads", lifecycle_cache_misses as u64);
     span.record("public_count", public_count as u64);
     span.record("private_checked_count", private_checked_count as u64);
     span.record("denied_count", denied_count as u64);
@@ -2179,6 +3183,111 @@ async fn can_read_record_locally(
     )
     .await
     .map_err(|error| MetadataError::Backend(error.to_string()))
+}
+
+// All-metadata reads defer per-graph authorization to evaluation time: the
+// scope is resolved once per query (O(caller's groups)) and the per-graph
+// decision is a cheap synchronous lookup that craqle memoizes per query.
+enum LocalReadScope<T> {
+    Eager(T),
+    Lazy(GraphVisibilityScope),
+}
+
+struct GraphVisibilityScope {
+    records: Arc<Vec<MetadataRegistryRecord>>,
+    auth_realm: Option<RealmId>,
+    readable_groups: HashSet<GroupId>,
+}
+
+impl GraphVisibilityScope {
+    fn record_for_graph(&self, graph_iri: &str) -> Option<&MetadataRegistryRecord> {
+        registry_record_for_graph(&self.records, graph_iri)
+    }
+
+    fn record_visible(
+        &self,
+        visibility_cache: &MetadataVisibilityCache,
+        record: &MetadataRegistryRecord,
+    ) -> bool {
+        if matches!(
+            visibility_cache.lifecycle_deleted_any(&record.graph_iri),
+            Some((true, _))
+        ) {
+            return false;
+        }
+        record.public
+            || (self.auth_realm == Some(record.realm_id)
+                && self.readable_groups.contains(&record.group_id))
+    }
+
+    // Graphs without a registry record stay invisible (fail closed).
+    fn graph_visible(&self, visibility_cache: &MetadataVisibilityCache, graph_iri: &str) -> bool {
+        self.record_for_graph(graph_iri)
+            .is_some_and(|record| self.record_visible(visibility_cache, record))
+    }
+}
+
+// Canonical graph IRIs embed the document id (graph_iri_for), enabling an
+// O(log n) lookup in the document-id-ordered snapshot; non-canonical IRIs
+// fall back to a scan.
+fn registry_record_for_graph<'a>(
+    records: &'a [MetadataRegistryRecord],
+    graph_iri: &str,
+) -> Option<&'a MetadataRegistryRecord> {
+    if let Some(document_id) = graph_iri
+        .rsplit('/')
+        .next()
+        .and_then(|tail| Ulid::from_string(tail).ok())
+        && let Ok(index) = records.binary_search_by(|record| record.document_id.cmp(&document_id))
+        && records[index].graph_iri == graph_iri
+    {
+        return Some(&records[index]);
+    }
+    records.iter().find(|record| record.graph_iri == graph_iri)
+}
+
+async fn resolve_graph_visibility_scope(
+    inner: &Arc<MetadataInner>,
+    auth_context: Option<AuthContext>,
+    records: Arc<Vec<MetadataRegistryRecord>>,
+) -> Result<GraphVisibilityScope, MetadataError> {
+    let auth_realm = auth_context.as_ref().map(|auth| auth.realm_id);
+    let mut readable_groups = HashSet::new();
+    if let Some(auth_context) = auth_context {
+        let context = DriverContext {
+            storage_handle: inner.storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+        let groups = drive(ListGroupOperation::new(), &context)
+            .await
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
+        for group in groups {
+            if group.realm_id != auth_context.realm_id {
+                continue;
+            }
+            let readable = drive(
+                CheckPermissionsOperation::new(CheckPermissionsConfig {
+                    auth_context: auth_context.clone(),
+                    path: format!("/{}/g/{}/meta/**", group.realm_id, group.group_id),
+                    required_permission: Permission::READ,
+                }),
+                &context,
+            )
+            .await
+            .unwrap_or(false);
+            if readable {
+                readable_groups.insert(group.group_id);
+            }
+        }
+    }
+    Ok(GraphVisibilityScope {
+        records,
+        auth_realm,
+        readable_groups,
+    })
 }
 
 #[tracing::instrument(
@@ -2269,4 +3378,221 @@ async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError
         })?
         .map(|_| ())
         .map_err(|error| MetadataError::Backend(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::structs::RealmId;
+
+    fn registry_record(document_path: &str) -> MetadataRegistryRecord {
+        let document_id = Ulid::new();
+        MetadataRegistryRecord {
+            realm_id: RealmId([7u8; 32]),
+            group_id: Ulid::new(),
+            document_id,
+            document_path: document_path.to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: format!("/metadata/{document_path}"),
+            holder_node_ids: Vec::new(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            last_event_id: Ulid::nil(),
+        }
+    }
+
+    fn filled_cache(records: Vec<MetadataRegistryRecord>) -> MetadataVisibilityCache {
+        let cache = MetadataVisibilityCache::new();
+        cache.store_registry_records(Arc::new(records));
+        cache
+    }
+
+    #[test]
+    fn upsert_replaces_existing_record_and_appends_new_ones() {
+        let mut existing = registry_record("datasets/a");
+        let cache = filled_cache(vec![existing.clone()]);
+
+        existing.public = false;
+        existing.updated_at_ms = 42;
+        let added = registry_record("datasets/b");
+        cache.upsert_registry_records(&[existing.clone(), added.clone()]);
+
+        let records = cache.registry_records().expect("cache entry");
+        assert_eq!(records.len(), 2);
+        let updated = records
+            .iter()
+            .find(|record| record.document_id == existing.document_id)
+            .expect("updated record");
+        assert!(!updated.public);
+        assert_eq!(updated.updated_at_ms, 42);
+        assert!(
+            records
+                .iter()
+                .any(|record| record.document_id == added.document_id)
+        );
+    }
+
+    #[test]
+    fn upsert_without_filled_cache_is_noop_until_refill() {
+        let cache = MetadataVisibilityCache::new();
+        cache.upsert_registry_records(&[registry_record("datasets/a")]);
+        assert!(cache.registry_records().is_none());
+    }
+
+    #[test]
+    fn remove_by_document_and_graph_drop_records() {
+        let by_document = registry_record("datasets/a");
+        let by_graph = registry_record("datasets/b");
+        let kept = registry_record("datasets/c");
+        let cache = filled_cache(vec![by_document.clone(), by_graph.clone(), kept.clone()]);
+
+        cache.remove_registry_record(by_document.document_id);
+        cache.remove_registry_records_by_graph(&by_graph.graph_iri);
+
+        let records = cache.registry_records().expect("cache entry");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].document_id, kept.document_id);
+    }
+
+    #[test]
+    fn upsert_does_not_extend_expiry_or_resurrect_expired_entries() {
+        let cache = filled_cache(vec![registry_record("datasets/a")]);
+        {
+            let mut registry = cache.registry.lock().unwrap();
+            registry.as_mut().expect("cache entry").expires_at =
+                Instant::now() - Duration::from_secs(1);
+        }
+
+        cache.upsert_registry_records(&[registry_record("datasets/b")]);
+
+        assert!(cache.registry_records().is_none());
+    }
+
+    #[test]
+    fn lifecycle_entry_removal_forces_storage_reread() {
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted("urn:graph:a".to_string(), false);
+        assert_eq!(cache.lifecycle_deleted("urn:graph:a"), Some(false));
+
+        cache.remove_lifecycle_entry("urn:graph:a");
+        assert_eq!(cache.lifecycle_deleted("urn:graph:a"), None);
+    }
+
+    #[test]
+    fn expired_registry_entry_is_served_stale_not_dropped() {
+        let record = registry_record("datasets/a");
+        let cache = filled_cache(vec![record.clone()]);
+        cache.expire_now();
+
+        assert!(cache.registry_records().is_none());
+        let (records, fresh) = cache.registry_records_any().expect("stale entry kept");
+        assert!(!fresh);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].document_id, record.document_id);
+
+        cache.store_registry_records(Arc::new(vec![record.clone()]));
+        let (_, fresh) = cache.registry_records_any().expect("fresh entry");
+        assert!(fresh);
+        assert!(cache.registry_records().is_some());
+    }
+
+    #[test]
+    fn expired_lifecycle_entry_is_served_stale_not_dropped() {
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted("urn:graph:a".to_string(), true);
+        cache.expire_now();
+
+        assert_eq!(cache.lifecycle_deleted("urn:graph:a"), None);
+        assert_eq!(cache.lifecycle_deleted_any("urn:graph:a"), Some((true, false)));
+    }
+
+    #[test]
+    fn registry_record_lookup_parses_iri_and_falls_back_to_scan() {
+        let mut records: Vec<_> = (0..4)
+            .map(|index| registry_record(&format!("datasets/{index}")))
+            .collect();
+        let mut custom = registry_record("datasets/custom");
+        custom.graph_iri = "https://example.org/custom-graph".to_string();
+        records.push(custom.clone());
+        records.sort_unstable_by_key(|record| record.document_id);
+
+        for record in &records {
+            let found =
+                registry_record_for_graph(&records, &record.graph_iri).expect("record found");
+            assert_eq!(found.document_id, record.document_id);
+        }
+        assert!(
+            registry_record_for_graph(
+                &records,
+                &MetadataRegistryRecord::graph_iri_for(Ulid::new())
+            )
+            .is_none()
+        );
+        assert!(registry_record_for_graph(&records, "https://example.org/missing").is_none());
+    }
+
+    #[test]
+    fn visibility_scope_enforces_public_group_and_lifecycle_rules() {
+        let realm = RealmId([7u8; 32]);
+        let mut public_record = registry_record("datasets/public");
+        public_record.public = true;
+        let mut private_record = registry_record("datasets/private");
+        private_record.public = false;
+        let mut deleted_record = registry_record("datasets/deleted");
+        deleted_record.public = true;
+        let mut records = vec![
+            public_record.clone(),
+            private_record.clone(),
+            deleted_record.clone(),
+        ];
+        records.sort_unstable_by_key(|record| record.document_id);
+
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted(deleted_record.graph_iri.clone(), true);
+
+        let anonymous = GraphVisibilityScope {
+            records: Arc::new(records.clone()),
+            auth_realm: None,
+            readable_groups: HashSet::new(),
+        };
+        assert!(anonymous.graph_visible(&cache, &public_record.graph_iri));
+        assert!(!anonymous.graph_visible(&cache, &private_record.graph_iri));
+        assert!(!anonymous.graph_visible(&cache, &deleted_record.graph_iri));
+        assert!(
+            !anonymous.graph_visible(&cache, &MetadataRegistryRecord::graph_iri_for(Ulid::new()))
+        );
+
+        let member = GraphVisibilityScope {
+            records: Arc::new(records.clone()),
+            auth_realm: Some(realm),
+            readable_groups: HashSet::from([private_record.group_id]),
+        };
+        assert!(member.graph_visible(&cache, &public_record.graph_iri));
+        assert!(member.graph_visible(&cache, &private_record.graph_iri));
+        assert!(!member.graph_visible(&cache, &deleted_record.graph_iri));
+
+        let wrong_realm = GraphVisibilityScope {
+            records: Arc::new(records),
+            auth_realm: Some(RealmId([8u8; 32])),
+            readable_groups: HashSet::from([private_record.group_id]),
+        };
+        assert!(wrong_realm.graph_visible(&cache, &public_record.graph_iri));
+        assert!(!wrong_realm.graph_visible(&cache, &private_record.graph_iri));
+    }
+
+    #[test]
+    fn lifecycle_refresh_restamps_entries_and_prunes_expired_leftovers() {
+        let cache = MetadataVisibilityCache::new();
+        cache.store_lifecycle_deleted("urn:graph:kept".to_string(), true);
+        cache.store_lifecycle_deleted("urn:graph:gone".to_string(), false);
+        cache.expire_now();
+        cache.store_lifecycle_deleted("urn:graph:fresh".to_string(), false);
+
+        cache.refresh_lifecycle_deleted(vec![("urn:graph:kept".to_string(), false)]);
+
+        assert_eq!(cache.lifecycle_deleted("urn:graph:kept"), Some(false));
+        assert_eq!(cache.lifecycle_deleted_any("urn:graph:gone"), None);
+        assert_eq!(cache.lifecycle_deleted("urn:graph:fresh"), Some(false));
+    }
 }
