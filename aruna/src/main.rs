@@ -25,7 +25,8 @@ use aruna_operations::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::ensure_realm_config::{EnsureRealmConfigConfig, EnsureRealmConfigOperation};
 use aruna_operations::incoming::initialize_net_incoming;
-use aruna_operations::metadata::MetadataHandle;
+use aruna_operations::metadata::projector::replay_metadata_event_log;
+use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions, spawn_metadata_warmup};
 use aruna_operations::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use aruna_operations::startup::RestoreTopicSubscriptionsOperation;
 use aruna_operations::task_incoming::initialize_task_incoming;
@@ -73,13 +74,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         warn!(error = %error, "Failed to refresh realm peers from persisted config during startup");
     }
     let task_handle = TaskHandle::new();
-    let metadata_handle = MetadataHandle::new(
+    let metadata_handle = MetadataHandle::new_with_options(
         &config.metadata_storage_path,
         config.node_id,
         storage_handle.clone(),
         Some(net_handle.clone()),
         Some(net_handle.irokle_node()),
         Some(net_handle.irokle_database()),
+        MetadataHandleOptions::default().with_search_storage(config.metadata_search_storage),
     )?;
     let blob_handle = BlobHandler::new(
         BackendConfig {
@@ -106,6 +108,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     initialize_net_incoming(driver_ctx.clone());
     initialize_task_incoming(driver_ctx.clone(), task_handle).await;
+
+    let replayed_metadata_events = replay_metadata_event_log(driver_ctx.as_ref()).await?;
+    if replayed_metadata_events > 0 {
+        info!(
+            replayed_metadata_events,
+            "Replayed metadata event log during startup"
+        );
+    }
+    spawn_metadata_warmup(driver_ctx.clone());
 
     match &config.startup_mode {
         StartupMode::InitializeRealm { realm_description } => {

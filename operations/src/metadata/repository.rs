@@ -1,3 +1,4 @@
+use aruna_core::document::DocumentSyncOutboxRecord;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
@@ -5,10 +6,15 @@ use aruna_core::keyspaces::{
     METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
     METADATA_INDEX_KEYSPACE,
 };
-use aruna_core::metadata::MetadataGraphLifecycleRecord;
+use aruna_core::metadata::{
+    MetadataCreateEventRecord, MetadataGraphLifecycleRecord, MetadataMaterializationJobRecord,
+    MetadataMaterializationStatusRecord,
+};
 pub use aruna_core::storage_entries::{
-    metadata_document_key, metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
-    metadata_registry_key, metadata_registry_prefix,
+    metadata_create_event_write_entry, metadata_document_key, metadata_graph_lifecycle_key,
+    metadata_graph_lifecycle_write_entry, metadata_materialization_job_key,
+    metadata_materialization_job_write_entry, metadata_materialization_status_key,
+    metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -17,6 +23,9 @@ use smallvec::smallvec;
 use ulid::Ulid;
 
 pub const LIST_METADATA_PAGE_SIZE: usize = 128;
+// Cache fills sweep whole keyspaces; large pages keep the number of storage
+// actor round trips low (the data volume is small, the trips dominate).
+pub const REGISTRY_FILL_PAGE_SIZE: usize = 8192;
 
 pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(48);
@@ -105,7 +114,7 @@ pub fn iter_all_registry_effect(start_after: Option<Key>, txn_id: Option<TxnId>)
         key_space: METADATA_INDEX_KEYSPACE.to_string(),
         prefix: None,
         start_after,
-        limit: LIST_METADATA_PAGE_SIZE,
+        limit: REGISTRY_FILL_PAGE_SIZE,
         txn_id,
     })
 }
@@ -158,6 +167,119 @@ pub fn write_audit_effect(
         value: postcard::to_allocvec(record)?.into(),
         txn_id,
     }))
+}
+
+pub fn write_create_event_effect(
+    event: &MetadataCreateEventRecord,
+) -> Result<Effect, ConversionError> {
+    let (key_space, key, value) = metadata_create_event_write_entry(event)?;
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space,
+        key,
+        value,
+        txn_id: None,
+    }))
+}
+
+pub fn write_create_records_effect(
+    record: &MetadataRegistryRecord,
+    audit: &MetadataAuditRecord,
+    audit_id: Ulid,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    write_create_records_and_outbox_effect(record, audit, audit_id, None, txn_id)
+}
+
+pub fn write_create_records_and_outbox_effect(
+    record: &MetadataRegistryRecord,
+    audit: &MetadataAuditRecord,
+    audit_id: Ulid,
+    outbox: Option<&DocumentSyncOutboxRecord>,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    let writes = create_records_and_outbox_write_entries(record, audit, audit_id, outbox)?;
+
+    Ok(Effect::Storage(StorageEffect::BatchWrite {
+        writes,
+        txn_id,
+    }))
+}
+
+pub fn create_records_and_outbox_write_entries(
+    record: &MetadataRegistryRecord,
+    audit: &MetadataAuditRecord,
+    audit_id: Ulid,
+    outbox: Option<&DocumentSyncOutboxRecord>,
+) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
+    let mut writes = vec![
+        (
+            METADATA_INDEX_KEYSPACE.to_string(),
+            metadata_registry_key(record.group_id, record.document_id),
+            postcard::to_allocvec(record)?.into(),
+        ),
+        (
+            METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
+            metadata_document_key(record.document_id),
+            postcard::to_allocvec(record)?.into(),
+        ),
+        (
+            METADATA_HOLDERS_KEYSPACE.to_string(),
+            metadata_registry_key(record.group_id, record.document_id),
+            postcard::to_allocvec(&record.holder_node_ids)?.into(),
+        ),
+        (
+            METADATA_AUDIT_KEYSPACE.to_string(),
+            metadata_audit_key(record.group_id, record.document_id, audit_id),
+            postcard::to_allocvec(audit)?.into(),
+        ),
+    ];
+    if let Some(outbox) = outbox {
+        writes.push(crate::document_sync_outbox::outbox_write_entry(outbox)?);
+    }
+
+    Ok(writes)
+}
+
+pub fn write_create_records_outbox_and_materialization_effect(
+    record: &MetadataRegistryRecord,
+    audit: &MetadataAuditRecord,
+    audit_id: Ulid,
+    outbox: Option<&DocumentSyncOutboxRecord>,
+    materialization_status: &MetadataMaterializationStatusRecord,
+    materialization_job: &MetadataMaterializationJobRecord,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    let base_writes = create_records_outbox_and_materialization_write_entries(
+        record,
+        audit,
+        audit_id,
+        outbox,
+        materialization_status,
+        materialization_job,
+    )?;
+
+    Ok(Effect::Storage(StorageEffect::BatchWrite {
+        writes: base_writes,
+        txn_id,
+    }))
+}
+
+pub fn create_records_outbox_and_materialization_write_entries(
+    record: &MetadataRegistryRecord,
+    audit: &MetadataAuditRecord,
+    audit_id: Ulid,
+    outbox: Option<&DocumentSyncOutboxRecord>,
+    materialization_status: &MetadataMaterializationStatusRecord,
+    materialization_job: &MetadataMaterializationJobRecord,
+) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
+    let mut writes = create_records_and_outbox_write_entries(record, audit, audit_id, outbox)?;
+    writes.push(metadata_materialization_status_write_entry(
+        materialization_status,
+    )?);
+    writes.push(metadata_materialization_job_write_entry(
+        materialization_job,
+    )?);
+    Ok(writes)
 }
 
 pub fn parse_registry_read(
