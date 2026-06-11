@@ -15,19 +15,24 @@ use byteview::ByteView;
 use tracing::warn;
 use ulid::Ulid;
 
-const OUTBOX_RESTORE_PAGE_SIZE: usize = 256;
+// Sized so one single-flight drain run fills several full irokle topic-batch
+// streams per peer instead of paying the per-run scan/projection/fan-out
+// setup for a half-filled one. Records group by peer set, and every peer in
+// the set receives every topic in the group, so the cap scales with stream
+// capacity rather than peer count.
+pub const OUTBOX_DRAIN_BATCH_SIZE: usize = 4 * aruna_net::irokle::IROKLE_BATCH_SYNC_TOPIC_LIMIT;
 
-pub fn outbox_prefix(target: &DocumentSyncTarget, event: &DocumentSyncOutboxEvent) -> Key {
+// Keys order by kind then outbox id (a ULID), so drains are FIFO instead of
+// following the random blake3 topic id order; the topic stays in the value.
+pub fn outbox_prefix(event: &DocumentSyncOutboxEvent) -> Key {
     let mut bytes = b"document-sync-outbox-v1/".to_vec();
     bytes.extend_from_slice(event.kind());
-    bytes.push(b'/');
-    bytes.extend_from_slice(target.irokle_topic_id().to_string().as_bytes());
     bytes.push(b'/');
     ByteView::from(bytes)
 }
 
 pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
-    let mut bytes = outbox_prefix(&record.target, &record.event).to_vec();
+    let mut bytes = outbox_prefix(&record.event).to_vec();
     bytes.extend_from_slice(&record.outbox_id.to_bytes());
     ByteView::from(bytes)
 }
@@ -53,23 +58,32 @@ pub fn write_outbox_effect(record: &DocumentSyncOutboxRecord) -> Result<Effect, 
     write_outbox_effect_with_txn(record, None)
 }
 
+pub fn outbox_write_entry(
+    record: &DocumentSyncOutboxRecord,
+) -> Result<(String, ByteView, ByteView), postcard::Error> {
+    Ok((
+        DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+        outbox_key(record),
+        ByteView::from(postcard::to_allocvec(record)?),
+    ))
+}
+
 pub fn write_outbox_effect_with_txn(
     record: &DocumentSyncOutboxRecord,
     txn_id: Option<TxnId>,
 ) -> Result<Effect, postcard::Error> {
+    let (key_space, key, value) = outbox_write_entry(record)?;
     Ok(Effect::Storage(StorageEffect::Write {
-        key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
-        key: outbox_key(record),
-        value: ByteView::from(postcard::to_allocvec(record)?),
+        key_space,
+        key,
+        value,
         txn_id,
     }))
 }
 
-pub fn schedule_outbox_drain_effect(record: &DocumentSyncOutboxRecord) -> Effect {
+pub fn schedule_outbox_drain_effect() -> Effect {
     Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainDocumentSyncOutbox {
-            prefix: outbox_prefix(&record.target, &record.event).to_vec(),
-        },
+        key: TaskKey::DrainDocumentSyncOutbox,
         after: Duration::ZERO,
     })
 }
@@ -94,43 +108,60 @@ pub async fn read_outbox_record(
     }
 }
 
-pub async fn read_next_outbox_record(
+pub struct OutboxReadBatch {
+    pub records: Vec<(Vec<u8>, DocumentSyncOutboxRecord)>,
+    pub has_more: bool,
+}
+
+pub async fn read_outbox_records(
     storage: &StorageHandle,
     prefix: &[u8],
-) -> Result<Option<(Vec<u8>, DocumentSyncOutboxRecord, bool)>, String> {
+    limit: usize,
+) -> Result<OutboxReadBatch, String> {
+    let read_limit = limit.saturating_add(1);
     match storage
         .send_storage_effect(StorageEffect::Iter {
             key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(prefix.to_vec())),
             start_after: None,
-            limit: 2,
+            limit: read_limit,
             txn_id: None,
         })
         .await
     {
         Event::Storage(StorageEvent::IterResult { values, .. }) => {
-            let mut values = values.into_iter();
-            let Some((key, value)) = values.next() else {
-                return Ok(None);
-            };
-            let record = postcard::from_bytes(&value).map_err(|error| error.to_string())?;
-            Ok(Some((key.to_vec(), record, values.next().is_some())))
+            let has_more = values.len() > limit;
+            let mut records = Vec::with_capacity(values.len().min(limit));
+            for (key, value) in values.into_iter().take(limit) {
+                let record = postcard::from_bytes(&value).map_err(|error| error.to_string())?;
+                records.push((key.to_vec(), record));
+            }
+            Ok(OutboxReadBatch { records, has_more })
         }
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
     }
 }
 
-pub async fn delete_outbox_record(storage: &StorageHandle, key: &[u8]) -> Result<(), String> {
+pub async fn delete_outbox_records(
+    storage: &StorageHandle,
+    keys: Vec<Vec<u8>>,
+) -> Result<(), String> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let deletes = keys
+        .into_iter()
+        .map(|key| (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), ByteView::from(key)))
+        .collect();
     match storage
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
-            key: ByteView::from(key.to_vec()),
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes,
             txn_id: None,
         })
         .await
     {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
         Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
         other => Err(format!("unexpected storage event: {other:?}")),
     }
@@ -140,56 +171,34 @@ pub async fn restore_document_sync_outbox_timers(
     storage: &StorageHandle,
     task_handle: &TaskHandle,
 ) {
-    let mut start_after = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
-                prefix: None,
-                start_after: start_after.take(),
-                limit: OUTBOX_RESTORE_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await;
+    let event = storage
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+            prefix: None,
+            start_after: None,
+            limit: 1,
+            txn_id: None,
+        })
+        .await;
 
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => {
-                warn!(error = %error, "Failed to scan document sync outbox");
-                return;
-            }
-            other => {
-                warn!(event = ?other, "Unexpected event while scanning document sync outbox");
-                return;
-            }
-        };
-
-        for (_, value) in values {
-            let record = match postcard::from_bytes::<DocumentSyncOutboxRecord>(&value) {
-                Ok(record) => record,
-                Err(error) => {
-                    warn!(error = %error, "Failed to decode document sync outbox record while restoring timers");
-                    continue;
-                }
-            };
-            let effect = TaskEffect::ResetTimer {
-                key: TaskKey::DrainDocumentSyncOutbox {
-                    prefix: outbox_prefix(&record.target, &record.event).to_vec(),
-                },
-                after: Duration::ZERO,
-            };
-            let event = task_handle.send_effect(Effect::Task(effect)).await;
-            if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
-                warn!(message = %message, "Failed to restore document sync outbox timer");
-            }
+    let has_records = match event {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(error = %error, "Failed to scan document sync outbox");
+            return;
         }
+        other => {
+            warn!(event = ?other, "Unexpected event while scanning document sync outbox");
+            return;
+        }
+    };
 
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => break,
+    if has_records {
+        let event = task_handle
+            .send_effect(schedule_outbox_drain_effect())
+            .await;
+        if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
+            warn!(message = %message, "Failed to restore document sync outbox timer");
         }
     }
 }
@@ -213,18 +222,11 @@ mod tests {
 
     #[test]
     fn outbox_prefix_is_deterministic_and_kind_scoped() {
-        let target = target();
         let upsert = DocumentSyncOutboxEvent::Upsert { bytes: vec![1, 2] };
         let delete = DocumentSyncOutboxEvent::Delete;
 
-        assert_eq!(
-            outbox_prefix(&target, &upsert),
-            outbox_prefix(&target, &upsert)
-        );
-        assert_ne!(
-            outbox_prefix(&target, &upsert),
-            outbox_prefix(&target, &delete)
-        );
+        assert_eq!(outbox_prefix(&upsert), outbox_prefix(&upsert));
+        assert_ne!(outbox_prefix(&upsert), outbox_prefix(&delete));
     }
 
     #[test]
@@ -245,14 +247,32 @@ mod tests {
     }
 
     #[test]
-    fn outbox_key_is_unique_under_target_prefix() {
+    fn outbox_key_is_unique_under_kind_prefix() {
         let event = DocumentSyncOutboxEvent::Upsert { bytes: vec![1] };
         let left = new_outbox_record(node(1), target(), vec![node(2)], event.clone());
         let right = new_outbox_record(node(1), target(), vec![node(2)], event);
-        let prefix = outbox_prefix(&left.target, &left.event);
+        let prefix = outbox_prefix(&left.event);
 
         assert_ne!(outbox_key(&left), outbox_key(&right));
         assert!(outbox_key(&left).starts_with(prefix.as_ref()));
         assert!(outbox_key(&right).starts_with(prefix.as_ref()));
+    }
+
+    #[test]
+    fn outbox_keys_order_by_outbox_id_across_targets() {
+        let event = DocumentSyncOutboxEvent::Upsert { bytes: vec![1] };
+        let mut older = new_outbox_record(node(1), target(), vec![node(2)], event.clone());
+        older.outbox_id = Ulid::from_parts(1, 0);
+        let mut newer = new_outbox_record(
+            node(1),
+            DocumentSyncTarget::RealmConfig {
+                realm_id: RealmId::from_bytes([9u8; 32]),
+            },
+            vec![node(2)],
+            event,
+        );
+        newer.outbox_id = Ulid::from_parts(2, 0);
+
+        assert!(outbox_key(&older) < outbox_key(&newer));
     }
 }
