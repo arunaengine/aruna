@@ -2,11 +2,12 @@ mod shared;
 
 use aruna_api::routes::credentials::CreateS3PathRestriction;
 use aruna_core::structs::{PathRestriction, Permission, blob_group_permission_path};
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use reqwest::StatusCode;
 use shared::{
-    TestResult, create_bearer_token, create_group_via_http,
-    create_s3_credentials_with_restrictions_via_http, get_user_access, sign_scoped_bearer_token,
-    spawn_seed_node,
+    TestResult, create_bearer_token, create_group_via_http, create_s3_credentials_via_http,
+    create_s3_credentials_with_restrictions_via_http, get_user_access, s3_client,
+    sign_scoped_bearer_token, spawn_full_seed_node, spawn_seed_node,
 };
 
 fn create_request_restriction(pattern: String, permission: Permission) -> CreateS3PathRestriction {
@@ -34,6 +35,17 @@ async fn post_credentials(
         )
         .send()
         .await?)
+}
+
+fn service_error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
+where
+    E: ProvideErrorMetadata,
+{
+    result
+        .as_ref()
+        .err()
+        .and_then(|err| err.as_service_error().and_then(|inner| inner.code()))
+        .map(ToOwned::to_owned)
 }
 
 #[tokio::test]
@@ -237,6 +249,66 @@ async fn scoped_token_for_other_group_is_rejected() -> TestResult<()> {
     let response = post_credentials(&seed.base_url, &scoped_token, &group_b.group_id, None).await?;
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    seed.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn list_objects_v2_scoped_credentials_still_deny_outside_bucket_scope() -> TestResult<()> {
+    let seed = spawn_full_seed_node().await?;
+    let admin_token = create_bearer_token(
+        seed.context.as_ref(),
+        seed.user_id,
+        seed.realm_id,
+        seed.capabilities.clone(),
+    )
+    .await?;
+    let group =
+        create_group_via_http(&seed.base_url, &admin_token, "credentials-scope-list").await?;
+    let group_root =
+        blob_group_permission_path(seed.realm_id, group.group_id.parse()?, seed.net.node_id());
+    let bootstrap_credentials =
+        create_s3_credentials_via_http(&seed.base_url, &admin_token, &group.group_id).await?;
+    let s3_endpoint = seed
+        .s3
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("missing s3 endpoint"))?;
+    let bootstrap_client = s3_client(s3_endpoint, &bootstrap_credentials);
+
+    bootstrap_client
+        .create_bucket()
+        .bucket("allowed")
+        .send()
+        .await?;
+    bootstrap_client
+        .create_bucket()
+        .bucket("blocked")
+        .send()
+        .await?;
+
+    let scoped_token = sign_scoped_bearer_token(
+        &seed,
+        seed.user_id,
+        vec![PathRestriction {
+            pattern: format!("{group_root}/allowed/**"),
+            permission: Permission::WRITE,
+        }],
+    )?;
+    let credentials = create_s3_credentials_with_restrictions_via_http(
+        &seed.base_url,
+        &scoped_token,
+        &group.group_id,
+        None,
+    )
+    .await?;
+    let client = s3_client(s3_endpoint, &credentials);
+
+    let blocked_list = client.list_objects_v2().bucket("blocked").send().await;
+    assert_eq!(
+        service_error_code(&blocked_list).as_deref(),
+        Some("AccessDenied")
+    );
 
     seed.shutdown().await;
     Ok(())

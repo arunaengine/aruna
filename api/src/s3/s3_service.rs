@@ -1736,6 +1736,48 @@ mod tests {
         }
     }
 
+    async fn seed_materialized_keys(
+        storage_handle: &storage::StorageHandle,
+        bucket: &str,
+        keys: &[&str],
+        created_by: UserId,
+        created_at: SystemTime,
+    ) {
+        for key in keys {
+            let version_id = Ulid::new();
+            let hash = [key.len() as u8; 32];
+            write_head(storage_handle, bucket, key, version_id).await;
+            write_materialized_version(
+                storage_handle,
+                bucket,
+                key,
+                version_id,
+                hash,
+                created_by,
+                created_at,
+                42,
+            )
+            .await;
+        }
+    }
+
+    fn test_list_objects_v2_request(
+        extensions: Extensions,
+        input: ListObjectsV2Input,
+    ) -> S3Request<ListObjectsV2Input> {
+        S3Request {
+            input,
+            method: Method::GET,
+            uri: Uri::from_static("/"),
+            headers: HeaderMap::new(),
+            extensions,
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        }
+    }
+
     #[tokio::test]
     async fn test_list_objects_v2_delimiter_grouping() {
         let storage_dir = tempfile::tempdir().unwrap();
@@ -2131,5 +2173,185 @@ mod tests {
         );
 
         assert_eq!(output.is_truncated, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_honors_explicit_zero_max_keys() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([6u8; 32]);
+        let group_id = Ulid::new();
+        let created_by = UserId::local(Ulid::new(), realm_id);
+        let created_at = UNIX_EPOCH + Duration::from_secs(5);
+
+        let service = ArunaS3Service::new(
+            context.clone(),
+            realm_id,
+            NodeId::from_bytes(&[0u8; 32]).unwrap(),
+        )
+        .await;
+
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["alpha"],
+            created_by,
+            created_at,
+        )
+        .await;
+
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+
+        let req = test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
+                bucket: "bucket".to_string(),
+                continuation_token: None,
+                delimiter: None,
+                encoding_type: None,
+                expected_bucket_owner: None,
+                fetch_owner: None,
+                max_keys: Some(0),
+                optional_object_attributes: None,
+                prefix: None,
+                request_payer: None,
+                start_after: None,
+            },
+        );
+
+        let response = service.list_objects_v2(req).await.unwrap();
+        let output = response.output;
+
+        assert_eq!(output.max_keys, Some(0));
+        assert_eq!(output.key_count, Some(0));
+        assert_eq!(output.is_truncated, Some(false));
+        assert_eq!(output.contents.unwrap_or_default().len(), 0);
+        assert_eq!(output.common_prefixes.unwrap_or_default().len(), 0);
+        assert!(output.next_continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_start_after_filters_common_prefixes() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([7u8; 32]);
+        let group_id = Ulid::new();
+        let created_by = UserId::local(Ulid::new(), realm_id);
+        let created_at = UNIX_EPOCH;
+
+        let service = ArunaS3Service::new(
+            context.clone(),
+            realm_id,
+            NodeId::from_bytes(&[0u8; 32]).unwrap(),
+        )
+        .await;
+
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["dir-a/1", "dir-b/1", "root.txt"],
+            created_by,
+            created_at,
+        )
+        .await;
+
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+
+        let req = test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
+                bucket: "bucket".to_string(),
+                continuation_token: None,
+                delimiter: Some("/".to_string()),
+                encoding_type: None,
+                expected_bucket_owner: None,
+                fetch_owner: None,
+                max_keys: Some(10),
+                optional_object_attributes: None,
+                prefix: None,
+                request_payer: None,
+                start_after: Some("dir-b/".to_string()),
+            },
+        );
+
+        let response = service.list_objects_v2(req).await.unwrap();
+        let output = response.output;
+
+        let common_prefixes: Vec<_> = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|cp| cp.prefix)
+            .collect();
+        let contents: Vec<_> = output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|obj| obj.key)
+            .collect();
+
+        assert!(common_prefixes.is_empty());
+        assert_eq!(contents, vec!["root.txt"]);
+        assert_eq!(output.key_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_requires_user_access_extension() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([8u8; 32]);
+        let service =
+            ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
+
+        let req = test_list_objects_v2_request(
+            Extensions::new(),
+            ListObjectsV2Input {
+                bucket: "bucket".to_string(),
+                continuation_token: None,
+                delimiter: None,
+                encoding_type: None,
+                expected_bucket_owner: None,
+                fetch_owner: None,
+                max_keys: Some(10),
+                optional_object_attributes: None,
+                prefix: None,
+                request_payer: None,
+                start_after: None,
+            },
+        );
+
+        let err = service.list_objects_v2(req).await.unwrap_err();
+        assert_eq!(*err.code(), S3ErrorCode::UnexpectedContent);
     }
 }
