@@ -711,6 +711,24 @@ impl S3 for ArunaS3Service {
         let mut contents = Vec::new();
         let mut common_prefixes = BTreeSet::new();
 
+        if req.input.max_keys == Some(0) {
+            return Ok(S3Response::new(ListObjectsV2Output {
+                name: Some(bucket),
+                prefix,
+                max_keys: Some(0),
+                key_count: Some(0),
+                continuation_token: requested_continuation_token,
+                is_truncated: Some(false),
+                next_continuation_token: None,
+                contents: Some(contents),
+                common_prefixes: Some(Vec::new()),
+                delimiter,
+                encoding_type: req.input.encoding_type,
+                start_after,
+                ..Default::default()
+            }));
+        }
+
         let group_id = bucket_info
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
@@ -757,7 +775,15 @@ impl S3 for ArunaS3Service {
                     let prefix_start = prefix.as_ref().map(|prefix| prefix.len()).unwrap_or(0);
                     if let Some(relative_match) = key[prefix_start..].find(delimiter) {
                         let group_end = prefix_start + relative_match + delimiter.len();
-                        common_prefixes.insert(key[..group_end].to_string());
+                        let candidate_prefix = key[..group_end].to_string();
+                        if continuation_token.is_none()
+                            && start_after.as_ref().is_some_and(|start_after| {
+                                candidate_prefix.as_str() <= start_after.as_str()
+                            })
+                        {
+                            continue;
+                        }
+                        common_prefixes.insert(candidate_prefix);
                         if contents.len() + common_prefixes.len() >= max_keys {
                             next_continuation_token = if index + 1 < page_len {
                                 Some(head_bytes)

@@ -100,10 +100,7 @@ impl ListObjectsV2Operation {
     }
 
     fn max_keys(&self) -> usize {
-        self.input
-            .max_keys
-            .filter(|limit| *limit > 0)
-            .unwrap_or(Self::DEFAULT_MAX_KEYS)
+        self.input.max_keys.unwrap_or(Self::DEFAULT_MAX_KEYS)
     }
 
     fn handle_init(&mut self) -> Effects {
@@ -124,21 +121,32 @@ impl ListObjectsV2Operation {
 
         self.txn_id = Some(txn_id);
         let prefix = match BlobHeadKey::bucket_prefix(&self.input.bucket) {
-            Ok(p) => p,
+            Ok(prefix) => prefix,
             Err(err) => return self.emit_error(err.into()),
         };
-
-        let limit = if self.input.prefix.as_ref().is_some_and(|p| !p.is_empty()) {
-            self.max_keys().saturating_mul(4).saturating_add(1)
+        let start_after = if self.input.continuation_token.is_some() {
+            self.input.continuation_token.clone()
+        } else if let Some(prefix) = self
+            .input
+            .prefix
+            .as_ref()
+            .filter(|prefix| !prefix.is_empty())
+        {
+            match BlobHeadKey::object_prefix(&self.input.bucket, prefix) {
+                Ok(prefix) => Some(prefix),
+                Err(err) => return self.emit_error(err.into()),
+            }
         } else {
-            self.max_keys().saturating_add(1)
+            None
         };
+
+        let limit = self.max_keys().saturating_add(1);
 
         self.state = ListObjectsV2State::ReadHeads;
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start_after: self.input.continuation_token.clone().map(Into::into),
+            start_after: start_after.map(Into::into),
             limit,
             txn_id: self.txn_id,
         })]
@@ -156,6 +164,10 @@ impl ListObjectsV2Operation {
         let max_keys = self.max_keys();
         self.pending.clear();
         self.continuation_token = None;
+
+        if max_keys == 0 {
+            return self.read_next_version_or_finish();
+        }
 
         let has_prefix = self.input.prefix.as_ref().is_some_and(|p| !p.is_empty());
         let raw_count = values.len();
@@ -193,10 +205,11 @@ impl ListObjectsV2Operation {
                 self.continuation_token = continuation;
             }
         } else {
-            // Prefix filter: collect all matching keys; use non-matching
-            // keys as continuation points so no matches are skipped
+            // Prefix filter: we start scanning at the requested object prefix,
+            // then stop at the first key outside that contiguous prefix range.
             let prefix = self.input.prefix.as_ref().unwrap();
             let mut continuation = None;
+            let mut has_more_matches = false;
             for (key, value) in values {
                 let head = match BlobHeadKey::from_bytes(key.as_ref()) {
                     Ok(head) => head,
@@ -209,14 +222,18 @@ impl ListObjectsV2Operation {
                 if head.bucket != self.input.bucket {
                     continue;
                 }
-                if head.key.starts_with(prefix.as_str()) {
-                    if self.pending.len() < max_keys {
-                        self.pending.push((head, pointer.version_id));
-                        continuation = Some(key.to_vec());
-                    }
+                if !head.key.starts_with(prefix.as_str()) {
+                    break;
+                }
+                if self.pending.len() < max_keys {
+                    self.pending.push((head, pointer.version_id));
+                    continuation = Some(key.to_vec());
+                } else {
+                    has_more_matches = true;
+                    break;
                 }
             }
-            if self.pending.len() >= max_keys {
+            if has_more_matches {
                 self.continuation_token = continuation;
             }
         }
