@@ -52,6 +52,7 @@ pub mod remove_user_from_group;
 pub mod replicate_documents;
 pub mod replication;
 pub mod reserve_onboarding_secret;
+pub mod search_users;
 pub mod s3;
 pub mod staging;
 pub mod startup;
