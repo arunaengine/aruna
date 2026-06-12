@@ -43,7 +43,9 @@ use aruna_operations::s3::get_object::{
 };
 use aruna_operations::s3::head_object::{HeadObjectInput as HOI, HeadObjectOperation};
 use aruna_operations::s3::list_buckets::{ListBucketsInput as LBI, ListBucketsOperation};
-use aruna_operations::s3::list_objects_v2::{ListObjectsV2Input as LOV2I, ListObjectsV2Operation};
+use aruna_operations::s3::list_objects_v2::{
+    ListObjectsV2ContinuationToken, ListObjectsV2Input as LOV2I, ListObjectsV2Operation,
+};
 use aruna_operations::s3::put_bucket_replication::{
     DeleteBucketReplicationOperation, GetBucketReplicationOperation, PutBucketReplicationOperation,
 };
@@ -89,28 +91,6 @@ struct ReferenceMetadataRefresh {
     refreshed_at: SystemTime,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct ListObjectsV2ContinuationCursor {
-    backend_continuation_token: Vec<u8>,
-    last_common_prefix: Option<String>,
-}
-
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-enum ListObjectsV2LogicalEntry {
-    Content(Object),
-    CommonPrefix(String),
-}
-
-impl ListObjectsV2LogicalEntry {
-    fn last_common_prefix(&self) -> Option<&str> {
-        match self {
-            Self::Content(_) => None,
-            Self::CommonPrefix(prefix) => Some(prefix.as_str()),
-        }
-    }
-}
-
 fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
     match range {
         s3s::dto::Range::Int { first, last } => match last {
@@ -136,7 +116,6 @@ impl Debug for ArunaS3Service {
 }
 
 impl ArunaS3Service {
-    const LIST_OBJECTS_V2_MAX_PAGES: usize = 100;
     const LIST_OBJECTS_V2_MAX_KEYS: usize = 1000;
 
     #[tracing::instrument(level = "trace", skip(driver_ctx))]
@@ -457,26 +436,29 @@ impl ArunaS3Service {
 
     fn decode_list_objects_v2_continuation_token(
         token: Option<&str>,
-    ) -> S3Result<Option<ListObjectsV2ContinuationCursor>> {
+    ) -> S3Result<Option<ListObjectsV2ContinuationToken>> {
         token
             .map(|token| {
                 let decoded = STANDARD
                     .decode(token)
                     .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))?;
-                postcard::from_bytes(&decoded)
+                ListObjectsV2ContinuationToken::from_bytes(&decoded)
                     .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
             })
             .transpose()
     }
 
     fn encode_list_objects_v2_continuation_token(
-        token: Option<&ListObjectsV2ContinuationCursor>,
-    ) -> Option<String> {
-        token.and_then(|token| {
-            postcard::to_allocvec(token)
-                .ok()
-                .map(|token| STANDARD.encode(token))
-        })
+        token: Option<&ListObjectsV2ContinuationToken>,
+    ) -> S3Result<Option<String>> {
+        token
+            .map(|token| {
+                token
+                    .to_bytes()
+                    .map(|bytes| STANDARD.encode(bytes))
+                    .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))
+            })
+            .transpose()
     }
 }
 
@@ -727,15 +709,9 @@ impl S3 for ArunaS3Service {
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let requested_continuation_token = req.input.continuation_token.clone();
-        let continuation_cursor = Self::decode_list_objects_v2_continuation_token(
+        let continuation_token = Self::decode_list_objects_v2_continuation_token(
             requested_continuation_token.as_deref(),
         )?;
-        let mut continuation_token = continuation_cursor
-            .as_ref()
-            .map(|cursor| cursor.backend_continuation_token.clone());
-        let mut resume_common_prefix = continuation_cursor
-            .as_ref()
-            .and_then(|cursor| cursor.last_common_prefix.clone());
         let max_keys = match req.input.max_keys {
             None => Self::LIST_OBJECTS_V2_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
@@ -746,8 +722,6 @@ impl S3 for ArunaS3Service {
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
         let start_after = req.input.start_after.clone();
-
-        let mut logical_entries = Vec::new();
 
         // Early return in case of max_keys = 0
         if req.input.max_keys == Some(0) {
@@ -772,181 +746,54 @@ impl S3 for ArunaS3Service {
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
             .unwrap_or(user_access.group_id);
-        let mut next_continuation_token = None;
-        let mut backend_pages_scanned = 0usize;
 
-        loop {
-            let result = drive(
-                ListObjectsV2Operation::new(LOV2I {
-                    bucket: bucket.clone(),
-                    group_id,
-                    continuation_token: continuation_token.clone(),
-                    max_keys: Some(max_keys),
-                    prefix: prefix.clone(),
-                    start_after: start_after.clone(),
-                }),
-                &self.state,
-            )
-            .await
-            .and_then(|result| result.transpose())
-            .map_err(IntoS3Error::into_s3_error)?
-            .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
+        let result = drive(
+            ListObjectsV2Operation::new(LOV2I {
+                bucket: bucket.clone(),
+                group_id,
+                continuation_token,
+                max_keys: Some(max_keys),
+                prefix: prefix.clone(),
+                delimiter: delimiter.clone(),
+                start_after: start_after.clone(),
+            }),
+            &self.state,
+        )
+        .await
+        .and_then(|result| result.transpose())
+        .map_err(IntoS3Error::into_s3_error)?
+        .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
 
-            let page_next_continuation_token = result.continuation_token.clone();
-            let page_len = result.objects.len();
-            backend_pages_scanned += 1;
-            let mut previous_raw_token = continuation_token.clone();
-
-            for object in result.objects.into_iter() {
-                let head_bytes = object
-                    .head
-                    .to_bytes()
-                    .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
-                let key = object.head.key;
-
-                let logical_entry = if let Some(delimiter) = delimiter.as_ref() {
-                    let prefix_start = prefix.as_ref().map(|prefix| prefix.len()).unwrap_or(0);
-                    if let Some(relative_match) = key[prefix_start..].find(delimiter) {
-                        let group_end = prefix_start + relative_match + delimiter.len();
-                        let candidate_prefix = key[..group_end].to_string();
-                        if resume_common_prefix.as_ref() == Some(&candidate_prefix) {
-                            previous_raw_token = Some(head_bytes);
-                            continue;
-                        }
-                        if logical_entries
-                            .last()
-                            .and_then(ListObjectsV2LogicalEntry::last_common_prefix)
-                            == Some(candidate_prefix.as_str())
-                        {
-                            previous_raw_token = Some(head_bytes);
-                            continue;
-                        }
-
-                        ListObjectsV2LogicalEntry::CommonPrefix(candidate_prefix)
-                    } else {
-                        let response_fields = self.build_object_response_fields(
-                            object.location.as_ref(),
-                            object.source_metadata.as_ref(),
-                            object.last_refresh,
-                        );
-                        ListObjectsV2LogicalEntry::Content(Object {
-                            e_tag: response_fields.e_tag,
-                            key: Some(key),
-                            last_modified: response_fields.last_modified,
-                            owner: None,
-                            size: response_fields.content_length,
-                            ..Default::default()
-                        })
-                    }
-                } else {
-                    let response_fields = self.build_object_response_fields(
-                        object.location.as_ref(),
-                        object.source_metadata.as_ref(),
-                        object.last_refresh,
-                    );
-                    ListObjectsV2LogicalEntry::Content(Object {
-                        e_tag: response_fields.e_tag,
-                        key: Some(key),
-                        last_modified: response_fields.last_modified,
-                        owner: None,
-                        size: response_fields.content_length,
-                        ..Default::default()
-                    })
-                };
-
-                resume_common_prefix = None;
-
-                if logical_entries.len() < max_keys {
-                    logical_entries.push(logical_entry);
-                    previous_raw_token = Some(head_bytes);
-                    continue;
-                }
-
-                next_continuation_token =
-                    previous_raw_token
-                        .clone()
-                        .map(
-                            |backend_continuation_token| ListObjectsV2ContinuationCursor {
-                                backend_continuation_token,
-                                last_common_prefix: logical_entries
-                                    .last()
-                                    .and_then(ListObjectsV2LogicalEntry::last_common_prefix)
-                                    .map(str::to_string),
-                            },
-                        );
-                if next_continuation_token.is_none() && page_len > 0 {
-                    next_continuation_token =
-                        page_next_continuation_token
-                            .clone()
-                            .map(
-                                |backend_continuation_token| ListObjectsV2ContinuationCursor {
-                                    backend_continuation_token,
-                                    last_common_prefix: logical_entries
-                                        .last()
-                                        .and_then(ListObjectsV2LogicalEntry::last_common_prefix)
-                                        .map(str::to_string),
-                                },
-                            );
-                }
-                if next_continuation_token.is_some() {
-                    break;
-                }
-                previous_raw_token = Some(head_bytes);
-            }
-
-            if next_continuation_token.is_some() {
-                break;
-            }
-
-            if backend_pages_scanned >= Self::LIST_OBJECTS_V2_MAX_PAGES
-                && page_next_continuation_token.is_some()
-            {
-                warn!(
-                    bucket = %bucket,
-                    prefix = ?prefix,
-                    delimiter = ?delimiter,
-                    max_keys = %max_keys,
-                    visible_count = logical_entries.len(),
-                    pages = backend_pages_scanned,
-                    "ListObjectsV2 pagination guard triggered; returning truncated response"
+        let contents: Vec<Object> = result
+            .objects
+            .into_iter()
+            .map(|object| {
+                let response_fields = self.build_object_response_fields(
+                    object.location.as_ref(),
+                    object.source_metadata.as_ref(),
+                    object.last_refresh,
                 );
-                next_continuation_token =
-                    page_next_continuation_token
-                        .clone()
-                        .map(
-                            |backend_continuation_token| ListObjectsV2ContinuationCursor {
-                                backend_continuation_token,
-                                last_common_prefix: logical_entries
-                                    .last()
-                                    .and_then(ListObjectsV2LogicalEntry::last_common_prefix)
-                                    .map(str::to_string),
-                            },
-                        );
-                break;
-            }
-
-            continuation_token = page_next_continuation_token;
-            if continuation_token.is_none() {
-                break;
-            }
-        }
-
-        let is_truncated = next_continuation_token.is_some();
-        let mut contents = Vec::new();
-        let mut common_prefixes = Vec::new();
-        for entry in logical_entries {
-            match entry {
-                ListObjectsV2LogicalEntry::Content(object) => contents.push(object),
-                ListObjectsV2LogicalEntry::CommonPrefix(prefix) => {
-                    common_prefixes.push(CommonPrefix {
-                        prefix: Some(prefix),
-                    });
+                Object {
+                    e_tag: response_fields.e_tag,
+                    key: Some(object.head.key),
+                    last_modified: response_fields.last_modified,
+                    owner: None,
+                    size: response_fields.content_length,
+                    ..Default::default()
                 }
-            }
-        }
+            })
+            .collect();
+        let common_prefixes: Vec<CommonPrefix> = result
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| CommonPrefix {
+                prefix: Some(prefix),
+            })
+            .collect();
         let key_count = contents.len() + common_prefixes.len();
         let next_continuation_token =
-            Self::encode_list_objects_v2_continuation_token(next_continuation_token.as_ref());
+            Self::encode_list_objects_v2_continuation_token(result.continuation_token.as_ref())?;
+        let is_truncated = next_continuation_token.is_some();
 
         Ok(S3Response::new(ListObjectsV2Output {
             name: Some(bucket),
