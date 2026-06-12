@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
 use aruna_core::metadata::MetadataGraphLifecycleRecord;
@@ -80,7 +80,7 @@ impl ListMetadataDocumentsOperation {
         Effect::Storage(StorageEffect::Iter {
             key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
             prefix: None,
-            start_after,
+            start: start_after.map(IterStart::After),
             limit: LIST_METADATA_PAGE_SIZE,
             txn_id: None,
         })
@@ -310,7 +310,7 @@ mod tests {
             [Effect::Storage(StorageEffect::Iter {
                 key_space,
                 prefix: None,
-                start_after: None,
+                start: None,
                 ..
             })] if key_space == METADATA_GRAPH_LIFECYCLE_KEYSPACE
         ));

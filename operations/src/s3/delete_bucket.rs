@@ -123,7 +123,7 @@ impl DeleteBucketOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start_after: None,
+            start: None,
             limit: Self::SCAN_LIMIT,
             txn_id: self.txn_id,
         })]
@@ -151,7 +151,7 @@ impl DeleteBucketOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start_after: None,
+            start: None,
             limit: Self::SCAN_LIMIT,
             txn_id: self.txn_id,
         })]
@@ -174,7 +174,7 @@ impl DeleteBucketOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_UPLOAD_KEYSPACE.to_string(),
             prefix: None,
-            start_after: None,
+            start: None,
             limit: u64::MAX as usize,
             txn_id: self.txn_id,
         })]

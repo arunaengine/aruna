@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aruna_core::TopicId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{DhtEffect, Effect, NetEffect, StorageEffect};
+use aruna_core::effects::{DhtEffect, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
@@ -60,7 +60,7 @@ async fn test_storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>
         .send_effect(Effect::Storage(StorageEffect::Iter {
             key_space: "iter_test".to_string(),
             prefix: Some(ByteView::from(*b"a")),
-            start_after: None,
+            start: None,
             limit: 2,
             txn_id: None,
         }))
@@ -83,7 +83,7 @@ async fn test_storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>
         .send_effect(Effect::Storage(StorageEffect::Iter {
             key_space: "iter_test".to_string(),
             prefix: Some(ByteView::from(*b"a")),
-            start_after: next_start_after,
+            start: next_start_after.map(IterStart::After),
             limit: 2,
             txn_id: None,
         }))

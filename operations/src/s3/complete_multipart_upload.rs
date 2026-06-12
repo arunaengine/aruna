@@ -293,7 +293,7 @@ impl CompleteMultipartUploadOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_UPLOAD_PART_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start_after: None,
+            start: None,
             limit: 10_000,
             txn_id: None,
         })]

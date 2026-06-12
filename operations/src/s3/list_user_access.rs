@@ -1,4 +1,4 @@
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::USER_ACCESS_KEYSPACE;
@@ -67,7 +67,7 @@ impl ListUserAccessOperation {
         Effect::Storage(StorageEffect::Iter {
             key_space: USER_ACCESS_KEYSPACE.to_string(),
             prefix: None,
-            start_after,
+            start: start_after.map(IterStart::After),
             limit: Self::SCAN_LIMIT,
             txn_id: None,
         })

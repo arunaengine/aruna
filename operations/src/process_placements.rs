@@ -1,6 +1,6 @@
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
@@ -115,7 +115,7 @@ impl ProcessPlacementsOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
             prefix: Some(placement_prefix(self.config.realm_id)),
-            start_after: self.next_start_after.take(),
+            start: self.next_start_after.take().map(IterStart::After),
             limit: PENDING_PLACEMENT_PAGE_SIZE,
             txn_id: None,
         })]

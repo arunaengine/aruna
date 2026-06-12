@@ -257,7 +257,7 @@ impl DeleteObjectOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix),
-            start_after: None,
+            start: None,
             limit: u64::MAX as usize,
             txn_id: self.txn_id,
         })]
@@ -465,7 +465,7 @@ impl DeleteObjectOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
             prefix: Some(prefix),
-            start_after: None,
+            start: None,
             limit: 10_000,
             txn_id: self.txn_id,
         })]

@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
@@ -54,7 +54,7 @@ pub async fn restore_persisted_task_timers(storage: &StorageHandle, task_handle:
             .send_storage_effect(StorageEffect::Iter {
                 key_space: TASK_TIMER_KEYSPACE.to_string(),
                 prefix: None,
-                start_after: start_after.take(),
+                start: start_after.take().map(IterStart::After),
                 limit: TASK_TIMER_RESTORE_PAGE_SIZE,
                 txn_id: None,
             })

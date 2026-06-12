@@ -1,5 +1,5 @@
 use aruna_core::USER_KEYSPACE;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::{Operation, boxed_suboperation};
@@ -110,7 +110,7 @@ impl ListUsersOperation {
         Ok(smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: USER_KEYSPACE.to_string(),
             prefix: Some(UserId::storage_prefix(self.input.self_realm_id)),
-            start_after: self.start_after_key()?,
+            start: self.start_after_key()?.map(IterStart::After),
             limit: self.input.limit.saturating_add(1),
             txn_id: None,
         })])
@@ -237,7 +237,7 @@ impl Operation for ListUsersOperation {
 #[cfg(test)]
 mod tests {
     use super::{ListUsersInput, ListUsersOperation, ListUsersOutput};
-    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
     use aruna_core::structs::{Actor, AuthContext, RealmId, User};
@@ -300,13 +300,13 @@ mod tests {
             Effect::Storage(StorageEffect::Iter {
                 key_space,
                 prefix,
-                start_after,
+                start,
                 limit,
                 txn_id,
             }) => {
                 assert_eq!(key_space, aruna_core::USER_KEYSPACE);
                 assert_eq!(prefix.as_ref(), Some(&UserId::storage_prefix(realm_id)));
-                assert_eq!(start_after, &None);
+                assert_eq!(start, &None);
                 assert_eq!(*limit, 11);
                 assert_eq!(txn_id, &None);
             }
@@ -379,7 +379,7 @@ mod tests {
         let effects = authorize(&mut operation);
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::Iter {
-                start_after: Some(key),
+                start: Some(IterStart::After(key)),
                 ..
             }) => {
                 assert_eq!(key.as_ref(), start_after.to_storage_key().as_slice());

@@ -123,7 +123,7 @@ pub async fn read_outbox_records(
         .send_storage_effect(StorageEffect::Iter {
             key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(prefix.to_vec())),
-            start_after: None,
+            start: None,
             limit: read_limit,
             txn_id: None,
         })
@@ -180,7 +180,7 @@ pub async fn restore_document_sync_outbox_timers(
         .send_storage_effect(StorageEffect::Iter {
             key_space: DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
             prefix: None,
-            start_after: None,
+            start: None,
             limit: 1,
             txn_id: None,
         })

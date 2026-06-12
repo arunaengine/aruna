@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use aruna_core::NodeId;
 use aruna_core::document::DocumentSyncTarget;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
@@ -152,7 +152,7 @@ impl RestoreTopicSubscriptionsOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: key_space.to_string(),
             prefix,
-            start_after: self.next_start_after.take(),
+            start: self.next_start_after.take().map(IterStart::After),
             limit: STARTUP_DOCUMENT_PAGE_SIZE,
             txn_id: None,
         })]

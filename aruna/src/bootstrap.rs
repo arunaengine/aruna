@@ -99,7 +99,7 @@ async fn core_document_targets(
         .send_effect(Effect::Storage(StorageEffect::Iter {
             key_space: USER_KEYSPACE.to_string(),
             prefix: Some(UserId::storage_prefix(realm_id)),
-            start_after: None,
+            start: None,
             limit: 10_000,
             txn_id: None,
         }))

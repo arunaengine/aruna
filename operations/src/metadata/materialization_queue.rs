@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -114,7 +114,7 @@ pub async fn restore_metadata_materialization_timer(
         .send_storage_effect(StorageEffect::Iter {
             key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
             prefix: None,
-            start_after: None,
+            start: None,
             limit: 1,
             txn_id: None,
         })
@@ -377,7 +377,7 @@ async fn read_due_materialization_jobs(
             .send_storage_effect(StorageEffect::Iter {
                 key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
                 prefix: None,
-                start_after: start_after.take(),
+                start: start_after.take().map(IterStart::After),
                 limit: MATERIALIZATION_SCAN_PAGE_SIZE,
                 txn_id: None,
             })
@@ -582,7 +582,7 @@ pub async fn metadata_materialization_jobs_exist(
         .send_storage_effect(StorageEffect::Iter {
             key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
             prefix: None,
-            start_after: None,
+            start: None,
             limit: 1,
             txn_id: None,
         })

@@ -1,4 +1,4 @@
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -100,7 +100,7 @@ pub fn iter_connectors_effect(
     Effect::Storage(StorageEffect::Iter {
         key_space: SOURCE_CONNECTOR_INDEX_KEYSPACE.to_string(),
         prefix: Some(source_connector_prefix(group_id)),
-        start_after,
+        start: start_after.map(IterStart::After),
         limit: LIST_SOURCE_CONNECTOR_PAGE_SIZE,
         txn_id,
     })
@@ -113,7 +113,7 @@ pub fn iter_connector_reference_versions_effect(
     Effect::Storage(StorageEffect::Iter {
         key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
         prefix: None,
-        start_after,
+        start: start_after.map(IterStart::After),
         limit: CONNECTOR_REFERENCE_SCAN_PAGE_SIZE,
         txn_id,
     })

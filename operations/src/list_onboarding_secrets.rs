@@ -63,7 +63,7 @@ impl Operation for ListOnboardingSecretsOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: ONBOARDING_KEYSPACE.to_string(),
             prefix: Some(ByteView::from(b"secret:".as_slice())),
-            start_after: None,
+            start: None,
             limit: usize::MAX,
             txn_id: None,
         })]

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
@@ -237,7 +237,7 @@ impl AnnounceTopicOperation {
                 smallvec![Effect::Storage(StorageEffect::Iter {
                     key_space: USER_KEYSPACE.to_string(),
                     prefix: Some(UserId::storage_prefix(realm_id)),
-                    start_after,
+                    start: start_after.map(IterStart::After),
                     limit: USER_SYNC_PAGE_SIZE,
                     txn_id: None,
                 })]

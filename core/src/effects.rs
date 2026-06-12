@@ -142,15 +142,32 @@ pub enum StorageEffect {
     ///
     /// Iteration order is lexicographic by key bytes.
     /// - `prefix`: restricts results to keys with this prefix
-    /// - `start_after`: exclusive cursor key
+    /// - `start`: lower bound for the first returned key
     /// - `limit`: maximum number of entries to return
     Iter {
         key_space: KeySpace,
         prefix: Option<Key>,
-        start_after: Option<Key>,
+        start: Option<IterStart>,
         limit: usize,
         txn_id: Option<TxnId>,
     },
+}
+
+/// Lower bound for a [`StorageEffect::Iter`] scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IterStart {
+    /// Exclusive cursor: iteration begins at the first key greater than this.
+    After(Key),
+    /// Inclusive seek: iteration begins at this key if it exists.
+    At(Key),
+}
+
+impl IterStart {
+    pub fn key(&self) -> &Key {
+        match self {
+            IterStart::After(key) | IterStart::At(key) => key,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

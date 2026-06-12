@@ -6,7 +6,7 @@ use crate::replication::protocol::{
     MaterializedBlobInfo, MultipartObjectReplicationMetadata, ReplicationMode,
     VersionReplicationManifest, VersionReplicationMessage, VersionReplicationRequest,
 };
-use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
 use aruna_core::keyspaces::{
@@ -239,7 +239,7 @@ impl ReplicateScopeOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start_after: self.next_start_after.clone(),
+            start: self.next_start_after.clone().map(IterStart::After),
             limit: ITER_PAGE_SIZE,
             txn_id: None,
         })]
@@ -725,7 +725,10 @@ impl ReplicateObjectVersionOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_MULTIPART_OBJECT_METADATA_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start_after: self.multipart_parts_next_start_after.clone(),
+            start: self
+                .multipart_parts_next_start_after
+                .clone()
+                .map(IterStart::After),
             limit: ITER_PAGE_SIZE,
             txn_id: None,
         })]
@@ -1549,7 +1552,7 @@ mod tests {
         ReplicationMode, VersionReplicationMessage, VersionReplicationRequest,
     };
     use aruna_core::UserId;
-    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use aruna_core::effects::{BlobEffect, Effect, IterStart, StagingSourceEffect, StorageEffect};
     use aruna_core::events::{
         BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent,
     };
@@ -1844,10 +1847,10 @@ mod tests {
                 .into(),
             ),
         }));
-        let Effect::Storage(StorageEffect::Iter { start_after, .. }) = &effects[0] else {
+        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
             panic!("expected multipart iter request")
         };
-        assert!(start_after.is_none());
+        assert!(start.is_none());
 
         let next_cursor: aruna_core::types::Key = vec![9u8].into();
         let effects = op.step(Event::Storage(StorageEvent::IterResult {
@@ -1857,10 +1860,10 @@ mod tests {
             ],
             next_start_after: Some(next_cursor.clone()),
         }));
-        let Effect::Storage(StorageEffect::Iter { start_after, .. }) = &effects[0] else {
+        let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
             panic!("expected paginated multipart iter request")
         };
-        assert_eq!(start_after.as_ref(), Some(&next_cursor));
+        assert_eq!(start, &Some(IterStart::After(next_cursor.clone())));
 
         let effects = op.step(Event::Storage(StorageEvent::IterResult {
             values: vec![multipart_part_entry(version_id, 3)],

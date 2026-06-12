@@ -1,4 +1,4 @@
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
@@ -212,7 +212,11 @@ impl ListObjectsV2Operation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(self.scan_prefix.clone().into()),
-            start_after: self.last_consumed_key.clone().map(Into::into),
+            start: self
+                .last_consumed_key
+                .clone()
+                .map(Into::into)
+                .map(IterStart::After),
             limit: self.scan_limit,
             txn_id: self.txn_id,
         })]

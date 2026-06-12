@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
@@ -2788,7 +2788,7 @@ async fn list_deleted_graph_iris(
             .send_effect(Effect::Storage(StorageEffect::Iter {
                 key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
                 prefix: None,
-                start_after,
+                start: start_after.map(IterStart::After),
                 limit: REGISTRY_FILL_PAGE_SIZE,
                 txn_id: None,
             }))

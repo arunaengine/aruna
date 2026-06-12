@@ -448,7 +448,7 @@ async fn read_create_events(
         .send_storage_effect(StorageEffect::Iter {
             key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
             prefix: Some(metadata_event_log_prefix(document_id)),
-            start_after: None,
+            start: None,
             limit: 10,
             txn_id: None,
         })

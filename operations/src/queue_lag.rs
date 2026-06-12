@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Weak};
 
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE};
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
@@ -206,7 +206,7 @@ async fn iter_page(
         .send_storage_effect(StorageEffect::Iter {
             key_space: key_space.to_string(),
             prefix: None,
-            start_after,
+            start: start_after.map(IterStart::After),
             limit,
             txn_id: None,
         })

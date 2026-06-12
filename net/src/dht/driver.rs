@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use aruna_core::DistributedTraceContext;
 use aruna_core::alpn::Alpn;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::id::{DhtKeyId, NodeId};
@@ -1100,7 +1100,7 @@ impl DhtDriver {
                 let effect = Effect::Storage(StorageEffect::Iter {
                     key_space: DHT_KEYSPACE.to_string(),
                     prefix: None,
-                    start_after: start_after.map(ByteView::from),
+                    start: start_after.map(ByteView::from).map(IterStart::After),
                     limit: if limit == 0 { CLEANUP_PAGE_SIZE } else { limit },
                     txn_id: None,
                 });

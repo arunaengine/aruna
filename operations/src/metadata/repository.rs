@@ -1,5 +1,5 @@
 use aruna_core::document::DocumentSyncOutboxRecord;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -103,7 +103,7 @@ pub fn iter_registry_effect(
     Effect::Storage(StorageEffect::Iter {
         key_space: METADATA_INDEX_KEYSPACE.to_string(),
         prefix: Some(metadata_registry_prefix(group_id)),
-        start_after,
+        start: start_after.map(IterStart::After),
         limit: LIST_METADATA_PAGE_SIZE,
         txn_id,
     })
@@ -113,7 +113,7 @@ pub fn iter_all_registry_effect(start_after: Option<Key>, txn_id: Option<TxnId>)
     Effect::Storage(StorageEffect::Iter {
         key_space: METADATA_INDEX_KEYSPACE.to_string(),
         prefix: None,
-        start_after,
+        start: start_after.map(IterStart::After),
         limit: REGISTRY_FILL_PAGE_SIZE,
         txn_id,
     })

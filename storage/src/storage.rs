@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -442,10 +442,10 @@ impl FjallStorage {
             StorageEffect::Iter {
                 key_space,
                 prefix,
-                start_after,
+                start,
                 limit,
                 txn_id,
-            } => self.iterate(key_space, prefix, start_after, limit, txn_id),
+            } => self.iterate(key_space, prefix, start, limit, txn_id),
         }
     }
 
@@ -849,11 +849,7 @@ impl FjallStorage {
         }
     }
 
-    fn batch_read(
-        &mut self,
-        reads: Vec<(String, ByteView)>,
-        txn_id: Option<Ulid>,
-    ) -> StorageEvent {
+    fn batch_read(&mut self, reads: Vec<(String, ByteView)>, txn_id: Option<Ulid>) -> StorageEvent {
         if let Some(txn_id) = txn_id {
             match self.txns.get(&txn_id) {
                 Some(Txn::Read(txn)) => batch_read_with(&self.store, txn, reads),
@@ -1079,14 +1075,14 @@ impl FjallStorage {
     #[tracing::instrument(
         name = "storage.iterate",
         level = "debug",
-        skip(self, prefix, start_after),
-        fields(key_space = %key_space, has_prefix = prefix.is_some(), has_cursor = start_after.is_some(), limit, txn_id = ?txn_id)
+        skip(self, prefix, start),
+        fields(key_space = %key_space, has_prefix = prefix.is_some(), has_cursor = start.is_some(), limit, txn_id = ?txn_id)
     )]
     fn iterate(
         &mut self,
         key_space: String,
         prefix: Option<ByteView>,
-        start_after: Option<ByteView>,
+        start: Option<IterStart>,
         limit: usize,
         txn_id: Option<Ulid>,
     ) -> StorageEvent {
@@ -1105,13 +1101,13 @@ impl FjallStorage {
         let result = if let Some(txn_id) = txn_id {
             match self.txns.get(&txn_id) {
                 Some(Txn::Read(txn)) => {
-                    iterate_page(txn, &keyspace, prefix.as_ref(), start_after.as_ref(), limit)
+                    iterate_page(txn, &keyspace, prefix.as_ref(), start.as_ref(), limit)
                 }
                 Some(Txn::Write(txn)) => iterate_page(
                     txn.as_ref(),
                     &keyspace,
                     prefix.as_ref(),
-                    start_after.as_ref(),
+                    start.as_ref(),
                     limit,
                 ),
                 None => {
@@ -1121,7 +1117,7 @@ impl FjallStorage {
                 }
             }
         } else {
-            return store_iterate(&self.store, keyspace, prefix, start_after, limit);
+            return store_iterate(&self.store, keyspace, prefix, start, limit);
         };
 
         match result {
@@ -1179,17 +1175,11 @@ fn store_iterate(
     store: &Store,
     keyspace: OptimisticTxKeyspace,
     prefix: Option<ByteView>,
-    start_after: Option<ByteView>,
+    start: Option<IterStart>,
     limit: usize,
 ) -> StorageEvent {
     let snapshot = store.db.read_tx();
-    match iterate_page(
-        &snapshot,
-        &keyspace,
-        prefix.as_ref(),
-        start_after.as_ref(),
-        limit,
-    ) {
+    match iterate_page(&snapshot, &keyspace, prefix.as_ref(), start.as_ref(), limit) {
         Ok((values, next_start_after)) => StorageEvent::IterResult {
             values,
             next_start_after,
@@ -1254,7 +1244,7 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
             StorageEffect::Iter {
                 key_space,
                 prefix,
-                start_after,
+                start,
                 limit,
                 txn_id: None,
             } => match store.resolve_keyspace(&key_space) {
@@ -1265,7 +1255,7 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
                             next_start_after: None,
                         }
                     } else {
-                        store_iterate(&store, keyspace, prefix, start_after, limit)
+                        store_iterate(&store, keyspace, prefix, start, limit)
                     }
                 }
                 Err(error) => StorageEvent::Error { error },
@@ -1432,7 +1422,7 @@ fn record_storage_effect_fields(span: &Span, effect: &StorageEffect) {
         StorageEffect::Iter {
             key_space,
             prefix,
-            start_after,
+            start,
             limit,
             txn_id,
         } => {
@@ -1440,8 +1430,8 @@ fn record_storage_effect_fields(span: &Span, effect: &StorageEffect) {
             if let Some(prefix) = prefix {
                 span.record("key_len", prefix.as_ref().len() as u64);
             }
-            if let Some(start_after) = start_after {
-                span.record("cursor_len", start_after.as_ref().len() as u64);
+            if let Some(start) = start {
+                span.record("cursor_len", start.key().as_ref().len() as u64);
             }
             span.record("limit", *limit as u64);
             if let Some(txn_id) = txn_id {
@@ -1504,18 +1494,20 @@ fn iterate_page<R: Readable>(
     reader: &R,
     keyspace: &OptimisticTxKeyspace,
     prefix: Option<&ByteView>,
-    start_after: Option<&ByteView>,
+    start: Option<&IterStart>,
     limit: usize,
 ) -> Result<PageResult, StorageError> {
     let prefix_bytes = prefix.map(|p| p.as_ref().to_vec());
-    let start_after_bytes = start_after.map(|s| s.as_ref().to_vec());
+    let start_bound = start.map(|start| match start {
+        IterStart::After(key) => Excluded(key.as_ref().to_vec()),
+        IterStart::At(key) => Included(key.as_ref().to_vec()),
+    });
 
-    let iter = match (prefix_bytes.as_ref(), start_after_bytes.as_ref()) {
-        (Some(prefix), Some(start_after)) => {
-            let start_bound = if start_after < prefix {
-                Included(prefix.clone())
-            } else {
-                Excluded(start_after.clone())
+    let iter = match (prefix_bytes.as_ref(), start_bound) {
+        (Some(prefix), Some(start_bound)) => {
+            let start_bound = match start_bound {
+                Excluded(key) | Included(key) if &key < prefix => Included(prefix.clone()),
+                bound => bound,
             };
 
             match prefix_upper_bound(prefix) {
@@ -1527,10 +1519,7 @@ fn iterate_page<R: Readable>(
             Some(end) => reader.range(keyspace, (Included(prefix.clone()), Excluded(end))),
             None => reader.range(keyspace, (Included(prefix.clone()), Unbounded::<Vec<u8>>)),
         },
-        (None, Some(start_after)) => reader.range(
-            keyspace,
-            (Excluded(start_after.clone()), Unbounded::<Vec<u8>>),
-        ),
+        (None, Some(start_bound)) => reader.range(keyspace, (start_bound, Unbounded::<Vec<u8>>)),
         (None, None) => reader.iter(keyspace),
     };
 
@@ -1574,7 +1563,7 @@ fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{FjallStorage, StorageHandle};
-    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
@@ -1750,11 +1739,7 @@ mod tests {
                     txn_id: None,
                 })
                 .await,
-            &[
-                (b"b", Some(b"2")),
-                (b"missing", None),
-                (b"a", Some(b"1")),
-            ],
+            &[(b"b", Some(b"2")), (b"missing", None), (b"a", Some(b"1"))],
         );
     }
 
@@ -1794,6 +1779,79 @@ mod tests {
                 })
                 .await,
             &[(b"key", None)],
+        );
+    }
+
+    async fn iter_keys(
+        handle: &StorageHandle,
+        key_space: &str,
+        prefix: Option<&[u8]>,
+        start: Option<IterStart>,
+    ) -> Vec<Vec<u8>> {
+        match handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix: prefix.map(|p| p.to_vec().into()),
+                start,
+                limit: 100,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => {
+                values.into_iter().map(|(k, _)| k.to_vec()).collect()
+            }
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn iter_start_bound_controls_inclusivity() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        for key in [b"p/a", b"p/b", b"p/c"] {
+            assert_write_result(
+                handle
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: "iter_start".to_string(),
+                        key: key.to_vec().into(),
+                        value: b"v".to_vec().into(),
+                        txn_id: None,
+                    })
+                    .await,
+                key,
+            );
+        }
+
+        let keys = iter_keys(
+            &handle,
+            "iter_start",
+            None,
+            Some(IterStart::After(b"p/b".to_vec().into())),
+        )
+        .await;
+        assert_eq!(keys, vec![b"p/c".to_vec()]);
+
+        let keys = iter_keys(
+            &handle,
+            "iter_start",
+            None,
+            Some(IterStart::At(b"p/b".to_vec().into())),
+        )
+        .await;
+        assert_eq!(keys, vec![b"p/b".to_vec(), b"p/c".to_vec()]);
+
+        let keys = iter_keys(
+            &handle,
+            "iter_start",
+            Some(b"p/"),
+            Some(IterStart::At(b"a".to_vec().into())),
+        )
+        .await;
+        assert_eq!(
+            keys,
+            vec![b"p/a".to_vec(), b"p/b".to_vec(), b"p/c".to_vec()]
         );
     }
 

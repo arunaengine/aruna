@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -64,7 +64,7 @@ pub async fn replay_metadata_event_log(
             .send_storage_effect(StorageEffect::Iter {
                 key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
                 prefix: None,
-                start_after: start_after.take(),
+                start: start_after.take().map(IterStart::After),
                 limit: REPLAY_PAGE_SIZE,
                 txn_id: None,
             })

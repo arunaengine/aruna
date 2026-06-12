@@ -1,4 +1,4 @@
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
@@ -76,7 +76,12 @@ impl ListBucketsOperation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: S3_BUCKET_KEYSPACE.to_string(),
             prefix: self.input.prefix.clone().map(Into::into),
-            start_after: self.input.continuation_token.clone().map(Into::into),
+            start: self
+                .input
+                .continuation_token
+                .clone()
+                .map(Into::into)
+                .map(IterStart::After),
             limit: Self::SCAN_LIMIT,
             txn_id: None,
         })]
