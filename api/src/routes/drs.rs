@@ -491,6 +491,7 @@ async fn resolve_content_hash(
     debug!(?mappings);
 
     let mut any_mapping_on_this_node = false;
+    let mut last_permission_check: Option<(String, bool)> = None;
 
     for mapping in mappings {
         if mapping.realm_id != state.get_realm_id() || mapping.node_id != state.get_node_id() {
@@ -498,8 +499,17 @@ async fn resolve_content_hash(
             continue;
         }
         any_mapping_on_this_node = true;
-        if !can_read_permission_path(state, auth, &mapping.permission_path()).await? {
-            debug!("No permissions for path: {}", mapping.permission_path());
+        let path = mapping.permission_path();
+        let allowed = match &last_permission_check {
+            Some((cached_path, allowed)) if cached_path == &path => *allowed,
+            _ => {
+                let allowed = can_read_permission_path(state, auth, &path).await?;
+                last_permission_check = Some((path.clone(), allowed));
+                allowed
+            }
+        };
+        if !allowed {
+            debug!("No permissions for path: {path}");
             continue;
         }
         let head = match drive(
