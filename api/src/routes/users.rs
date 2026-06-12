@@ -1162,6 +1162,7 @@ mod tests {
             ServerConfig {
                 http_addr: addr,
                 max_http_body_size: crate::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+                cors: crate::cors::CorsConfig::default(),
             },
         )
         .build_router();

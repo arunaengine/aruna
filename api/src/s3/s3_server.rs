@@ -1,12 +1,13 @@
 use super::auth::AuthProvider;
 use super::s3_service::ArunaS3Service;
+use crate::cors::CorsConfig;
 use crate::error::S3ServerError;
 use crate::telemetry::{emit_request_completed, make_request_span};
 use aruna_core::NodeId;
 use aruna_core::structs::RealmId;
 use aruna_operations::driver::DriverContext;
 use futures_core::future::BoxFuture;
-use http::Request;
+use http::{Method, Request, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::service::Service;
 use hyper_util::rt::TokioExecutor;
@@ -28,11 +29,13 @@ use tracing::{Instrument, error, info, trace};
 pub struct S3Server {
     address: String,
     s3service: S3Service,
+    cors: CorsConfig,
 }
 
 #[derive(Clone)]
 pub struct WrappingService {
     shared: S3Service, // Aruna specific implementation of S3 trait
+    cors: CorsConfig,
 }
 
 impl S3Server {
@@ -43,6 +46,7 @@ impl S3Server {
         driver_ctx: Arc<DriverContext>,
         realm_id: RealmId,
         node_id: NodeId,
+        cors: CorsConfig,
     ) -> Result<Self, S3ServerError> {
         let s3service = ArunaS3Service::new(driver_ctx.clone(), realm_id, node_id).await;
 
@@ -64,6 +68,7 @@ impl S3Server {
         Ok(Self {
             address: address.into(),
             s3service: service,
+            cors,
         })
     }
 
@@ -74,6 +79,7 @@ impl S3Server {
         let local_addr = listener.local_addr()?;
         let service = WrappingService {
             shared: self.s3service,
+            cors: self.cors,
         };
         let connection = ConnBuilder::new(TokioExecutor::new());
 
@@ -116,7 +122,29 @@ impl Service<Request<Incoming>> for WrappingService {
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
-        //TODO: CORS
+        let origin = req.headers().get(header::ORIGIN).cloned();
+
+        // Answer CORS preflight before s3s signature validation: an unsigned
+        // OPTIONS request must not fail with 403.
+        if req.method() == Method::OPTIONS
+            && let Some(origin) = origin.as_ref()
+        {
+            let requested_headers = req
+                .headers()
+                .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+                .cloned();
+            let mut response = http::Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(s3s::Body::empty())
+                .expect("static response must build");
+            if let Some(cors_headers) = self
+                .cors
+                .s3_preflight_headers(origin, requested_headers.as_ref())
+            {
+                response.headers_mut().extend(cors_headers);
+            }
+            return Box::pin(async move { Ok(response) });
+        }
 
         // Default S3 operation call
         let (parts, body) = req.into_parts();
@@ -136,8 +164,12 @@ impl Service<Request<Incoming>> for WrappingService {
         }
         let s3s_request = s3s::HttpRequest::from_parts(parts, body.into());
         let shared = self.shared.clone();
+        let cors = self.cors.clone();
         Box::pin(async move {
-            let result = shared.call(s3s_request).instrument(span.clone()).await;
+            let mut result = shared.call(s3s_request).instrument(span.clone()).await;
+            if let Ok(response) = &mut result {
+                cors.apply_s3_response_headers(origin.as_ref(), response.headers_mut());
+            }
             match &result {
                 Ok(response) => {
                     emit_request_completed(&span, "s3", response.status().as_u16(), started)

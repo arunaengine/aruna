@@ -58,6 +58,7 @@ pub struct Config {
     pub blob_transfer_idle_timeout_secs: u64,
     pub http_socket_addr: SocketAddr,
     pub max_http_body_size: usize,
+    pub cors_allowed_origins: Vec<String>,
     pub p2p_socket_addr: SocketAddr,
     pub max_concurrent_uni_streams: Option<u64>,
     pub max_concurrent_bidi_streams: Option<u64>,
@@ -247,6 +248,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .map(|value| value.parse::<usize>())
         .transpose()?
         .unwrap_or(aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE);
+    let cors_allowed_origins = parse_list_env("CORS_ALLOWED_ORIGINS");
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
     )?;
@@ -352,6 +354,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             blob_transfer_idle_timeout_secs,
             http_socket_addr,
             max_http_body_size,
+            cors_allowed_origins,
             p2p_socket_addr,
             max_concurrent_uni_streams,
             max_concurrent_bidi_streams,

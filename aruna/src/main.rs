@@ -7,6 +7,7 @@ use aruna::bootstrap::{
 use aruna::config::{StartupMode, load, mark_node_state_complete, mark_onboarding_phase};
 use aruna::telemetry::{init_tracing, shutdown_tracing};
 use aruna_api::auth::OidcValidator;
+use aruna_api::cors::CorsConfig;
 use aruna_api::s3::s3_server::S3Server;
 use aruna_api::server::{Server, ServerConfig};
 use aruna_api::server_state::ServerState;
@@ -256,9 +257,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await,
     );
 
+    let cors = CorsConfig::new(config.cors_allowed_origins.clone());
     let server_config = ServerConfig {
         http_addr: config.http_socket_addr,
         max_http_body_size: config.max_http_body_size,
+        cors: cors.clone(),
     };
     let server = Server::new(state.clone(), server_config);
 
@@ -269,6 +272,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         driver_ctx.clone(),
         config.realm_id,
         config.node_id,
+        cors,
     )
     .await
     .unwrap();

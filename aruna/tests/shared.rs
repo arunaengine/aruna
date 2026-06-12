@@ -4,6 +4,7 @@ use aruna::bootstrap::{
     announce_core_documents, fetch_core_onboarding_documents, realm_bootstrap_exists,
 };
 use aruna::config::{Config, load, mark_node_state_complete, mark_onboarding_phase};
+use aruna_api::cors::CorsConfig;
 use aruna_api::routes::credentials::{
     CreateS3CredentialsRequest, CreateS3CredentialsResponse, CreateS3PathRestriction,
 };
@@ -734,6 +735,12 @@ async fn announce_realm_presence(
     Ok(())
 }
 
+pub const TEST_CORS_ORIGIN: &str = "http://portal.test";
+
+fn test_cors_config() -> CorsConfig {
+    CorsConfig::new(vec![TEST_CORS_ORIGIN.to_string()])
+}
+
 async fn spawn_rest_server(
     context: Arc<DriverContext>,
     realm_id: RealmId,
@@ -749,6 +756,7 @@ async fn spawn_rest_server(
         ServerConfig {
             http_addr: addr,
             max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+            cors: test_cors_config(),
         },
     );
     let router = server.build_router();
@@ -786,8 +794,15 @@ async fn spawn_s3_server(
     let bind_addr = listener.local_addr()?;
     let address = bind_addr.to_string();
     let host = format!("localhost:{}", bind_addr.port());
-    let s3_server =
-        S3Server::new(address.as_str(), host.clone(), context, realm_id, node_id).await?;
+    let s3_server = S3Server::new(
+        address.as_str(),
+        host.clone(),
+        context,
+        realm_id,
+        node_id,
+        test_cors_config(),
+    )
+    .await?;
     let (_addr, task) = s3_server.run_with_listener(listener)?;
     Ok((
         S3Endpoint {

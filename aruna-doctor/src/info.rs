@@ -359,6 +359,7 @@ mod tests {
             ServerConfig {
                 http_addr: addr,
                 max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+                cors: aruna_api::cors::CorsConfig::default(),
             },
         );
         let server_task = tokio::spawn(async move {
