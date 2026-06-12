@@ -173,7 +173,7 @@ pub fn decode_placement(value: &[u8]) -> Result<PendingDocumentPlacement, postca
 
 pub fn realm_nodes_from_config_bytes(value: &[u8]) -> Result<Vec<NodeId>, ConversionError> {
     let document = RealmConfigDocument::from_bytes(value)?;
-    let mut nodes = document.node_ids()?;
+    let mut nodes = document.sync_eligible_node_ids()?;
     sort_node_ids(&mut nodes);
     Ok(nodes)
 }

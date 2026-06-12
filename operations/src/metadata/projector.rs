@@ -647,7 +647,7 @@ fn expand_create_event_holders(
         event.record.group_id,
         Some(event.record.document_path.as_str()),
     );
-    let candidates = realm_config.node_ids()?;
+    let candidates = realm_config.sync_eligible_node_ids()?;
 
     event.record.holder_node_ids =
         complete_authoritative_holders(&target, &candidates, &holders, desired_holder_count);
