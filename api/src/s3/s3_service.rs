@@ -116,6 +116,7 @@ impl Debug for ArunaS3Service {
 
 impl ArunaS3Service {
     const LIST_OBJECTS_V2_MAX_PAGES: usize = 100;
+    const LIST_OBJECTS_V2_MAX_KEYS: usize = 1000;
 
     #[tracing::instrument(level = "trace", skip(driver_ctx))]
     pub async fn new(driver_ctx: Arc<DriverContext>, realm_id: RealmId, node_id: NodeId) -> Self {
@@ -702,7 +703,7 @@ impl S3 for ArunaS3Service {
             .input
             .max_keys
             .and_then(|max_keys| usize::try_from(max_keys).ok())
-            .unwrap_or(1_000);
+            .unwrap_or(Self::LIST_OBJECTS_V2_MAX_KEYS);
         let bucket = req.input.bucket.clone();
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
