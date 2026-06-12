@@ -498,6 +498,7 @@ async fn lazy_visibility_matches_eager_query_and_search_semantics() -> Result<()
         group_id,
         realm_id: REALM,
         roles: group_auth.roles.keys().copied().collect(),
+        owner: member,
     };
     let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(REALM);
     write_value(

@@ -283,6 +283,7 @@ mod test {
                     node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),
                 },
                 display_name: format!("Test group {i}"),
+                owner_cap: None,
             };
             let group_operation = CreateGroupOperation::new(group_config.clone());
             let create_result = drive(group_operation, &context).await.unwrap();

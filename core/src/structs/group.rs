@@ -13,6 +13,7 @@ pub struct Group {
     pub group_id: GroupId,
     pub realm_id: RealmId,
     pub roles: HashSet<RoleId>,
+    pub owner: UserId,
 }
 
 impl Group {
@@ -22,6 +23,18 @@ impl Group {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
     }
+}
+
+/// Key in GROUP_OWNER_INDEX_KEYSPACE: owner storage key (realm + user ulid)
+/// followed by the group id, so a prefix scan counts a user's owned groups.
+pub fn group_owner_index_key(owner: UserId, group_id: GroupId) -> Vec<u8> {
+    let mut bytes = owner.to_storage_key();
+    bytes.extend_from_slice(&group_id.to_bytes());
+    bytes
+}
+
+pub fn group_owner_index_prefix(owner: UserId) -> Vec<u8> {
+    owner.to_storage_key()
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -116,6 +129,7 @@ mod test {
             group_id: Ulid::new(),
             realm_id: RealmId([0u8; 32]),
             roles: HashSet::from([Ulid::new(), Ulid::new()]),
+            owner: UserId::local(Ulid::new(), RealmId([0u8; 32])),
         };
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[1u8; 32]).public(),

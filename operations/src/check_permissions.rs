@@ -537,6 +537,7 @@ mod test {
                 realm_id,
             },
             display_name: "Test group".to_string(),
+            owner_cap: None,
         };
 
         let group_operation = CreateGroupOperation::new(group_config.clone());

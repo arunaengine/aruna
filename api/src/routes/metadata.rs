@@ -3305,6 +3305,7 @@ mod tests {
             group_id,
             realm_id,
             roles: group_auth.roles.keys().copied().collect(),
+            owner: user_id,
         };
         let realm_auth = RealmAuthorizationDocument::new_default_realm_doc(realm_id);
 

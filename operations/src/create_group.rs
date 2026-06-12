@@ -9,14 +9,17 @@ use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, GROUP_OWNER_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::storage_entries::{
     admin_document_conflict_write_entries, admin_document_reducer_state_write_entry,
 };
-use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, Role};
+use aruna_core::structs::{
+    Actor, Group, GroupAuthorizationDocument, Role, group_owner_index_key, group_owner_index_prefix,
+};
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId, Value};
+use byteview::ByteView;
 use smallvec::smallvec;
 use std::collections::HashSet;
 use thiserror::Error;
@@ -27,6 +30,10 @@ use ulid::Ulid;
 pub struct CreateGroupConfig {
     pub actor: Actor,
     pub display_name: String,
+    /// Maximum number of groups the actor may own; checked inside the write
+    /// transaction so concurrent creates cannot slip past. None = unlimited
+    /// (realm admins are exempt).
+    pub owner_cap: Option<u32>,
 }
 
 #[derive(PartialEq)]
@@ -63,6 +70,43 @@ impl CreateGroupOperation {
             output: None,
         }
     }
+    #[tracing::instrument(name = "group.create.emit_count_owned", level = "debug", skip(self), fields(state = ?self.state))]
+    fn emit_count_owned_groups(&mut self, cap: u32) -> Effects {
+        self.state = CreateGroupState::CountOwnedGroups;
+        smallvec![Effect::Storage(StorageEffect::Iter {
+            key_space: GROUP_OWNER_INDEX_KEYSPACE.to_string(),
+            prefix: Some(group_owner_index_prefix(self.config.actor.user_id).into()),
+            start: None,
+            limit: cap as usize,
+            txn_id: self.txn_id,
+        })]
+    }
+
+    #[tracing::instrument(name = "group.create.handle_count_owned", level = "debug", skip(self, event), fields(state = ?self.state))]
+    fn handle_count_owned_groups(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
+            return self.unexpected_event(
+                CreateGroupState::CountOwnedGroups,
+                "Event::Storage(StorageEvent::IterResult)",
+                got,
+            );
+        };
+        let cap = self.config.owner_cap.unwrap_or(u32::MAX);
+        if values.len() >= cap as usize {
+            let cleanup_effects = self.abort();
+            return self.fail_with_cleanup(
+                CreateGroupError::OwnedGroupLimitReached { limit: cap },
+                cleanup_effects,
+            );
+        }
+        self.state = CreateGroupState::CreateGroup;
+        match self.emit_create_group() {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
     #[tracing::instrument(name = "group.create.emit_group", level = "debug", skip(self), fields(state = ?self.state, group_name = %self.config.display_name))]
     fn emit_create_group(&mut self) -> Result<Effects, CreateGroupError> {
         let group_id = Ulid::new();
@@ -76,6 +120,7 @@ impl CreateGroupOperation {
             display_name: self.config.display_name.clone(),
             group_id,
             realm_id: self.config.actor.realm_id,
+            owner: self.config.actor.user_id,
         };
 
         self.auth_doc = Some(auth_doc);
@@ -261,11 +306,23 @@ impl CreateGroupOperation {
             );
         };
 
-        self.state = CreateGroupState::CreateGroup;
         self.txn_id = Some(txn_id);
-        match self.emit_create_group() {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
+        match self.config.owner_cap {
+            Some(0) => {
+                let cleanup_effects = self.abort();
+                self.fail_with_cleanup(
+                    CreateGroupError::OwnedGroupLimitReached { limit: 0 },
+                    cleanup_effects,
+                )
+            }
+            Some(cap) => self.emit_count_owned_groups(cap),
+            None => {
+                self.state = CreateGroupState::CreateGroup;
+                match self.emit_create_group() {
+                    Ok(effects) => effects,
+                    Err(err) => self.fail(err),
+                }
+            }
         }
     }
 
@@ -275,6 +332,39 @@ impl CreateGroupOperation {
         let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
             return self.unexpected_event(
                 CreateGroupState::CreateGroup,
+                "Event::Storage(StorageEvent::WriteResult)",
+                got,
+            );
+        };
+
+        self.state = CreateGroupState::WriteOwnerIndex;
+        match self.emit_write_owner_index() {
+            Ok(effects) => effects,
+            Err(err) => self.fail(err),
+        }
+    }
+
+    #[tracing::instrument(name = "group.create.emit_owner_index", level = "debug", skip(self), fields(state = ?self.state))]
+    fn emit_write_owner_index(&mut self) -> Result<Effects, CreateGroupError> {
+        let group_id = self
+            .group
+            .as_ref()
+            .ok_or(CreateGroupError::GroupNotFound)?
+            .group_id;
+        Ok(smallvec![Effect::Storage(StorageEffect::Write {
+            key_space: GROUP_OWNER_INDEX_KEYSPACE.to_string(),
+            key: group_owner_index_key(self.config.actor.user_id, group_id).into(),
+            value: ByteView::from(Vec::new()),
+            txn_id: self.txn_id,
+        })])
+    }
+
+    #[tracing::instrument(name = "group.create.handle_owner_index_write", level = "debug", skip(self, event), fields(state = ?self.state, event = ?event))]
+    fn handle_write_owner_index(&mut self, event: Event) -> Effects {
+        let got = format!("{event:?}");
+        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
+            return self.unexpected_event(
+                CreateGroupState::WriteOwnerIndex,
                 "Event::Storage(StorageEvent::WriteResult)",
                 got,
             );
@@ -358,7 +448,9 @@ fn sorted_user_ids(user_ids: &HashSet<UserId>) -> Vec<UserId> {
 pub enum CreateGroupState {
     Init,
     StartTransaction,
+    CountOwnedGroups,
     CreateGroup,
+    WriteOwnerIndex,
     CreateRoles,
     CommitTransaction,
     ScheduleDocumentSyncOutboxDrain,
@@ -382,6 +474,8 @@ pub enum CreateGroupError {
     NoTransactionFound,
     #[error("No group found")]
     GroupNotFound,
+    #[error("owned group limit reached ({limit})")]
+    OwnedGroupLimitReached { limit: u32 },
     #[error("Creating Group did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
@@ -415,7 +509,9 @@ impl Operation for CreateGroupOperation {
 
         match self.state {
             CreateGroupState::StartTransaction => self.handle_start_transaction(event),
+            CreateGroupState::CountOwnedGroups => self.handle_count_owned_groups(event),
             CreateGroupState::CreateGroup => self.handle_create_group(event),
+            CreateGroupState::WriteOwnerIndex => self.handle_write_owner_index(event),
             CreateGroupState::CreateRoles => self.handle_create_roles(event),
             CreateGroupState::CommitTransaction => self.handle_commit_transaction(event),
             CreateGroupState::ScheduleDocumentSyncOutboxDrain => {
@@ -725,6 +821,7 @@ mod test {
                 realm_id,
             },
             display_name: "Test group".to_string(),
+            owner_cap: None,
         };
         let group_operation = CreateGroupOperation::new(group_config.clone());
         let result = drive(group_operation, &context).await.unwrap();
@@ -763,6 +860,71 @@ mod test {
                 .iter()
                 .any(|(_id, role)| { role.name == "viewer" })
         );
+
+        net_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    pub async fn owner_cap_blocks_creation_at_limit() {
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let task_handle = TaskHandle::new();
+
+        let context = DriverContext {
+            storage_handle,
+            blob_handle: None,
+            net_handle: Some(net_handle.clone()),
+            metadata_handle: None,
+            task_handle: Some(task_handle),
+        };
+
+        let realm_id = aruna_core::structs::RealmId([0u8; 32]);
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let actor = Actor {
+            node_id,
+            user_id,
+            realm_id,
+        };
+
+        let capped = |name: &str| CreateGroupConfig {
+            actor: actor.clone(),
+            display_name: name.to_string(),
+            owner_cap: Some(1),
+        };
+
+        drive(CreateGroupOperation::new(capped("first")), &context)
+            .await
+            .unwrap();
+        let second = drive(CreateGroupOperation::new(capped("second")), &context).await;
+        assert!(matches!(
+            second,
+            Err(crate::create_group::CreateGroupError::OwnedGroupLimitReached { limit: 1 })
+        ));
+
+        // Uncapped (realm admin) creation still works past the limit.
+        drive(
+            CreateGroupOperation::new(CreateGroupConfig {
+                actor: actor.clone(),
+                display_name: "third".to_string(),
+                owner_cap: None,
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
 
         net_handle.shutdown().await;
     }

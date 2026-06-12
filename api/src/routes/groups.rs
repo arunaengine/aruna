@@ -13,9 +13,10 @@ use aruna_operations::add_user_to_group::{
     AddUserToGroupError, AddUserToGroupInput, AddUserToGroupOperation,
 };
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_operations::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_operations::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::get_group::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::remove_group_role::{
     RemoveGroupRoleConfig, RemoveGroupRoleError, RemoveGroupRoleOperation,
@@ -329,7 +330,7 @@ pub async fn create_group(
         return Err(ServerError::Forbidden);
     }
 
-    let allowed = drive(
+    let is_realm_admin = drive(
         CheckPermissionsOperation::new(CheckPermissionsConfig {
             auth_context: auth.clone(),
             path: format!("/{realm_id}/admin/groups"),
@@ -345,9 +346,20 @@ pub async fn create_group(
         | AuthorizationError::AuthDocNotFound => ServerError::Forbidden,
         _ => ServerError::InternalError(err.to_string()),
     })?;
-    if !allowed {
-        return Err(ServerError::Forbidden);
-    }
+
+    // Self-service path: any unrestricted realm member may create groups,
+    // capped by the realm quota config; realm admins are exempt.
+    let owner_cap = if is_realm_admin {
+        None
+    } else {
+        if auth.path_restrictions.is_some() {
+            return Err(ServerError::Forbidden);
+        }
+        let realm_config = drive(GetRealmConfigOperation::new(realm_id), &state.get_ctx())
+            .await
+            .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        realm_config.quota.max_groups_for(&auth.user_id)
+    };
 
     trace!(
         event = "request.group.create.authorized",
@@ -373,12 +385,18 @@ pub async fn create_group(
                 realm_id,
             },
             display_name: request.name,
+            owner_cap,
         }),
         &state.get_ctx(),
     )
     .instrument(create_span.clone())
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| match err {
+        CreateGroupError::OwnedGroupLimitReached { limit } => {
+            ServerError::Conflict(format!("owned group limit reached ({limit})"))
+        }
+        other => ServerError::InternalError(other.to_string()),
+    })?;
     create_span.record("group_id", field::display(result.0.group_id));
     request_span.record("group_id", field::display(result.0.group_id));
 
