@@ -1,31 +1,71 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use aruna_core::document::DocumentSyncOutboxEvent;
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncTarget};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::telemetry::duration_ms;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_core::{IrokleEffect, IrokleEvent};
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation, REALM_PRESENCE_REFRESH_AFTER,
 };
 use crate::document_sync_outbox::{
-    delete_outbox_record, read_next_outbox_record, restore_document_sync_outbox_timers,
+    OUTBOX_DRAIN_BATCH_SIZE, delete_outbox_records, read_outbox_records,
+    restore_document_sync_outbox_timers,
 };
 use crate::driver::{DriverContext, drive};
+use crate::metadata::materialization_queue::{
+    METADATA_MATERIALIZATION_POLL_AFTER, METADATA_MATERIALIZATION_RETRY_AFTER,
+    metadata_materialization_jobs_exist, process_metadata_materialization_batch,
+    restore_metadata_materialization_timer,
+};
+use crate::metadata::projector::{
+    project_metadata_create_events, project_metadata_create_events_from_log,
+    replay_metadata_event_log,
+};
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::sync_placement::{DOCUMENT_SYNC_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER};
 use crate::task_persistence::{
     delete_persisted_timer, persist_task_effect, restore_persisted_task_timers,
 };
 
+const DRAIN_SUBBATCH_RECORDS: usize = 512;
+
 #[derive(Debug)]
 struct OperationsTaskHandler {
     context: Arc<DriverContext>,
+}
+
+struct DrainSubBatch {
+    peers: Vec<aruna_core::NodeId>,
+    documents: Vec<DocumentSyncPublish>,
+    targets: Vec<DocumentSyncTarget>,
+    record_keys: Vec<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct DrainSyncOutcome {
+    sync_elapsed: Duration,
+    project_elapsed: Duration,
+    delete_elapsed: Duration,
+    retry_needed: bool,
+}
+
+impl DrainSyncOutcome {
+    fn merge(&mut self, other: DrainSyncOutcome) {
+        self.sync_elapsed += other.sync_elapsed;
+        self.project_elapsed += other.project_elapsed;
+        self.delete_elapsed += other.delete_elapsed;
+        self.retry_needed |= other.retry_needed;
+    }
 }
 
 impl OperationsTaskHandler {
@@ -59,25 +99,29 @@ impl OperationsTaskHandler {
         }
     }
 
-    async fn drain_document_sync_outbox(&self, prefix: Vec<u8>) {
-        let retry_key = TaskKey::DrainDocumentSyncOutbox {
-            prefix: prefix.clone(),
-        };
-        let (record_key, record, has_more) = match read_next_outbox_record(
-            &self.context.storage_handle,
-            &prefix,
-        )
-        .await
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => return,
-            Err(error) => {
-                warn!(prefix = ?prefix, error = %error, "Failed to read document sync outbox record");
-                self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                    .await;
-                return;
-            }
-        };
+    async fn drain_document_sync_outbox(&self) {
+        let retry_key = TaskKey::DrainDocumentSyncOutbox;
+        let drain_started = Instant::now();
+        let batch =
+            match read_outbox_records(&self.context.storage_handle, &[], OUTBOX_DRAIN_BATCH_SIZE)
+                .await
+            {
+                Ok(batch) if batch.records.is_empty() => return,
+                Ok(batch) => batch,
+                Err(error) => {
+                    warn!(error = %error, "Failed to read document sync outbox record");
+                    self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
+                        .await;
+                    return;
+                }
+            };
+        let scan_elapsed = drain_started.elapsed();
+        let record_count = batch.records.len();
+        let oldest_record_ms = batch
+            .records
+            .iter()
+            .map(|(_, record)| record.outbox_id.timestamp_ms())
+            .min();
 
         let Some(net_handle) = self.context.net_handle.as_ref() else {
             warn!(key = ?retry_key, "Cannot drain document sync outbox without net handle");
@@ -86,70 +130,269 @@ impl OperationsTaskHandler {
             return;
         };
 
-        let local_effect = match record.event.clone() {
-            DocumentSyncOutboxEvent::Upsert { bytes } => IrokleEffect::PublishDocument {
-                event_id: record.outbox_id,
-                target: record.target.clone(),
-                bytes,
-                peers: record.peers.clone(),
-            },
-            DocumentSyncOutboxEvent::Delete => IrokleEffect::DeleteDocument {
-                event_id: record.outbox_id,
-                target: record.target.clone(),
-                peers: record.peers.clone(),
-            },
-        };
+        let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
+            BTreeMap::new();
+        for (record_key, record) in batch.records {
+            let document = match record.event {
+                DocumentSyncOutboxEvent::Upsert { bytes } => DocumentSyncPublish::Upsert {
+                    event_id: record.outbox_id,
+                    target: record.target.clone(),
+                    bytes,
+                },
+                DocumentSyncOutboxEvent::Delete => DocumentSyncPublish::Delete {
+                    event_id: record.outbox_id,
+                    target: record.target.clone(),
+                },
+            };
 
-        let event = net_handle
-            .send_effect(Effect::Net(NetEffect::Irokle(local_effect)))
+            let subbatches = publish_groups.entry(record.peers.clone()).or_default();
+            if subbatches
+                .last()
+                .is_none_or(|subbatch| subbatch.documents.len() >= DRAIN_SUBBATCH_RECORDS)
+            {
+                subbatches.push(DrainSubBatch {
+                    peers: record.peers,
+                    documents: Vec::new(),
+                    targets: Vec::new(),
+                    record_keys: Vec::new(),
+                });
+            }
+            let subbatch = subbatches.last_mut().expect("sub-batch was just pushed");
+            subbatch.documents.push(document);
+            subbatch.targets.push(record.target);
+            subbatch.record_keys.push(record_key);
+        }
+
+        let group_count = publish_groups.len();
+        let subbatches: Vec<DrainSubBatch> = publish_groups.into_values().flatten().collect();
+        let subbatch_count = subbatches.len();
+
+        // Two-slot pipeline: publish sub-batch N+1 while sub-batch N syncs;
+        // sub-batches enter the sync stage strictly in submission order.
+        let mut publish_elapsed = Duration::ZERO;
+        let mut totals = DrainSyncOutcome::default();
+        let mut awaiting_sync: Option<DrainSubBatch> = None;
+        for mut subbatch in subbatches {
+            let documents = std::mem::take(&mut subbatch.documents);
+            let peers = subbatch.peers.clone();
+            let publish = async {
+                let publish_started = Instant::now();
+                let event = net_handle
+                    .send_effect(Effect::Net(NetEffect::Irokle(
+                        IrokleEffect::PublishDocuments { documents, peers },
+                    )))
+                    .await;
+                (event, publish_started.elapsed())
+            };
+            let ((publish_event, publish_time), sync_outcome) = tokio::join!(
+                publish,
+                self.sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
+            );
+            publish_elapsed += publish_time;
+            totals.merge(sync_outcome);
+            match publish_event {
+                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsPublished { .. })) => {
+                    awaiting_sync = Some(subbatch);
+                }
+                Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
+                    warn!(key = ?retry_key, error = %error, "Failed to create local document sync batch");
+                    totals.retry_needed = true;
+                }
+                Event::Net(NetEvent::Error(error)) => {
+                    warn!(key = ?retry_key, error = ?error, "Failed to create local document sync batch");
+                    totals.retry_needed = true;
+                }
+                other => {
+                    warn!(key = ?retry_key, event = ?other, "Unexpected local document sync batch result");
+                    totals.retry_needed = true;
+                }
+            }
+        }
+        let sync_outcome = self
+            .sync_drain_subbatch(&retry_key, net_handle, awaiting_sync.take())
             .await;
-        match event {
-            Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { .. }))
-            | Event::Net(NetEvent::Irokle(IrokleEvent::DocumentDeleted { .. })) => {}
-            Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
-                warn!(key = ?retry_key, error = %error, "Failed to create local document sync op");
-                self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                    .await;
-                return;
-            }
-            Event::Net(NetEvent::Error(error)) => {
-                warn!(key = ?retry_key, error = ?error, "Failed to create local document sync op");
-                self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                    .await;
-                return;
-            }
-            other => {
-                warn!(key = ?retry_key, event = ?other, "Unexpected local document sync op result");
-                self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                    .await;
-                return;
-            }
-        }
+        totals.merge(sync_outcome);
 
-        let sync_key = TaskKey::SyncDocument {
-            node_id: record.node_id,
-            target: record.target,
-            peers: record.peers,
-        };
-        if !self
-            .reschedule_timer(sync_key, std::time::Duration::ZERO)
-            .await
-        {
+        let oldest_age_ms = oldest_record_ms
+            .map(|record_ms| unix_timestamp_millis().saturating_sub(record_ms))
+            .unwrap_or(0);
+        info!(
+            event = "pipeline.drain.summary",
+            records = record_count,
+            groups = group_count,
+            subbatches = subbatch_count,
+            scan_ms = duration_ms(scan_elapsed),
+            publish_ms = duration_ms(publish_elapsed),
+            sync_ms = duration_ms(totals.sync_elapsed),
+            project_ms = duration_ms(totals.project_elapsed),
+            delete_ms = duration_ms(totals.delete_elapsed),
+            total_ms = duration_ms(drain_started.elapsed()),
+            oldest_age_ms,
+            retry = totals.retry_needed,
+            has_more = batch.has_more,
+            "Document sync outbox drain summary"
+        );
+
+        if totals.retry_needed {
             self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
                 .await;
-            return;
-        }
-
-        if let Err(error) = delete_outbox_record(&self.context.storage_handle, &record_key).await {
-            warn!(key = ?retry_key, error = %error, "Failed to delete document sync outbox record");
-            self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
-                .await;
-            return;
-        }
-
-        if has_more {
+        } else if batch.has_more {
             self.reschedule_timer(retry_key, std::time::Duration::ZERO)
                 .await;
+        }
+    }
+
+    async fn sync_drain_subbatch(
+        &self,
+        retry_key: &TaskKey,
+        net_handle: &aruna_net::NetHandle,
+        subbatch: Option<DrainSubBatch>,
+    ) -> DrainSyncOutcome {
+        let mut outcome = DrainSyncOutcome::default();
+        let Some(subbatch) = subbatch else {
+            return outcome;
+        };
+        let sync_started = Instant::now();
+        let event = net_handle
+            .send_effect(Effect::Net(NetEffect::Irokle(
+                IrokleEffect::SyncDocuments {
+                    targets: subbatch.targets,
+                    peers: subbatch.peers,
+                },
+            )))
+            .await;
+        outcome.sync_elapsed = sync_started.elapsed();
+        match event {
+            Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled {
+                targets,
+                metadata_create_events,
+                ..
+            })) => {
+                let project_started = Instant::now();
+                let projected = self
+                    .project_reconciled_metadata_create_events(
+                        retry_key,
+                        targets,
+                        metadata_create_events,
+                    )
+                    .await;
+                outcome.project_elapsed = project_started.elapsed();
+                if projected.is_err() {
+                    outcome.retry_needed = true;
+                    return outcome;
+                }
+                let delete_started = Instant::now();
+                let deleted =
+                    delete_outbox_records(&self.context.storage_handle, subbatch.record_keys).await;
+                outcome.delete_elapsed = delete_started.elapsed();
+                if let Err(error) = deleted {
+                    warn!(key = ?retry_key, error = %error, "Failed to delete document sync outbox records");
+                    outcome.retry_needed = true;
+                }
+            }
+            Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
+                warn!(key = ?retry_key, error = %error, "Failed to sync document batch");
+                outcome.retry_needed = true;
+            }
+            Event::Net(NetEvent::Error(error)) => {
+                warn!(key = ?retry_key, error = ?error, "Failed to sync document batch");
+                outcome.retry_needed = true;
+            }
+            other => {
+                warn!(key = ?retry_key, event = ?other, "Unexpected document sync batch result");
+                outcome.retry_needed = true;
+            }
+        }
+        outcome
+    }
+
+    async fn project_reconciled_metadata_create_events(
+        &self,
+        retry_key: &TaskKey,
+        targets: Vec<DocumentSyncTarget>,
+        metadata_create_events: Vec<aruna_core::metadata::MetadataCreateEventRecord>,
+    ) -> Result<(), ()> {
+        if !metadata_create_events.is_empty() {
+            let local_node_id = self.context.net_handle.as_ref().map(|net| net.node_id());
+            if let Err(error) =
+                project_metadata_create_events(&self.context, metadata_create_events, local_node_id)
+                    .await
+            {
+                warn!(key = ?retry_key, error = ?error, "Failed to project metadata create event batch after document sync");
+                return Err(());
+            }
+            return Ok(());
+        }
+
+        let mut create_event_targets = Vec::new();
+        for target in targets {
+            let DocumentSyncTarget::MetadataCreateEvent {
+                document_id,
+                event_id,
+                ..
+            } = target
+            else {
+                continue;
+            };
+            create_event_targets.push((document_id, event_id));
+        }
+        if let Err(error) =
+            project_metadata_create_events_from_log(&self.context, create_event_targets).await
+        {
+            warn!(key = ?retry_key, error = ?error, "Failed to project metadata create event batch from log after document sync");
+            return Err(());
+        }
+        Ok(())
+    }
+
+    async fn drain_metadata_materialization_queue(&self) {
+        match process_metadata_materialization_batch(&self.context).await {
+            Ok(result) if result.has_more_due => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataMaterializationQueue,
+                    std::time::Duration::ZERO,
+                )
+                .await;
+            }
+            Ok(_) => {
+                match metadata_materialization_jobs_exist(&self.context.storage_handle).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        self.reschedule_timer(
+                            TaskKey::DrainMetadataMaterializationQueue,
+                            METADATA_MATERIALIZATION_POLL_AFTER,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        warn!(error = ?error, "Failed to probe metadata materialization jobs");
+                        self.reschedule_timer(
+                            TaskKey::DrainMetadataMaterializationQueue,
+                            METADATA_MATERIALIZATION_RETRY_AFTER,
+                        )
+                        .await;
+                    }
+                }
+            }
+            Err(error) => {
+                warn!(error = ?error, "Failed to drain metadata materialization queue");
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataMaterializationQueue,
+                    METADATA_MATERIALIZATION_RETRY_AFTER,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn drain_metadata_projection_queue(&self) {
+        if let Err(error) = replay_metadata_event_log(&self.context).await {
+            warn!(error = ?error, "Failed to drain metadata projection queue");
+            self.reschedule_timer(
+                TaskKey::DrainMetadataProjectionQueue,
+                METADATA_MATERIALIZATION_RETRY_AFTER,
+            )
+            .await;
         }
     }
 }
@@ -159,8 +402,10 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     task_handle
         .set_inbound_handler(Arc::new(OperationsTaskHandler::new(handler_context)))
         .await;
+    crate::queue_lag::spawn_queue_lag_monitor(&context);
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
+    restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
 }
 
 #[async_trait]
@@ -220,7 +465,25 @@ impl InboundTaskHandler for OperationsTaskHandler {
                     })))
                     .await;
                 match event {
-                    Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled { .. })) => {}
+                    Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled {
+                        targets,
+                        metadata_create_events,
+                        ..
+                    })) => {
+                        if self
+                            .project_reconciled_metadata_create_events(
+                                &retry_key,
+                                targets,
+                                metadata_create_events,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
+                                .await;
+                            return;
+                        }
+                    }
                     Event::Net(NetEvent::Irokle(IrokleEvent::Error { error, .. })) => {
                         warn!(key = ?retry_key, error = %error, "Failed to process durable document sync timer event");
                         self.reschedule_timer(retry_key, DOCUMENT_SYNC_RETRY_AFTER)
@@ -238,8 +501,14 @@ impl InboundTaskHandler for OperationsTaskHandler {
                     }
                 }
             }
-            TaskKey::DrainDocumentSyncOutbox { prefix } => {
-                self.drain_document_sync_outbox(prefix).await;
+            TaskKey::DrainDocumentSyncOutbox => {
+                self.drain_document_sync_outbox().await;
+            }
+            TaskKey::DrainMetadataProjectionQueue => {
+                self.drain_metadata_projection_queue().await;
+            }
+            TaskKey::DrainMetadataMaterializationQueue => {
+                self.drain_metadata_materialization_queue().await;
             }
         }
     }
