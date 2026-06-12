@@ -29,6 +29,8 @@ use aruna_core::types::Key;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
@@ -55,6 +57,33 @@ pub struct PendingMetadataProjectionDrainResult {
     pub markers_examined: usize,
     pub projected: usize,
     pub has_more: bool,
+}
+
+/// Conflict resolution is last-writer-wins on wall-clock time, so an event
+/// stamped far in the future would win every conflict forever. Inbound
+/// events beyond the configured skew are rejected; operators must run NTP.
+const DEFAULT_MAX_CLOCK_SKEW_SECS: u64 = 300;
+
+static CLOCK_SKEW_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+
+fn max_clock_skew_ms() -> u64 {
+    static SKEW_MS: OnceLock<u64> = OnceLock::new();
+    *SKEW_MS.get_or_init(|| {
+        std::env::var("MAX_CLOCK_SKEW_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_MAX_CLOCK_SKEW_SECS)
+            .saturating_mul(1000)
+    })
+}
+
+pub fn clock_skew_rejection_count() -> u64 {
+    CLOCK_SKEW_REJECTIONS.load(Ordering::Relaxed)
+}
+
+fn exceeds_clock_skew(event: &MetadataCreateEventRecord, now_ms: u64, max_skew_ms: u64) -> bool {
+    let limit = now_ms.saturating_add(max_skew_ms);
+    event.record.updated_at_ms > limit || event.occurred_at_ms > limit
 }
 
 #[derive(Debug, Error)]
@@ -369,6 +398,23 @@ pub async fn project_metadata_create_events(
     let mut projected_records = Vec::new();
 
     for event in events {
+        let now_ms = aruna_core::util::unix_timestamp_millis();
+        if exceeds_clock_skew(&event, now_ms, max_clock_skew_ms()) {
+            let rejected_total = CLOCK_SKEW_REJECTIONS.fetch_add(1, Ordering::Relaxed) + 1;
+            warn!(
+                event = "metadata.event.rejected",
+                reason = "clock_skew",
+                event_id = %event.event_id,
+                document_id = %event.record.document_id,
+                node_id = %event.node_id,
+                updated_at_ms = event.record.updated_at_ms,
+                occurred_at_ms = event.occurred_at_ms,
+                now_ms,
+                rejected_total,
+                "Rejecting metadata event stamped too far in the future; check NTP on the emitting node"
+            );
+            continue;
+        }
         let document_id = event.record.document_id;
         pending_projection_delete_targets.insert((document_id, event.event_id));
         if metadata_graph_deleted_cached(context, &event.record.graph_iri, &mut lifecycle_cache)
@@ -845,6 +891,7 @@ mod tests {
         metadata_create_event_write_entry, metadata_pending_projection_key,
     };
     use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+    use aruna_core::types::UserId;
     use aruna_storage::{FjallStorage, StorageHandle};
     use aruna_tasks::{InboundTaskHandler, TaskHandle};
     use async_trait::async_trait;
@@ -1155,5 +1202,65 @@ mod tests {
             aruna_core::document::DocumentSyncChangeKind::Upsert
         );
         assert_eq!(change.current.event_id, event.event_id);
+    }
+
+    fn skew_event(updated_at_ms: u64, occurred_at_ms: u64) -> MetadataCreateEventRecord {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let document_id = Ulid::new();
+        MetadataCreateEventRecord {
+            event_id: Ulid::new(),
+            record: MetadataRegistryRecord {
+                realm_id,
+                group_id: Ulid::new(),
+                document_id,
+                document_path: "datasets/skew".to_string(),
+                graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+                public: false,
+                permission_path: String::new(),
+                holder_node_ids: Vec::new(),
+                created_at_ms: updated_at_ms,
+                updated_at_ms,
+                last_event_id: Ulid::new(),
+            },
+            user_id: UserId::nil(realm_id),
+            node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
+            payload: MetadataCreateEventPayload::RoCrate {
+                jsonld: String::new(),
+            },
+            occurred_at_ms,
+        }
+    }
+
+    #[test]
+    fn skew_guard_accepts_events_at_the_threshold() {
+        let now_ms = 1_000_000;
+        let max_skew_ms = 300_000;
+        assert!(!exceeds_clock_skew(
+            &skew_event(now_ms + max_skew_ms, now_ms),
+            now_ms,
+            max_skew_ms
+        ));
+        assert!(!exceeds_clock_skew(
+            &skew_event(now_ms, now_ms + max_skew_ms),
+            now_ms,
+            max_skew_ms
+        ));
+        assert!(!exceeds_clock_skew(&skew_event(0, 0), now_ms, max_skew_ms));
+    }
+
+    #[test]
+    fn skew_guard_rejects_events_past_the_threshold() {
+        let now_ms = 1_000_000;
+        let max_skew_ms = 300_000;
+        assert!(exceeds_clock_skew(
+            &skew_event(now_ms + max_skew_ms + 1, now_ms),
+            now_ms,
+            max_skew_ms
+        ));
+        assert!(exceeds_clock_skew(
+            &skew_event(now_ms, now_ms + max_skew_ms + 1),
+            now_ms,
+            max_skew_ms
+        ));
     }
 }
