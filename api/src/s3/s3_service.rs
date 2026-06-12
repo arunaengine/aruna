@@ -65,7 +65,6 @@ use s3s::dto::{
     ReplicationRule, ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
 use s3s::{S3, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
-use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -88,6 +87,28 @@ struct ReferenceMetadataRefresh {
     version_id: ulid::Ulid,
     metadata: SourceMetadata,
     refreshed_at: SystemTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ListObjectsV2ContinuationCursor {
+    backend_continuation_token: Vec<u8>,
+    last_common_prefix: Option<String>,
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum ListObjectsV2LogicalEntry {
+    Content(Object),
+    CommonPrefix(String),
+}
+
+impl ListObjectsV2LogicalEntry {
+    fn last_common_prefix(&self) -> Option<&str> {
+        match self {
+            Self::Content(_) => None,
+            Self::CommonPrefix(prefix) => Some(prefix.as_str()),
+        }
+    }
 }
 
 fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
@@ -434,18 +455,28 @@ impl ArunaS3Service {
         }
     }
 
-    fn decode_list_objects_v2_continuation_token(token: Option<&str>) -> S3Result<Option<Vec<u8>>> {
+    fn decode_list_objects_v2_continuation_token(
+        token: Option<&str>,
+    ) -> S3Result<Option<ListObjectsV2ContinuationCursor>> {
         token
             .map(|token| {
-                STANDARD
+                let decoded = STANDARD
                     .decode(token)
+                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))?;
+                postcard::from_bytes(&decoded)
                     .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
             })
             .transpose()
     }
 
-    fn encode_list_objects_v2_continuation_token(token: Option<&[u8]>) -> Option<String> {
-        token.map(|token| STANDARD.encode(token))
+    fn encode_list_objects_v2_continuation_token(
+        token: Option<&ListObjectsV2ContinuationCursor>,
+    ) -> Option<String> {
+        token.and_then(|token| {
+            postcard::to_allocvec(token)
+                .ok()
+                .map(|token| STANDARD.encode(token))
+        })
     }
 }
 
@@ -696,9 +727,15 @@ impl S3 for ArunaS3Service {
         })?;
         let bucket_info = req.extensions.get::<BucketInfo>().cloned();
         let requested_continuation_token = req.input.continuation_token.clone();
-        let mut continuation_token = Self::decode_list_objects_v2_continuation_token(
+        let continuation_cursor = Self::decode_list_objects_v2_continuation_token(
             requested_continuation_token.as_deref(),
         )?;
+        let mut continuation_token = continuation_cursor
+            .as_ref()
+            .map(|cursor| cursor.backend_continuation_token.clone());
+        let mut resume_common_prefix = continuation_cursor
+            .as_ref()
+            .and_then(|cursor| cursor.last_common_prefix.clone());
         let max_keys = req
             .input
             .max_keys
@@ -709,9 +746,9 @@ impl S3 for ArunaS3Service {
         let delimiter = req.input.delimiter.clone();
         let start_after = req.input.start_after.clone();
 
-        let mut contents = Vec::new();
-        let mut common_prefixes = BTreeSet::new();
+        let mut logical_entries = Vec::new();
 
+        // Early return in case of max_keys = 0
         if req.input.max_keys == Some(0) {
             return Ok(S3Response::new(ListObjectsV2Output {
                 name: Some(bucket),
@@ -721,7 +758,7 @@ impl S3 for ArunaS3Service {
                 continuation_token: requested_continuation_token,
                 is_truncated: Some(false),
                 next_continuation_token: None,
-                contents: Some(contents),
+                contents: Some(Vec::new()),
                 common_prefixes: Some(Vec::new()),
                 delimiter,
                 encoding_type: req.input.encoding_type,
@@ -756,71 +793,123 @@ impl S3 for ArunaS3Service {
             let page_next_continuation_token = result.continuation_token.clone();
             let page_len = result.objects.len();
             backend_pages_scanned += 1;
+            let mut previous_raw_token = continuation_token.clone();
 
-            for (index, object) in result.objects.into_iter().enumerate() {
+            for object in result.objects.into_iter() {
                 let head_bytes = object
                     .head
                     .to_bytes()
                     .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
                 let key = object.head.key;
 
-                if continuation_token.is_none()
+                if requested_continuation_token.is_none()
                     && start_after
                         .as_ref()
                         .is_some_and(|start_after| key.as_str() <= start_after.as_str())
                 {
+                    previous_raw_token = Some(head_bytes);
                     continue;
                 }
 
-                if let Some(delimiter) = delimiter.as_ref() {
+                let logical_entry = if let Some(delimiter) = delimiter.as_ref() {
                     let prefix_start = prefix.as_ref().map(|prefix| prefix.len()).unwrap_or(0);
                     if let Some(relative_match) = key[prefix_start..].find(delimiter) {
                         let group_end = prefix_start + relative_match + delimiter.len();
                         let candidate_prefix = key[..group_end].to_string();
-                        if continuation_token.is_none()
+                        if requested_continuation_token.is_none()
                             && start_after.as_ref().is_some_and(|start_after| {
                                 candidate_prefix.as_str() <= start_after.as_str()
                             })
                         {
+                            previous_raw_token = Some(head_bytes);
                             continue;
                         }
-                        common_prefixes.insert(candidate_prefix);
-                        if contents.len() + common_prefixes.len() >= max_keys {
-                            next_continuation_token = if index + 1 < page_len {
-                                Some(head_bytes)
-                            } else {
-                                page_next_continuation_token.clone()
-                            };
-                            break;
+                        if resume_common_prefix.as_ref() == Some(&candidate_prefix) {
+                            previous_raw_token = Some(head_bytes);
+                            continue;
                         }
-                        continue;
+                        if logical_entries
+                            .last()
+                            .and_then(ListObjectsV2LogicalEntry::last_common_prefix)
+                            == Some(candidate_prefix.as_str())
+                        {
+                            previous_raw_token = Some(head_bytes);
+                            continue;
+                        }
+
+                        ListObjectsV2LogicalEntry::CommonPrefix(candidate_prefix)
+                    } else {
+                        let response_fields = self.build_object_response_fields(
+                            object.location.as_ref(),
+                            object.source_metadata.as_ref(),
+                            object.last_refresh,
+                        );
+                        ListObjectsV2LogicalEntry::Content(Object {
+                            e_tag: response_fields.e_tag,
+                            key: Some(key),
+                            last_modified: response_fields.last_modified,
+                            owner: None,
+                            size: response_fields.content_length,
+                            ..Default::default()
+                        })
                     }
+                } else {
+                    let response_fields = self.build_object_response_fields(
+                        object.location.as_ref(),
+                        object.source_metadata.as_ref(),
+                        object.last_refresh,
+                    );
+                    ListObjectsV2LogicalEntry::Content(Object {
+                        e_tag: response_fields.e_tag,
+                        key: Some(key),
+                        last_modified: response_fields.last_modified,
+                        owner: None,
+                        size: response_fields.content_length,
+                        ..Default::default()
+                    })
+                };
+
+                resume_common_prefix = None;
+
+                if logical_entries.len() < max_keys {
+                    logical_entries.push(logical_entry);
+                    previous_raw_token = Some(head_bytes);
+                    continue;
                 }
 
-                let response_fields = self.build_object_response_fields(
-                    object.location.as_ref(),
-                    object.source_metadata.as_ref(),
-                    object.last_refresh,
-                );
-                contents.push(Object {
-                    e_tag: response_fields.e_tag,
-                    key: Some(key),
-                    last_modified: response_fields.last_modified,
-                    owner: None,
-                    size: response_fields.content_length,
-                    ..Default::default()
-                });
-                if contents.len() + common_prefixes.len() >= max_keys {
-                    next_continuation_token = if index + 1 < page_len {
-                        Some(head_bytes)
-                    } else {
-                        page_next_continuation_token.clone()
-                    };
+                next_continuation_token =
+                    previous_raw_token
+                        .clone()
+                        .map(
+                            |backend_continuation_token| ListObjectsV2ContinuationCursor {
+                                backend_continuation_token,
+                                last_common_prefix: logical_entries
+                                    .last()
+                                    .and_then(ListObjectsV2LogicalEntry::last_common_prefix)
+                                    .map(str::to_string),
+                            },
+                        );
+                if next_continuation_token.is_none() && page_len > 0 {
+                    next_continuation_token =
+                        page_next_continuation_token
+                            .clone()
+                            .map(
+                                |backend_continuation_token| ListObjectsV2ContinuationCursor {
+                                    backend_continuation_token,
+                                    last_common_prefix: logical_entries
+                                        .last()
+                                        .and_then(ListObjectsV2LogicalEntry::last_common_prefix)
+                                        .map(str::to_string),
+                                },
+                            );
+                }
+                if next_continuation_token.is_some() {
                     break;
                 }
+                previous_raw_token = Some(head_bytes);
             }
 
-            if contents.len() + common_prefixes.len() >= max_keys {
+            if next_continuation_token.is_some() {
                 break;
             }
 
@@ -832,34 +921,47 @@ impl S3 for ArunaS3Service {
                     prefix = ?prefix,
                     delimiter = ?delimiter,
                     max_keys = %max_keys,
-                    visible_count = contents.len() + common_prefixes.len(),
+                    visible_count = logical_entries.len(),
                     pages = backend_pages_scanned,
                     "ListObjectsV2 pagination guard triggered; returning truncated response"
                 );
-                next_continuation_token = page_next_continuation_token.clone();
+                next_continuation_token =
+                    page_next_continuation_token
+                        .clone()
+                        .map(
+                            |backend_continuation_token| ListObjectsV2ContinuationCursor {
+                                backend_continuation_token,
+                                last_common_prefix: logical_entries
+                                    .last()
+                                    .and_then(ListObjectsV2LogicalEntry::last_common_prefix)
+                                    .map(str::to_string),
+                            },
+                        );
                 break;
             }
 
-            next_continuation_token = page_next_continuation_token.clone();
-            if next_continuation_token.is_none() {
+            continuation_token = page_next_continuation_token;
+            if continuation_token.is_none() {
                 break;
             }
-
-            continuation_token = next_continuation_token.clone();
         }
 
         let is_truncated = next_continuation_token.is_some();
-        if contents.len() > max_keys {
-            contents.truncate(max_keys);
+        let mut contents = Vec::new();
+        let mut common_prefixes = Vec::new();
+        for entry in logical_entries {
+            match entry {
+                ListObjectsV2LogicalEntry::Content(object) => contents.push(object),
+                ListObjectsV2LogicalEntry::CommonPrefix(prefix) => {
+                    common_prefixes.push(CommonPrefix {
+                        prefix: Some(prefix),
+                    });
+                }
+            }
         }
-        let remaining_common_prefixes = max_keys.saturating_sub(contents.len());
-        let common_prefixes: Vec<_> = common_prefixes
-            .into_iter()
-            .take(remaining_common_prefixes)
-            .collect();
         let key_count = contents.len() + common_prefixes.len();
         let next_continuation_token =
-            Self::encode_list_objects_v2_continuation_token(next_continuation_token.as_deref());
+            Self::encode_list_objects_v2_continuation_token(next_continuation_token.as_ref());
 
         Ok(S3Response::new(ListObjectsV2Output {
             name: Some(bucket),
@@ -870,14 +972,7 @@ impl S3 for ArunaS3Service {
             is_truncated: Some(is_truncated),
             next_continuation_token,
             contents: Some(contents),
-            common_prefixes: Some(
-                common_prefixes
-                    .into_iter()
-                    .map(|prefix| CommonPrefix {
-                        prefix: Some(prefix),
-                    })
-                    .collect(),
-            ),
+            common_prefixes: Some(common_prefixes),
             delimiter,
             encoding_type: req.input.encoding_type,
             start_after,
@@ -2001,15 +2096,198 @@ mod tests {
             }
         }
 
-        // First page emitted the "a/" common prefix (from a/1)
-        // Second page re-emitted "a/" (from a/2, now correctly on page 2)
-        // Third page returned b.txt as a content key
-        // Common prefixes are repeated per page because the API
-        // accumulates them from scratch on each request.
-        assert!(!all_prefixes.is_empty());
-        assert!(all_prefixes.iter().all(|p| p == "a/"));
+        assert_eq!(all_prefixes, vec!["a/"]);
         assert_eq!(all_keys, vec!["b.txt"]);
-        assert!(total_pages >= 2);
+        assert_eq!(total_pages, 2);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_prefix_only_page_is_not_truncated() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([33u8; 32]);
+        let group_id = Ulid::new();
+        let created_by = UserId::local(Ulid::new(), realm_id);
+
+        let service =
+            ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
+
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["a/1", "a/2"],
+            created_by,
+            UNIX_EPOCH,
+        )
+        .await;
+
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+
+        let req = test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
+                bucket: "bucket".to_string(),
+                continuation_token: None,
+                delimiter: Some("/".to_string()),
+                encoding_type: None,
+                expected_bucket_owner: None,
+                fetch_owner: None,
+                max_keys: Some(1),
+                optional_object_attributes: None,
+                prefix: None,
+                request_payer: None,
+                start_after: None,
+            },
+        );
+
+        let response = service.list_objects_v2(req).await.unwrap();
+        let output = response.output;
+
+        let prefixes: Vec<_> = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+
+        assert_eq!(prefixes, vec!["a/"]);
+        assert_eq!(output.contents.unwrap_or_default().len(), 0);
+        assert_eq!(output.key_count, Some(1));
+        assert_eq!(output.is_truncated, Some(false));
+        assert!(output.next_continuation_token.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_counts_prefixes_and_contents_in_order() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([34u8; 32]);
+        let group_id = Ulid::new();
+        let created_by = UserId::local(Ulid::new(), realm_id);
+
+        let service = ArunaS3Service::new(
+            context.clone(),
+            realm_id,
+            NodeId::from_bytes(&[0u8; 32]).unwrap(),
+        )
+        .await;
+
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["a.txt", "b/1", "c.txt"],
+            created_by,
+            UNIX_EPOCH,
+        )
+        .await;
+
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+
+        let first_response = service
+            .list_objects_v2(test_list_objects_v2_request(
+                extensions,
+                ListObjectsV2Input {
+                    bucket: "bucket".to_string(),
+                    continuation_token: None,
+                    delimiter: Some("/".to_string()),
+                    encoding_type: None,
+                    expected_bucket_owner: None,
+                    fetch_owner: None,
+                    max_keys: Some(2),
+                    optional_object_attributes: None,
+                    prefix: None,
+                    request_payer: None,
+                    start_after: None,
+                },
+            ))
+            .await
+            .unwrap()
+            .output;
+
+        let first_keys: Vec<_> = first_response
+            .contents
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|object| object.key)
+            .collect();
+        let first_prefixes: Vec<_> = first_response
+            .common_prefixes
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+
+        assert_eq!(first_keys, vec!["a.txt"]);
+        assert_eq!(first_prefixes, vec!["b/"]);
+        assert_eq!(first_response.key_count, Some(2));
+        assert_eq!(first_response.is_truncated, Some(true));
+
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+
+        let second_response = service
+            .list_objects_v2(test_list_objects_v2_request(
+                extensions,
+                ListObjectsV2Input {
+                    bucket: "bucket".to_string(),
+                    continuation_token: first_response.next_continuation_token,
+                    delimiter: Some("/".to_string()),
+                    encoding_type: None,
+                    expected_bucket_owner: None,
+                    fetch_owner: None,
+                    max_keys: Some(2),
+                    optional_object_attributes: None,
+                    prefix: None,
+                    request_payer: None,
+                    start_after: None,
+                },
+            ))
+            .await
+            .unwrap()
+            .output;
+
+        let second_keys: Vec<_> = second_response
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|object| object.key)
+            .collect();
+        let second_prefixes: Vec<_> = second_response
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+
+        assert_eq!(second_keys, vec!["c.txt"]);
+        assert!(second_prefixes.is_empty());
+        assert_eq!(second_response.key_count, Some(1));
+        assert_eq!(second_response.is_truncated, Some(false));
     }
 
     #[tokio::test]
