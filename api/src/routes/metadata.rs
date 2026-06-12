@@ -16,13 +16,15 @@ use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentPayload,
 };
 use aruna_operations::delete_metadata_document::DeleteMetadataDocumentOperation;
-use aruna_operations::driver::drive;
+use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
+use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
 use aruna_operations::metadata::repository::{
     parse_registry_read, read_registry_by_document_effect,
 };
+use aruna_operations::metadata::visible_registry;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentError, UpdateMetadataDocumentMutation,
     UpdateMetadataDocumentOperation,
@@ -637,6 +639,7 @@ pub async fn delete_metadata_document(
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_writable(&state, &auth, &record).await?;
 
+    let ctx = state.get_ctx();
     drive(
         DeleteMetadataDocumentOperation::new(
             Actor {
@@ -647,10 +650,14 @@ pub async fn delete_metadata_document(
             record.group_id,
             document_id,
         ),
-        &state.get_ctx(),
+        &ctx,
     )
     .await
     .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
+        metadata_handle.remove_cached_accepted_create(document_id);
+    }
+    visible_registry::remove_visible_registry_record(ctx.as_ref(), record.group_id, document_id);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -850,6 +857,7 @@ pub async fn replace_metadata_rocrate(
     )
     .await
     .map_err(map_update_metadata_error)?;
+    upsert_visible_registry_record(&state, &updated);
 
     Ok((
         StatusCode::OK,
@@ -942,6 +950,7 @@ pub async fn add_metadata_data_entity(
     )
     .await
     .map_err(map_update_metadata_error)?;
+    upsert_visible_registry_record(&state, &updated);
 
     Ok((
         StatusCode::OK,
@@ -1030,6 +1039,7 @@ pub async fn add_metadata_contextual_entity(
     )
     .await
     .map_err(map_update_metadata_error)?;
+    upsert_visible_registry_record(&state, &updated);
 
     Ok((
         StatusCode::OK,
@@ -1185,16 +1195,136 @@ fn parse_document_id(document_id: &str) -> ServerResult<Ulid> {
     Ulid::from_string(document_id).map_err(|_| ServerError::BadRequest)
 }
 
+fn metadata_projection_batch_key(ctx: &Arc<DriverContext>) -> [u8; 32] {
+    match ctx.net_handle.as_ref() {
+        Some(net) => *net.node_id().as_bytes(),
+        None => {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&(Arc::as_ptr(ctx) as usize as u64).to_be_bytes());
+            key
+        }
+    }
+}
+
+fn wake_metadata_create_projection(ctx: Arc<DriverContext>, document_id: Ulid, event_id: Ulid) {
+    let key = metadata_projection_batch_key(&ctx);
+    let should_spawn = {
+        let batches = METADATA_PROJECTION_BATCHES.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut batches = batches
+            .lock()
+            .expect("metadata projection batch mutex poisoned");
+        let batch = batches
+            .entry(key)
+            .or_insert_with(|| MetadataProjectionBatch {
+                ctx: Arc::downgrade(&ctx),
+                pending: Vec::new(),
+                scheduled: false,
+            });
+        batch.ctx = Arc::downgrade(&ctx);
+        batch.pending.push((document_id, event_id));
+        if batch.scheduled {
+            false
+        } else {
+            batch.scheduled = true;
+            true
+        }
+    };
+    if should_spawn {
+        tokio::spawn(async move {
+            tokio::time::sleep(METADATA_PROJECTION_DEBOUNCE_AFTER).await;
+            drain_metadata_projection_batch(key).await;
+        });
+    }
+}
+
+async fn drain_metadata_projection_batch(key: [u8; 32]) {
+    let Some((ctx, targets)) = take_metadata_projection_batch(key) else {
+        return;
+    };
+    if targets.is_empty() {
+        return;
+    }
+    if let Err(error) = project_metadata_create_events_from_log(ctx.as_ref(), targets).await {
+        warn!(error = ?error, "Failed to project metadata create event batch after create");
+    }
+}
+
+fn take_metadata_projection_batch(
+    key: [u8; 32],
+) -> Option<(Arc<DriverContext>, Vec<(Ulid, Ulid)>)> {
+    let batches = METADATA_PROJECTION_BATCHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut batches = batches
+        .lock()
+        .expect("metadata projection batch mutex poisoned");
+    let mut remove = false;
+    let result = batches.get_mut(&key).and_then(|batch| {
+        batch.scheduled = false;
+        let ctx = match batch.ctx.upgrade() {
+            Some(ctx) => ctx,
+            None => {
+                remove = true;
+                return None;
+            }
+        };
+        let targets = std::mem::take(&mut batch.pending);
+        Some((ctx, targets))
+    });
+    if remove {
+        batches.remove(&key);
+    }
+    result
+}
+
 async fn load_group_metadata_records(
     state: &ServerState,
     group_id: Ulid,
 ) -> ServerResult<Vec<MetadataRegistryRecord>> {
-    drive(
-        ListMetadataDocumentsOperation::new(group_id),
-        &state.get_ctx(),
+    let ctx = state.get_ctx();
+    // Listing is eventually consistent by design: the visible-registry cache is
+    // incrementally updated on local writes (projection upserts, updates,
+    // deletes), serves stale snapshots while a background refill runs, and is
+    // keyed per group so a small group's listing stays independent of the
+    // realm-wide corpus size; the registry scan only runs as a cold-cache
+    // fallback when the fill fails.
+    let mut records = match visible_registry::list_visible_registry_records_for_group(
+        ctx.as_ref(),
+        group_id,
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))
+    {
+        Ok(group_records) => group_records.as_ref().clone(),
+        Err(error) => {
+            warn!(
+                error = %error,
+                "visible registry cache fill failed, falling back to registry scan"
+            );
+            drive(ListMetadataDocumentsOperation::new(group_id), &ctx)
+                .await
+                .map_err(|err| ServerError::InternalError(err.to_string()))?
+        }
+    };
+    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
+        merge_cached_metadata_records(
+            &mut records,
+            metadata_handle.cached_accepted_creates_for_group(group_id),
+        );
+    }
+    Ok(records)
+}
+
+fn merge_cached_metadata_records(
+    records: &mut Vec<MetadataRegistryRecord>,
+    cached: Vec<MetadataRegistryRecord>,
+) {
+    let existing = records
+        .iter()
+        .map(|record| record.document_id)
+        .collect::<HashSet<_>>();
+    records.extend(
+        cached
+            .into_iter()
+            .filter(|record| !existing.contains(&record.document_id)),
+    );
 }
 
 async fn build_metadata_list_response(
@@ -1210,28 +1340,43 @@ async fn build_metadata_list_response(
         .clamp(1, MAX_LIST_METADATA_LIMIT);
     let offset = query.offset.unwrap_or(0);
 
-    let mut visible = Vec::new();
+    let needed = offset.saturating_add(limit);
+    let mut selected = Vec::with_capacity(limit.min(records.len()));
+    let mut visible_count = 0usize;
     for record in records {
         if !metadata_record_matches_filters(&record, query) {
             continue;
         }
-        if can_read_record(state, auth, &record).await? {
-            visible.push(record);
+        if !can_read_record(state, auth, &record).await? {
+            continue;
+        }
+        visible_count += 1;
+        if visible_count > offset {
+            selected.push(record);
+            if visible_count >= needed {
+                break;
+            }
         }
     }
 
-    let selected = visible.into_iter().skip(offset).take(limit);
-    let mut documents = Vec::new();
-    for record in selected {
-        let rocrate_summary = if include.summary {
-            Some(export_rocrate_summary_jsonld(state, &record.graph_iri).await?)
-        } else {
-            None
-        };
-        documents.push(MetadataDocumentListItem::from_record(
-            &record,
-            rocrate_summary,
-        ));
+    let mut documents = Vec::with_capacity(selected.len());
+    if include.summary {
+        let summaries = futures_util::future::join_all(
+            selected
+                .iter()
+                .map(|record| export_rocrate_summary_jsonld(state, &record.graph_iri)),
+        )
+        .await;
+        for (record, summary) in selected.iter().zip(summaries) {
+            documents.push(MetadataDocumentListItem::from_record(
+                record,
+                Some(summary?),
+            ));
+        }
+    } else {
+        for record in &selected {
+            documents.push(MetadataDocumentListItem::from_record(record, None));
+        }
     }
     let total_returned = documents.len();
 
@@ -1464,7 +1609,12 @@ async fn load_metadata_record_by_document(
         .await;
     match parse_registry_read(event) {
         Ok(Some(record)) => Ok(record),
-        Ok(None) => Err(ServerError::NotFound),
+        Ok(None) => state
+            .get_ctx()
+            .metadata_handle
+            .as_ref()
+            .and_then(|metadata_handle| metadata_handle.cached_accepted_create(document_id))
+            .ok_or(ServerError::NotFound),
         Err(crate::routes::metadata::ReadError::Storage(error)) => {
             Err(ServerError::InternalError(error.to_string()))
         }
@@ -1475,6 +1625,14 @@ async fn load_metadata_record_by_document(
 }
 
 type ReadError = aruna_operations::metadata::repository::StorageReadError;
+
+fn upsert_visible_registry_record(state: &ServerState, record: &MetadataRegistryRecord) {
+    let ctx = state.get_ctx();
+    if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
+        metadata_handle.upsert_visible_registry_record(record.clone());
+    }
+    visible_registry::upsert_visible_registry_records(ctx.as_ref(), std::slice::from_ref(record));
+}
 
 async fn export_rocrate_jsonld(state: &ServerState, graph_iri: &str) -> ServerResult<Value> {
     let handle = state
@@ -2531,6 +2689,71 @@ mod tests {
         assert!(json.contains("Created From RO-Crate"));
         assert!(json.contains("Ada Lovelace"));
         assert!(json.contains("run-42.raw"));
+    }
+
+    #[tokio::test]
+    async fn list_metadata_documents_serves_records_from_visible_registry_cache() {
+        let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+        visible_registry::invalidate_visible_registry(ctx.as_ref());
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/cache-served".to_string(),
+                    name: "Cache Served Dataset".to_string(),
+                    description: "Served from the visible registry cache".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        // Drop the accepted-create overlay so the listing below can only come
+        // from the visible-registry cache fill.
+        let document_id = parse_document_id(&created.summary.document_id).unwrap();
+        ctx.metadata_handle
+            .as_ref()
+            .unwrap()
+            .remove_cached_accepted_create(document_id);
+        visible_registry::invalidate_visible_registry(ctx.as_ref());
+
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.documents.len(), 1);
+        assert_eq!(listed.documents[0].document_id, created.summary.document_id);
+
+        let status = delete_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Path(created.summary.document_id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(listed.documents.is_empty());
     }
 
     #[tokio::test]
