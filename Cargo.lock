@@ -188,7 +188,7 @@ checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
 name = "aruna"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "aruna-api",
  "aruna-blob",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-api"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "ahash",
  "aruna-core",
@@ -244,6 +244,7 @@ dependencies = [
  "crypto_box",
  "ed25519-dalek 2.2.0",
  "futures-core",
+ "futures-util",
  "http 1.4.1",
  "hyper 1.10.1",
  "hyper-util",
@@ -256,6 +257,7 @@ dependencies = [
  "s3s",
  "serde",
  "serde_json",
+ "spargebra",
  "tempfile",
  "thiserror",
  "tokio",
@@ -269,7 +271,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-blob"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "aruna-core",
  "aruna-net",
@@ -300,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-core"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "async-trait",
  "base64",
@@ -320,12 +322,14 @@ dependencies = [
  "serde_json",
  "smallvec",
  "thiserror",
+ "tokio",
+ "tracing",
  "ulid",
 ]
 
 [[package]]
 name = "aruna-doctor"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "ahash",
  "aruna",
@@ -363,7 +367,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-net"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "aruna-core",
  "aruna-storage",
@@ -394,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-operations"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "aruna-blob",
  "aruna-core",
@@ -429,12 +433,13 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-opentelemetry",
+ "tracing-subscriber",
  "ulid",
 ]
 
 [[package]]
 name = "aruna-storage"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -450,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "aruna-tasks"
-version = "3.0.0-alpha.20"
+version = "3.0.0-alpha.32"
 dependencies = [
  "aruna-core",
  "async-trait",
@@ -1714,7 +1719,7 @@ dependencies = [
 [[package]]
 name = "craqle"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/craqle?branch=feat%2Firokle#02c1b087ff0f91faa27a54a9d8ee8f4257d275fc"
+source = "git+https://github.com/arunaengine/craqle?branch=feat%2Firokle#fe47bea5a0f7e004b563dab12a18efaf69fea0e0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1730,6 +1735,7 @@ dependencies = [
  "spargebra",
  "tantivy",
  "thiserror",
+ "tracing",
  "uuid",
 ]
 
@@ -3834,7 +3840,7 @@ dependencies = [
 [[package]]
 name = "irokle"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?branch=main#17d8dd0187da5666c3555d50c4b98446aeae7e5e"
+source = "git+https://github.com/arunaengine/irokle.git?branch=main#877d600eef409340d7e93d26c356438a3ff1c3f1"
 dependencies = [
  "blake3",
  "bytes",
@@ -3854,7 +3860,7 @@ dependencies = [
 [[package]]
 name = "irokle-derive"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?branch=main#17d8dd0187da5666c3555d50c4b98446aeae7e5e"
+source = "git+https://github.com/arunaengine/irokle.git?branch=main#877d600eef409340d7e93d26c356438a3ff1c3f1"
 dependencies = [
  "proc-macro2",
  "quote",
