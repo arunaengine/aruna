@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::{DocumentSyncReconcileResult, DocumentSyncTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{DhtEntry, Event, NetError as CoreNetError, NetEvent, StorageEvent};
@@ -50,7 +50,7 @@ pub use error::{NetError, Result};
 pub use irokle::IrokleService;
 
 const DHT_SIGNED_MAX_CLOCK_SKEW_SECS: u64 = 300;
-const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 256;
+const MAX_INBOUND_APP_STREAM_HANDLERS: usize = 1024;
 use connection_pool::{ConnectionPool, ConnectionPoolOptions};
 pub use streams::StreamsService;
 
@@ -621,10 +621,17 @@ impl NetHandle {
         });
 
         let endpoint_for_accept = endpoint.clone();
+        let irokle_for_accept = irokle.clone();
         let shutdown_for_accept = shutdown.child_token();
         let accept_task = tokio::spawn(async move {
-            streams::run_accept_loop(endpoint_for_accept, dht_tx, stream_tx, shutdown_for_accept)
-                .await;
+            streams::run_accept_loop(
+                endpoint_for_accept,
+                dht_tx,
+                stream_tx,
+                irokle_for_accept,
+                shutdown_for_accept,
+            )
+            .await;
         });
 
         let peer_connectivity_task = tokio::spawn(run_peer_connectivity_manager(
@@ -721,13 +728,22 @@ impl NetHandle {
         &self,
         stream: streams::BiStream,
         peer: NodeId,
-    ) -> Result<usize> {
-        let applied = self
-            .inner
-            .irokle
-            .handle_inbound_stream(stream, peer)
-            .await?;
-        self.reload_realm_peers().await?;
+    ) -> Result<Vec<::irokle::TopicId>> {
+        self.inner.irokle.handle_inbound_stream(stream, peer).await
+    }
+
+    pub async fn reconcile_irokle_topics(
+        &self,
+        topic_ids: Vec<::irokle::TopicId>,
+    ) -> Result<DocumentSyncReconcileResult> {
+        let applied = self.inner.irokle.reconcile_irokle_topics(topic_ids).await?;
+        if applied
+            .targets
+            .iter()
+            .any(|target| matches!(target, DocumentSyncTarget::RealmConfig { .. }))
+        {
+            self.reload_realm_peers().await?;
+        }
         Ok(applied)
     }
 

@@ -10,6 +10,7 @@ use tracing::{Instrument, Span, field, info_span, trace, warn};
 
 use crate::connection_pool::{ConnectionLease, ConnectionPool};
 use crate::error::{NetError, Result};
+use crate::irokle::IrokleService;
 use crate::telemetry::{
     duration_ms, record_duration_ms, warn_if_slow_iroh_phase, warn_if_slow_iroh_request,
 };
@@ -196,6 +197,7 @@ pub async fn run_accept_loop(
     endpoint: Endpoint,
     dht_handler: mpsc::Sender<(SendStream, RecvStream, NodeId)>,
     stream_handler: mpsc::Sender<(Alpn, BiStream, NodeId)>,
+    irokle: std::sync::Arc<IrokleService>,
     shutdown: CancellationToken,
 ) {
     loop {
@@ -206,6 +208,7 @@ pub async fn run_accept_loop(
 
                 let dht_handler = dht_handler.clone();
                 let stream_handler = stream_handler.clone();
+                let irokle = irokle.clone();
 
                 tokio::spawn(async move {
                     let accepting = match incoming.accept() {
@@ -237,6 +240,9 @@ pub async fn run_accept_loop(
                             run_dht_connection(conn, dht_handler, peer_id).await;
                         }
                         Some(alpn @ (Alpn::Bao | Alpn::Irokle | Alpn::Metadata)) => {
+                            if alpn == Alpn::Irokle {
+                                irokle.register_inbound_connection(&conn);
+                            }
                             run_app_connection(conn, alpn, stream_handler, peer_id).await;
                         }
                         None => {
