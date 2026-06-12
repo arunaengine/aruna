@@ -1760,31 +1760,22 @@ mod tests {
         )
         .await;
 
-        // Seed keys: dir-a/1, dir-a/2, dir-b/1, root.txt
-        let keys = ["dir-a/1", "dir-a/2", "dir-b/1", "root.txt"];
-        for key in &keys {
-            let version_id = Ulid::new();
-            let hash = [key.len() as u8; 32];
-            write_head(&storage_handle, "bucket", key, version_id).await;
-            write_materialized_version(
-                &storage_handle,
-                "bucket",
-                key,
-                version_id,
-                hash,
-                created_by,
-                created_at,
-                42,
-            )
-            .await;
-        }
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["dir-a/1", "dir-a/2", "dir-b/1", "root.txt"],
+            created_by,
+            created_at,
+        )
+        .await;
 
         let mut extensions = Extensions::new();
         extensions.insert(test_user_access(group_id, realm_id));
         extensions.insert(test_bucket_info(group_id, created_by));
 
-        let req = S3Request {
-            input: ListObjectsV2Input {
+        let req = test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
                 bucket: "bucket".to_string(),
                 continuation_token: None,
                 delimiter: Some("/".to_string()),
@@ -1797,15 +1788,7 @@ mod tests {
                 request_payer: None,
                 start_after: None,
             },
-            method: Method::GET,
-            uri: Uri::from_static("/"),
-            headers: HeaderMap::new(),
-            extensions,
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        );
 
         let response = service.list_objects_v2(req).await.unwrap();
         let output = response.output;
@@ -1856,26 +1839,15 @@ mod tests {
         )
         .await;
 
-        // Seed keys: a/1, a/2, b.txt
-        let keys = ["a/1", "a/2", "b.txt"];
-        for key in &keys {
-            let version_id = Ulid::new();
-            let hash = [key.len() as u8; 32];
-            write_head(&storage_handle, "bucket", key, version_id).await;
-            write_materialized_version(
-                &storage_handle,
-                "bucket",
-                key,
-                version_id,
-                hash,
-                created_by,
-                created_at,
-                42,
-            )
-            .await;
-        }
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["a/1", "a/2", "b.txt"],
+            created_by,
+            created_at,
+        )
+        .await;
 
-        // Paginate with max_keys=1, delimiter="/" and collect all results
         let mut continuation_token = None;
         let mut all_keys = Vec::new();
         let mut all_prefixes = Vec::new();
@@ -1886,8 +1858,9 @@ mod tests {
             extensions.insert(test_user_access(group_id, realm_id));
             extensions.insert(test_bucket_info(group_id, created_by));
 
-            let req = S3Request {
-                input: ListObjectsV2Input {
+            let req = test_list_objects_v2_request(
+                extensions,
+                ListObjectsV2Input {
                     bucket: "bucket".to_string(),
                     continuation_token,
                     delimiter: Some("/".to_string()),
@@ -1900,15 +1873,7 @@ mod tests {
                     request_payer: None,
                     start_after: None,
                 },
-                method: Method::GET,
-                uri: Uri::from_static("/"),
-                headers: HeaderMap::new(),
-                extensions,
-                credentials: None,
-                region: None,
-                service: None,
-                trailing_headers: None,
-            };
+            );
 
             let response = service.list_objects_v2(req).await.unwrap();
             let output = response.output;
@@ -2174,8 +2139,9 @@ mod tests {
         extensions.insert(test_user_access(group_id, realm_id));
         extensions.insert(test_bucket_info(group_id, created_by));
 
-        let req = S3Request {
-            input: ListObjectsV2Input {
+        let req = test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
                 bucket: "bucket".to_string(),
                 continuation_token: None,
                 delimiter: Some("/".to_string()),
@@ -2188,15 +2154,7 @@ mod tests {
                 request_payer: None,
                 start_after: None,
             },
-            method: Method::GET,
-            uri: Uri::from_static("/"),
-            headers: HeaderMap::new(),
-            extensions,
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
+        );
 
         let response = service.list_objects_v2(req).await.unwrap();
         let output = response.output;
