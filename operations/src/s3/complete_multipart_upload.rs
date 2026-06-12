@@ -3,13 +3,15 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_blob::hash::Hasher;
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
-    S3_MULTIPART_UPLOAD_KEYSPACE, S3_MULTIPART_UPLOAD_PART_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE, S3_MULTIPART_UPLOAD_KEYSPACE,
+    S3_MULTIPART_UPLOAD_PART_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum, HASH_MD5};
@@ -17,7 +19,7 @@ use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer,
     MultipartChecksumType, MultipartObjectMetadataKey, MultipartObjectPart, MultipartObjectSummary,
     MultipartUpload, MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId,
-    VersionKey,
+    UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
 use smallvec::smallvec;
@@ -39,12 +41,14 @@ pub enum CompleteMultipartUploadState {
     CheckHashLookup,
     WriteBlobLocation,
     ReadObjectLookup,
+    ReadLivenessVersion,
     WriteBlobHead,
     WriteHashPathIndex,
     WriteBlobVersionRecord,
     WriteObjectMetadata,
     DeleteUploadRecords,
     WriteLiveReplicationObligation,
+    UpdateUsage,
     CommitFinalizeTransaction,
     RegisterBlobInDht,
     CleanupDuplicate,
@@ -90,6 +94,8 @@ pub enum CompleteMultipartUploadError {
     MissingPartEtag,
     #[error("part etag mismatch")]
     PartEtagMismatch,
+    #[error(transparent)]
+    UsageUpdateError(#[from] UsageUpdateError),
     #[error("CompleteMultipartUpload failed")]
     CompleteMultipartUploadFailed,
 }
@@ -136,6 +142,9 @@ pub struct CompleteMultipartUploadOperation {
     version_id: Option<Ulid>,
     version_created_at: Option<SystemTime>,
     existing_pointer: Option<CurrentVersionPointer>,
+    new_blob: bool,
+    was_live: bool,
+    usage_update: Option<UsageCounterUpdate>,
     cleanup_part_index: usize,
     pending_error: Option<CompleteMultipartUploadError>,
     output: Option<Result<CompleteMultipartUploadResult, CompleteMultipartUploadError>>,
@@ -155,6 +164,9 @@ impl CompleteMultipartUploadOperation {
             version_id: None,
             version_created_at: None,
             existing_pointer: None,
+            new_blob: false,
+            was_live: false,
+            usage_update: None,
             cleanup_part_index: 0,
             pending_error: None,
             output: None,
@@ -439,7 +451,10 @@ impl CompleteMultipartUploadOperation {
                     return self.schedule_error(CompleteMultipartUploadError::ConversionError(err));
                 }
             },
-            None => Some(composed_location),
+            None => {
+                self.new_blob = true;
+                Some(composed_location)
+            }
         };
 
         self.write_blob_location()
@@ -505,6 +520,33 @@ impl CompleteMultipartUploadOperation {
             Err(err) => return self.schedule_error(err.into()),
         };
         self.existing_pointer = existing;
+        let existing_pointer = self.existing_pointer.clone();
+        if let Some(pointer) = existing_pointer.as_ref() {
+            let key = match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
+                .to_bytes()
+            {
+                Ok(key) => key.into(),
+                Err(err) => return self.schedule_error(err.into()),
+            };
+            self.state = CompleteMultipartUploadState::ReadLivenessVersion;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key,
+                txn_id: self.txn_id,
+            })];
+        }
+        self.write_current_lookup(existing_pointer.as_ref())
+    }
+
+    fn handle_liveness_version_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.schedule_error(CompleteMultipartUploadError::InvalidOperationState);
+        };
+
+        self.was_live = value
+            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
+            .is_some_and(|version| !version.is_deleted());
+
         let existing_pointer = self.existing_pointer.clone();
         self.write_current_lookup(existing_pointer.as_ref())
     }
@@ -745,8 +787,52 @@ impl CompleteMultipartUploadOperation {
         let Some(txn_id) = self.txn_id else {
             return self.schedule_error(CompleteMultipartUploadError::NoTransactionFound);
         };
-        self.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        let Some(group_id) = self.upload_record.as_ref().map(|record| record.group_id) else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        let Some(size) = self
+            .final_location
+            .as_ref()
+            .map(|location| i64::try_from(location.blob_size).unwrap_or(i64::MAX))
+        else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+
+        let group_delta = UsageDelta {
+            objects: if self.was_live { 0 } else { 1 },
+            logical_bytes: size,
+            ..Default::default()
+        };
+        let global_delta = UsageDelta {
+            stored_blobs: if self.new_blob { 1 } else { 0 },
+            stored_bytes: if self.new_blob { size } else { 0 },
+            ..group_delta
+        };
+        let mut update = UsageCounterUpdate::with_global(group_id, group_delta, global_delta);
+        self.state = CompleteMultipartUploadState::UpdateUsage;
+        let effects = update.start(txn_id);
+        self.usage_update = Some(update);
+        effects
+    }
+
+    fn handle_usage_update(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.schedule_error(CompleteMultipartUploadError::NoTransactionFound);
+        };
+        let Some(update) = self.usage_update.as_mut() else {
+            return self
+                .schedule_error(CompleteMultipartUploadError::CompleteMultipartUploadFailed);
+        };
+        match update.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                self.state = CompleteMultipartUploadState::CommitFinalizeTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Err(err) => self.schedule_error(err.into()),
+        }
     }
 
     fn handle_finalize_committed(&mut self, event: Event) -> Effects {
@@ -976,6 +1062,9 @@ impl Operation for CompleteMultipartUploadOperation {
                 self.handle_blob_location_written(event)
             }
             CompleteMultipartUploadState::ReadObjectLookup => self.handle_object_lookup_read(event),
+            CompleteMultipartUploadState::ReadLivenessVersion => {
+                self.handle_liveness_version_read(event)
+            }
             CompleteMultipartUploadState::WriteBlobHead => self.handle_blob_head_written(event),
             CompleteMultipartUploadState::WriteHashPathIndex => {
                 self.handle_hash_path_index_written(event)
@@ -992,6 +1081,7 @@ impl Operation for CompleteMultipartUploadOperation {
             CompleteMultipartUploadState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
+            CompleteMultipartUploadState::UpdateUsage => self.handle_usage_update(event),
             CompleteMultipartUploadState::CommitFinalizeTransaction => {
                 self.handle_finalize_committed(event)
             }

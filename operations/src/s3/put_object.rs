@@ -3,16 +3,17 @@ use crate::blob::blob_keyspace_helper::{
     write_blob_location_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{BlobEffect, DhtEffect, Effect, NetEffect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{BlobEvent, DhtEvent, Event, NetEvent, StorageEvent};
-use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::ExpectedChecksum;
 use aruna_core::structs::{
     AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer, RealmId,
-    VersionKey, VersionSourceBinding,
+    UsageDelta, VersionKey, VersionSourceBinding,
 };
 use aruna_core::types::{Effects, GroupId, NodeId, UserId};
 use bytes::Bytes;
@@ -29,10 +30,12 @@ pub enum PutObjectState {
     CheckHashLookup,
     CreateBlobLocation,
     ReadObjectLookup,
+    ReadLivenessVersion,
     WriteBlobHead,
     WriteHashPathIndex,
     CreateBlobVersionRecord,
     WriteLiveReplicationObligation,
+    UpdateUsage,
     CommitTransaction,
     RegisterBlobInDht,
     CleanupDuplicate,
@@ -62,6 +65,8 @@ pub enum PutObjectError {
     ChecksumMismatch(&'static str),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    UsageUpdateError(#[from] UsageUpdateError),
     #[error("Something went wrong ...")]
     PutObjectFailed,
 }
@@ -102,6 +107,9 @@ pub struct PutObjectOperation {
     written_location: Option<BackendLocation>,
     cleanup_location: Option<BackendLocation>,
     existing_pointer: Option<CurrentVersionPointer>,
+    new_blob: bool,
+    was_live: bool,
+    usage_update: Option<UsageCounterUpdate>,
     pending_error: Option<PutObjectError>,
     output: Option<Result<BackendLocation, PutObjectError>>,
 }
@@ -116,6 +124,9 @@ impl PutObjectOperation {
             written_location: None,
             cleanup_location: None,
             existing_pointer: None,
+            new_blob: false,
+            was_live: false,
+            usage_update: None,
             pending_error: None,
             output: None,
         }
@@ -218,6 +229,7 @@ impl PutObjectOperation {
                 self.create_blob_location()
             }
             None => {
+                self.new_blob = true;
                 self.output = Some(Ok(written_location.clone()));
                 self.create_blob_location()
             }
@@ -294,6 +306,37 @@ impl PutObjectOperation {
             Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
         };
         self.existing_pointer = existing;
+        let existing_pointer = self.existing_pointer.clone();
+        if let Some(pointer) = existing_pointer.as_ref() {
+            let key = match VersionKey::new(
+                self.config.request.bucket.clone(),
+                self.config.request.key.clone(),
+                pointer.version_id,
+            )
+            .to_bytes()
+            {
+                Ok(key) => key.into(),
+                Err(err) => return self.emit_error(PutObjectError::ConversionError(err)),
+            };
+            self.state = PutObjectState::ReadLivenessVersion;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key,
+                txn_id: self.txn_id,
+            })];
+        }
+        self.write_current_lookup(existing_pointer.as_ref())
+    }
+
+    fn handle_liveness_version_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(PutObjectError::InvalidOperationState);
+        };
+
+        self.was_live = value
+            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
+            .is_some_and(|version| !version.is_deleted());
+
         let existing_pointer = self.existing_pointer.clone();
         self.write_current_lookup(existing_pointer.as_ref())
     }
@@ -425,13 +468,51 @@ impl PutObjectOperation {
     fn handle_live_replication_obligation_written(&mut self, event: Event) -> Effects {
         if let Event::Storage(StorageEvent::WriteResult { .. }) = event {
             if let Some(txn_id) = self.txn_id {
-                self.state = PutObjectState::CommitTransaction;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+                let Some(location) = self.get_output().cloned() else {
+                    return self.emit_error(PutObjectError::MissingOutput);
+                };
+                let size = i64::try_from(location.blob_size).unwrap_or(i64::MAX);
+                let group_delta = UsageDelta {
+                    objects: if self.was_live { 0 } else { 1 },
+                    logical_bytes: size,
+                    ..Default::default()
+                };
+                let global_delta = UsageDelta {
+                    stored_blobs: if self.new_blob { 1 } else { 0 },
+                    stored_bytes: if self.new_blob { size } else { 0 },
+                    ..group_delta
+                };
+                let mut update = UsageCounterUpdate::with_global(
+                    self.config.group_id,
+                    group_delta,
+                    global_delta,
+                );
+                self.state = PutObjectState::UpdateUsage;
+                let effects = update.start(txn_id);
+                self.usage_update = Some(update);
+                effects
             } else {
                 self.emit_error(PutObjectError::NoTransactionFound)
             }
         } else {
             self.emit_error(PutObjectError::InvalidOperationState)
+        }
+    }
+
+    fn handle_usage_update(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(PutObjectError::NoTransactionFound);
+        };
+        let Some(update) = self.usage_update.as_mut() else {
+            return self.emit_error(PutObjectError::PutObjectFailed);
+        };
+        match update.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                self.state = PutObjectState::CommitTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Err(err) => self.emit_error(err.into()),
         }
     }
 
@@ -561,6 +642,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::CheckHashLookup => self.handle_hash_lookup_checked(event),
             PutObjectState::CreateBlobLocation => self.handle_blob_location_created(event),
             PutObjectState::ReadObjectLookup => self.handle_object_lookup_read(event),
+            PutObjectState::ReadLivenessVersion => self.handle_liveness_version_read(event),
             PutObjectState::WriteBlobHead => self.handle_blob_head_written(event),
             PutObjectState::WriteHashPathIndex => self.handle_hash_path_index_created(event),
             PutObjectState::CreateBlobVersionRecord => {
@@ -569,6 +651,7 @@ impl Operation for PutObjectOperation {
             PutObjectState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
+            PutObjectState::UpdateUsage => self.handle_usage_update(event),
             PutObjectState::CommitTransaction => self.handle_transaction_committed(event),
             PutObjectState::RegisterBlobInDht => self.handle_blob_registered_in_dht(event),
             PutObjectState::CleanupDuplicate => self.handle_duplicate_cleanup(event),
@@ -1062,7 +1145,15 @@ mod test {
             key: vec![0].into(),
             value: Some(existing.to_bytes().unwrap().into()),
         }));
+        let [Effect::Storage(StorageEffect::Read { key_space, .. })] = effects.as_slice() else {
+            panic!("expected liveness version read")
+        };
+        assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
 
+        let effects = op.handle_liveness_version_read(Event::Storage(StorageEvent::ReadResult {
+            key: vec![0].into(),
+            value: None,
+        }));
         let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
             panic!("expected current pointer write")
         };

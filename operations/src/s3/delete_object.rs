@@ -3,16 +3,18 @@ use crate::blob::blob_keyspace_helper::{
     delete_hash_path_index_effect, write_blob_version_effect,
 };
 use crate::replication::queue::write_live_replication_obligation_effect;
+use crate::usage_stats::{UsageCounterUpdate, UsageUpdateError};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    S3_MULTIPART_OBJECT_METADATA_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::structs::{
-    AuthContext, BlobHeadKey, BlobVersion, CurrentVersionPointer, MultipartObjectMetadataKey,
-    RealmId, VersionKey,
+    AuthContext, BackendLocation, BlobHeadKey, BlobVersion, CurrentVersionPointer,
+    MultipartObjectMetadataKey, RealmId, UsageDelta, VersionKey,
 };
 use aruna_core::types::{Effects, GroupId, Key, NodeId, UserId};
 use smallvec::smallvec;
@@ -26,8 +28,10 @@ pub enum DeleteObjectState {
     Init,
     StartTransaction,
     ReadTargetVersion,
+    ReadTargetLocation,
     ReadAllVersions,
     ReadCurrentLookup,
+    ReadLivenessVersion,
     ApplyHeadTransition,
     DeleteTargetHashPathIndex,
     DeleteTargetVersion,
@@ -36,6 +40,7 @@ pub enum DeleteObjectState {
     DeleteMultipartPart,
     WriteBlobVersion,
     WriteLiveReplicationObligation,
+    UpdateUsage,
     CommitTransaction,
     Finish,
     Error,
@@ -80,6 +85,8 @@ pub enum DeleteObjectError {
     NoSuchVersion,
     #[error("Invalid operation state")]
     InvalidOperationState,
+    #[error(transparent)]
+    UsageUpdateError(#[from] UsageUpdateError),
     #[error("DeleteObject failed")]
     DeleteObjectFailed,
 }
@@ -118,6 +125,9 @@ pub struct DeleteObjectOperation {
     deleted_version_created_at: Option<SystemTime>,
     multipart_part_keys: Vec<Key>,
     multipart_delete_index: usize,
+    target_size: Option<u64>,
+    live_before_marker: bool,
+    usage_update: Option<UsageCounterUpdate>,
     output: Option<Result<DeleteObjectResult, DeleteObjectError>>,
 }
 
@@ -139,6 +149,9 @@ impl DeleteObjectOperation {
             deleted_version_created_at: None,
             multipart_part_keys: Vec::new(),
             multipart_delete_index: 0,
+            target_size: None,
+            live_before_marker: false,
+            usage_update: None,
             output: None,
         }
     }
@@ -248,8 +261,35 @@ impl DeleteObjectOperation {
             Ok(version) => version,
             Err(err) => return self.emit_error(err.into()),
         };
-        self.target_version = Some(VersionSummary::from_blob_version(version_id, &version));
+        let summary = VersionSummary::from_blob_version(version_id, &version);
+        let materialized_hash = summary.materialized_hash;
+        self.target_version = Some(summary);
 
+        if let Some(hash) = materialized_hash {
+            self.state = DeleteObjectState::ReadTargetLocation;
+            return smallvec![Effect::Storage(StorageEffect::Read {
+                key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                key: hash.to_vec().into(),
+                txn_id: self.txn_id,
+            })];
+        }
+
+        self.read_all_versions()
+    }
+
+    fn handle_target_location_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+
+        self.target_size = value
+            .and_then(|value| BackendLocation::from_bytes(value.as_ref()).ok())
+            .map(|location| location.blob_size);
+
+        self.read_all_versions()
+    }
+
+    fn read_all_versions(&mut self) -> Effects {
         self.state = DeleteObjectState::ReadAllVersions;
         let prefix = match VersionKey::object_prefix(&self.input.bucket, &self.input.key) {
             Ok(prefix) => prefix.into(),
@@ -333,8 +373,40 @@ impl DeleteObjectOperation {
             self.handle_version_delete_current_lookup(target_version_id, existing.as_ref())
         } else {
             self.pending_new_current_hash = None;
+            if let Some(pointer) = existing.as_ref() {
+                let key =
+                    match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
+                        .to_bytes()
+                    {
+                        Ok(key) => key.into(),
+                        Err(err) => return self.emit_error(err.into()),
+                    };
+                self.state = DeleteObjectState::ReadLivenessVersion;
+                return smallvec![Effect::Storage(StorageEffect::Read {
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                    key,
+                    txn_id: self.txn_id,
+                })];
+            }
+            self.live_before_marker = false;
             self.write_tombstone_current_lookup(version_id, existing.as_ref())
         }
+    }
+
+    fn handle_liveness_version_read(&mut self, event: Event) -> Effects {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+
+        self.live_before_marker = value
+            .and_then(|value| BlobVersion::from_bytes(value.as_ref()).ok())
+            .is_some_and(|version| !version.is_deleted());
+
+        let Some(version_id) = self.version_id else {
+            return self.emit_error(DeleteObjectError::InvalidOperationState);
+        };
+        let existing = self.existing_pointer.clone();
+        self.write_tombstone_current_lookup(version_id, existing.as_ref())
     }
 
     fn handle_version_delete_current_lookup(
@@ -483,17 +555,79 @@ impl DeleteObjectOperation {
         self.delete_next_multipart_part()
     }
 
+    fn usage_delta(&self) -> UsageDelta {
+        if let Some(target) = self.target_version.as_ref() {
+            let pointed_at_target = self
+                .existing_pointer
+                .as_ref()
+                .is_some_and(|pointer| pointer.version_id == target.version_id);
+            let objects = if pointed_at_target {
+                let live_before = !target.is_deleted();
+                let live_after = self
+                    .latest_remaining
+                    .as_ref()
+                    .is_some_and(|latest| !latest.is_deleted());
+                i64::from(live_after) - i64::from(live_before)
+            } else {
+                0
+            };
+            let logical_bytes = match (target.materialized_hash, self.target_size) {
+                (Some(_), Some(size)) => -i64::try_from(size).unwrap_or(i64::MAX),
+                _ => 0,
+            };
+            UsageDelta {
+                objects,
+                logical_bytes,
+                ..Default::default()
+            }
+        } else {
+            UsageDelta {
+                objects: if self.live_before_marker { -1 } else { 0 },
+                ..Default::default()
+            }
+        }
+    }
+
+    fn start_usage_update(&mut self) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(DeleteObjectError::NoTransactionFound);
+        };
+        let delta = self.usage_delta();
+        let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta);
+        if update.is_noop() {
+            self.state = DeleteObjectState::CommitTransaction;
+            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        }
+        self.state = DeleteObjectState::UpdateUsage;
+        let effects = update.start(txn_id);
+        self.usage_update = Some(update);
+        effects
+    }
+
+    fn handle_usage_update(&mut self, event: Event) -> Effects {
+        let Some(txn_id) = self.txn_id else {
+            return self.emit_error(DeleteObjectError::NoTransactionFound);
+        };
+        let Some(update) = self.usage_update.as_mut() else {
+            return self.emit_error(DeleteObjectError::DeleteObjectFailed);
+        };
+        match update.step(event, txn_id) {
+            Ok(Some(effects)) => effects,
+            Ok(None) => {
+                self.state = DeleteObjectState::CommitTransaction;
+                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            }
+            Err(err) => self.emit_error(err.into()),
+        }
+    }
+
     fn delete_next_multipart_part(&mut self) -> Effects {
         let Some(key) = self
             .multipart_part_keys
             .get(self.multipart_delete_index)
             .cloned()
         else {
-            let Some(txn_id) = self.txn_id else {
-                return self.emit_error(DeleteObjectError::NoTransactionFound);
-            };
-            self.state = DeleteObjectState::CommitTransaction;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+            return self.start_usage_update();
         };
 
         self.state = DeleteObjectState::DeleteMultipartPart;
@@ -584,11 +718,7 @@ impl DeleteObjectOperation {
             return self.emit_error(DeleteObjectError::InvalidOperationState);
         };
 
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(DeleteObjectError::NoTransactionFound);
-        };
-        self.state = DeleteObjectState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+        self.start_usage_update()
     }
 
     fn handle_transaction_committed(&mut self, event: Event) -> Effects {
@@ -638,8 +768,10 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::Init => self.handle_init(),
             DeleteObjectState::StartTransaction => self.handle_transaction_started(event),
             DeleteObjectState::ReadTargetVersion => self.handle_target_version_read(event),
+            DeleteObjectState::ReadTargetLocation => self.handle_target_location_read(event),
             DeleteObjectState::ReadAllVersions => self.handle_all_versions_read(event),
             DeleteObjectState::ReadCurrentLookup => self.handle_current_lookup_read(event),
+            DeleteObjectState::ReadLivenessVersion => self.handle_liveness_version_read(event),
             DeleteObjectState::ApplyHeadTransition => self.handle_head_transition_applied(event),
             DeleteObjectState::DeleteTargetHashPathIndex => {
                 self.handle_target_hash_path_deleted(event)
@@ -654,6 +786,7 @@ impl Operation for DeleteObjectOperation {
             DeleteObjectState::WriteLiveReplicationObligation => {
                 self.handle_live_replication_obligation_written(event)
             }
+            DeleteObjectState::UpdateUsage => self.handle_usage_update(event),
             DeleteObjectState::CommitTransaction => self.handle_transaction_committed(event),
             DeleteObjectState::Finish => smallvec![],
             DeleteObjectState::Error => self.abort(),
