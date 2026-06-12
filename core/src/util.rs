@@ -29,9 +29,31 @@ pub fn xor_distance_32(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
     result
 }
 
+/// Smallest key strictly greater than every key starting with `prefix`,
+/// or `None` if no such key exists (prefix is all `0xFF`).
+pub fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    for idx in (0..upper.len()).rev() {
+        if upper[idx] != u8::MAX {
+            upper[idx] = upper[idx].saturating_add(1);
+            upper.truncate(idx + 1);
+            return Some(upper);
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_prefix_upper_bound() {
+        assert_eq!(prefix_upper_bound(b"abc"), Some(b"abd".to_vec()));
+        assert_eq!(prefix_upper_bound(b"ab\xff"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_upper_bound(b"\xff\xff"), None);
+    }
 
     #[test]
     fn test_unix_timestamp_secs() {

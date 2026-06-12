@@ -2086,7 +2086,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_pagination_guard_returns_truncated() {
+    async fn test_list_objects_v2_large_group_collapses_to_single_page() {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
@@ -2110,7 +2110,8 @@ mod tests {
         .await;
 
         // Seed 305 keys under "dir/" so delimiter collapses them into one
-        // common prefix, forcing many backend pages.
+        // common prefix; the scan seeks past the group instead of paging
+        // through it.
         for i in 0..305 {
             let key = format!("dir/key_{:04}", i);
             let version_id = Ulid::new();
@@ -2153,13 +2154,13 @@ mod tests {
         let response = service.list_objects_v2(req).await.unwrap();
         let output = response.output;
 
-        assert_eq!(output.is_truncated, Some(true));
+        assert_eq!(output.is_truncated, Some(false));
         assert!(
-            output.next_continuation_token.is_some(),
-            "guard should set next_continuation_token"
+            output.next_continuation_token.is_none(),
+            "single visible entry must not be truncated"
         );
+        assert_eq!(output.key_count, Some(1));
 
-        // Verify we got a common_prefix
         let common_prefixes: Vec<_> = output
             .common_prefixes
             .unwrap_or_default()

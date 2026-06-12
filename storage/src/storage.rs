@@ -10,6 +10,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::telemetry::{LatencyAggregator, record_stage};
+use aruna_core::util::prefix_upper_bound;
 use async_trait::async_trait;
 use byteview::ByteView;
 use crossfire::{TrySendError, mpsc, oneshot};
@@ -1545,19 +1546,6 @@ fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageEr
     }
 
     Ok((values, None))
-}
-
-fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut upper = prefix.to_vec();
-    for idx in (0..upper.len()).rev() {
-        if upper[idx] != u8::MAX {
-            upper[idx] = upper[idx].saturating_add(1);
-            upper.truncate(idx + 1);
-            return Some(upper);
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
