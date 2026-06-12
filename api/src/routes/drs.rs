@@ -149,8 +149,8 @@ pub struct DownloadQuery {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DrsErrorPayload {
-    status: u16,
-    message: String,
+    status_code: u16,
+    msg: String,
 }
 
 enum RequestedObjectId {
@@ -302,15 +302,15 @@ pub async fn post_objects(
     let mut objects = Vec::with_capacity(body.object_ids.len());
     for object_id in body.object_ids {
         let result = match resolve_object(state.as_ref(), &auth, &object_id).await {
-            Ok(ResolveOutcome::Found(resolved)) => {
-                serde_json::to_value(build_object_response(&headers, &resolved))
-                    .unwrap_or_else(|_| json!({ "status": 500, "message": "serialization failed" }))
-            }
-            Ok(ResolveOutcome::Denied) => json!({ "status": 403, "message": "Forbidden" }),
+            Ok(ResolveOutcome::Found(resolved)) => serde_json::to_value(build_object_response(
+                &headers, &resolved,
+            ))
+            .unwrap_or_else(|_| json!({ "status_code": 500, "msg": "serialization failed" })),
+            Ok(ResolveOutcome::Denied) => json!({ "status_code": 403, "msg": "Forbidden" }),
             Ok(ResolveOutcome::NotFound) => {
-                json!({ "status": 404, "message": "DRS object not found" })
+                json!({ "status_code": 404, "msg": "DRS object not found" })
             }
-            Err(error) => json!({ "status": error.status.as_u16(), "message": error.message }),
+            Err(error) => json!({ "status_code": error.status.as_u16(), "msg": error.message }),
         };
         objects.push(DrsBulkObjectItem { object_id, result });
     }
@@ -641,8 +641,8 @@ fn drs_error(status: StatusCode, message: impl Into<String>) -> Response {
     drs_json_response(
         status,
         DrsErrorPayload {
-            status: status.as_u16(),
-            message: message.into(),
+            status_code: status.as_u16(),
+            msg: message.into(),
         },
     )
 }
