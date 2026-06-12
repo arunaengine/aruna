@@ -112,6 +112,10 @@ pub enum StorageEffect {
         key: Key,
         txn_id: Option<TxnId>,
     },
+    BatchRead {
+        reads: Vec<(KeySpace, Key)>,
+        txn_id: Option<TxnId>,
+    },
     Write {
         key_space: KeySpace,
         key: Key,

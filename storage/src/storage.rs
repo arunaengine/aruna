@@ -65,6 +65,9 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
         | StorageEffect::Write { key_space, .. }
         | StorageEffect::Delete { key_space, .. }
         | StorageEffect::Iter { key_space, .. } => Some(key_space),
+        StorageEffect::BatchRead { reads, .. } => {
+            reads.first().map(|(key_space, _)| key_space.as_str())
+        }
         StorageEffect::BatchWrite { writes, .. } => {
             writes.first().map(|(key_space, _, _)| key_space.as_str())
         }
@@ -328,6 +331,10 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
             txn_id: Some(txn_id),
             ..
         }
+        | StorageEffect::BatchRead {
+            txn_id: Some(txn_id),
+            ..
+        }
         | StorageEffect::Write {
             txn_id: Some(txn_id),
             ..
@@ -352,6 +359,7 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
         StorageEffect::StartTransaction { .. }
         | StorageEffect::AbortTransaction { .. }
         | StorageEffect::Read { txn_id: None, .. }
+        | StorageEffect::BatchRead { txn_id: None, .. }
         | StorageEffect::Write { txn_id: None, .. }
         | StorageEffect::BatchWrite { txn_id: None, .. }
         | StorageEffect::Delete { txn_id: None, .. }
@@ -416,6 +424,7 @@ impl FjallStorage {
                 key,
                 txn_id,
             } => self.read(key_space, key, txn_id),
+            StorageEffect::BatchRead { reads, txn_id } => self.batch_read(reads, txn_id),
             StorageEffect::Write {
                 key_space,
                 key,
@@ -840,6 +849,24 @@ impl FjallStorage {
         }
     }
 
+    fn batch_read(
+        &mut self,
+        reads: Vec<(String, ByteView)>,
+        txn_id: Option<Ulid>,
+    ) -> StorageEvent {
+        if let Some(txn_id) = txn_id {
+            match self.txns.get(&txn_id) {
+                Some(Txn::Read(txn)) => batch_read_with(&self.store, txn, reads),
+                Some(Txn::Write(txn)) => batch_read_with(&self.store, txn.as_ref(), reads),
+                None => StorageEvent::Error {
+                    error: StorageError::TransactionNotFound,
+                },
+            }
+        } else {
+            store_batch_read(&self.store, reads)
+        }
+    }
+
     #[tracing::instrument(
         name = "storage.write",
         level = "debug",
@@ -1120,6 +1147,34 @@ fn store_read(store: &Store, keyspace: OptimisticTxKeyspace, key: ByteView) -> S
     }
 }
 
+fn batch_read_with<R: Readable>(
+    store: &Store,
+    reader: &R,
+    reads: Vec<(String, ByteView)>,
+) -> StorageEvent {
+    let mut values = Vec::with_capacity(reads.len());
+    for (key_space, key) in reads {
+        let keyspace = match store.resolve_keyspace(&key_space) {
+            Ok(ks) => ks,
+            Err(error) => return StorageEvent::Error { error },
+        };
+        match reader.get(&keyspace, &key) {
+            Ok(value_opt) => values.push((key, value_opt.map(Into::into))),
+            Err(_e) => {
+                return StorageEvent::Error {
+                    error: StorageError::ReadError,
+                };
+            }
+        }
+    }
+    StorageEvent::BatchReadResult { values }
+}
+
+fn store_batch_read(store: &Store, reads: Vec<(String, ByteView)>) -> StorageEvent {
+    let snapshot = store.db.read_tx();
+    batch_read_with(store, &snapshot, reads)
+}
+
 fn store_iterate(
     store: &Store,
     keyspace: OptimisticTxKeyspace,
@@ -1156,7 +1211,9 @@ fn is_groupable_write(effect: &StorageEffect) -> bool {
 fn is_poolable_read(effect: &StorageEffect) -> bool {
     matches!(
         effect,
-        StorageEffect::Read { txn_id: None, .. } | StorageEffect::Iter { txn_id: None, .. }
+        StorageEffect::Read { txn_id: None, .. }
+            | StorageEffect::BatchRead { txn_id: None, .. }
+            | StorageEffect::Iter { txn_id: None, .. }
     )
 }
 
@@ -1190,6 +1247,10 @@ fn read_pool_loop(store: Store, receiver: EffectReceiver) {
                 Ok(keyspace) => store_read(&store, keyspace, key),
                 Err(error) => StorageEvent::Error { error },
             },
+            StorageEffect::BatchRead {
+                reads,
+                txn_id: None,
+            } => store_batch_read(&store, reads),
             StorageEffect::Iter {
                 key_space,
                 prefix,
@@ -1350,6 +1411,12 @@ fn record_storage_effect_fields(span: &Span, effect: &StorageEffect) {
                 span.record("txn_id", field::display(txn_id));
             }
         }
+        StorageEffect::BatchRead { reads, txn_id } => {
+            span.record("batch_len", reads.len() as u64);
+            if let Some(txn_id) = txn_id {
+                span.record("txn_id", field::display(txn_id));
+            }
+        }
         StorageEffect::BatchWrite { writes, txn_id } => {
             span.record("batch_len", writes.len() as u64);
             if let Some(txn_id) = txn_id {
@@ -1389,6 +1456,7 @@ fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::StartTransaction { .. } => "start_transaction",
         StorageEffect::CommitTransaction { .. } => "commit_transaction",
         StorageEffect::Read { .. } => "read",
+        StorageEffect::BatchRead { .. } => "batch_read",
         StorageEffect::Write { .. } => "write",
         StorageEffect::BatchWrite { .. } => "batch_write",
         StorageEffect::Delete { .. } => "delete",
@@ -1418,6 +1486,7 @@ fn storage_event_kind(event: &StorageEvent) -> &'static str {
         StorageEvent::TransactionCommitted { .. } => "transaction_committed",
         StorageEvent::TransactionAborted { .. } => "transaction_aborted",
         StorageEvent::ReadResult { .. } => "read_result",
+        StorageEvent::BatchReadResult { .. } => "batch_read_result",
         StorageEvent::WriteResult { .. } => "write_result",
         StorageEvent::BatchWriteResult { .. } => "batch_write_result",
         StorageEvent::DeleteResult { .. } => "delete_result",
@@ -1635,6 +1704,96 @@ mod tests {
                 .await,
             b"b",
             b"2",
+        );
+    }
+
+    fn assert_batch_read_result(event: Event, expected: &[(&[u8], Option<&[u8]>)]) {
+        match event {
+            Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                let actual = values
+                    .iter()
+                    .map(|(key, value)| (key.as_ref(), value.as_ref().map(|v| v.as_ref())))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_transactional_batch_read_returns_values_in_request_order() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        for (key, value) in [(b"a", b"1"), (b"b", b"2")] {
+            assert_write_result(
+                handle
+                    .send_storage_effect(StorageEffect::Write {
+                        key_space: "batch_read".to_string(),
+                        key: key.to_vec().into(),
+                        value: value.to_vec().into(),
+                        txn_id: None,
+                    })
+                    .await,
+                key,
+            );
+        }
+
+        assert_batch_read_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchRead {
+                    reads: vec![
+                        ("batch_read".to_string(), b"b".to_vec().into()),
+                        ("batch_read".to_string(), b"missing".to_vec().into()),
+                        ("batch_read".to_string(), b"a".to_vec().into()),
+                    ],
+                    txn_id: None,
+                })
+                .await,
+            &[
+                (b"b", Some(b"2")),
+                (b"missing", None),
+                (b"a", Some(b"1")),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_read_sees_uncommitted_writes() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        let txn_id = start_write_transaction(&handle).await;
+        assert_write_result(
+            handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: "batch_read_txn".to_string(),
+                    key: b"key".to_vec().into(),
+                    value: b"txn".to_vec().into(),
+                    txn_id: Some(txn_id),
+                })
+                .await,
+            b"key",
+        );
+
+        assert_batch_read_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchRead {
+                    reads: vec![("batch_read_txn".to_string(), b"key".to_vec().into())],
+                    txn_id: Some(txn_id),
+                })
+                .await,
+            &[(b"key", Some(b"txn"))],
+        );
+
+        assert_batch_read_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchRead {
+                    reads: vec![("batch_read_txn".to_string(), b"key".to_vec().into())],
+                    txn_id: None,
+                })
+                .await,
+            &[(b"key", None)],
         );
     }
 

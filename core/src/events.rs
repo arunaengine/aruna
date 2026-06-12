@@ -117,6 +117,10 @@ pub enum StorageEvent {
         key: Key,
         value: Option<Value>,
     },
+    /// Values in the same order as the requested reads.
+    BatchReadResult {
+        values: Vec<(Key, Option<Value>)>,
+    },
     WriteResult {
         key: Key,
     },
