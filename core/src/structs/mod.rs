@@ -11,6 +11,7 @@ mod source_connector;
 mod staging;
 #[allow(clippy::module_inception)]
 mod structs;
+mod usage;
 
 pub use blob::*;
 pub use group::*;
@@ -23,3 +24,4 @@ pub use source_access::*;
 pub use source_connector::*;
 pub use staging::*;
 pub use structs::*;
+pub use usage::*;
