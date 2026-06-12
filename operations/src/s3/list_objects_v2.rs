@@ -139,6 +139,16 @@ impl ListObjectsV2Operation {
     }
 
     fn handle_init(&mut self) -> Effects {
+        if self.max_keys() == 0 {
+            self.state = ListObjectsV2State::Finish;
+            self.output = Some(Ok(ListObjectsV2Result {
+                objects: Vec::new(),
+                common_prefixes: Vec::new(),
+                continuation_token: None,
+            }));
+            return smallvec![];
+        }
+
         self.state = ListObjectsV2State::StartTransaction;
         smallvec![Effect::Storage(StorageEffect::StartTransaction {
             read: true
@@ -241,10 +251,6 @@ impl ListObjectsV2Operation {
         };
 
         let max_keys = self.max_keys();
-        if max_keys == 0 {
-            return self.finish_scan();
-        }
-
         let round_len = values.len();
         for (key, value) in values.into_iter() {
             let head = match BlobHeadKey::from_bytes(key.as_ref()) {

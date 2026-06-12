@@ -723,25 +723,6 @@ impl S3 for ArunaS3Service {
         let delimiter = req.input.delimiter.clone();
         let start_after = req.input.start_after.clone();
 
-        // Early return in case of max_keys = 0
-        if req.input.max_keys == Some(0) {
-            return Ok(S3Response::new(ListObjectsV2Output {
-                name: Some(bucket),
-                prefix,
-                max_keys: Some(0),
-                key_count: Some(0),
-                continuation_token: requested_continuation_token,
-                is_truncated: Some(false),
-                next_continuation_token: None,
-                contents: Some(Vec::new()),
-                common_prefixes: Some(Vec::new()),
-                delimiter,
-                encoding_type: req.input.encoding_type,
-                start_after,
-                ..Default::default()
-            }));
-        }
-
         let group_id = bucket_info
             .as_ref()
             .map(|bucket_info| bucket_info.group_id)
