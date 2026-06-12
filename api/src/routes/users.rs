@@ -232,6 +232,8 @@ fn map_inspect_onboarding_error(error: InspectOnboardingSecretError) -> ServerEr
     }
 }
 
+const USER_TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
+
 async fn issue_user_token(
     state: &Arc<ServerState>,
     user_id: UserId,
@@ -566,7 +568,7 @@ async fn get_token(
         }
     };
 
-    let expiry = None;
+    let expiry = Some(now_timestamp() + USER_TOKEN_EXPIRY_SECONDS);
     let token = issue_user_token(&state, user_id, expiry).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))
@@ -1155,7 +1157,14 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let router = Server::new(state.clone(), ServerConfig { http_addr: addr }).build_router();
+        let router = Server::new(
+            state.clone(),
+            ServerConfig {
+                http_addr: addr,
+                max_http_body_size: crate::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+            },
+        )
+        .build_router();
         let server_task = tokio::spawn(async move {
             axum::serve(
                 listener,
@@ -1262,6 +1271,39 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let body: ErrorResponse = response.json().await.unwrap();
         assert_eq!(body.error, "Forbidden");
+
+        node.server_task.abort();
+        node.net.shutdown().await;
+        oidc_task.abort();
+    }
+
+    #[tokio::test]
+    async fn issued_user_token_carries_bounded_expiry() {
+        let issuer = "https://issuer.example";
+        let kid = "main-key";
+        let signing_key = SigningKey::generate(&mut jsonwebtoken::signature::rand_core::OsRng);
+        let (provider, oidc_task) = spawn_oidc_provider(issuer, kid, &signing_key).await;
+        let node = spawn_test_node(provider, true).await;
+
+        let (_registered, aruna_token) = register_via_oidc(
+            &node,
+            issuer,
+            kid,
+            &signing_key,
+            "expiry-subject",
+            "Expiry Alice",
+            None,
+        )
+        .await;
+
+        let payload = aruna_token.split('.').nth(1).unwrap();
+        let claims: TokenClaims = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims.exp, claims.iat + super::USER_TOKEN_EXPIRY_SECONDS);
 
         node.server_task.abort();
         node.net.shutdown().await;

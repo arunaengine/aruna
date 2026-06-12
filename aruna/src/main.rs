@@ -258,6 +258,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let server_config = ServerConfig {
         http_addr: config.http_socket_addr,
+        max_http_body_size: config.max_http_body_size,
     };
     let server = Server::new(state.clone(), server_config);
 

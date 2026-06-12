@@ -744,7 +744,13 @@ async fn spawn_rest_server(
         Arc::new(ServerState::new(context, realm_id, node_id, capabilities, false, None).await);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let server = Server::new(state, ServerConfig { http_addr: addr });
+    let server = Server::new(
+        state,
+        ServerConfig {
+            http_addr: addr,
+            max_http_body_size: aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE,
+        },
+    );
     let router = server.build_router();
     let server_task = tokio::spawn(async move {
         axum::serve(

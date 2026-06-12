@@ -1093,7 +1093,10 @@ impl S3 for ArunaS3Service {
         &self,
         _req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
-        unimplemented!()
+        Err(s3_error!(
+            NotImplemented,
+            "GetObjectAttributes is not implemented"
+        ))
     }
 
     #[tracing::instrument(err, skip(self, req))]

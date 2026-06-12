@@ -57,6 +57,7 @@ pub struct Config {
     pub blob_control_plane_io_timeout_secs: u64,
     pub blob_transfer_idle_timeout_secs: u64,
     pub http_socket_addr: SocketAddr,
+    pub max_http_body_size: usize,
     pub p2p_socket_addr: SocketAddr,
     pub max_concurrent_uni_streams: Option<u64>,
     pub max_concurrent_bidi_streams: Option<u64>,
@@ -241,6 +242,11 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
         .transpose()?
         .unwrap_or(30 * 60);
     let http_socket_addr = SocketAddr::from_str(&dotenvy::var("SOCKET_ADDRESS")?)?;
+    let max_http_body_size = dotenvy::var("MAX_HTTP_BODY_SIZE")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?
+        .unwrap_or(aruna_api::server::DEFAULT_MAX_HTTP_BODY_SIZE);
     let p2p_socket_addr = SocketAddr::from_str(
         &dotenvy::var("P2P_SOCKET_ADDRESS").unwrap_or_else(|_| http_socket_addr.to_string()),
     )?;
@@ -345,6 +351,7 @@ pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
             blob_control_plane_io_timeout_secs,
             blob_transfer_idle_timeout_secs,
             http_socket_addr,
+            max_http_body_size,
             p2p_socket_addr,
             max_concurrent_uni_streams,
             max_concurrent_bidi_streams,
