@@ -63,7 +63,7 @@ use s3s::dto::{
     Destination, ETag, EncodingType, GetBucketReplicationInput, GetBucketReplicationOutput,
     GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
     HeadObjectInput, HeadObjectOutput, LastModified, ListBucketsInput, ListBucketsOutput,
-    ListObjectsV2Input, ListObjectsV2Output, Object, PutBucketReplicationInput,
+    ListObjectsV2Input, ListObjectsV2Output, Object, Owner, PutBucketReplicationInput,
     PutBucketReplicationOutput, PutObjectInput, PutObjectOutput, ReplicationConfiguration,
     ReplicationRule, ReplicationRuleStatus, StreamingBlob, UploadPartInput, UploadPartOutput,
 };
@@ -752,6 +752,10 @@ impl S3 for ArunaS3Service {
         .map_err(IntoS3Error::into_s3_error)?
         .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
 
+        let owner = req.input.fetch_owner.unwrap_or(false).then(|| Owner {
+            display_name: None,
+            id: Some(group_id.to_string()),
+        });
         let url_encoded = req
             .input
             .encoding_type
@@ -778,7 +782,7 @@ impl S3 for ArunaS3Service {
                     e_tag: response_fields.e_tag,
                     key: Some(encode_field(object.head.key)),
                     last_modified: response_fields.last_modified,
-                    owner: None,
+                    owner: owner.clone(),
                     size: response_fields.content_length,
                     ..Default::default()
                 }
@@ -2629,5 +2633,58 @@ mod tests {
                 .map(|encoding| encoding.as_str().to_string()),
             Some("url".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_fetch_owner_includes_group() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([37u8; 32]);
+        let group_id = Ulid::new();
+        let created_by = UserId::local(Ulid::new(), realm_id);
+
+        let service =
+            ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
+
+        seed_materialized_keys(&storage_handle, "bucket", &["a"], created_by, UNIX_EPOCH).await;
+
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+
+        let req = test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
+                bucket: "bucket".to_string(),
+                continuation_token: None,
+                delimiter: None,
+                encoding_type: None,
+                expected_bucket_owner: None,
+                fetch_owner: Some(true),
+                max_keys: Some(10),
+                optional_object_attributes: None,
+                prefix: None,
+                request_payer: None,
+                start_after: None,
+            },
+        );
+        let output = service.list_objects_v2(req).await.unwrap().output;
+
+        let owners: Vec<_> = output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|object| object.owner.and_then(|owner| owner.id))
+            .collect();
+        assert_eq!(owners, vec![group_id.to_string()]);
     }
 }
