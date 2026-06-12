@@ -9,7 +9,7 @@ use crate::s3::replication::spawn_version_replication;
 use crate::s3::util::{
     convert_input, multipart_checksum_type_from_s3, parse_completed_part,
     parse_multipart_checksum_hint, parse_multipart_part_number, parse_upload_id, parse_version_id,
-    s3_checksum_type_from_multipart, to_base64,
+    s3_checksum_type_from_multipart,
 };
 use aruna_core::NodeId;
 use aruna_core::effects::StorageEffect;
@@ -280,7 +280,7 @@ impl ArunaS3Service {
                 .location
                 .hashes
                 .get(HASH_MD5)
-                .map(|value| ETag::Strong(to_base64(value))),
+                .map(|value| ETag::Strong(hex::encode(value))),
             version_id: Some(result.version_id.to_string()),
             ..Default::default()
         };
@@ -314,7 +314,7 @@ impl ArunaS3Service {
         result: PutObjectResult,
     ) -> S3Result<S3Response<PutObjectOutput>> {
         let mut output = PutObjectOutput {
-            e_tag: Some(ETag::Strong(to_base64(
+            e_tag: Some(ETag::Strong(hex::encode(
                 result.location.hashes.get(HASH_MD5).ok_or_else(|| {
                     error!(error = "Missing MD5 hash");
                     s3_error!(InternalError, "Missing MD5 hash")
@@ -419,7 +419,7 @@ impl ArunaS3Service {
                     location
                         .hashes
                         .get(HASH_MD5)
-                        .map(|value| ETag::Strong(to_base64(value)))
+                        .map(|value| ETag::Strong(hex::encode(value)))
                 })
                 .or_else(|| {
                     source_metadata.and_then(|metadata| {
@@ -962,7 +962,7 @@ impl S3 for ArunaS3Service {
                 .location
                 .hashes
                 .get(HASH_MD5)
-                .map(|value| ETag::Strong(to_base64(value))),
+                .map(|value| ETag::Strong(hex::encode(value))),
             ..Default::default()
         };
         output.apply_checksums(encode_checksums(
