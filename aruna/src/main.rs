@@ -234,6 +234,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    ensure_usage_counters(driver_ctx.as_ref()).await?;
+
     drive(
         AnnounceRealmPresenceOperation::new(AnnounceRealmPresenceConfig {
             realm_id: config.realm_id,
@@ -337,6 +339,34 @@ async fn shutdown_runtime(
     if let Err(error) = storage_handle.sync_all().await {
         error!(error = %error, "Failed to sync storage during shutdown");
     }
+}
+
+/// Builds the maintained usage counters once for stores that predate them.
+async fn ensure_usage_counters(
+    driver_ctx: &DriverContext,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::USAGE_GLOBAL_KEY;
+    use aruna_operations::usage_stats::RebuildUsageStatsOperation;
+
+    let event = driver_ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: USAGE_GLOBAL_KEY.to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+
+    if matches!(
+        event,
+        Event::Storage(StorageEvent::ReadResult { value: None, .. })
+    ) {
+        drive(RebuildUsageStatsOperation::new(), driver_ctx).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
