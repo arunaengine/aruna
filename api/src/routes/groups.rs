@@ -3,7 +3,7 @@ use crate::server_state::ServerState;
 use aruna_core::UserId;
 use aruna_core::errors::{AuthorizationError, StorageError};
 use aruna_core::structs::{
-    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, Role,
+    Actor, AuthContext, Group, GroupAuthorizationDocument, Permission, Role, usage_group_key,
 };
 use aruna_core::types::RoleId;
 use aruna_operations::add_group_role::{
@@ -42,6 +42,7 @@ use utoipa::{OpenApi, ToSchema};
         create_group,
         list_groups,
         get_group,
+        get_group_usage,
         list_group_members,
         add_group_member,
         remove_group_member,
@@ -57,6 +58,7 @@ pub fn router() -> Router<Arc<ServerState>> {
         .route("/groups", post(create_group))
         .route("/groups", get(list_groups))
         .route("/groups/{id}", get(get_group))
+        .route("/groups/{id}/usage", get(get_group_usage))
         .route(
             "/groups/{id}/members",
             get(list_group_members).post(add_group_member),
@@ -564,6 +566,35 @@ fn map_remove_member_error(error: RemoveUserFromGroupError) -> ServerError {
         }
         other => ServerError::InternalError(other.to_string()),
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/groups/{id}/usage",
+    tag = "groups",
+    params(("id" = String, Path, description = "Group id")),
+    responses(
+        (status = 200, description = "Group storage usage", body = crate::routes::info::UsageResponse),
+        (status = 401, description = "Unauthorized", body = ErrorResponse),
+        (status = 403, description = "Forbidden", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_group_usage(
+    State(state): State<Arc<ServerState>>,
+    Extension(auth): Extension<Option<AuthContext>>,
+    Path(group_id): Path<String>,
+) -> ServerResult<(StatusCode, Json<crate::routes::info::UsageResponse>)> {
+    let auth = auth.ok_or(ServerError::Unauthorized)?;
+    let group_id = parse_group_id(&group_id)?;
+    let (_, auth_doc) = load_group(&state, group_id).await?;
+    if !is_group_member(&auth_doc, auth.user_id) {
+        return Err(ServerError::Forbidden);
+    }
+
+    let counters =
+        crate::routes::info::load_usage_counters(&state, usage_group_key(group_id)).await?;
+    Ok((StatusCode::OK, Json(counters.into())))
 }
 
 #[utoipa::path(
