@@ -124,7 +124,7 @@ impl ListObjectsV2Operation {
             Ok(prefix) => prefix,
             Err(err) => return self.emit_error(err.into()),
         };
-        let start_after = if self.input.continuation_token.is_some() {
+        let iter_start_key = if self.input.continuation_token.is_some() {
             self.input.continuation_token.clone()
         } else if let Some(prefix) = self
             .input
@@ -146,7 +146,7 @@ impl ListObjectsV2Operation {
         smallvec![Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(prefix.into()),
-            start_after: start_after.map(Into::into),
+            start_after: iter_start_key.map(Into::into),
             limit,
             txn_id: self.txn_id,
         })]
