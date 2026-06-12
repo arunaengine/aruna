@@ -49,6 +49,7 @@ pub struct ListObjectsV2Input {
     pub continuation_token: Option<Vec<u8>>,
     pub max_keys: Option<usize>,
     pub prefix: Option<String>,
+    pub start_after: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,7 +137,24 @@ impl ListObjectsV2Operation {
             Ok(prefix) => prefix,
             Err(err) => return self.emit_error(err.into()),
         };
-        let iter_start_key = self.input.continuation_token.clone();
+        // start_after only applies to the first page; the exclusive Iter
+        // start bound matches S3's StartAfter semantics exactly.
+        let iter_start_key = match (&self.input.continuation_token, &self.input.start_after) {
+            (Some(token), _) => Some(token.clone()),
+            (None, Some(start_after)) if !start_after.is_empty() => {
+                match BlobHeadKey::object_prefix(&self.input.bucket, start_after) {
+                    Ok(key) => Some(key),
+                    Err(err) => return self.emit_error(err.into()),
+                }
+            }
+            _ => None,
+        };
+        if let Some(start) = iter_start_key.as_ref()
+            && start.as_slice() > prefix.as_slice()
+            && !start.starts_with(&prefix)
+        {
+            return self.read_next_version_or_finish();
+        }
 
         let limit = self.max_keys().saturating_add(1);
 
@@ -474,6 +492,7 @@ mod test {
                 continuation_token: None,
                 max_keys: Some(10),
                 prefix: None,
+                start_after: None,
             }),
             &driver_ctx,
         )
@@ -572,6 +591,7 @@ mod test {
                     continuation_token,
                     max_keys: Some(2),
                     prefix: Some("rare/".to_string()),
+                    start_after: None,
                 }),
                 &driver_ctx,
             )
@@ -684,6 +704,7 @@ mod test {
                 continuation_token: None,
                 max_keys: Some(1),
                 prefix: Some("rare/".to_string()),
+                start_after: None,
             }),
             &driver_ctx,
         )
@@ -758,6 +779,7 @@ mod test {
                 continuation_token: None,
                 max_keys: Some(0),
                 prefix: None,
+                start_after: None,
             }),
             &driver_ctx,
         )
@@ -854,6 +876,7 @@ mod test {
                     continuation_token,
                     max_keys: Some(3),
                     prefix: None,
+                    start_after: None,
                 }),
                 &driver_ctx,
             )
@@ -904,6 +927,7 @@ mod test {
                 continuation_token: None,
                 max_keys: Some(10),
                 prefix: None,
+                start_after: None,
             }),
             &driver_ctx,
         )
@@ -1000,6 +1024,7 @@ mod test {
                 continuation_token: None,
                 max_keys: Some(10),
                 prefix: None,
+                start_after: None,
             }),
             &driver_ctx,
         )
@@ -1091,6 +1116,7 @@ mod test {
         driver_ctx: &DriverContext,
         bucket: &str,
         prefix: Option<&str>,
+        start_after: Option<&str>,
     ) -> Vec<String> {
         let result = drive(
             ListObjectsV2Operation::new(ListObjectsV2Input {
@@ -1099,6 +1125,7 @@ mod test {
                 continuation_token: None,
                 max_keys: Some(100),
                 prefix: prefix.map(str::to_string),
+                start_after: start_after.map(str::to_string),
             }),
             driver_ctx,
         )
@@ -1129,10 +1156,10 @@ mod test {
         )
         .await;
 
-        let keys = list_keys(&driver_ctx, "bucket", Some("docs/")).await;
+        let keys = list_keys(&driver_ctx, "bucket", Some("docs/"), None).await;
         assert_eq!(keys, vec!["docs/", "docs/readme.md"]);
 
-        let keys = list_keys(&driver_ctx, "bucket", Some("docs/readme.md")).await;
+        let keys = list_keys(&driver_ctx, "bucket", Some("docs/readme.md"), None).await;
         assert_eq!(keys, vec!["docs/readme.md"]);
     }
 
@@ -1148,7 +1175,7 @@ mod test {
         // orderings; the contiguous prefix range must not be cut by it.
         seed_materialized_keys(&storage_handle, "bucket", &["rare0", "rare/1"], created_by).await;
 
-        let keys = list_keys(&driver_ctx, "bucket", Some("rare/")).await;
+        let keys = list_keys(&driver_ctx, "bucket", Some("rare/"), None).await;
         assert_eq!(keys, vec!["rare/1"]);
     }
 
@@ -1162,7 +1189,44 @@ mod test {
 
         seed_materialized_keys(&storage_handle, "bucket", &["b", "aa", "a/1"], created_by).await;
 
-        let keys = list_keys(&driver_ctx, "bucket", None).await;
+        let keys = list_keys(&driver_ctx, "bucket", None, None).await;
         assert_eq!(keys, vec!["a/1", "aa", "b"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_start_after_skips_preceding_keys() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+        let created_by = UserId::local(Ulid::new(), RealmId([7u8; 32]));
+
+        seed_materialized_keys(&storage_handle, "bucket", &["a", "b", "c"], created_by).await;
+
+        let keys = list_keys(&driver_ctx, "bucket", None, Some("a")).await;
+        assert_eq!(keys, vec!["b", "c"]);
+
+        let keys = list_keys(&driver_ctx, "bucket", None, Some("b")).await;
+        assert_eq!(keys, vec!["c"]);
+
+        let keys = list_keys(&driver_ctx, "bucket", None, Some("c")).await;
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_start_after_beyond_prefix_range_returns_empty() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+        let created_by = UserId::local(Ulid::new(), RealmId([7u8; 32]));
+
+        seed_materialized_keys(&storage_handle, "bucket", &["docs/1", "docs/2"], created_by).await;
+
+        let keys = list_keys(&driver_ctx, "bucket", Some("docs/"), Some("zzz")).await;
+        assert!(keys.is_empty());
+
+        let keys = list_keys(&driver_ctx, "bucket", Some("docs/"), Some("a")).await;
+        assert_eq!(keys, vec!["docs/1", "docs/2"]);
     }
 }

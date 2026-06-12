@@ -783,6 +783,7 @@ impl S3 for ArunaS3Service {
                     continuation_token: continuation_token.clone(),
                     max_keys: Some(max_keys),
                     prefix: prefix.clone(),
+                    start_after: start_after.clone(),
                 }),
                 &self.state,
             )
@@ -803,28 +804,11 @@ impl S3 for ArunaS3Service {
                     .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))?;
                 let key = object.head.key;
 
-                if requested_continuation_token.is_none()
-                    && start_after
-                        .as_ref()
-                        .is_some_and(|start_after| key.as_str() <= start_after.as_str())
-                {
-                    previous_raw_token = Some(head_bytes);
-                    continue;
-                }
-
                 let logical_entry = if let Some(delimiter) = delimiter.as_ref() {
                     let prefix_start = prefix.as_ref().map(|prefix| prefix.len()).unwrap_or(0);
                     if let Some(relative_match) = key[prefix_start..].find(delimiter) {
                         let group_end = prefix_start + relative_match + delimiter.len();
                         let candidate_prefix = key[..group_end].to_string();
-                        if requested_continuation_token.is_none()
-                            && start_after.as_ref().is_some_and(|start_after| {
-                                candidate_prefix.as_str() <= start_after.as_str()
-                            })
-                        {
-                            previous_raw_token = Some(head_bytes);
-                            continue;
-                        }
                         if resume_common_prefix.as_ref() == Some(&candidate_prefix) {
                             previous_raw_token = Some(head_bytes);
                             continue;
@@ -2548,7 +2532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_objects_v2_start_after_filters_common_prefixes() {
+    async fn test_list_objects_v2_start_after_includes_later_common_prefixes() {
         let storage_dir = tempfile::tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
@@ -2618,9 +2602,11 @@ mod tests {
             .filter_map(|obj| obj.key)
             .collect();
 
-        assert!(common_prefixes.is_empty());
+        // S3 rolls dir-b/1 (which sorts after start-after "dir-b/") into the
+        // "dir-b/" common prefix instead of dropping it.
+        assert_eq!(common_prefixes, vec!["dir-b/"]);
         assert_eq!(contents, vec!["root.txt"]);
-        assert_eq!(output.key_count, Some(1));
+        assert_eq!(output.key_count, Some(2));
     }
 
     #[tokio::test]
