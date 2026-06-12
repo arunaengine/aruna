@@ -197,9 +197,6 @@ impl BlobHeadKey {
         }
     }
 
-    // Encoded as raw UTF-8 `{bucket}/{key}`: bucket names cannot contain
-    // `/`, so the first `/` separates unambiguously, and the raw key suffix
-    // makes storage byte order match S3's lexicographic key order.
     pub fn bucket_prefix(bucket: &str) -> Result<Vec<u8>, ConversionError> {
         Ok(format!("{bucket}/").into_bytes())
     }

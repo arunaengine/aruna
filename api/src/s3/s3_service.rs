@@ -2449,8 +2449,6 @@ mod tests {
             .filter_map(|obj| obj.key)
             .collect();
 
-        // S3 rolls dir-b/1 (which sorts after start-after "dir-b/") into the
-        // "dir-b/" common prefix instead of dropping it.
         assert_eq!(common_prefixes, vec!["dir-b/"]);
         assert_eq!(contents, vec!["root.txt"]);
         assert_eq!(output.key_count, Some(2));
