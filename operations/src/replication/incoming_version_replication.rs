@@ -1,6 +1,6 @@
 use crate::blob::blob_keyspace_helper::{
-    HeadAliasContext, build_head_transition_effects, write_blob_location_effect,
-    write_blob_version_effect,
+    HeadAliasContext, add_hash_path_index_effect, build_head_transition_effects,
+    write_blob_location_effect, write_blob_version_effect,
 };
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::replication::error::ReplicationError;
@@ -105,6 +105,7 @@ pub struct IncomingVersionReplicationOperation {
     pending_new_pointer: Option<CurrentVersionPointer>,
     pending_new_current_hash: Option<[u8; 32]>,
     pending_head_transition_effects: VecDeque<Effect>,
+    pending_version_effects: VecDeque<Effect>,
     cleanup_blob_location: Option<BackendLocation>,
     apply_committed: bool,
     output: Option<Result<(), IncomingVersionReplicationError>>,
@@ -132,6 +133,7 @@ impl IncomingVersionReplicationOperation {
             pending_new_pointer: None,
             pending_new_current_hash: None,
             pending_head_transition_effects: VecDeque::new(),
+            pending_version_effects: VecDeque::new(),
             cleanup_blob_location: None,
             apply_committed: false,
             output: None,
@@ -521,7 +523,7 @@ impl IncomingVersionReplicationOperation {
             &self.manifest.key,
             self.manifest.version_id,
         );
-        let version = match self.manifest.kind {
+        let (version, materialized_hash) = match self.manifest.kind {
             ReplicationItemKind::Materialized => {
                 let Ok(location) = self.effective_materialized_location() else {
                     return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
@@ -529,25 +531,41 @@ impl IncomingVersionReplicationOperation {
                 let Some(blake3_hash) = location.get_blake3() else {
                     return self.fail(IncomingVersionReplicationError::MissingBlobLocation);
                 };
-                BlobVersion::materialized(
-                    match blake3_hash.try_into() {
-                        Ok(hash) => hash,
-                        Err(err) => return self.fail(ConversionError::from(err).into()),
-                    },
-                    self.manifest.created_at,
-                    self.manifest.created_by,
-                    self.manifest.source.clone(),
+                let hash: [u8; 32] = match blake3_hash.try_into() {
+                    Ok(hash) => hash,
+                    Err(err) => return self.fail(ConversionError::from(err).into()),
+                };
+                (
+                    BlobVersion::materialized(
+                        hash,
+                        self.manifest.created_at,
+                        self.manifest.created_by,
+                        self.manifest.source.clone(),
+                    ),
+                    Some(hash),
                 )
             }
-            ReplicationItemKind::DeleteMarker => {
-                BlobVersion::deleted(self.manifest.created_at, self.manifest.created_by)
-            }
+            ReplicationItemKind::DeleteMarker => (
+                BlobVersion::deleted(self.manifest.created_at, self.manifest.created_by),
+                None,
+            ),
         };
 
         let effect = match write_blob_version_effect(&version_key, &version, self.txn_id) {
             Ok(effect) => effect,
             Err(err) => return self.fail(err.into()),
         };
+        if let Some(hash) = materialized_hash {
+            let context = match self.alias_context() {
+                Ok(context) => context,
+                Err(err) => return self.fail(err),
+            };
+            match add_hash_path_index_effect(&context, hash, self.manifest.version_id, self.txn_id)
+            {
+                Ok(index_effect) => self.pending_version_effects.push_back(index_effect),
+                Err(err) => return self.fail(err.into()),
+            }
+        }
         smallvec![effect]
     }
 
@@ -990,6 +1008,9 @@ impl Operation for IncomingVersionReplicationOperation {
                         received: event,
                     });
                 };
+                if let Some(effect) = self.pending_version_effects.pop_front() {
+                    return smallvec![effect];
+                }
                 self.write_multipart_metadata_or_continue()
             }
             IncomingVersionReplicationState::WriteMultipartMetadata => {
@@ -1170,12 +1191,13 @@ mod tests {
     use aruna_core::events::{BlobEvent, Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+        HASH_PATHS_INDEX_KEYSPACE,
     };
     use aruna_core::operation::Operation;
     use aruna_core::structs::{
-        AuthContext, BackendLocation, BlobVersion, BucketInfo, CurrentVersionPointer, RealmId,
-        ReplicationItemKind, ReplicationNegotiationResult, SourceConnectorKind, StagingStrategy,
-        VersionSourceBinding,
+        AuthContext, BackendLocation, BlobVersion, BucketInfo, CurrentVersionPointer,
+        HashPathIndexKey, RealmId, ReplicationItemKind, ReplicationNegotiationResult,
+        SourceConnectorKind, StagingStrategy, VersionSourceBinding,
     };
     use std::collections::HashMap;
     use std::time::SystemTime;
@@ -1490,6 +1512,7 @@ mod tests {
             manifest,
         );
         op.txn_id = Some(Ulid::new());
+        op.destination_group_id = Some(Ulid::new());
         op.existing_blob_location = Some(make_location());
 
         let effects = op.write_version();
@@ -1499,6 +1522,52 @@ mod tests {
         };
         let version = BlobVersion::from_bytes(value.as_ref()).unwrap();
         assert_eq!(version.source_binding(), Some(&source));
+    }
+
+    #[test]
+    fn write_version_indexes_non_current_materialized_version_by_content_hash() {
+        let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+        manifest.current_version = false;
+        let group_id = Ulid::new();
+        let mut op = IncomingVersionReplicationOperation::new(
+            Ulid::new(),
+            iroh::SecretKey::generate().public(),
+            RealmId::from_bytes([7u8; 32]),
+            manifest.clone(),
+        );
+        op.txn_id = Some(Ulid::new());
+        op.destination_group_id = Some(group_id);
+        op.existing_blob_location = Some(make_location());
+
+        let effects = op.write_version();
+        let [Effect::Storage(StorageEffect::Write { key_space, .. })] = effects.as_slice() else {
+            panic!("expected blob version write")
+        };
+        assert_eq!(key_space, BLOB_VERSIONS_KEYSPACE);
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
+        let [Effect::Storage(StorageEffect::Write { key_space, key, .. })] = effects.as_slice()
+        else {
+            panic!("expected hash path index write")
+        };
+        assert_eq!(key_space, HASH_PATHS_INDEX_KEYSPACE);
+        let index_key = HashPathIndexKey::from_bytes(key.as_ref()).unwrap();
+        assert_eq!(index_key.blake3_hash, [1u8; 32]);
+        assert_eq!(index_key.version_id, manifest.version_id);
+        assert_eq!(index_key.group_id, group_id);
+        assert_eq!(index_key.bucket, manifest.bucket);
+        assert_eq!(index_key.key, manifest.key);
+
+        let effects = op.step(Event::Storage(StorageEvent::WriteResult {
+            key: vec![0u8; 4].into(),
+        }));
+        assert_eq!(op.state, IncomingVersionReplicationState::CommitTransaction);
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        ));
     }
 
     #[test]
