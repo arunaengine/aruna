@@ -736,11 +736,12 @@ impl S3 for ArunaS3Service {
         let mut resume_common_prefix = continuation_cursor
             .as_ref()
             .and_then(|cursor| cursor.last_common_prefix.clone());
-        let max_keys = req
-            .input
-            .max_keys
-            .and_then(|max_keys| usize::try_from(max_keys).ok())
-            .unwrap_or(Self::LIST_OBJECTS_V2_MAX_KEYS);
+        let max_keys = match req.input.max_keys {
+            None => Self::LIST_OBJECTS_V2_MAX_KEYS,
+            Some(max_keys) => usize::try_from(max_keys)
+                .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
+                .min(Self::LIST_OBJECTS_V2_MAX_KEYS),
+        };
         let bucket = req.input.bucket.clone();
         let prefix = req.input.prefix.clone();
         let delimiter = req.input.delimiter.clone();
@@ -2658,5 +2659,67 @@ mod tests {
 
         let err = service.list_objects_v2(req).await.unwrap_err();
         assert_eq!(*err.code(), S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_clamps_and_validates_max_keys() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([35u8; 32]);
+        let group_id = Ulid::new();
+        let created_by = UserId::local(Ulid::new(), realm_id);
+
+        let service =
+            ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
+
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["a", "b"],
+            created_by,
+            UNIX_EPOCH,
+        )
+        .await;
+
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+
+        let input = ListObjectsV2Input {
+            bucket: "bucket".to_string(),
+            continuation_token: None,
+            delimiter: None,
+            encoding_type: None,
+            expected_bucket_owner: None,
+            fetch_owner: None,
+            max_keys: Some(5000),
+            optional_object_attributes: None,
+            prefix: None,
+            request_payer: None,
+            start_after: None,
+        };
+        let req = test_list_objects_v2_request(extensions.clone(), input.clone());
+        let output = service.list_objects_v2(req).await.unwrap().output;
+        assert_eq!(output.max_keys, Some(1000));
+        assert_eq!(output.key_count, Some(2));
+
+        let req = test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
+                max_keys: Some(-1),
+                ..input
+            },
+        );
+        let err = service.list_objects_v2(req).await.unwrap_err();
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
     }
 }
