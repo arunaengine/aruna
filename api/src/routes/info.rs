@@ -2,8 +2,13 @@ use crate::error::{ServerError, ServerResult};
 pub use crate::server_state::PortalStatus;
 use crate::server_state::ServerState;
 use aruna_core::alpn::Alpn;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::{REALM_KEYSPACE, USAGE_STATS_KEYSPACE};
 use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
-use aruna_core::structs::{RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::{Realm, RealmConfigDocument, RealmNodeKind};
+use aruna_core::structs::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_operations::driver::drive;
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
 use aruna_operations::get_realm_description::{
@@ -25,7 +30,7 @@ use utoipa::{OpenApi, ToSchema};
 #[derive(OpenApi)]
 #[openapi(
     tags((name = "info", description = "Node information endpoints")),
-    paths(get_info, get_realm_info)
+    paths(get_info, get_realm_info, get_usage)
 )]
 pub struct InfoApiDoc;
 
@@ -33,6 +38,7 @@ pub fn router() -> Router<Arc<ServerState>> {
     Router::new()
         .route("/info", get(get_info))
         .route("/info/realm", get(get_realm_info))
+        .route("/info/usage", get(get_usage))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -291,6 +297,69 @@ pub async fn get_realm_info(
         interface_services_status(&state).await,
     )?;
     Ok((StatusCode::OK, Json(response)))
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct UsageResponse {
+    pub buckets: u64,
+    pub objects: u64,
+    pub stored_blobs: u64,
+    pub stored_bytes: u64,
+    pub logical_bytes: u64,
+}
+
+impl From<UsageCounters> for UsageResponse {
+    fn from(counters: UsageCounters) -> Self {
+        Self {
+            buckets: counters.buckets,
+            objects: counters.objects,
+            stored_blobs: counters.stored_blobs,
+            stored_bytes: counters.stored_bytes,
+            logical_bytes: counters.logical_bytes,
+        }
+    }
+}
+
+pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerResult<UsageCounters> {
+    match state
+        .get_ctx()
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: key.into(),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => UsageCounters::from_bytes(&bytes)
+            .map_err(|error| ServerError::InternalError(error.to_string())),
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
+            Ok(UsageCounters::default())
+        }
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(ServerError::InternalError(error.to_string()))
+        }
+        other => Err(ServerError::InternalError(format!(
+            "unexpected storage event: {other:?}"
+        ))),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/info/usage",
+    tag = "info",
+    responses(
+        (status = 200, description = "Aggregate storage usage on this node", body = UsageResponse)
+    )
+)]
+pub async fn get_usage(
+    State(state): State<Arc<ServerState>>,
+) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
+    let counters = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
+    Ok((StatusCode::OK, Json(UsageResponse::from(counters))))
 }
 
 fn map_realm_info_response(
