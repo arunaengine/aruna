@@ -1,9 +1,10 @@
+use crate::auth::{ensure_permission, require_realm_auth};
+use crate::error::ServerError;
 use crate::server_state::ServerState;
 use aruna_core::structs::{
     ArunaArn, ArunaArnType, AuthContext, BackendLocation, Permission, SourceMetadata,
 };
 use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
-use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use aruna_operations::s3::get_object::{GetObjectError, GetObjectInput, GetObjectOperation};
 use aruna_operations::s3::head_object::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
@@ -262,11 +263,12 @@ pub async fn get_object(
     headers: HeaderMap,
     Path(object_id): Path<String>,
 ) -> Response {
-    if auth.is_none() {
-        return DrsError::forbidden("Forbidden").into_response();
-    }
+    let auth = match require_drs_auth(state.as_ref(), auth) {
+        Ok(auth) => auth,
+        Err(error) => return error.into_response(),
+    };
 
-    match resolve_object(state.as_ref(), auth.as_ref(), &object_id).await {
+    match resolve_object(state.as_ref(), &auth, &object_id).await {
         Ok(ResolveOutcome::Found(resolved)) => {
             drs_json_response(StatusCode::OK, build_object_response(&headers, &resolved))
         }
@@ -292,13 +294,14 @@ pub async fn post_objects(
     headers: HeaderMap,
     Json(body): Json<DrsBulkObjectsRequestBody>,
 ) -> Response {
-    if auth.is_none() {
-        return DrsError::forbidden("Forbidden").into_response();
-    }
+    let auth = match require_drs_auth(state.as_ref(), auth) {
+        Ok(auth) => auth,
+        Err(error) => return error.into_response(),
+    };
 
     let mut objects = Vec::with_capacity(body.object_ids.len());
     for object_id in body.object_ids {
-        let result = match resolve_object(state.as_ref(), auth.as_ref(), &object_id).await {
+        let result = match resolve_object(state.as_ref(), &auth, &object_id).await {
             Ok(ResolveOutcome::Found(resolved)) => {
                 serde_json::to_value(build_object_response(&headers, &resolved))
                     .unwrap_or_else(|_| json!({ "status": 500, "message": "serialization failed" }))
@@ -330,10 +333,10 @@ pub async fn download_object(
     Extension(auth): Extension<Option<AuthContext>>,
     Query(query): Query<DownloadQuery>,
 ) -> Response {
-    let Some(auth) = auth else {
+    let Ok(auth) = require_realm_auth(state.as_ref(), auth) else {
         return drs_error(StatusCode::NOT_FOUND, "DRS object not found");
     };
-    let resolved = match resolve_object(state.as_ref(), Some(&auth), &query.object_id).await {
+    let resolved = match resolve_object(state.as_ref(), &auth, &query.object_id).await {
         Ok(ResolveOutcome::Found(resolved)) => resolved,
         Ok(ResolveOutcome::Denied) => return DrsError::forbidden("Forbidden").into_response(),
         Ok(ResolveOutcome::NotFound) => {
@@ -442,9 +445,16 @@ fn build_object_response(headers: &HeaderMap, resolved: &ResolvedObject) -> DrsO
     }
 }
 
+fn require_drs_auth(
+    state: &ServerState,
+    auth: Option<AuthContext>,
+) -> Result<AuthContext, DrsError> {
+    require_realm_auth(state, auth).map_err(|_| DrsError::forbidden("Forbidden"))
+}
+
 async fn resolve_object(
     state: &ServerState,
-    auth: Option<&AuthContext>,
+    auth: &AuthContext,
     object_id: &str,
 ) -> Result<ResolveOutcome, DrsError> {
     match parse_requested_object_id(object_id)? {
@@ -461,7 +471,7 @@ async fn resolve_object(
 
 async fn resolve_content_hash(
     state: &ServerState,
-    auth: Option<&AuthContext>,
+    auth: &AuthContext,
     requested_id: &str,
     requested_scope: Option<(aruna_core::structs::RealmId, aruna_core::NodeId)>,
     hash: &[u8; 32],
@@ -548,35 +558,14 @@ async fn resolve_content_hash(
 
 async fn can_read_permission_path(
     state: &ServerState,
-    auth: Option<&AuthContext>,
+    auth: &AuthContext,
     path: &str,
 ) -> Result<bool, DrsError> {
-    let Some(auth) = auth.cloned() else {
-        debug!("No auth context available");
-        return Ok(false);
-    };
-    if auth.realm_id != state.get_realm_id() {
-        debug!(
-            "Realm id mismatch: {} - {}",
-            auth.realm_id,
-            state.get_realm_id()
-        );
-        return Ok(false);
+    match ensure_permission(state, auth, path.to_string(), Permission::READ).await {
+        Ok(()) => Ok(true),
+        Err(ServerError::Forbidden) => Ok(false),
+        Err(error) => Err(DrsError::internal(error.to_string())),
     }
-
-    let res = drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth,
-            path: path.to_string(),
-            required_permission: Permission::READ,
-        }),
-        &state.get_ctx(),
-    )
-    .await
-    .map_err(|error| DrsError::internal(error.to_string()));
-
-    debug!(check_permissions_result = ?res);
-    res
 }
 
 fn parse_requested_object_id(object_id: &str) -> Result<RequestedObjectId, DrsError> {
