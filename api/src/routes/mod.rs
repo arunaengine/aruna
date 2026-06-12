@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub mod blobs;
 pub mod connectors;
 pub mod credentials;
+pub mod drs;
 pub mod groups;
 pub mod info;
 pub mod metadata;
@@ -20,6 +21,7 @@ pub fn rest_router(state: Arc<ServerState>) -> Router {
         .merge(info::router())
         .merge(onboarding::router())
         .merge(blobs::router())
+        .merge(drs::router())
         .merge(staging::router())
         .merge(connectors::router())
         .merge(credentials::router())

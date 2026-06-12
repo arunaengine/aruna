@@ -14,7 +14,9 @@ aruna-operations = { workspace = true }
 # General
 ahash = { workspace = true }
 base64 = { workspace = true }
+hex.workspace = true
 opentelemetry = { workspace = true }
+percent-encoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spargebra = { workspace = true }

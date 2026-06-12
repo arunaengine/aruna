@@ -6,7 +6,6 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::HashPathIndexKey;
 use aruna_core::types::Effects;
 use smallvec::smallvec;
-use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -42,7 +41,7 @@ pub enum ResolveBlobPermissionPathsError {
 pub struct ResolveBlobPermissionPathsOperation {
     blake3_hash: [u8; 32],
     txn_id: Option<Ulid>,
-    output: Option<Result<Vec<String>, ResolveBlobPermissionPathsError>>,
+    output: Option<Result<Vec<HashPathIndexKey>, ResolveBlobPermissionPathsError>>,
     state: ResolveBlobPermissionPathsState,
 }
 
@@ -67,15 +66,15 @@ impl ResolveBlobPermissionPathsOperation {
         &mut self,
         values: Vec<(aruna_core::types::Key, aruna_core::types::Value)>,
     ) -> Result<Effects, ResolveBlobPermissionPathsError> {
-        let permission_paths = values
+        let mut candidates = values
             .into_iter()
             .map(|(key, _)| HashPathIndexKey::from_bytes(key.as_ref()))
-            .map(|result| result.map(|key| key.permission_path()))
-            .collect::<Result<BTreeSet<_>, _>>()?
-            .into_iter()
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
-        self.output = Some(Ok(permission_paths));
+        candidates
+            .sort_by_cached_key(|candidate| (candidate.permission_path(), candidate.version_id));
+
+        self.output = Some(Ok(candidates));
 
         let txn_id = self
             .txn_id
@@ -179,7 +178,7 @@ impl ResolveBlobPermissionPathsOperation {
 }
 
 impl Operation for ResolveBlobPermissionPathsOperation {
-    type Output = Vec<String>;
+    type Output = Vec<HashPathIndexKey>;
     type Error = ResolveBlobPermissionPathsError;
 
     fn start(&mut self) -> Effects {
@@ -248,13 +247,14 @@ mod tests {
 
     fn alias_key(
         hash: [u8; 32],
+        version_id: Ulid,
         realm_id: RealmId,
         group_id: Ulid,
         node_id: aruna_core::NodeId,
         bucket: &str,
         key: &str,
     ) -> HashPathIndexKey {
-        HashPathIndexKey::new(hash, realm_id, group_id, node_id, bucket, key)
+        HashPathIndexKey::new(hash, version_id, realm_id, group_id, node_id, bucket, key)
     }
 
     #[test]
@@ -281,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn read_hash_aliases_sorts_and_deduplicates_permission_paths() {
+    fn read_hash_aliases_sorts_candidates_by_permission_path_and_version_id() {
         let hash = [9u8; 32];
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let group_a = Ulid::from_bytes([2u8; 16]);
@@ -300,9 +300,33 @@ mod tests {
             [Effect::Storage(StorageEffect::Iter { .. })]
         ));
 
-        let alias_a = alias_key(hash, realm_id, group_b, node_b, "bucket-b", "z.txt");
-        let alias_b = alias_key(hash, realm_id, group_a, node_a, "bucket-a", "a.txt");
-        let alias_b_dupe = alias_key(hash, realm_id, group_a, node_a, "bucket-a", "a.txt");
+        let alias_a = alias_key(
+            hash,
+            Ulid::from_bytes([6u8; 16]),
+            realm_id,
+            group_b,
+            node_b,
+            "bucket-b",
+            "z.txt",
+        );
+        let alias_b = alias_key(
+            hash,
+            Ulid::from_bytes([7u8; 16]),
+            realm_id,
+            group_a,
+            node_a,
+            "bucket-a",
+            "a.txt",
+        );
+        let alias_b_dupe = alias_key(
+            hash,
+            Ulid::from_bytes([8u8; 16]),
+            realm_id,
+            group_a,
+            node_a,
+            "bucket-a",
+            "a.txt",
+        );
 
         let effects = op.step(Event::Storage(StorageEvent::IterResult {
             values: vec![
@@ -327,14 +351,11 @@ mod tests {
         }));
         assert!(effects.is_empty());
         assert_eq!(op.state, ResolveBlobPermissionPathsState::Finish);
-        assert_eq!(
-            op.finalize().unwrap(),
-            vec![alias_b.permission_path(), alias_a.permission_path()]
-        );
+        assert_eq!(op.finalize().unwrap(), vec![alias_b, alias_b_dupe, alias_a]);
     }
 
     #[tokio::test]
-    async fn resolves_empty_hash_to_empty_permission_path_list() {
+    async fn resolves_empty_hash_to_empty_candidate_list() {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
@@ -356,7 +377,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_existing_hash_aliases_to_permission_paths() {
+    async fn resolves_existing_hash_aliases_to_candidates() {
         let random_path = tempdir().unwrap();
         let storage_handle =
             storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
@@ -371,6 +392,7 @@ mod tests {
         let hash = [8u8; 32];
         let alias = HashPathIndexKey::new(
             hash,
+            Ulid::from_bytes([4u8; 16]),
             RealmId::from_bytes([1u8; 32]),
             Ulid::from_bytes([2u8; 16]),
             iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
@@ -386,6 +408,7 @@ mod tests {
                 alias.key.clone(),
             ),
             hash,
+            alias.version_id,
             None,
         )
         .unwrap();
@@ -398,6 +421,6 @@ mod tests {
         let result = drive(ResolveBlobPermissionPathsOperation::new(hash), &context)
             .await
             .unwrap();
-        assert_eq!(result, vec![alias.permission_path()]);
+        assert_eq!(result, vec![alias]);
     }
 }

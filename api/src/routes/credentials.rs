@@ -51,6 +51,7 @@ pub struct CreateS3PathRestriction {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateS3CredentialsRequest {
     pub group_id: String,
+    #[schema(default = 31536000)]
     pub expires_in_seconds: Option<u64>,
     pub path_restrictions: Option<Vec<CreateS3PathRestriction>>,
 }

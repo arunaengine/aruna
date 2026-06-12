@@ -12,10 +12,6 @@ use s3s::dto::{
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use ulid::Ulid;
 
-pub fn to_base64<T: AsRef<[u8]>>(input: T) -> String {
-    BASE64_STANDARD.encode(input)
-}
-
 pub fn get_s3_operation_permission(operation_name: &str) -> Option<Action> {
     match operation_name {
         // Write operations (operations that modify state/data)
