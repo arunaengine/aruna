@@ -178,6 +178,8 @@ pub fn realm_nodes_from_config_bytes(value: &[u8]) -> Result<Vec<NodeId>, Conver
     Ok(nodes)
 }
 
+/// Scores a candidate for a topic. The score must not depend on the local
+/// node identity so every node derives the same holder set for a document.
 fn selector_score(topic_id: &[u8], candidate_node_id: NodeId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SELECTOR_DOMAIN);
@@ -220,6 +222,16 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 3);
+    }
+
+    #[test]
+    fn selector_is_identical_across_local_node_identities() {
+        let candidates = vec![node(4), node(2), node(3), node(1), node(7), node(8)];
+        let from_first_node = select_sync_peers(&target(), &candidates, &[], 3);
+        let from_second_node = select_sync_peers(&target(), &candidates, &[], 3);
+
+        assert_eq!(from_first_node, from_second_node);
+        assert_eq!(from_first_node.len(), 3);
     }
 
     #[test]
