@@ -123,8 +123,6 @@ impl Debug for ArunaS3Service {
 }
 
 impl ArunaS3Service {
-    const LIST_OBJECTS_V2_MAX_KEYS: usize = 1000;
-
     #[tracing::instrument(level = "trace", skip(driver_ctx))]
     pub async fn new(driver_ctx: Arc<DriverContext>, realm_id: RealmId, node_id: NodeId) -> Self {
         ArunaS3Service {
@@ -720,10 +718,10 @@ impl S3 for ArunaS3Service {
             requested_continuation_token.as_deref(),
         )?;
         let max_keys = match req.input.max_keys {
-            None => Self::LIST_OBJECTS_V2_MAX_KEYS,
+            None => ListObjectsV2Operation::DEFAULT_MAX_KEYS,
             Some(max_keys) => usize::try_from(max_keys)
                 .map_err(|_| s3_error!(InvalidArgument, "max-keys must be non-negative"))?
-                .min(Self::LIST_OBJECTS_V2_MAX_KEYS),
+                .min(ListObjectsV2Operation::DEFAULT_MAX_KEYS),
         };
         let bucket = req.input.bucket.clone();
         let prefix = req.input.prefix.clone();

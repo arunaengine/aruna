@@ -105,7 +105,7 @@ pub struct ListObjectsV2Operation {
 }
 
 impl ListObjectsV2Operation {
-    const DEFAULT_MAX_KEYS: usize = 1_000;
+    pub const DEFAULT_MAX_KEYS: usize = 1_000;
     const MAX_SCAN_ROUNDS: usize = 100;
 
     pub fn new(input: ListObjectsV2Input) -> Self {
