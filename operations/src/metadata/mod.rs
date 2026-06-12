@@ -17,10 +17,10 @@ pub use handle::{MetadataHandle, MetadataHandleOptions, MetadataSearchStorage};
 /// finds them warm. Never blocks startup.
 pub fn spawn_metadata_warmup(context: Arc<DriverContext>) {
     tokio::spawn(async move {
-        if let Some(handle) = context.metadata_handle.clone() {
-            if let Err(error) = handle.warm_caches().await {
-                warn!(error = %error, "Metadata visibility cache warmup failed");
-            }
+        if let Some(handle) = context.metadata_handle.clone()
+            && let Err(error) = handle.warm_caches().await
+        {
+            warn!(error = %error, "Metadata visibility cache warmup failed");
         }
         if let Err(error) = visible_registry::list_visible_registry_records(&context).await {
             warn!(error = %error, "Visible registry cache warmup failed");

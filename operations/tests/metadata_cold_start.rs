@@ -121,7 +121,10 @@ async fn create_crate_graph(handle: &MetadataHandle, index: usize) -> Result<(),
     }
 }
 
-async fn timed_query(handle: &MetadataHandle, label: &str) -> Result<std::time::Duration, BoxError> {
+async fn timed_query(
+    handle: &MetadataHandle,
+    label: &str,
+) -> Result<std::time::Duration, BoxError> {
     let started = Instant::now();
     let results = handle
         .query_authorized_local(
@@ -215,8 +218,6 @@ async fn first_query_on_cold_node_with_40k_docs() -> Result<(), BoxError> {
     println!("warm_caches after reopen: {:?}", warmup_started.elapsed());
     let warmed = timed_query(&handle, "first query (after warmup)").await?;
 
-    println!(
-        "summary: docs={docs} cold={cold:?} warm={warm:?} warmed-first={warmed:?}"
-    );
+    println!("summary: docs={docs} cold={cold:?} warm={warm:?} warmed-first={warmed:?}");
     Ok(())
 }

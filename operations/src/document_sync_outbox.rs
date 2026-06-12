@@ -152,7 +152,12 @@ pub async fn delete_outbox_records(
     }
     let deletes = keys
         .into_iter()
-        .map(|key| (DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(), ByteView::from(key)))
+        .map(|key| {
+            (
+                DOCUMENT_SYNC_OUTBOX_KEYSPACE.to_string(),
+                ByteView::from(key),
+            )
+        })
         .collect();
     match storage
         .send_storage_effect(StorageEffect::BatchDelete {

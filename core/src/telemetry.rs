@@ -402,11 +402,7 @@ pub fn record_stage(name: &'static str, elapsed: Duration) {
 
 /// Adds a per-item detail line (for example one fan-out peer); the detail
 /// string is only built when a request scope is active.
-pub fn record_stage_detail(
-    name: &'static str,
-    detail: impl FnOnce() -> String,
-    elapsed: Duration,
-) {
+pub fn record_stage_detail(name: &'static str, detail: impl FnOnce() -> String, elapsed: Duration) {
     let _ = REQUEST_STAGES.try_with(|stages| stages.add_detail(name, detail(), elapsed));
 }
 
@@ -486,11 +482,7 @@ mod tests {
     #[test]
     fn aggregator_split_reports_wait_and_service() {
         let aggregator = LatencyAggregator::new("test");
-        aggregator.record_split(
-            "write",
-            Duration::from_millis(40),
-            Duration::from_millis(2),
-        );
+        aggregator.record_split("write", Duration::from_millis(40), Duration::from_millis(2));
         let summaries = aggregator.flush();
         let split = summaries[0].split.as_ref().expect("split summary");
         assert_eq!(split.wait_max_ms, 40.0);

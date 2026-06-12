@@ -52,11 +52,9 @@ fn record_storage_call(
     service: Duration,
 ) {
     match key_space {
-        Some(key_space) => STORAGE_LATENCY.record_split(
-            &format!("{operation}:{key_space}"),
-            queue_wait,
-            service,
-        ),
+        Some(key_space) => {
+            STORAGE_LATENCY.record_split(&format!("{operation}:{key_space}"), queue_wait, service)
+        }
         None => STORAGE_LATENCY.record_split(operation, queue_wait, service),
     }
 }

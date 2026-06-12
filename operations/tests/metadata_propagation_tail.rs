@@ -385,7 +385,7 @@ async fn flush_projection_batches(
         if batch.is_empty() {
             continue;
         }
-        let drained: Vec<(Ulid, Ulid)> = batch.drain(..).collect();
+        let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
         project_metadata_create_events_from_log(targets[slot].1.as_ref(), drained)
             .await
             .map_err(|error| format!("projection failed: {error:?}"))?;

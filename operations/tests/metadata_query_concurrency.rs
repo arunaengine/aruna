@@ -71,7 +71,11 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
     })
 }
 
-fn registry_record(group_id: GroupId, index: usize, graph_iri: Option<String>) -> MetadataRegistryRecord {
+fn registry_record(
+    group_id: GroupId,
+    index: usize,
+    graph_iri: Option<String>,
+) -> MetadataRegistryRecord {
     let document_id = Ulid::new();
     MetadataRegistryRecord {
         realm_id: REALM,
@@ -174,7 +178,7 @@ async fn query_names_as(
     };
     Ok(rows
         .into_iter()
-        .filter_map(|row| row.get("name").map(|term| term.clone()))
+        .filter_map(|row| row.get("name").cloned())
         .collect())
 }
 
@@ -214,7 +218,10 @@ async fn stale_visibility_cache_serves_reads_and_refreshes_in_background() -> Re
     // Cold query blocks on the first fill and sees every graph.
     let names = query_names(&harness).await?;
     for index in 0..initial_graphs {
-        assert!(names_contain(&names, index), "missing graph {index} after cold fill");
+        assert!(
+            names_contain(&names, index),
+            "missing graph {index} after cold fill"
+        );
     }
 
     // A new graph lands in storage without touching the cache.
@@ -288,7 +295,10 @@ fn visibility_record(group_id: GroupId, path: &str, public: bool) -> MetadataReg
         graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
         public,
         permission_path: MetadataRegistryRecord::permission_path_for(
-            &REALM, group_id, path, document_id,
+            &REALM,
+            group_id,
+            path,
+            document_id,
         ),
         holder_node_ids: Vec::new(),
         created_at_ms: 0,
@@ -527,7 +537,10 @@ async fn concurrent_queries_with_mutation_load_profile() -> Result<(), BoxError>
     let stale_started = Instant::now();
     harness.handle.expire_visibility_caches();
     let _ = query_names(&harness).await?;
-    println!("stale-serve query after TTL expiry: {:?}", stale_started.elapsed());
+    println!(
+        "stale-serve query after TTL expiry: {:?}",
+        stale_started.elapsed()
+    );
 
     let run_concurrent = |label: &'static str| {
         let harness = harness.clone();

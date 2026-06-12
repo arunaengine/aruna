@@ -21,11 +21,11 @@ use aruna_core::storage_entries::{
     metadata_materialization_status_key, metadata_materialization_status_write_entry,
 };
 use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::telemetry::duration_ms;
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use aruna_tasks::TaskHandle;
 use byteview::ByteView;
-use aruna_core::telemetry::duration_ms;
 use thiserror::Error;
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -195,7 +195,9 @@ fn collect_group_outcome(
     match result {
         Ok(outcome) => {
             timings.processed = timings.processed.saturating_add(outcome.processed);
-            timings.craqle_elapsed = timings.craqle_elapsed.saturating_add(outcome.craqle_elapsed);
+            timings.craqle_elapsed = timings
+                .craqle_elapsed
+                .saturating_add(outcome.craqle_elapsed);
             completed.extend(outcome.completed);
             if first_error.is_none() {
                 *first_error = outcome.error;

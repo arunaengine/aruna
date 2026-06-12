@@ -123,10 +123,8 @@ impl Operation for ListMetadataDocumentsOperation {
                     smallvec![self.iter_effect(None)]
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event(
-                    "metadata graph lifecycle iter result",
-                    format!("{other:?}"),
-                ),
+                other => self
+                    .unexpected_event("metadata graph lifecycle iter result", format!("{other:?}")),
             },
             ListMetadataDocumentsState::ListDocuments => match parse_registry_iter(event) {
                 Ok((page, next_start_after)) => {

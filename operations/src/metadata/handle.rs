@@ -317,7 +317,9 @@ impl MetadataVisibilityCache {
             return;
         };
         let before = entry.records.len();
-        entry.records.retain(|_, record| record.graph_iri != graph_iri);
+        entry
+            .records
+            .retain(|_, record| record.graph_iri != graph_iri);
         if entry.records.len() != before {
             entry.snapshot = None;
         }
@@ -464,7 +466,9 @@ impl MetadataHandle {
     }
 
     pub fn remove_visible_registry_record(&self, document_id: Ulid) {
-        self.inner.visibility_cache.remove_registry_record(document_id);
+        self.inner
+            .visibility_cache
+            .remove_registry_record(document_id);
     }
 
     /// Test hook: marks all visibility cache entries as expired so the next
@@ -510,7 +514,9 @@ impl MetadataHandle {
             self.inner
                 .visibility_cache
                 .remove_registry_records_by_graph(graph_iri);
-            self.inner.visibility_cache.remove_lifecycle_entry(graph_iri);
+            self.inner
+                .visibility_cache
+                .remove_lifecycle_entry(graph_iri);
         }
         if let Some(graph_iri) = graph_iri.as_deref()
             && !metadata_effect_skips_lifecycle_read(&effect)
@@ -2678,7 +2684,12 @@ async fn list_local_registry_records(
 // Single-flight background refill; readers keep being served the stale entry
 // until the new Arc is swapped in.
 fn spawn_visibility_cache_refill(inner: Arc<MetadataInner>) {
-    let Ok(guard) = inner.visibility_cache.registry_fill.clone().try_lock_owned() else {
+    let Ok(guard) = inner
+        .visibility_cache
+        .registry_fill
+        .clone()
+        .try_lock_owned()
+    else {
         return;
     };
     tokio::spawn(async move {
@@ -3504,7 +3515,10 @@ mod tests {
         cache.expire_now();
 
         assert_eq!(cache.lifecycle_deleted("urn:graph:a"), None);
-        assert_eq!(cache.lifecycle_deleted_any("urn:graph:a"), Some((true, false)));
+        assert_eq!(
+            cache.lifecycle_deleted_any("urn:graph:a"),
+            Some((true, false))
+        );
     }
 
     #[test]

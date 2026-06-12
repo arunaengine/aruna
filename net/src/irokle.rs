@@ -18,6 +18,7 @@ use aruna_core::storage_entries::{
     subject_index_writes,
 };
 use aruna_core::structs::{MetadataRegistryRecord, User};
+use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Value;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
@@ -29,7 +30,6 @@ use irokle_crate::net::{decode_sync_message, encode_frame, encode_sync_message};
 use irokle_crate::oplog::Oplog;
 use irokle_crate::sync::{SyncData, SyncMessage, SyncRequest};
 use irokle_crate::{EventEnvelope, PeerId, ReplicationPolicy, TopicGenesis, TopicPayload};
-use aruna_core::telemetry::duration_ms;
 use parking_lot::RwLock;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -1871,7 +1871,9 @@ fn process_batch_data_responses(
     let mut acks = Vec::new();
     for response in responses {
         match response {
-            SyncMessage::Ack(ack) if ack.peer_id == peer && known_topics.contains(&ack.topic_id) => {
+            SyncMessage::Ack(ack)
+                if ack.peer_id == peer && known_topics.contains(&ack.topic_id) =>
+            {
                 acks.push(ack);
             }
             SyncMessage::Summary(summary) if known_topics.contains(&summary.topic_id) => {}

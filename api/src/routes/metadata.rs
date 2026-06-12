@@ -1249,9 +1249,9 @@ async fn drain_metadata_projection_batch(key: [u8; 32]) {
     }
 }
 
-fn take_metadata_projection_batch(
-    key: [u8; 32],
-) -> Option<(Arc<DriverContext>, Vec<(Ulid, Ulid)>)> {
+type ProjectionBatchTargets = (Arc<DriverContext>, Vec<(Ulid, Ulid)>);
+
+fn take_metadata_projection_batch(key: [u8; 32]) -> Option<ProjectionBatchTargets> {
     let batches = METADATA_PROJECTION_BATCHES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut batches = batches
         .lock()
@@ -1286,23 +1286,21 @@ async fn load_group_metadata_records(
     // keyed per group so a small group's listing stays independent of the
     // realm-wide corpus size; the registry scan only runs as a cold-cache
     // fallback when the fill fails.
-    let mut records = match visible_registry::list_visible_registry_records_for_group(
-        ctx.as_ref(),
-        group_id,
-    )
-    .await
-    {
-        Ok(group_records) => group_records.as_ref().clone(),
-        Err(error) => {
-            warn!(
-                error = %error,
-                "visible registry cache fill failed, falling back to registry scan"
-            );
-            drive(ListMetadataDocumentsOperation::new(group_id), &ctx)
-                .await
-                .map_err(|err| ServerError::InternalError(err.to_string()))?
-        }
-    };
+    let mut records =
+        match visible_registry::list_visible_registry_records_for_group(ctx.as_ref(), group_id)
+            .await
+        {
+            Ok(group_records) => group_records.as_ref().clone(),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "visible registry cache fill failed, falling back to registry scan"
+                );
+                drive(ListMetadataDocumentsOperation::new(group_id), &ctx)
+                    .await
+                    .map_err(|err| ServerError::InternalError(err.to_string()))?
+            }
+        };
     if let Some(metadata_handle) = ctx.metadata_handle.as_ref() {
         merge_cached_metadata_records(
             &mut records,
@@ -3097,7 +3095,10 @@ mod tests {
         assert_eq!(value["nodes_failed"], json!(1));
 
         let roundtrip: MetadataQueryResponse = serde_json::from_value(value).unwrap();
-        assert!(matches!(roundtrip.result, MetadataQueryResult::Boolean(true)));
+        assert!(matches!(
+            roundtrip.result,
+            MetadataQueryResult::Boolean(true)
+        ));
         assert_eq!(roundtrip.nodes_queried, 3);
         assert_eq!(roundtrip.nodes_failed, 1);
     }

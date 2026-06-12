@@ -17,8 +17,7 @@ const DEFAULT_SLOW_REQUEST_THRESHOLD_MS: u64 = 500;
 const SLOW_REQUEST_THRESHOLD_ENV: &str = "ARUNA_SLOW_REQUEST_THRESHOLD_MS";
 
 // Unbiased per-route request latency histograms flushed as `latency.summary`.
-static HTTP_LATENCY: LazyLock<LatencyAggregator> =
-    LazyLock::new(|| LatencyAggregator::new("http"));
+static HTTP_LATENCY: LazyLock<LatencyAggregator> = LazyLock::new(|| LatencyAggregator::new("http"));
 
 fn slow_request_threshold() -> Duration {
     static THRESHOLD: OnceLock<Duration> = OnceLock::new();

@@ -377,7 +377,7 @@ async fn churn_convergence_body() -> Result<f64, BoxError> {
     println!("node 2 respawned, polling for catch-up");
 
     let result = wait_for_visibility(
-        &[node2.context.clone()],
+        std::slice::from_ref(&node2.context),
         &pairs,
         Duration::from_millis(500),
         Duration::from_secs(60),
@@ -491,7 +491,7 @@ async fn flush_projection_batches(
         if batch.is_empty() {
             continue;
         }
-        let drained: Vec<(Ulid, Ulid)> = batch.drain(..).collect();
+        let drained: Vec<(Ulid, Ulid)> = std::mem::take(batch);
         project_metadata_create_events_from_log(targets[slot].1.as_ref(), drained)
             .await
             .map_err(|error| format!("projection failed: {error:?}"))?;

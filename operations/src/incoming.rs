@@ -132,7 +132,10 @@ fn spawn_reconcile_queue_gauge(coalescer: Weak<IrokleReconcileCoalescer>) {
     });
 }
 
-async fn reconcile_inbound_irokle_topics(context: &Arc<DriverContext>, topics: Vec<irokle::TopicId>) {
+async fn reconcile_inbound_irokle_topics(
+    context: &Arc<DriverContext>,
+    topics: Vec<irokle::TopicId>,
+) {
     let Some(net_handle) = context.net_handle.clone() else {
         return;
     };

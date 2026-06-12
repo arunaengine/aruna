@@ -20,8 +20,7 @@ use crate::metadata::repository::{
 
 const VISIBLE_REGISTRY_TTL: Duration = Duration::from_secs(30);
 
-static VISIBLE_REGISTRY_SLOTS: OnceLock<Mutex<HashMap<[u8; 32], Arc<CacheSlot>>>> =
-    OnceLock::new();
+static VISIBLE_REGISTRY_SLOTS: OnceLock<Mutex<HashMap<[u8; 32], Arc<CacheSlot>>>> = OnceLock::new();
 
 #[derive(Debug, Error)]
 pub enum VisibleRegistryError {
@@ -151,9 +150,8 @@ fn cache_key(context: &DriverContext) -> [u8; 32] {
         Some(net) => *net.node_id().as_bytes(),
         None => {
             let mut key = [0u8; 32];
-            key[..8].copy_from_slice(
-                &(context as *const DriverContext as usize as u64).to_be_bytes(),
-            );
+            key[..8]
+                .copy_from_slice(&(context as *const DriverContext as usize as u64).to_be_bytes());
             key
         }
     }
