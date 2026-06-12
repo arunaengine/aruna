@@ -252,6 +252,7 @@ dependencies = [
  "iroh",
  "jsonwebtoken",
  "opentelemetry",
+ "percent-encoding",
  "postcard",
  "rand 0.10.1",
  "reqwest",

@@ -53,13 +53,14 @@ use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectOperation, PutO
 use aruna_operations::s3::upload_part::{UploadPartInput as UPI, UploadPartOperation};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, Bucket, CommonPrefix,
     CompleteMultipartUploadInput, CompleteMultipartUploadOutput, CreateBucketInput,
     CreateBucketOutput, CreateMultipartUploadInput, CreateMultipartUploadOutput, DeleteBucketInput,
     DeleteBucketOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput,
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, DeleteObjectInput, DeleteObjectOutput,
-    Destination, ETag, GetBucketReplicationInput, GetBucketReplicationOutput,
+    Destination, ETag, EncodingType, GetBucketReplicationInput, GetBucketReplicationOutput,
     GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectInput, GetObjectOutput,
     HeadObjectInput, HeadObjectOutput, LastModified, ListBucketsInput, ListBucketsOutput,
     ListObjectsV2Input, ListObjectsV2Output, Object, PutBucketReplicationInput,
@@ -81,6 +82,12 @@ struct ObjectResponseFields {
     last_modified: Option<LastModified>,
     metadata: Option<std::collections::HashMap<String, String>>,
 }
+
+const S3_URL_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 #[derive(Debug)]
 struct ReferenceMetadataRefresh {
@@ -745,6 +752,19 @@ impl S3 for ArunaS3Service {
         .map_err(IntoS3Error::into_s3_error)?
         .ok_or_else(|| s3_error!(InternalError, "Failed to list objects"))?;
 
+        let url_encoded = req
+            .input
+            .encoding_type
+            .as_ref()
+            .is_some_and(|encoding_type| encoding_type.as_str() == EncodingType::URL);
+        let encode_field = |value: String| -> String {
+            if url_encoded {
+                utf8_percent_encode(&value, S3_URL_ENCODE_SET).to_string()
+            } else {
+                value
+            }
+        };
+
         let contents: Vec<Object> = result
             .objects
             .into_iter()
@@ -756,7 +776,7 @@ impl S3 for ArunaS3Service {
                 );
                 Object {
                     e_tag: response_fields.e_tag,
-                    key: Some(object.head.key),
+                    key: Some(encode_field(object.head.key)),
                     last_modified: response_fields.last_modified,
                     owner: None,
                     size: response_fields.content_length,
@@ -768,7 +788,7 @@ impl S3 for ArunaS3Service {
             .common_prefixes
             .into_iter()
             .map(|prefix| CommonPrefix {
-                prefix: Some(prefix),
+                prefix: Some(encode_field(prefix)),
             })
             .collect();
         let key_count = contents.len() + common_prefixes.len();
@@ -778,7 +798,7 @@ impl S3 for ArunaS3Service {
 
         Ok(S3Response::new(ListObjectsV2Output {
             name: Some(bucket),
-            prefix,
+            prefix: prefix.map(&encode_field),
             max_keys: Some(i32::try_from(max_keys).unwrap_or(i32::MAX)),
             key_count: Some(i32::try_from(key_count).unwrap_or(i32::MAX)),
             continuation_token: requested_continuation_token,
@@ -786,9 +806,9 @@ impl S3 for ArunaS3Service {
             next_continuation_token,
             contents: Some(contents),
             common_prefixes: Some(common_prefixes),
-            delimiter,
+            delimiter: delimiter.map(&encode_field),
             encoding_type: req.input.encoding_type,
-            start_after,
+            start_after: start_after.map(&encode_field),
             ..Default::default()
         }))
     }
@@ -2533,5 +2553,81 @@ mod tests {
         );
         let err = service.list_objects_v2(req).await.unwrap_err();
         assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_applies_url_encoding_type() {
+        let storage_dir = tempfile::tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+        let context = Arc::new(DriverContext {
+            storage_handle: storage_handle.clone(),
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let realm_id = RealmId([36u8; 32]);
+        let group_id = Ulid::new();
+        let created_by = UserId::local(Ulid::new(), realm_id);
+
+        let service =
+            ArunaS3Service::new(context, realm_id, NodeId::from_bytes(&[0u8; 32]).unwrap()).await;
+
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["a b+c.txt", "d e/f.txt"],
+            created_by,
+            UNIX_EPOCH,
+        )
+        .await;
+
+        let mut extensions = Extensions::new();
+        extensions.insert(test_user_access(group_id, realm_id));
+        extensions.insert(test_bucket_info(group_id, created_by));
+
+        let req = test_list_objects_v2_request(
+            extensions,
+            ListObjectsV2Input {
+                bucket: "bucket".to_string(),
+                continuation_token: None,
+                delimiter: Some("/".to_string()),
+                encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
+                expected_bucket_owner: None,
+                fetch_owner: None,
+                max_keys: Some(10),
+                optional_object_attributes: None,
+                prefix: None,
+                request_payer: None,
+                start_after: Some("a".to_string()),
+            },
+        );
+        let output = service.list_objects_v2(req).await.unwrap().output;
+
+        let keys: Vec<_> = output
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|object| object.key)
+            .collect();
+        let prefixes: Vec<_> = output
+            .common_prefixes
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|prefix| prefix.prefix)
+            .collect();
+
+        assert_eq!(keys, vec!["a%20b%2Bc.txt"]);
+        assert_eq!(prefixes, vec!["d%20e%2F"]);
+        assert_eq!(output.delimiter.as_deref(), Some("%2F"));
+        assert_eq!(output.start_after.as_deref(), Some("a"));
+        assert_eq!(
+            output
+                .encoding_type
+                .map(|encoding| encoding.as_str().to_string()),
+            Some("url".to_string())
+        );
     }
 }
