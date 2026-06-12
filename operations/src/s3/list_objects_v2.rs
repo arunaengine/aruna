@@ -120,25 +120,23 @@ impl ListObjectsV2Operation {
         };
 
         self.txn_id = Some(txn_id);
-        let prefix = match BlobHeadKey::bucket_prefix(&self.input.bucket) {
-            Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        let iter_start_key = if self.input.continuation_token.is_some() {
-            self.input.continuation_token.clone()
-        } else if let Some(prefix) = self
+        // The object prefix is a byte prefix of every matching head key, so
+        // the storage layer bounds the scan to the contiguous prefix range
+        // (including a key equal to the prefix itself).
+        let prefix = match self
             .input
             .prefix
             .as_ref()
             .filter(|prefix| !prefix.is_empty())
         {
-            match BlobHeadKey::object_prefix(&self.input.bucket, prefix) {
-                Ok(prefix) => Some(prefix),
-                Err(err) => return self.emit_error(err.into()),
-            }
-        } else {
-            None
+            Some(key_prefix) => BlobHeadKey::object_prefix(&self.input.bucket, key_prefix),
+            None => BlobHeadKey::bucket_prefix(&self.input.bucket),
         };
+        let prefix = match prefix {
+            Ok(prefix) => prefix,
+            Err(err) => return self.emit_error(err.into()),
+        };
+        let iter_start_key = self.input.continuation_token.clone();
 
         let limit = self.max_keys().saturating_add(1);
 
@@ -169,73 +167,25 @@ impl ListObjectsV2Operation {
             return self.read_next_version_or_finish();
         }
 
-        let has_prefix = self.input.prefix.as_ref().is_some_and(|p| !p.is_empty());
-        let raw_count = values.len();
-
-        if !has_prefix {
-            // Track the key of the last pushed item as the continuation
-            // token.  Since the Iter effect uses an *exclusive* start_after
-            // bound, using the first excluded item (index == max_keys) would
-            // skip it on the next page.
-            //
-            // Only set the token when the storage returned a full page
-            // (more than max_keys items), which is our signal that more
-            // items likely exist.  When fewer items are returned we are
-            // at the end and there is nothing left to page.
-            let mut continuation = None;
-            for (index, (key, value)) in values.into_iter().enumerate() {
-                if index >= max_keys {
-                    break;
-                }
-                let head = match BlobHeadKey::from_bytes(key.as_ref()) {
-                    Ok(head) => head,
-                    Err(err) => return self.emit_error(err.into()),
-                };
-                let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
-                    Ok(pointer) => pointer,
-                    Err(err) => return self.emit_error(err.into()),
-                };
-                if head.bucket != self.input.bucket {
-                    continue;
-                }
-                continuation = Some(key.to_vec());
-                self.pending.push((head, pointer.version_id));
-            }
-            if raw_count > max_keys {
-                self.continuation_token = continuation;
-            }
-        } else {
-            // Prefix filter: we start scanning at the requested object prefix,
-            // then stop at the first key outside that contiguous prefix range.
-            let prefix = self.input.prefix.as_ref().unwrap();
-            let mut continuation = None;
-            let mut has_more_matches = false;
-            for (key, value) in values {
-                let head = match BlobHeadKey::from_bytes(key.as_ref()) {
-                    Ok(head) => head,
-                    Err(err) => return self.emit_error(err.into()),
-                };
-                let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
-                    Ok(pointer) => pointer,
-                    Err(err) => return self.emit_error(err.into()),
-                };
-                if head.bucket != self.input.bucket {
-                    continue;
-                }
-                if !head.key.starts_with(prefix.as_str()) {
-                    break;
-                }
-                if self.pending.len() < max_keys {
-                    self.pending.push((head, pointer.version_id));
-                    continuation = Some(key.to_vec());
-                } else {
-                    has_more_matches = true;
-                    break;
-                }
-            }
-            if has_more_matches {
-                self.continuation_token = continuation;
-            }
+        // The continuation token is the key of the last returned item: the
+        // Iter start_after bound is exclusive, and a full page (more than
+        // max_keys items) signals that more items exist in the range.
+        let has_more = values.len() > max_keys;
+        let mut last_key = None;
+        for (key, value) in values.into_iter().take(max_keys) {
+            let head = match BlobHeadKey::from_bytes(key.as_ref()) {
+                Ok(head) => head,
+                Err(err) => return self.emit_error(err.into()),
+            };
+            let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
+                Ok(pointer) => pointer,
+                Err(err) => return self.emit_error(err.into()),
+            };
+            last_key = Some(key);
+            self.pending.push((head, pointer.version_id));
+        }
+        if has_more {
+            self.continuation_token = last_key.map(|key| key.to_vec());
         }
 
         self.pending.reverse();
@@ -1064,5 +1014,155 @@ mod test {
         assert_eq!(result.objects[0].source_metadata, Some(source_metadata));
         assert_eq!(result.objects[0].last_refresh, Some(last_refresh));
         assert!(result.continuation_token.is_none());
+    }
+
+    fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
+        DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            automerge_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        }
+    }
+
+    async fn seed_materialized_keys(
+        storage_handle: &storage::StorageHandle,
+        bucket: &str,
+        keys: &[&str],
+        created_by: UserId,
+    ) {
+        let created_at = UNIX_EPOCH + Duration::from_secs(5);
+        for (index, key) in keys.iter().enumerate() {
+            let version_id = Ulid::new();
+            let hash = [index as u8 + 1; 32];
+            let version = BlobVersion::materialized(hash, created_at, created_by, None);
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                    key: BlobHeadKey::new(bucket, *key).to_bytes().unwrap().into(),
+                    value: CurrentVersionPointer::new(version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    txn_id: None,
+                })
+                .await;
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                    key: VersionKey::new(bucket, *key, version_id)
+                        .to_bytes()
+                        .unwrap()
+                        .into(),
+                    value: version.to_bytes().unwrap().into(),
+                    txn_id: None,
+                })
+                .await;
+            let _ = storage_handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    key: hash.to_vec().into(),
+                    value: BackendLocation {
+                        root: "/tmp".to_string(),
+                        storage_bucket: "objects".to_string(),
+                        backend_path: format!("path/{key}"),
+                        ulid: Ulid::new(),
+                        compressed: false,
+                        encrypted: false,
+                        created_by,
+                        created_at,
+                        staging: false,
+                        partial: false,
+                        blob_size: 42,
+                        hashes: HashMap::new(),
+                    }
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+                    txn_id: None,
+                })
+                .await;
+        }
+    }
+
+    async fn list_keys(
+        driver_ctx: &DriverContext,
+        bucket: &str,
+        prefix: Option<&str>,
+    ) -> Vec<String> {
+        let result = drive(
+            ListObjectsV2Operation::new(ListObjectsV2Input {
+                bucket: bucket.to_string(),
+                group_id: Ulid::new(),
+                continuation_token: None,
+                max_keys: Some(100),
+                prefix: prefix.map(str::to_string),
+            }),
+            driver_ctx,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        result
+            .objects
+            .into_iter()
+            .map(|object| object.head.key)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_prefix_includes_key_equal_to_prefix() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+        let created_by = UserId::local(Ulid::new(), RealmId([7u8; 32]));
+
+        seed_materialized_keys(
+            &storage_handle,
+            "bucket",
+            &["docs/", "docs/readme.md"],
+            created_by,
+        )
+        .await;
+
+        let keys = list_keys(&driver_ctx, "bucket", Some("docs/")).await;
+        assert_eq!(keys, vec!["docs/", "docs/readme.md"]);
+
+        let keys = list_keys(&driver_ctx, "bucket", Some("docs/readme.md")).await;
+        assert_eq!(keys, vec!["docs/readme.md"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_prefix_scan_with_interleaved_shorter_key() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+        let created_by = UserId::local(Ulid::new(), RealmId([7u8; 32]));
+
+        // "rare0" sorts between "rare/" and "rare/1" under length-first
+        // orderings; the contiguous prefix range must not be cut by it.
+        seed_materialized_keys(&storage_handle, "bucket", &["rare0", "rare/1"], created_by).await;
+
+        let keys = list_keys(&driver_ctx, "bucket", Some("rare/")).await;
+        assert_eq!(keys, vec!["rare/1"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_objects_v2_returns_keys_in_lexicographic_order() {
+        let temp_handle = tempdir().unwrap();
+        let storage_handle =
+            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = driver_context(storage_handle.clone());
+        let created_by = UserId::local(Ulid::new(), RealmId([7u8; 32]));
+
+        seed_materialized_keys(&storage_handle, "bucket", &["b", "aa", "a/1"], created_by).await;
+
+        let keys = list_keys(&driver_ctx, "bucket", None).await;
+        assert_eq!(keys, vec!["a/1", "aa", "b"]);
     }
 }
