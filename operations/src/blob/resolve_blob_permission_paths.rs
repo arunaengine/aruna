@@ -71,11 +71,8 @@ impl ResolveBlobPermissionPathsOperation {
             .map(|(key, _)| HashPathIndexKey::from_bytes(key.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
 
-        candidates.sort_by(|left, right| {
-            left.permission_path()
-                .cmp(&right.permission_path())
-                .then_with(|| left.version_id.cmp(&right.version_id))
-        });
+        candidates
+            .sort_by_cached_key(|candidate| (candidate.permission_path(), candidate.version_id));
 
         self.output = Some(Ok(candidates));
 

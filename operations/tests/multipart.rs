@@ -31,7 +31,6 @@ use aruna_operations::s3::delete_object::{DeleteObjectInput, DeleteObjectOperati
 use aruna_operations::s3::put_object::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_operations::s3::upload_part::{UploadPartInput, UploadPartOperation};
 use aruna_storage::storage;
-use base64::Engine;
 use std::collections::HashMap;
 use std::fs::{create_dir_all, exists, read_dir, read_to_string};
 use std::path::Path;
@@ -203,10 +202,7 @@ async fn complete_upload(
                 .enumerate()
                 .map(|(idx, part)| CompleteMultipartPart {
                     part_number: (idx + 1) as u16,
-                    etag: Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(part.location.hashes.get("md5").unwrap()),
-                    ),
+                    etag: Some(hex::encode(part.location.hashes.get("md5").unwrap())),
                     expected_checksums: vec![],
                 })
                 .collect(),
@@ -310,18 +306,16 @@ async fn completes_multipart_upload_and_persists_object_part_metadata() {
             completed_parts: vec![
                 CompleteMultipartPart {
                     part_number: 1,
-                    etag: Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(uploaded_part1.location.hashes.get("md5").unwrap()),
-                    ),
+                    etag: Some(hex::encode(
+                        uploaded_part1.location.hashes.get("md5").unwrap(),
+                    )),
                     expected_checksums: vec![],
                 },
                 CompleteMultipartPart {
                     part_number: 2,
-                    etag: Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(uploaded_part2.location.hashes.get("md5").unwrap()),
-                    ),
+                    etag: Some(hex::encode(
+                        uploaded_part2.location.hashes.get("md5").unwrap(),
+                    )),
                     expected_checksums: vec![],
                 },
             ],
@@ -678,18 +672,16 @@ async fn completes_multipart_upload_retains_previous_current_hash_path_index() {
             completed_parts: vec![
                 CompleteMultipartPart {
                     part_number: 1,
-                    etag: Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(uploaded_part1.location.hashes.get("md5").unwrap()),
-                    ),
+                    etag: Some(hex::encode(
+                        uploaded_part1.location.hashes.get("md5").unwrap(),
+                    )),
                     expected_checksums: vec![],
                 },
                 CompleteMultipartPart {
                     part_number: 2,
-                    etag: Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(uploaded_part2.location.hashes.get("md5").unwrap()),
-                    ),
+                    etag: Some(hex::encode(
+                        uploaded_part2.location.hashes.get("md5").unwrap(),
+                    )),
                     expected_checksums: vec![],
                 },
             ],
@@ -1295,18 +1287,16 @@ async fn delete_object_removes_completed_multipart_metadata() {
             completed_parts: vec![
                 CompleteMultipartPart {
                     part_number: 1,
-                    etag: Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(uploaded_part1.location.hashes.get("md5").unwrap()),
-                    ),
+                    etag: Some(hex::encode(
+                        uploaded_part1.location.hashes.get("md5").unwrap(),
+                    )),
                     expected_checksums: vec![],
                 },
                 CompleteMultipartPart {
                     part_number: 2,
-                    etag: Some(
-                        base64::engine::general_purpose::STANDARD
-                            .encode(uploaded_part2.location.hashes.get("md5").unwrap()),
-                    ),
+                    etag: Some(hex::encode(
+                        uploaded_part2.location.hashes.get("md5").unwrap(),
+                    )),
                     expected_checksums: vec![],
                 },
             ],

@@ -1,10 +1,7 @@
 mod shared;
 
-use aruna_core::effects::Effect;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::HASH_PATHS_INDEX_KEYSPACE;
 use aruna_core::structs::HashPathIndexKey;
+use aruna_operations::blob::resolve_blob_permission_paths::ResolveBlobPermissionPathsOperation;
 use aruna_operations::driver::drive;
 use aruna_operations::s3::head_object::{HeadObjectInput, HeadObjectOperation};
 use aws_sdk_s3::primitives::ByteStream;
@@ -27,26 +24,9 @@ async fn iter_hash_path_index(
     context: &aruna_operations::driver::DriverContext,
     hash: [u8; 32],
 ) -> TestResult<Vec<HashPathIndexKey>> {
-    let prefix = HashPathIndexKey::hash_prefix(&hash)?;
-    let event = context
-        .storage_handle
-        .send_effect(Effect::Storage(aruna_core::effects::StorageEffect::Iter {
-            key_space: HASH_PATHS_INDEX_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start_after: None,
-            limit: 10_000,
-            txn_id: None,
-        }))
-        .await;
-
-    let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-        return Err(std::io::Error::other("unexpected hash-path iteration result").into());
-    };
-
-    values
-        .into_iter()
-        .map(|(key, _)| HashPathIndexKey::from_bytes(key.as_ref()).map_err(Into::into))
-        .collect()
+    drive(ResolveBlobPermissionPathsOperation::new(hash), context)
+        .await
+        .map_err(Into::into)
 }
 
 #[tokio::test]

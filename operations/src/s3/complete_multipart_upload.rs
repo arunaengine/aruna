@@ -18,8 +18,6 @@ use aruna_core::structs::{
     MultipartUploadPart, MultipartUploadPartKey, MultipartUploadStatus, RealmId, VersionKey,
 };
 use aruna_core::types::{Effects, NodeId, TxnId, UserId};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use smallvec::smallvec;
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -1017,7 +1015,7 @@ fn validate_requested_part(
         let Some(md5) = record.location.hashes.get(HASH_MD5) else {
             return Err(CompleteMultipartUploadError::MissingPartEtag);
         };
-        if STANDARD.encode(md5) != *etag {
+        if hex::encode(md5) != *etag {
             return Err(CompleteMultipartUploadError::PartEtagMismatch);
         }
     }

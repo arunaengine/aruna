@@ -189,11 +189,6 @@ pub struct BlobHeadKey {
     pub key: String,
 }
 
-#[derive(Serialize)]
-struct BlobHeadKeyPrefix<'a> {
-    bucket: &'a str,
-}
-
 impl BlobHeadKey {
     pub fn new(bucket: impl Into<String>, key: impl Into<String>) -> Self {
         Self {
@@ -203,15 +198,23 @@ impl BlobHeadKey {
     }
 
     pub fn bucket_prefix(bucket: &str) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&BlobHeadKeyPrefix { bucket })?)
+        Ok(format!("{bucket}/").into_bytes())
+    }
+
+    pub fn object_prefix(bucket: &str, key: &str) -> Result<Vec<u8>, ConversionError> {
+        Ok(format!("{bucket}/{key}").into_bytes())
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(&self)?)
+        Self::object_prefix(&self.bucket, &self.key)
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
+        let raw = String::from_utf8(bytes.to_vec())?;
+        let (bucket, key) = raw.split_once('/').ok_or_else(|| {
+            ConversionError::FromStrError("blob head key is missing the bucket separator".into())
+        })?;
+        Ok(Self::new(bucket, key))
     }
 }
 
@@ -600,6 +603,39 @@ mod tests {
 
         assert_eq!(key, restored);
         assert!(key.to_bytes().unwrap().starts_with(&prefix));
+    }
+
+    #[test]
+    fn blob_head_key_object_prefix_roundtrip() {
+        let prefix = BlobHeadKey::object_prefix("bucket", "rare/").unwrap();
+        let key = BlobHeadKey::new("bucket", "rare/").to_bytes().unwrap();
+        assert_eq!(prefix, key);
+    }
+
+    #[test]
+    fn blob_head_key_object_prefix_rejects_wrong_bucket() {
+        let key = BlobHeadKey::new("bucket_b", "docs/file.txt")
+            .to_bytes()
+            .unwrap();
+        let prefix = BlobHeadKey::object_prefix("bucket_a", "docs/").unwrap();
+        assert!(!key.starts_with(&prefix));
+    }
+
+    #[test]
+    fn blob_head_key_byte_order_matches_lexicographic_key_order() {
+        let short = BlobHeadKey::new("bucket", "b").to_bytes().unwrap();
+        let long = BlobHeadKey::new("bucket", "aa").to_bytes().unwrap();
+        assert!(long < short);
+    }
+
+    #[test]
+    fn blob_head_key_prefix_range_is_contiguous() {
+        let prefix = BlobHeadKey::object_prefix("bucket", "rare/").unwrap();
+        let inside = BlobHeadKey::new("bucket", "rare/1").to_bytes().unwrap();
+        let outside = BlobHeadKey::new("bucket", "rare0").to_bytes().unwrap();
+        assert!(inside.starts_with(&prefix));
+        assert!(!outside.starts_with(&prefix));
+        assert!(outside > inside);
     }
 
     #[test]
