@@ -100,7 +100,7 @@ pub enum SourceConnectorResolutionError {
     ResolveFailed,
 }
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Error, PartialEq, Clone)]
 pub enum StorageError {
     #[error("Key not found")]
     KeyNotFound,

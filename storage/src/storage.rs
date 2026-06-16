@@ -454,6 +454,7 @@ impl FjallStorage {
     pub fn receive_loop(&mut self, receiver: EffectReceiver) {
         let mut slow_queue = SlowQueueAggregator::default();
         let mut group: Vec<EffectHandle> = Vec::new();
+        let mut group_index: Option<PendingWriteIndex> = None;
         loop {
             let Ok(first) = receiver.recv() else {
                 tracing::warn!("Storage receiver channel closed, shutting down storage thread.");
@@ -470,17 +471,30 @@ impl FjallStorage {
 
             for item in pending {
                 if is_groupable_write(&item.0) {
+                    if let Some(index) = &mut group_index {
+                        index.insert(&item.0);
+                    }
                     group.push(item);
                     continue;
                 }
                 if is_poolable_read(&item.0) {
+                    let conflicts = !group.is_empty()
+                        && group_index
+                            .get_or_insert_with(|| PendingWriteIndex::from_group(&group))
+                            .conflicts_with_read(&item.0);
+                    if conflicts {
+                        self.flush_write_group(&mut group, &mut slow_queue);
+                        group_index = None;
+                    }
                     self.forward_to_read_pool(item, &mut slow_queue);
                     continue;
                 }
                 self.flush_write_group(&mut group, &mut slow_queue);
+                group_index = None;
                 self.process_single(item, &mut slow_queue);
             }
             self.flush_write_group(&mut group, &mut slow_queue);
+            group_index = None;
         }
     }
 
@@ -581,7 +595,29 @@ impl FjallStorage {
             return;
         }
 
-        let members = std::mem::take(group);
+        let mut members = std::mem::take(group);
+        members.retain(|item| {
+            if item.1.is_disconnected() {
+                let _guard = item.2.enter();
+                warn!(
+                    event = "storage.request.abandoned",
+                    operation = storage_effect_kind(&item.0),
+                    "Skipping abandoned storage request"
+                );
+                false
+            } else {
+                true
+            }
+        });
+        if members.is_empty() {
+            return;
+        }
+        if members.len() == 1 {
+            let item = members.pop().expect("group has one item");
+            self.process_single(item, slow_queue);
+            return;
+        }
+
         let service_started = Instant::now();
         let tx = match self.buffered_write_tx() {
             Ok(tx) => tx,
@@ -602,43 +638,44 @@ impl FjallStorage {
             }
         }
 
-        let commit_result = self
-            .commit_buffered_write_tx(tx)
-            .and_then(|()| self.persist_journal());
-
-        match commit_result {
-            Ok(()) => {
-                let service_elapsed = service_started.elapsed();
-                for ((effect, response_tx, span, enqueued_at), outcome) in prepared {
-                    let _guard = span.enter();
-                    let queue_wait = enqueued_at.elapsed().saturating_sub(service_elapsed);
-                    let event = match outcome {
-                        Ok(event) => event,
-                        Err(error) => StorageEvent::Error { error },
-                    };
-                    let result = storage_event_kind(&event);
-                    span.record("queue_wait_ms", duration_ms(queue_wait));
-                    span.record("service_ms", duration_ms(service_elapsed));
-                    span.record("result", result);
-                    span.record("path", "group_commit");
-                    slow_queue.observe(
-                        storage_effect_kind(&effect),
-                        storage_effect_key_space(&effect),
-                        queue_wait,
-                        service_elapsed,
-                        result,
-                    );
-                    if !response_tx.is_disconnected() {
-                        response_tx.send(event);
-                    }
-                }
-            }
-            Err(_) => {
-                // Conflict with a held transaction: retry each member alone so
-                // only genuinely conflicting writes fail.
+        let group_error = match self.commit_buffered_write_tx(tx) {
+            Ok(()) => self.persist_journal().err(),
+            Err(StorageError::TransactionConflict) => {
                 for (item, _) in prepared {
                     self.process_single(item, slow_queue);
                 }
+                return;
+            }
+            Err(error) => Some(error),
+        };
+
+        let service_elapsed = service_started.elapsed();
+        for ((effect, response_tx, span, enqueued_at), outcome) in prepared {
+            let _guard = span.enter();
+            let queue_wait = enqueued_at.elapsed().saturating_sub(service_elapsed);
+            let event = match outcome {
+                Ok(event) => match &group_error {
+                    Some(error) => StorageEvent::Error {
+                        error: error.clone(),
+                    },
+                    None => event,
+                },
+                Err(error) => StorageEvent::Error { error },
+            };
+            let result = storage_event_kind(&event);
+            span.record("queue_wait_ms", duration_ms(queue_wait));
+            span.record("service_ms", duration_ms(service_elapsed));
+            span.record("result", result);
+            span.record("path", "group_commit");
+            slow_queue.observe(
+                storage_effect_kind(&effect),
+                storage_effect_key_space(&effect),
+                queue_wait,
+                service_elapsed,
+                result,
+            );
+            if !response_tx.is_disconnected() {
+                response_tx.send(event);
             }
         }
     }
@@ -664,8 +701,12 @@ impl FjallStorage {
                 txn_id: None,
             } => {
                 let mut entries = Vec::with_capacity(writes.len());
+                let mut resolved = Vec::with_capacity(writes.len());
                 for (key_space, key, value) in writes {
                     let keyspace = self.store.resolve_keyspace(key_space)?;
+                    resolved.push((keyspace, key_space, key, value));
+                }
+                for (keyspace, key_space, key, value) in resolved {
                     tx.insert(keyspace, key.clone(), value.clone());
                     entries.push((key_space.clone(), key.clone()));
                 }
@@ -685,8 +726,12 @@ impl FjallStorage {
                 txn_id: None,
             } => {
                 let mut entries = Vec::with_capacity(deletes.len());
+                let mut resolved = Vec::with_capacity(deletes.len());
                 for (key_space, key) in deletes {
                     let keyspace = self.store.resolve_keyspace(key_space)?;
+                    resolved.push((keyspace, key_space, key));
+                }
+                for (keyspace, key_space, key) in resolved {
                     tx.remove(keyspace, key.clone());
                     entries.push((key_space.clone(), key.clone()));
                 }
@@ -1206,6 +1251,189 @@ fn is_poolable_read(effect: &StorageEffect) -> bool {
             | StorageEffect::BatchRead { txn_id: None, .. }
             | StorageEffect::Iter { txn_id: None, .. }
     )
+}
+
+#[derive(Default)]
+struct PendingWriteIndex {
+    key_spaces: Vec<String>,
+    keys: Vec<PendingWriteKey>,
+    sorted: bool,
+}
+
+struct PendingWriteKey {
+    key_space: usize,
+    key: ByteView,
+}
+
+impl PendingWriteIndex {
+    fn from_group(group: &[EffectHandle]) -> Self {
+        let mut index = Self {
+            key_spaces: Vec::with_capacity(group.len()),
+            keys: Vec::with_capacity(group.len()),
+            sorted: true,
+        };
+        for (effect, _, _, _) in group {
+            index.insert(effect);
+        }
+        index
+    }
+
+    fn insert(&mut self, effect: &StorageEffect) {
+        match effect {
+            StorageEffect::Write {
+                key_space,
+                key,
+                txn_id: None,
+                ..
+            }
+            | StorageEffect::Delete {
+                key_space,
+                key,
+                txn_id: None,
+            } => self.insert_key(key_space, key),
+            StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            } => {
+                for (key_space, key, _) in writes {
+                    self.insert_key(key_space, key);
+                }
+            }
+            StorageEffect::BatchDelete {
+                deletes,
+                txn_id: None,
+            } => {
+                for (key_space, key) in deletes {
+                    self.insert_key(key_space, key);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn insert_key(&mut self, key_space: &str, key: &ByteView) {
+        let key_space = self.key_space_index_or_insert(key_space);
+        self.keys.push(PendingWriteKey {
+            key_space,
+            key: key.clone(),
+        });
+        self.sorted = false;
+    }
+
+    fn conflicts_with_read(&mut self, read: &StorageEffect) -> bool {
+        match read {
+            StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            } => self.contains_key(key_space, key),
+            StorageEffect::BatchRead {
+                reads,
+                txn_id: None,
+            } => reads
+                .iter()
+                .any(|(key_space, key)| self.contains_key(key_space, key)),
+            StorageEffect::Iter {
+                key_space,
+                prefix,
+                start,
+                limit,
+                txn_id: None,
+            } => *limit != 0 && self.contains_iter_key(key_space, prefix.as_ref(), start.as_ref()),
+            _ => false,
+        }
+    }
+
+    fn contains_key(&mut self, key_space: &str, key: &ByteView) -> bool {
+        let Some(key_space) = self.key_space_index(key_space) else {
+            return false;
+        };
+        self.sort_keys();
+        self.keys
+            .binary_search_by(|pending| compare_pending_key(pending, key_space, key.as_ref()))
+            .is_ok()
+    }
+
+    fn contains_iter_key(
+        &mut self,
+        key_space: &str,
+        prefix: Option<&ByteView>,
+        start: Option<&IterStart>,
+    ) -> bool {
+        let Some(key_space) = self.key_space_index(key_space) else {
+            return false;
+        };
+        self.sort_keys();
+        let start_index = self
+            .keys
+            .partition_point(|pending| pending.key_space < key_space);
+        let end_index = self
+            .keys
+            .partition_point(|pending| pending.key_space <= key_space);
+        self.keys[start_index..end_index]
+            .iter()
+            .any(|pending| iter_may_include_key(prefix, start, &pending.key))
+    }
+
+    fn key_space_index(&self, key_space: &str) -> Option<usize> {
+        self.key_spaces
+            .iter()
+            .position(|existing| existing.as_str() == key_space)
+    }
+
+    fn key_space_index_or_insert(&mut self, key_space: &str) -> usize {
+        match self.key_space_index(key_space) {
+            Some(index) => index,
+            None => {
+                self.key_spaces.push(key_space.to_string());
+                self.key_spaces.len() - 1
+            }
+        }
+    }
+
+    fn sort_keys(&mut self) {
+        if self.sorted {
+            return;
+        }
+        self.keys.sort_unstable_by(|left, right| {
+            left.key_space
+                .cmp(&right.key_space)
+                .then_with(|| left.key.as_ref().cmp(right.key.as_ref()))
+        });
+        self.keys.dedup_by(|left, right| {
+            left.key_space == right.key_space && left.key.as_ref() == right.key.as_ref()
+        });
+        self.sorted = true;
+    }
+}
+
+fn compare_pending_key(
+    pending: &PendingWriteKey,
+    key_space: usize,
+    key: &[u8],
+) -> std::cmp::Ordering {
+    pending
+        .key_space
+        .cmp(&key_space)
+        .then_with(|| pending.key.as_ref().cmp(key))
+}
+
+fn iter_may_include_key(
+    prefix: Option<&ByteView>,
+    start: Option<&IterStart>,
+    key: &ByteView,
+) -> bool {
+    let key = key.as_ref();
+    if let Some(prefix) = prefix
+        && !key.starts_with(prefix.as_ref())
+    {
+        return false;
+    }
+    match start {
+        Some(IterStart::After(start)) if key <= start.as_ref() => false,
+        Some(IterStart::At(start)) if key < start.as_ref() => false,
+        _ => true,
+    }
 }
 
 fn spawn_read_pool(store: Store, threads: usize) -> Vec<EffectSender> {
