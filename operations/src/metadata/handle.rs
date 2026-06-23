@@ -7,10 +7,11 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
+use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE;
+use aruna_core::keyspaces::{API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE};
 use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataQuadOp,
@@ -24,20 +25,28 @@ use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
+use byteview::ByteView;
 use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
     Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleIrokleOptions, CraqleNode,
     CraqleOptions, CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, GraphId,
     GraphPolicy, QueryResults, RoCrateError, SearchStorage, vocab,
 };
+use jsonwebtoken::DecodingKey;
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
+use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
+use tokio::sync::RwLock;
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
 use super::protocol::{MetadataAuthToken, MetadataTransportMessage, read_message, write_message};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
+use crate::auth::{
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
+    validate_aruna_bearer_token,
+};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
 use crate::list_groups::ListGroupOperation;
@@ -105,6 +114,7 @@ impl From<MetadataSearchStorage> for SearchStorage {
 struct MetadataInner {
     node: Arc<CraqleNode>,
     storage_handle: StorageHandle,
+    auth_validation: MetadataAuthValidationState,
     net_handle: Option<NetHandle>,
     irokle_db: Option<fjall::OptimisticTxDatabase>,
     irokle_persist_policy: FjallPersistPolicy,
@@ -114,6 +124,73 @@ struct MetadataInner {
     craqle_read_permits: Arc<tokio::sync::Semaphore>,
     deferred_persist_requested: AtomicBool,
     deferred_persist_running: AtomicBool,
+}
+
+#[derive(Clone)]
+struct MetadataAuthValidationState {
+    storage_handle: StorageHandle,
+    issuer_keys: Arc<RwLock<HashMap<String, DecodingKey>>>,
+}
+
+impl MetadataAuthValidationState {
+    fn new(storage_handle: StorageHandle) -> Self {
+        Self {
+            storage_handle,
+            issuer_keys: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ArunaBearerTokenValidationState for MetadataAuthValidationState {
+    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+        match load_metadata_auth_state::<HashSet<String>>(
+            &self.storage_handle,
+            TOKEN_REVOCATION_LIST_KEY,
+        )
+        .await
+        {
+            Ok(revoked) => revoked.contains(token_hash),
+            Err(error) => {
+                warn!(error = %error, "Failed to read metadata token revocation state");
+                true
+            }
+        }
+    }
+
+    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
+        match load_metadata_auth_state::<HashSet<RealmId>>(
+            &self.storage_handle,
+            TRUSTED_REALMS_LIST_KEY,
+        )
+        .await
+        {
+            Ok(trusted) => trusted.contains(realm_id),
+            Err(error) => {
+                warn!(error = %error, "Failed to read metadata trusted realms state");
+                false
+            }
+        }
+    }
+
+    async fn decoding_key_for_issuer(
+        &self,
+        issuer_pubkey: &str,
+    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+        let read_lock = self.issuer_keys.read().await;
+        let key = read_lock.get(issuer_pubkey).cloned();
+        drop(read_lock);
+        if let Some(key) = key {
+            return Ok(key);
+        }
+
+        let decoding_key = decoding_key_from_base64_public_key(issuer_pubkey)?;
+        self.issuer_keys
+            .write()
+            .await
+            .insert(issuer_pubkey.to_string(), decoding_key.clone());
+        Ok(decoding_key)
+    }
 }
 
 #[derive(Default)]
@@ -416,6 +493,7 @@ impl MetadataHandle {
         Ok(Self {
             inner: Arc::new(MetadataInner {
                 node: Arc::new(node),
+                auth_validation: MetadataAuthValidationState::new(storage_handle.clone()),
                 storage_handle,
                 net_handle,
                 irokle_db,
@@ -796,10 +874,20 @@ impl MetadataHandle {
                 graph_iris,
                 sparql,
             } => {
-                let auth_context = remote_metadata_auth_context(auth_token);
-                match query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql).await
-                {
-                    Ok(results) => MetadataTransportMessage::QueryResults { results },
+                match remote_metadata_auth_context(&self.inner.auth_validation, auth_token).await {
+                    Ok(auth_context) => {
+                        match query_local_graphs(
+                            self.inner.clone(),
+                            auth_context,
+                            graph_iris,
+                            sparql,
+                        )
+                        .await
+                        {
+                            Ok(results) => MetadataTransportMessage::QueryResults { results },
+                            Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                        }
+                    }
                     Err(error) => MetadataTransportMessage::Reject(error.to_string()),
                 }
             }
@@ -809,17 +897,21 @@ impl MetadataHandle {
                 query,
                 limit,
             } => {
-                let auth_context = remote_metadata_auth_context(auth_token);
-                match search_local_graphs(
-                    self.inner.clone(),
-                    auth_context,
-                    graph_iris,
-                    query,
-                    limit,
-                )
-                .await
-                {
-                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
+                match remote_metadata_auth_context(&self.inner.auth_validation, auth_token).await {
+                    Ok(auth_context) => {
+                        match search_local_graphs(
+                            self.inner.clone(),
+                            auth_context,
+                            graph_iris,
+                            query,
+                            limit,
+                        )
+                        .await
+                        {
+                            Ok(hits) => MetadataTransportMessage::SearchResults { hits },
+                            Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                        }
+                    }
                     Err(error) => MetadataTransportMessage::Reject(error.to_string()),
                 }
             }
@@ -1003,10 +1095,51 @@ impl MetadataHandle {
     }
 }
 
-fn remote_metadata_auth_context(_auth_token: Option<MetadataAuthToken>) -> Option<AuthContext> {
-    // Tokens are intentionally ignored in this slice; private remote reads fail
-    // closed through the existing local authorization path with None.
-    None
+async fn remote_metadata_auth_context<S>(
+    state: &S,
+    auth_token: Option<MetadataAuthToken>,
+) -> Result<Option<AuthContext>, MetadataError>
+where
+    S: ArunaBearerTokenValidationState + ?Sized,
+{
+    let Some(auth_token) = auth_token else {
+        return Ok(None);
+    };
+    let MetadataAuthToken::Bearer(token) = auth_token;
+    validate_aruna_bearer_token(state, token.as_str())
+        .await
+        .map(Some)
+        .map_err(|error| MetadataError::Backend(format!("invalid metadata auth token: {error}")))
+}
+
+async fn load_metadata_auth_state<T>(
+    storage_handle: &StorageHandle,
+    key: &[u8],
+) -> Result<T, MetadataError>
+where
+    T: DeserializeOwned + Default,
+{
+    match storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: API_STATE_KEYSPACE.to_string(),
+            key: ByteView::from(key),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => {
+            postcard::from_bytes(&bytes).map_err(|error| MetadataError::Backend(error.to_string()))
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(T::default()),
+        Event::Storage(StorageEvent::Error { error }) => {
+            Err(MetadataError::Backend(error.to_string()))
+        }
+        other => Err(MetadataError::Backend(format!(
+            "unexpected metadata auth state read result: {other:?}"
+        ))),
+    }
 }
 
 async fn graph_lifecycle_record(
@@ -3747,7 +3880,18 @@ async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::structs::RealmId;
+    use aruna_core::UserId;
+    use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
+    use aruna_core::keyspaces::API_STATE_KEYSPACE;
+    use aruna_core::structs::{RealmId, TokenClaims};
+    use aruna_storage::{FjallStorage, StorageHandle};
+    use byteview::ByteView;
+    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+    use serde::Serialize;
+    use tempfile::{TempDir, tempdir};
 
     #[test]
     fn metadata_handle_options_default_to_buffered_irokle_persist() {
@@ -3766,12 +3910,149 @@ mod tests {
         assert_eq!(options.irokle_persist_policy, FjallPersistPolicy::SyncAll);
     }
 
-    #[test]
-    fn remote_metadata_auth_is_anonymous_until_validator_exists() {
-        assert_eq!(
-            remote_metadata_auth_context(Some(MetadataAuthToken::bearer("token").unwrap())),
-            None
+    #[tokio::test]
+    async fn remote_metadata_auth_validates_token_into_auth_context() {
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+        let (_dir, storage) = auth_storage();
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        let state = MetadataAuthValidationState::new(storage);
+
+        let auth =
+            remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(auth.user_id, user_id);
+        assert_eq!(auth.realm_id, realm_id);
+    }
+
+    #[tokio::test]
+    async fn remote_metadata_auth_rejects_revoked_untrusted_and_invalid_tokens() {
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let token = sign_token(&realm_signing_key, &token_claims(realm_id, user_id));
+
+        let (_revoked_dir, revoked_storage) = auth_storage();
+        persist_auth_state(
+            &revoked_storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        persist_auth_state(
+            &revoked_storage,
+            TOKEN_REVOCATION_LIST_KEY,
+            &HashSet::from([bearer_token_hash(&token)]),
+        )
+        .await;
+        let revoked_state = MetadataAuthValidationState::new(revoked_storage);
+        assert_metadata_auth_rejected(&revoked_state, &token, "Token is revoked").await;
+
+        let (_untrusted_dir, untrusted_storage) = auth_storage();
+        let untrusted_state = MetadataAuthValidationState::new(untrusted_storage);
+        assert_metadata_auth_rejected(&untrusted_state, &token, "Realm is not trusted").await;
+
+        let (_invalid_dir, invalid_storage) = auth_storage();
+        let invalid_state = MetadataAuthValidationState::new(invalid_storage);
+        assert_metadata_auth_rejected(&invalid_state, "not-a-jwt", "invalid metadata auth token")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn remote_metadata_auth_keeps_missing_token_anonymous() {
+        let (_dir, storage) = auth_storage();
+        let state = MetadataAuthValidationState::new(storage);
+
+        assert!(
+            remote_metadata_auth_context(&state, None)
+                .await
+                .unwrap()
+                .is_none()
         );
+    }
+
+    async fn assert_metadata_auth_rejected(
+        state: &MetadataAuthValidationState,
+        token: &str,
+        expected: &str,
+    ) {
+        let error =
+            remote_metadata_auth_context(state, Some(MetadataAuthToken::bearer(token).unwrap()))
+                .await
+                .unwrap_err();
+
+        match error {
+            MetadataError::Backend(message) => assert!(
+                message.contains(expected),
+                "expected {message:?} to contain {expected:?}"
+            ),
+            other => panic!("unexpected metadata auth error: {other:?}"),
+        }
+    }
+
+    fn auth_storage() -> (TempDir, StorageHandle) {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+        (dir, storage)
+    }
+
+    async fn persist_auth_state<T: Serialize>(storage: &StorageHandle, key: &[u8], value: &T) {
+        let bytes = postcard::to_allocvec(value).expect("auth state serializes");
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: API_STATE_KEYSPACE.to_string(),
+                key: ByteView::from(key),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected auth state write result: {other:?}"),
+        }
+    }
+
+    fn realm_fixture() -> (SigningKey, RealmId, UserId) {
+        let signing_key = signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        (signing_key, realm_id, user_id)
+    }
+
+    fn signing_key() -> SigningKey {
+        let mut rng = jsonwebtoken::signature::rand_core::OsRng;
+        SigningKey::generate(&mut rng)
+    }
+
+    fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
+        let now = chrono::Utc::now().timestamp().max(0) as u64;
+        TokenClaims {
+            sub: user_id.to_string(),
+            iss: realm_id.to_string(),
+            iat: now,
+            exp: now + 600,
+            jti: Ulid::new().to_string(),
+            restrictions: None,
+            issuer_pubkey: None,
+            delegation_signature: None,
+        }
+    }
+
+    fn sign_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
+        let key_pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
+        encode(
+            &Header::new(Algorithm::EdDSA),
+            claims,
+            &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
+        )
+        .unwrap()
     }
 
     fn registry_record(document_path: &str) -> MetadataRegistryRecord {
