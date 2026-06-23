@@ -1377,4 +1377,299 @@ mod tests {
         ));
         assert!(should_write_pending_retry_status(None, &older_retry));
     }
+
+    #[tokio::test]
+    async fn finish_does_not_regress_newer_status() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([3u8; 16]);
+        let old_event_id = Ulid::from_parts(3, 1);
+        let newer_event_id = Ulid::from_parts(4, 1);
+        let old_event = create_event(document_id, old_event_id, "old");
+        let old_job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: old_event_id,
+            due_at_ms: 1,
+            attempts: 0,
+        };
+        let newer_status = MetadataMaterializationStatusRecord {
+            document_id,
+            event_id: newer_event_id,
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            state: MetadataMaterializationState::Pending,
+            attempts: 7,
+            last_error: Some("newer pending".to_string()),
+            updated_at_ms: 7,
+        };
+        let (_, old_job_key, _) = metadata_materialization_job_write_entry(&old_job).unwrap();
+        write_entries(
+            &storage,
+            vec![
+                metadata_materialization_status_write_entry(&newer_status).unwrap(),
+                metadata_materialization_job_write_entry(&old_job).unwrap(),
+                metadata_materialization_document_job_write_entry(&old_job).unwrap(),
+            ],
+        )
+        .await;
+
+        finish_completed_materialization_jobs(
+            &storage,
+            vec![CompletedMaterializationJob {
+                job_key: old_job_key.to_vec(),
+                document_job_key: metadata_materialization_document_job_key(
+                    old_job.document_id,
+                    old_job.event_id,
+                )
+                .to_vec(),
+                status: Some(materialization_success_status(&old_job, &old_event)),
+                sync: None,
+            }],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_materialization_status(&storage, document_id, None)
+                .await
+                .unwrap(),
+            Some(newer_status)
+        );
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                key: old_job_key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+                key: metadata_materialization_document_job_key(
+                    old_job.document_id,
+                    old_job.event_id,
+                ),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {}
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_jobs_do_not_force_global_predecessor_scan() {
+        let (storage, receiver) = StorageHandle::new();
+        let document_id = Ulid::from_bytes([11u8; 16]);
+        let event_id = Ulid::from_parts(11, 2);
+        let scripted = thread::spawn(move || {
+            let (effect, response_tx, _span, _enqueued_at) =
+                receiver.recv().expect("status read request");
+            let status_key = match effect {
+                StorageEffect::Read {
+                    key_space,
+                    key,
+                    txn_id: None,
+                } => {
+                    assert_eq!(key_space, METADATA_MATERIALIZATION_STATUS_KEYSPACE);
+                    assert_eq!(key, metadata_materialization_status_key(document_id));
+                    key
+                }
+                other => panic!("unexpected storage effect: {other:?}"),
+            };
+            response_tx.send(StorageEvent::ReadResult {
+                key: status_key,
+                value: None,
+            });
+
+            let (effect, response_tx, _span, _enqueued_at) =
+                receiver.recv().expect("document-local predecessor scan");
+            match effect {
+                StorageEffect::Iter {
+                    key_space,
+                    prefix,
+                    start,
+                    limit,
+                    txn_id: None,
+                } => {
+                    assert_eq!(key_space, METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE);
+                    assert_eq!(
+                        prefix,
+                        Some(metadata_materialization_document_job_prefix(document_id))
+                    );
+                    assert_eq!(start, None);
+                    assert_eq!(limit, MATERIALIZATION_SCAN_PAGE_SIZE);
+                }
+                other => panic!("unexpected storage effect: {other:?}"),
+            }
+            response_tx.send(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            });
+        });
+
+        assert!(
+            !older_materialization_job_exists(&storage, document_id, event_id, &BTreeSet::new())
+                .await
+                .unwrap()
+        );
+        scripted.join().expect("scripted storage actor finished");
+    }
+
+    #[tokio::test]
+    async fn older_queued_job_blocks_later_materialization_until_advanced() {
+        let dir = tempdir().unwrap();
+        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let document_id = Ulid::from_bytes([10u8; 16]);
+        let older_event_id = Ulid::from_parts(10, 1);
+        let newer_event_id = Ulid::from_parts(10, 2);
+        let older_job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: older_event_id,
+            due_at_ms: 30_000,
+            attempts: 1,
+        };
+        let newer_pending = MetadataMaterializationStatusRecord {
+            document_id,
+            event_id: newer_event_id,
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            state: MetadataMaterializationState::Pending,
+            attempts: 0,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        write_entries(
+            &storage,
+            vec![
+                metadata_materialization_status_write_entry(&newer_pending).unwrap(),
+                metadata_materialization_job_write_entry(&older_job).unwrap(),
+                metadata_materialization_document_job_write_entry(&older_job).unwrap(),
+            ],
+        )
+        .await;
+
+        assert!(
+            older_materialization_job_exists(
+                &storage,
+                document_id,
+                newer_event_id,
+                &BTreeSet::new()
+            )
+            .await
+            .unwrap()
+        );
+
+        let mut advanced = BTreeSet::new();
+        advanced.insert(older_event_id);
+        assert!(
+            !older_materialization_job_exists(&storage, document_id, newer_event_id, &advanced)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_reschedule_is_atomic() {
+        let (storage, receiver) = StorageHandle::new();
+        let txn_id = Ulid::from_parts(5, 1);
+        let document_id = Ulid::from_bytes([4u8; 16]);
+        let event_id = Ulid::from_parts(5, 2);
+        let event = create_event(document_id, event_id, "retry");
+        let job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id,
+            due_at_ms: 1,
+            attempts: 0,
+        };
+        let old_job_key = b"old-job".to_vec();
+        let scripted = thread::spawn({
+            let old_job_key = old_job_key.clone();
+            move || {
+                let (effect, response_tx, _span, _enqueued_at) =
+                    receiver.recv().expect("start transaction request");
+                assert_eq!(effect, StorageEffect::StartTransaction { read: false });
+                response_tx.send(StorageEvent::TransactionStarted { txn_id });
+
+                let (effect, response_tx, _span, _enqueued_at) =
+                    receiver.recv().expect("status read request");
+                let status_key = match effect {
+                    StorageEffect::Read {
+                        key_space,
+                        key,
+                        txn_id: Some(read_txn_id),
+                    } => {
+                        assert_eq!(read_txn_id, txn_id);
+                        assert_eq!(key_space, METADATA_MATERIALIZATION_STATUS_KEYSPACE);
+                        key
+                    }
+                    other => panic!("unexpected storage effect: {other:?}"),
+                };
+                response_tx.send(StorageEvent::ReadResult {
+                    key: status_key,
+                    value: None,
+                });
+
+                let (effect, response_tx, _span, _enqueued_at) =
+                    receiver.recv().expect("retry writes request");
+                let write_entries = match effect {
+                    StorageEffect::BatchWrite {
+                        writes,
+                        txn_id: Some(write_txn_id),
+                    } => {
+                        assert_eq!(write_txn_id, txn_id);
+                        assert_eq!(writes.len(), 3);
+                        writes
+                    }
+                    other => panic!("unexpected storage effect: {other:?}"),
+                };
+                assert_eq!(write_entries[0].0, METADATA_MATERIALIZATION_STATUS_KEYSPACE);
+                assert_eq!(write_entries[1].0, METADATA_MATERIALIZATION_JOB_KEYSPACE);
+                assert_eq!(
+                    write_entries[2].0,
+                    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE
+                );
+                response_tx.send(StorageEvent::BatchWriteResult {
+                    entries: write_entries
+                        .iter()
+                        .map(|(key_space, key, _)| (key_space.clone(), key.clone()))
+                        .collect(),
+                });
+
+                let (effect, response_tx, _span, _enqueued_at) =
+                    receiver.recv().expect("old job delete request");
+                let deletes = match effect {
+                    StorageEffect::BatchDelete {
+                        deletes,
+                        txn_id: Some(delete_txn_id),
+                    } => {
+                        assert_eq!(delete_txn_id, txn_id);
+                        deletes
+                    }
+                    other => panic!("unexpected storage effect: {other:?}"),
+                };
+                assert_eq!(
+                    deletes,
+                    vec![(
+                        METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                        ByteView::from(old_job_key)
+                    )]
+                );
+                response_tx.send(StorageEvent::BatchDeleteResult { entries: deletes });
+
+                let (effect, response_tx, _span, _enqueued_at) =
+                    receiver.recv().expect("commit request");
+                assert_eq!(effect, StorageEffect::CommitTransaction { txn_id });
+                response_tx.send(StorageEvent::TransactionCommitted { txn_id });
+            }
+        });
+
+        reschedule_materialization_job(&storage, &old_job_key, &job, &event, "transient".into())
+            .await
+            .unwrap();
+        scripted.join().expect("scripted storage actor finished");
+    }
 }
