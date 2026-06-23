@@ -10,16 +10,21 @@ use aruna_core::document::{
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::IROKLE_APPLIED_OPS_KEYSPACE;
-use aruna_core::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
+use aruna_core::keyspaces::{IROKLE_APPLIED_OPS_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE};
+use aruna_core::metadata::{
+    MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
+    MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
+};
 use aruna_core::storage_entries::{
+    metadata_document_lifecycle_key, metadata_document_lifecycle_write_entry,
     metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
-    metadata_registry_delete_entries, metadata_registry_write_entries, stale_subject_index_deletes,
-    subject_index_writes,
+    metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
+    metadata_registry_write_entries, stale_subject_index_deletes, subject_index_writes,
 };
 use aruna_core::structs::{MetadataRegistryRecord, User};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Value;
+use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::StorageHandle;
 use byteview::ByteView;
 use irokle_crate::Event as _;
@@ -313,6 +318,7 @@ impl IrokleService {
                 applied: result.applied(),
                 targets: result.targets,
                 metadata_create_events: result.metadata_create_events,
+                metadata_graph_tombstones: result.metadata_graph_tombstones,
             },
             Err(error) => IrokleEvent::Error {
                 target: None,
@@ -369,6 +375,7 @@ impl IrokleService {
                 applied: result.applied(),
                 targets: result.targets,
                 metadata_create_events: result.metadata_create_events,
+                metadata_graph_tombstones: result.metadata_graph_tombstones,
             },
             Err(error) => IrokleEvent::Error {
                 target: Some(target),
@@ -460,6 +467,7 @@ impl IrokleService {
                     applied: result.applied(),
                     targets: result.targets,
                     metadata_create_events: result.metadata_create_events,
+                    metadata_graph_tombstones: result.metadata_graph_tombstones,
                 }
             }
             Err(error) => IrokleEvent::Error {
@@ -762,7 +770,6 @@ impl IrokleService {
     }
 
     async fn fan_out_peer_syncs<F, Fut>(
-        &self,
         peers: BTreeSet<PeerId>,
         context: String,
         run: F,
@@ -825,10 +832,10 @@ impl IrokleService {
             per_peer = %per_peer.join(","),
             "Irokle peer fan-out summary"
         );
-        if successes == 0 {
+        if successes != attempted {
             let detail = first_error.unwrap_or_else(|| "unknown sync error".to_string());
             return Err(NetError::Bootstrap(format!(
-                "{context}: all {attempted} peers failed; {detail}"
+                "{context}: only {successes}/{attempted} peers synced; {detail}"
             )));
         }
         Ok(())
@@ -840,7 +847,7 @@ impl IrokleService {
         peers: BTreeSet<PeerId>,
     ) -> Result<()> {
         let net = self.net.clone();
-        self.fan_out_peer_syncs(peers, format!("Irokle topic {topic_id}"), move |peer| {
+        Self::fan_out_peer_syncs(peers, format!("Irokle topic {topic_id}"), move |peer| {
             let net = net.clone();
             async move {
                 match timeout(IROKLE_PEER_SYNC_TIMEOUT, net.sync_peer_now(peer, topic_id)).await {
@@ -877,7 +884,7 @@ impl IrokleService {
         }
         let service = self.clone();
         let topic_ids = topic_ids.to_vec();
-        self.fan_out_peer_syncs(
+        Self::fan_out_peer_syncs(
             peers,
             format!("Irokle topic batch of {} topics", topic_ids.len()),
             move |peer| {
@@ -1066,6 +1073,9 @@ impl IrokleService {
                     "peer {peer} did not return an Irokle summary for topic {topic_id}"
                 ))
             })?;
+        if remote_summary_is_empty(&summary) {
+            return Ok(());
+        }
         if summary.event_type_id.as_deref() != Some(DocumentSyncEvent::TYPE_ID) {
             return Err(NetError::Bootstrap(format!(
                 "peer {peer} advertised Irokle topic {topic_id} with unexpected event type {:?}",
@@ -1162,6 +1172,7 @@ impl IrokleService {
         let mut seen_topics = BTreeSet::new();
         let mut applied_targets = Vec::new();
         let mut metadata_create_events = Vec::new();
+        let mut metadata_graph_tombstones = Vec::new();
         let mut pending_metadata_creates = Vec::new();
         let mut deferred_cursor_writes = Vec::new();
         for topic_id in topic_ids {
@@ -1211,21 +1222,81 @@ impl IrokleService {
                     );
                     continue;
                 }
-                if matches!(
-                    event,
-                    DocumentSyncEvent::Upsert {
+                match event {
+                    event @ DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
+                    } => {
+                        let pending = self.pending_metadata_create_apply(event)?;
+                        pending_metadata_creates.push(pending);
+                        deferred_creates = true;
                     }
-                ) {
-                    let pending = self.pending_metadata_create_apply(event)?;
-                    pending_metadata_creates.push(pending);
-                    deferred_creates = true;
-                    continue;
+                    DocumentSyncEvent::Upsert {
+                        target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+                        bytes,
+                        ..
+                    } => {
+                        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+                        let lifecycle: MetadataDocumentLifecycleRecord =
+                            postcard::from_bytes(&bytes)
+                                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        if lifecycle.document_id() != document_id {
+                            return Err(NetError::Bootstrap(format!(
+                                "replicated metadata document lifecycle target {document_id} does not match payload document {}",
+                                lifecycle.document_id()
+                            )));
+                        }
+                        match lifecycle {
+                            MetadataDocumentLifecycleRecord::Upsert { event: record } => {
+                                let record = *record;
+                                let bytes = postcard::to_allocvec(&record)
+                                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                                pending_metadata_creates.push(PendingMetadataCreateApply {
+                                    target,
+                                    record,
+                                    bytes,
+                                });
+                                deferred_creates = true;
+                            }
+                            MetadataDocumentLifecycleRecord::Delete { event } => {
+                                let tombstone = event.tombstone.clone();
+                                self.apply_metadata_document_delete(event).await?;
+                                if tombstone.is_deleted() {
+                                    metadata_graph_tombstones.push(tombstone);
+                                }
+                                applied_targets.push(target);
+                            }
+                        }
+                    }
+                    DocumentSyncEvent::Upsert {
+                        target: DocumentSyncTarget::MetadataGraphLifecycle { graph_iri },
+                        bytes,
+                        ..
+                    } => {
+                        let target = DocumentSyncTarget::MetadataGraphLifecycle {
+                            graph_iri: graph_iri.clone(),
+                        };
+                        let record: MetadataGraphLifecycleRecord = postcard::from_bytes(&bytes)
+                            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                        if record.graph_iri != graph_iri {
+                            return Err(NetError::Bootstrap(format!(
+                                "replicated metadata graph lifecycle target `{graph_iri}` does not match payload graph `{}`",
+                                record.graph_iri
+                            )));
+                        }
+                        self.apply_metadata_graph_lifecycle(record.clone(), bytes)
+                            .await?;
+                        if record.is_deleted() {
+                            metadata_graph_tombstones.push(record);
+                        }
+                        applied_targets.push(target);
+                    }
+                    event => {
+                        let target = event.target().clone();
+                        self.apply_document_event(event).await?;
+                        applied_targets.push(target);
+                    }
                 }
-                let target = event.target().clone();
-                self.apply_document_event(event).await?;
-                applied_targets.push(target);
             }
             let value = ByteView::from(
                 postcard::to_allocvec(&cursor)
@@ -1252,6 +1323,7 @@ impl IrokleService {
         Ok(DocumentSyncReconcileResult {
             targets: applied_targets,
             metadata_create_events,
+            metadata_graph_tombstones,
         })
     }
 
@@ -1344,16 +1416,27 @@ impl IrokleService {
             return Ok(());
         }
         let mut writes = Vec::with_capacity(pending.len() + cursor_writes.len());
-        for apply in &pending {
+        let mut accepted = Vec::with_capacity(pending.len());
+        for apply in pending {
+            if self.metadata_create_fenced(&apply.record).await? {
+                continue;
+            }
+            let target = DocumentSyncTarget::MetadataCreateEvent {
+                document_id: apply.record.record.document_id,
+                event_id: apply.record.event_id,
+            };
             writes.push((
-                apply.target.storage_keyspace().to_string(),
-                apply.target.storage_key(),
+                target.storage_keyspace().to_string(),
+                target.storage_key(),
                 ByteView::from(apply.bytes.clone()),
             ));
+            accepted.push(apply);
         }
         writes.extend(cursor_writes);
-        self.storage_batch_write(writes).await?;
-        for apply in pending {
+        if !writes.is_empty() {
+            self.storage_batch_write(writes).await?;
+        }
+        for apply in accepted {
             applied_targets.push(apply.target);
             metadata_create_events.push(apply.record);
         }
@@ -1383,6 +1466,9 @@ impl IrokleService {
                     record.record.document_id, record.event_id
                 )));
             }
+            if self.metadata_create_fenced(&record).await? {
+                return Ok(());
+            }
             return self
                 .storage_write(
                     DocumentSyncTarget::MetadataCreateEvent {
@@ -1399,6 +1485,17 @@ impl IrokleService {
                     bytes.into(),
                 )
                 .await;
+        }
+        if let DocumentSyncTarget::MetadataDocumentLifecycle { document_id } = target {
+            let record: MetadataDocumentLifecycleRecord = postcard::from_bytes(&bytes)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+            if record.document_id() != document_id {
+                return Err(NetError::Bootstrap(format!(
+                    "replicated metadata document lifecycle target {document_id} does not match payload document {}",
+                    record.document_id()
+                )));
+            }
+            return self.apply_metadata_document_lifecycle(record).await;
         }
         if let DocumentSyncTarget::MetadataRegistry {
             group_id,
@@ -1492,6 +1589,51 @@ impl IrokleService {
         self.storage_batch_write(entries).await
     }
 
+    async fn apply_metadata_document_lifecycle(
+        &self,
+        record: MetadataDocumentLifecycleRecord,
+    ) -> Result<()> {
+        match record {
+            MetadataDocumentLifecycleRecord::Upsert { event } => {
+                if self.metadata_create_fenced(&event).await? {
+                    return Ok(());
+                }
+                let event = *event;
+                let bytes = postcard::to_allocvec(&event)
+                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                let target = DocumentSyncTarget::MetadataCreateEvent {
+                    document_id: event.record.document_id,
+                    event_id: event.event_id,
+                };
+                self.storage_write(
+                    target.storage_keyspace().to_string(),
+                    target.storage_key(),
+                    bytes.into(),
+                )
+                .await
+            }
+            MetadataDocumentLifecycleRecord::Delete { event } => {
+                self.apply_metadata_document_delete(event).await
+            }
+        }
+    }
+
+    async fn apply_metadata_document_delete(
+        &self,
+        record: MetadataDocumentDeleteRecord,
+    ) -> Result<()> {
+        self.storage_batch_write(metadata_document_delete_write_entries(&record)?)
+            .await?;
+        if record.tombstone.is_deleted() {
+            self.storage_batch_delete(metadata_registry_delete_entries(
+                record.tombstone.group_id,
+                record.tombstone.document_id,
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn apply_metadata_graph_lifecycle(
         &self,
         record: MetadataGraphLifecycleRecord,
@@ -1526,8 +1668,42 @@ impl IrokleService {
         Ok(record.is_deleted())
     }
 
+    async fn metadata_document_delete(
+        &self,
+        document_id: Ulid,
+    ) -> Result<Option<MetadataDocumentDeleteRecord>> {
+        let value = self
+            .storage_read(
+                METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+                metadata_document_lifecycle_key(document_id),
+            )
+            .await?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let record: MetadataDocumentLifecycleRecord =
+            postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        match record {
+            MetadataDocumentLifecycleRecord::Delete { event } => Ok(Some(event)),
+            MetadataDocumentLifecycleRecord::Upsert { .. } => Ok(None),
+        }
+    }
+
+    async fn metadata_create_fenced(&self, event: &MetadataCreateEventRecord) -> Result<bool> {
+        if let Some(delete) = self
+            .metadata_document_delete(event.record.document_id)
+            .await?
+        {
+            return Ok(event.event_id <= delete.deleted_after_event_id);
+        }
+        self.metadata_graph_deleted(&event.record.graph_iri).await
+    }
+
     async fn apply_delete(&self, target: DocumentSyncTarget) -> Result<()> {
         if let DocumentSyncTarget::MetadataGraphLifecycle { .. } = target {
+            return Ok(());
+        }
+        if let DocumentSyncTarget::MetadataDocumentLifecycle { .. } = target {
             return Ok(());
         }
         if let DocumentSyncTarget::MetadataRegistry {
@@ -1645,6 +1821,31 @@ impl IrokleService {
             ))),
         }
     }
+}
+
+fn metadata_document_delete_write_entries(
+    record: &MetadataDocumentDeleteRecord,
+) -> Result<Vec<(String, ByteView, Value)>> {
+    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+        event: record.clone(),
+    };
+    let mut entries = vec![
+        metadata_document_lifecycle_write_entry(&lifecycle)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        metadata_graph_lifecycle_write_entry(&record.tombstone)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    ];
+    if record.tombstone.is_deleted() {
+        let job = MetadataGraphPruneJobRecord::new(
+            record.tombstone.graph_iri.clone(),
+            unix_timestamp_millis(),
+        );
+        entries.push(
+            metadata_graph_prune_job_write_entry(&job)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+    }
+    Ok(entries)
 }
 
 fn node_id_to_peer_id(node_id: &NodeId) -> PeerId {
@@ -1952,18 +2153,17 @@ fn finish_batch_sync(
     failed_topics: &BTreeSet<irokle_crate::TopicId>,
 ) -> Result<()> {
     if !failed_topics.is_empty() {
-        if failed_topics.len() == known_topics.len() {
-            return Err(NetError::Bootstrap(format!(
-                "peer {peer}: all {} Irokle batch topics failed to sync",
-                known_topics.len()
-            )));
-        }
         warn!(
             %peer,
             failed = failed_topics.len(),
             total = known_topics.len(),
-            "Irokle batch sync completed with per-topic failures"
+            "Irokle batch sync failed for one or more topics"
         );
+        return Err(NetError::Bootstrap(format!(
+            "peer {peer}: {}/{} Irokle batch topics failed to sync",
+            failed_topics.len(),
+            known_topics.len()
+        )));
     }
     Ok(())
 }
@@ -1979,8 +2179,143 @@ fn sync_message_topic_id(message: &SyncMessage) -> irokle_crate::TopicId {
     }
 }
 
+fn remote_summary_is_empty(summary: &irokle_crate::sync::SyncSummary) -> bool {
+    summary.event_type_id.is_none() && summary.heads.is_empty()
+}
+
 fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
     let endpoint_id = iroh::EndpointId::from_bytes(peer_id.as_bytes())
         .map_err(|error| NetError::Bootstrap(error.to_string()))?;
     Ok(iroh::EndpointAddr::from(endpoint_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
+    use aruna_core::structs::RealmId;
+    use std::collections::BTreeMap;
+
+    fn peer(seed: u8) -> PeerId {
+        node_id_to_peer_id(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
+    }
+
+    fn topic(seed: u8) -> irokle_crate::TopicId {
+        DocumentSyncTarget::RealmConfig {
+            realm_id: RealmId::from_bytes([seed; 32]),
+        }
+        .irokle_topic_id()
+    }
+
+    fn sync_summary(
+        event_type_id: Option<String>,
+        heads: BTreeSet<irokle_crate::OpId>,
+    ) -> irokle_crate::sync::SyncSummary {
+        irokle_crate::sync::SyncSummary {
+            topic_id: topic(9),
+            event_type_id,
+            fingerprint: [0; 32],
+            heads,
+            actor_clock: irokle_crate::ActorClock::default(),
+            actor_tips: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fan_out_peer_syncs_fails_when_any_peer_failed() {
+        let ok_peer = peer(1);
+        let failed_peer = peer(2);
+        let peers = BTreeSet::from([ok_peer, failed_peer]);
+
+        let error = IrokleService::fan_out_peer_syncs(
+            peers,
+            "test document sync".to_string(),
+            move |peer| async move {
+                if peer == ok_peer {
+                    Ok(())
+                } else {
+                    Err(NetError::Bootstrap("offline peer".to_string()))
+                }
+            },
+        )
+        .await
+        .expect_err("partial peer fan-out must fail");
+
+        let NetError::Bootstrap(message) = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(message.contains("only 1/2 peers synced"));
+        assert!(message.contains("offline peer"));
+    }
+
+    #[test]
+    fn finish_batch_sync_fails_when_any_known_topic_failed() {
+        let known_topics = BTreeSet::from([topic(3), topic(4)]);
+        let failed_topics = BTreeSet::from([topic(4)]);
+
+        let error = finish_batch_sync(peer(5), &known_topics, &failed_topics)
+            .expect_err("partial topic failure must fail the batch");
+
+        let NetError::Bootstrap(message) = error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(message.contains("1/2 Irokle batch topics failed"));
+    }
+
+    #[test]
+    fn finish_batch_sync_succeeds_when_no_topics_failed() {
+        let known_topics = BTreeSet::from([topic(6), topic(7)]);
+        let failed_topics = BTreeSet::new();
+
+        finish_batch_sync(peer(8), &known_topics, &failed_topics)
+            .expect("batch with no failed topics should succeed");
+    }
+
+    #[test]
+    fn remote_summary_is_empty_only_for_untyped_headless_topics() {
+        assert!(remote_summary_is_empty(&sync_summary(
+            None,
+            BTreeSet::new()
+        )));
+        assert!(!remote_summary_is_empty(&sync_summary(
+            Some(DocumentSyncEvent::TYPE_ID.to_string()),
+            BTreeSet::new()
+        )));
+        assert!(!remote_summary_is_empty(&sync_summary(
+            None,
+            BTreeSet::from([irokle_crate::OpId::hash(b"head")])
+        )));
+    }
+
+    #[test]
+    fn metadata_document_delete_write_entries_include_prune_job() {
+        let document_id = Ulid::from_parts(10, 1);
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            "urn:graph:deleted".to_string(),
+            RealmId::from_bytes([1; 32]),
+            Ulid::from_parts(11, 1),
+            document_id,
+            12,
+        );
+        let record = MetadataDocumentDeleteRecord {
+            event_id: Ulid::from_parts(13, 1),
+            tombstone: tombstone.clone(),
+            deleted_after_event_id: Ulid::from_parts(9, 1),
+        };
+
+        let entries = metadata_document_delete_write_entries(&record).expect("entries build");
+
+        let prune_jobs = entries
+            .iter()
+            .filter(|(keyspace, _, _)| keyspace == METADATA_GRAPH_PRUNE_JOB_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataGraphPruneJobRecord>(value.as_ref())
+                    .expect("prune job decodes")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prune_jobs.len(), 1);
+        assert_eq!(prune_jobs[0].graph_iri, tombstone.graph_iri);
+        assert_eq!(prune_jobs[0].attempts, 0);
+        assert!(prune_jobs[0].last_error.is_none());
+    }
 }

@@ -28,8 +28,13 @@ use crate::metadata::materialization_queue::{
     restore_metadata_materialization_timer,
 };
 use crate::metadata::projector::{
-    project_metadata_create_events, project_metadata_create_events_from_log,
-    replay_metadata_event_log,
+    METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
+    project_metadata_create_events_from_log, replay_metadata_event_log,
+};
+use crate::metadata::prune_queue::{
+    METADATA_GRAPH_PRUNE_POLL_AFTER, METADATA_GRAPH_PRUNE_RETRY_AFTER,
+    metadata_graph_prune_jobs_exist, process_metadata_graph_prune_batch,
+    process_metadata_graph_tombstones, restore_metadata_graph_prune_timer,
 };
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::sync_placement::{DOCUMENT_SYNC_RETRY_AFTER, SYNC_PLACEMENT_RETRY_AFTER};
@@ -262,12 +267,26 @@ impl OperationsTaskHandler {
             )))
             .await;
         outcome.sync_elapsed = sync_started.elapsed();
+        self.finish_sync_drain_subbatch(retry_key, subbatch.record_keys, event, outcome)
+            .await
+    }
+
+    async fn finish_sync_drain_subbatch(
+        &self,
+        retry_key: &TaskKey,
+        record_keys: Vec<Vec<u8>>,
+        event: Event,
+        mut outcome: DrainSyncOutcome,
+    ) -> DrainSyncOutcome {
         match event {
             Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled {
                 targets,
                 metadata_create_events,
+                metadata_graph_tombstones,
                 ..
             })) => {
+                process_metadata_graph_tombstones(self.context.as_ref(), metadata_graph_tombstones)
+                    .await;
                 let project_started = Instant::now();
                 let projected = self
                     .project_reconciled_metadata_create_events(
@@ -283,7 +302,7 @@ impl OperationsTaskHandler {
                 }
                 let delete_started = Instant::now();
                 let deleted =
-                    delete_outbox_records(&self.context.storage_handle, subbatch.record_keys).await;
+                    delete_outbox_records(&self.context.storage_handle, record_keys).await;
                 outcome.delete_elapsed = delete_started.elapsed();
                 if let Err(error) = deleted {
                     warn!(key = ?retry_key, error = %error, "Failed to delete document sync outbox records");
@@ -385,12 +404,50 @@ impl OperationsTaskHandler {
         }
     }
 
+    async fn drain_metadata_graph_prune_queue(&self) {
+        match process_metadata_graph_prune_batch(&self.context).await {
+            Ok(result) if result.has_more_due => {
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataGraphPruneQueue,
+                    std::time::Duration::ZERO,
+                )
+                .await;
+            }
+            Ok(_) => match metadata_graph_prune_jobs_exist(&self.context.storage_handle).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataGraphPruneQueue,
+                        METADATA_GRAPH_PRUNE_POLL_AFTER,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    warn!(error = ?error, "Failed to probe metadata graph prune jobs");
+                    self.reschedule_timer(
+                        TaskKey::DrainMetadataGraphPruneQueue,
+                        METADATA_GRAPH_PRUNE_RETRY_AFTER,
+                    )
+                    .await;
+                }
+            },
+            Err(error) => {
+                warn!(error = ?error, "Failed to drain metadata graph prune queue");
+                self.reschedule_timer(
+                    TaskKey::DrainMetadataGraphPruneQueue,
+                    METADATA_GRAPH_PRUNE_RETRY_AFTER,
+                )
+                .await;
+            }
+        }
+    }
+
     async fn drain_metadata_projection_queue(&self) {
         if let Err(error) = replay_metadata_event_log(&self.context).await {
             warn!(error = ?error, "Failed to drain metadata projection queue");
             self.reschedule_timer(
                 TaskKey::DrainMetadataProjectionQueue,
-                METADATA_MATERIALIZATION_RETRY_AFTER,
+                METADATA_PROJECTION_RETRY_AFTER,
             )
             .await;
         }
@@ -406,6 +463,7 @@ pub async fn initialize_task_incoming(context: Arc<DriverContext>, task_handle: 
     restore_persisted_task_timers(&context.storage_handle, &task_handle).await;
     restore_document_sync_outbox_timers(&context.storage_handle, &task_handle).await;
     restore_metadata_materialization_timer(&context.storage_handle, &task_handle).await;
+    restore_metadata_graph_prune_timer(&context.storage_handle, &task_handle).await;
 }
 
 #[async_trait]
@@ -468,8 +526,14 @@ impl InboundTaskHandler for OperationsTaskHandler {
                     Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled {
                         targets,
                         metadata_create_events,
+                        metadata_graph_tombstones,
                         ..
                     })) => {
+                        process_metadata_graph_tombstones(
+                            self.context.as_ref(),
+                            metadata_graph_tombstones,
+                        )
+                        .await;
                         if self
                             .project_reconciled_metadata_create_events(
                                 &retry_key,
@@ -510,6 +574,152 @@ impl InboundTaskHandler for OperationsTaskHandler {
             TaskKey::DrainMetadataMaterializationQueue => {
                 self.drain_metadata_materialization_queue().await;
             }
+            TaskKey::DrainMetadataGraphPruneQueue => {
+                self.drain_metadata_graph_prune_queue().await;
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document_sync_outbox::{outbox_key, read_outbox_record, write_outbox_effect};
+    use aruna_core::document::DocumentSyncOutboxEvent;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
+    use aruna_core::metadata::{MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord};
+    use aruna_core::structs::RealmId;
+    use aruna_storage::FjallStorage;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    fn node(seed: u8) -> aruna_core::NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&bytes).public()
+    }
+
+    fn target() -> DocumentSyncTarget {
+        DocumentSyncTarget::Group {
+            group_id: Ulid::from_parts(7, 1),
+        }
+    }
+
+    async fn read_graph_prune_jobs(
+        storage: &aruna_storage::StorageHandle,
+    ) -> Vec<MetadataGraphPruneJobRecord> {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 16,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| postcard::from_bytes(&value).expect("prune job decodes"))
+                .collect(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn outbox_sync_error_retains_record_for_retry() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context);
+        let record = crate::document_sync_outbox::new_outbox_record(
+            node(1),
+            target(),
+            vec![node(2)],
+            DocumentSyncOutboxEvent::Upsert {
+                bytes: b"retained work".to_vec(),
+            },
+        );
+        let key = outbox_key(&record).to_vec();
+
+        match storage
+            .send_effect(write_outbox_effect(&record).expect("outbox effect"))
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected outbox write event: {other:?}"),
+        }
+
+        let outcome = handler
+            .finish_sync_drain_subbatch(
+                &TaskKey::DrainDocumentSyncOutbox,
+                vec![key.clone()],
+                Event::Net(NetEvent::Irokle(IrokleEvent::Error {
+                    target: Some(record.target.clone()),
+                    error: "only 1/2 peers synced".to_string(),
+                })),
+                DrainSyncOutcome::default(),
+            )
+            .await;
+
+        assert!(outcome.retry_needed);
+        let retained = read_outbox_record(&storage, &key)
+            .await
+            .expect("outbox record reads");
+        assert_eq!(retained, Some(record));
+    }
+
+    #[tokio::test]
+    async fn tombstones_are_processed_before_projection_retry_return() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = Arc::new(DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        });
+        let handler = OperationsTaskHandler::new(context);
+        let document_id = Ulid::from_parts(17, 1);
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            "urn:graph:tombstone-before-retry".to_string(),
+            RealmId::from_bytes([3; 32]),
+            Ulid::from_parts(18, 1),
+            document_id,
+            19,
+        );
+
+        let outcome = handler
+            .finish_sync_drain_subbatch(
+                &TaskKey::DrainDocumentSyncOutbox,
+                Vec::new(),
+                Event::Net(NetEvent::Irokle(IrokleEvent::DocumentsReconciled {
+                    applied: 1,
+                    targets: vec![DocumentSyncTarget::MetadataCreateEvent {
+                        document_id,
+                        event_id: Ulid::from_parts(20, 1),
+                    }],
+                    metadata_create_events: Vec::new(),
+                    metadata_graph_tombstones: vec![tombstone.clone()],
+                })),
+                DrainSyncOutcome::default(),
+            )
+            .await;
+
+        assert!(outcome.retry_needed);
+        let jobs = read_graph_prune_jobs(&storage).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].graph_iri, tombstone.graph_iri);
     }
 }

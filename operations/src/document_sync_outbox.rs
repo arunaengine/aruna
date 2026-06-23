@@ -40,12 +40,22 @@ pub fn outbox_key(record: &DocumentSyncOutboxRecord) -> Key {
 pub fn new_outbox_record(
     node_id: NodeId,
     target: DocumentSyncTarget,
+    peers: Vec<NodeId>,
+    event: DocumentSyncOutboxEvent,
+) -> DocumentSyncOutboxRecord {
+    new_outbox_record_with_id(Ulid::new(), node_id, target, peers, event)
+}
+
+pub fn new_outbox_record_with_id(
+    outbox_id: Ulid,
+    node_id: NodeId,
+    target: DocumentSyncTarget,
     mut peers: Vec<NodeId>,
     event: DocumentSyncOutboxEvent,
 ) -> DocumentSyncOutboxRecord {
     crate::sync_placement::sort_node_ids(&mut peers);
     DocumentSyncOutboxRecord {
-        outbox_id: Ulid::new(),
+        outbox_id,
         node_id,
         target,
         peers,
