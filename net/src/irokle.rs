@@ -25,7 +25,7 @@ use aruna_core::structs::{MetadataRegistryRecord, User};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Value;
 use aruna_core::util::unix_timestamp_millis;
-use aruna_storage::StorageHandle;
+use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
 use irokle_crate::Event as _;
 use irokle_crate::Storage as _;
@@ -66,6 +66,7 @@ pub struct IrokleService {
     node: irokle_crate::Irokle<irokle_crate::FjallStorage>,
     net: Arc<irokle_crate::net::IrohNet<irokle_crate::FjallStorage>>,
     db: fjall::OptimisticTxDatabase,
+    persist_policy: FjallPersistPolicy,
     storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
     storage_path: PathBuf,
@@ -89,6 +90,26 @@ impl IrokleService {
         alpns: Vec<Vec<u8>>,
         runtime: irokle_crate::net::IrohRuntimeConfig,
     ) -> Result<Self> {
+        Self::open_with_persist_policy(
+            endpoint,
+            storage,
+            storage_path,
+            peer_nodes,
+            alpns,
+            runtime,
+            FjallPersistPolicy::default(),
+        )
+    }
+
+    pub fn open_with_persist_policy(
+        endpoint: iroh::Endpoint,
+        storage: StorageHandle,
+        storage_path: impl AsRef<Path>,
+        peer_nodes: &[NodeId],
+        alpns: Vec<Vec<u8>>,
+        runtime: irokle_crate::net::IrohRuntimeConfig,
+        persist_policy: FjallPersistPolicy,
+    ) -> Result<Self> {
         let storage_path = storage_path.as_ref().to_path_buf();
         let default_peers: BTreeSet<PeerId> = peer_nodes.iter().map(node_id_to_peer_id).collect();
         let db = fjall::OptimisticTxDatabase::builder(&storage_path)
@@ -98,7 +119,7 @@ impl IrokleService {
         let node = irokle_crate::Irokle::builder()
             .with_iroh_secret_key(endpoint.secret_key())
             .with_peer_whitelist(default_peers.clone())
-            .with_fjall_database_and_persist_mode(db.clone(), fjall::PersistMode::Buffer)
+            .with_fjall_database_and_persist_mode(db.clone(), persist_policy.as_fjall())
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
             .build()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -118,6 +139,7 @@ impl IrokleService {
             node,
             net,
             db,
+            persist_policy,
             storage,
             default_peers: Arc::new(RwLock::new(default_peers)),
             storage_path,
@@ -669,7 +691,7 @@ impl IrokleService {
 
     fn flush_database(&self) -> Result<()> {
         self.db
-            .persist(fjall::PersistMode::Buffer)
+            .persist(self.persist_policy.as_fjall())
             .map_err(|error| NetError::Bootstrap(error.to_string()))
     }
 
