@@ -219,7 +219,10 @@ pub struct User {
 
 #[cfg(test)]
 mod tests {
-    use super::oidc_subject_key;
+    use super::{AuthContext, PathRestriction, Permission, TokenClaims, oidc_subject_key};
+    use crate::UserId;
+    use crate::structs::RealmId;
+    use ulid::Ulid;
 
     #[test]
     fn oidc_subject_key_uses_structured_encoding() {
@@ -235,6 +238,32 @@ mod tests {
         let second = oidc_subject_key("a", "b:c");
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn auth_context_conversion_preserves_path_restrictions() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let user_id = UserId::new(Ulid::from_bytes([9u8; 16]), realm_id);
+        let restrictions = vec![PathRestriction {
+            pattern: "/realm/g/group/data/**".to_string(),
+            permission: Permission::READ,
+        }];
+
+        let auth = AuthContext::try_from(TokenClaims {
+            sub: user_id.to_string(),
+            iss: realm_id.to_base64(),
+            iat: 1,
+            exp: 2,
+            jti: "token-id".to_string(),
+            restrictions: Some(restrictions.clone()),
+            issuer_pubkey: None,
+            delegation_signature: None,
+        })
+        .unwrap();
+
+        assert_eq!(auth.user_id, user_id);
+        assert_eq!(auth.realm_id, realm_id);
+        assert_eq!(auth.path_restrictions, Some(restrictions));
     }
 }
 

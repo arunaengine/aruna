@@ -1,8 +1,7 @@
 use crate::error::CliError;
 use aruna::config::PersistedNodeState;
-use aruna_api::server_state::{
-    INITIAL_REALM_ADMIN_CLAIMED_KEY, TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY,
-};
+use aruna_api::server_state::INITIAL_REALM_ADMIN_CLAIMED_KEY;
+use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
 use aruna_core::document::{DocumentSyncTarget, PendingTopicPlacement};
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{

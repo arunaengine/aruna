@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod alpn;
+pub mod auth;
 pub mod document;
 pub mod effects;
 pub mod errors;

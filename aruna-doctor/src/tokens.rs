@@ -2,9 +2,8 @@ use crate::error::CliError;
 use aruna::config::load;
 use aruna_api::error::TokenError;
 use aruna_api::routes::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
-use aruna_api::server_state::{
-    TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, load_persisted_state,
-};
+use aruna_api::server_state::load_persisted_state;
+use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::structs::{OidcProviderConfig, RealmId, TokenClaims};
 use aruna_operations::driver::DriverContext;
 use aruna_storage::storage;
@@ -261,7 +260,7 @@ pub enum Valid {
 }
 
 pub async fn view_token(token: String) -> Result<String, CliError> {
-    let hash = blake3::hash(token.as_bytes()).to_string();
+    let hash = bearer_token_hash(&token);
     let unvalidated_claims = insecure_decode::<TokenClaims>(&token)?;
 
     let (config, _) = load().await.unwrap();

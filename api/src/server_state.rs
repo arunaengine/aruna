@@ -2,6 +2,7 @@ use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::{OidcError, TokenError};
 use crate::openapi::ApiDoc;
 use aruna_core::NodeId;
+use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::document::DocumentSyncTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
@@ -34,8 +35,6 @@ use tokio::sync::RwLock;
 use tracing::warn;
 use utoipa_swagger_ui::SwaggerUi;
 
-pub const TOKEN_REVOCATION_LIST_KEY: &[u8] = b"token_revocation_list";
-pub const TRUSTED_REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
 pub const INITIAL_REALM_ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
 pub const INITIAL_LOCAL_ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 const ONBOARDING_SYNC_TICKET_TTL_SECS: u64 = 300;
@@ -318,7 +317,7 @@ impl ServerState {
     }
 
     pub async fn add_token_to_blacklist(&self, token: &str) {
-        let hash = blake3::hash(token.as_bytes()).to_string();
+        let hash = bearer_token_hash(token);
         self.token_revocation_list.write().await.insert(hash);
         self.persist_token_revocation_list().await;
     }
@@ -328,7 +327,7 @@ impl ServerState {
     }
 
     pub async fn is_token_blacklisted(&self, token: &str) -> bool {
-        let hash = blake3::hash(token.as_bytes()).to_string();
+        let hash = bearer_token_hash(token);
         self.token_revocation_list.read().await.get(&hash).is_some()
     }
 
