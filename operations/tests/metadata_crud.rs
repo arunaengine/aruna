@@ -1,10 +1,19 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::METADATA_EVENT_LOG_KEYSPACE;
-use aruna_core::metadata::{MetadataCreateEventPayload, MetadataCreateEventRecord};
-use aruna_core::storage_entries::{metadata_create_event_write_entry, metadata_event_log_prefix};
+use aruna_core::keyspaces::{
+    DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
+};
+use aruna_core::metadata::{
+    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataGraphLifecycleRecord,
+};
+use aruna_core::storage_entries::{
+    metadata_create_event_write_entry, metadata_document_key, metadata_event_log_prefix,
+    metadata_graph_lifecycle_write_entry, metadata_registry_key, metadata_registry_write_entries,
+};
 use aruna_core::structs::{Actor, MetadataRegistryRecord, RealmId};
 use aruna_net::{NetConfig, NetHandle};
 use aruna_operations::create_metadata_document::{
@@ -19,8 +28,10 @@ use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
 use aruna_operations::metadata::MetadataHandle;
 use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
 use aruna_operations::metadata::projector::{
-    project_metadata_create_event_from_log, replay_metadata_event_log,
+    project_metadata_create_event_from_log, project_metadata_create_events,
+    replay_metadata_event_log, schedule_metadata_projection_retry,
 };
+use aruna_operations::task_incoming::initialize_task_incoming;
 use aruna_operations::update_metadata_document::{
     UpdateMetadataDocumentConfig, UpdateMetadataDocumentMutation, UpdateMetadataDocumentOperation,
 };
@@ -148,6 +159,9 @@ async fn metadata_crud_roundtrip_uses_craqle_backend() -> Result<(), Box<dyn std
     )
     .await?;
     assert!(updated.public);
+
+    let materialized = process_metadata_materialization_batch(test.context.as_ref()).await?;
+    assert_eq!(materialized.processed, 1);
 
     let fetched_after_update = drive(
         GetMetadataDocumentOperation::new(group_id, document_id),
@@ -316,6 +330,83 @@ async fn metadata_event_log_replay_repairs_wal_only_create()
 }
 
 #[tokio::test]
+async fn scheduled_projection_queue_recovers_event_log_only_create()
+-> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let (record, create_event) = build_create_event(
+        &test,
+        group_id,
+        document_id,
+        "datasets/scheduled-recovery",
+        "Scheduled Recovery Dataset",
+    );
+    write_create_event(&test, &create_event).await?;
+
+    let before_recovery = drive(
+        ListMetadataDocumentsOperation::new(group_id),
+        test.context.as_ref(),
+    )
+    .await?;
+    assert!(before_recovery.is_empty());
+
+    schedule_metadata_projection_retry(test.context.as_ref(), Duration::ZERO).await?;
+    initialize_task_incoming(test.context.clone(), TaskHandle::new()).await;
+
+    wait_for_projected_record(&test, group_id, &record).await?;
+    let materialized = process_metadata_materialization_batch(test.context.as_ref()).await?;
+    assert_eq!(materialized.processed, 1);
+
+    let fetched = drive(
+        GetMetadataDocumentOperation::new(group_id, document_id),
+        test.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(fetched.record, record);
+    assert!(fetched.jsonld.contains("Scheduled Recovery Dataset"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn projection_queue_replay_is_idempotent_for_already_projected_create()
+-> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let (record, create_event) = build_create_event(
+        &test,
+        group_id,
+        document_id,
+        "datasets/idempotent-replay",
+        "Idempotent Replay Dataset",
+    );
+    write_create_event(&test, &create_event).await?;
+
+    let projected = replay_metadata_event_log(test.context.as_ref()).await?;
+    assert_eq!(projected, 1);
+    assert_eq!(
+        iter_keyspace_count(&test, METADATA_MATERIALIZATION_JOB_KEYSPACE).await?,
+        1
+    );
+
+    let replayed_again = replay_metadata_event_log(test.context.as_ref()).await?;
+    assert_eq!(replayed_again, 0);
+    assert_eq!(
+        iter_keyspace_count(&test, METADATA_MATERIALIZATION_JOB_KEYSPACE).await?,
+        1
+    );
+
+    let listed = drive(
+        ListMetadataDocumentsOperation::new(group_id),
+        test.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(listed, vec![record]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_event_log_targeted_projection_repairs_only_requested_create()
 -> Result<(), Box<dyn std::error::Error>> {
     let test = build_context().await?;
@@ -371,6 +462,110 @@ async fn metadata_event_log_targeted_projection_repairs_only_requested_create()
         net_handle.shutdown().await;
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_event_log_replay_does_not_resurrect_deleted_document()
+-> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let (record, create_event) = build_create_event(
+        &test,
+        group_id,
+        document_id,
+        "datasets/deleted-replay",
+        "Deleted Replay Dataset",
+    );
+    write_create_event(&test, &create_event).await?;
+    write_tombstone(&test, &record).await?;
+
+    let replayed = replay_metadata_event_log(test.context.as_ref()).await?;
+
+    assert_eq!(replayed, 0);
+    assert_projection_absent(&test, &record).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn projector_skips_stale_create_when_graph_tombstone_exists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let (record, create_event) = build_create_event(
+        &test,
+        group_id,
+        document_id,
+        "datasets/deleted-direct",
+        "Deleted Direct Dataset",
+    );
+    write_tombstone(&test, &record).await?;
+
+    let projected = project_metadata_create_events(
+        test.context.as_ref(),
+        vec![create_event],
+        Some(test.actor.node_id),
+    )
+    .await?;
+
+    assert_eq!(projected, 0);
+    assert_projection_absent(&test, &record).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn projector_deletes_stale_registry_when_tombstone_fence_wins()
+-> Result<(), Box<dyn std::error::Error>> {
+    let test = build_context_without_net().await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let (record, create_event) = build_create_event(
+        &test,
+        group_id,
+        document_id,
+        "datasets/deleted-repair",
+        "Deleted Repair Dataset",
+    );
+    write_registry_rows(&test, &record).await?;
+    let warm =
+        aruna_operations::metadata::visible_registry::list_visible_registry_records_for_group(
+            test.context.as_ref(),
+            group_id,
+        )
+        .await?;
+    assert_eq!(warm.as_ref(), &vec![record.clone()]);
+    let metadata_handle = test
+        .context
+        .metadata_handle
+        .as_ref()
+        .expect("metadata handle installed");
+    metadata_handle.cache_accepted_create(record.clone());
+    metadata_handle.upsert_visible_registry_records(std::slice::from_ref(&record));
+    write_tombstone(&test, &record).await?;
+
+    let projected = project_metadata_create_events(
+        test.context.as_ref(),
+        vec![create_event],
+        Some(test.actor.node_id),
+    )
+    .await?;
+
+    assert_eq!(projected, 0);
+    assert_projection_absent(&test, &record).await?;
+    assert!(
+        metadata_handle
+            .cached_accepted_create(document_id)
+            .is_none()
+    );
+    let visible =
+        aruna_operations::metadata::visible_registry::list_visible_registry_records_for_group(
+            test.context.as_ref(),
+            group_id,
+        )
+        .await?;
+    assert!(visible.is_empty());
     Ok(())
 }
 
@@ -436,6 +631,165 @@ async fn write_create_event(
         Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
         other => Err(format!("unexpected create event write result: {other:?}").into()),
     }
+}
+
+async fn write_tombstone(
+    test: &TestContext,
+    record: &MetadataRegistryRecord,
+) -> Result<MetadataGraphLifecycleRecord, Box<dyn std::error::Error>> {
+    let lifecycle = MetadataGraphLifecycleRecord::deleted(
+        record.graph_iri.clone(),
+        record.realm_id,
+        record.group_id,
+        record.document_id,
+        record.updated_at_ms.saturating_add(1),
+    );
+    let (key_space, key, value) = metadata_graph_lifecycle_write_entry(&lifecycle)?;
+    match test
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(lifecycle),
+        other => Err(format!("unexpected lifecycle write result: {other:?}").into()),
+    }
+}
+
+async fn write_registry_rows(
+    test: &TestContext,
+    record: &MetadataRegistryRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match test
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes: metadata_registry_write_entries(record)?,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        other => Err(format!("unexpected registry batch write result: {other:?}").into()),
+    }
+}
+
+async fn assert_projection_absent(
+    test: &TestContext,
+    record: &MetadataRegistryRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(
+        read_storage_value(
+            test,
+            METADATA_INDEX_KEYSPACE,
+            metadata_registry_key(record.group_id, record.document_id),
+        )
+        .await?
+        .is_none()
+    );
+    assert!(
+        read_storage_value(
+            test,
+            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            metadata_document_key(record.document_id),
+        )
+        .await?
+        .is_none()
+    );
+    assert!(
+        read_storage_value(
+            test,
+            METADATA_HOLDERS_KEYSPACE,
+            metadata_registry_key(record.group_id, record.document_id),
+        )
+        .await?
+        .is_none()
+    );
+    assert_eq!(
+        iter_keyspace_count(test, DOCUMENT_SYNC_OUTBOX_KEYSPACE).await?,
+        0
+    );
+    assert_eq!(
+        iter_keyspace_count(test, METADATA_MATERIALIZATION_JOB_KEYSPACE).await?,
+        0
+    );
+    let fetched = drive(
+        GetMetadataDocumentOperation::new(record.group_id, record.document_id),
+        test.context.as_ref(),
+    )
+    .await;
+    assert!(matches!(
+        fetched,
+        Err(GetMetadataDocumentError::DocumentNotFound)
+    ));
+    Ok(())
+}
+
+async fn read_storage_value(
+    test: &TestContext,
+    key_space: &str,
+    key: aruna_core::types::Key,
+) -> Result<Option<aruna_core::types::Value>, Box<dyn std::error::Error>> {
+    match test
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected storage read result: {other:?}").into()),
+    }
+}
+
+async fn iter_keyspace_count(
+    test: &TestContext,
+    key_space: &str,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    match test
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 10,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => Ok(values.len()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected storage iter result: {other:?}").into()),
+    }
+}
+
+async fn wait_for_projected_record(
+    test: &TestContext,
+    group_id: Ulid,
+    expected: &MetadataRegistryRecord,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..200 {
+        let listed = drive(
+            ListMetadataDocumentsOperation::new(group_id),
+            test.context.as_ref(),
+        )
+        .await?;
+        if listed == vec![expected.clone()] {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Err("timed out waiting for metadata projection".into())
 }
 
 async fn read_create_events(
