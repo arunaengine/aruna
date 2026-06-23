@@ -83,6 +83,41 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
 const MAX_GROUP_COMMIT: usize = 256;
 const READ_POOL_THREADS: usize = 4;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FjallPersistPolicy {
+    #[default]
+    Buffer,
+    SyncAll,
+}
+
+impl FjallPersistPolicy {
+    pub fn as_fjall(self) -> PersistMode {
+        match self {
+            Self::Buffer => PersistMode::Buffer,
+            Self::SyncAll => PersistMode::SyncAll,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Buffer => "buffer",
+            Self::SyncAll => "sync_all",
+        }
+    }
+}
+
+impl std::str::FromStr for FjallPersistPolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "buffer" | "buffered" => Ok(Self::Buffer),
+            "sync_all" | "sync-all" | "syncall" | "sync" => Ok(Self::SyncAll),
+            other => Err(format!("unsupported fjall persist policy `{other}`")),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Store {
     db: OptimisticTxDatabase,
@@ -125,6 +160,7 @@ impl Store {
 
 pub struct FjallStorage {
     store: Store,
+    persist_policy: FjallPersistPolicy,
     txns: HashMap<Ulid, Txn>,
     read_pool: Vec<EffectSender>,
     next_reader: usize,
@@ -395,6 +431,18 @@ impl Handle for StorageHandle {
 impl FjallStorage {
     #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]
     pub fn open(path: &str) -> Result<StorageHandle, StorageLibError> {
+        Self::open_with_persist_policy(path, FjallPersistPolicy::default())
+    }
+
+    #[tracing::instrument(
+        name = "storage.open",
+        level = "debug",
+        fields(path = %path, persist_policy = policy.label())
+    )]
+    pub fn open_with_persist_policy(
+        path: &str,
+        policy: FjallPersistPolicy,
+    ) -> Result<StorageHandle, StorageLibError> {
         let db = OptimisticTxDatabase::builder(path)
             .manual_journal_persist(true)
             .open()?;
@@ -406,6 +454,7 @@ impl FjallStorage {
         thread::spawn(move || {
             let mut storage = FjallStorage {
                 store,
+                persist_policy: policy,
                 txns: HashMap::new(),
                 read_pool,
                 next_reader: 0,
@@ -778,7 +827,7 @@ impl FjallStorage {
         let persist_started = Instant::now();
         self.store
             .db
-            .persist(PersistMode::Buffer)
+            .persist(self.persist_policy.as_fjall())
             .map_err(|error| StorageError::PersistError(error.to_string()))?;
         Span::current().record("persist_ms", duration_ms(persist_started.elapsed()));
         Ok(())
@@ -788,7 +837,7 @@ impl FjallStorage {
         self.store
             .db
             .write_tx()
-            .map(|tx| tx.durability(Some(PersistMode::Buffer)))
+            .map(|tx| tx.durability(Some(self.persist_policy.as_fjall())))
             .map_err(|_| StorageError::WriteError)
     }
 
@@ -825,7 +874,7 @@ impl FjallStorage {
         } else {
             match self.store.db.write_tx() {
                 Ok(txn) => {
-                    let txn = txn.durability(Some(PersistMode::Buffer));
+                    let txn = txn.durability(Some(self.persist_policy.as_fjall()));
                     Txn::Write(Box::new(txn))
                 }
                 Err(_e) => {
@@ -1778,7 +1827,7 @@ fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageEr
 
 #[cfg(test)]
 mod tests {
-    use super::{FjallStorage, StorageHandle};
+    use super::{FjallPersistPolicy, FjallStorage, StorageHandle};
     use aruna_core::effects::{Effect, IterStart, StorageEffect};
     use aruna_core::errors::StorageError;
     use aruna_core::events::{Event, StorageEvent};
@@ -1833,6 +1882,55 @@ mod tests {
             }
             other => panic!("unexpected storage event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn persist_policy_defaults_to_buffer() {
+        assert_eq!(FjallPersistPolicy::default(), FjallPersistPolicy::Buffer);
+        assert_eq!(FjallPersistPolicy::default().label(), "buffer");
+    }
+
+    #[test]
+    fn persist_policy_accepts_sync_all_aliases() {
+        for value in ["sync_all", "sync-all", "syncall", "sync", "SYNC_ALL"] {
+            assert_eq!(
+                value.parse::<FjallPersistPolicy>().unwrap(),
+                FjallPersistPolicy::SyncAll
+            );
+        }
+        for value in ["buffer", "buffered", "BUFFER"] {
+            assert_eq!(
+                value.parse::<FjallPersistPolicy>().unwrap(),
+                FjallPersistPolicy::Buffer
+            );
+        }
+    }
+
+    #[test]
+    fn persist_policy_rejects_invalid_values() {
+        assert!("always".parse::<FjallPersistPolicy>().is_err());
+    }
+
+    #[tokio::test]
+    async fn open_with_persist_policy_accepts_sync_all() {
+        let dir = tempdir().expect("temp dir");
+        let handle = FjallStorage::open_with_persist_policy(
+            dir.path().to_str().expect("utf-8 path"),
+            FjallPersistPolicy::SyncAll,
+        )
+        .expect("storage opens");
+
+        assert_write_result(
+            handle
+                .send_effect(Effect::Storage(StorageEffect::Write {
+                    key_space: "persist_policy".to_string(),
+                    key: b"key".to_vec().into(),
+                    value: b"value".to_vec().into(),
+                    txn_id: None,
+                }))
+                .await,
+            b"key",
+        );
     }
 
     async fn start_write_transaction(handle: &StorageHandle) -> Ulid {
