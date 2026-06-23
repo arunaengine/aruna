@@ -595,3 +595,239 @@ async fn transactional_batch_delete_no_txn(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::storage_entries::{
+        metadata_graph_lifecycle_write_entry, metadata_registry_write_entries,
+    };
+    use aruna_core::structs::MetadataRegistryRecord;
+    use aruna_core::structs::RealmId;
+    use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
+    use tempfile::tempdir;
+
+    use crate::metadata::MetadataHandle;
+
+    fn lifecycle(graph_iri: &str) -> MetadataGraphLifecycleRecord {
+        MetadataGraphLifecycleRecord::deleted(
+            graph_iri.to_string(),
+            RealmId::from_bytes([7u8; 32]),
+            Ulid::from_parts(7, 1),
+            Ulid::from_parts(7, 2),
+            1,
+        )
+    }
+
+    fn registry_record(group_id: Ulid, path: &str) -> MetadataRegistryRecord {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let document_id = Ulid::new();
+        MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: path.to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                path,
+                document_id,
+            ),
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_event_id: Ulid::nil(),
+        }
+    }
+
+    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    async fn read_jobs(storage: &StorageHandle) -> Vec<MetadataGraphPruneJobRecord> {
+        match storage
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 16,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values
+                .into_iter()
+                .map(|(_, value)| postcard::from_bytes(&value).expect("job decodes"))
+                .collect(),
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn document_lifecycle_tombstone_processing_enqueues_prune_and_hides_stale_registry_cache()
+    {
+        let dir = tempdir().expect("temp dir");
+        let metadata_dir = tempdir().expect("metadata dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
+        let metadata_handle = MetadataHandle::new(
+            metadata_dir.path(),
+            node_id,
+            storage.clone(),
+            None,
+            None,
+            None,
+        )
+        .expect("metadata handle opens");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: Some(metadata_handle.clone()),
+            task_handle: Some(TaskHandle::new()),
+        };
+        let record = registry_record(Ulid::from_parts(8, 1), "docs/tombstoned");
+        write_entries(
+            &storage,
+            metadata_registry_write_entries(&record).expect("registry entries"),
+        )
+        .await;
+        crate::metadata::visible_registry::invalidate_visible_registry(&context);
+        let stale = crate::metadata::visible_registry::list_visible_registry_records_for_group(
+            &context,
+            record.group_id,
+        )
+        .await
+        .expect("visible registry fills");
+        assert_eq!(stale.as_ref(), &vec![record.clone()]);
+        metadata_handle.cache_accepted_create(record.clone());
+
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+        write_entries(
+            &storage,
+            vec![metadata_graph_lifecycle_write_entry(&tombstone).expect("lifecycle entry")],
+        )
+        .await;
+
+        let processed = process_metadata_graph_tombstones(&context, vec![tombstone.clone()]).await;
+
+        assert_eq!(processed.enqueued, 1);
+        assert!(
+            metadata_handle
+                .cached_accepted_create(record.document_id)
+                .is_none()
+        );
+        let listed = crate::metadata::visible_registry::list_visible_registry_records_for_group(
+            &context,
+            record.group_id,
+        )
+        .await
+        .expect("visible registry reads");
+        assert!(listed.is_empty());
+        let jobs = read_jobs(&storage).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].graph_iri, record.graph_iri);
+    }
+
+    #[tokio::test]
+    async fn job_is_dropped_when_lifecycle_is_not_deleted() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let job = new_graph_prune_job("urn:graph:not-deleted".to_string(), 1);
+        write_entries(
+            &storage,
+            vec![metadata_graph_prune_job_write_entry(&job).expect("job entry")],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let result = process_metadata_graph_prune_batch(&context)
+            .await
+            .expect("queue drains");
+
+        assert_eq!(result.processed, 0);
+        assert!(read_jobs(&storage).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_metadata_handle_reschedules_job_with_backoff() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+        let graph_iri = "urn:graph:deleted";
+        let job = new_graph_prune_job(graph_iri.to_string(), 1);
+        write_entries(
+            &storage,
+            vec![
+                metadata_graph_lifecycle_write_entry(&lifecycle(graph_iri))
+                    .expect("lifecycle entry"),
+                metadata_graph_prune_job_write_entry(&job).expect("job entry"),
+            ],
+        )
+        .await;
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: None,
+        };
+
+        let result = process_metadata_graph_prune_batch(&context)
+            .await
+            .expect("queue reschedules");
+
+        assert_eq!(result.processed, 1);
+        let jobs = read_jobs(&storage).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].graph_iri, graph_iri);
+        assert_eq!(jobs[0].attempts, 1);
+        assert_eq!(
+            jobs[0].last_error.as_deref(),
+            Some("metadata handle missing")
+        );
+        assert!(jobs[0].due_at_ms > job.due_at_ms);
+    }
+
+    #[tokio::test]
+    async fn metadata_graph_prune_jobs_exist_reflects_queue_state() {
+        let dir = tempdir().expect("temp dir");
+        let storage =
+            FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage opens");
+
+        assert!(!metadata_graph_prune_jobs_exist(&storage).await.unwrap());
+        let job = new_graph_prune_job("urn:graph:queued".to_string(), 1);
+        write_entries(
+            &storage,
+            vec![metadata_graph_prune_job_write_entry(&job).expect("job entry")],
+        )
+        .await;
+
+        assert!(metadata_graph_prune_jobs_exist(&storage).await.unwrap());
+    }
+}
