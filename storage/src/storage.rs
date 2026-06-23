@@ -1809,6 +1809,19 @@ mod tests {
         }
     }
 
+    fn assert_batch_delete_result(event: Event, expected: &[(&str, &[u8])]) {
+        match event {
+            Event::Storage(StorageEvent::BatchDeleteResult { entries }) => {
+                let actual = entries
+                    .iter()
+                    .map(|(key_space, key)| (key_space.as_str(), key.as_ref()))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected);
+            }
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
     fn assert_read_result(event: Event, expected_key: &[u8], expected_value: &[u8]) {
         match event {
             Event::Storage(StorageEvent::ReadResult {
@@ -1828,6 +1841,30 @@ mod tests {
             .await
         {
             Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    async fn commit_transaction(handle: &StorageHandle, txn_id: Ulid) {
+        match handle
+            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }) => {
+                assert_eq!(committed, txn_id);
+            }
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    async fn abort_transaction(handle: &StorageHandle, txn_id: Ulid) {
+        match handle
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionAborted { txn_id: aborted }) => {
+                assert_eq!(aborted, txn_id);
+            }
             other => panic!("unexpected storage event: {other:?}"),
         }
     }
@@ -1995,6 +2032,157 @@ mod tests {
                 })
                 .await,
             &[(b"key", None)],
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_write_and_batch_delete_commit_atomically() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        assert_write_result(
+            handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: "batch_write_delete_commit".to_string(),
+                    key: b"delete".to_vec().into(),
+                    value: b"old".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"delete",
+        );
+
+        let txn_id = start_write_transaction(&handle).await;
+        assert_batch_write_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes: vec![(
+                        "batch_write_delete_commit".to_string(),
+                        b"write".to_vec().into(),
+                        b"new".to_vec().into(),
+                    )],
+                    txn_id: Some(txn_id),
+                })
+                .await,
+            &[("batch_write_delete_commit", b"write")],
+        );
+        assert_batch_delete_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchDelete {
+                    deletes: vec![(
+                        "batch_write_delete_commit".to_string(),
+                        b"delete".to_vec().into(),
+                    )],
+                    txn_id: Some(txn_id),
+                })
+                .await,
+            &[("batch_write_delete_commit", b"delete")],
+        );
+
+        assert_batch_read_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchRead {
+                    reads: vec![
+                        (
+                            "batch_write_delete_commit".to_string(),
+                            b"write".to_vec().into(),
+                        ),
+                        (
+                            "batch_write_delete_commit".to_string(),
+                            b"delete".to_vec().into(),
+                        ),
+                    ],
+                    txn_id: None,
+                })
+                .await,
+            &[(b"write", None), (b"delete", Some(b"old"))],
+        );
+
+        commit_transaction(&handle, txn_id).await;
+
+        assert_batch_read_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchRead {
+                    reads: vec![
+                        (
+                            "batch_write_delete_commit".to_string(),
+                            b"write".to_vec().into(),
+                        ),
+                        (
+                            "batch_write_delete_commit".to_string(),
+                            b"delete".to_vec().into(),
+                        ),
+                    ],
+                    txn_id: None,
+                })
+                .await,
+            &[(b"write", Some(b"new")), (b"delete", None)],
+        );
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_write_and_batch_delete_abort_discards_all_changes() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        assert_write_result(
+            handle
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: "batch_write_delete_abort".to_string(),
+                    key: b"delete".to_vec().into(),
+                    value: b"old".to_vec().into(),
+                    txn_id: None,
+                })
+                .await,
+            b"delete",
+        );
+
+        let txn_id = start_write_transaction(&handle).await;
+        assert_batch_write_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchWrite {
+                    writes: vec![(
+                        "batch_write_delete_abort".to_string(),
+                        b"write".to_vec().into(),
+                        b"new".to_vec().into(),
+                    )],
+                    txn_id: Some(txn_id),
+                })
+                .await,
+            &[("batch_write_delete_abort", b"write")],
+        );
+        assert_batch_delete_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchDelete {
+                    deletes: vec![(
+                        "batch_write_delete_abort".to_string(),
+                        b"delete".to_vec().into(),
+                    )],
+                    txn_id: Some(txn_id),
+                })
+                .await,
+            &[("batch_write_delete_abort", b"delete")],
+        );
+
+        abort_transaction(&handle, txn_id).await;
+
+        assert_batch_read_result(
+            handle
+                .send_storage_effect(StorageEffect::BatchRead {
+                    reads: vec![
+                        (
+                            "batch_write_delete_abort".to_string(),
+                            b"write".to_vec().into(),
+                        ),
+                        (
+                            "batch_write_delete_abort".to_string(),
+                            b"delete".to_vec().into(),
+                        ),
+                    ],
+                    txn_id: None,
+                })
+                .await,
+            &[(b"write", None), (b"delete", Some(b"old"))],
         );
     }
 

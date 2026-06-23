@@ -3,13 +3,15 @@ use ulid::Ulid;
 
 use crate::errors::ConversionError;
 use crate::keyspaces::{
-    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
-    METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
-    METADATA_MATERIALIZATION_JOB_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
-    USER_SUBJECT_INDEX_KEYSPACE,
+    METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+    METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
+    METADATA_MATERIALIZATION_STATUS_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE,
 };
 use crate::metadata::{
-    MetadataCreateEventRecord, MetadataGraphLifecycleRecord, MetadataMaterializationJobRecord,
+    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
+    MetadataGraphPruneJobRecord, MetadataMaterializationJobRecord,
     MetadataMaterializationStatusRecord,
 };
 use crate::structs::{MetadataRegistryRecord, User};
@@ -79,6 +81,10 @@ pub fn metadata_graph_lifecycle_key(graph_iri: &str) -> Key {
     ByteView::from(blake3::hash(graph_iri.as_bytes()).as_bytes().to_vec())
 }
 
+pub fn metadata_document_lifecycle_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
 pub fn metadata_event_log_prefix(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
@@ -94,11 +100,29 @@ pub fn metadata_materialization_status_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
+pub fn metadata_materialization_document_job_prefix(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn metadata_materialization_document_job_key(document_id: Ulid, event_id: Ulid) -> Key {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(&event_id.to_bytes());
+    ByteView::from(bytes)
+}
+
 pub fn metadata_materialization_job_key(record: &MetadataMaterializationJobRecord) -> Key {
     let mut bytes = Vec::with_capacity(40);
     bytes.extend_from_slice(&record.due_at_ms.to_be_bytes());
     bytes.extend_from_slice(&record.document_id.to_bytes());
     bytes.extend_from_slice(&record.event_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn metadata_graph_prune_job_key(record: &MetadataGraphPruneJobRecord) -> Key {
+    let mut bytes = Vec::with_capacity(40);
+    bytes.extend_from_slice(&record.due_at_ms.to_be_bytes());
+    bytes.extend_from_slice(blake3::hash(record.graph_iri.as_bytes()).as_bytes());
     ByteView::from(bytes)
 }
 
@@ -122,6 +146,16 @@ pub fn metadata_graph_lifecycle_write_entry(
     ))
 }
 
+pub fn metadata_document_lifecycle_write_entry(
+    record: &MetadataDocumentLifecycleRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+        metadata_document_lifecycle_key(record.document_id()),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
 pub fn metadata_materialization_status_write_entry(
     record: &MetadataMaterializationStatusRecord,
 ) -> Result<(KeySpace, Key, Value), ConversionError> {
@@ -138,6 +172,26 @@ pub fn metadata_materialization_job_write_entry(
     Ok((
         METADATA_MATERIALIZATION_JOB_KEYSPACE.to_string(),
         metadata_materialization_job_key(record),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn metadata_materialization_document_job_write_entry(
+    record: &MetadataMaterializationJobRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE.to_string(),
+        metadata_materialization_document_job_key(record.document_id, record.event_id),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn metadata_graph_prune_job_write_entry(
+    record: &MetadataGraphPruneJobRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+        metadata_graph_prune_job_key(record),
         postcard::to_allocvec(record)?.into(),
     ))
 }

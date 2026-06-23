@@ -3,11 +3,14 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::keyspaces::{
-    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
-    METADATA_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
+    AUTH_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, USER_KEYSPACE,
 };
-use crate::metadata::MetadataCreateEventRecord;
-use crate::storage_entries::{metadata_event_log_key, metadata_graph_lifecycle_key};
+use crate::metadata::{MetadataCreateEventRecord, MetadataGraphLifecycleRecord};
+use crate::storage_entries::{
+    metadata_document_lifecycle_key, metadata_event_log_key, metadata_graph_lifecycle_key,
+};
 use crate::structs::RealmId;
 use crate::types::{GroupId, Key, UserId};
 use crate::{NodeId, TopicId};
@@ -37,6 +40,9 @@ pub enum DocumentSyncTarget {
         document_id: Ulid,
         event_id: Ulid,
     },
+    MetadataDocumentLifecycle {
+        document_id: Ulid,
+    },
     MetadataGraphLifecycle {
         graph_iri: String,
     },
@@ -49,6 +55,7 @@ pub struct PendingTopicPlacement {
     pub desired_peer_count: usize,
     pub selected_peers: Vec<NodeId>,
     pub updated_at: u64,
+    pub authoritative_node_id: NodeId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,6 +91,7 @@ pub enum DocumentSyncPublish {
 pub struct DocumentSyncReconcileResult {
     pub targets: Vec<DocumentSyncTarget>,
     pub metadata_create_events: Vec<MetadataCreateEventRecord>,
+    pub metadata_graph_tombstones: Vec<MetadataGraphLifecycleRecord>,
 }
 
 impl DocumentSyncReconcileResult {
@@ -120,7 +128,8 @@ impl DocumentSyncTarget {
             }
             Self::User { user_id } => TopicId::users(user_id.realm_id),
             Self::MetadataRegistry { document_id, .. }
-            | Self::MetadataCreateEvent { document_id, .. } => TopicId::metadata(*document_id),
+            | Self::MetadataCreateEvent { document_id, .. }
+            | Self::MetadataDocumentLifecycle { document_id } => TopicId::metadata(*document_id),
             Self::MetadataGraphLifecycle { graph_iri } => {
                 TopicId::metadata(metadata_graph_lifecycle_topic_id(graph_iri))
             }
@@ -135,6 +144,7 @@ impl DocumentSyncTarget {
             Self::User { .. } => USER_KEYSPACE,
             Self::MetadataRegistry { .. } => METADATA_INDEX_KEYSPACE,
             Self::MetadataCreateEvent { .. } => METADATA_EVENT_LOG_KEYSPACE,
+            Self::MetadataDocumentLifecycle { .. } => METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
             Self::MetadataGraphLifecycle { .. } => METADATA_GRAPH_LIFECYCLE_KEYSPACE,
         }
     }
@@ -161,6 +171,9 @@ impl DocumentSyncTarget {
                 document_id,
                 event_id,
             } => metadata_event_log_key(*document_id, *event_id),
+            Self::MetadataDocumentLifecycle { document_id } => {
+                metadata_document_lifecycle_key(*document_id)
+            }
             Self::MetadataGraphLifecycle { graph_iri } => metadata_graph_lifecycle_key(graph_iri),
         }
     }
@@ -183,6 +196,10 @@ impl DocumentSyncTarget {
             }
             Self::MetadataCreateEvent { document_id, .. } => {
                 bytes.extend_from_slice(b"/metadata-create-event/");
+                bytes.extend_from_slice(&document_id.to_bytes());
+            }
+            Self::MetadataDocumentLifecycle { document_id } => {
+                bytes.extend_from_slice(b"/metadata-document-lifecycle/");
                 bytes.extend_from_slice(&document_id.to_bytes());
             }
             Self::MetadataGraphLifecycle { graph_iri } => {
@@ -271,9 +288,42 @@ pub enum IrokleEvent {
         applied: usize,
         targets: Vec<DocumentSyncTarget>,
         metadata_create_events: Vec<MetadataCreateEventRecord>,
+        metadata_graph_tombstones: Vec<MetadataGraphLifecycleRecord>,
     },
     Error {
         target: Option<DocumentSyncTarget>,
         error: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DocumentSyncTarget;
+    use ulid::Ulid;
+
+    #[test]
+    fn metadata_document_lifecycle_target_is_document_scoped() {
+        let document_id = Ulid::new();
+        let lifecycle = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let create = DocumentSyncTarget::MetadataCreateEvent {
+            document_id,
+            event_id: Ulid::new(),
+        };
+
+        assert_eq!(lifecycle.topic_id(), create.topic_id());
+        assert_eq!(lifecycle.storage_key().as_ref(), document_id.to_bytes());
+    }
+
+    #[test]
+    fn metadata_document_lifecycle_topic_is_shared_by_upsert_and_delete() {
+        let document_id = Ulid::new();
+        let upsert_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let delete_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+
+        assert_eq!(upsert_target.topic_id(), delete_target.topic_id());
+        assert_eq!(
+            upsert_target.irokle_topic_id(),
+            delete_target.irokle_topic_id()
+        );
+    }
 }

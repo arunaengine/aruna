@@ -514,10 +514,14 @@ impl Serialize for JsonPendingTopicPlacement {
     where
         S: Serializer,
     {
-        let mut state = serializer.serialize_struct("PendingTopicPlacement", 7)?;
+        let mut state = serializer.serialize_struct("PendingTopicPlacement", 8)?;
         state.serialize_field("realm_id", &self.0.realm_id.to_string())?;
         state.serialize_field("target", &json_document_sync_target(&self.0.target))?;
         state.serialize_field("topic_id", &placement_topic_id(&self.0))?;
+        state.serialize_field(
+            "authoritative_node_id",
+            &self.0.authoritative_node_id.to_string(),
+        )?;
         state.serialize_field("desired_peer_count", &self.0.desired_peer_count)?;
         state.serialize_field(
             "selected_peers",
@@ -539,9 +543,13 @@ fn placement_topic_id(placement: &PendingTopicPlacement) -> String {
 }
 
 fn placement_missing_peer_count(placement: &PendingTopicPlacement) -> usize {
+    let mut selected_peers = placement.selected_peers.clone();
+    selected_peers.retain(|node_id| *node_id != placement.authoritative_node_id);
+    selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    selected_peers.dedup();
     placement
         .desired_peer_count
-        .saturating_sub(placement.selected_peers.len())
+        .saturating_sub(selected_peers.len().saturating_add(1))
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -569,6 +577,9 @@ enum JsonDocumentSyncTarget {
     MetadataCreateEvent {
         document_id: String,
         event_id: String,
+    },
+    MetadataDocumentLifecycle {
+        document_id: String,
     },
     MetadataGraphLifecycle {
         graph_iri: String,
@@ -610,6 +621,11 @@ fn json_document_sync_target(target: &DocumentSyncTarget) -> JsonDocumentSyncTar
             document_id: document_id.to_string(),
             event_id: event_id.to_string(),
         },
+        DocumentSyncTarget::MetadataDocumentLifecycle { document_id } => {
+            JsonDocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: document_id.to_string(),
+            }
+        }
         DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => {
             JsonDocumentSyncTarget::MetadataGraphLifecycle {
                 graph_iri: graph_iri.clone(),
@@ -1768,9 +1784,11 @@ mod tests {
         };
         let realm_id = RealmId::from_bytes([4_u8; 32]);
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
+        let authoritative_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
         let placement = aruna_operations::sync_placement::new_placement(
             realm_id,
             target.clone(),
+            authoritative_node_id,
             3,
             vec![selected_peer],
         );
@@ -1788,9 +1806,10 @@ mod tests {
             DecodedValue::PendingTopicPlacement { data } => {
                 assert_eq!(data.0.realm_id, realm_id);
                 assert_eq!(data.0.target, target);
+                assert_eq!(data.0.authoritative_node_id, authoritative_node_id);
                 assert_eq!(data.0.desired_peer_count, 3);
                 assert_eq!(data.0.selected_peers, vec![selected_peer]);
-                assert_eq!(placement_missing_peer_count(&data.0), 2);
+                assert_eq!(placement_missing_peer_count(&data.0), 1);
             }
             other => panic!("expected pending topic placement, got {other:?}"),
         }

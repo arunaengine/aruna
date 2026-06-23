@@ -6,7 +6,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::NodeId;
-use crate::structs::{AuthContext, MetadataRegistryRecord, RealmId};
+use crate::structs::{AuthContext, MetadataAuditOperation, MetadataRegistryRecord, RealmId};
 use crate::types::{GroupId, UserId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +55,45 @@ pub enum MetadataCreateEventPayload {
     RoCrate {
         jsonld: String,
     },
+    ReplaceRoCrate {
+        jsonld: String,
+    },
+    UpsertDataEntity {
+        jsonld: String,
+    },
+    UpsertContextualEntity {
+        jsonld: String,
+    },
+}
+
+impl MetadataCreateEventPayload {
+    pub fn audit_operation(&self) -> MetadataAuditOperation {
+        match self {
+            Self::Scaffold { .. } | Self::RoCrate { .. } => MetadataAuditOperation::Create,
+            Self::ReplaceRoCrate { .. } => MetadataAuditOperation::ReplaceRoCrate,
+            Self::UpsertDataEntity { .. } => MetadataAuditOperation::UpsertDataEntity,
+            Self::UpsertContextualEntity { .. } => MetadataAuditOperation::UpsertContextualEntity,
+        }
+    }
+
+    pub fn requires_existing_graph(&self) -> bool {
+        matches!(
+            self,
+            Self::ReplaceRoCrate { .. }
+                | Self::UpsertDataEntity { .. }
+                | Self::UpsertContextualEntity { .. }
+        )
+    }
+
+    pub fn materialization_kind(&self) -> &'static str {
+        match self {
+            Self::Scaffold { .. } => "scaffold",
+            Self::RoCrate { .. } => "rocrate",
+            Self::ReplaceRoCrate { .. } => "replace_rocrate",
+            Self::UpsertDataEntity { .. } => "upsert_data_entity",
+            Self::UpsertContextualEntity { .. } => "upsert_contextual_entity",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +104,39 @@ pub struct MetadataCreateEventRecord {
     pub node_id: NodeId,
     pub payload: MetadataCreateEventPayload,
     pub occurred_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetadataDocumentLifecycleRecord {
+    Upsert {
+        event: Box<MetadataCreateEventRecord>,
+    },
+    Delete {
+        event: MetadataDocumentDeleteRecord,
+    },
+}
+
+impl MetadataDocumentLifecycleRecord {
+    pub fn document_id(&self) -> Ulid {
+        match self {
+            Self::Upsert { event } => event.record.document_id,
+            Self::Delete { event } => event.tombstone.document_id,
+        }
+    }
+
+    pub fn event_id(&self) -> Ulid {
+        match self {
+            Self::Upsert { event } => event.event_id,
+            Self::Delete { event } => event.event_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataDocumentDeleteRecord {
+    pub event_id: Ulid,
+    pub tombstone: MetadataGraphLifecycleRecord,
+    pub deleted_after_event_id: Ulid,
 }
 
 /// CRDT actor used when materializing `event_id` into the local graph store,
@@ -128,6 +200,25 @@ impl MetadataMaterializationJobRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataGraphPruneJobRecord {
+    pub graph_iri: String,
+    pub due_at_ms: u64,
+    pub attempts: u32,
+    pub last_error: Option<String>,
+}
+
+impl MetadataGraphPruneJobRecord {
+    pub fn new(graph_iri: String, due_at_ms: u64) -> Self {
+        Self {
+            graph_iri,
+            due_at_ms,
+            attempts: 0,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataApplyRoCrateRequest {
     pub graph_iri: String,
     pub jsonld: String,
@@ -142,6 +233,10 @@ pub struct MetadataApplyRoCrateRequest {
 pub struct MetadataUpsertEntityRequest {
     pub graph_iri: String,
     pub jsonld: String,
+    #[serde(default)]
+    pub durability: MetadataRequestDurability,
+    #[serde(default)]
+    pub deterministic_actor: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -430,9 +525,16 @@ pub enum MetadataError {
 
 #[cfg(test)]
 mod tests {
-    use super::{MetadataClockRelation, compare_metadata_clocks};
+    use super::{
+        MetadataClockRelation, MetadataCreateEventPayload, MetadataCreateEventRecord,
+        MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
+        MetadataGraphLifecycleRecord, compare_metadata_clocks,
+    };
+    use crate::structs::{MetadataRegistryRecord, RealmId};
+    use crate::{NodeId, UserId};
     use craqle::{ActorId, VectorClock};
     use std::collections::BTreeMap;
+    use ulid::Ulid;
 
     #[test]
     fn compares_metadata_vector_clocks() {
@@ -457,5 +559,100 @@ mod tests {
             compare_metadata_clocks(&local, &concurrent),
             MetadataClockRelation::Concurrent
         );
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn create_event(document_id: Ulid, event_id: Ulid) -> MetadataCreateEventRecord {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let group_id = Ulid::new();
+        let document_path = "datasets/lifecycle";
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: document_path.to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                document_path,
+                document_id,
+            ),
+            holder_node_ids: vec![node(1)],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_event_id: event_id,
+        };
+        MetadataCreateEventRecord {
+            event_id,
+            record,
+            user_id: UserId::local(Ulid::new(), realm_id),
+            node_id: node(1),
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: "Lifecycle".to_string(),
+                description: "Lifecycle envelope".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+            occurred_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn metadata_document_lifecycle_upsert_wraps_create_event() {
+        let document_id = Ulid::new();
+        let event_id = Ulid::new();
+        let create = create_event(document_id, event_id);
+
+        let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(create.clone()),
+        };
+
+        assert_eq!(lifecycle.document_id(), document_id);
+        assert_eq!(lifecycle.event_id(), event_id);
+        assert_eq!(
+            postcard::from_bytes::<MetadataDocumentLifecycleRecord>(
+                &postcard::to_allocvec(&lifecycle).expect("lifecycle serializes")
+            )
+            .expect("lifecycle decodes"),
+            lifecycle
+        );
+    }
+
+    #[test]
+    fn metadata_document_lifecycle_delete_carries_tombstone_and_fence() {
+        let document_id = Ulid::new();
+        let event_id = Ulid::new();
+        let deleted_after_event_id = Ulid::new();
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        let group_id = Ulid::new();
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            graph_iri.clone(),
+            realm_id,
+            group_id,
+            document_id,
+            2,
+        );
+
+        let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+            event: MetadataDocumentDeleteRecord {
+                event_id,
+                tombstone: tombstone.clone(),
+                deleted_after_event_id,
+            },
+        };
+
+        assert_eq!(lifecycle.document_id(), document_id);
+        assert_eq!(lifecycle.event_id(), event_id);
+        let MetadataDocumentLifecycleRecord::Delete { event } = lifecycle else {
+            panic!("expected delete lifecycle record");
+        };
+        assert_eq!(event.tombstone, tombstone);
+        assert_eq!(event.deleted_after_event_id, deleted_after_event_id);
     }
 }

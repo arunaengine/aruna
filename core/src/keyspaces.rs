@@ -7,9 +7,13 @@ pub const METADATA_DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const METADATA_HOLDERS_KEYSPACE: &str = "metadata_holders";
 pub const METADATA_AUDIT_KEYSPACE: &str = "metadata_audit";
 pub const METADATA_EVENT_LOG_KEYSPACE: &str = "metadata_event_log";
+pub const METADATA_DOCUMENT_LIFECYCLE_KEYSPACE: &str = "metadata_document_lifecycle";
 pub const METADATA_GRAPH_LIFECYCLE_KEYSPACE: &str = "metadata_graph_lifecycle";
+pub const METADATA_GRAPH_PRUNE_JOB_KEYSPACE: &str = "metadata_graph_prune_jobs";
 pub const METADATA_MATERIALIZATION_STATUS_KEYSPACE: &str = "metadata_materialization_status";
 pub const METADATA_MATERIALIZATION_JOB_KEYSPACE: &str = "metadata_materialization_jobs";
+pub const METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE: &str =
+    "metadata_materialization_document_jobs";
 pub const IROKLE_APPLIED_OPS_KEYSPACE: &str = "irokle_applied_ops";
 pub const DOCUMENT_SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
 pub const SYNC_PLACEMENT_KEYSPACE: &str = "sync_placements";
