@@ -6,6 +6,7 @@ pub mod add_user_to_group;
 pub mod add_user_to_realm_role;
 pub mod announce;
 pub mod announce_realm_presence;
+pub mod auth;
 pub mod blob;
 pub mod check_permissions;
 pub mod claim_initial_realm_admin;
