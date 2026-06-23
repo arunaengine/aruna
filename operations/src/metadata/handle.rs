@@ -3580,6 +3580,7 @@ async fn resolve_graph_visibility_scope(
     auth_context: Option<AuthContext>,
     records: Arc<Vec<MetadataRegistryRecord>>,
 ) -> Result<GraphVisibilityScope, MetadataError> {
+    refresh_lifecycle_visibility_for_records(inner, &records).await?;
     let auth_realm = auth_context.as_ref().map(|auth| auth.realm_id);
     let mut readable_groups = HashSet::new();
     if let Some(auth_context) = auth_context {
@@ -3617,6 +3618,22 @@ async fn resolve_graph_visibility_scope(
         auth_realm,
         readable_groups,
     })
+}
+
+async fn refresh_lifecycle_visibility_for_records(
+    inner: &Arc<MetadataInner>,
+    records: &[MetadataRegistryRecord],
+) -> Result<(), MetadataError> {
+    let (deleted_graphs, _) = list_deleted_graph_iris(inner).await?;
+    inner
+        .visibility_cache
+        .refresh_lifecycle_deleted(records.iter().map(|record| {
+            (
+                record.graph_iri.clone(),
+                deleted_graphs.contains(&record.graph_iri),
+            )
+        }));
+    Ok(())
 }
 
 #[tracing::instrument(
