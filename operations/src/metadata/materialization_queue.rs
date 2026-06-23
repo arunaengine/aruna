@@ -1150,3 +1150,231 @@ async fn write_materialization_status_and_job(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::NodeId;
+    use aruna_core::structs::{MetadataRegistryRecord, RealmId};
+    use aruna_storage::{FjallStorage, StorageHandle};
+    use std::collections::BTreeSet;
+    use std::thread;
+    use tempfile::tempdir;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn create_event(document_id: Ulid, event_id: Ulid, name: &str) -> MetadataCreateEventRecord {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let group_id = Ulid::from_parts(7, 1);
+        let document_path = format!("datasets/{name}");
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: document_path.clone(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                &document_path,
+                document_id,
+            ),
+            holder_node_ids: vec![node(1)],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_event_id: event_id,
+        };
+        MetadataCreateEventRecord {
+            event_id,
+            record,
+            user_id: aruna_core::UserId::local(Ulid::from_parts(7, 2), realm_id),
+            node_id: node(1),
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: name.to_string(),
+                description: "Materialization test".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+            occurred_at_ms: 1,
+        }
+    }
+
+    fn with_payload(
+        mut event: MetadataCreateEventRecord,
+        payload: MetadataCreateEventPayload,
+    ) -> MetadataCreateEventRecord {
+        event.payload = payload;
+        event
+    }
+
+    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
+        match storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn graph_materialization_effect_uses_event_id_actor_and_wal_durability() {
+        let document_id = Ulid::from_bytes([1u8; 16]);
+        let event_id = Ulid::from_parts(1, 1);
+        let event = create_event(document_id, event_id, "deterministic");
+        let deterministic_actor = Some(deterministic_materialization_actor(event_id));
+
+        match graph_materialization_effect(&event) {
+            Effect::Metadata(MetadataEffect::CreateCrate { request }) => {
+                assert_eq!(
+                    request.durability,
+                    MetadataRequestDurability::WalAlreadyDurable
+                );
+                assert_eq!(request.deterministic_actor, deterministic_actor);
+            }
+            other => panic!("unexpected materialization effect: {other:?}"),
+        }
+
+        let rocrate = with_payload(
+            event.clone(),
+            MetadataCreateEventPayload::RoCrate {
+                jsonld: "{}".to_string(),
+            },
+        );
+        match graph_materialization_effect(&rocrate) {
+            Effect::Metadata(MetadataEffect::ApplyRoCrate { request }) => {
+                assert_eq!(
+                    request.durability,
+                    MetadataRequestDurability::WalAlreadyDurable
+                );
+                assert_eq!(request.deterministic_actor, deterministic_actor);
+            }
+            other => panic!("unexpected materialization effect: {other:?}"),
+        }
+
+        let data = with_payload(
+            event.clone(),
+            MetadataCreateEventPayload::UpsertDataEntity {
+                jsonld: r#"{"@id":"./file.txt","@type":"File","name":"file"}"#.to_string(),
+            },
+        );
+        match graph_materialization_effect(&data) {
+            Effect::Metadata(MetadataEffect::UpsertDataEntity { request }) => {
+                assert_eq!(
+                    request.durability,
+                    MetadataRequestDurability::WalAlreadyDurable
+                );
+                assert_eq!(request.deterministic_actor, deterministic_actor);
+            }
+            other => panic!("unexpected materialization effect: {other:?}"),
+        }
+
+        let contextual = with_payload(
+            event,
+            MetadataCreateEventPayload::UpsertContextualEntity {
+                jsonld: r##"{"@id":"#lab","@type":"Organization","name":"lab"}"##.to_string(),
+            },
+        );
+        match graph_materialization_effect(&contextual) {
+            Effect::Metadata(MetadataEffect::UpsertContextualEntity { request }) => {
+                assert_eq!(
+                    request.durability,
+                    MetadataRequestDurability::WalAlreadyDurable
+                );
+                assert_eq!(request.deterministic_actor, deterministic_actor);
+            }
+            other => panic!("unexpected materialization effect: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_same_materialization_event_is_graph_idempotent() {
+        let document_id = Ulid::from_bytes([2u8; 16]);
+        let event_id = Ulid::from_parts(2, 1);
+        let event = create_event(document_id, event_id, "replay");
+        let data = with_payload(
+            event.clone(),
+            MetadataCreateEventPayload::UpsertDataEntity {
+                jsonld: r#"{"@id":"./file.txt","@type":"File","name":"file"}"#.to_string(),
+            },
+        );
+
+        for event in [event, data] {
+            assert_eq!(
+                graph_materialization_effect(&event),
+                graph_materialization_effect(&event)
+            );
+        }
+    }
+
+    #[test]
+    fn newer_pending_status_does_not_obsolete_older_job() {
+        let document_id = Ulid::from_bytes([8u8; 16]);
+        let older_event_id = Ulid::from_parts(8, 1);
+        let newer_event_id = Ulid::from_parts(8, 2);
+        let older_job = MetadataMaterializationJobRecord {
+            document_id,
+            event_id: older_event_id,
+            due_at_ms: 1,
+            attempts: 0,
+        };
+        let newer_pending = MetadataMaterializationStatusRecord {
+            document_id,
+            event_id: newer_event_id,
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            state: MetadataMaterializationState::Pending,
+            attempts: 0,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        let newer_final = MetadataMaterializationStatusRecord {
+            state: MetadataMaterializationState::Materialized,
+            ..newer_pending.clone()
+        };
+
+        assert!(!materialization_status_obsoletes_job(
+            &newer_pending,
+            &older_job
+        ));
+        assert!(materialization_status_obsoletes_job(
+            &newer_final,
+            &older_job
+        ));
+    }
+
+    #[test]
+    fn older_retry_status_does_not_regress_newer_pending_status() {
+        let document_id = Ulid::from_bytes([9u8; 16]);
+        let older_event_id = Ulid::from_parts(9, 1);
+        let newer_event_id = Ulid::from_parts(9, 2);
+        let older_retry = MetadataMaterializationStatusRecord {
+            document_id,
+            event_id: older_event_id,
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            state: MetadataMaterializationState::Pending,
+            attempts: 1,
+            last_error: Some("transient".to_string()),
+            updated_at_ms: 1,
+        };
+        let newer_pending = MetadataMaterializationStatusRecord {
+            document_id,
+            event_id: newer_event_id,
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            state: MetadataMaterializationState::Pending,
+            attempts: 0,
+            last_error: None,
+            updated_at_ms: 2,
+        };
+
+        assert!(!should_write_pending_retry_status(
+            Some(&newer_pending),
+            &older_retry
+        ));
+        assert!(should_write_pending_retry_status(None, &older_retry));
+    }
+}
