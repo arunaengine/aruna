@@ -603,6 +603,7 @@ async fn spawn_joiner_node_with_mode(
             max_concurrent_bidi_streams: config.max_concurrent_bidi_streams,
             irokle_storage_path: Some(config.irokle_storage_path.clone()),
             irokle_runtime: Some(config.irokle_runtime),
+            fjall_persist_policy: config.fjall_persist_policy,
         },
         storage_handle.clone(),
     )

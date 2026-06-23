@@ -30,7 +30,7 @@ use aruna_core::structs::{
     realm_endpoint_announcement_signing_bytes,
 };
 use aruna_core::util::unix_timestamp_secs;
-use aruna_storage::StorageHandle;
+use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
 use crossfire::TrySendError;
 use iroh::address_lookup::memory::MemoryLookup;
@@ -68,6 +68,7 @@ pub struct NetConfig {
     pub max_concurrent_bidi_streams: Option<u64>,
     pub irokle_storage_path: Option<PathBuf>,
     pub irokle_runtime: Option<IrohRuntimeConfig>,
+    pub fjall_persist_policy: FjallPersistPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +271,7 @@ impl Default for NetConfig {
             max_concurrent_uni_streams: None,
             irokle_storage_path: None,
             irokle_runtime: None,
+            fjall_persist_policy: FjallPersistPolicy::default(),
         }
     }
 }
@@ -288,6 +290,7 @@ impl std::fmt::Debug for NetConfig {
             )
             .field("discovery_method", &self.discovery_method)
             .field("relay_method", &self.relay_method)
+            .field("fjall_persist_policy", &self.fjall_persist_policy)
             .finish()
     }
 }
@@ -523,13 +526,14 @@ impl NetHandle {
         let irokle_path = config.irokle_storage_path.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("aruna-irokle-{}", ulid::Ulid::new()))
         });
-        let irokle = Arc::new(IrokleService::open(
+        let irokle = Arc::new(IrokleService::open_with_persist_policy(
             endpoint.clone(),
             storage.clone(),
             irokle_path,
             &realm_peer_nodes,
             app_alpns,
             config.irokle_runtime.unwrap_or_default(),
+            config.fjall_persist_policy,
         )?);
 
         let streams = Arc::new(StreamsService::new(

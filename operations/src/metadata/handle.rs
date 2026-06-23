@@ -22,7 +22,7 @@ use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission, Realm
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
-use aruna_storage::StorageHandle;
+use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use async_trait::async_trait;
 use craqle::{
     Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
@@ -62,6 +62,7 @@ pub struct MetadataHandle {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MetadataHandleOptions {
     pub search_storage: MetadataSearchStorage,
+    pub irokle_persist_policy: FjallPersistPolicy,
     /// Size of the craqle mutation and read permit pools. Defaults to the
     /// host parallelism; set explicitly when cgroup limits make
     /// `available_parallelism` unrepresentative.
@@ -71,6 +72,11 @@ pub struct MetadataHandleOptions {
 impl MetadataHandleOptions {
     pub fn with_search_storage(mut self, search_storage: MetadataSearchStorage) -> Self {
         self.search_storage = search_storage;
+        self
+    }
+
+    pub fn with_irokle_persist_policy(mut self, persist_policy: FjallPersistPolicy) -> Self {
+        self.irokle_persist_policy = persist_policy;
         self
     }
 
@@ -101,6 +107,7 @@ struct MetadataInner {
     storage_handle: StorageHandle,
     net_handle: Option<NetHandle>,
     irokle_db: Option<fjall::OptimisticTxDatabase>,
+    irokle_persist_policy: FjallPersistPolicy,
     visibility_cache: MetadataVisibilityCache,
     accepted_create_cache: Mutex<AcceptedCreateCache>,
     craqle_permits: Arc<tokio::sync::Semaphore>,
@@ -412,6 +419,7 @@ impl MetadataHandle {
                 storage_handle,
                 net_handle,
                 irokle_db,
+                irokle_persist_policy: metadata_options.irokle_persist_policy,
                 visibility_cache: MetadataVisibilityCache::new(),
                 accepted_create_cache: Mutex::new(AcceptedCreateCache::default()),
                 craqle_permits: Arc::new(tokio::sync::Semaphore::new(pool_size)),
@@ -1729,12 +1737,12 @@ fn flush_irokle_journal(
         "metadata.backend.irokle.flush",
         effect = effect_name,
         graph_iri = graph_iri.unwrap_or("<none>"),
-        mode = "buffer",
+        mode = inner.irokle_persist_policy.label(),
         elapsed_ms = field::Empty,
         result = field::Empty,
     );
     let started = Instant::now();
-    let result = span.in_scope(|| db.persist(fjall::PersistMode::Buffer));
+    let result = span.in_scope(|| db.persist(inner.irokle_persist_policy.as_fjall()));
     record_elapsed(&span, "elapsed_ms", started);
     match result {
         Ok(()) => {
@@ -3730,6 +3738,23 @@ async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError
 mod tests {
     use super::*;
     use aruna_core::structs::RealmId;
+
+    #[test]
+    fn metadata_handle_options_default_to_buffered_irokle_persist() {
+        let options = MetadataHandleOptions::default();
+
+        assert_eq!(options.irokle_persist_policy, FjallPersistPolicy::Buffer);
+    }
+
+    #[test]
+    fn metadata_handle_options_can_set_irokle_persist_policy() {
+        let options = MetadataHandleOptions::default()
+            .with_search_storage(MetadataSearchStorage::Memory)
+            .with_irokle_persist_policy(FjallPersistPolicy::SyncAll);
+
+        assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
+        assert_eq!(options.irokle_persist_policy, FjallPersistPolicy::SyncAll);
+    }
 
     fn registry_record(document_path: &str) -> MetadataRegistryRecord {
         let document_id = Ulid::new();
