@@ -336,11 +336,136 @@ async fn search_probe_graphs(
     harness: &TestHarness,
     auth: Option<AuthContext>,
 ) -> Result<std::collections::HashSet<String>, BoxError> {
+    Ok(search_graph_iris(harness, auth, None, "probe", 20)
+        .await?
+        .into_iter()
+        .collect())
+}
+
+async fn search_graph_iris(
+    harness: &TestHarness,
+    auth: Option<AuthContext>,
+    graph_iris: Option<Vec<String>>,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<String>, BoxError> {
     let hits = harness
         .handle
-        .search_authorized_local(auth, None, "probe".to_string(), 20)
+        .search_authorized_local(auth, graph_iris, query.to_string(), limit)
         .await?;
     Ok(hits.into_iter().map(|hit| hit.graph_iri).collect())
+}
+
+fn repeated_search_name(marker: &str, label: &str, repeats: usize) -> String {
+    let mut name = label.to_string();
+    for _ in 0..repeats {
+        name.push(' ');
+        name.push_str(marker);
+    }
+    name
+}
+
+async fn write_deleted_lifecycle(
+    harness: &TestHarness,
+    record: &MetadataRegistryRecord,
+) -> Result<(), BoxError> {
+    let lifecycle = MetadataGraphLifecycleRecord::deleted(
+        record.graph_iri.clone(),
+        REALM,
+        record.group_id,
+        record.document_id,
+        1,
+    );
+    let (key_space, key, value) = metadata_graph_lifecycle_write_entry(&lifecycle)?;
+    write_value(harness, &key_space, key, value).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_fills_visible_limit_after_invisible_matches_are_removed() -> Result<(), BoxError> {
+    let harness = build_harness(None).await?;
+    let marker = "visibilitylimitneedle";
+    let group_id = harness.group_id;
+
+    let public_a = visibility_record(group_id, "datasets/search-public-a", true);
+    let public_b = visibility_record(group_id, "datasets/search-public-b", true);
+    let private = visibility_record(group_id, "datasets/search-private", false);
+    let deleted = visibility_record(group_id, "datasets/search-deleted", true);
+    let unregistered_iri = MetadataRegistryRecord::graph_iri_for(Ulid::new());
+
+    create_crate(
+        &harness,
+        &private.graph_iri,
+        &repeated_search_name(marker, "private", 32),
+    )
+    .await?;
+    create_crate(
+        &harness,
+        &deleted.graph_iri,
+        &repeated_search_name(marker, "deleted", 32),
+    )
+    .await?;
+    create_crate(
+        &harness,
+        &unregistered_iri,
+        &repeated_search_name(marker, "unregistered", 32),
+    )
+    .await?;
+    create_crate(&harness, &public_a.graph_iri, &format!("public a {marker}")).await?;
+    create_crate(&harness, &public_b.graph_iri, &format!("public b {marker}")).await?;
+    write_registry_records(
+        &harness,
+        &[
+            public_a.clone(),
+            public_b.clone(),
+            private.clone(),
+            deleted.clone(),
+        ],
+    )
+    .await?;
+    write_deleted_lifecycle(&harness, &deleted).await?;
+
+    harness.handle.flush_search_updates().await?;
+    let hits = search_graph_iris(&harness, None, None, marker, 2).await?;
+
+    assert_eq!(hits.len(), 2, "search should fill the visible limit");
+    assert!(hits.contains(&public_a.graph_iri));
+    assert!(hits.contains(&public_b.graph_iri));
+    assert!(!hits.contains(&private.graph_iri));
+    assert!(!hits.contains(&deleted.graph_iri));
+    assert!(!hits.contains(&unregistered_iri));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn search_honors_explicit_graph_filter_before_visible_limit() -> Result<(), BoxError> {
+    let harness = build_harness(None).await?;
+    let marker = "graphfilterlimitneedle";
+    let group_id = harness.group_id;
+
+    let inside = visibility_record(group_id, "datasets/search-filter-inside", true);
+    let outside = visibility_record(group_id, "datasets/search-filter-outside", true);
+
+    create_crate(
+        &harness,
+        &outside.graph_iri,
+        &repeated_search_name(marker, "outside", 32),
+    )
+    .await?;
+    create_crate(&harness, &inside.graph_iri, &format!("inside {marker}")).await?;
+    write_registry_records(&harness, &[inside.clone(), outside.clone()]).await?;
+
+    harness.handle.flush_search_updates().await?;
+    let hits = search_graph_iris(
+        &harness,
+        None,
+        Some(vec![inside.graph_iri.clone()]),
+        marker,
+        1,
+    )
+    .await?;
+
+    assert_eq!(hits, vec![inside.graph_iri]);
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -599,7 +724,12 @@ async fn concurrent_queries_with_mutation_load_profile() -> Result<(), BoxError>
                 let event = harness
                     .handle
                     .send_metadata_effect(MetadataEffect::UpsertDataEntity {
-                        request: MetadataUpsertEntityRequest { graph_iri, jsonld },
+                        request: MetadataUpsertEntityRequest {
+                            graph_iri,
+                            jsonld,
+                            durability: Default::default(),
+                            deterministic_actor: None,
+                        },
                     })
                     .await;
                 if let Event::Metadata(MetadataEvent::Error { error, .. }) = event {

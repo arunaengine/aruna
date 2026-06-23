@@ -3,18 +3,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::document::DocumentSyncTarget;
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{METADATA_EVENT_LOG_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::metadata::{
-    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataEffect, MetadataEvent,
+    MetadataCreateEventPayload, MetadataCreateEventRecord, MetadataDocumentDeleteRecord,
+    MetadataDocumentLifecycleRecord, MetadataEffect, MetadataEvent, MetadataGraphLifecycleRecord,
 };
-use aruna_core::storage_entries::metadata_create_event_write_entry;
+use aruna_core::storage_entries::{metadata_create_event_write_entry, metadata_event_log_key};
 use aruna_core::structs::{
     Actor, MetadataRegistryRecord, RealmConfigDocument, RealmId, RealmNodeKind,
 };
 use aruna_core::util::unix_timestamp_millis;
+use aruna_core::{IrokleEffect, IrokleEvent};
 use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
 use aruna_operations::announce_realm_presence::{
     AnnounceRealmPresenceConfig, AnnounceRealmPresenceOperation,
@@ -292,6 +295,116 @@ async fn batched_metadata_create_projection_materializes_many_documents()
     Ok(())
 }
 
+#[tokio::test]
+async fn metadata_delete_wins_when_stale_create_arrives_after_tombstone()
+-> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([44u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let group_id = Ulid::new();
+    let document_id = Ulid::new();
+    let document_path = "datasets/reordered-delete";
+    let event_id = Ulid::new();
+    let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+    let record = MetadataRegistryRecord {
+        realm_id,
+        group_id,
+        document_id,
+        document_path: document_path.to_string(),
+        graph_iri: graph_iri.clone(),
+        public: true,
+        permission_path: MetadataRegistryRecord::permission_path_for(
+            &realm_id,
+            group_id,
+            document_path,
+            document_id,
+        ),
+        holder_node_ids: vec![nodes[0].net.node_id(), nodes[1].net.node_id()],
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        last_event_id: event_id,
+    };
+    let create_event = MetadataCreateEventRecord {
+        event_id,
+        record: record.clone(),
+        user_id: UserId::local(Ulid::new(), realm_id),
+        node_id: nodes[0].net.node_id(),
+        payload: MetadataCreateEventPayload::Scaffold {
+            name: "Reordered Delete".to_string(),
+            description: "Stale create follows tombstone".to_string(),
+            date_published: "2026-01-01".to_string(),
+            license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+        },
+        occurred_at_ms: 1,
+    };
+    let tombstone =
+        MetadataGraphLifecycleRecord::deleted(graph_iri, realm_id, group_id, document_id, 2);
+    let delete_event_id = Ulid::new();
+    let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+        event: MetadataDocumentDeleteRecord {
+            event_id: delete_event_id,
+            tombstone,
+            deleted_after_event_id: event_id,
+        },
+    };
+    let lifecycle_target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+    publish_document_to_peer(
+        &nodes[0],
+        delete_event_id,
+        lifecycle_target.clone(),
+        postcard::to_allocvec(&lifecycle)?,
+        nodes[1].net.node_id(),
+    )
+    .await?;
+    nodes[1]
+        .net
+        .sync_irokle_topic_with_peers(
+            lifecycle_target.irokle_topic_id(),
+            vec![nodes[0].net.node_id()],
+        )
+        .await?;
+    let delete_result = nodes[1]
+        .net
+        .reconcile_irokle_topics(vec![lifecycle_target.irokle_topic_id()])
+        .await?;
+    assert_eq!(delete_result.metadata_create_events.len(), 0);
+
+    let stale_target = DocumentSyncTarget::MetadataCreateEvent {
+        document_id,
+        event_id,
+    };
+    publish_document_to_peer(
+        &nodes[0],
+        Ulid::new(),
+        stale_target.clone(),
+        postcard::to_allocvec(&create_event)?,
+        nodes[1].net.node_id(),
+    )
+    .await?;
+    nodes[1]
+        .net
+        .sync_irokle_topic_with_peers(stale_target.irokle_topic_id(), vec![nodes[0].net.node_id()])
+        .await?;
+    let stale_result = nodes[1]
+        .net
+        .reconcile_irokle_topics(vec![stale_target.irokle_topic_id()])
+        .await?;
+
+    assert!(stale_result.metadata_create_events.is_empty());
+    assert!(
+        read_metadata_event_log_value(&nodes[1], document_id, event_id)
+            .await?
+            .is_none()
+    );
+    let fetched = drive(
+        GetMetadataDocumentOperation::new(group_id, document_id),
+        nodes[1].context.as_ref(),
+    )
+    .await;
+    assert!(fetched.is_err());
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
 async fn build_realm_nodes(
     realm_id: &RealmId,
     count: usize,
@@ -407,6 +520,54 @@ async fn install_realm_config(
     }
 
     Ok(())
+}
+
+async fn publish_document_to_peer(
+    node: &TestNode,
+    event_id: Ulid,
+    target: DocumentSyncTarget,
+    bytes: Vec<u8>,
+    peer: aruna_core::NodeId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match node
+        .net
+        .send_effect(Effect::Net(NetEffect::Irokle(
+            IrokleEffect::PublishDocument {
+                event_id,
+                target: target.clone(),
+                bytes,
+                peers: vec![peer],
+            },
+        )))
+        .await
+    {
+        Event::Net(NetEvent::Irokle(IrokleEvent::DocumentPublished { target: published })) => {
+            assert_eq!(published, target);
+            Ok(())
+        }
+        other => Err(format!("unexpected publish event: {other:?}").into()),
+    }
+}
+
+async fn read_metadata_event_log_value(
+    node: &TestNode,
+    document_id: Ulid,
+    event_id: Ulid,
+) -> Result<Option<aruna_core::types::Value>, Box<dyn std::error::Error>> {
+    match node
+        .context
+        .storage_handle
+        .send_effect(Effect::Storage(StorageEffect::Read {
+            key_space: METADATA_EVENT_LOG_KEYSPACE.to_string(),
+            key: metadata_event_log_key(document_id, event_id),
+            txn_id: None,
+        }))
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(format!("unexpected event log read event: {other:?}").into()),
+    }
 }
 
 async fn wait_for_realm_node_convergence(
@@ -635,7 +796,7 @@ async fn wait_for_batched_metadata_projection(
             let document_id = event.record.document_id;
             let expected_name = match &event.payload {
                 MetadataCreateEventPayload::Scaffold { name, .. } => name.as_str(),
-                MetadataCreateEventPayload::RoCrate { .. } => "",
+                _ => "",
             };
             match drive(
                 GetMetadataDocumentOperation::new(group_id, document_id),
