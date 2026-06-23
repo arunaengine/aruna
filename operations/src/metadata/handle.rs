@@ -36,7 +36,7 @@ use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
 
-use super::protocol::{MetadataTransportMessage, read_message, write_message};
+use super::protocol::{MetadataAuthToken, MetadataTransportMessage, read_message, write_message};
 use super::repository::{REGISTRY_FILL_PAGE_SIZE, iter_all_registry_effect, parse_registry_iter};
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use crate::driver::{DriverContext, drive};
@@ -792,10 +792,11 @@ impl MetadataHandle {
         let process_started = Instant::now();
         let response = match message {
             MetadataTransportMessage::QueryGraphs {
-                auth_context,
+                auth_token,
                 graph_iris,
                 sparql,
             } => {
+                let auth_context = remote_metadata_auth_context(auth_token);
                 match query_local_graphs(self.inner.clone(), auth_context, graph_iris, sparql).await
                 {
                     Ok(results) => MetadataTransportMessage::QueryResults { results },
@@ -803,22 +804,25 @@ impl MetadataHandle {
                 }
             }
             MetadataTransportMessage::SearchGraphs {
-                auth_context,
+                auth_token,
                 graph_iris,
                 query,
                 limit,
-            } => match search_local_graphs(
-                self.inner.clone(),
-                auth_context,
-                graph_iris,
-                query,
-                limit,
-            )
-            .await
-            {
-                Ok(hits) => MetadataTransportMessage::SearchResults { hits },
-                Err(error) => MetadataTransportMessage::Reject(error.to_string()),
-            },
+            } => {
+                let auth_context = remote_metadata_auth_context(auth_token);
+                match search_local_graphs(
+                    self.inner.clone(),
+                    auth_context,
+                    graph_iris,
+                    query,
+                    limit,
+                )
+                .await
+                {
+                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
+                    Err(error) => MetadataTransportMessage::Reject(error.to_string()),
+                }
+            }
             MetadataTransportMessage::QueryResults { .. }
             | MetadataTransportMessage::SearchResults { .. }
             | MetadataTransportMessage::Reject(_) => {
@@ -913,11 +917,12 @@ impl MetadataHandle {
             record_error(&span, "metadata net handle missing");
             return Err(MetadataError::HandleMissing);
         };
+        let auth_token = remote_metadata_auth_token(auth_context);
         let result = match send_request(
             &net_handle,
             node_id,
             MetadataTransportMessage::QueryGraphs {
-                auth_context,
+                auth_token,
                 graph_iris,
                 sparql,
             },
@@ -969,11 +974,12 @@ impl MetadataHandle {
             record_error(&span, "metadata net handle missing");
             return Err(MetadataError::HandleMissing);
         };
+        let auth_token = remote_metadata_auth_token(auth_context);
         let result = match send_request(
             &net_handle,
             node_id,
             MetadataTransportMessage::SearchGraphs {
-                auth_context,
+                auth_token,
                 graph_iris,
                 query,
                 limit,
@@ -997,6 +1003,19 @@ impl MetadataHandle {
         }
         result
     }
+}
+
+fn remote_metadata_auth_token(_auth_context: Option<AuthContext>) -> Option<MetadataAuthToken> {
+    // Raw AuthContext is process-local authorization state and must not cross
+    // the B3 metadata transport. Until shared token validation exists, remote
+    // fanout is anonymous/public-only.
+    None
+}
+
+fn remote_metadata_auth_context(_auth_token: Option<MetadataAuthToken>) -> Option<AuthContext> {
+    // Tokens are intentionally ignored in this slice; private remote reads fail
+    // closed through the existing local authorization path with None.
+    None
 }
 
 async fn graph_lifecycle_record(
@@ -3737,6 +3756,7 @@ async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
     use aruna_core::structs::RealmId;
 
     #[test]
@@ -3754,6 +3774,22 @@ mod tests {
 
         assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
         assert_eq!(options.irokle_persist_policy, FjallPersistPolicy::SyncAll);
+    }
+
+    #[test]
+    fn remote_metadata_auth_is_anonymous_until_validator_exists() {
+        let realm_id = RealmId([9u8; 32]);
+        let auth_context = AuthContext {
+            user_id: UserId::local(Ulid::new(), realm_id),
+            realm_id,
+            path_restrictions: None,
+        };
+
+        assert_eq!(remote_metadata_auth_token(Some(auth_context)), None);
+        assert_eq!(
+            remote_metadata_auth_context(Some(MetadataAuthToken::bearer("token").unwrap())),
+            None
+        );
     }
 
     fn registry_record(document_path: &str) -> MetadataRegistryRecord {
