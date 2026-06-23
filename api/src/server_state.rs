@@ -11,18 +11,19 @@ use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{API_STATE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingSyncTicket};
 use aruna_core::structs::{Actor, AuthContext, NodeCapabilities, OidcProviderConfig, RealmId};
+use aruna_operations::auth::{
+    ArunaBearerTokenError, ArunaBearerTokenValidationState, decoding_key_from_base64_public_key,
+};
 use aruna_operations::claim_initial_realm_admin::{
     ClaimInitialRealmAdminError, ClaimInitialRealmAdminInput, ClaimInitialRealmAdminOperation,
     ClaimInitialRealmAdminResult,
 };
 use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_config::GetRealmConfigOperation;
-use base64::Engine;
+use async_trait::async_trait;
 use byteview::ByteView;
 use ed25519_dalek::Signer;
-use ed25519_dalek::VerifyingKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
-use ed25519_dalek::pkcs8::EncodePublicKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
 use jsonwebtoken::DecodingKey;
@@ -294,26 +295,9 @@ impl ServerState {
     }
 
     pub async fn get_cached_pubkey(&self, pubkey: String) -> Result<DecodingKey, TokenError> {
-        // Just to be double sure this is not producing deadlocks
-        let read_lock = self.issuer_keys.read().await;
-        let key = read_lock.get(&pubkey).cloned();
-        drop(read_lock);
-        if let Some(key) = key {
-            return Ok(key);
-        }
-
-        let issuer_pubkey: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(pubkey.clone())?
-            .try_into()
-            .map_err(|_| TokenError::InvalidIssuerKey)?;
-        let pub_pem_key =
-            VerifyingKey::from_bytes(&issuer_pubkey)?.to_public_key_pem(LineEnding::default())?;
-        let decoding_key = DecodingKey::from_ed_pem(pub_pem_key.as_bytes())?;
-        self.issuer_keys
-            .write()
+        <Self as ArunaBearerTokenValidationState>::decoding_key_for_issuer(self, &pubkey)
             .await
-            .insert(pubkey, decoding_key.clone());
-        Ok(decoding_key)
+            .map_err(Into::into)
     }
 
     pub async fn add_token_to_blacklist(&self, token: &str) {
@@ -440,6 +424,36 @@ impl ServerState {
             &claimed,
         )
         .await;
+    }
+}
+
+#[async_trait]
+impl ArunaBearerTokenValidationState for ServerState {
+    async fn is_bearer_token_revoked(&self, token_hash: &str) -> bool {
+        self.token_revocation_list.read().await.contains(token_hash)
+    }
+
+    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
+        self.trusted_realms_list.read().await.contains(realm_id)
+    }
+
+    async fn decoding_key_for_issuer(
+        &self,
+        issuer_pubkey: &str,
+    ) -> Result<DecodingKey, ArunaBearerTokenError> {
+        let read_lock = self.issuer_keys.read().await;
+        let key = read_lock.get(issuer_pubkey).cloned();
+        drop(read_lock);
+        if let Some(key) = key {
+            return Ok(key);
+        }
+
+        let decoding_key = decoding_key_from_base64_public_key(issuer_pubkey)?;
+        self.issuer_keys
+            .write()
+            .await
+            .insert(issuer_pubkey.to_string(), decoding_key.clone());
+        Ok(decoding_key)
     }
 }
 

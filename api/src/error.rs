@@ -1,6 +1,7 @@
 use std::array::TryFromSliceError;
 
 use aruna_core::errors::ConversionError;
+use aruna_operations::auth::ArunaBearerTokenError;
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -50,6 +51,8 @@ pub enum TokenError {
     Expired,
     #[error("Invalid server token")]
     InvalidServerToken,
+    #[error("Error decoding AuthContext")]
+    AuthContextConversion(#[from] ConversionError),
     #[error(transparent)]
     FromSliceError(#[from] TryFromSliceError),
     #[error(transparent)]
@@ -60,6 +63,28 @@ pub enum TokenError {
     JWTError(#[from] jsonwebtoken::errors::Error),
     #[error(transparent)]
     Base64Error(#[from] base64::DecodeError),
+}
+
+impl From<ArunaBearerTokenError> for TokenError {
+    fn from(error: ArunaBearerTokenError) -> Self {
+        match error {
+            ArunaBearerTokenError::RealmNotTrusted => Self::RealmNotTrusted,
+            ArunaBearerTokenError::TokenRevoked => Self::TokenBlacklisted,
+            ArunaBearerTokenError::InvalidIssuerKey => Self::InvalidIssuerKey,
+            ArunaBearerTokenError::Expired => Self::Expired,
+            ArunaBearerTokenError::InvalidServerToken => Self::InvalidServerToken,
+            ArunaBearerTokenError::AuthContextConversion(error) => {
+                Self::AuthContextConversion(error)
+            }
+            ArunaBearerTokenError::PublicKeyError(error) => Self::PublicKeyError(error),
+            ArunaBearerTokenError::FromSliceError(error) => Self::FromSliceError(error),
+            ArunaBearerTokenError::PublicKeyConversionError(error) => {
+                Self::PublicKeyConversionError(error)
+            }
+            ArunaBearerTokenError::JwtError(error) => Self::JWTError(error),
+            ArunaBearerTokenError::Base64Error(error) => Self::Base64Error(error),
+        }
+    }
 }
 
 #[derive(Debug, Error)]

@@ -3,15 +3,14 @@ use crate::server_state::ServerState;
 use crate::telemetry::record_auth_context;
 use aruna_core::errors::ConversionError;
 use aruna_core::structs::{
-    AuthContext, OidcProviderConfig, Permission, RealmId, TokenClaims, blob_object_permission_path,
+    AuthContext, OidcProviderConfig, Permission, TokenClaims, blob_object_permission_path,
 };
+use aruna_operations::auth::{decode_aruna_bearer_token, validate_aruna_bearer_token_claims};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::driver::drive;
 use axum::extract::Request;
 use axum::middleware::Next;
 use axum::response::Response;
-use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use http::HeaderMap;
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::jwk::JwkSet;
@@ -362,70 +361,15 @@ async fn extract_auth_context(state: &ServerState, headers: &HeaderMap) -> Optio
 }
 
 pub async fn handle_token(state: &ServerState, token: &str) -> Result<TokenClaims, TokenError> {
-    let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
-
-    // - Check token hash against revocation list
-    if state.is_token_blacklisted(token).await {
-        return Err(TokenError::TokenBlacklisted);
-    }
-
-    let claims = match (
-        unvalidated_claims.claims.issuer_pubkey,
-        unvalidated_claims.claims.delegation_signature.is_some(),
-    ) {
-        (Some(issuer), true) => {
-            let decoding_key = state.get_cached_pubkey(issuer).await?;
-
-            decode::<TokenClaims>(
-                token,
-                &decoding_key,
-                &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?
-        }
-        (_, _) => {
-            let pubkey = state
-                .get_cached_pubkey(unvalidated_claims.claims.iss)
-                .await?;
-
-            decode::<TokenClaims>(
-                token,
-                &pubkey,
-                &Validation::new(jsonwebtoken::Algorithm::EdDSA),
-            )?
-        }
-    };
-    validate_claims(state, &claims.claims).await?;
-    Ok(claims.claims)
+    decode_aruna_bearer_token(state, token)
+        .await
+        .map_err(Into::into)
 }
 
 pub async fn validate_claims(state: &ServerState, claims: &TokenClaims) -> Result<(), TokenError> {
-    let now = chrono::Utc::now().timestamp() as u64;
-    if now > claims.exp {
-        return Err(TokenError::Expired);
-    }
-
-    if !state
-        .is_trusted_realm(
-            &RealmId::from_base64(&claims.iss).map_err(|_| TokenError::InvalidIssuerKey)?,
-        )
+    validate_aruna_bearer_token_claims(state, claims)
         .await
-    {
-        return Err(TokenError::RealmNotTrusted);
-    }
-
-    // Check server token claims
-    match (&claims.delegation_signature, &claims.issuer_pubkey) {
-        (Some(delegation_token), Some(issuer_pubkey)) => {
-            // Check delegation signature
-            let realm_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&claims.iss)?;
-            let realm_verifying_key = VerifyingKey::from_bytes(realm_key.as_slice().try_into()?)?;
-            let signature = Signature::from_str(delegation_token)?;
-            realm_verifying_key.verify(issuer_pubkey.as_bytes(), &signature)?;
-            Ok(())
-        }
-        (None, None) => Ok(()),
-        (_, _) => Err(TokenError::InvalidServerToken),
-    }
+        .map_err(Into::into)
 }
 
 pub async fn auth_middleware(
@@ -512,8 +456,9 @@ pub(crate) fn bucket_blob_permission_path(
 mod test {
     use crate::auth::{
         OIDC_PROVIDER_METADATA_CACHE_TTL_SECS, OidcValidator, bucket_blob_permission_path,
-        extract_auth_context,
+        extract_auth_context, handle_token,
     };
+    use crate::error::TokenError;
     use crate::server::ServerState;
     use aruna_core::UserId;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -1470,6 +1415,12 @@ mod test {
         let ctx = extract_auth_context(&state, &headers).await.unwrap();
         assert_eq!(ctx.realm_id, realm_id);
         assert_eq!(ctx.user_id, token_config.user_id);
+
+        state.add_token_to_blacklist(&management_token).await;
+        assert!(matches!(
+            handle_token(&state, &management_token).await,
+            Err(TokenError::TokenBlacklisted)
+        ));
 
         let old_time = chrono::Utc::now()
             .checked_sub_days(Days::new(10))
