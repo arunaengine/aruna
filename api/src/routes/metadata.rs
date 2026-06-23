@@ -6,8 +6,8 @@ use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
 use aruna_core::handle::Handle;
 use aruna_core::metadata::{
-    MetadataEffect, MetadataError, MetadataEvent, MetadataQueryResults, MetadataRoCratePage,
-    MetadataSearchHit,
+    MetadataEffect, MetadataError, MetadataEvent, MetadataMaterializationState,
+    MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
@@ -20,9 +20,13 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
-use aruna_operations::metadata::projector::project_metadata_create_events_from_log;
+use aruna_operations::metadata::projector::{
+    METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events_from_log,
+    schedule_metadata_projection_retry,
+};
 use aruna_operations::metadata::repository::{
-    parse_registry_read, read_registry_by_document_effect,
+    parse_materialization_status_read, parse_registry_read, read_materialization_status_effect,
+    read_registry_by_document_effect,
 };
 use aruna_operations::metadata::visible_registry;
 use aruna_operations::update_metadata_document::{
@@ -612,6 +616,7 @@ pub async fn get_metadata_document(
     let document_id = parse_document_id(&document_id)?;
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_readable(&state, auth.as_ref(), &record).await?;
+    ensure_record_materialized_for_graph_read(&state, &record).await?;
     Ok((StatusCode::OK, Json(MetadataDocumentSummary::from(&record))))
 }
 
@@ -732,6 +737,7 @@ pub async fn export_metadata_rocrate(
     let document_id = parse_document_id(&document_id)?;
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_readable(&state, auth.as_ref(), &record).await?;
+    ensure_record_materialized_for_graph_read(&state, &record).await?;
     let response = match params.view.clone().unwrap_or(MetadataRoCrateView::Full) {
         MetadataRoCrateView::Full => MetadataRoCrateResponse {
             rocrate: export_rocrate_jsonld(&state, &record.graph_iri).await?,
@@ -1093,6 +1099,7 @@ pub async fn query_metadata_document(
     ensure_supported_query_form(&request.query)?;
     let record = load_metadata_record_by_document(&state, document_id).await?;
     ensure_record_readable(&state, auth.as_ref(), &record).await?;
+    ensure_record_materialized_for_graph_read(&state, &record).await?;
     let (results, fanout) = run_query_distributed(
         &state,
         auth,
@@ -1246,6 +1253,11 @@ async fn drain_metadata_projection_batch(key: [u8; 32]) {
     }
     if let Err(error) = project_metadata_create_events_from_log(ctx.as_ref(), targets).await {
         warn!(error = ?error, "Failed to project metadata create event batch after create");
+        if let Err(error) =
+            schedule_metadata_projection_retry(ctx.as_ref(), METADATA_PROJECTION_RETRY_AFTER).await
+        {
+            warn!(error = ?error, "Failed to schedule metadata projection retry after create projection failure");
+        }
     }
 }
 
@@ -1623,6 +1635,35 @@ async fn load_metadata_record_by_document(
 }
 
 type ReadError = aruna_operations::metadata::repository::StorageReadError;
+
+async fn ensure_record_materialized_for_graph_read(
+    state: &ServerState,
+    record: &MetadataRegistryRecord,
+) -> ServerResult<()> {
+    let event = state
+        .get_ctx()
+        .storage_handle
+        .send_effect(read_materialization_status_effect(record.document_id, None))
+        .await;
+    let status = match parse_materialization_status_read(event) {
+        Ok(status) => status,
+        Err(ReadError::Storage(error)) => {
+            return Err(ServerError::InternalError(error.to_string()));
+        }
+        Err(ReadError::Conversion(error)) => {
+            return Err(ServerError::InternalError(error.to_string()));
+        }
+    };
+    let Some(status) = status else {
+        return Ok(());
+    };
+    if status.event_id == record.last_event_id
+        && !matches!(status.state, MetadataMaterializationState::Materialized)
+    {
+        return Err(ServerError::ServiceUnavailable);
+    }
+    Ok(())
+}
 
 fn upsert_visible_registry_record(state: &ServerState, record: &MetadataRegistryRecord) {
     let ctx = state.get_ctx();
@@ -2394,14 +2435,25 @@ mod tests {
 
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, TASK_TIMER_KEYSPACE};
+    use aruna_core::metadata::{
+        MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord, MetadataGraphLifecycleRecord,
+    };
+    use aruna_core::storage_entries::metadata_registry_delete_entries;
     use aruna_core::structs::{
         Group, GroupAuthorizationDocument, NodeCapabilities, RealmAuthorizationDocument, RealmId,
     };
+    use aruna_core::task::{PersistedTaskTimer, TaskKey};
     use aruna_operations::driver::DriverContext;
     use aruna_operations::metadata::MetadataHandle;
     use aruna_operations::metadata::materialization_queue::process_metadata_materialization_batch;
     use aruna_operations::metadata::projector::replay_metadata_event_log;
+    use aruna_operations::metadata::prune_queue::{
+        metadata_graph_prune_jobs_exist, process_metadata_graph_tombstones,
+    };
+    use aruna_operations::metadata::repository::{
+        write_document_lifecycle_effect, write_graph_lifecycle_effect,
+    };
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use serde_json::json;
@@ -2504,6 +2556,7 @@ mod tests {
         )
         .await
         .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
 
         let (_, Json(response)) = export_metadata_rocrate(
             State(test.state.clone()),
@@ -2672,6 +2725,7 @@ mod tests {
         )
         .await
         .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
 
         let (_, Json(exported)) = export_metadata_rocrate(
             State(test.state),
@@ -2752,6 +2806,121 @@ mod tests {
         .await
         .unwrap();
         assert!(listed.documents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inbound_document_lifecycle_tombstone_hides_stale_visible_registry_listing() {
+        let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+        visible_registry::invalidate_visible_registry(ctx.as_ref());
+
+        let (_, Json(created)) = create_metadata_document(
+            State(test.state.clone()),
+            Extension(Some(test.auth.clone())),
+            Json(CreateMetadataRequest::Scaffold(
+                CreateMetadataScaffoldRequest {
+                    group_id: test.group_id.to_string(),
+                    path: "datasets/inbound-tombstone".to_string(),
+                    name: "Inbound Tombstone Dataset".to_string(),
+                    description: "Deleted by document lifecycle only".to_string(),
+                    date_published: "2026-01-01".to_string(),
+                    license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+                    public: true,
+                },
+            )),
+        )
+        .await
+        .unwrap();
+        drain_metadata_background(test.state.as_ref()).await;
+
+        let document_id = parse_document_id(&created.summary.document_id).unwrap();
+        let record = load_metadata_record_by_document(test.state.as_ref(), document_id)
+            .await
+            .unwrap();
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(listed.documents.len(), 1);
+
+        let tombstone = MetadataGraphLifecycleRecord::deleted(
+            record.graph_iri.clone(),
+            record.realm_id,
+            record.group_id,
+            record.document_id,
+            2,
+        );
+        let lifecycle = MetadataDocumentLifecycleRecord::Delete {
+            event: MetadataDocumentDeleteRecord {
+                event_id: Ulid::new(),
+                tombstone: tombstone.clone(),
+                deleted_after_event_id: record.last_event_id,
+            },
+        };
+        for effect in [
+            write_graph_lifecycle_effect(&tombstone, None).unwrap(),
+            write_document_lifecycle_effect(&lifecycle, None).unwrap(),
+        ] {
+            match ctx.storage_handle.send_effect(effect).await {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected lifecycle write event: {other:?}"),
+            }
+        }
+        match ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchDelete {
+                deletes: metadata_registry_delete_entries(record.group_id, record.document_id),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            other => panic!("unexpected registry delete event: {other:?}"),
+        }
+
+        let processed = process_metadata_graph_tombstones(ctx.as_ref(), vec![tombstone]).await;
+
+        assert_eq!(processed.enqueued, 1);
+        assert!(
+            metadata_graph_prune_jobs_exist(&ctx.storage_handle)
+                .await
+                .unwrap()
+        );
+        let (_, Json(listed)) = list_metadata_documents(
+            State(test.state.clone()),
+            Extension(None),
+            Path(test.group_id.to_string()),
+            Query(ListMetadataQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert!(listed.documents.is_empty());
+        let fetched = get_metadata_document(
+            State(test.state.clone()),
+            Extension(None),
+            Path(created.summary.document_id),
+        )
+        .await;
+        assert!(matches!(fetched, Err(ServerError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn projection_batch_failure_persists_projection_retry() {
+        let test = setup_state().await;
+        let ctx = test.state.get_ctx();
+        let key = metadata_projection_batch_key(&ctx);
+
+        wake_metadata_create_projection(ctx.clone(), Ulid::new(), Ulid::new());
+        drain_metadata_projection_batch(key).await;
+
+        let timer = read_persisted_task_timer(ctx.as_ref(), &TaskKey::DrainMetadataProjectionQueue)
+            .await
+            .expect("projection retry timer persisted");
+        assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
     }
 
     #[tokio::test]
@@ -3237,12 +3406,13 @@ mod tests {
                     score: 0.7,
                 },
             ],
-            10,
+            2,
         );
 
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].graph_iri, "https://w3id.org/aruna/01A");
         assert_eq!(hits[0].score, 0.8);
+        assert_eq!(hits[1].graph_iri, "https://w3id.org/aruna/01B");
     }
 
     async fn setup_state() -> TestState {
@@ -3385,5 +3555,25 @@ mod tests {
             event,
             Event::Storage(StorageEvent::WriteResult { .. })
         ));
+    }
+
+    async fn read_persisted_task_timer(
+        ctx: &DriverContext,
+        key: &TaskKey,
+    ) -> Option<PersistedTaskTimer> {
+        let event = ctx
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: TASK_TIMER_KEYSPACE.to_string(),
+                key: postcard::to_allocvec(key).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                value.map(|value| postcard::from_bytes(&value).expect("timer decodes"))
+            }
+            other => panic!("unexpected task timer read event: {other:?}"),
+        }
     }
 }

@@ -5,8 +5,10 @@ use std::time::{Duration, Instant};
 use crate::driver::{DriverContext, drive};
 use crate::metadata::MetadataHandle;
 use crate::metadata::projector::{
-    project_metadata_create_events, project_metadata_create_events_from_log,
+    METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events,
+    project_metadata_create_events_from_log, schedule_metadata_projection_retry,
 };
+use crate::metadata::prune_queue::process_metadata_graph_tombstones;
 use crate::process_placements::{PlacementConfig, ProcessPlacementsOperation};
 use crate::replication::incoming_version_replication::IncomingVersionReplicationOperation;
 use crate::replication::protocol::VersionReplicationMessage;
@@ -14,7 +16,6 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentSyncReconcileResult, DocumentSyncTarget};
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
-use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::telemetry::{QUEUE_LAG_INTERVAL, duration_ms};
 use aruna_net::InboundEventHandler;
@@ -25,7 +26,6 @@ use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 const METADATA_IROKLE_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 const METADATA_IROKLE_MAINTENANCE_JITTER_SECS: u64 = 15;
-const METADATA_PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct OperationsInboundHandler {
@@ -154,14 +154,7 @@ async fn reconcile_inbound_irokle_topics(
     if applied == 0 {
         return;
     }
-    let lifecycle_graphs = targets
-        .targets
-        .iter()
-        .filter_map(|target| match target {
-            DocumentSyncTarget::MetadataGraphLifecycle { graph_iri } => Some(graph_iri.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
+    let metadata_graph_tombstones = targets.metadata_graph_tombstones.clone();
     let realm_config_changed = targets
         .targets
         .iter()
@@ -179,7 +172,7 @@ async fn reconcile_inbound_irokle_topics(
     project_inbound_metadata_create_events(context, targets).await;
     let project_elapsed = project_started.elapsed();
     let prune_started = Instant::now();
-    prune_inbound_deleted_graphs(context, lifecycle_graphs).await;
+    process_metadata_graph_tombstones(context, metadata_graph_tombstones).await;
     info!(
         event = "pipeline.reconcile.summary",
         topics = topic_count,
@@ -358,19 +351,10 @@ async fn project_inbound_metadata_create_events(
 }
 
 async fn schedule_projection_retry(context: &DriverContext) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        return;
-    };
-    let event = task_handle
-        .send_effect(aruna_core::effects::Effect::Task(
-            aruna_core::task::TaskEffect::ResetTimer {
-                key: aruna_core::task::TaskKey::DrainMetadataProjectionQueue,
-                after: METADATA_PROJECTION_RETRY_AFTER,
-            },
-        ))
-        .await;
-    if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) = event {
-        warn!(message = %message, "Failed to schedule metadata projection retry");
+    if let Err(error) =
+        schedule_metadata_projection_retry(context, METADATA_PROJECTION_RETRY_AFTER).await
+    {
+        warn!(error = ?error, "Failed to schedule metadata projection retry");
     }
 }
 
@@ -389,23 +373,6 @@ fn schedule_periodic_metadata_irokle_maintenance(metadata_handle: MetadataHandle
             run_metadata_irokle_maintenance(&metadata_handle, "periodic", cycle).await;
         }
     });
-}
-
-async fn prune_inbound_deleted_graphs(context: &DriverContext, graphs: Vec<String>) {
-    if graphs.is_empty() {
-        return;
-    }
-    let Some(metadata_handle) = context.metadata_handle.clone() else {
-        return;
-    };
-    for graph_iri in graphs {
-        if let Err(error) = metadata_handle
-            .prune_graph_if_deleted(graph_iri.clone())
-            .await
-        {
-            warn!(graph_iri = %graph_iri, error = ?error, "Failed to prune deleted metadata graph");
-        }
-    }
 }
 
 async fn run_metadata_irokle_maintenance(
@@ -432,5 +399,69 @@ async fn run_metadata_irokle_maintenance(
             error = ?error,
             "Metadata graph prune failed"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::keyspaces::TASK_TIMER_KEYSPACE;
+    use aruna_core::task::{PersistedTaskTimer, TaskKey};
+    use aruna_storage::FjallStorage;
+    use aruna_tasks::TaskHandle;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn inbound_projection_failure_schedules_durable_projection_retry() {
+        let temp_dir = tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        let context = DriverContext {
+            storage_handle: storage.clone(),
+            net_handle: None,
+            blob_handle: None,
+            metadata_handle: None,
+            task_handle: Some(TaskHandle::new()),
+        };
+        let document_id = ulid::Ulid::new();
+        let event_id = ulid::Ulid::new();
+
+        project_inbound_metadata_create_events(
+            &context,
+            DocumentSyncReconcileResult {
+                targets: vec![DocumentSyncTarget::MetadataCreateEvent {
+                    document_id,
+                    event_id,
+                }],
+                metadata_create_events: Vec::new(),
+                metadata_graph_tombstones: Vec::new(),
+            },
+        )
+        .await;
+
+        let timer = read_persisted_task_timer(&storage, &TaskKey::DrainMetadataProjectionQueue)
+            .await
+            .expect("projection retry timer persisted");
+        assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
+    }
+
+    async fn read_persisted_task_timer(
+        storage: &aruna_storage::StorageHandle,
+        key: &TaskKey,
+    ) -> Option<PersistedTaskTimer> {
+        let event = storage
+            .send_storage_effect(aruna_core::effects::StorageEffect::Read {
+                key_space: TASK_TIMER_KEYSPACE.to_string(),
+                key: postcard::to_allocvec(key).unwrap().into(),
+                txn_id: None,
+            })
+            .await;
+        match event {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                value.map(|value| postcard::from_bytes(&value).expect("timer decodes"))
+            }
+            other => panic!("unexpected task timer read event: {other:?}"),
+        }
     }
 }

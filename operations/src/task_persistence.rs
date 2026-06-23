@@ -37,7 +37,9 @@ fn timer_is_restored_from_durable_queue(effect: &TaskEffect) -> bool {
     };
     matches!(
         key,
-        TaskKey::DrainDocumentSyncOutbox | TaskKey::DrainMetadataMaterializationQueue
+        TaskKey::DrainDocumentSyncOutbox
+            | TaskKey::DrainMetadataMaterializationQueue
+            | TaskKey::DrainMetadataGraphPruneQueue
     )
 }
 
@@ -296,5 +298,82 @@ mod tests {
         .expect("drain timer persistence is redundant");
 
         assert_eq!(storage.snapshot_metrics().requests_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_graph_prune_drain_timer_is_not_persisted() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+
+        persist_task_effect(
+            &storage,
+            &TaskEffect::ResetTimer {
+                key: TaskKey::DrainMetadataGraphPruneQueue,
+                after: Duration::ZERO,
+            },
+        )
+        .await
+        .expect("prune drain timer persistence is redundant");
+
+        assert_eq!(storage.snapshot_metrics().requests_total, 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_projection_timer_reset_is_persisted() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+
+        persist_task_effect(
+            &storage,
+            &TaskEffect::ResetTimer {
+                key: TaskKey::DrainMetadataProjectionQueue,
+                after: Duration::ZERO,
+            },
+        )
+        .await
+        .expect("projection timer persists");
+
+        let timer = read_timer(&storage, &TaskKey::DrainMetadataProjectionQueue)
+            .await
+            .expect("timer reads")
+            .expect("projection timer exists");
+        assert_eq!(timer.key, TaskKey::DrainMetadataProjectionQueue);
+    }
+
+    #[tokio::test]
+    async fn metadata_projection_timer_restores_to_new_task_handle() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let storage = FjallStorage::open(temp_dir.path().to_str().expect("utf-8 path"))
+            .expect("storage opens");
+        let key = TaskKey::DrainMetadataProjectionQueue;
+
+        persist_task_effect(
+            &storage,
+            &TaskEffect::ResetTimer {
+                key: key.clone(),
+                after: Duration::from_millis(1),
+            },
+        )
+        .await
+        .expect("timer persists");
+
+        let task_handle = TaskHandle::new();
+        let observed = Arc::new(Mutex::new(None));
+        let notify = Arc::new(Notify::new());
+        task_handle
+            .set_inbound_handler(Arc::new(RecordingHandler {
+                observed: observed.clone(),
+                notify: notify.clone(),
+            }))
+            .await;
+
+        restore_persisted_task_timers(&storage, &task_handle).await;
+        tokio::time::timeout(Duration::from_secs(1), notify.notified())
+            .await
+            .expect("restored timer should fire");
+
+        assert_eq!(*observed.lock().await, Some(key));
     }
 }
