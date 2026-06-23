@@ -893,7 +893,7 @@ impl MetadataHandle {
     #[tracing::instrument(
         name = "metadata.query.remote",
         level = "debug",
-        skip(self, auth_context, sparql),
+        skip(self, auth_token, sparql),
         fields(
             peer = ?node_id,
             query_len = sparql.len() as u64,
@@ -907,7 +907,7 @@ impl MetadataHandle {
     pub async fn request_remote_query_graphs(
         &self,
         node_id: NodeId,
-        auth_context: Option<AuthContext>,
+        auth_token: Option<MetadataAuthToken>,
         graph_iris: Option<Vec<String>>,
         sparql: String,
     ) -> Result<MetadataQueryResults, MetadataError> {
@@ -917,7 +917,6 @@ impl MetadataHandle {
             record_error(&span, "metadata net handle missing");
             return Err(MetadataError::HandleMissing);
         };
-        let auth_token = remote_metadata_auth_token(auth_context);
         let result = match send_request(
             &net_handle,
             node_id,
@@ -949,7 +948,7 @@ impl MetadataHandle {
     #[tracing::instrument(
         name = "metadata.search.remote",
         level = "debug",
-        skip(self, auth_context, query),
+        skip(self, auth_token, query),
         fields(
             peer = ?node_id,
             query_len = query.len() as u64,
@@ -963,7 +962,7 @@ impl MetadataHandle {
     pub async fn request_remote_search_graphs(
         &self,
         node_id: NodeId,
-        auth_context: Option<AuthContext>,
+        auth_token: Option<MetadataAuthToken>,
         graph_iris: Option<Vec<String>>,
         query: String,
         limit: usize,
@@ -974,7 +973,6 @@ impl MetadataHandle {
             record_error(&span, "metadata net handle missing");
             return Err(MetadataError::HandleMissing);
         };
-        let auth_token = remote_metadata_auth_token(auth_context);
         let result = match send_request(
             &net_handle,
             node_id,
@@ -1003,13 +1001,6 @@ impl MetadataHandle {
         }
         result
     }
-}
-
-fn remote_metadata_auth_token(_auth_context: Option<AuthContext>) -> Option<MetadataAuthToken> {
-    // Raw AuthContext is process-local authorization state and must not cross
-    // the B3 metadata transport. Until shared token validation exists, remote
-    // fanout is anonymous/public-only.
-    None
 }
 
 fn remote_metadata_auth_context(_auth_token: Option<MetadataAuthToken>) -> Option<AuthContext> {
@@ -3756,7 +3747,6 @@ async fn drain_request_stream(stream: &mut BiStream) -> Result<(), MetadataError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::RealmId;
 
     #[test]
@@ -3778,14 +3768,6 @@ mod tests {
 
     #[test]
     fn remote_metadata_auth_is_anonymous_until_validator_exists() {
-        let realm_id = RealmId([9u8; 32]);
-        let auth_context = AuthContext {
-            user_id: UserId::local(Ulid::new(), realm_id),
-            realm_id,
-            path_restrictions: None,
-        };
-
-        assert_eq!(remote_metadata_auth_token(Some(auth_context)), None);
         assert_eq!(
             remote_metadata_auth_context(Some(MetadataAuthToken::bearer("token").unwrap())),
             None

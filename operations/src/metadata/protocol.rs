@@ -12,7 +12,6 @@ pub enum MetadataAuthToken {
     Bearer(MetadataBearerToken),
 }
 
-#[cfg(test)]
 impl MetadataAuthToken {
     pub fn bearer(token: impl Into<String>) -> Result<Self, MetadataAuthTokenError> {
         MetadataBearerToken::new(token).map(Self::Bearer)

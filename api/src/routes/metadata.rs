@@ -1,4 +1,4 @@
-use crate::auth::{parse_group_id, require_realm_auth};
+use crate::auth::{ValidatedArunaBearerTokenCarrier, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server_state::ServerState;
 use aruna_core::effects::Effect;
@@ -20,6 +20,7 @@ use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::get_realm_nodes::GetRealmNodesOperation;
 use aruna_operations::list_groups::ListGroupOperation;
 use aruna_operations::list_metadata_documents::ListMetadataDocumentsOperation;
+use aruna_operations::metadata::MetadataAuthToken;
 use aruna_operations::metadata::projector::{
     METADATA_PROJECTION_RETRY_AFTER, project_metadata_create_events_from_log,
     schedule_metadata_projection_retry,
@@ -1092,6 +1093,7 @@ pub async fn add_metadata_contextual_entity(
 pub async fn query_metadata_document(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Path(document_id): Path<String>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
@@ -1103,6 +1105,7 @@ pub async fn query_metadata_document(
     let (results, fanout) = run_query_distributed(
         &state,
         auth,
+        bearer_token,
         Some(vec![record.graph_iri.clone()]),
         request.query,
         request.mode,
@@ -1151,11 +1154,20 @@ pub async fn query_metadata_document(
 pub async fn query_all_metadata(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     ensure_supported_query_form(&request.query)?;
-    let (results, fanout) =
-        run_query_distributed(&state, auth, None, request.query, request.mode, None).await?;
+    let (results, fanout) = run_query_distributed(
+        &state,
+        auth,
+        bearer_token,
+        None,
+        request.query,
+        request.mode,
+        None,
+    )
+    .await?;
     let serialize_started = Instant::now();
     let response = map_query_results(results, fanout)?;
     aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
@@ -1180,14 +1192,23 @@ pub async fn query_all_metadata(
 pub async fn search_metadata(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Extension(bearer_token): Extension<Option<ValidatedArunaBearerTokenCarrier>>,
     Query(params): Query<MetadataSearchParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataSearchResponse>)> {
     if params.q.trim().is_empty() {
         return Err(ServerError::BadRequest);
     }
     let limit = params.limit.unwrap_or(25).clamp(1, 250);
-    let (hits, fanout) =
-        run_search_distributed(&state, auth, None, params.q, limit, params.mode).await?;
+    let (hits, fanout) = run_search_distributed(
+        &state,
+        auth,
+        bearer_token,
+        None,
+        params.q,
+        limit,
+        params.mode,
+    )
+    .await?;
     Ok((
         StatusCode::OK,
         Json(MetadataSearchResponse {
@@ -1962,6 +1983,12 @@ fn short_node_id(node_id: aruna_core::NodeId) -> String {
     id
 }
 
+fn metadata_auth_token_from_carrier(
+    carrier: Option<&ValidatedArunaBearerTokenCarrier>,
+) -> Option<MetadataAuthToken> {
+    carrier.and_then(|carrier| MetadataAuthToken::bearer(carrier.as_str()).ok())
+}
+
 #[tracing::instrument(
     name = "metadata.api.query_distributed",
     level = "debug",
@@ -1979,6 +2006,7 @@ fn short_node_id(node_id: aruna_core::NodeId) -> String {
 async fn run_query_distributed(
     state: &ServerState,
     auth: Option<AuthContext>,
+    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
     graph_iris: Option<Vec<String>>,
     query: String,
     mode: Option<MetadataQueryMode>,
@@ -1997,6 +2025,7 @@ async fn run_query_distributed(
         QueryForm::Select => query_select_limit(&query),
         QueryForm::Ask => None,
     };
+    let remote_auth_token = metadata_auth_token_from_carrier(bearer_token.as_ref());
 
     let mut parts = Vec::new();
     let mut fanout = DistributedFanout::default();
@@ -2057,6 +2086,7 @@ async fn run_query_distributed(
                     };
                     let handle = handle.clone();
                     let auth = auth.clone();
+                    let auth_token = remote_auth_token.clone();
                     let graph_iris = graph_iris.clone();
                     let query = query.clone();
                     let local = node_id == local_node_id;
@@ -2081,7 +2111,9 @@ async fn run_query_distributed(
                             match tokio::time::timeout(
                                 METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
                                 handle
-                                    .request_remote_query_graphs(node_id, auth, graph_iris, query)
+                                    .request_remote_query_graphs(
+                                        node_id, auth_token, graph_iris, query,
+                                    )
                                     .instrument(node_span.clone()),
                             )
                             .await
@@ -2164,6 +2196,7 @@ async fn run_query_distributed(
 async fn run_search_distributed(
     state: &ServerState,
     auth: Option<AuthContext>,
+    bearer_token: Option<ValidatedArunaBearerTokenCarrier>,
     graph_iris: Option<Vec<String>>,
     query: String,
     limit: usize,
@@ -2177,6 +2210,7 @@ async fn run_search_distributed(
         .metadata_handle
         .clone()
         .ok_or_else(|| ServerError::InternalError("metadata handle unavailable".to_string()))?;
+    let remote_auth_token = metadata_auth_token_from_carrier(bearer_token.as_ref());
 
     let mut hits = Vec::new();
     let mut fanout = DistributedFanout::default();
@@ -2223,6 +2257,7 @@ async fn run_search_distributed(
                     };
                     let handle = handle.clone();
                     let auth = auth.clone();
+                    let auth_token = remote_auth_token.clone();
                     let graph_iris = graph_iris.clone();
                     let query = query.clone();
                     let local = node_id == local_node_id;
@@ -2249,7 +2284,7 @@ async fn run_search_distributed(
                                 METADATA_DISTRIBUTED_QUERY_NODE_TIMEOUT,
                                 handle
                                     .request_remote_search_graphs(
-                                        node_id, auth, graph_iris, query, limit,
+                                        node_id, auth_token, graph_iris, query, limit,
                                     )
                                     .instrument(node_span.clone()),
                             )
@@ -2619,6 +2654,7 @@ mod tests {
         let (_, Json(result)) = query_metadata_document(
             State(test.state.clone()),
             Extension(None),
+            Extension(None),
             Path(document_id.clone()),
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s <http://schema.org/name> \"Public Dataset\" }".to_string(),
@@ -2642,6 +2678,7 @@ mod tests {
 
         let (_, Json(search)) = search_metadata(
             State(test.state.clone()),
+            Extension(None),
             Extension(None),
             Query(MetadataSearchParams {
                 q: "Public".to_string(),
@@ -2972,6 +3009,7 @@ mod tests {
         let result = query_metadata_document(
             State(test.state),
             Extension(None),
+            Extension(None),
             Path(Ulid::new().to_string()),
             Json(SparqlQueryRequest {
                 query: "ASK WHERE { ?s ?p ?o }".to_string(),
@@ -3022,6 +3060,17 @@ mod tests {
             document_query_target_nodes(&empty_holders, local_node_id),
             vec![local_node_id]
         );
+    }
+
+    #[test]
+    fn metadata_auth_token_helper_uses_validated_carrier_only() {
+        let carrier = ValidatedArunaBearerTokenCarrier::new_for_test("raw-aruna-token");
+
+        assert_eq!(
+            metadata_auth_token_from_carrier(Some(&carrier)),
+            Some(MetadataAuthToken::bearer("raw-aruna-token").unwrap())
+        );
+        assert_eq!(metadata_auth_token_from_carrier(None), None);
     }
 
     #[tokio::test]
@@ -3301,6 +3350,7 @@ mod tests {
         let (_, Json(result)) = query_all_metadata(
             State(test.state.clone()),
             Extension(None),
+            Extension(None),
             Json(SparqlQueryRequest {
                 query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name } LIMIT 10"
                     .to_string(),
@@ -3353,6 +3403,7 @@ mod tests {
             let (_, Json(result)) = query_all_metadata(
                 State(test.state.clone()),
                 Extension(auth),
+                Extension(None),
                 Json(SparqlQueryRequest {
                     query: "SELECT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
                     mode: Some(MetadataQueryMode::Local),
