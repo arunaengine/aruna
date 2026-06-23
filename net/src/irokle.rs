@@ -1595,20 +1595,7 @@ impl IrokleService {
         record: MetadataRegistryRecord,
         primary_bytes: Vec<u8>,
     ) -> Result<()> {
-        if self.metadata_graph_deleted(&record.graph_iri).await? {
-            return self
-                .storage_batch_delete(metadata_registry_delete_entries(
-                    record.group_id,
-                    record.document_id,
-                ))
-                .await;
-        }
-        let mut entries = metadata_registry_write_entries(&record)
-            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        if let Some((_, _, value)) = entries.first_mut() {
-            *value = primary_bytes.into();
-        }
-        self.storage_batch_write(entries).await
+        apply_metadata_registry_upsert_to_storage(&self.storage, record, primary_bytes).await
     }
 
     async fn apply_metadata_document_lifecycle(
@@ -1756,21 +1743,7 @@ impl IrokleService {
     }
 
     async fn storage_read(&self, key_space: String, key: ByteView) -> Result<Option<Value>> {
-        match self
-            .storage
-            .send_storage_effect(StorageEffect::Read {
-                key_space,
-                key,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
-            other => Err(NetError::Dht(format!(
-                "unexpected storage event while applying irokle read: {other:?}"
-            ))),
-        }
+        storage_read_from(&self.storage, key_space, key).await
     }
 
     async fn storage_write(&self, key_space: String, key: ByteView, value: Value) -> Result<()> {
@@ -1793,20 +1766,7 @@ impl IrokleService {
     }
 
     async fn storage_batch_write(&self, writes: Vec<(String, ByteView, Value)>) -> Result<()> {
-        match self
-            .storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
-            other => Err(NetError::Dht(format!(
-                "unexpected storage event while applying irokle batch write: {other:?}"
-            ))),
-        }
+        storage_batch_write_to(&self.storage, writes).await
     }
 
     async fn storage_delete(&self, key_space: String, key: ByteView) -> Result<()> {
@@ -1828,20 +1788,136 @@ impl IrokleService {
     }
 
     async fn storage_batch_delete(&self, deletes: Vec<(String, ByteView)>) -> Result<()> {
-        match self
-            .storage
-            .send_storage_effect(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-            Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
-            other => Err(NetError::Dht(format!(
-                "unexpected storage event while applying irokle batch delete: {other:?}"
-            ))),
-        }
+        storage_batch_delete_to(&self.storage, deletes).await
+    }
+}
+
+async fn apply_metadata_registry_upsert_to_storage(
+    storage: &StorageHandle,
+    record: MetadataRegistryRecord,
+    primary_bytes: Vec<u8>,
+) -> Result<()> {
+    if metadata_graph_deleted_in_storage(storage, &record.graph_iri).await? {
+        return storage_batch_delete_to(
+            storage,
+            metadata_registry_delete_entries(record.group_id, record.document_id),
+        )
+        .await;
+    }
+
+    let target = DocumentSyncTarget::MetadataRegistry {
+        group_id: record.group_id,
+        document_id: record.document_id,
+    };
+    let existing = storage_read_from(
+        storage,
+        target.storage_keyspace().to_string(),
+        target.storage_key(),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<MetadataRegistryRecord>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if existing
+        .as_ref()
+        .is_some_and(|existing| incoming_metadata_registry_stale_or_equal(existing, &record))
+    {
+        return Ok(());
+    }
+
+    let mut entries = metadata_registry_write_entries(&record)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if let Some((_, _, value)) = entries.first_mut() {
+        *value = primary_bytes.into();
+    }
+    storage_batch_write_to(storage, entries).await
+}
+
+fn incoming_metadata_registry_stale_or_equal(
+    existing: &MetadataRegistryRecord,
+    incoming: &MetadataRegistryRecord,
+) -> bool {
+    metadata_registry_freshness(incoming) <= metadata_registry_freshness(existing)
+}
+
+fn metadata_registry_freshness(record: &MetadataRegistryRecord) -> (u64, Ulid) {
+    (record.updated_at_ms, record.last_event_id)
+}
+
+async fn metadata_graph_deleted_in_storage(
+    storage: &StorageHandle,
+    graph_iri: &str,
+) -> Result<bool> {
+    let value = storage_read_from(
+        storage,
+        aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        metadata_graph_lifecycle_key(graph_iri),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let record: MetadataGraphLifecycleRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    Ok(record.is_deleted())
+}
+
+async fn storage_read_from(
+    storage: &StorageHandle,
+    key_space: String,
+    key: ByteView,
+) -> Result<Option<Value>> {
+    match storage
+        .send_storage_effect(StorageEffect::Read {
+            key_space,
+            key,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        other => Err(NetError::Dht(format!(
+            "unexpected storage event while applying irokle read: {other:?}"
+        ))),
+    }
+}
+
+async fn storage_batch_write_to(
+    storage: &StorageHandle,
+    writes: Vec<(String, ByteView, Value)>,
+) -> Result<()> {
+    match storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        other => Err(NetError::Dht(format!(
+            "unexpected storage event while applying irokle batch write: {other:?}"
+        ))),
+    }
+}
+
+async fn storage_batch_delete_to(
+    storage: &StorageHandle,
+    deletes: Vec<(String, ByteView)>,
+) -> Result<()> {
+    match storage
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        other => Err(NetError::Dht(format!(
+            "unexpected storage event while applying irokle batch delete: {other:?}"
+        ))),
     }
 }
 
@@ -2214,9 +2290,14 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
+    use aruna_core::keyspaces::{
+        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
+        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    };
+    use aruna_core::storage_entries::{metadata_document_key, metadata_registry_key};
     use aruna_core::structs::RealmId;
     use std::collections::BTreeMap;
+    use tempfile::TempDir;
 
     fn peer(seed: u8) -> PeerId {
         node_id_to_peer_id(&iroh::SecretKey::from_bytes(&[seed; 32]).public())
@@ -2227,6 +2308,87 @@ mod tests {
             realm_id: RealmId::from_bytes([seed; 32]),
         }
         .irokle_topic_id()
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn test_storage() -> (TempDir, StorageHandle) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
+        (dir, storage)
+    }
+
+    fn registry_record(
+        group_id: Ulid,
+        document_id: Ulid,
+        document_path: &str,
+        updated_at_ms: u64,
+        last_event_id: Ulid,
+    ) -> MetadataRegistryRecord {
+        let realm_id = RealmId::from_bytes([42; 32]);
+        MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: document_path.to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                document_path,
+                document_id,
+            ),
+            holder_node_ids: vec![node(1)],
+            created_at_ms: 1,
+            updated_at_ms,
+            last_event_id,
+        }
+    }
+
+    async fn write_registry_record(storage: &StorageHandle, record: &MetadataRegistryRecord) {
+        let event = storage
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes: metadata_registry_write_entries(record).expect("registry entries build"),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+    }
+
+    async fn read_storage_value(
+        storage: &StorageHandle,
+        key_space: &str,
+        key: ByteView,
+    ) -> Option<Value> {
+        match storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space: key_space.to_string(),
+                key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
+            other => panic!("unexpected storage read event: {other:?}"),
+        }
+    }
+
+    async fn read_registry_record(
+        storage: &StorageHandle,
+        key_space: &str,
+        key: ByteView,
+    ) -> MetadataRegistryRecord {
+        let value = read_storage_value(storage, key_space, key)
+            .await
+            .expect("registry record exists");
+        postcard::from_bytes(&value).expect("registry record decodes")
     }
 
     fn sync_summary(
@@ -2307,6 +2469,61 @@ mod tests {
             None,
             BTreeSet::from([irokle_crate::OpId::hash(b"head")])
         )));
+    }
+
+    #[tokio::test]
+    async fn metadata_registry_upsert_skips_stale_local_record() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(1, 1);
+        let document_id = Ulid::from_parts(2, 2);
+        let local = registry_record(
+            group_id,
+            document_id,
+            "datasets/fresh",
+            200,
+            Ulid::from_parts(200, 2),
+        );
+        write_registry_record(&storage, &local).await;
+
+        let mut stale = registry_record(
+            group_id,
+            document_id,
+            "datasets/stale",
+            100,
+            Ulid::from_parts(100, 1),
+        );
+        stale.public = false;
+        stale.holder_node_ids = vec![node(2)];
+        let stale_bytes = postcard::to_allocvec(&stale).expect("stale registry serializes");
+
+        apply_metadata_registry_upsert_to_storage(&storage, stale, stale_bytes)
+            .await
+            .expect("stale registry upsert succeeds idempotently");
+
+        let primary = read_registry_record(
+            &storage,
+            METADATA_INDEX_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await;
+        let document_index = read_registry_record(
+            &storage,
+            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            metadata_document_key(document_id),
+        )
+        .await;
+        let holder_value = read_storage_value(
+            &storage,
+            METADATA_HOLDERS_KEYSPACE,
+            metadata_registry_key(group_id, document_id),
+        )
+        .await
+        .expect("holder index exists");
+        let holders: Vec<NodeId> = postcard::from_bytes(&holder_value).expect("holders decode");
+
+        assert_eq!(primary, local);
+        assert_eq!(document_index, local);
+        assert_eq!(holders, local.holder_node_ids);
     }
 
     #[test]
