@@ -1,22 +1,28 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use aruna_core::NodeId;
 use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget};
-use aruna_core::effects::{IterStart, StorageEffect};
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{
-    METADATA_EVENT_LOG_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+    METADATA_EVENT_LOG_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+    METADATA_MATERIALIZATION_STATUS_KEYSPACE,
 };
 use aruna_core::metadata::{
-    MetadataCreateEventRecord, MetadataError, MetadataMaterializationStatusRecord,
+    MetadataCreateEventRecord, MetadataDocumentLifecycleRecord, MetadataError,
+    MetadataGraphLifecycleRecord, MetadataMaterializationStatusRecord,
 };
-use aruna_core::storage_entries::{metadata_event_log_key, metadata_materialization_status_key};
+use aruna_core::storage_entries::{
+    metadata_event_log_key, metadata_graph_lifecycle_key, metadata_materialization_status_key,
+    metadata_registry_delete_entries,
+};
 use aruna_core::structs::{
-    MetadataAuditOperation, MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument,
-    RealmId,
+    MetadataAuditRecord, MetadataRegistryRecord, RealmConfigDocument, RealmId,
 };
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use thiserror::Error;
 use ulid::Ulid;
@@ -31,9 +37,11 @@ use crate::metadata::repository::{
     create_records_and_outbox_write_entries,
     create_records_outbox_and_materialization_write_entries, read_registry_by_document_effect,
 };
-use crate::sync_placement::{select_sync_peers, sort_node_ids};
+use crate::sync_placement::{complete_authoritative_holders, sort_node_ids};
+use crate::task_persistence::persist_task_effect;
 
 const REPLAY_PAGE_SIZE: usize = 1_024;
+pub const METADATA_PROJECTION_RETRY_AFTER: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Error)]
 pub enum MetadataProjectionError {
@@ -49,6 +57,42 @@ pub enum MetadataProjectionError {
     MetadataCreateEventMissing { document_id: Ulid, event_id: Ulid },
     #[error("unexpected event while projecting metadata create event: {0}")]
     UnexpectedEvent(String),
+}
+
+fn metadata_projection_drain_task_effect(after: Duration) -> TaskEffect {
+    TaskEffect::ResetTimer {
+        key: TaskKey::DrainMetadataProjectionQueue,
+        after,
+    }
+}
+
+pub fn schedule_metadata_projection_drain_effect(after: Duration) -> Effect {
+    Effect::Task(metadata_projection_drain_task_effect(after))
+}
+
+pub async fn schedule_metadata_projection_retry(
+    context: &DriverContext,
+    after: Duration,
+) -> Result<(), MetadataProjectionError> {
+    let effect = metadata_projection_drain_task_effect(after);
+    persist_task_effect(&context.storage_handle, &effect)
+        .await
+        .map_err(MetadataProjectionError::UnexpectedEvent)?;
+
+    let Some(task_handle) = context.task_handle.as_ref() else {
+        return Err(MetadataProjectionError::UnexpectedEvent(
+            "task handle unavailable".to_string(),
+        ));
+    };
+    match task_handle.send_effect(Effect::Task(effect)).await {
+        Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(()),
+        Event::Task(TaskEvent::Error { message, .. }) => {
+            Err(MetadataProjectionError::UnexpectedEvent(message))
+        }
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
 }
 
 pub async fn replay_metadata_event_log(
@@ -181,18 +225,45 @@ pub async fn project_metadata_create_events(
     }
 
     let mut realm_configs = BTreeMap::new();
+    let mut lifecycle_cache: BTreeMap<String, bool> = BTreeMap::new();
     let mut registry_cache: BTreeMap<Ulid, Option<MetadataRegistryRecord>> = BTreeMap::new();
     let mut status_cache: BTreeMap<Ulid, Option<MetadataMaterializationStatusRecord>> =
         BTreeMap::new();
     let mut writes = Vec::new();
+    let mut repair_deletes = Vec::new();
+    let mut repaired_records = Vec::new();
     let mut outboxes = Vec::new();
     let mut needs_materialization_drain = false;
     let mut projected = 0usize;
     let mut projected_records = Vec::new();
 
     for event in events {
-        let event = expand_create_event_holders_cached(context, event, &mut realm_configs).await?;
         let document_id = event.record.document_id;
+        if metadata_graph_deleted_cached(context, &event.record.graph_iri, &mut lifecycle_cache)
+            .await?
+        {
+            let existing_registry = match registry_cache.get(&document_id) {
+                Some(record) => record.clone(),
+                None => {
+                    let record = read_existing_registry(context, document_id).await?;
+                    registry_cache.insert(document_id, None);
+                    record
+                }
+            };
+            let stale_record = existing_registry.as_ref().unwrap_or(&event.record);
+            repair_deletes.extend(metadata_registry_delete_entries(
+                stale_record.group_id,
+                stale_record.document_id,
+            ));
+            repaired_records.push(stale_record.clone());
+            registry_cache.insert(document_id, None);
+            status_cache.insert(document_id, None);
+            continue;
+        }
+
+        let event =
+            expand_create_event_holders_cached(context, event, local_node_id, &mut realm_configs)
+                .await?;
         let existing_registry = match registry_cache.get(&document_id) {
             Some(record) => record.clone(),
             None => {
@@ -276,6 +347,38 @@ pub async fn project_metadata_create_events(
         projected = projected.saturating_add(1);
     }
 
+    if !repair_deletes.is_empty() {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchDelete {
+                deletes: repair_deletes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => {
+                return Err(MetadataProjectionError::UnexpectedEvent(format!(
+                    "{other:?}"
+                )));
+            }
+        }
+        if let Some(metadata_handle) = context.metadata_handle.as_ref() {
+            for record in &repaired_records {
+                metadata_handle.remove_visible_registry_record(record.document_id);
+                metadata_handle.remove_cached_accepted_create(record.document_id);
+            }
+        }
+        for record in &repaired_records {
+            crate::metadata::visible_registry::remove_visible_registry_record(
+                context,
+                record.group_id,
+                record.document_id,
+            );
+        }
+    }
+
     if !writes.is_empty() {
         match context
             .storage_handle
@@ -313,56 +416,59 @@ pub async fn project_metadata_create_events(
 
 async fn expand_create_event_holders_cached(
     context: &DriverContext,
-    mut event: MetadataCreateEventRecord,
+    event: MetadataCreateEventRecord,
+    local_node_id: Option<NodeId>,
     realm_configs: &mut BTreeMap<RealmId, Option<RealmConfigDocument>>,
 ) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
-    event.record.last_event_id = event.event_id;
-    let realm_id = event.record.realm_id;
-    let realm_config = match realm_configs.get(&realm_id) {
-        Some(config) => config.clone(),
-        None => {
-            let config = read_realm_config(context, realm_id).await?;
-            realm_configs.insert(realm_id, config.clone());
-            config
+    let realm_config = if local_node_id == Some(event.node_id) {
+        let realm_id = event.record.realm_id;
+        match realm_configs.get(&realm_id) {
+            Some(config) => config.clone(),
+            None => {
+                let config = read_realm_config(context, realm_id).await?;
+                realm_configs.insert(realm_id, config.clone());
+                config
+            }
         }
-    };
-    let Some(realm_config) = realm_config else {
-        sort_node_ids(&mut event.record.holder_node_ids);
-        if !event.record.holder_node_ids.contains(&event.node_id) {
-            event.record.holder_node_ids.push(event.node_id);
-            sort_node_ids(&mut event.record.holder_node_ids);
-        }
-        return Ok(event);
+    } else {
+        None
     };
 
-    let target = DocumentSyncTarget::MetadataCreateEvent {
-        document_id: event.record.document_id,
-        event_id: event.event_id,
-    };
-    let desired_holder_count = realm_config.metadata_replication_factor_for(
-        event.record.group_id,
-        Some(event.record.document_path.as_str()),
-    );
+    expand_create_event_holders(event, local_node_id, realm_config.as_ref())
+}
+
+fn expand_create_event_holders(
+    mut event: MetadataCreateEventRecord,
+    local_node_id: Option<NodeId>,
+    realm_config: Option<&RealmConfigDocument>,
+) -> Result<MetadataCreateEventRecord, MetadataProjectionError> {
+    event.record.last_event_id = event.event_id;
     let mut holders = event.record.holder_node_ids.clone();
     if !holders.contains(&event.node_id) {
         holders.push(event.node_id);
     }
     sort_node_ids(&mut holders);
 
-    if holders.len() < desired_holder_count {
-        let candidates = realm_config.node_ids()?;
-        let mut additional = select_sync_peers(
-            &target,
-            event.node_id,
-            &candidates,
-            &holders,
-            desired_holder_count.saturating_sub(holders.len()),
-        );
-        holders.append(&mut additional);
-        sort_node_ids(&mut holders);
-    }
+    let Some(realm_config) = realm_config else {
+        event.record.holder_node_ids = holders;
+        return Ok(event);
+    };
+    if local_node_id != Some(event.node_id) {
+        event.record.holder_node_ids = holders;
+        return Ok(event);
+    };
 
-    event.record.holder_node_ids = holders;
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: event.record.document_id,
+    };
+    let desired_holder_count = realm_config.metadata_replication_factor_for(
+        event.record.group_id,
+        Some(event.record.document_path.as_str()),
+    );
+    let candidates = realm_config.node_ids()?;
+
+    event.record.holder_node_ids =
+        complete_authoritative_holders(&target, &candidates, &holders, desired_holder_count);
     Ok(event)
 }
 
@@ -388,18 +494,62 @@ async fn read_realm_config(
 }
 
 pub fn create_event_outbox_record(event: &MetadataCreateEventRecord) -> DocumentSyncOutboxRecord {
+    let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+        event: Box::new(event.clone()),
+    };
     DocumentSyncOutboxRecord {
         outbox_id: event.event_id,
         node_id: event.node_id,
-        target: DocumentSyncTarget::MetadataCreateEvent {
+        target: DocumentSyncTarget::MetadataDocumentLifecycle {
             document_id: event.record.document_id,
-            event_id: event.event_id,
         },
         peers: event.record.holder_node_ids.clone(),
         event: DocumentSyncOutboxEvent::Upsert {
-            bytes: postcard::to_allocvec(event).expect("metadata create event serializes"),
+            bytes: postcard::to_allocvec(&lifecycle)
+                .expect("metadata document lifecycle event serializes"),
         },
         updated_at: event.occurred_at_ms / 1_000,
+    }
+}
+
+async fn metadata_graph_deleted_cached(
+    context: &DriverContext,
+    graph_iri: &str,
+    lifecycle_cache: &mut BTreeMap<String, bool>,
+) -> Result<bool, MetadataProjectionError> {
+    if let Some(deleted) = lifecycle_cache.get(graph_iri) {
+        return Ok(*deleted);
+    }
+    let deleted = metadata_graph_deleted(context, graph_iri).await?;
+    lifecycle_cache.insert(graph_iri.to_string(), deleted);
+    Ok(deleted)
+}
+
+async fn metadata_graph_deleted(
+    context: &DriverContext,
+    graph_iri: &str,
+) -> Result<bool, MetadataProjectionError> {
+    match context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+            key: metadata_graph_lifecycle_key(graph_iri),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(value), ..
+        }) => {
+            let record: MetadataGraphLifecycleRecord =
+                postcard::from_bytes(&value).map_err(ConversionError::from)?;
+            Ok(record.is_deleted())
+        }
+        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(false),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataProjectionError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
     }
 }
 
@@ -411,9 +561,13 @@ fn audit_record(event: &MetadataCreateEventRecord) -> MetadataAuditRecord {
         graph_iri: event.record.graph_iri.clone(),
         user_id: event.user_id,
         node_id: event.node_id,
-        operation: MetadataAuditOperation::Create,
+        operation: event.payload.audit_operation(),
         occurred_at_ms: event.occurred_at_ms,
-        details: Some(format!("holders={}", event.record.holder_node_ids.len())),
+        details: Some(format!(
+            "kind={} holders={}",
+            event.payload.materialization_kind(),
+            event.record.holder_node_ids.len()
+        )),
     }
 }
 
@@ -496,5 +650,131 @@ async fn schedule_materialization_drain(
         other => Err(MetadataProjectionError::UnexpectedEvent(format!(
             "{other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::metadata::{MetadataCreateEventPayload, MetadataDocumentLifecycleRecord};
+    use aruna_core::structs::{RealmConfigDocument, RealmId, RealmNodeKind};
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn create_event() -> MetadataCreateEventRecord {
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let group_id = Ulid::new();
+        let document_id = Ulid::new();
+        let event_id = Ulid::new();
+        let document_path = "datasets/outbox-lifecycle";
+        let record = MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: document_path.to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                document_path,
+                document_id,
+            ),
+            holder_node_ids: vec![node(2)],
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            last_event_id: event_id,
+        };
+        MetadataCreateEventRecord {
+            event_id,
+            record,
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            node_id: node(1),
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: "Lifecycle Outbox".to_string(),
+                description: "Projector outbox envelope".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+            occurred_at_ms: 1_000,
+        }
+    }
+
+    fn realm_config(realm_id: RealmId, nodes: &[NodeId]) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        for node in nodes {
+            config.ensure_node(*node, RealmNodeKind::Server);
+        }
+        config
+    }
+
+    #[test]
+    fn metadata_origin_expands_holders_with_rendezvous() {
+        let mut event = create_event();
+        event.node_id = node(1);
+        event.record.holder_node_ids = vec![node(1)];
+        let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
+
+        let expanded =
+            expand_create_event_holders(event.clone(), Some(event.node_id), Some(&config))
+                .expect("holders expand");
+
+        assert_eq!(expanded.record.holder_node_ids.len(), 3);
+        assert!(expanded.record.holder_node_ids.contains(&event.node_id));
+        assert_eq!(expanded.record.last_event_id, event.event_id);
+    }
+
+    #[test]
+    fn metadata_recipient_preserves_authoritative_holders() {
+        let mut event = create_event();
+        event.node_id = node(1);
+        event.record.holder_node_ids = vec![node(3), node(1), node(3)];
+        let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
+
+        let expanded = expand_create_event_holders(event, Some(node(2)), Some(&config))
+            .expect("holders normalize");
+
+        assert_eq!(expanded.record.holder_node_ids, vec![node(1), node(3)]);
+    }
+
+    #[test]
+    fn metadata_recipient_does_not_expand_single_holder_legacy_event() {
+        let mut event = create_event();
+        event.node_id = node(1);
+        event.record.holder_node_ids.clear();
+        let config = realm_config(event.record.realm_id, &[node(1), node(2), node(3), node(4)]);
+
+        let expanded = expand_create_event_holders(event, Some(node(2)), Some(&config))
+            .expect("holders normalize");
+
+        assert_eq!(expanded.record.holder_node_ids, vec![node(1)]);
+    }
+
+    #[test]
+    fn create_event_outbox_record_uses_document_lifecycle_stream() {
+        let event = create_event();
+        let outbox = create_event_outbox_record(&event);
+
+        assert_eq!(outbox.outbox_id, event.event_id);
+        assert_eq!(outbox.peers, event.record.holder_node_ids);
+        assert_eq!(
+            outbox.target,
+            DocumentSyncTarget::MetadataDocumentLifecycle {
+                document_id: event.record.document_id
+            }
+        );
+        let DocumentSyncOutboxEvent::Upsert { bytes } = outbox.event else {
+            panic!("expected lifecycle upsert outbox event");
+        };
+        let lifecycle: MetadataDocumentLifecycleRecord =
+            postcard::from_bytes(&bytes).expect("lifecycle payload decodes");
+        assert_eq!(
+            lifecycle,
+            MetadataDocumentLifecycleRecord::Upsert {
+                event: Box::new(event.clone())
+            }
+        );
     }
 }

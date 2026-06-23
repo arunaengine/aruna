@@ -3,18 +3,21 @@ use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
-    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE,
-    METADATA_INDEX_KEYSPACE,
+    METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE,
+    METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE, METADATA_MATERIALIZATION_STATUS_KEYSPACE,
 };
+use aruna_core::metadata::MetadataDocumentLifecycleRecord;
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataGraphLifecycleRecord, MetadataMaterializationJobRecord,
     MetadataMaterializationStatusRecord,
 };
 pub use aruna_core::storage_entries::{
-    metadata_create_event_write_entry, metadata_document_key, metadata_graph_lifecycle_key,
-    metadata_graph_lifecycle_write_entry, metadata_materialization_job_key,
-    metadata_materialization_job_write_entry, metadata_materialization_status_key,
-    metadata_materialization_status_write_entry, metadata_registry_key, metadata_registry_prefix,
+    metadata_create_event_write_entry, metadata_document_key,
+    metadata_document_lifecycle_write_entry, metadata_graph_lifecycle_key,
+    metadata_graph_lifecycle_write_entry, metadata_materialization_document_job_write_entry,
+    metadata_materialization_job_key, metadata_materialization_job_write_entry,
+    metadata_materialization_status_key, metadata_materialization_status_write_entry,
+    metadata_registry_key, metadata_registry_prefix,
 };
 use aruna_core::structs::{MetadataAuditRecord, MetadataRegistryRecord};
 use aruna_core::types::{Effects, GroupId, Key, TxnId};
@@ -47,6 +50,22 @@ pub fn read_registry_by_document_effect(document_id: Ulid, txn_id: Option<TxnId>
     Effect::Storage(StorageEffect::Read {
         key_space: METADATA_DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
+        txn_id,
+    })
+}
+
+pub fn read_materialization_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: METADATA_MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+        key: metadata_materialization_status_key(document_id),
+        txn_id,
+    })
+}
+
+pub fn read_graph_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        key: metadata_graph_lifecycle_key(graph_iri),
         txn_id,
     })
 }
@@ -144,6 +163,19 @@ pub fn write_graph_lifecycle_effect(
     }))
 }
 
+pub fn write_document_lifecycle_effect(
+    record: &MetadataDocumentLifecycleRecord,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    let (key_space, key, value) = metadata_document_lifecycle_write_entry(record)?;
+    Ok(Effect::Storage(StorageEffect::Write {
+        key_space,
+        key,
+        value,
+        txn_id,
+    }))
+}
+
 pub fn delete_holders_effect(
     group_id: GroupId,
     document_id: Ulid,
@@ -169,16 +201,23 @@ pub fn write_audit_effect(
     }))
 }
 
-pub fn write_create_event_effect(
+pub fn write_metadata_event_effect(
     event: &MetadataCreateEventRecord,
+    txn_id: Option<TxnId>,
 ) -> Result<Effect, ConversionError> {
     let (key_space, key, value) = metadata_create_event_write_entry(event)?;
     Ok(Effect::Storage(StorageEffect::Write {
         key_space,
         key,
         value,
-        txn_id: None,
+        txn_id,
     }))
+}
+
+pub fn write_create_event_effect(
+    event: &MetadataCreateEventRecord,
+) -> Result<Effect, ConversionError> {
+    write_metadata_event_effect(event, None)
 }
 
 pub fn write_create_records_effect(
@@ -279,12 +318,68 @@ pub fn create_records_outbox_and_materialization_write_entries(
     writes.push(metadata_materialization_job_write_entry(
         materialization_job,
     )?);
+    writes.push(metadata_materialization_document_job_write_entry(
+        materialization_job,
+    )?);
+    Ok(writes)
+}
+
+pub fn metadata_event_projection_write_entries(
+    event: &MetadataCreateEventRecord,
+    audit: &MetadataAuditRecord,
+    outbox: Option<&DocumentSyncOutboxRecord>,
+    materialization_status: &MetadataMaterializationStatusRecord,
+    materialization_job: &MetadataMaterializationJobRecord,
+) -> Result<Vec<(String, ByteView, ByteView)>, ConversionError> {
+    let mut writes = vec![metadata_create_event_write_entry(event)?];
+    writes.extend(create_records_outbox_and_materialization_write_entries(
+        &event.record,
+        audit,
+        event.event_id,
+        outbox,
+        materialization_status,
+        materialization_job,
+    )?);
     Ok(writes)
 }
 
 pub fn parse_registry_read(
     event: Event,
 ) -> Result<Option<MetadataRegistryRecord>, StorageReadError> {
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| {
+                postcard::from_bytes(&bytes)
+                    .map_err(|error| StorageReadError::Conversion(error.into()))
+            })
+            .transpose(),
+        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
+        _ => Err(StorageReadError::Storage(
+            aruna_core::errors::StorageError::ReadError,
+        )),
+    }
+}
+
+pub fn parse_materialization_status_read(
+    event: Event,
+) -> Result<Option<MetadataMaterializationStatusRecord>, StorageReadError> {
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
+            .map(|bytes| {
+                postcard::from_bytes(&bytes)
+                    .map_err(|error| StorageReadError::Conversion(error.into()))
+            })
+            .transpose(),
+        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
+        _ => Err(StorageReadError::Storage(
+            aruna_core::errors::StorageError::ReadError,
+        )),
+    }
+}
+
+pub fn parse_graph_lifecycle_read(
+    event: Event,
+) -> Result<Option<MetadataGraphLifecycleRecord>, StorageReadError> {
     match event {
         Event::Storage(StorageEvent::ReadResult { value, .. }) => value
             .map(|bytes| {
