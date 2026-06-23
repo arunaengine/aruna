@@ -429,3 +429,270 @@ impl Operation for UpdateMetadataDocumentOperation {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
+    use aruna_core::keyspaces::{
+        DOCUMENT_SYNC_OUTBOX_KEYSPACE, METADATA_AUDIT_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_EVENT_LOG_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE, METADATA_MATERIALIZATION_JOB_KEYSPACE,
+        METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+    };
+    use aruna_core::storage_entries::metadata_registry_key;
+    use aruna_core::structs::{Actor, RealmId};
+
+    fn actor() -> Actor {
+        let realm_id = RealmId::from_bytes([9u8; 32]);
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+            user_id: aruna_core::UserId::local(Ulid::new(), realm_id),
+            realm_id,
+        }
+    }
+
+    fn record(actor: &Actor) -> MetadataRegistryRecord {
+        let group_id = Ulid::new();
+        let document_id = Ulid::new();
+        let document_path = "datasets/update-atomicity";
+        MetadataRegistryRecord {
+            realm_id: actor.realm_id,
+            group_id,
+            document_id,
+            document_path: document_path.to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: false,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &actor.realm_id,
+                group_id,
+                document_path,
+                document_id,
+            ),
+            holder_node_ids: vec![actor.node_id],
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_event_id: Ulid::from_parts(1, 1),
+        }
+    }
+
+    fn replace_jsonld(document_id: Ulid, name: &str) -> String {
+        format!(
+            r#"{{
+  "@context": "https://w3id.org/ro/crate/1.2/context",
+  "@graph": [
+    {{
+      "@id": "ro-crate-metadata.json",
+      "@type": "CreativeWork",
+      "conformsTo": {{"@id": "https://w3id.org/ro/crate/1.2"}},
+      "about": {{"@id": "https://w3id.org/aruna/{document_id}"}}
+    }},
+    {{
+      "@id": "https://w3id.org/aruna/{document_id}",
+      "@type": "Dataset",
+      "name": "{name}",
+      "description": "Updated atomically",
+      "datePublished": "2026-01-01",
+      "license": {{"@id": "https://creativecommons.org/licenses/by/4.0/"}}
+    }}
+  ]
+}}"#
+        )
+    }
+
+    fn config(
+        actor: Actor,
+        record: &MetadataRegistryRecord,
+        mutation: UpdateMetadataDocumentMutation,
+    ) -> UpdateMetadataDocumentConfig {
+        UpdateMetadataDocumentConfig {
+            actor,
+            group_id: record.group_id,
+            document_id: record.document_id,
+            public: true,
+            mutation,
+        }
+    }
+
+    fn registry_read(record: &MetadataRegistryRecord) -> Event {
+        Event::Storage(StorageEvent::ReadResult {
+            key: metadata_registry_key(record.group_id, record.document_id),
+            value: Some(postcard::to_allocvec(record).unwrap().into()),
+        })
+    }
+
+    fn assert_no_graph_mutation_or_sync(effects: &[Effect]) {
+        for effect in effects {
+            match effect {
+                Effect::Metadata(MetadataEffect::ApplyRoCrate { .. })
+                | Effect::Metadata(MetadataEffect::UpsertDataEntity { .. })
+                | Effect::Metadata(MetadataEffect::UpsertContextualEntity { .. })
+                | Effect::Metadata(MetadataEffect::SyncGraphBestEffort { .. }) => {
+                    panic!("unexpected graph mutation or sync effect: {effect:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn assert_start_transaction(effects: &[Effect]) {
+        let [Effect::Storage(StorageEffect::StartTransaction { read: false })] = effects else {
+            panic!("expected write transaction start, got {effects:?}");
+        };
+    }
+
+    fn assert_update_batch(
+        effects: &[Effect],
+        txn_id: TxnId,
+        expected_payload: impl FnOnce(&MetadataCreateEventPayload) -> bool,
+    ) -> MetadataCreateEventRecord {
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects
+        else {
+            panic!("expected update batch write, got {effects:?}");
+        };
+        assert_eq!(*write_txn_id, txn_id);
+        for keyspace in [
+            METADATA_EVENT_LOG_KEYSPACE,
+            METADATA_INDEX_KEYSPACE,
+            METADATA_DOCUMENT_INDEX_KEYSPACE,
+            METADATA_AUDIT_KEYSPACE,
+            DOCUMENT_SYNC_OUTBOX_KEYSPACE,
+            METADATA_MATERIALIZATION_STATUS_KEYSPACE,
+            METADATA_MATERIALIZATION_JOB_KEYSPACE,
+            METADATA_MATERIALIZATION_DOCUMENT_JOB_KEYSPACE,
+        ] {
+            assert!(
+                writes
+                    .iter()
+                    .any(|(entry_keyspace, _, _)| entry_keyspace == keyspace),
+                "missing keyspace {keyspace} in update batch: {writes:?}"
+            );
+        }
+        let event = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == METADATA_EVENT_LOG_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<MetadataCreateEventRecord>(value)
+                    .expect("update event decodes")
+            })
+            .expect("event log write exists");
+        assert!(expected_payload(&event.payload));
+        let outbox = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+            .map(|(_, _, value)| {
+                postcard::from_bytes::<DocumentSyncOutboxRecord>(value)
+                    .expect("outbox record decodes")
+            })
+            .expect("outbox write exists");
+        assert_eq!(outbox.outbox_id, event.event_id);
+        assert!(matches!(
+            outbox.event,
+            DocumentSyncOutboxEvent::Upsert { .. }
+        ));
+        event
+    }
+
+    #[test]
+    fn replace_rocrate_validates_and_commits_update_intent_before_craqle_mutation() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::new();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: replace_jsonld(record.document_id, "Atomic Replace"),
+            },
+        ));
+
+        assert_no_graph_mutation_or_sync(operation.start().as_slice());
+        let effects = operation.step(registry_read(&record));
+        let [Effect::Metadata(MetadataEffect::ValidateRoCrate { request })] = effects.as_slice()
+        else {
+            panic!("expected RO-Crate validation before transaction, got {effects:?}");
+        };
+        assert_eq!(request.graph_iri, record.graph_iri);
+
+        let effects = operation.step(Event::Metadata(MetadataEvent::ValidationResult {
+            graph_iri: record.graph_iri.clone(),
+        }));
+        assert_start_transaction(effects.as_slice());
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_update_batch(effects.as_slice(), txn_id, |payload| {
+            matches!(payload, MetadataCreateEventPayload::ReplaceRoCrate { .. })
+        });
+    }
+
+    #[test]
+    fn entity_upsert_appends_durable_update_event_before_materialization() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::new();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::UpsertDataEntity {
+                jsonld: r#"{"@id":"./data/file.txt","@type":"File","name":"file.txt"}"#.to_string(),
+            },
+        ));
+
+        operation.start();
+        let effects = operation.step(registry_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert_start_transaction(effects.as_slice());
+
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let event = assert_update_batch(effects.as_slice(), txn_id, |payload| {
+            matches!(payload, MetadataCreateEventPayload::UpsertDataEntity { .. })
+        });
+        assert_eq!(event.record.last_event_id, event.event_id);
+    }
+
+    #[test]
+    fn commit_failure_does_not_mutate_or_sync_graph() {
+        let actor = actor();
+        let record = record(&actor);
+        let txn_id = Ulid::new();
+        let mut operation = UpdateMetadataDocumentOperation::new(config(
+            actor,
+            &record,
+            UpdateMetadataDocumentMutation::ReplaceRoCrate {
+                jsonld: replace_jsonld(record.document_id, "Commit Failure"),
+            },
+        ));
+
+        assert_no_graph_mutation_or_sync(operation.start().as_slice());
+        let effects = operation.step(registry_read(&record));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(Event::Metadata(MetadataEvent::ValidationResult {
+            graph_iri: record.graph_iri.clone(),
+        }));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
+        }));
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+
+        let effects = operation.step(Event::Storage(StorageEvent::Error {
+            error: aruna_core::errors::StorageError::WriteError,
+        }));
+
+        assert_no_graph_mutation_or_sync(effects.as_slice());
+        assert!(operation.is_complete());
+        assert_eq!(
+            operation.finalize(),
+            Err(UpdateMetadataDocumentError::StorageError(
+                aruna_core::errors::StorageError::WriteError
+            ))
+        );
+    }
+}
