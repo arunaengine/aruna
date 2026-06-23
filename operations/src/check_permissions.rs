@@ -398,7 +398,7 @@ mod test {
     use std::collections::{HashMap, HashSet};
 
     use aruna_core::UserId;
-    use aruna_core::structs::{Actor, Permission, RealmId};
+    use aruna_core::structs::{Actor, AuthContext, PathRestriction, Permission, RealmId};
     use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
@@ -440,6 +440,41 @@ mod test {
 
         let path = format!("/abcd/g/{}", Ulid::new().to_string());
         assert!(CheckPermissionsOperation::parse_path(&path).is_err());
+    }
+
+    #[test]
+    fn path_restrictions_enforce_whitelist_and_required_permission() {
+        let realm_id = RealmId([0u8; 32]);
+        let group_id = Ulid::new();
+        let pattern = format!("/{realm_id}/g/{group_id}/meta/**");
+        let mut operation = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: AuthContext {
+                user_id: UserId::local(Ulid::new(), realm_id),
+                realm_id,
+                path_restrictions: Some(vec![PathRestriction {
+                    pattern: pattern.clone(),
+                    permission: Permission::READ,
+                }]),
+            },
+            path: format!("/{realm_id}/g/{group_id}/meta/document"),
+            required_permission: Permission::READ,
+        });
+
+        assert!(operation.check_path_restrictions().unwrap());
+
+        operation.config.path = format!("/{realm_id}/g/{group_id}/data/document");
+        assert!(!operation.check_path_restrictions().unwrap());
+
+        operation.config.path = format!("/{realm_id}/g/{group_id}/meta/document");
+        operation.config.required_permission = Permission::WRITE;
+        assert!(!operation.check_path_restrictions().unwrap());
+
+        operation.config.required_permission = Permission::READ;
+        operation.config.auth_context.path_restrictions = Some(vec![PathRestriction {
+            pattern,
+            permission: Permission::DENY,
+        }]);
+        assert!(!operation.check_path_restrictions().unwrap());
     }
 
     #[tokio::test]

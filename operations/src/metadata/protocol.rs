@@ -157,6 +157,18 @@ mod tests {
     }
 
     #[test]
+    fn bearer_auth_token_round_trips_through_postcard() {
+        let token = MetadataAuthToken::bearer("bearer-token").unwrap();
+        let bytes = postcard::to_allocvec(&token).unwrap();
+
+        let decoded = postcard::from_bytes::<MetadataAuthToken>(&bytes).unwrap();
+
+        assert_eq!(decoded, token);
+        let MetadataAuthToken::Bearer(bearer) = decoded;
+        assert_eq!(bearer.as_str(), "bearer-token");
+    }
+
+    #[test]
     fn oversized_bearer_tokens_are_rejected_on_decode() {
         #[derive(Serialize)]
         enum RawAuthToken {

@@ -3883,7 +3883,7 @@ mod tests {
     use aruna_core::UserId;
     use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
     use aruna_core::keyspaces::API_STATE_KEYSPACE;
-    use aruna_core::structs::{RealmId, TokenClaims};
+    use aruna_core::structs::{PathRestriction, RealmId, TokenClaims};
     use aruna_storage::{FjallStorage, StorageHandle};
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
@@ -3931,6 +3931,36 @@ mod tests {
 
         assert_eq!(auth.user_id, user_id);
         assert_eq!(auth.realm_id, realm_id);
+    }
+
+    #[tokio::test]
+    async fn remote_metadata_auth_preserves_path_restrictions() {
+        let (realm_signing_key, realm_id, user_id) = realm_fixture();
+        let restrictions = vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{}/meta/**", Ulid::new()),
+            permission: Permission::READ,
+        }];
+        let mut claims = token_claims(realm_id, user_id);
+        claims.restrictions = Some(restrictions.clone());
+        let token = sign_token(&realm_signing_key, &claims);
+        let (_dir, storage) = auth_storage();
+        persist_auth_state(
+            &storage,
+            TRUSTED_REALMS_LIST_KEY,
+            &HashSet::from([realm_id]),
+        )
+        .await;
+        let state = MetadataAuthValidationState::new(storage);
+
+        let auth =
+            remote_metadata_auth_context(&state, Some(MetadataAuthToken::bearer(token).unwrap()))
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(auth.user_id, user_id);
+        assert_eq!(auth.realm_id, realm_id);
+        assert_eq!(auth.path_restrictions, Some(restrictions));
     }
 
     #[tokio::test]

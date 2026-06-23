@@ -9,7 +9,7 @@ use base64::Engine;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::{Signer, SigningKey};
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode, errors::ErrorKind};
 use std::collections::HashSet;
 use ulid::Ulid;
 
@@ -56,6 +56,29 @@ async fn rejects_revoked_token_by_shared_hash() {
         .unwrap_err();
 
     assert!(matches!(error, ArunaBearerTokenError::TokenRevoked));
+}
+
+#[tokio::test]
+async fn rejects_expired_token() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let mut claims = token_claims(realm_id, user_id);
+    claims.iat = now.saturating_sub(7200);
+    claims.exp = now.saturating_sub(3600);
+    let token = sign_token(&realm_signing_key, &claims);
+    let state = trusted_state(realm_id);
+
+    let error = validate_aruna_bearer_token(&state, &token)
+        .await
+        .unwrap_err();
+
+    match error {
+        ArunaBearerTokenError::Expired => {}
+        ArunaBearerTokenError::JwtError(error) => {
+            assert!(matches!(error.kind(), ErrorKind::ExpiredSignature));
+        }
+        other => panic!("unexpected expired token error: {other:?}"),
+    }
 }
 
 #[tokio::test]
