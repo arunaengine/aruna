@@ -394,3 +394,204 @@ async fn metadata_graph_deleted(
     }
 }
 
+async fn write_graph_prune_job(
+    storage: &StorageHandle,
+    job: &MetadataGraphPruneJobRecord,
+) -> Result<(), MetadataGraphPruneQueueError> {
+    let (key_space, key, value) = metadata_graph_prune_job_write_entry(job)?;
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space,
+            key,
+            value,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+async fn reschedule_graph_prune_job(
+    storage: &StorageHandle,
+    old_keys: &[Vec<u8>],
+    job: &MetadataGraphPruneJobRecord,
+    error: String,
+) -> Result<(), MetadataGraphPruneQueueError> {
+    let attempts = job.attempts.saturating_add(1);
+    let next_job = MetadataGraphPruneJobRecord {
+        graph_iri: job.graph_iri.clone(),
+        due_at_ms: unix_timestamp_millis().saturating_add(retry_after_ms(attempts)),
+        attempts,
+        last_error: Some(error),
+    };
+    let write = metadata_graph_prune_job_write_entry(&next_job)?;
+    let next_key = write.1.to_vec();
+    let deletes = old_keys
+        .iter()
+        .filter(|key| key.as_slice() != next_key.as_slice())
+        .map(|key| {
+            (
+                METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                ByteView::from(key.clone()),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let txn_id = start_write_transaction(storage).await?;
+    let result = async {
+        transactional_batch_write(storage, txn_id, vec![write]).await?;
+        transactional_batch_delete(storage, txn_id, deletes).await
+    }
+    .await;
+    match result {
+        Ok(()) => commit_storage_transaction(storage, txn_id).await,
+        Err(error) => {
+            abort_storage_transaction_best_effort(storage, txn_id).await;
+            Err(error)
+        }
+    }
+}
+
+async fn delete_graph_prune_jobs(
+    storage: &StorageHandle,
+    keys: Vec<Vec<u8>>,
+) -> Result<(), MetadataGraphPruneQueueError> {
+    let deletes = keys
+        .into_iter()
+        .map(|key| {
+            (
+                METADATA_GRAPH_PRUNE_JOB_KEYSPACE.to_string(),
+                ByteView::from(key),
+            )
+        })
+        .collect::<Vec<_>>();
+    transactional_batch_delete_no_txn(storage, deletes).await
+}
+
+fn retry_after_ms(attempts: u32) -> u64 {
+    let shift = attempts.min(7);
+    let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    PRUNE_RETRY_BASE_MS
+        .saturating_mul(multiplier)
+        .min(PRUNE_RETRY_MAX_MS)
+}
+
+async fn start_write_transaction(
+    storage: &StorageHandle,
+) -> Result<Ulid, MetadataGraphPruneQueueError> {
+    match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+async fn commit_storage_transaction(
+    storage: &StorageHandle,
+    txn_id: Ulid,
+) -> Result<(), MetadataGraphPruneQueueError> {
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+async fn abort_storage_transaction_best_effort(storage: &StorageHandle, txn_id: Ulid) {
+    match storage
+        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionAborted { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            warn!(error = %error, txn_id = %txn_id, "Failed to abort metadata graph prune transaction");
+        }
+        other => {
+            warn!(event = ?other, txn_id = %txn_id, "Unexpected metadata graph prune transaction abort result");
+        }
+    }
+}
+
+async fn transactional_batch_write(
+    storage: &StorageHandle,
+    txn_id: Ulid,
+    writes: Vec<(String, ByteView, ByteView)>,
+) -> Result<(), MetadataGraphPruneQueueError> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+    match storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+async fn transactional_batch_delete(
+    storage: &StorageHandle,
+    txn_id: Ulid,
+    deletes: Vec<(String, ByteView)>,
+) -> Result<(), MetadataGraphPruneQueueError> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    match storage
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+
+async fn transactional_batch_delete_no_txn(
+    storage: &StorageHandle,
+    deletes: Vec<(String, ByteView)>,
+) -> Result<(), MetadataGraphPruneQueueError> {
+    if deletes.is_empty() {
+        return Ok(());
+    }
+    match storage
+        .send_storage_effect(StorageEffect::BatchDelete {
+            deletes,
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+        other => Err(MetadataGraphPruneQueueError::UnexpectedEvent(format!(
+            "{other:?}"
+        ))),
+    }
+}
+

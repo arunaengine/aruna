@@ -2,6 +2,7 @@ mod handle;
 pub mod materialization_queue;
 pub mod projector;
 mod protocol;
+pub mod prune_queue;
 pub mod repository;
 pub mod visible_registry;
 
