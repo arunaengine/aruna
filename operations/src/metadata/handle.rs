@@ -25,12 +25,13 @@ use aruna_net::streams::BiStream;
 use aruna_storage::StorageHandle;
 use async_trait::async_trait;
 use craqle::{
-    ActorId, AllowAllAuthorizer, Batch, CraqleError, CraqleIrokleOptions, CraqleNode,
+    Action as CraqleAction, ActorId, AllowAllAuthorizer, AuthorizationError as CraqleAuthError,
+    Authorizer as CraqleAuthorizer, Batch, CraqleError, CraqleIrokleOptions, CraqleNode,
     CraqleOptions, CraqleRequestDurability, CreateCrateRequest, CreateEntityRequest, GraphId,
     GraphPolicy, QueryResults, RoCrateError, SearchStorage, vocab,
 };
 use oxrdf::{BlankNode, Literal, NamedNode, Term};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::time::{sleep, timeout};
 use tracing::{Instrument, Span, debug_span, field, warn};
 use ulid::Ulid;
@@ -221,6 +222,7 @@ impl MetadataVisibilityCache {
         });
     }
 
+    #[cfg(test)]
     fn lifecycle_deleted(&self, graph_iri: &str) -> Option<bool> {
         match self.lifecycle_deleted_any(graph_iri) {
             Some((deleted, true)) => Some(deleted),
@@ -612,6 +614,15 @@ impl MetadataHandle {
                     },
                 },
             ),
+            MetadataEffect::ListGraphs => {
+                Event::Metadata(match list_visible_graphs(self.inner.clone()).await {
+                    Ok(graph_iris) => MetadataEvent::GraphListResult { graph_iris },
+                    Err(error) => MetadataEvent::Error {
+                        graph_iri: None,
+                        error,
+                    },
+                })
+            }
             other => {
                 let inner = self.inner.clone();
                 let span = debug_span!(
@@ -670,6 +681,9 @@ impl MetadataHandle {
         self.inner
             .visibility_cache
             .store_lifecycle_deleted(graph_iri.clone(), true);
+        if !contains_local_graph(self.inner.node.clone(), graph_iri.clone()).await? {
+            return Ok(true);
+        }
         delete_local_graph(self.inner.node.clone(), graph_iri).await?;
         Ok(true)
     }
@@ -1008,32 +1022,9 @@ async fn metadata_graph_deleted(
     inner: Arc<MetadataInner>,
     graph_iri: &str,
 ) -> Result<MetadataGraphDeletedRead, MetadataError> {
-    if let Some(deleted) = inner.visibility_cache.lifecycle_deleted(graph_iri) {
+    if let Some((true, _)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
         return Ok(MetadataGraphDeletedRead {
-            deleted,
-            cache_hit: true,
-        });
-    }
-
-    let deleted = graph_lifecycle_deleted(inner.storage_handle.clone(), graph_iri).await?;
-    inner
-        .visibility_cache
-        .store_lifecycle_deleted(graph_iri.to_string(), deleted);
-    Ok(MetadataGraphDeletedRead {
-        deleted,
-        cache_hit: false,
-    })
-}
-
-// Read-path variant: serves expired entries instead of blocking on storage;
-// the background visibility fill re-stamps them within one TTL.
-async fn metadata_graph_deleted_allow_stale(
-    inner: &Arc<MetadataInner>,
-    graph_iri: &str,
-) -> Result<MetadataGraphDeletedRead, MetadataError> {
-    if let Some((deleted, _fresh)) = inner.visibility_cache.lifecycle_deleted_any(graph_iri) {
-        return Ok(MetadataGraphDeletedRead {
-            deleted,
+            deleted: true,
             cache_hit: true,
         });
     }
@@ -1060,6 +1051,16 @@ async fn graph_lifecycle_deleted(
 
 async fn delete_local_graph(node: Arc<CraqleNode>, graph_iri: String) -> Result<(), MetadataError> {
     tokio::task::spawn_blocking(move || node.delete_graph_unchecked(&GraphId::new(&graph_iri)))
+        .await
+        .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+        .map_err(metadata_error_from_craqle)
+}
+
+async fn contains_local_graph(
+    node: Arc<CraqleNode>,
+    graph_iri: String,
+) -> Result<bool, MetadataError> {
+    tokio::task::spawn_blocking(move || node.contains_graph(&GraphId::new(&graph_iri)))
         .await
         .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
         .map_err(metadata_error_from_craqle)
@@ -1374,15 +1375,17 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             })
         }
         MetadataEffect::UpsertDataEntity { request } => {
+            let graph_iri = request.graph_iri.clone();
+            let durability = request.durability;
             let call_span = debug_span!(
                 "metadata.backend.craqle.upsert_data_entity",
-                graph_iri = %request.graph_iri,
+                graph_iri = %graph_iri,
                 jsonld_len = request.jsonld.len() as u64,
+                durability = ?durability,
                 elapsed_ms = field::Empty,
                 result = field::Empty,
                 batch_ops = field::Empty,
             );
-            let graph_iri = request.graph_iri.clone();
             let started = Instant::now();
             let result = call_span.in_scope(|| upsert_data_entity(&node, &auth, request));
             let converted = result.map(|batch| {
@@ -1402,15 +1405,17 @@ fn handle_effect(inner: Arc<MetadataInner>, effect: MetadataEffect) -> MetadataE
             converted
         }
         MetadataEffect::UpsertContextualEntity { request } => {
+            let graph_iri = request.graph_iri.clone();
+            let durability = request.durability;
             let call_span = debug_span!(
                 "metadata.backend.craqle.upsert_contextual_entity",
-                graph_iri = %request.graph_iri,
+                graph_iri = %graph_iri,
                 jsonld_len = request.jsonld.len() as u64,
+                durability = ?durability,
                 elapsed_ms = field::Empty,
                 result = field::Empty,
                 batch_ops = field::Empty,
             );
-            let graph_iri = request.graph_iri.clone();
             let started = Instant::now();
             let result = call_span.in_scope(|| upsert_contextual_entity(&node, &auth, request));
             let converted = result.map(|batch| {
@@ -1756,9 +1761,11 @@ fn metadata_effect_persists_irokle(effect: &MetadataEffect) -> bool {
         MetadataEffect::ApplyRoCrate { request } => {
             metadata_request_persists_irokle(request.durability)
         }
-        MetadataEffect::UpsertDataEntity { .. }
-        | MetadataEffect::UpsertContextualEntity { .. }
-        | MetadataEffect::SetGraphPolicy { .. }
+        MetadataEffect::UpsertDataEntity { request }
+        | MetadataEffect::UpsertContextualEntity { request } => {
+            metadata_request_persists_irokle(request.durability)
+        }
+        MetadataEffect::SetGraphPolicy { .. }
         | MetadataEffect::AddGraphPeer { .. }
         | MetadataEffect::DeleteGraph { .. } => true,
         MetadataEffect::SyncGraphBestEffort { .. }
@@ -1781,6 +1788,10 @@ fn metadata_effect_defers_persist(effect: &MetadataEffect) -> bool {
         MetadataEffect::ApplyRoCrate { request } => {
             request.durability == MetadataRequestDurability::WalAlreadyDurable
         }
+        MetadataEffect::UpsertDataEntity { request }
+        | MetadataEffect::UpsertContextualEntity { request } => {
+            request.durability == MetadataRequestDurability::WalAlreadyDurable
+        }
         _ => false,
     }
 }
@@ -1792,6 +1803,10 @@ fn metadata_effect_skips_lifecycle_read(effect: &MetadataEffect) -> bool {
             request.durability == MetadataRequestDurability::WalAlreadyDurable
         }
         MetadataEffect::ApplyRoCrate { request } => {
+            request.durability == MetadataRequestDurability::WalAlreadyDurable
+        }
+        MetadataEffect::UpsertDataEntity { request }
+        | MetadataEffect::UpsertContextualEntity { request } => {
             request.durability == MetadataRequestDurability::WalAlreadyDurable
         }
         _ => false,
@@ -1907,6 +1922,15 @@ fn upsert_data_entity(
     request: MetadataUpsertEntityRequest,
 ) -> Result<MetadataBatch, CraqleError> {
     let graph = GraphId::new(&request.graph_iri);
+    if request.durability == MetadataRequestDurability::WalAlreadyDurable {
+        return upsert_entity_via_rocrate_document(
+            node,
+            auth,
+            graph,
+            request,
+            EntityUpsertKind::Data,
+        );
+    }
     let entity_request = craqle_entity_request(&graph, &request.jsonld)?;
     node.add_data_entity_with(auth, entity_request)
         .map(metadata_batch_from_craqle)
@@ -1918,9 +1942,277 @@ fn upsert_contextual_entity(
     request: MetadataUpsertEntityRequest,
 ) -> Result<MetadataBatch, CraqleError> {
     let graph = GraphId::new(&request.graph_iri);
+    if request.durability == MetadataRequestDurability::WalAlreadyDurable {
+        return upsert_entity_via_rocrate_document(
+            node,
+            auth,
+            graph,
+            request,
+            EntityUpsertKind::Contextual,
+        );
+    }
     let entity_request = craqle_entity_request(&graph, &request.jsonld)?;
     node.add_contextual_entity_with(auth, entity_request)
         .map(metadata_batch_from_craqle)
+}
+
+#[derive(Clone, Copy)]
+enum EntityUpsertKind {
+    Data,
+    Contextual,
+}
+
+fn upsert_entity_via_rocrate_document(
+    node: &CraqleNode,
+    auth: &AllowAllAuthorizer,
+    graph: GraphId,
+    request: MetadataUpsertEntityRequest,
+    kind: EntityUpsertKind,
+) -> Result<MetadataBatch, CraqleError> {
+    let actor = request.deterministic_actor.map(ActorId::from_bytes);
+    let entity_request = craqle_entity_request(&graph, &request.jsonld)?;
+    let jsonld = graph_snapshot_jsonld(node, &graph)?;
+    let merged_jsonld = merge_entity_into_rocrate_jsonld(
+        &graph,
+        &jsonld,
+        &request.jsonld,
+        &entity_request.entity_id,
+        kind,
+    )?;
+    let policy = node.graph_policy(&graph)?;
+    node.apply_rocrate_document_prevalidated_with_policy_and_durability_as(
+        auth,
+        graph,
+        &merged_jsonld,
+        policy,
+        craqle_request_durability(request.durability),
+        actor,
+    )
+    .map(metadata_batch_from_craqle)
+}
+
+fn graph_snapshot_jsonld(node: &CraqleNode, graph: &GraphId) -> Result<String, CraqleError> {
+    let snapshot = node.graph_snapshot(graph)?;
+    let mut by_subject = BTreeMap::<String, Map<String, Value>>::new();
+    for quad in snapshot.quads {
+        let subject_id = encoded_subject_id(&quad.subject)?;
+        let predicate = quad.predicate.to_named_node().ok_or_else(|| {
+            CraqleError::RoCrate(RoCrateError::UnsupportedTerm(quad.predicate.0.clone()))
+        })?;
+        let object = encoded_object_value(&quad.object)?;
+        let entry = by_subject.entry(subject_id.clone()).or_insert_with(|| {
+            Map::from_iter([("@id".to_string(), Value::String(subject_id.clone()))])
+        });
+        insert_jsonld_property(entry, predicate.as_str().to_string(), object);
+    }
+
+    let mut document = Map::new();
+    document.insert(
+        "@graph".to_string(),
+        Value::Array(by_subject.into_values().map(Value::Object).collect()),
+    );
+    serde_json::to_string(&Value::Object(document))
+        .map_err(|error| CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string())))
+}
+
+fn encoded_subject_id(term: &craqle::EncodedTerm) -> Result<String, CraqleError> {
+    match term.to_term() {
+        Some(Term::NamedNode(node)) => Ok(node.as_str().to_string()),
+        Some(Term::BlankNode(node)) => Ok(format!("_:{}", node.as_str())),
+        _ => Err(CraqleError::RoCrate(RoCrateError::UnsupportedTerm(
+            term.0.clone(),
+        ))),
+    }
+}
+
+fn encoded_object_value(term: &craqle::EncodedTerm) -> Result<Value, CraqleError> {
+    match term.to_term() {
+        Some(Term::NamedNode(node)) => Ok(entity_reference_value(node.as_str())),
+        Some(Term::BlankNode(node)) => Ok(entity_reference_value(&format!("_:{}", node.as_str()))),
+        Some(Term::Literal(literal)) => Ok(literal_value(literal)),
+        _ => Err(CraqleError::RoCrate(RoCrateError::UnsupportedTerm(
+            term.0.clone(),
+        ))),
+    }
+}
+
+fn literal_value(literal: Literal) -> Value {
+    if let Some(language) = literal.language() {
+        return Value::Object(Map::from_iter([
+            (
+                "@value".to_string(),
+                Value::String(literal.value().to_string()),
+            ),
+            ("@language".to_string(), Value::String(language.to_string())),
+        ]));
+    }
+    let datatype = literal.datatype();
+    if datatype.as_str() != "http://www.w3.org/2001/XMLSchema#string" {
+        return Value::Object(Map::from_iter([
+            (
+                "@value".to_string(),
+                Value::String(literal.value().to_string()),
+            ),
+            (
+                "@type".to_string(),
+                Value::String(datatype.as_str().to_string()),
+            ),
+        ]));
+    }
+    Value::String(literal.value().to_string())
+}
+
+fn insert_jsonld_property(entry: &mut Map<String, Value>, key: String, value: Value) {
+    match entry.get_mut(&key) {
+        Some(existing) if existing == &value => {}
+        Some(Value::Array(values)) => {
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
+        Some(existing) => {
+            let old = existing.clone();
+            *existing = Value::Array(vec![old, value]);
+        }
+        None => {
+            entry.insert(key, value);
+        }
+    }
+}
+
+fn merge_entity_into_rocrate_jsonld(
+    graph: &GraphId,
+    rocrate_jsonld: &str,
+    entity_jsonld: &str,
+    entity_id: &str,
+    kind: EntityUpsertKind,
+) -> Result<String, CraqleError> {
+    let mut rocrate: Value = serde_json::from_str(rocrate_jsonld).map_err(|error| {
+        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string()))
+    })?;
+    let entity: Value = serde_json::from_str(entity_jsonld).map_err(|error| {
+        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string()))
+    })?;
+    if !entity.is_object() {
+        return Err(CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+            "entity payload must be a JSON object".to_string(),
+        )));
+    }
+
+    let graph_entries = rocrate_graph_entries_mut(&mut rocrate)?;
+    match graph_entries
+        .iter()
+        .position(|entry| graph_entry_id(entry).as_deref() == Some(entity_id))
+    {
+        Some(index) => graph_entries[index] = entity,
+        None => graph_entries.push(entity),
+    }
+    if matches!(kind, EntityUpsertKind::Data) {
+        ensure_root_has_part(graph_entries, graph, entity_id)?;
+    }
+
+    serde_json::to_string(&rocrate)
+        .map_err(|error| CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(error.to_string())))
+}
+
+fn rocrate_graph_entries_mut(rocrate: &mut Value) -> Result<&mut Vec<Value>, CraqleError> {
+    let object = rocrate.as_object_mut().ok_or_else(|| {
+        CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+            "top-level JSON-LD document must be an object".to_string(),
+        ))
+    })?;
+    let graph_key = if object.contains_key("@graph") {
+        "@graph"
+    } else {
+        "graph"
+    };
+    object
+        .get_mut(graph_key)
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            CraqleError::RoCrate(RoCrateError::UnsupportedJsonLd(
+                "RO-Crate import requires a top-level `@graph` array".to_string(),
+            ))
+        })
+}
+
+fn graph_entry_id(entry: &Value) -> Option<String> {
+    entry
+        .as_object()?
+        .get("@id")
+        .or_else(|| entry.as_object()?.get("id"))
+        .and_then(Value::as_str)
+        .map(normalize_entity_id)
+}
+
+fn ensure_root_has_part(
+    graph_entries: &mut [Value],
+    graph: &GraphId,
+    entity_id: &str,
+) -> Result<(), CraqleError> {
+    let root_id = graph.as_str();
+    let Some(root) = graph_entries
+        .iter_mut()
+        .find(|entry| graph_entry_id(entry).as_deref() == Some(root_id))
+        .and_then(Value::as_object_mut)
+    else {
+        return Err(CraqleError::RoCrate(RoCrateError::InvalidGraph(format!(
+            "root entity missing for graph `{root_id}`"
+        ))));
+    };
+    let has_part_key = has_part_key(root);
+    let reference = entity_reference_value(entity_id);
+    match root.get_mut(has_part_key) {
+        Some(value) if entity_reference_contains(value, entity_id) => {}
+        Some(Value::Array(values)) => values.push(reference),
+        Some(value) => {
+            let existing = value.clone();
+            *value = Value::Array(vec![existing, reference]);
+        }
+        None => {
+            root.insert(has_part_key.to_string(), Value::Array(vec![reference]));
+        }
+    }
+    Ok(())
+}
+
+fn has_part_key(root: &Map<String, Value>) -> &'static str {
+    if root.contains_key("hasPart") {
+        "hasPart"
+    } else if root.contains_key("schema:hasPart") {
+        "schema:hasPart"
+    } else if root.contains_key("http://schema.org/hasPart") {
+        "http://schema.org/hasPart"
+    } else if root.contains_key("https://schema.org/hasPart") {
+        "https://schema.org/hasPart"
+    } else {
+        "hasPart"
+    }
+}
+
+fn entity_reference_value(entity_id: &str) -> Value {
+    Value::Object(Map::from_iter([(
+        "@id".to_string(),
+        Value::String(entity_id.to_string()),
+    )]))
+}
+
+fn entity_reference_contains(value: &Value, entity_id: &str) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| entity_reference_contains(value, entity_id)),
+        Value::Object(object) => {
+            object
+                .get("@id")
+                .or_else(|| object.get("id"))
+                .and_then(Value::as_str)
+                .map(normalize_entity_id)
+                .as_deref()
+                == Some(entity_id)
+        }
+        _ => false,
+    }
 }
 
 fn craqle_entity_request(
@@ -2834,7 +3126,6 @@ async fn list_deleted_graph_iris(
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
         registry_records = field::Empty,
         authorized_graphs = field::Empty,
-        readable_groups = field::Empty,
         registry_ms = field::Empty,
         authorization_ms = field::Empty,
         craqle_query_ms = field::Empty,
@@ -2950,7 +3241,6 @@ async fn query_local_graphs(
         graph_filter_count = graph_iris.as_ref().map_or(0, Vec::len) as u64,
         registry_records = field::Empty,
         authorized_graphs = field::Empty,
-        readable_groups = field::Empty,
         registry_ms = field::Empty,
         authorization_ms = field::Empty,
         craqle_search_ms = field::Empty,
@@ -2975,72 +3265,56 @@ async fn search_local_graphs(
     span.record("registry_records", records.len() as u64);
 
     let authorization_started = Instant::now();
-    // Graph-scoped searches keep the eager per-record selection; the
-    // all-metadata path authorizes per hit against the visibility scope.
-    let scope = match graph_iris {
-        Some(graph_iris) => LocalReadScope::Eager(
-            select_authorized_records(inner.clone(), auth_context, records, Some(graph_iris))
-                .await?,
-        ),
-        None => LocalReadScope::Lazy(
-            resolve_graph_visibility_scope(&inner, auth_context, records).await?,
-        ),
-    };
+    let allowed_records =
+        select_authorized_records(inner.clone(), auth_context, records, graph_iris).await?;
     record_elapsed(&span, "authorization_ms", authorization_started);
-    let lazy = match &scope {
-        LocalReadScope::Eager(allowed_records) => {
-            span.record("authorized_graphs", allowed_records.len() as u64);
-            false
-        }
-        LocalReadScope::Lazy(scope) => {
-            span.record("readable_groups", scope.readable_groups.len() as u64);
-            true
-        }
-    };
+    span.record("authorized_graphs", allowed_records.len() as u64);
+
+    if limit == 0 || allowed_records.is_empty() {
+        span.record("result", "ok");
+        span.record("hit_count", 0u64);
+        record_elapsed(&span, "elapsed_ms", total_started);
+        return Ok(Vec::new());
+    }
+
+    let by_graph: HashMap<_, _> = allowed_records
+        .into_iter()
+        .map(|record| (record.graph_iri.clone(), record))
+        .collect();
+    let allowed_graphs = by_graph.keys().cloned().collect::<HashSet<_>>();
 
     let search_span = debug_span!(
         "metadata.backend.craqle.search",
-        lazy,
-        graph_count = field::Empty,
+        lazy = false,
+        graph_count = allowed_graphs.len() as u64,
         query_len = query.len() as u64,
         limit = limit as u64,
         elapsed_ms = field::Empty,
         result = field::Empty,
         hit_count = field::Empty,
     );
-    if let LocalReadScope::Eager(allowed_records) = &scope {
-        search_span.record("graph_count", allowed_records.len() as u64);
-    }
     let blocking_span = search_span.clone();
     let search_started = Instant::now();
     let _permit = inner.craqle_read_permits.clone().acquire_owned().await.ok();
     let result = match tokio::task::spawn_blocking(move || {
         blocking_span.in_scope(|| {
+            let authorizer = AllowedGraphAuthorizer {
+                graph_iris: allowed_graphs,
+            };
+            // Craqle currently lacks a public multi-graph filtered search API;
+            // this is the earliest available authorization hook before its
+            // public search limit, with the Aruna mapping below kept defensive.
             let hits = inner
                 .node
-                .search(&AllowAllAuthorizer, &query, limit)
+                .search(&authorizer, &query, limit)
                 .map_err(|error| MetadataError::Backend(error.to_string()))?;
-            Ok(match scope {
-                LocalReadScope::Eager(allowed_records) => {
-                    let by_graph: HashMap<_, _> = allowed_records
-                        .into_iter()
-                        .map(|record| (record.graph_iri.clone(), record))
-                        .collect();
-                    hits.into_iter()
-                        .filter_map(|hit| by_graph.get(&hit.graph_id).map(|record| (hit, record)))
-                        .map(|(hit, record)| metadata_search_hit_from_craqle(hit, record))
-                        .collect::<Vec<_>>()
-                }
-                LocalReadScope::Lazy(scope) => hits
-                    .into_iter()
-                    .filter_map(|hit| {
-                        scope
-                            .record_for_graph(&hit.graph_id)
-                            .filter(|record| scope.record_visible(&inner.visibility_cache, record))
-                            .map(|record| metadata_search_hit_from_craqle(hit, record))
-                    })
-                    .collect(),
-            })
+            let mut visible = hits
+                .into_iter()
+                .filter_map(|hit| by_graph.get(&hit.graph_id).map(|record| (hit, record)))
+                .map(|(hit, record)| metadata_search_hit_from_craqle(hit, record))
+                .collect::<Vec<_>>();
+            visible.truncate(limit);
+            Ok(visible)
         })
     })
     .await
@@ -3066,6 +3340,50 @@ async fn search_local_graphs(
     warn_if_slow_metadata_backend("search", None, search_elapsed);
     record_elapsed(&span, "elapsed_ms", total_started);
     result
+}
+
+struct AllowedGraphAuthorizer {
+    graph_iris: HashSet<String>,
+}
+
+impl CraqleAuthorizer for AllowedGraphAuthorizer {
+    fn authorize(
+        &self,
+        graph: &GraphId,
+        _policy: &GraphPolicy,
+        action: CraqleAction,
+    ) -> Result<(), CraqleAuthError> {
+        if matches!(action, CraqleAction::Read) && self.graph_iris.contains(graph.as_str()) {
+            return Ok(());
+        }
+
+        Err(CraqleAuthError::PermissionDenied {
+            action,
+            graph: graph.as_str().to_string(),
+        })
+    }
+}
+
+async fn list_visible_graphs(inner: Arc<MetadataInner>) -> Result<Vec<String>, MetadataError> {
+    let graphs = tokio::task::spawn_blocking({
+        let inner = inner.clone();
+        move || inner.node.graphs()
+    })
+    .await
+    .map_err(|error| MetadataError::TaskJoin(error.to_string()))?
+    .map_err(|error| MetadataError::Backend(error.to_string()))?;
+
+    let mut visible = Vec::with_capacity(graphs.len());
+    for graph in graphs {
+        let graph_iri = graph.as_str().to_string();
+        if !metadata_graph_deleted(inner.clone(), &graph_iri)
+            .await?
+            .deleted
+        {
+            visible.push(graph_iri);
+        }
+    }
+    Ok(visible)
 }
 
 async fn select_authorized_graphs(
@@ -3126,7 +3444,7 @@ async fn select_authorized_records(
             filtered_count += 1;
             continue;
         }
-        let deleted = metadata_graph_deleted_allow_stale(&inner, &record.graph_iri).await?;
+        let deleted = metadata_graph_deleted(inner.clone(), &record.graph_iri).await?;
         if deleted.cache_hit {
             lifecycle_cache_hits += 1;
         } else {
