@@ -1,5 +1,7 @@
 #![allow(clippy::result_large_err)]
 
+pub mod admin_document_reducer;
+pub mod admin_documents;
 pub mod alpn;
 pub mod auth;
 pub mod document;
