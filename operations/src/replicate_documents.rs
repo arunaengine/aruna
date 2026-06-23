@@ -138,12 +138,14 @@ impl ReplicateDocumentsOperation {
             return self.emit_next_publish();
         }
         let desired_remote_count = desired_remote_peer_count(desired_count);
+        let mut excluded_peers = self.config.excluded_peers.clone();
+        excluded_peers.push(self.config.local_node_id);
+        sort_node_ids(&mut excluded_peers);
 
         let selected_peers = select_sync_peers(
             &document,
-            self.config.local_node_id,
             &self.realm_nodes,
-            &self.config.excluded_peers,
+            &excluded_peers,
             desired_remote_count,
         );
         self.placement_action = if placement_satisfied(selected_peers.len(), desired_count) {
@@ -152,6 +154,7 @@ impl ReplicateDocumentsOperation {
             Some(PlacementAction::Write(new_placement(
                 self.config.realm_id,
                 document.clone(),
+                self.config.local_node_id,
                 desired_count,
                 selected_peers.clone(),
             )))
@@ -213,6 +216,7 @@ impl ReplicateDocumentsOperation {
         self.placement_action = Some(PlacementAction::Write(new_placement(
             self.config.realm_id,
             target,
+            self.config.local_node_id,
             desired_count,
             Vec::new(),
         )));
@@ -253,7 +257,6 @@ impl Operation for ReplicateDocumentsOperation {
                         Ok(nodes) => nodes,
                         Err(error) => return self.fail(error.into()),
                     };
-                    nodes.retain(|node_id| *node_id != self.config.local_node_id);
                     sort_node_ids(&mut nodes);
                     self.realm_nodes = nodes;
                     self.emit_next_publish()
@@ -378,5 +381,94 @@ mod tests {
             matches!(operation.placement_action, Some(PlacementAction::Delete(ref delete_target)) if *delete_target == target)
         );
         assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    }
+
+    #[test]
+    fn pending_placement_records_authoritative_origin() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = group_target(5);
+        let local_node_id = node(1);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target],
+        });
+        operation.realm_nodes = vec![local_node_id, node(2)];
+
+        let effects = operation.emit_next_publish();
+
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let Some(PlacementAction::Write(record)) = operation.placement_action else {
+            panic!("expected pending placement write");
+        };
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert_eq!(record.selected_peers, vec![node(2)]);
+    }
+
+    #[test]
+    fn publish_failure_keeps_authoritative_origin() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = group_target(6);
+        let local_node_id = node(1);
+        let mut operation = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id,
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+        });
+        operation.state = ReplicateDocumentsState::Publish;
+        operation.placement_action = Some(PlacementAction::Delete(target));
+
+        let effects = operation.step(Event::SubOperation(SubOperationEvent::DocumentSyncResult {
+            result: Err("publish failed".to_string()),
+        }));
+
+        let [Effect::Storage(aruna_core::effects::StorageEffect::Write { value, .. })] =
+            effects.as_slice()
+        else {
+            panic!("expected placement write");
+        };
+        let record =
+            crate::sync_placement::decode_placement(value.as_ref()).expect("placement decodes");
+        assert_eq!(record.authoritative_node_id, local_node_id);
+        assert!(record.selected_peers.is_empty());
+    }
+
+    #[test]
+    fn replicate_documents_selection_uses_rendezvous_not_local_salt() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let target = group_target(7);
+        let realm_nodes = vec![node(2)];
+
+        let mut first = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node(1),
+            excluded_peers: Vec::new(),
+            documents: vec![target.clone()],
+        });
+        first.realm_nodes = realm_nodes.clone();
+        let _ = first.emit_next_publish();
+
+        let mut second = ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: node(9),
+            excluded_peers: Vec::new(),
+            documents: vec![target],
+        });
+        second.realm_nodes = realm_nodes;
+        let _ = second.emit_next_publish();
+
+        let Some(PlacementAction::Write(first_record)) = first.placement_action else {
+            panic!("expected first placement");
+        };
+        let Some(PlacementAction::Write(second_record)) = second.placement_action else {
+            panic!("expected second placement");
+        };
+        assert_eq!(first_record.selected_peers, second_record.selected_peers);
+        assert_ne!(
+            first_record.authoritative_node_id,
+            second_record.authoritative_node_id
+        );
     }
 }

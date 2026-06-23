@@ -10,8 +10,9 @@ use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::Key;
 use aruna_core::util::unix_timestamp_secs;
 use byteview::ByteView;
+use serde::{Deserialize, Serialize};
 
-const SELECTOR_DOMAIN: &[u8] = b"aruna-sync-peer-v1";
+const SELECTOR_DOMAIN: &[u8] = b"aruna-sync-rendezvous-v2";
 pub const DEFAULT_DOCUMENT_PEER_COUNT: usize = 3;
 pub const DOCUMENT_SYNC_RETRY_AFTER: Duration = Duration::from_secs(30);
 pub const SYNC_PLACEMENT_RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -29,7 +30,6 @@ pub fn desired_remote_peer_count(desired_peer_count: usize) -> usize {
 
 pub fn select_sync_peers(
     target: &DocumentSyncTarget,
-    local_node_id: NodeId,
     candidates: &[NodeId],
     excluded: &[NodeId],
     desired_count: usize,
@@ -42,20 +42,42 @@ pub fn select_sync_peers(
     let mut candidates = candidates
         .iter()
         .copied()
-        .filter(|node_id| *node_id != local_node_id)
         .filter(|node_id| !excluded.contains(node_id))
         .collect::<Vec<_>>();
     candidates.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     candidates.dedup();
     candidates.sort_unstable_by(|left, right| {
-        let left_score = selector_score(topic_id.as_bytes(), local_node_id, *left);
-        let right_score = selector_score(topic_id.as_bytes(), local_node_id, *right);
+        let left_score = selector_score(topic_id.as_bytes(), *left);
+        let right_score = selector_score(topic_id.as_bytes(), *right);
         left_score
             .cmp(&right_score)
             .then_with(|| left.as_bytes().cmp(right.as_bytes()))
     });
     candidates.truncate(desired_count);
     candidates
+}
+
+pub fn complete_authoritative_holders(
+    target: &DocumentSyncTarget,
+    candidates: &[NodeId],
+    existing_holders: &[NodeId],
+    desired_holder_count: usize,
+) -> Vec<NodeId> {
+    let mut holders = existing_holders.to_vec();
+    sort_node_ids(&mut holders);
+    if holders.len() >= desired_holder_count {
+        return holders;
+    }
+
+    let mut additional = select_sync_peers(
+        target,
+        candidates,
+        &holders,
+        desired_holder_count.saturating_sub(holders.len()),
+    );
+    holders.append(&mut additional);
+    sort_node_ids(&mut holders);
+    holders
 }
 
 pub fn placement_prefix(realm_id: RealmId) -> Key {
@@ -71,9 +93,11 @@ pub fn placement_key(realm_id: RealmId, target: &DocumentSyncTarget) -> Key {
 pub fn new_placement(
     realm_id: RealmId,
     target: DocumentSyncTarget,
+    authoritative_node_id: NodeId,
     desired_peer_count: usize,
     mut selected_peers: Vec<NodeId>,
 ) -> PendingTopicPlacement {
+    selected_peers.retain(|node_id| *node_id != authoritative_node_id);
     selected_peers.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     selected_peers.dedup();
     PendingTopicPlacement {
@@ -82,13 +106,17 @@ pub fn new_placement(
         desired_peer_count,
         selected_peers,
         updated_at: unix_timestamp_secs(),
+        authoritative_node_id,
     }
 }
 
 pub fn missing_peer_count(record: &PendingTopicPlacement) -> usize {
+    let mut selected_peers = record.selected_peers.clone();
+    selected_peers.retain(|node_id| *node_id != record.authoritative_node_id);
+    sort_node_ids(&mut selected_peers);
     record
         .desired_peer_count
-        .saturating_sub(record.selected_peers.len().saturating_add(1))
+        .saturating_sub(selected_peers.len().saturating_add(1))
 }
 
 pub fn placement_satisfied(selected_peer_count: usize, desired_peer_count: usize) -> bool {
@@ -142,11 +170,23 @@ pub fn decode_placement(value: &[u8]) -> Result<PendingTopicPlacement, postcard:
     postcard::from_bytes(value)
 }
 
-fn selector_score(topic_id: &[u8], local_node_id: NodeId, candidate_node_id: NodeId) -> [u8; 32] {
+pub fn decode_placement_with_authoritative_fallback(
+    value: &[u8],
+    authoritative_node_id: NodeId,
+) -> Result<PendingTopicPlacement, postcard::Error> {
+    match decode_placement(value) {
+        Ok(record) => Ok(record),
+        Err(error) => match postcard::from_bytes::<LegacyPendingTopicPlacement>(value) {
+            Ok(record) => Ok(record.into_pending(authoritative_node_id)),
+            Err(_) => Err(error),
+        },
+    }
+}
+
+fn selector_score(topic_id: &[u8], candidate_node_id: NodeId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SELECTOR_DOMAIN);
     hasher.update(topic_id);
-    hasher.update(local_node_id.as_bytes());
     hasher.update(candidate_node_id.as_bytes());
     *hasher.finalize().as_bytes()
 }
@@ -158,6 +198,31 @@ pub fn sort_node_ids(nodes: &mut Vec<NodeId>) {
 
 fn compare_node_ids(left: &NodeId, right: &NodeId) -> Ordering {
     left.as_bytes().cmp(right.as_bytes())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LegacyPendingTopicPlacement {
+    realm_id: RealmId,
+    target: DocumentSyncTarget,
+    desired_peer_count: usize,
+    selected_peers: Vec<NodeId>,
+    updated_at: u64,
+}
+
+impl LegacyPendingTopicPlacement {
+    fn into_pending(self, authoritative_node_id: NodeId) -> PendingTopicPlacement {
+        let mut selected_peers = self.selected_peers;
+        selected_peers.retain(|node_id| *node_id != authoritative_node_id);
+        sort_node_ids(&mut selected_peers);
+        PendingTopicPlacement {
+            realm_id: self.realm_id,
+            target: self.target,
+            desired_peer_count: self.desired_peer_count,
+            selected_peers,
+            updated_at: self.updated_at,
+            authoritative_node_id,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,8 +245,8 @@ mod tests {
     #[test]
     fn selector_is_deterministic() {
         let candidates = vec![node(4), node(2), node(3), node(1)];
-        let first = select_sync_peers(&target(), node(9), &candidates, &[], 3);
-        let second = select_sync_peers(&target(), node(9), &candidates, &[], 3);
+        let first = select_sync_peers(&target(), &candidates, &[], 3);
+        let second = select_sync_peers(&target(), &candidates, &[], 3);
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 3);
@@ -193,9 +258,8 @@ mod tests {
         let excluded = node(3);
         let selected = select_sync_peers(
             &target(),
-            local,
             &[local, node(2), excluded, node(4)],
-            &[excluded],
+            &[local, excluded],
             3,
         );
 
@@ -206,9 +270,70 @@ mod tests {
 
     #[test]
     fn selector_returns_available_candidates_when_under_capacity() {
-        let selected = select_sync_peers(&target(), node(1), &[node(2)], &[], 3);
+        let selected = select_sync_peers(&target(), &[node(2)], &[], 3);
 
         assert_eq!(selected, vec![node(2)]);
+    }
+
+    #[test]
+    fn rendezvous_selector_is_independent_of_selecting_node() {
+        let candidates = vec![node(1), node(2), node(3), node(4), node(5)];
+        let exclusions = vec![node(1)];
+
+        let selected_by_first = select_sync_peers(&target(), &candidates, &exclusions, 3);
+        let selected_by_second = select_sync_peers(&target(), &candidates, &exclusions, 3);
+
+        assert_eq!(selected_by_first, selected_by_second);
+    }
+
+    #[test]
+    fn rendezvous_selector_is_order_and_duplicate_stable() {
+        let ordered = vec![node(1), node(2), node(3), node(4), node(5)];
+        let shuffled_with_duplicates = vec![
+            node(5),
+            node(3),
+            node(3),
+            node(1),
+            node(2),
+            node(4),
+            node(2),
+        ];
+
+        assert_eq!(
+            select_sync_peers(&target(), &ordered, &[node(1)], 3),
+            select_sync_peers(&target(), &shuffled_with_duplicates, &[node(1)], 3)
+        );
+    }
+
+    #[test]
+    fn rendezvous_selector_uses_explicit_exclusions_only() {
+        let candidates = vec![node(1), node(2), node(3)];
+
+        let selected = select_sync_peers(&target(), &candidates, &[], 3);
+
+        assert!(selected.contains(&node(1)));
+        assert_eq!(selected.len(), 3);
+    }
+
+    #[test]
+    fn rendezvous_selector_has_golden_order() {
+        let candidates = vec![node(1), node(2), node(3), node(4), node(5)];
+
+        let selected = select_sync_peers(&target(), &candidates, &[node(1)], 4);
+
+        assert_eq!(selected, vec![node(5), node(2), node(4), node(3)]);
+    }
+
+    #[test]
+    fn authoritative_holder_completion_is_monotonic() {
+        let existing = vec![node(1), node(3), node(3)];
+        let candidates = vec![node(5), node(4), node(3), node(2), node(1)];
+
+        let holders = complete_authoritative_holders(&target(), &candidates, &existing, 4);
+
+        assert!(holders.contains(&node(1)));
+        assert!(holders.contains(&node(3)));
+        assert_eq!(holders.len(), 4);
     }
 
     #[test]
@@ -231,18 +356,20 @@ mod tests {
     #[test]
     fn placement_deduplicates_peers_and_computes_missing_count() {
         let realm_id = RealmId::from_bytes([3u8; 32]);
+        let authoritative = node(1);
         let peer = node(5);
-        let placement = new_placement(realm_id, target(), 3, vec![peer, peer]);
+        let placement = new_placement(realm_id, target(), authoritative, 3, vec![peer, peer]);
 
         assert_eq!(placement.realm_id, realm_id);
+        assert_eq!(placement.authoritative_node_id, authoritative);
         assert_eq!(placement.selected_peers, vec![peer]);
         assert_eq!(missing_peer_count(&placement), 1);
     }
 
     #[test]
-    fn placement_counts_local_node_toward_desired_peer_count() {
+    fn placement_counts_authoritative_node_toward_desired_peer_count() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
-        let placement = new_placement(realm_id, target(), 3, vec![node(5), node(6)]);
+        let placement = new_placement(realm_id, target(), node(1), 3, vec![node(5), node(6)]);
 
         assert_eq!(desired_remote_peer_count(DEFAULT_DOCUMENT_PEER_COUNT), 2);
         assert_eq!(missing_peer_count(&placement), 0);
@@ -250,5 +377,54 @@ mod tests {
             placement.selected_peers.len(),
             placement.desired_peer_count
         ));
+    }
+
+    #[test]
+    fn placement_records_authoritative_holder_explicitly() {
+        let realm_id = RealmId::from_bytes([5u8; 32]);
+        let authoritative = node(7);
+
+        let placement = new_placement(realm_id, target(), authoritative, 3, vec![node(8)]);
+
+        assert_eq!(placement.authoritative_node_id, authoritative);
+    }
+
+    #[test]
+    fn placement_deduplicates_selected_peers_and_excludes_authoritative() {
+        let realm_id = RealmId::from_bytes([6u8; 32]);
+        let authoritative = node(7);
+
+        let placement = new_placement(
+            realm_id,
+            target(),
+            authoritative,
+            3,
+            vec![node(8), authoritative, node(8), node(9)],
+        );
+
+        assert_eq!(placement.selected_peers, vec![node(9), node(8)]);
+        assert_eq!(missing_peer_count(&placement), 0);
+    }
+
+    #[test]
+    fn legacy_pending_placement_decodes_with_local_as_authoritative() {
+        let realm_id = RealmId::from_bytes([7u8; 32]);
+        let authoritative = node(1);
+        let legacy = LegacyPendingTopicPlacement {
+            realm_id,
+            target: target(),
+            desired_peer_count: 3,
+            selected_peers: vec![node(2)],
+            updated_at: 42,
+        };
+        let bytes = postcard::to_allocvec(&legacy).expect("legacy placement serializes");
+
+        let placement = decode_placement_with_authoritative_fallback(&bytes, authoritative)
+            .expect("legacy placement decodes");
+
+        assert_eq!(placement.authoritative_node_id, authoritative);
+        assert_eq!(placement.selected_peers, vec![node(2)]);
+        assert_eq!(placement.updated_at, 42);
+        assert_eq!(missing_peer_count(&placement), 1);
     }
 }

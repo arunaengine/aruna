@@ -14,9 +14,9 @@ use thiserror::Error;
 use crate::announce::AnnounceTopicOperation;
 use crate::document_repository::read_effect;
 use crate::sync_placement::{
-    decode_placement, delete_placement_effect, missing_peer_count, new_placement, placement_prefix,
-    placement_satisfied, schedule_placement_retry_effect, select_sync_peers, sort_node_ids,
-    write_placement_effect,
+    decode_placement_with_authoritative_fallback, delete_placement_effect, missing_peer_count,
+    new_placement, placement_prefix, placement_satisfied, schedule_placement_retry_effect,
+    select_sync_peers, sort_node_ids, write_placement_effect,
 };
 use tracing::warn;
 
@@ -55,6 +55,7 @@ enum PlacementState {
 #[derive(Debug, Clone, PartialEq)]
 struct CurrentPlacement {
     target: DocumentSyncTarget,
+    authoritative_node_id: NodeId,
     desired_peer_count: usize,
     selected_peers: Vec<NodeId>,
     newly_selected: Vec<NodeId>,
@@ -139,17 +140,24 @@ impl ProcessPlacementsOperation {
             return self.emit_next_record();
         }
 
+        let missing_peer_count = missing_peer_count(&record);
+        let mut selected_peers = record.selected_peers;
+        selected_peers.retain(|node_id| *node_id != record.authoritative_node_id);
+        sort_node_ids(&mut selected_peers);
+        let mut excluded_peers = selected_peers.clone();
+        excluded_peers.push(record.authoritative_node_id);
+        sort_node_ids(&mut excluded_peers);
         let newly_selected = select_sync_peers(
             &record.target,
-            self.config.local_node_id,
             &self.realm_nodes,
-            &record.selected_peers,
-            missing_peer_count(&record),
+            &excluded_peers,
+            missing_peer_count,
         );
         self.current = Some(CurrentPlacement {
             target: record.target.clone(),
+            authoritative_node_id: record.authoritative_node_id,
             desired_peer_count: record.desired_peer_count,
-            selected_peers: record.selected_peers,
+            selected_peers,
             newly_selected: newly_selected.clone(),
         });
 
@@ -176,6 +184,9 @@ impl ProcessPlacementsOperation {
             return self.emit_next_record();
         };
         current.selected_peers.append(&mut current.newly_selected);
+        current
+            .selected_peers
+            .retain(|node_id| *node_id != current.authoritative_node_id);
         sort_node_ids(&mut current.selected_peers);
 
         self.state = PlacementState::StorePlacement;
@@ -190,6 +201,7 @@ impl ProcessPlacementsOperation {
         let record = new_placement(
             self.config.realm_id,
             current.target,
+            current.authoritative_node_id,
             current.desired_peer_count,
             current.selected_peers,
         );
@@ -230,7 +242,6 @@ impl Operation for ProcessPlacementsOperation {
                         Ok(nodes) => nodes,
                         Err(error) => return self.fail(error.into()),
                     };
-                    nodes.retain(|node_id| *node_id != self.config.local_node_id);
                     sort_node_ids(&mut nodes);
                     self.realm_nodes = nodes;
                     self.emit_list_pending()
@@ -246,7 +257,10 @@ impl Operation for ProcessPlacementsOperation {
                     self.next_start_after = next_start_after;
                     self.records.clear();
                     for (_, value) in values.into_iter().rev() {
-                        let record = match decode_placement(&value) {
+                        let record = match decode_placement_with_authoritative_fallback(
+                            &value,
+                            self.config.local_node_id,
+                        ) {
                             Ok(record) => record,
                             Err(error) => {
                                 return self.fail(PlacementError::Decode(error.to_string()));
@@ -366,6 +380,7 @@ mod tests {
         });
         operation.current = Some(CurrentPlacement {
             target: target.clone(),
+            authoritative_node_id: node(1),
             desired_peer_count: 3,
             selected_peers: vec![node(2), node(3)],
             newly_selected: Vec::new(),
@@ -379,5 +394,84 @@ mod tests {
                 if key_space == SYNC_PLACEMENT_KEYSPACE
         ));
         assert!(!operation.retry_needed);
+    }
+
+    #[test]
+    fn process_placement_uses_record_authoritative_holder() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let authoritative = node(1);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(9),
+        });
+        operation.realm_nodes = vec![authoritative, node(2), node(3), node(4)];
+        operation.records = vec![new_placement(
+            realm_id,
+            group_target(5),
+            authoritative,
+            3,
+            vec![node(2)],
+        )];
+
+        let effects = operation.emit_next_record();
+
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let current = operation.current.expect("placement is active");
+        assert_eq!(current.authoritative_node_id, authoritative);
+        assert_eq!(current.selected_peers, vec![node(2)]);
+        assert!(!current.newly_selected.contains(&authoritative));
+        assert!(!current.newly_selected.contains(&node(2)));
+    }
+
+    #[test]
+    fn process_placement_does_not_replace_existing_holders() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let target = group_target(6);
+        let authoritative = node(1);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(9),
+        });
+        operation.current = Some(CurrentPlacement {
+            target,
+            authoritative_node_id: authoritative,
+            desired_peer_count: 5,
+            selected_peers: vec![node(2)],
+            newly_selected: vec![node(3)],
+        });
+
+        let effects = operation.emit_placement_update();
+
+        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+            panic!("expected placement write");
+        };
+        let record = decode_placement_with_authoritative_fallback(value.as_ref(), node(9))
+            .expect("placement decodes");
+        assert_eq!(record.authoritative_node_id, authoritative);
+        assert_eq!(record.selected_peers, vec![node(2), node(3)]);
+    }
+
+    #[test]
+    fn process_placement_excludes_authoritative_holder_from_new_selection() {
+        let realm_id = RealmId::from_bytes([8u8; 32]);
+        let authoritative = node(1);
+        let mut operation = ProcessPlacementsOperation::new(PlacementConfig {
+            realm_id,
+            local_node_id: node(9),
+        });
+        operation.realm_nodes = vec![authoritative, node(2)];
+        operation.records = vec![new_placement(
+            realm_id,
+            group_target(7),
+            authoritative,
+            2,
+            Vec::new(),
+        )];
+
+        let effects = operation.emit_next_record();
+
+        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+        let current = operation.current.expect("placement is active");
+        assert_eq!(current.newly_selected, vec![node(2)]);
     }
 }
