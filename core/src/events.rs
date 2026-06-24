@@ -133,6 +133,7 @@ pub enum StorageEvent {
     BatchDeleteResult {
         entries: Vec<(KeySpace, Key)>,
     },
+    SyncAllFinished,
     /// Result of an iteration request with optional pagination cursor.
     IterResult {
         values: Vec<(Key, Value)>,

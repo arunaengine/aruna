@@ -77,7 +77,8 @@ fn storage_effect_key_space(effect: &StorageEffect) -> Option<&str> {
         }
         StorageEffect::StartTransaction { .. }
         | StorageEffect::CommitTransaction { .. }
-        | StorageEffect::AbortTransaction { .. } => None,
+        | StorageEffect::AbortTransaction { .. }
+        | StorageEffect::SyncAll => None,
     }
 }
 const MAX_GROUP_COMMIT: usize = 256;
@@ -240,6 +241,14 @@ impl StorageHandle {
         Event::Storage(self.dispatch_storage_effect(effect).await)
     }
 
+    pub async fn sync_all(&self) -> Result<(), StorageError> {
+        match self.dispatch_storage_effect(StorageEffect::SyncAll).await {
+            StorageEvent::SyncAllFinished => Ok(()),
+            StorageEvent::Error { error } => Err(error),
+            _ => Err(StorageError::InvalidEffect),
+        }
+    }
+
     #[tracing::instrument(
         name = "storage.handle.dispatch",
         level = "debug",
@@ -395,6 +404,7 @@ fn active_txn_id_for_effect(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::CommitTransaction { txn_id } => Some(*txn_id),
         StorageEffect::StartTransaction { .. }
         | StorageEffect::AbortTransaction { .. }
+        | StorageEffect::SyncAll
         | StorageEffect::Read { txn_id: None, .. }
         | StorageEffect::BatchRead { txn_id: None, .. }
         | StorageEffect::Write { txn_id: None, .. }
@@ -469,6 +479,7 @@ impl FjallStorage {
         match effect {
             StorageEffect::StartTransaction { read } => self.start_transaction(read),
             StorageEffect::AbortTransaction { txn_id } => self.abort_transaction(txn_id),
+            StorageEffect::SyncAll => self.sync_all(),
             StorageEffect::Read {
                 key_space,
                 key,
@@ -823,11 +834,22 @@ impl FjallStorage {
         }
     }
 
+    fn sync_all(&self) -> StorageEvent {
+        match self.persist_with_mode(PersistMode::SyncAll) {
+            Ok(()) => StorageEvent::SyncAllFinished,
+            Err(error) => StorageEvent::Error { error },
+        }
+    }
+
     fn persist_journal(&self) -> Result<(), StorageError> {
+        self.persist_with_mode(self.persist_policy.as_fjall())
+    }
+
+    fn persist_with_mode(&self, mode: PersistMode) -> Result<(), StorageError> {
         let persist_started = Instant::now();
         self.store
             .db
-            .persist(self.persist_policy.as_fjall())
+            .persist(mode)
             .map_err(|error| StorageError::PersistError(error.to_string()))?;
         Span::current().record("persist_ms", duration_ms(persist_started.elapsed()));
         Ok(())
@@ -1716,6 +1738,7 @@ fn record_storage_effect_fields(span: &Span, effect: &StorageEffect) {
                 span.record("txn_id", field::display(txn_id));
             }
         }
+        StorageEffect::SyncAll => {}
     }
 }
 
@@ -1730,6 +1753,7 @@ fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::Delete { .. } => "delete",
         StorageEffect::BatchDelete { .. } => "batch_delete",
         StorageEffect::AbortTransaction { .. } => "abort_transaction",
+        StorageEffect::SyncAll => "sync_all",
         StorageEffect::Iter { .. } => "iter",
     }
 }
@@ -1759,6 +1783,7 @@ fn storage_event_kind(event: &StorageEvent) -> &'static str {
         StorageEvent::BatchWriteResult { .. } => "batch_write_result",
         StorageEvent::DeleteResult { .. } => "delete_result",
         StorageEvent::BatchDeleteResult { .. } => "batch_delete_result",
+        StorageEvent::SyncAllFinished => "sync_all_finished",
         StorageEvent::IterResult { .. } => "iter_result",
         StorageEvent::Error { .. } => "error",
     }
@@ -1931,6 +1956,37 @@ mod tests {
                 .await,
             b"key",
         );
+    }
+
+    #[tokio::test]
+    async fn sync_all_effect_returns_success() {
+        let dir = tempdir().unwrap();
+        let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+
+        let event = handle.send_storage_effect(StorageEffect::SyncAll).await;
+
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::SyncAllFinished)
+        ));
+    }
+
+    #[tokio::test]
+    async fn sync_all_handle_surfaces_persist_errors() {
+        let (handle, receiver) = StorageHandle::new();
+        thread::spawn(move || {
+            let (effect, response_tx, _span, _enqueued_at) =
+                receiver.recv().expect("sync_all effect should arrive");
+            assert!(matches!(effect, StorageEffect::SyncAll));
+            response_tx.send(StorageEvent::Error {
+                error: StorageError::PersistError("boom".to_string()),
+            });
+        });
+
+        let error = handle.sync_all().await.expect_err("sync_all should fail");
+
+        assert_eq!(error, StorageError::PersistError("boom".to_string()));
+        assert_eq!(handle.get_errors(), 1);
     }
 
     async fn start_write_transaction(handle: &StorageHandle) -> Ulid {

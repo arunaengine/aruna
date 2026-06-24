@@ -138,6 +138,8 @@ pub enum StorageEffect {
     AbortTransaction {
         txn_id: TxnId,
     },
+    /// Persist all pending storage data with `SyncAll` durability.
+    SyncAll,
     /// Iterate over keys in a keyspace with optional prefix and pagination.
     ///
     /// Iteration order is lexicographic by key bytes.
