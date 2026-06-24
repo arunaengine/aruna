@@ -112,6 +112,29 @@ impl AdminDocumentReducerState {
             ) => {
                 self.apply_group_role_user_assignment(event, role_id, user_id, None);
             }
+            (
+                AdminDocumentTarget::Realm { .. },
+                AdminDocumentOperation::RealmRoleAdded { role_id },
+            ) => {
+                self.apply_realm_role(event, role_id, Some(role_id.to_string()));
+            }
+            (
+                AdminDocumentTarget::Realm { .. },
+                AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id },
+            ) => {
+                self.apply_realm_role_user_assignment(
+                    event,
+                    role_id,
+                    user_id,
+                    Some(user_id.to_string()),
+                );
+            }
+            (
+                AdminDocumentTarget::Realm { .. },
+                AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
+            ) => {
+                self.apply_realm_role_user_assignment(event, role_id, user_id, None);
+            }
             (AdminDocumentTarget::User { .. }, AdminDocumentOperation::UserNameSet { name }) => {
                 self.apply_user_name(event, name);
             }
@@ -228,6 +251,47 @@ impl AdminDocumentReducerState {
             })
     }
 
+    pub fn materialized_realm_roles(&self) -> BTreeSet<RoleId> {
+        if !matches!(&self.target, AdminDocumentTarget::Realm { .. }) {
+            return BTreeSet::new();
+        }
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| version.value.as_ref().map(|_| path))
+            .filter_map(|path| realm_role_id_from_path(path))
+            .collect()
+    }
+
+    pub fn materialized_realm_role_user_assignments(&self) -> BTreeMap<RoleId, BTreeSet<UserId>> {
+        if !matches!(&self.target, AdminDocumentTarget::Realm { .. }) {
+            return BTreeMap::new();
+        }
+
+        let active_roles = self.materialized_realm_roles();
+
+        self.user_subject_ids
+            .iter()
+            .filter_map(|(path, version)| {
+                let role_id = realm_role_user_assignment_role_id_from_path(path)?;
+                let user_id = version
+                    .value
+                    .as_ref()
+                    .and_then(|value| UserId::from_string(value).ok())?;
+
+                active_roles
+                    .contains(&role_id)
+                    .then_some((role_id, user_id))
+            })
+            .fold(BTreeMap::new(), |mut assignments, (role_id, user_id)| {
+                assignments
+                    .entry(role_id)
+                    .or_insert_with(BTreeSet::new)
+                    .insert(user_id);
+                assignments
+            })
+    }
+
     fn apply_user_name(&mut self, event: &AdminDocumentEvent, name: &str) {
         self.user_name = self.reduce_value(
             event,
@@ -303,6 +367,45 @@ impl AdminDocumentReducerState {
         value: Option<String>,
     ) {
         let path = group_role_user_assignment_path(role_id, user_id);
+        let current = self.user_subject_ids.get(&path).cloned();
+
+        match self.reduce_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path, version);
+            }
+            None => {
+                self.user_subject_ids.remove(&path);
+            }
+        }
+    }
+
+    fn apply_realm_role(
+        &mut self,
+        event: &AdminDocumentEvent,
+        role_id: &RoleId,
+        value: Option<String>,
+    ) {
+        let path = realm_role_path(role_id);
+        let current = self.user_subject_ids.get(&path).cloned();
+
+        match self.reduce_value(event, &path, current, value) {
+            Some(version) => {
+                self.user_subject_ids.insert(path, version);
+            }
+            None => {
+                self.user_subject_ids.remove(&path);
+            }
+        }
+    }
+
+    fn apply_realm_role_user_assignment(
+        &mut self,
+        event: &AdminDocumentEvent,
+        role_id: &RoleId,
+        user_id: &UserId,
+        value: Option<String>,
+    ) {
+        let path = realm_role_user_assignment_path(role_id, user_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
         match self.reduce_value(event, &path, current, value) {
@@ -401,6 +504,14 @@ fn group_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String
     format!("group.roles.{role_id}.assigned_users.{user_id}")
 }
 
+fn realm_role_path(role_id: &RoleId) -> String {
+    format!("realm.roles.{role_id}")
+}
+
+fn realm_role_user_assignment_path(role_id: &RoleId, user_id: &UserId) -> String {
+    format!("realm.roles.{role_id}.assigned_users.{user_id}")
+}
+
 fn group_role_id_from_path(path: &str) -> Option<RoleId> {
     let role_id = path.strip_prefix("group.roles.")?;
 
@@ -413,6 +524,23 @@ fn group_role_id_from_path(path: &str) -> Option<RoleId> {
 
 fn group_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
     let path = path.strip_prefix("group.roles.")?;
+    let (role_id, _) = path.split_once(".assigned_users.")?;
+
+    Ulid::from_string(role_id).ok()
+}
+
+fn realm_role_id_from_path(path: &str) -> Option<RoleId> {
+    let role_id = path.strip_prefix("realm.roles.")?;
+
+    if role_id.contains(".assigned_users.") {
+        return None;
+    }
+
+    Ulid::from_string(role_id).ok()
+}
+
+fn realm_role_user_assignment_role_id_from_path(path: &str) -> Option<RoleId> {
+    let path = path.strip_prefix("realm.roles.")?;
     let (role_id, _) = path.split_once(".assigned_users.")?;
 
     Ulid::from_string(role_id).ok()
@@ -476,6 +604,12 @@ mod tests {
         })
     }
 
+    fn realm_state() -> AdminDocumentReducerState {
+        AdminDocumentReducerState::new(AdminDocumentTarget::Realm {
+            realm_id: realm_id(),
+        })
+    }
+
     fn event(
         event_seed: u8,
         origin_node_id: NodeId,
@@ -505,6 +639,26 @@ mod tests {
             event_id: Ulid::from_bytes([event_seed; 16]),
             target: AdminDocumentTarget::Group {
                 group_id: group_id(),
+            },
+            origin_node_id,
+            origin_seq,
+            observed,
+            actor: actor(origin_node_id),
+            op,
+        }
+    }
+
+    fn realm_event(
+        event_seed: u8,
+        origin_node_id: NodeId,
+        origin_seq: u64,
+        observed: AdminDocumentClock,
+        op: AdminDocumentOperation,
+    ) -> AdminDocumentEvent {
+        AdminDocumentEvent {
+            event_id: Ulid::from_bytes([event_seed; 16]),
+            target: AdminDocumentTarget::Realm {
+                realm_id: realm_id(),
             },
             origin_node_id,
             origin_seq,
@@ -600,6 +754,46 @@ mod tests {
             1,
             AdminDocumentClock::default(),
             AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+        )
+    }
+
+    fn add_realm_role(event_seed: u8, origin_seed: u8, role_id: RoleId) -> AdminDocumentEvent {
+        realm_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmRoleAdded { role_id },
+        )
+    }
+
+    fn assign_realm_role_user(
+        event_seed: u8,
+        origin_seed: u8,
+        role_id: RoleId,
+        user_id: UserId,
+    ) -> AdminDocumentEvent {
+        realm_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id },
+        )
+    }
+
+    fn remove_realm_role_user_assignment(
+        event_seed: u8,
+        origin_seed: u8,
+        role_id: RoleId,
+        user_id: UserId,
+    ) -> AdminDocumentEvent {
+        realm_event(
+            event_seed,
+            node(origin_seed),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
         )
     }
 
@@ -957,6 +1151,56 @@ mod tests {
         let conflict = state
             .conflicts
             .get(&format!("group.roles.{role_id}.assigned_users.{user_id}"))
+            .expect("conflict is recorded");
+        let expected_user_id = user_id.to_string();
+        assert_eq!(conflict.values.len(), 2);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(expected_user_id.as_str()))
+        );
+        assert!(conflict.values.iter().any(|value| value.value.is_none()));
+    }
+
+    #[test]
+    fn realm_role_and_user_assignment_materialize() {
+        let mut state = realm_state();
+        let role_id = role_id(3);
+        let user_id = user_id_with_seed(4);
+
+        state.apply(&add_realm_role(1, 1, role_id)).unwrap();
+        state
+            .apply(&assign_realm_role_user(2, 2, role_id, user_id))
+            .unwrap();
+
+        assert_eq!(state.materialized_realm_roles(), BTreeSet::from([role_id]));
+        assert_eq!(
+            state.materialized_realm_role_user_assignments(),
+            BTreeMap::from([(role_id, BTreeSet::from([user_id]))])
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn concurrent_realm_role_user_assignment_add_remove_conflict_fails_closed() {
+        let mut state = realm_state();
+        let role_id = role_id(3);
+        let user_id = user_id_with_seed(4);
+
+        state.apply(&add_realm_role(1, 1, role_id)).unwrap();
+        state
+            .apply(&assign_realm_role_user(2, 2, role_id, user_id))
+            .unwrap();
+        state
+            .apply(&remove_realm_role_user_assignment(3, 3, role_id, user_id))
+            .unwrap();
+
+        assert_eq!(state.materialized_realm_roles(), BTreeSet::from([role_id]));
+        assert!(state.materialized_realm_role_user_assignments().is_empty());
+        let conflict = state
+            .conflicts
+            .get(&format!("realm.roles.{role_id}.assigned_users.{user_id}"))
             .expect("conflict is recorded");
         let expected_user_id = user_id.to_string();
         assert_eq!(conflict.values.len(), 2);

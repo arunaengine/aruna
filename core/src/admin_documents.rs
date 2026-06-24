@@ -59,6 +59,9 @@ pub enum AdminDocumentOperation {
     UserNameSet { name: String },
     UserSubjectIdAdded { subject_id: String },
     UserSubjectIdRemoved { subject_id: String },
+    RealmRoleAdded { role_id: RoleId },
+    RealmRoleUserAssignmentAdded { role_id: RoleId, user_id: UserId },
+    RealmRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
