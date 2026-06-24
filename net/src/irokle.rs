@@ -5,18 +5,23 @@ use std::time::{Duration, Instant};
 
 use aruna_core::NodeId;
 use aruna_core::document::{
-    DocumentSyncEvent, DocumentSyncPublish, DocumentSyncReconcileResult, DocumentSyncTarget,
-    IrokleEvent,
+    DocumentSyncChange, DocumentSyncEvent, DocumentSyncPublish, DocumentSyncReconcileResult,
+    DocumentSyncTarget, IrokleEvent,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{IROKLE_APPLIED_OPS_KEYSPACE, METADATA_DOCUMENT_LIFECYCLE_KEYSPACE};
+use aruna_core::keyspaces::{
+    DOCUMENT_SYNC_REVISION_KEYSPACE, IROKLE_APPLIED_OPS_KEYSPACE,
+    METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+};
 use aruna_core::metadata::{
     MetadataCreateEventRecord, MetadataDocumentDeleteRecord, MetadataDocumentLifecycleRecord,
     MetadataGraphLifecycleRecord, MetadataGraphPruneJobRecord,
 };
 use aruna_core::storage_entries::{
-    metadata_document_lifecycle_key, metadata_document_lifecycle_write_entry,
+    document_sync_revision_key, document_sync_revision_write_entry,
+    metadata_create_event_write_entry, metadata_document_lifecycle_key,
+    metadata_document_lifecycle_revision_change, metadata_document_lifecycle_write_entry,
     metadata_graph_lifecycle_key, metadata_graph_lifecycle_write_entry,
     metadata_graph_prune_job_write_entry, metadata_registry_delete_entries,
     metadata_registry_write_entries, stale_subject_index_deletes, subject_index_writes,
@@ -59,6 +64,7 @@ struct PendingMetadataCreateApply {
     target: DocumentSyncTarget,
     record: MetadataCreateEventRecord,
     bytes: Vec<u8>,
+    lifecycle_revision: Option<DocumentSyncChange>,
 }
 
 #[derive(Clone)]
@@ -148,6 +154,11 @@ impl IrokleService {
 
     pub fn node(&self) -> irokle_crate::Irokle<irokle_crate::FjallStorage> {
         self.node.clone()
+    }
+
+    fn local_node_id(&self) -> Result<NodeId> {
+        NodeId::from_bytes(self.node.peer_id().as_bytes())
+            .map_err(|error| NetError::Bootstrap(error.to_string()))
     }
 
     pub fn database(&self) -> fjall::OptimisticTxDatabase {
@@ -1273,8 +1284,17 @@ impl IrokleService {
                                 let record = *record;
                                 let bytes = postcard::to_allocvec(&record)
                                     .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+                                let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+                                    event: Box::new(record.clone()),
+                                };
                                 pending_metadata_creates.push(PendingMetadataCreateApply {
                                     target,
+                                    lifecycle_revision: Some(
+                                        metadata_document_lifecycle_revision_change(
+                                            &lifecycle,
+                                            self.local_node_id()?,
+                                        ),
+                                    ),
                                     record,
                                     bytes,
                                 });
@@ -1282,11 +1302,17 @@ impl IrokleService {
                             }
                             MetadataDocumentLifecycleRecord::Delete { event } => {
                                 let tombstone = event.tombstone.clone();
-                                self.apply_metadata_document_delete(event).await?;
-                                if tombstone.is_deleted() {
+                                let accepted = self
+                                    .apply_metadata_document_lifecycle(
+                                        MetadataDocumentLifecycleRecord::Delete { event },
+                                    )
+                                    .await?;
+                                if accepted && tombstone.is_deleted() {
                                     metadata_graph_tombstones.push(tombstone);
                                 }
-                                applied_targets.push(target);
+                                if accepted {
+                                    applied_targets.push(target);
+                                }
                             }
                         }
                     }
@@ -1424,6 +1450,7 @@ impl IrokleService {
             },
             record,
             bytes,
+            lifecycle_revision: None,
         })
     }
 
@@ -1447,6 +1474,21 @@ impl IrokleService {
                 document_id: apply.record.record.document_id,
                 event_id: apply.record.event_id,
             };
+            if let Some(revision) = &apply.lifecycle_revision {
+                if incoming_metadata_document_lifecycle_stale_or_equal(
+                    &self.storage,
+                    &apply.target,
+                    revision,
+                )
+                .await?
+                {
+                    continue;
+                }
+                writes.push(
+                    document_sync_revision_write_entry(&apply.target, revision)
+                        .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+                );
+            }
             writes.push((
                 target.storage_keyspace().to_string(),
                 target.storage_key(),
@@ -1517,7 +1559,10 @@ impl IrokleService {
                     record.document_id()
                 )));
             }
-            return self.apply_metadata_document_lifecycle(record).await;
+            return self
+                .apply_metadata_document_lifecycle(record)
+                .await
+                .map(|_| ());
         }
         if let DocumentSyncTarget::MetadataRegistry {
             group_id,
@@ -1601,46 +1646,9 @@ impl IrokleService {
     async fn apply_metadata_document_lifecycle(
         &self,
         record: MetadataDocumentLifecycleRecord,
-    ) -> Result<()> {
-        match record {
-            MetadataDocumentLifecycleRecord::Upsert { event } => {
-                if self.metadata_create_fenced(&event).await? {
-                    return Ok(());
-                }
-                let event = *event;
-                let bytes = postcard::to_allocvec(&event)
-                    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-                let target = DocumentSyncTarget::MetadataCreateEvent {
-                    document_id: event.record.document_id,
-                    event_id: event.event_id,
-                };
-                self.storage_write(
-                    target.storage_keyspace().to_string(),
-                    target.storage_key(),
-                    bytes.into(),
-                )
-                .await
-            }
-            MetadataDocumentLifecycleRecord::Delete { event } => {
-                self.apply_metadata_document_delete(event).await
-            }
-        }
-    }
-
-    async fn apply_metadata_document_delete(
-        &self,
-        record: MetadataDocumentDeleteRecord,
-    ) -> Result<()> {
-        self.storage_batch_write(metadata_document_delete_write_entries(&record)?)
-            .await?;
-        if record.tombstone.is_deleted() {
-            self.storage_batch_delete(metadata_registry_delete_entries(
-                record.tombstone.group_id,
-                record.tombstone.document_id,
-            ))
-            .await?;
-        }
-        Ok(())
+    ) -> Result<bool> {
+        apply_metadata_document_lifecycle_to_storage(&self.storage, &record, self.local_node_id()?)
+            .await
     }
 
     async fn apply_metadata_graph_lifecycle(
@@ -1662,50 +1670,8 @@ impl IrokleService {
         Ok(())
     }
 
-    async fn metadata_graph_deleted(&self, graph_iri: &str) -> Result<bool> {
-        let value = self
-            .storage_read(
-                aruna_core::keyspaces::METADATA_GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-                metadata_graph_lifecycle_key(graph_iri),
-            )
-            .await?;
-        let Some(value) = value else {
-            return Ok(false);
-        };
-        let record: MetadataGraphLifecycleRecord =
-            postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        Ok(record.is_deleted())
-    }
-
-    async fn metadata_document_delete(
-        &self,
-        document_id: Ulid,
-    ) -> Result<Option<MetadataDocumentDeleteRecord>> {
-        let value = self
-            .storage_read(
-                METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-                metadata_document_lifecycle_key(document_id),
-            )
-            .await?;
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        let record: MetadataDocumentLifecycleRecord =
-            postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
-        match record {
-            MetadataDocumentLifecycleRecord::Delete { event } => Ok(Some(event)),
-            MetadataDocumentLifecycleRecord::Upsert { .. } => Ok(None),
-        }
-    }
-
     async fn metadata_create_fenced(&self, event: &MetadataCreateEventRecord) -> Result<bool> {
-        if let Some(delete) = self
-            .metadata_document_delete(event.record.document_id)
-            .await?
-        {
-            return Ok(event.event_id <= delete.deleted_after_event_id);
-        }
-        self.metadata_graph_deleted(&event.record.graph_iri).await
+        metadata_create_fenced_in_storage(&self.storage, event).await
     }
 
     async fn apply_delete(&self, target: DocumentSyncTarget) -> Result<()> {
@@ -1833,6 +1799,85 @@ async fn apply_metadata_registry_upsert_to_storage(
     storage_batch_write_to(storage, entries).await
 }
 
+async fn apply_metadata_document_lifecycle_to_storage(
+    storage: &StorageHandle,
+    record: &MetadataDocumentLifecycleRecord,
+    delete_actor: NodeId,
+) -> Result<bool> {
+    let Some(writes) =
+        metadata_document_lifecycle_write_entries_if_current(storage, record, delete_actor).await?
+    else {
+        return Ok(false);
+    };
+    storage_batch_write_to(storage, writes).await?;
+    if let MetadataDocumentLifecycleRecord::Delete { event } = record {
+        if event.tombstone.is_deleted() {
+            storage_batch_delete_to(
+                storage,
+                metadata_registry_delete_entries(
+                    event.tombstone.group_id,
+                    event.tombstone.document_id,
+                ),
+            )
+            .await?;
+        }
+    }
+    Ok(true)
+}
+
+async fn metadata_document_lifecycle_write_entries_if_current(
+    storage: &StorageHandle,
+    record: &MetadataDocumentLifecycleRecord,
+    delete_actor: NodeId,
+) -> Result<Option<Vec<(String, ByteView, Value)>>> {
+    let target = DocumentSyncTarget::MetadataDocumentLifecycle {
+        document_id: record.document_id(),
+    };
+    let revision = metadata_document_lifecycle_revision_change(record, delete_actor);
+    if incoming_metadata_document_lifecycle_stale_or_equal(storage, &target, &revision).await? {
+        return Ok(None);
+    }
+    if let MetadataDocumentLifecycleRecord::Upsert { event } = record {
+        if metadata_create_fenced_in_storage(storage, event).await? {
+            return Ok(None);
+        }
+    }
+
+    let mut entries = match record {
+        MetadataDocumentLifecycleRecord::Upsert { event } => vec![
+            metadata_create_event_write_entry(event)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        ],
+        MetadataDocumentLifecycleRecord::Delete { event } => {
+            metadata_document_delete_write_entries(event)?
+        }
+    };
+    entries.push(
+        document_sync_revision_write_entry(&target, &revision)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    );
+    Ok(Some(entries))
+}
+
+async fn incoming_metadata_document_lifecycle_stale_or_equal(
+    storage: &StorageHandle,
+    target: &DocumentSyncTarget,
+    incoming: &DocumentSyncChange,
+) -> Result<bool> {
+    let value = storage_read_from(
+        storage,
+        DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+        document_sync_revision_key(target),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let local: DocumentSyncChange =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    Ok(incoming.current <= local.current)
+}
+
 fn incoming_metadata_registry_stale_or_equal(
     existing: &MetadataRegistryRecord,
     incoming: &MetadataRegistryRecord,
@@ -1860,6 +1905,39 @@ async fn metadata_graph_deleted_in_storage(
     let record: MetadataGraphLifecycleRecord =
         postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
     Ok(record.is_deleted())
+}
+
+async fn metadata_document_delete_in_storage(
+    storage: &StorageHandle,
+    document_id: Ulid,
+) -> Result<Option<MetadataDocumentDeleteRecord>> {
+    let value = storage_read_from(
+        storage,
+        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+        metadata_document_lifecycle_key(document_id),
+    )
+    .await?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let record: MetadataDocumentLifecycleRecord =
+        postcard::from_bytes(&value).map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    match record {
+        MetadataDocumentLifecycleRecord::Delete { event } => Ok(Some(event)),
+        MetadataDocumentLifecycleRecord::Upsert { .. } => Ok(None),
+    }
+}
+
+async fn metadata_create_fenced_in_storage(
+    storage: &StorageHandle,
+    event: &MetadataCreateEventRecord,
+) -> Result<bool> {
+    if let Some(delete) =
+        metadata_document_delete_in_storage(storage, event.record.document_id).await?
+    {
+        return Ok(event.event_id <= delete.deleted_after_event_id);
+    }
+    metadata_graph_deleted_in_storage(storage, &event.record.graph_iri).await
 }
 
 async fn storage_read_from(
@@ -2290,11 +2368,17 @@ fn peer_id_to_endpoint_addr(peer_id: PeerId) -> Result<iroh::EndpointAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::UserId;
+    use aruna_core::document::DocumentSyncChangeKind;
     use aruna_core::keyspaces::{
-        METADATA_DOCUMENT_INDEX_KEYSPACE, METADATA_GRAPH_PRUNE_JOB_KEYSPACE,
-        METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        DOCUMENT_SYNC_REVISION_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
+        METADATA_DOCUMENT_LIFECYCLE_KEYSPACE, METADATA_EVENT_LOG_KEYSPACE,
+        METADATA_GRAPH_PRUNE_JOB_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
     };
-    use aruna_core::storage_entries::{metadata_document_key, metadata_registry_key};
+    use aruna_core::metadata::MetadataCreateEventPayload;
+    use aruna_core::storage_entries::{
+        metadata_document_key, metadata_event_log_key, metadata_registry_key,
+    };
     use aruna_core::structs::RealmId;
     use std::collections::BTreeMap;
     use tempfile::TempDir;
@@ -2389,6 +2473,87 @@ mod tests {
             .await
             .expect("registry record exists");
         postcard::from_bytes(&value).expect("registry record decodes")
+    }
+
+    fn metadata_create_event(
+        group_id: Ulid,
+        document_id: Ulid,
+        updated_at_ms: u64,
+        event_id: Ulid,
+        actor_seed: u8,
+    ) -> MetadataCreateEventRecord {
+        let realm_id = RealmId::from_bytes([42; 32]);
+        MetadataCreateEventRecord {
+            event_id,
+            record: registry_record(
+                group_id,
+                document_id,
+                "datasets/lifecycle",
+                updated_at_ms,
+                event_id,
+            ),
+            user_id: UserId::local(Ulid::from_parts(90, 1), realm_id),
+            node_id: node(actor_seed),
+            payload: MetadataCreateEventPayload::Scaffold {
+                name: "Lifecycle".to_string(),
+                description: "Lifecycle event".to_string(),
+                date_published: "2026-01-01".to_string(),
+                license: "https://creativecommons.org/licenses/by/4.0/".to_string(),
+            },
+            occurred_at_ms: updated_at_ms,
+        }
+    }
+
+    fn metadata_delete_lifecycle(
+        group_id: Ulid,
+        document_id: Ulid,
+        updated_at_ms: u64,
+        event_id: Ulid,
+        deleted_after_event_id: Ulid,
+    ) -> MetadataDocumentLifecycleRecord {
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        MetadataDocumentLifecycleRecord::Delete {
+            event: MetadataDocumentDeleteRecord {
+                event_id,
+                tombstone: MetadataGraphLifecycleRecord::deleted(
+                    graph_iri,
+                    RealmId::from_bytes([42; 32]),
+                    group_id,
+                    document_id,
+                    updated_at_ms,
+                ),
+                deleted_after_event_id,
+            },
+        }
+    }
+
+    async fn read_document_lifecycle_record(
+        storage: &StorageHandle,
+        document_id: Ulid,
+    ) -> MetadataDocumentLifecycleRecord {
+        let value = read_storage_value(
+            storage,
+            METADATA_DOCUMENT_LIFECYCLE_KEYSPACE,
+            metadata_document_lifecycle_key(document_id),
+        )
+        .await
+        .expect("lifecycle record exists");
+        postcard::from_bytes(&value).expect("lifecycle record decodes")
+    }
+
+    async fn read_lifecycle_revision(
+        storage: &StorageHandle,
+        document_id: Ulid,
+    ) -> DocumentSyncChange {
+        let target = DocumentSyncTarget::MetadataDocumentLifecycle { document_id };
+        let value = read_storage_value(
+            storage,
+            DOCUMENT_SYNC_REVISION_KEYSPACE,
+            document_sync_revision_key(&target),
+        )
+        .await
+        .expect("lifecycle revision exists");
+        postcard::from_bytes(&value).expect("lifecycle revision decodes")
     }
 
     fn sync_summary(
@@ -2524,6 +2689,136 @@ mod tests {
         assert_eq!(primary, local);
         assert_eq!(document_index, local);
         assert_eq!(holders, local.holder_node_ids);
+    }
+
+    #[tokio::test]
+    async fn metadata_document_lifecycle_upsert_stamps_revision_and_replays_idempotently() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(1, 1);
+        let document_id = Ulid::from_parts(2, 2);
+        let event_id = Ulid::from_parts(3, 3);
+        let event = metadata_create_event(group_id, document_id, 100, event_id, 7);
+        let lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(event.clone()),
+        };
+
+        assert!(
+            apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, node(9))
+                .await
+                .expect("upsert lifecycle applies")
+        );
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(&storage, &lifecycle, node(9))
+                .await
+                .expect("equal upsert lifecycle is idempotent")
+        );
+
+        let stored_event = read_storage_value(
+            &storage,
+            METADATA_EVENT_LOG_KEYSPACE,
+            metadata_event_log_key(document_id, event_id),
+        )
+        .await
+        .expect("event log record exists");
+        assert_eq!(
+            postcard::from_bytes::<MetadataCreateEventRecord>(&stored_event)
+                .expect("event log record decodes"),
+            event
+        );
+        let revision = read_lifecycle_revision(&storage, document_id).await;
+        assert_eq!(revision.current.event_id, event_id);
+        assert_eq!(revision.current.actor, node(7));
+        assert_eq!(revision.current.generation, 100);
+        assert_eq!(revision.kind, DocumentSyncChangeKind::Upsert);
+    }
+
+    #[tokio::test]
+    async fn metadata_document_lifecycle_upsert_skips_newer_delete_sidecar() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(10, 1);
+        let document_id = Ulid::from_parts(11, 1);
+        let stale_event_id = Ulid::from_parts(12, 1);
+        let delete_event_id = Ulid::from_parts(13, 1);
+        let delete_lifecycle =
+            metadata_delete_lifecycle(group_id, document_id, 200, delete_event_id, stale_event_id);
+        assert!(
+            apply_metadata_document_lifecycle_to_storage(&storage, &delete_lifecycle, node(8))
+                .await
+                .expect("delete lifecycle applies")
+        );
+
+        let stale_event = metadata_create_event(group_id, document_id, 100, stale_event_id, 7);
+        let stale_lifecycle = MetadataDocumentLifecycleRecord::Upsert {
+            event: Box::new(stale_event),
+        };
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(&storage, &stale_lifecycle, node(8))
+                .await
+                .expect("stale upsert lifecycle is fenced")
+        );
+
+        assert_eq!(
+            read_document_lifecycle_record(&storage, document_id).await,
+            delete_lifecycle
+        );
+        assert!(
+            read_storage_value(
+                &storage,
+                METADATA_EVENT_LOG_KEYSPACE,
+                metadata_event_log_key(document_id, stale_event_id),
+            )
+            .await
+            .is_none()
+        );
+        let revision = read_lifecycle_revision(&storage, document_id).await;
+        assert_eq!(revision.current.event_id, delete_event_id);
+        assert_eq!(revision.kind, DocumentSyncChangeKind::Delete);
+    }
+
+    #[tokio::test]
+    async fn metadata_document_lifecycle_delete_skips_stale_and_equal_sidecars() {
+        let (_dir, storage) = test_storage();
+        let group_id = Ulid::from_parts(20, 1);
+        let document_id = Ulid::from_parts(21, 1);
+        let deleted_after_event_id = Ulid::from_parts(22, 1);
+        let local_delete = metadata_delete_lifecycle(
+            group_id,
+            document_id,
+            200,
+            Ulid::from_parts(23, 1),
+            deleted_after_event_id,
+        );
+        assert!(
+            apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, node(8))
+                .await
+                .expect("delete lifecycle applies")
+        );
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(&storage, &local_delete, node(8))
+                .await
+                .expect("equal delete lifecycle is idempotent")
+        );
+
+        let stale_delete = metadata_delete_lifecycle(
+            group_id,
+            document_id,
+            100,
+            Ulid::from_parts(24, 1),
+            deleted_after_event_id,
+        );
+        assert!(
+            !apply_metadata_document_lifecycle_to_storage(&storage, &stale_delete, node(8))
+                .await
+                .expect("stale delete lifecycle is fenced")
+        );
+
+        assert_eq!(
+            read_document_lifecycle_record(&storage, document_id).await,
+            local_delete
+        );
+        let revision = read_lifecycle_revision(&storage, document_id).await;
+        assert_eq!(revision.current.generation, 200);
+        assert_eq!(revision.kind, DocumentSyncChangeKind::Delete);
     }
 
     #[test]
