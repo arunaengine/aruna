@@ -229,6 +229,7 @@ mod tests {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
+    use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::structs::{Actor, RealmId};
     use aruna_core::types::UserId;
 
@@ -264,12 +265,30 @@ mod tests {
         }
     }
 
+    fn change() -> DocumentSyncChange {
+        DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(8, 1),
+                actor: node(1),
+                updated_at_ms: 9,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        }
+    }
+
     #[test]
     fn outbox_prefix_is_deterministic_and_kind_scoped() {
         let upsert = DocumentSyncOutboxEvent::Upsert { bytes: vec![1, 2] };
+        let upsert_with_revision = DocumentSyncOutboxEvent::UpsertWithRevision {
+            bytes: vec![1, 2],
+            change: change(),
+        };
         let delete = DocumentSyncOutboxEvent::Delete;
 
         assert_eq!(outbox_prefix(&upsert), outbox_prefix(&upsert));
+        assert_eq!(outbox_prefix(&upsert), outbox_prefix(&upsert_with_revision));
         assert_ne!(outbox_prefix(&upsert), outbox_prefix(&delete));
     }
 
@@ -288,6 +307,24 @@ mod tests {
 
         assert_eq!(decoded, record);
         assert_eq!(decoded.peers, vec![peer]);
+    }
+
+    #[test]
+    fn outbox_record_with_revision_round_trips() {
+        let record = new_outbox_record(
+            node(1),
+            target(),
+            vec![node(3)],
+            DocumentSyncOutboxEvent::UpsertWithRevision {
+                bytes: vec![4, 5],
+                change: change(),
+            },
+        );
+        let bytes = postcard::to_allocvec(&record).expect("record serializes");
+        let decoded: DocumentSyncOutboxRecord =
+            postcard::from_bytes(&bytes).expect("record decodes");
+
+        assert_eq!(decoded, record);
     }
 
     #[test]

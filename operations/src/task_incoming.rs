@@ -65,6 +65,32 @@ struct DrainSyncOutcome {
     retry_needed: bool,
 }
 
+fn document_publish_from_outbox(
+    event_id: ulid::Ulid,
+    target: DocumentSyncTarget,
+    event: DocumentSyncOutboxEvent,
+) -> DocumentSyncPublish {
+    match event {
+        DocumentSyncOutboxEvent::Upsert { bytes } => DocumentSyncPublish::Upsert {
+            event_id,
+            target,
+            bytes,
+        },
+        DocumentSyncOutboxEvent::Delete => DocumentSyncPublish::Delete { event_id, target },
+        DocumentSyncOutboxEvent::AdminOperation { event } => {
+            DocumentSyncPublish::AdminOperation { target, event }
+        }
+        DocumentSyncOutboxEvent::UpsertWithRevision { bytes, change } => {
+            DocumentSyncPublish::UpsertWithRevision {
+                event_id,
+                target,
+                bytes,
+                change,
+            }
+        }
+    }
+}
+
 impl DrainSyncOutcome {
     fn merge(&mut self, other: DrainSyncOutcome) {
         self.sync_elapsed += other.sync_elapsed;
@@ -139,23 +165,8 @@ impl OperationsTaskHandler {
         let mut publish_groups: BTreeMap<Vec<aruna_core::NodeId>, Vec<DrainSubBatch>> =
             BTreeMap::new();
         for (record_key, record) in batch.records {
-            let document = match record.event {
-                DocumentSyncOutboxEvent::Upsert { bytes } => DocumentSyncPublish::Upsert {
-                    event_id: record.outbox_id,
-                    target: record.target.clone(),
-                    bytes,
-                },
-                DocumentSyncOutboxEvent::Delete => DocumentSyncPublish::Delete {
-                    event_id: record.outbox_id,
-                    target: record.target.clone(),
-                },
-                DocumentSyncOutboxEvent::AdminOperation { event } => {
-                    DocumentSyncPublish::AdminOperation {
-                        target: record.target.clone(),
-                        event,
-                    }
-                }
-            };
+            let document =
+                document_publish_from_outbox(record.outbox_id, record.target.clone(), record.event);
 
             let subbatches = publish_groups.entry(record.peers.clone()).or_default();
             if subbatches
@@ -614,7 +625,10 @@ mod tests {
     use crate::document_sync_outbox::{
         outbox_key, read_outbox_record, restore_document_sync_outbox_timers, write_outbox_effect,
     };
-    use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncOutboxRecord};
+    use aruna_core::document::{
+        DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent,
+        DocumentSyncOutboxRecord, DocumentSyncRevision,
+    };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::METADATA_GRAPH_PRUNE_JOB_KEYSPACE;
@@ -650,6 +664,19 @@ mod tests {
         }
     }
 
+    fn change() -> DocumentSyncChange {
+        DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(8, 1),
+                actor: node(1),
+                updated_at_ms: 9,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        }
+    }
+
     async fn read_graph_prune_jobs(
         storage: &aruna_storage::StorageHandle,
     ) -> Vec<MetadataGraphPruneJobRecord> {
@@ -682,6 +709,29 @@ mod tests {
             Event::Storage(StorageEvent::WriteResult { .. }) => {}
             other => panic!("unexpected outbox write event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn outbox_upsert_with_revision_maps_to_publish_with_revision() {
+        let event_id = Ulid::from_parts(10, 1);
+        let target = target();
+        let change = change();
+        let publish = document_publish_from_outbox(
+            event_id,
+            target.clone(),
+            DocumentSyncOutboxEvent::UpsertWithRevision {
+                bytes: vec![1, 2, 3],
+                change,
+            },
+        );
+
+        assert_eq!(publish.target(), &target);
+        assert_eq!(publish.event_id(), event_id);
+        assert!(matches!(
+            publish,
+            DocumentSyncPublish::UpsertWithRevision { bytes, change: actual, .. }
+                if bytes == vec![1, 2, 3] && actual == change
+        ));
     }
 
     async fn restore_document_sync_outbox_timer_and_receive_key(

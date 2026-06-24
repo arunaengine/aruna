@@ -73,9 +73,17 @@ pub struct DocumentSyncOutboxRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DocumentSyncOutboxEvent {
-    Upsert { bytes: Vec<u8> },
+    Upsert {
+        bytes: Vec<u8>,
+    },
     Delete,
-    AdminOperation { event: Box<AdminDocumentEvent> },
+    AdminOperation {
+        event: Box<AdminDocumentEvent>,
+    },
+    UpsertWithRevision {
+        bytes: Vec<u8>,
+        change: DocumentSyncChange,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -122,6 +130,12 @@ pub enum DocumentSyncPublish {
         target: DocumentSyncTarget,
         event: Box<AdminDocumentEvent>,
     },
+    UpsertWithRevision {
+        event_id: Ulid,
+        target: DocumentSyncTarget,
+        bytes: Vec<u8>,
+        change: DocumentSyncChange,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -141,8 +155,18 @@ impl DocumentSyncPublish {
     pub fn target(&self) -> &DocumentSyncTarget {
         match self {
             Self::Upsert { target, .. }
+            | Self::UpsertWithRevision { target, .. }
             | Self::Delete { target, .. }
             | Self::AdminOperation { target, .. } => target,
+        }
+    }
+
+    pub fn event_id(&self) -> Ulid {
+        match self {
+            Self::Upsert { event_id, .. }
+            | Self::UpsertWithRevision { event_id, .. }
+            | Self::Delete { event_id, .. } => *event_id,
+            Self::AdminOperation { event, .. } => event.event_id,
         }
     }
 }
@@ -150,7 +174,7 @@ impl DocumentSyncPublish {
 impl DocumentSyncOutboxEvent {
     pub fn kind(&self) -> &'static [u8] {
         match self {
-            Self::Upsert { .. } => b"upsert",
+            Self::Upsert { .. } | Self::UpsertWithRevision { .. } => b"upsert",
             Self::Delete => b"delete",
             Self::AdminOperation { .. } => b"admin-operation",
         }
@@ -314,12 +338,19 @@ pub enum DocumentSyncEvent {
         target: DocumentSyncTarget,
         event: Box<AdminDocumentEvent>,
     },
+    UpsertWithRevision {
+        event_id: Ulid,
+        target: DocumentSyncTarget,
+        bytes: Vec<u8>,
+        change: DocumentSyncChange,
+    },
 }
 
 impl DocumentSyncEvent {
     pub fn target(&self) -> &DocumentSyncTarget {
         match self {
             Self::Upsert { target, .. }
+            | Self::UpsertWithRevision { target, .. }
             | Self::Delete { target, .. }
             | Self::AdminOperation { target, .. } => target,
         }
@@ -327,7 +358,9 @@ impl DocumentSyncEvent {
 
     pub fn event_id(&self) -> Ulid {
         match self {
-            Self::Upsert { event_id, .. } | Self::Delete { event_id, .. } => *event_id,
+            Self::Upsert { event_id, .. }
+            | Self::UpsertWithRevision { event_id, .. }
+            | Self::Delete { event_id, .. } => *event_id,
             Self::AdminOperation { event, .. } => event.event_id,
         }
     }
@@ -389,8 +422,8 @@ mod tests {
 
     use super::{
         DocumentSyncApplyDecision, DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncEvent,
-        DocumentSyncRevision, DocumentSyncTarget, compare_document_sync_revisions,
-        document_sync_apply_decision,
+        DocumentSyncOutboxEvent, DocumentSyncPublish, DocumentSyncRevision, DocumentSyncTarget,
+        compare_document_sync_revisions, document_sync_apply_decision,
     };
     use crate::NodeId;
     use crate::TopicId;
@@ -643,6 +676,40 @@ mod tests {
     #[test]
     fn document_sync_event_type_id_is_stable() {
         assert_eq!(DocumentSyncEvent::TYPE_ID, "aruna.document.v2");
+    }
+
+    #[test]
+    fn upsert_with_revision_uses_upsert_kind_and_helpers() {
+        let event_id = test_ulid(10);
+        let target = DocumentSyncTarget::RealmConfig {
+            realm_id: test_realm(11),
+        };
+        let change = change(DocumentSyncChangeKind::Upsert, None, 1, 12, 1);
+        let outbox = DocumentSyncOutboxEvent::UpsertWithRevision {
+            bytes: vec![1, 2],
+            change,
+        };
+        let publish = DocumentSyncPublish::UpsertWithRevision {
+            event_id,
+            target: target.clone(),
+            bytes: vec![1, 2],
+            change,
+        };
+        let event = DocumentSyncEvent::UpsertWithRevision {
+            event_id,
+            target: target.clone(),
+            bytes: vec![1, 2],
+            change,
+        };
+
+        assert_eq!(
+            outbox.kind(),
+            DocumentSyncOutboxEvent::Upsert { bytes: vec![] }.kind()
+        );
+        assert_eq!(publish.target(), &target);
+        assert_eq!(publish.event_id(), event_id);
+        assert_eq!(event.target(), &target);
+        assert_eq!(event.event_id(), event_id);
     }
 
     #[test]

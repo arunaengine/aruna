@@ -532,6 +532,17 @@ impl IrokleService {
                 target,
                 bytes,
             },
+            DocumentSyncEvent::UpsertWithRevision {
+                event_id,
+                target,
+                bytes,
+                change,
+            } => DocumentSyncPublish::UpsertWithRevision {
+                event_id,
+                target,
+                bytes,
+                change,
+            },
             DocumentSyncEvent::Delete { event_id, target } => {
                 DocumentSyncPublish::Delete { event_id, target }
             }
@@ -595,6 +606,17 @@ impl IrokleService {
                     event_id,
                     target,
                     bytes,
+                },
+                DocumentSyncPublish::UpsertWithRevision {
+                    event_id,
+                    target,
+                    bytes,
+                    change,
+                } => DocumentSyncEvent::UpsertWithRevision {
+                    event_id,
+                    target,
+                    bytes,
+                    change,
                 },
                 DocumentSyncPublish::Delete { event_id, target } => {
                     DocumentSyncEvent::Delete { event_id, target }
@@ -1272,15 +1294,24 @@ impl IrokleService {
                     continue;
                 }
                 match event {
-                    event @ DocumentSyncEvent::Upsert {
+                    event @ (DocumentSyncEvent::Upsert {
                         target: DocumentSyncTarget::MetadataCreateEvent { .. },
                         ..
-                    } => {
+                    }
+                    | DocumentSyncEvent::UpsertWithRevision {
+                        target: DocumentSyncTarget::MetadataCreateEvent { .. },
+                        ..
+                    }) => {
                         let pending = self.pending_metadata_create_apply(event)?;
                         pending_metadata_creates.push(pending);
                         deferred_creates = true;
                     }
                     DocumentSyncEvent::Upsert {
+                        target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
+                        bytes,
+                        ..
+                    }
+                    | DocumentSyncEvent::UpsertWithRevision {
                         target: DocumentSyncTarget::MetadataDocumentLifecycle { document_id },
                         bytes,
                         ..
@@ -1333,6 +1364,11 @@ impl IrokleService {
                         }
                     }
                     DocumentSyncEvent::Upsert {
+                        target: DocumentSyncTarget::MetadataGraphLifecycle { graph_iri },
+                        bytes,
+                        ..
+                    }
+                    | DocumentSyncEvent::UpsertWithRevision {
                         target: DocumentSyncTarget::MetadataGraphLifecycle { graph_iri },
                         bytes,
                         ..
@@ -1439,17 +1475,28 @@ impl IrokleService {
         &self,
         event: DocumentSyncEvent,
     ) -> Result<PendingMetadataCreateApply> {
-        let DocumentSyncEvent::Upsert {
-            target:
-                DocumentSyncTarget::MetadataCreateEvent {
-                    document_id,
-                    event_id: target_event_id,
-                },
-            bytes,
-            ..
-        } = event
-        else {
-            unreachable!("metadata create apply helper is only called for metadata create upserts");
+        let (document_id, target_event_id, bytes) = match event {
+            DocumentSyncEvent::Upsert {
+                target:
+                    DocumentSyncTarget::MetadataCreateEvent {
+                        document_id,
+                        event_id: target_event_id,
+                    },
+                bytes,
+                ..
+            }
+            | DocumentSyncEvent::UpsertWithRevision {
+                target:
+                    DocumentSyncTarget::MetadataCreateEvent {
+                        document_id,
+                        event_id: target_event_id,
+                    },
+                bytes,
+                ..
+            } => (document_id, target_event_id, bytes),
+            _ => unreachable!(
+                "metadata create apply helper is only called for metadata create upserts"
+            ),
         };
         let record: MetadataCreateEventRecord =
             postcard::from_bytes(&bytes).map_err(|error| NetError::Bootstrap(error.to_string()))?;
@@ -1525,7 +1572,8 @@ impl IrokleService {
 
     async fn apply_document_event(&self, event: DocumentSyncEvent) -> Result<()> {
         match event {
-            DocumentSyncEvent::Upsert { target, bytes, .. } => {
+            DocumentSyncEvent::Upsert { target, bytes, .. }
+            | DocumentSyncEvent::UpsertWithRevision { target, bytes, .. } => {
                 self.apply_upsert(target, bytes).await
             }
             DocumentSyncEvent::Delete { target, .. } => self.apply_delete(target).await,
@@ -3562,7 +3610,7 @@ mod tests {
         AdminDocumentRoleDefinition, AdminDocumentTarget,
     };
     use aruna_core::alpn::Alpn;
-    use aruna_core::document::DocumentSyncChangeKind;
+    use aruna_core::document::{DocumentSyncChangeKind, DocumentSyncRevision};
     use aruna_core::keyspaces::{
         ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE, AUTH_KEYSPACE,
         DOCUMENT_SYNC_REVISION_KEYSPACE, GROUP_KEYSPACE, METADATA_DOCUMENT_INDEX_KEYSPACE,
@@ -3627,6 +3675,19 @@ mod tests {
 
     fn restart_payload() -> Vec<u8> {
         b"buffered restart contract payload".to_vec()
+    }
+
+    fn revision_change() -> DocumentSyncChange {
+        DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(1_727_000_000_001, 43),
+                actor: node(77),
+                updated_at_ms: 1_727_000_000_002,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        }
     }
 
     async fn restart_endpoint() -> iroh::Endpoint {
@@ -5638,6 +5699,22 @@ mod tests {
 
         // Skip Rust destructors so the parent verifies the restart contract, not shutdown cleanup.
         std::process::exit(0);
+    }
+
+    #[test]
+    fn upsert_with_revision_event_envelope_round_trips() {
+        let event = DocumentSyncEvent::UpsertWithRevision {
+            event_id: restart_event_id(),
+            target: restart_target(),
+            bytes: restart_payload(),
+            change: revision_change(),
+        };
+        let envelope = EventEnvelope::encode_event(&event).expect("event encodes");
+        let decoded = envelope
+            .decode_event::<DocumentSyncEvent>()
+            .expect("event decodes");
+
+        assert_eq!(decoded, event);
     }
 
     #[tokio::test]
