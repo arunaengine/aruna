@@ -1,14 +1,19 @@
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncRevision, DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::document_sync_revision_write_entry;
 use aruna_core::structs::{Actor, User, oidc_subject_key};
 use aruna_core::types::{Effects, TxnId, UserId};
 use aruna_core::{USER_KEYSPACE, USER_SUBJECT_INDEX_KEYSPACE};
 use byteview::ByteView;
+use chrono::Utc;
 use smallvec::smallvec;
 use thiserror::Error;
+use ulid::Ulid;
 
 use crate::replicate_documents::replicate_documents_effect;
 use crate::user_subject_index::rewrite_subject_index_effects;
@@ -34,7 +39,7 @@ enum RegisterOrGetOidcUserState {
     StartTransaction,
     ReadSubjectIndex { txn_id: TxnId },
     ReadExistingUser { txn_id: TxnId },
-    WriteUser { txn_id: TxnId, user: User },
+    WriteUserAndDocumentRevision { txn_id: TxnId, user: User },
     WriteSubjectIndex { txn_id: TxnId, user: User },
     CommitTransaction { user: User, announce: bool },
     AnnounceUser { user: User },
@@ -162,25 +167,32 @@ impl RegisterOrGetOidcUserOperation {
             attributes: Default::default(),
         };
 
-        self.state = RegisterOrGetOidcUserState::WriteUser {
+        self.state = RegisterOrGetOidcUserState::WriteUserAndDocumentRevision {
             txn_id,
             user: user.clone(),
         };
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(self.input.user_id.to_bytes()),
-            value: ByteView::from(user.to_bytes(&self.input.actor)?),
+        let document_target = DocumentSyncTarget::User {
+            user_id: self.input.user_id,
+        };
+        let document_revision = initial_user_document_sync_change(&self.input.actor);
+        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
+            writes: vec![
+                (
+                    USER_KEYSPACE.to_string(),
+                    ByteView::from(self.input.user_id.to_bytes()),
+                    ByteView::from(user.to_bytes(&self.input.actor)?),
+                ),
+                document_sync_revision_write_entry(&document_target, &document_revision)?,
+            ],
             txn_id: Some(txn_id),
         })])
     }
 
     fn handle_write_user(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
         let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::WriteResult { .. }) = event else {
-            return self.unexpected_event(
-                "Event::Storage(StorageEvent::ReadResult { value, .. })",
-                got,
-            );
+        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
+            return self
+                .unexpected_event("Event::Storage(StorageEvent::BatchWriteResult { .. })", got);
         };
 
         match self.emit_write_subject_index(txn_id, user) {
@@ -323,7 +335,7 @@ impl Operation for RegisterOrGetOidcUserOperation {
             RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id } => {
                 self.handle_read_subject_index(event, txn_id)
             }
-            RegisterOrGetOidcUserState::WriteUser { txn_id, user } => {
+            RegisterOrGetOidcUserState::WriteUserAndDocumentRevision { txn_id, user } => {
                 self.handle_write_user(event, txn_id, user)
             }
             RegisterOrGetOidcUserState::WriteSubjectIndex { txn_id, user } => {
@@ -359,12 +371,30 @@ impl Operation for RegisterOrGetOidcUserOperation {
         match self.state {
             RegisterOrGetOidcUserState::ReadSubjectIndex { txn_id }
             | RegisterOrGetOidcUserState::ReadExistingUser { txn_id }
-            | RegisterOrGetOidcUserState::WriteUser { txn_id, .. }
+            | RegisterOrGetOidcUserState::WriteUserAndDocumentRevision { txn_id, .. }
             | RegisterOrGetOidcUserState::WriteSubjectIndex { txn_id, .. } => {
                 smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
             }
             _ => smallvec![],
         }
+    }
+}
+
+fn current_timestamp_ms() -> u64 {
+    u64::try_from(Utc::now().timestamp_millis()).unwrap_or_default()
+}
+
+fn initial_user_document_sync_change(actor: &Actor) -> DocumentSyncChange {
+    let updated_at_ms = current_timestamp_ms();
+    DocumentSyncChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: updated_at_ms,
+            event_id: Ulid::new(),
+            actor: actor.node_id,
+            updated_at_ms,
+        },
+        kind: DocumentSyncChangeKind::Upsert,
     }
 }
 
@@ -374,9 +404,11 @@ mod tests {
         RegisterOrGetOidcUserInput, RegisterOrGetOidcUserOperation, RegisterOrGetOidcUserState,
     };
     use aruna_core::UserId;
+    use aruna_core::document::{DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncTarget};
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::operation::Operation;
+    use aruna_core::storage_entries::document_sync_revision_key;
     use aruna_core::structs::{Actor, User, oidc_subject_key};
     use aruna_core::types::TxnId;
     use ulid::Ulid;
@@ -430,15 +462,24 @@ mod tests {
             value: None,
         }));
         match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Write { value, .. }) => {
-                let stored_user = User::from_bytes(value).unwrap();
+            Effect::Storage(StorageEffect::BatchWrite { writes, txn_id: id }) => {
+                assert_eq!(*id, Some(txn_id));
+                assert_eq!(writes.len(), 2);
+                let user_write = writes
+                    .iter()
+                    .find(|(keyspace, _, _)| keyspace == aruna_core::USER_KEYSPACE)
+                    .expect("user write is included");
+                let stored_user = User::from_bytes(user_write.2.as_ref()).unwrap();
                 assert_eq!(stored_user, expected_user);
+                assert!(writes.iter().any(
+                    |(keyspace, _, _)| keyspace == aruna_core::DOCUMENT_SYNC_REVISION_KEYSPACE
+                ));
             }
-            other => panic!("unexpected user write effect: {other:?}"),
+            other => panic!("unexpected user materialization effect: {other:?}"),
         }
 
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: user_id.to_bytes().into(),
+        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
+            entries: Vec::new(),
         }));
         match effects.first().unwrap() {
             Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => {
@@ -472,6 +513,70 @@ mod tests {
         }));
         assert!(effects.is_empty());
         assert_eq!(operation.finalize().unwrap(), expected_user);
+    }
+
+    #[tokio::test]
+    async fn writes_document_sync_revision_sidecar_with_new_user() {
+        let realm_id = aruna_core::structs::RealmId([7u8; 32]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let user_id = UserId::local(Ulid::new(), realm_id);
+        let mut operation = RegisterOrGetOidcUserOperation::new(RegisterOrGetOidcUserInput {
+            actor: actor.clone(),
+            issuer: "https://issuer.example".to_string(),
+            subject_id: "subject-3".to_string(),
+            name: "carol".to_string(),
+            user_id,
+        });
+        let document_target = DocumentSyncTarget::User { user_id };
+
+        operation.start();
+        let txn_id = TxnId::new();
+        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
+            key: oidc_subject_key("https://issuer.example", "subject-3")
+                .unwrap()
+                .into_bytes()
+                .into(),
+            value: None,
+        }));
+
+        let [
+            Effect::Storage(StorageEffect::BatchWrite {
+                writes,
+                txn_id: Some(write_txn_id),
+            }),
+        ] = effects.as_slice()
+        else {
+            panic!("expected new user batch write, got {effects:?}");
+        };
+        assert_eq!(*write_txn_id, txn_id);
+        assert_eq!(writes.len(), 2);
+        assert!(
+            writes
+                .iter()
+                .any(|(keyspace, _, _)| keyspace == aruna_core::USER_KEYSPACE)
+        );
+
+        let (revision_key, revision): (_, DocumentSyncChange) = writes
+            .iter()
+            .find(|(keyspace, _, _)| keyspace == aruna_core::DOCUMENT_SYNC_REVISION_KEYSPACE)
+            .map(|(_, key, value)| {
+                (
+                    key,
+                    postcard::from_bytes(value).expect("revision sidecar decodes"),
+                )
+            })
+            .expect("revision sidecar write exists");
+        assert_eq!(revision_key, &document_sync_revision_key(&document_target));
+        assert_eq!(revision.base, None);
+        assert_eq!(revision.current.actor, actor.node_id);
+        assert!(revision.current.generation > 0);
+        assert!(revision.current.updated_at_ms > 0);
+        assert_eq!(revision.kind, DocumentSyncChangeKind::Upsert);
     }
 
     #[tokio::test]
