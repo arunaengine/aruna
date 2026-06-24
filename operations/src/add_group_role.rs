@@ -1,8 +1,8 @@
 use aruna_core::admin_document_reducer::{AdminDocumentReducerError, AdminDocumentReducerState};
 use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
 };
-use aruna_core::document::DocumentSyncTarget;
+use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
@@ -13,6 +13,7 @@ use aruna_core::storage_entries::{
     admin_document_reducer_state_write_entry, stale_admin_document_conflict_delete_entries,
 };
 use aruna_core::structs::{Actor, AuthContext, Group, GroupAuthorizationDocument, RealmId, Role};
+use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, UserId};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,9 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use crate::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+use crate::document_sync_outbox::{
+    new_outbox_record_with_id, outbox_write_entry, schedule_outbox_drain_effect,
+};
 use crate::replicate_documents::replicate_documents_effect;
 use aruna_core::structs::Permission;
 
@@ -67,15 +71,22 @@ pub enum AddGroupRoleState {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
         stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
     },
     DeleteStaleAdminConflicts {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
     },
     CommitTransaction {
         txn_id: TxnId,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
+    },
+    ScheduleAdminDocumentOutboxDrain {
         group: Group,
         auth_doc: GroupAuthorizationDocument,
     },
@@ -287,7 +298,7 @@ impl AddGroupRoleOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentReducerState::new(target));
-        apply_admin_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events = apply_admin_reducer_updates(&mut reducer_state, &self.input)?;
         materialize_group_role(&mut group, &mut auth_doc, &self.input.role, &reducer_state);
 
         let stale_conflict_delete_keys: Vec<_> = stale_admin_document_conflict_delete_entries(
@@ -310,12 +321,28 @@ impl AddGroupRoleOperation {
             ),
             admin_document_reducer_state_write_entry(&reducer_state)?,
         ];
+        let document_target = DocumentSyncTarget::GroupAuthorization {
+            group_id: self.input.group_id,
+        };
+        for event in &admin_events {
+            let record = new_outbox_record_with_id(
+                event.event_id,
+                self.input.actor.node_id,
+                document_target.clone(),
+                Vec::new(),
+                DocumentSyncOutboxEvent::AdminOperation {
+                    event: Box::new(event.clone()),
+                },
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
         writes.extend(admin_document_conflict_write_entries(&reducer_state)?);
 
         self.state = AddGroupRoleState::WriteGroupAuthDocAndAdminState {
             txn_id,
             group,
             auth_doc,
+            admin_outbox_written: !admin_events.is_empty(),
             stale_conflict_delete_keys,
         };
 
@@ -331,6 +358,7 @@ impl AddGroupRoleOperation {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
         stale_conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
     ) -> Effects {
         let got = format!("{event:?}");
@@ -347,6 +375,7 @@ impl AddGroupRoleOperation {
                 txn_id,
                 group,
                 auth_doc,
+                admin_outbox_written,
             };
             let deletes = stale_conflict_delete_keys
                 .into_iter()
@@ -358,7 +387,7 @@ impl AddGroupRoleOperation {
             })];
         }
 
-        self.emit_commit_transaction(txn_id, group, auth_doc)
+        self.emit_commit_transaction(txn_id, group, auth_doc, admin_outbox_written)
     }
 
     fn handle_delete_stale_admin_conflicts(
@@ -367,6 +396,7 @@ impl AddGroupRoleOperation {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
     ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
@@ -377,7 +407,7 @@ impl AddGroupRoleOperation {
             );
         };
 
-        self.emit_commit_transaction(txn_id, group, auth_doc)
+        self.emit_commit_transaction(txn_id, group, auth_doc, admin_outbox_written)
     }
 
     fn emit_commit_transaction(
@@ -385,11 +415,13 @@ impl AddGroupRoleOperation {
         txn_id: TxnId,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
     ) -> Effects {
         self.state = AddGroupRoleState::CommitTransaction {
             txn_id,
             group,
             auth_doc,
+            admin_outbox_written,
         };
         smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
     }
@@ -399,6 +431,7 @@ impl AddGroupRoleOperation {
         event: Event,
         group: Group,
         auth_doc: GroupAuthorizationDocument,
+        admin_outbox_written: bool,
     ) -> Effects {
         let got = format!("{event:?}");
         let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
@@ -408,6 +441,42 @@ impl AddGroupRoleOperation {
                 got,
             );
         };
+        if admin_outbox_written {
+            self.state = AddGroupRoleState::ScheduleAdminDocumentOutboxDrain { group, auth_doc };
+            return smallvec![schedule_outbox_drain_effect()];
+        }
+
+        self.emit_announce_group_doc(group, auth_doc)
+    }
+
+    fn handle_schedule_admin_document_outbox_drain(
+        &mut self,
+        event: Event,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+    ) -> Effects {
+        match event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => {
+                self.emit_announce_group_doc(group, auth_doc)
+            }
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                self.fail(AddGroupRoleError::TopicAnnouncement(format!(
+                    "admin document outbox drain scheduling failed: {message}"
+                )))
+            }
+            other => self.unexpected_event(
+                self.state.clone(),
+                "admin document outbox drain timer schedule",
+                format!("{other:?}"),
+            ),
+        }
+    }
+
+    fn emit_announce_group_doc(
+        &mut self,
+        group: Group,
+        auth_doc: GroupAuthorizationDocument,
+    ) -> Effects {
         self.state = AddGroupRoleState::AnnounceGroupDoc {
             group: group.clone(),
             auth_doc: auth_doc.clone(),
@@ -555,22 +624,37 @@ impl Operation for AddGroupRoleOperation {
                 txn_id,
                 group,
                 auth_doc,
+                admin_outbox_written,
                 stale_conflict_delete_keys,
             } => self.handle_write_group_auth_doc_and_admin_state(
                 event,
                 txn_id,
                 group,
                 auth_doc,
+                admin_outbox_written,
                 stale_conflict_delete_keys,
             ),
             AddGroupRoleState::DeleteStaleAdminConflicts {
                 txn_id,
                 group,
                 auth_doc,
-            } => self.handle_delete_stale_admin_conflicts(event, txn_id, group, auth_doc),
+                admin_outbox_written,
+            } => self.handle_delete_stale_admin_conflicts(
+                event,
+                txn_id,
+                group,
+                auth_doc,
+                admin_outbox_written,
+            ),
             AddGroupRoleState::CommitTransaction {
-                group, auth_doc, ..
-            } => self.handle_commit_transaction(event, group, auth_doc),
+                group,
+                auth_doc,
+                admin_outbox_written,
+                ..
+            } => self.handle_commit_transaction(event, group, auth_doc, admin_outbox_written),
+            AddGroupRoleState::ScheduleAdminDocumentOutboxDrain { group, auth_doc } => {
+                self.handle_schedule_admin_document_outbox_drain(event, group, auth_doc)
+            }
             AddGroupRoleState::AnnounceGroupDoc { group, auth_doc } => {
                 self.handle_announce_group_doc(event, group, auth_doc)
             }
@@ -612,17 +696,19 @@ impl Operation for AddGroupRoleOperation {
 fn apply_admin_reducer_updates(
     state: &mut AdminDocumentReducerState,
     input: &AddGroupRoleConfig,
-) -> Result<(), AdminDocumentReducerError> {
-    apply_admin_reducer_operation(
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentReducerError> {
+    let mut admin_events = Vec::new();
+    let event = apply_admin_reducer_operation(
         state,
         &input.actor,
-        AdminDocumentOperation::GroupRoleAdded {
-            role_id: input.role.role_id,
+        AdminDocumentOperation::GroupRoleCreated {
+            role: AdminDocumentRoleDefinition::from(&input.role),
         },
     )?;
+    admin_events.push(event);
 
     for user_id in sorted_user_ids(&input.role.assigned_users) {
-        apply_admin_reducer_operation(
+        let event = apply_admin_reducer_operation(
             state,
             &input.actor,
             AdminDocumentOperation::GroupRoleUserAssignmentAdded {
@@ -630,16 +716,17 @@ fn apply_admin_reducer_updates(
                 user_id,
             },
         )?;
+        admin_events.push(event);
     }
 
-    Ok(())
+    Ok(admin_events)
 }
 
 fn apply_admin_reducer_operation(
     state: &mut AdminDocumentReducerState,
     actor: &Actor,
     op: AdminDocumentOperation,
-) -> Result<(), AdminDocumentReducerError> {
+) -> Result<AdminDocumentEvent, AdminDocumentReducerError> {
     let observed = state.clock.clone();
     let event = AdminDocumentEvent {
         event_id: Ulid::new(),
@@ -651,7 +738,7 @@ fn apply_admin_reducer_operation(
         op,
     };
     state.apply(&event)?;
-    Ok(())
+    Ok(event)
 }
 
 fn materialize_group_role(
@@ -703,7 +790,12 @@ pub mod test {
     use aruna_core::admin_document_reducer::{
         AdminDocumentConflict, AdminDocumentConflictValue, AdminDocumentReducerState,
     };
-    use aruna_core::admin_documents::{AdminDocumentDot, AdminDocumentTarget};
+    use aruna_core::admin_documents::{
+        AdminDocumentDot, AdminDocumentOperation, AdminDocumentRoleDefinition, AdminDocumentTarget,
+    };
+    use aruna_core::document::{
+        DocumentSyncOutboxEvent, DocumentSyncOutboxRecord, DocumentSyncTarget,
+    };
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
@@ -712,8 +804,12 @@ pub mod test {
         admin_document_reducer_conflict_key, admin_document_reducer_state_key,
     };
     use aruna_core::structs::{Actor, Group, GroupAuthorizationDocument, Permission, Role};
+    use aruna_core::task::{TaskEvent, TaskKey};
     use aruna_core::types::TxnId;
-    use aruna_core::{ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE};
+    use aruna_core::{
+        ADMIN_DOCUMENT_CONFLICT_KEYSPACE, ADMIN_DOCUMENT_STATE_KEYSPACE,
+        DOCUMENT_SYNC_OUTBOX_KEYSPACE,
+    };
     use ulid::Ulid;
 
     #[tokio::test]
@@ -911,6 +1007,11 @@ pub mod test {
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == ADMIN_DOCUMENT_STATE_KEYSPACE)
                     .expect("reducer state write is included");
+                let outbox_records: Vec<DocumentSyncOutboxRecord> = writes
+                    .iter()
+                    .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                    .map(|(_, _, value)| postcard::from_bytes(value.as_ref()).unwrap())
+                    .collect();
 
                 assert_eq!(auth_write.1, group_id.to_bytes().into());
                 assert_eq!(group_write.1, group_id.to_bytes().into());
@@ -927,6 +1028,19 @@ pub mod test {
                         .contains(&add_role_input.role.role_id)
                 );
                 assert!(!reducer_state.conflicts.contains_key(&conflict_path));
+                assert!(outbox_records.iter().any(|record| {
+                    record.target == (DocumentSyncTarget::GroupAuthorization { group_id })
+                        && matches!(
+                            &record.event,
+                            DocumentSyncOutboxEvent::AdminOperation { event }
+                                if event.target == target
+                                    && matches!(
+                                        &event.op,
+                                        AdminDocumentOperation::GroupRoleCreated { role }
+                                            if role == &AdminDocumentRoleDefinition::from(&add_role_input.role)
+                                    )
+                        )
+                }));
             }
             other => panic!("unexpected group role write effect: {other:?}"),
         }
@@ -936,6 +1050,7 @@ pub mod test {
                 txn_id,
                 group: mutated_group.clone(),
                 auth_doc: mutated_auth_doc.clone(),
+                admin_outbox_written: true,
                 stale_conflict_delete_keys: stale_conflict_delete_keys.clone(),
             }
         );
@@ -983,12 +1098,26 @@ pub mod test {
                 txn_id,
                 group: mutated_group.clone(),
                 auth_doc: mutated_auth_doc.clone(),
+                admin_outbox_written: true,
             }
         );
 
         let effects = add_role_operation.step(Event::Storage(
             aruna_core::events::StorageEvent::TransactionCommitted { txn_id },
         ));
+        assert!(matches!(effects.first(), Some(Effect::Task(_))));
+        assert_eq!(
+            add_role_operation.state,
+            AddGroupRoleState::ScheduleAdminDocumentOutboxDrain {
+                group: mutated_group.clone(),
+                auth_doc: mutated_auth_doc.clone(),
+            }
+        );
+
+        let effects = add_role_operation.step(Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainDocumentSyncOutbox,
+            after: std::time::Duration::ZERO,
+        }));
         let announce_group_doc = effects.first().unwrap();
         assert!(matches!(announce_group_doc, Effect::SubOperation(_)));
         assert_eq!(
