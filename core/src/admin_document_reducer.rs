@@ -93,13 +93,13 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::Group { .. },
                 AdminDocumentOperation::GroupRoleAdded { role_id },
             ) => {
-                self.apply_group_role(event, role_id, Some(role_id.to_string()));
+                self.apply_group_role(event, role_id, role_id.to_string());
             }
             (
                 AdminDocumentTarget::Group { .. },
                 AdminDocumentOperation::GroupRoleCreated { role },
             ) => {
-                self.apply_group_role(event, &role.role_id, Some(role_definition_value(role)));
+                self.apply_group_role(event, &role.role_id, role_definition_value(role));
             }
             (
                 AdminDocumentTarget::Group { .. },
@@ -122,13 +122,13 @@ impl AdminDocumentReducerState {
                 AdminDocumentTarget::Realm { .. },
                 AdminDocumentOperation::RealmRoleAdded { role_id },
             ) => {
-                self.apply_realm_role(event, role_id, Some(role_id.to_string()));
+                self.apply_realm_role(event, role_id, role_id.to_string());
             }
             (
                 AdminDocumentTarget::Realm { .. },
                 AdminDocumentOperation::RealmRoleCreated { role },
             ) => {
-                self.apply_realm_role(event, &role.role_id, Some(role_definition_value(role)));
+                self.apply_realm_role(event, &role.role_id, role_definition_value(role));
             }
             (
                 AdminDocumentTarget::Realm { .. },
@@ -352,16 +352,11 @@ impl AdminDocumentReducerState {
         }
     }
 
-    fn apply_group_role(
-        &mut self,
-        event: &AdminDocumentEvent,
-        role_id: &RoleId,
-        value: Option<String>,
-    ) {
+    fn apply_group_role(&mut self, event: &AdminDocumentEvent, role_id: &RoleId, value: String) {
         let path = group_role_path(role_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
-        match self.reduce_value(event, &path, current, value) {
+        match self.reduce_role_value(event, &path, role_id, current, value) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -391,16 +386,11 @@ impl AdminDocumentReducerState {
         }
     }
 
-    fn apply_realm_role(
-        &mut self,
-        event: &AdminDocumentEvent,
-        role_id: &RoleId,
-        value: Option<String>,
-    ) {
+    fn apply_realm_role(&mut self, event: &AdminDocumentEvent, role_id: &RoleId, value: String) {
         let path = realm_role_path(role_id);
         let current = self.user_subject_ids.get(&path).cloned();
 
-        match self.reduce_value(event, &path, current, value) {
+        match self.reduce_role_value(event, &path, role_id, current, value) {
             Some(version) => {
                 self.user_subject_ids.insert(path, version);
             }
@@ -466,6 +456,72 @@ impl AdminDocumentReducerState {
         Some(current)
     }
 
+    fn reduce_role_value(
+        &mut self,
+        event: &AdminDocumentEvent,
+        path: &str,
+        role_id: &RoleId,
+        current: Option<AdminDocumentAttributeVersion>,
+        value: String,
+    ) -> Option<AdminDocumentAttributeVersion> {
+        let dot = event.dot();
+
+        if self.conflict_is_observed(event, path) {
+            self.conflicts.remove(path);
+            return Some(AdminDocumentAttributeVersion {
+                value: Some(value),
+                dot,
+            });
+        }
+
+        if self.conflicts.contains_key(path) {
+            self.record_conflict_value(path, Some(value), dot);
+            return None;
+        }
+
+        let Some(current) = current else {
+            return Some(AdminDocumentAttributeVersion {
+                value: Some(value),
+                dot,
+            });
+        };
+
+        if current.value.as_deref() == Some(value.as_str()) {
+            if event_observes_dot(event, &current.dot) {
+                return Some(AdminDocumentAttributeVersion {
+                    value: Some(value),
+                    dot,
+                });
+            }
+            return Some(current);
+        }
+
+        if role_values_are_compatible(role_id, current.value.as_deref(), &value) {
+            if current
+                .value
+                .as_deref()
+                .is_some_and(|value| role_value_is_definition_for(value, role_id))
+            {
+                return Some(current);
+            }
+            return Some(AdminDocumentAttributeVersion {
+                value: Some(value),
+                dot,
+            });
+        }
+
+        if event_observes_dot(event, &current.dot) {
+            return Some(AdminDocumentAttributeVersion {
+                value: Some(value),
+                dot,
+            });
+        }
+
+        self.record_conflict_value(path, current.value, current.dot);
+        self.record_conflict_value(path, Some(value), dot);
+        None
+    }
+
     fn conflict_is_observed(&self, event: &AdminDocumentEvent, path: &str) -> bool {
         self.conflicts.get(path).is_some_and(|conflict| {
             conflict
@@ -502,6 +558,22 @@ fn event_observes_dot(event: &AdminDocumentEvent, dot: &AdminDocumentDot) -> boo
 
 fn role_definition_value(role: &AdminDocumentRoleDefinition) -> String {
     serde_json::to_string(role).expect("admin document role definition serializes")
+}
+
+fn role_values_are_compatible(role_id: &RoleId, current_value: Option<&str>, value: &str) -> bool {
+    let Some(current_value) = current_value else {
+        return false;
+    };
+    let legacy_value = role_id.to_string();
+
+    (current_value == legacy_value && role_value_is_definition_for(value, role_id))
+        || (value == legacy_value && role_value_is_definition_for(current_value, role_id))
+}
+
+fn role_value_is_definition_for(value: &str, role_id: &RoleId) -> bool {
+    serde_json::from_str::<AdminDocumentRoleDefinition>(value)
+        .map(|role| role.role_id == *role_id)
+        .unwrap_or(false)
 }
 
 fn user_attribute_path(key: &str) -> String {
@@ -1228,6 +1300,48 @@ mod tests {
                 .iter()
                 .any(|value| value.value.as_deref() == Some(second_value.as_str()))
         );
+    }
+
+    #[test]
+    fn group_role_created_and_legacy_added_do_not_conflict() {
+        let mut state = group_state();
+        let role_id = role_id(3);
+        let role = role_definition(role_id, "Group admin");
+        let expected_value = role_definition_value(&role);
+
+        state.apply(&create_group_role(1, 1, role)).unwrap();
+        state.apply(&add_group_role(2, 2, role_id)).unwrap();
+
+        assert_eq!(state.materialized_group_roles(), BTreeSet::from([role_id]));
+        assert_eq!(
+            state
+                .user_subject_ids
+                .get(&format!("group.roles.{role_id}"))
+                .and_then(|version| version.value.as_deref()),
+            Some(expected_value.as_str())
+        );
+        assert!(state.conflicts.is_empty());
+    }
+
+    #[test]
+    fn realm_legacy_added_and_role_created_do_not_conflict() {
+        let mut state = realm_state();
+        let role_id = role_id(3);
+        let role = role_definition(role_id, "Realm admin");
+        let expected_value = role_definition_value(&role);
+
+        state.apply(&add_realm_role(1, 1, role_id)).unwrap();
+        state.apply(&create_realm_role(2, 2, role)).unwrap();
+
+        assert_eq!(state.materialized_realm_roles(), BTreeSet::from([role_id]));
+        assert_eq!(
+            state
+                .user_subject_ids
+                .get(&format!("realm.roles.{role_id}"))
+                .and_then(|version| version.value.as_deref()),
+            Some(expected_value.as_str())
+        );
+        assert!(state.conflicts.is_empty());
     }
 
     #[test]

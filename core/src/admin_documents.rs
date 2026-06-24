@@ -79,7 +79,6 @@ impl From<Role> for AdminDocumentRoleDefinition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AdminDocumentOperation {
     GroupRoleAdded { role_id: RoleId },
-    GroupRoleCreated { role: AdminDocumentRoleDefinition },
     GroupRoleUserAssignmentAdded { role_id: RoleId, user_id: UserId },
     GroupRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
     UserAttributeSet { key: String, value: String },
@@ -88,9 +87,112 @@ pub enum AdminDocumentOperation {
     UserSubjectIdAdded { subject_id: String },
     UserSubjectIdRemoved { subject_id: String },
     RealmRoleAdded { role_id: RoleId },
-    RealmRoleCreated { role: AdminDocumentRoleDefinition },
     RealmRoleUserAssignmentAdded { role_id: RoleId, user_id: UserId },
     RealmRoleUserAssignmentRemoved { role_id: RoleId, user_id: UserId },
+    GroupRoleCreated { role: AdminDocumentRoleDefinition },
+    RealmRoleCreated { role: AdminDocumentRoleDefinition },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AdminDocumentOperation, AdminDocumentRoleDefinition};
+    use crate::structs::{Permission, RealmId};
+    use crate::types::{RoleId, UserId};
+    use std::collections::BTreeMap;
+    use ulid::Ulid;
+
+    fn role_id(seed: u8) -> RoleId {
+        Ulid::from_bytes([seed; 16])
+    }
+
+    fn user_id(seed: u8) -> UserId {
+        UserId::local(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([9; 32]))
+    }
+
+    fn role_definition(role_id: RoleId) -> AdminDocumentRoleDefinition {
+        AdminDocumentRoleDefinition {
+            role_id,
+            name: "admin".to_string(),
+            permissions: BTreeMap::from([("/dataset/**".to_string(), Permission::READ)]),
+        }
+    }
+
+    fn postcard_discriminant(op: &AdminDocumentOperation) -> u8 {
+        postcard::to_allocvec(op).expect("operation serializes")[0]
+    }
+
+    #[test]
+    fn admin_document_operation_postcard_discriminants_preserve_legacy_order() {
+        let role_id = role_id(1);
+        let user_id = user_id(2);
+        let operations = [
+            (AdminDocumentOperation::GroupRoleAdded { role_id }, 0),
+            (
+                AdminDocumentOperation::GroupRoleUserAssignmentAdded { role_id, user_id },
+                1,
+            ),
+            (
+                AdminDocumentOperation::GroupRoleUserAssignmentRemoved { role_id, user_id },
+                2,
+            ),
+            (
+                AdminDocumentOperation::UserAttributeSet {
+                    key: "department".to_string(),
+                    value: "biology".to_string(),
+                },
+                3,
+            ),
+            (
+                AdminDocumentOperation::UserAttributeRemoved {
+                    key: "department".to_string(),
+                },
+                4,
+            ),
+            (
+                AdminDocumentOperation::UserNameSet {
+                    name: "Alice".to_string(),
+                },
+                5,
+            ),
+            (
+                AdminDocumentOperation::UserSubjectIdAdded {
+                    subject_id: "subject-1".to_string(),
+                },
+                6,
+            ),
+            (
+                AdminDocumentOperation::UserSubjectIdRemoved {
+                    subject_id: "subject-1".to_string(),
+                },
+                7,
+            ),
+            (AdminDocumentOperation::RealmRoleAdded { role_id }, 8),
+            (
+                AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id },
+                9,
+            ),
+            (
+                AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id },
+                10,
+            ),
+            (
+                AdminDocumentOperation::GroupRoleCreated {
+                    role: role_definition(role_id),
+                },
+                11,
+            ),
+            (
+                AdminDocumentOperation::RealmRoleCreated {
+                    role: role_definition(role_id),
+                },
+                12,
+            ),
+        ];
+
+        for (op, discriminant) in operations {
+            assert_eq!(postcard_discriminant(&op), discriminant);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
