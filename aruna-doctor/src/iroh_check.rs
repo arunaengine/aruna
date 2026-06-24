@@ -4,6 +4,7 @@ use aruna_api::routes::info::{
     InfoResponse, NetworkServiceStatus, PeerConnectionInfo, ServiceStatus,
 };
 use aruna_core::alpn::Alpn;
+use aruna_core::telemetry::duration_ms;
 use aruna_net::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};
@@ -363,10 +364,6 @@ fn ok_step(name: &'static str, duration: Duration) -> IrohCheckStep {
         status: "ok",
         duration_ms: duration_ms(duration),
     }
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn nonzero_timeout(timeout: Duration) -> Duration {

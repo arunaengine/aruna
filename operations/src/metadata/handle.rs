@@ -24,6 +24,7 @@ use aruna_core::storage_entries::metadata_graph_lifecycle_key;
 use aruna_core::structs::{
     AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
 };
+use aruna_core::telemetry::duration_ms;
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
@@ -2953,10 +2954,6 @@ fn metadata_error_from_craqle(error: CraqleError) -> MetadataError {
         }
         other => MetadataError::Backend(other.to_string()),
     }
-}
-
-fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 fn record_duration(span: &Span, field: &'static str, duration: Duration) {

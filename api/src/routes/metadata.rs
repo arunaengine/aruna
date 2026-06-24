@@ -10,6 +10,7 @@ use aruna_core::metadata::{
     MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
 use aruna_core::structs::{Actor, AuthContext, MetadataRegistryRecord, Permission};
+use aruna_core::telemetry::duration_ms;
 use aruna_operations::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
 use aruna_operations::create_metadata_document::{
     CreateMetadataDocumentConfig, CreateMetadataDocumentError, CreateMetadataDocumentOperation,
@@ -1895,12 +1896,8 @@ fn map_query_results(
     })
 }
 
-fn api_duration_ms(duration: std::time::Duration) -> u64 {
-    duration.as_millis().min(u128::from(u64::MAX)) as u64
-}
-
 fn record_api_elapsed(span: &Span, field: &'static str, started: Instant) {
-    span.record(field, api_duration_ms(started.elapsed()));
+    span.record(field, duration_ms(started.elapsed()));
 }
 
 fn metadata_query_result_kind(results: &MetadataQueryResults) -> &'static str {
