@@ -1,15 +1,18 @@
 use std::collections::VecDeque;
 
-use aruna_core::document::{DocumentSyncOutboxEvent, DocumentSyncTarget};
+use aruna_core::document::{
+    DocumentSyncChange, DocumentSyncChangeKind, DocumentSyncOutboxEvent, DocumentSyncTarget,
+};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::operation::Operation;
+use aruna_core::storage_entries::document_sync_revision_key;
 use aruna_core::structs::RealmId;
 use aruna_core::task::TaskEvent;
 use aruna_core::types::{Effects, Key, UserId};
-use aruna_core::{NodeId, TopicId, USER_KEYSPACE};
+use aruna_core::{DOCUMENT_SYNC_REVISION_KEYSPACE, NodeId, TopicId, USER_KEYSPACE};
 use smallvec::smallvec;
 use thiserror::Error;
 
@@ -49,6 +52,7 @@ pub struct AnnounceTopicOperation {
 enum AnnounceTopicState {
     Init,
     ReadDocument,
+    ReadUserDocumentAndRevision,
     ListUsers,
     WriteOutbox,
     ScheduleSync,
@@ -204,17 +208,49 @@ impl AnnounceTopicOperation {
         document: DocumentSyncTarget,
         bytes: Vec<u8>,
     ) -> Effects {
+        self.write_document_outbox_event_effect(document, DocumentSyncOutboxEvent::Upsert { bytes })
+    }
+
+    fn write_document_outbox_event_effect(
+        &mut self,
+        document: DocumentSyncTarget,
+        event: DocumentSyncOutboxEvent,
+    ) -> Effects {
         self.current = Some(document.clone());
         self.state = AnnounceTopicState::WriteOutbox;
-        let record = new_outbox_record(
-            self.local_node_id,
-            document,
-            self.peers.clone(),
-            DocumentSyncOutboxEvent::Upsert { bytes },
-        );
+        let record = new_outbox_record(self.local_node_id, document, self.peers.clone(), event);
         match write_outbox_effect(&record) {
             Ok(effect) => smallvec![effect],
             Err(error) => self.fail(AnnounceTopicError::ConversionError(error.into())),
+        }
+    }
+
+    fn read_user_document_with_revision_effect(document: &DocumentSyncTarget) -> Effect {
+        Effect::Storage(StorageEffect::BatchRead {
+            reads: vec![
+                (
+                    document_repository::storage_keyspace(document).to_string(),
+                    document_repository::storage_key(document),
+                ),
+                (
+                    DOCUMENT_SYNC_REVISION_KEYSPACE.to_string(),
+                    document_sync_revision_key(document),
+                ),
+            ],
+            txn_id: None,
+        })
+    }
+
+    fn user_outbox_event(
+        bytes: Vec<u8>,
+        revision_value: Option<&aruna_core::types::Value>,
+    ) -> DocumentSyncOutboxEvent {
+        match revision_value
+            .and_then(|value| postcard::from_bytes::<DocumentSyncChange>(value.as_ref()).ok())
+            .filter(|change| change.kind == DocumentSyncChangeKind::Upsert)
+        {
+            Some(change) => DocumentSyncOutboxEvent::UpsertWithRevision { bytes, change },
+            None => DocumentSyncOutboxEvent::Upsert { bytes },
         }
     }
 
@@ -223,6 +259,10 @@ impl AnnounceTopicOperation {
             Some(PendingDocumentSync::Document { document, bytes }) => {
                 if let Some(bytes) = bytes {
                     self.write_document_outbox_effect(document, bytes)
+                } else if matches!(document, DocumentSyncTarget::User { .. }) {
+                    self.current = Some(document.clone());
+                    self.state = AnnounceTopicState::ReadUserDocumentAndRevision;
+                    smallvec![Self::read_user_document_with_revision_effect(&document)]
                 } else {
                     self.current = Some(document.clone());
                     self.state = AnnounceTopicState::ReadDocument;
@@ -273,6 +313,29 @@ impl Operation for AnnounceTopicOperation {
                 }
                 Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
                 other => self.unexpected_event("storage read result", format!("{other:?}")),
+            },
+            AnnounceTopicState::ReadUserDocumentAndRevision => match event {
+                Event::Storage(StorageEvent::BatchReadResult { values }) => {
+                    let Some(document) = self.current.clone() else {
+                        return self.unexpected_event(
+                            "tracked document sync target",
+                            "missing current document".to_string(),
+                        );
+                    };
+                    let [(_, user_value), (_, revision_value)] = values.as_slice() else {
+                        return self.unexpected_event(
+                            "storage batch read result with user document and revision",
+                            format!("{values:?}"),
+                        );
+                    };
+                    let Some(bytes) = user_value else {
+                        return self.next_effect();
+                    };
+                    let event = Self::user_outbox_event(bytes.to_vec(), revision_value.as_ref());
+                    self.write_document_outbox_event_effect(document, event)
+                }
+                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
+                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
             },
             AnnounceTopicState::ListUsers => match event {
                 Event::Storage(StorageEvent::IterResult {
@@ -364,15 +427,71 @@ impl Operation for AnnounceTopicOperation {
 mod tests {
     use super::*;
 
-    use aruna_core::document::DocumentSyncOutboxRecord;
+    use aruna_core::document::{
+        DocumentSyncChange, DocumentSyncOutboxRecord, DocumentSyncRevision,
+    };
     use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::keyspaces::DOCUMENT_SYNC_OUTBOX_KEYSPACE;
+    use aruna_core::keyspaces::{
+        DOCUMENT_SYNC_OUTBOX_KEYSPACE, DOCUMENT_SYNC_REVISION_KEYSPACE, USER_KEYSPACE,
+    };
     use aruna_core::types::GroupId;
     use ulid::Ulid;
 
+    fn local_node_id() -> NodeId {
+        iroh::SecretKey::from_bytes(&[1u8; 32]).public()
+    }
+
+    fn user_document() -> (UserId, DocumentSyncTarget) {
+        let realm_id = RealmId::from_bytes([2u8; 32]);
+        let user_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
+        (user_id, DocumentSyncTarget::User { user_id })
+    }
+
+    fn upsert_change(actor: NodeId) -> DocumentSyncChange {
+        DocumentSyncChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 7,
+                event_id: Ulid::from_bytes([4u8; 16]),
+                actor,
+                updated_at_ms: 123,
+            },
+            kind: DocumentSyncChangeKind::Upsert,
+        }
+    }
+
+    fn assert_user_batch_read(effects: &[Effect], user_id: UserId, document: &DocumentSyncTarget) {
+        let [Effect::Storage(StorageEffect::BatchRead { reads, txn_id })] = effects else {
+            panic!("expected user batch read, got {effects:?}");
+        };
+        assert_eq!(txn_id, &None);
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].0, USER_KEYSPACE);
+        assert_eq!(reads[0].1.as_ref(), user_id.to_bytes().as_slice());
+        assert_eq!(reads[1].0, DOCUMENT_SYNC_REVISION_KEYSPACE);
+        assert_eq!(reads[1].1, document_sync_revision_key(document));
+    }
+
+    fn written_outbox_record(effects: &[Effect]) -> DocumentSyncOutboxRecord {
+        let [
+            Effect::Storage(StorageEffect::Write {
+                key_space,
+                value,
+                txn_id,
+                ..
+            }),
+        ] = effects
+        else {
+            panic!("expected one outbox write, got {effects:?}");
+        };
+        assert_eq!(key_space, DOCUMENT_SYNC_OUTBOX_KEYSPACE);
+        assert_eq!(txn_id, &None);
+        postcard::from_bytes(value.as_ref()).expect("outbox record decodes")
+    }
+
     #[test]
     fn provided_document_bytes_skip_readback_before_outbox_write() {
-        let local_node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let local_node_id = local_node_id();
         let document = DocumentSyncTarget::MetadataRegistry {
             group_id: GroupId::new(),
             document_id: Ulid::new(),
@@ -388,21 +507,68 @@ mod tests {
 
         let effects = operation.start();
 
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                value,
-                txn_id,
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected one outbox write");
-        };
-        assert_eq!(key_space, DOCUMENT_SYNC_OUTBOX_KEYSPACE);
-        assert_eq!(txn_id, &None);
-        let record: DocumentSyncOutboxRecord =
-            postcard::from_bytes(value.as_ref()).expect("outbox record decodes");
+        let record = written_outbox_record(effects.as_slice());
+        assert_eq!(record.target, document);
+        assert_eq!(record.event, DocumentSyncOutboxEvent::Upsert { bytes });
+    }
+
+    #[test]
+    fn user_with_upsert_sidecar_writes_upsert_with_revision() {
+        let local_node_id = local_node_id();
+        let (user_id, document) = user_document();
+        let bytes = vec![9, 8, 7];
+        let change = upsert_change(local_node_id);
+        let mut operation = AnnounceTopicOperation::new_for_document_with_peers(
+            document.topic_id(),
+            local_node_id,
+            Some(document.clone()),
+            Vec::new(),
+        );
+
+        let effects = operation.start();
+        assert_user_batch_read(effects.as_slice(), user_id, &document);
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (user_id.to_bytes().into(), Some(bytes.clone().into())),
+                (
+                    document_sync_revision_key(&document),
+                    Some(postcard::to_allocvec(&change).unwrap().into()),
+                ),
+            ],
+        }));
+
+        let record = written_outbox_record(effects.as_slice());
+        assert_eq!(record.target, document);
+        assert_eq!(
+            record.event,
+            DocumentSyncOutboxEvent::UpsertWithRevision { bytes, change }
+        );
+    }
+
+    #[test]
+    fn user_without_sidecar_writes_legacy_upsert() {
+        let local_node_id = local_node_id();
+        let (user_id, document) = user_document();
+        let bytes = vec![5, 6, 7];
+        let mut operation = AnnounceTopicOperation::new_for_document_with_peers(
+            document.topic_id(),
+            local_node_id,
+            Some(document.clone()),
+            Vec::new(),
+        );
+
+        let effects = operation.start();
+        assert_user_batch_read(effects.as_slice(), user_id, &document);
+
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (user_id.to_bytes().into(), Some(bytes.clone().into())),
+                (document_sync_revision_key(&document), None),
+            ],
+        }));
+
+        let record = written_outbox_record(effects.as_slice());
         assert_eq!(record.target, document);
         assert_eq!(record.event, DocumentSyncOutboxEvent::Upsert { bytes });
     }
