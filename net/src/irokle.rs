@@ -33,9 +33,11 @@ use aruna_core::storage_entries::{
     stale_admin_document_conflict_delete_entries, stale_subject_index_deletes,
     subject_index_writes,
 };
-use aruna_core::structs::{GroupAuthorizationDocument, MetadataRegistryRecord, User};
+use aruna_core::structs::{
+    GroupAuthorizationDocument, MetadataRegistryRecord, RealmAuthorizationDocument, User,
+};
 use aruna_core::telemetry::duration_ms;
-use aruna_core::types::{UserId, Value};
+use aruna_core::types::{TxnId, UserId, Value};
 use aruna_core::util::unix_timestamp_millis;
 use aruna_storage::{FjallPersistPolicy, StorageHandle};
 use byteview::ByteView;
@@ -1876,6 +1878,14 @@ async fn apply_admin_document_operation_to_storage(
             )
             .await
         }
+        (DocumentSyncTarget::RealmAuthorization { .. }, AdminDocumentTarget::Realm { .. }) => {
+            apply_realm_authorization_admin_document_operation_to_storage(
+                storage,
+                document_target,
+                event,
+            )
+            .await
+        }
         _ => Err(NetError::Bootstrap(
             "admin document operation target does not match document sync target".to_string(),
         )),
@@ -2069,6 +2079,96 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
     storage_batch_write_to(storage, writes).await
 }
 
+async fn apply_realm_authorization_admin_document_operation_to_storage(
+    storage: &StorageHandle,
+    document_target: DocumentSyncTarget,
+    event: AdminDocumentEvent,
+) -> Result<()> {
+    let DocumentSyncTarget::RealmAuthorization { realm_id } = document_target.clone() else {
+        return Err(NetError::Bootstrap(
+            "realm admin operation sync only supports realm authorization targets".to_string(),
+        ));
+    };
+    let AdminDocumentTarget::Realm {
+        realm_id: event_realm_id,
+    } = event.target.clone()
+    else {
+        return Err(NetError::Bootstrap(
+            "admin document operation payload target is not a realm".to_string(),
+        ));
+    };
+    if event_realm_id != realm_id {
+        return Err(NetError::Bootstrap(format!(
+            "replicated realm admin operation target {realm_id} does not match payload realm id {event_realm_id}"
+        )));
+    }
+    if !matches!(
+        event.op,
+        AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
+            | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
+    ) {
+        return Err(NetError::Bootstrap(
+            "realm admin operation sync only supports role user assignment updates".to_string(),
+        ));
+    }
+
+    let previous_state = storage_read_from(
+        storage,
+        ADMIN_DOCUMENT_STATE_KEYSPACE.to_string(),
+        admin_document_reducer_state_key(&event.target),
+    )
+    .await?
+    .map(|bytes| postcard::from_bytes::<AdminDocumentReducerState>(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut reducer_state = previous_state
+        .clone()
+        .unwrap_or_else(|| AdminDocumentReducerState::new(event.target.clone()));
+    let apply_status = reducer_state
+        .apply(&event)
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    if apply_status != AdminDocumentApplyStatus::Applied {
+        return Ok(());
+    }
+
+    let previous_auth_doc = storage_read_from(
+        storage,
+        document_target.storage_keyspace().to_string(),
+        document_target.storage_key(),
+    )
+    .await?
+    .map(|bytes| RealmAuthorizationDocument::from_bytes(&bytes))
+    .transpose()
+    .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    let mut auth_doc = previous_auth_doc.unwrap_or_else(|| RealmAuthorizationDocument {
+        realm_id,
+        roles: Default::default(),
+        operation_restrictions: Default::default(),
+    });
+    materialize_realm_authorization_admin_document_operation(&mut auth_doc, &reducer_state, &event);
+
+    let mut writes = vec![
+        (
+            document_target.storage_keyspace().to_string(),
+            document_target.storage_key(),
+            auth_doc
+                .to_bytes(&event.actor)
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?
+                .into(),
+        ),
+        admin_document_reducer_state_write_entry(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    ];
+    writes.extend(
+        admin_document_conflict_write_entries(&reducer_state)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+    );
+
+    let stale_conflict_deletes =
+        stale_admin_document_conflict_delete_entries(previous_state.as_ref(), Some(&reducer_state));
+    storage_batch_delete_and_write_transactionally(storage, stale_conflict_deletes, writes).await
+}
+
 fn materialize_group_authorization_admin_document_operation(
     auth_doc: &mut GroupAuthorizationDocument,
     reducer_state: &AdminDocumentReducerState,
@@ -2101,11 +2201,50 @@ fn materialize_group_authorization_admin_document_operation(
     }
 }
 
+fn materialize_realm_authorization_admin_document_operation(
+    auth_doc: &mut RealmAuthorizationDocument,
+    reducer_state: &AdminDocumentReducerState,
+    event: &AdminDocumentEvent,
+) {
+    let (role_id, user_id) = match &event.op {
+        AdminDocumentOperation::RealmRoleUserAssignmentAdded { role_id, user_id }
+        | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { role_id, user_id } => {
+            (role_id, user_id)
+        }
+        _ => return,
+    };
+    let path = realm_role_user_assignment_path(role_id, user_id);
+    if reducer_state.conflicts.contains_key(&path) {
+        return;
+    }
+    let Some(role) = auth_doc.roles.get_mut(role_id) else {
+        return;
+    };
+    let assigned = reducer_state
+        .user_subject_ids
+        .get(&path)
+        .and_then(|version| version.value.as_deref())
+        .and_then(|value| UserId::from_string(value).ok())
+        .is_some_and(|materialized_user_id| materialized_user_id == *user_id);
+    if assigned {
+        role.assigned_users.insert(*user_id);
+    } else {
+        role.assigned_users.remove(user_id);
+    }
+}
+
 fn group_role_user_assignment_path(
     role_id: &aruna_core::types::RoleId,
     user_id: &UserId,
 ) -> String {
     format!("group.roles.{role_id}.assigned_users.{user_id}")
+}
+
+fn realm_role_user_assignment_path(
+    role_id: &aruna_core::types::RoleId,
+    user_id: &UserId,
+) -> String {
+    format!("realm.roles.{role_id}.assigned_users.{user_id}")
 }
 
 fn materialize_user_admin_document_operation(
@@ -2305,6 +2444,94 @@ async fn storage_batch_write_to(
         Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
         other => Err(NetError::Dht(format!(
             "unexpected storage event while applying irokle batch write: {other:?}"
+        ))),
+    }
+}
+
+async fn storage_batch_delete_and_write_transactionally(
+    storage: &StorageHandle,
+    deletes: Vec<(String, ByteView)>,
+    writes: Vec<(String, ByteView, Value)>,
+) -> Result<()> {
+    let txn_id = match storage
+        .send_storage_effect(StorageEffect::StartTransaction { read: false })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(NetError::Dht(error.to_string()));
+        }
+        other => {
+            return Err(NetError::Dht(format!(
+                "unexpected storage event while starting irokle apply transaction: {other:?}"
+            )));
+        }
+    };
+
+    if let Err(error) =
+        storage_batch_delete_and_write_in_transaction(storage, txn_id, deletes, writes).await
+    {
+        let _ = storage
+            .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
+            .await;
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn storage_batch_delete_and_write_in_transaction(
+    storage: &StorageHandle,
+    txn_id: TxnId,
+    deletes: Vec<(String, ByteView)>,
+    writes: Vec<(String, ByteView, Value)>,
+) -> Result<()> {
+    if !deletes.is_empty() {
+        match storage
+            .send_storage_effect(StorageEffect::BatchDelete {
+                deletes,
+                txn_id: Some(txn_id),
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(NetError::Dht(error.to_string()));
+            }
+            other => {
+                return Err(NetError::Dht(format!(
+                    "unexpected storage event while applying irokle transactional batch delete: {other:?}"
+                )));
+            }
+        }
+    }
+
+    match storage
+        .send_storage_effect(StorageEffect::BatchWrite {
+            writes,
+            txn_id: Some(txn_id),
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+        Event::Storage(StorageEvent::Error { error }) => {
+            return Err(NetError::Dht(error.to_string()));
+        }
+        other => {
+            return Err(NetError::Dht(format!(
+                "unexpected storage event while applying irokle transactional batch write: {other:?}"
+            )));
+        }
+    }
+
+    match storage
+        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
+        .await
+    {
+        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(()),
+        Event::Storage(StorageEvent::Error { error }) => Err(NetError::Dht(error.to_string())),
+        other => Err(NetError::Dht(format!(
+            "unexpected storage event while committing irokle apply transaction: {other:?}"
         ))),
     }
 }
@@ -2714,7 +2941,9 @@ mod tests {
         admin_document_reducer_state_key, metadata_document_key, metadata_event_log_key,
         metadata_registry_key, subject_index_key, subject_index_value,
     };
-    use aruna_core::structs::{Actor, GroupAuthorizationDocument, Permission, RealmId, Role};
+    use aruna_core::structs::{
+        Actor, GroupAuthorizationDocument, Permission, RealmAuthorizationDocument, RealmId, Role,
+    };
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::{env, process::Command};
     use tempfile::TempDir;
@@ -3128,6 +3357,144 @@ mod tests {
             &storage,
             ADMIN_DOCUMENT_STATE_KEYSPACE,
             admin_document_reducer_state_key(&AdminDocumentTarget::Group { group_id }),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert_eq!(
+            reducer_state
+                .user_subject_ids
+                .get(&assignment_path)
+                .and_then(|version| version.value.clone()),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_assignment_admin_operation_materializes_auth_doc_and_reducer_state() {
+        let (_dir, storage) = test_storage();
+        let realm_id = RealmId::from_bytes([10; 32]);
+        let role_id = Ulid::from_parts(2, 2);
+        let assigned_user_id = UserId::local(Ulid::from_parts(3, 3), realm_id);
+        let actor = Actor {
+            node_id: node(8),
+            user_id: UserId::local(Ulid::from_parts(4, 4), realm_id),
+            realm_id,
+        };
+        let auth_doc = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::from([(
+                role_id,
+                Role {
+                    role_id,
+                    name: "realm_member".to_string(),
+                    permissions: HashMap::from([("/datasets".to_string(), Permission::READ)]),
+                    assigned_users: HashSet::new(),
+                },
+            )]),
+            operation_restrictions: HashMap::new(),
+        };
+        storage_batch_write_to(
+            &storage,
+            vec![(
+                AUTH_KEYSPACE.to_string(),
+                (*realm_id.as_bytes()).into(),
+                auth_doc
+                    .to_bytes(&actor)
+                    .expect("auth doc serializes")
+                    .into(),
+            )],
+        )
+        .await
+        .expect("auth doc writes");
+
+        let add_event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(5, 5),
+            target: AdminDocumentTarget::Realm { realm_id },
+            origin_node_id: actor.node_id,
+            origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor: actor.clone(),
+            op: AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+                role_id,
+                user_id: assigned_user_id,
+            },
+        };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            add_event,
+        )
+        .await
+        .expect("add assignment applies");
+
+        let stored_auth_doc =
+            read_storage_value(&storage, AUTH_KEYSPACE, (*realm_id.as_bytes()).into())
+                .await
+                .expect("auth doc exists");
+        let stored_auth_doc =
+            RealmAuthorizationDocument::from_bytes(&stored_auth_doc).expect("auth doc decodes");
+        assert!(
+            stored_auth_doc.roles[&role_id]
+                .assigned_users
+                .contains(&assigned_user_id)
+        );
+        let target = AdminDocumentTarget::Realm { realm_id };
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&target),
+        )
+        .await
+        .expect("reducer state exists");
+        let reducer_state: AdminDocumentReducerState =
+            postcard::from_bytes(&reducer_state).expect("reducer state decodes");
+        assert!(reducer_state.conflicts.is_empty());
+        let assignment_path = realm_role_user_assignment_path(&role_id, &assigned_user_id);
+        assert_eq!(
+            reducer_state
+                .user_subject_ids
+                .get(&assignment_path)
+                .and_then(|version| version.value.clone()),
+            Some(assigned_user_id.to_string())
+        );
+
+        let remove_event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(6, 6),
+            target,
+            origin_node_id: actor.node_id,
+            origin_seq: 2,
+            observed: AdminDocumentClock::default(),
+            actor,
+            op: AdminDocumentOperation::RealmRoleUserAssignmentRemoved {
+                role_id,
+                user_id: assigned_user_id,
+            },
+        };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            remove_event,
+        )
+        .await
+        .expect("remove assignment applies");
+
+        let stored_auth_doc =
+            read_storage_value(&storage, AUTH_KEYSPACE, (*realm_id.as_bytes()).into())
+                .await
+                .expect("auth doc exists");
+        let stored_auth_doc =
+            RealmAuthorizationDocument::from_bytes(&stored_auth_doc).expect("auth doc decodes");
+        assert!(
+            !stored_auth_doc.roles[&role_id]
+                .assigned_users
+                .contains(&assigned_user_id)
+        );
+        let reducer_state = read_storage_value(
+            &storage,
+            ADMIN_DOCUMENT_STATE_KEYSPACE,
+            admin_document_reducer_state_key(&AdminDocumentTarget::Realm { realm_id }),
         )
         .await
         .expect("reducer state exists");
