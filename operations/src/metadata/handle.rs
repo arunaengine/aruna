@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -239,6 +239,7 @@ struct MetadataVisibilityCache {
     registry: Mutex<Option<RegistryCacheEntry>>,
     registry_fill: Arc<tokio::sync::Mutex<()>>,
     lifecycle_deleted: Mutex<HashMap<String, LifecycleDeletedCacheEntry>>,
+    generation: AtomicU64,
 }
 
 struct RegistryCacheEntry {
@@ -271,7 +272,16 @@ impl MetadataVisibilityCache {
             registry: Mutex::new(None),
             registry_fill: Arc::new(tokio::sync::Mutex::new(())),
             lifecycle_deleted: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    fn advance_generation(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     #[cfg(test)]
@@ -295,6 +305,7 @@ impl MetadataVisibilityCache {
             .map(|entry| (entry.snapshot(), entry.expires_at > now))
     }
 
+    #[cfg(test)]
     fn store_registry_records(&self, records: Arc<Vec<MetadataRegistryRecord>>) {
         let map: BTreeMap<_, _> = records
             .iter()
@@ -309,6 +320,50 @@ impl MetadataVisibilityCache {
             snapshot: Some(records),
             expires_at: Instant::now() + METADATA_VISIBILITY_CACHE_TTL,
         });
+    }
+
+    fn store_visibility_fill(
+        &self,
+        records: Arc<Vec<MetadataRegistryRecord>>,
+        lifecycle_entries: Vec<(String, bool)>,
+        fill_generation: u64,
+    ) -> bool {
+        if self.current_generation() != fill_generation {
+            return false;
+        }
+        let map: BTreeMap<_, _> = records
+            .iter()
+            .map(|record| (record.document_id, record.clone()))
+            .collect();
+        let now = Instant::now();
+        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let mut registry = self
+            .registry
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        if self.current_generation() != fill_generation {
+            return false;
+        }
+        for (graph_iri, deleted) in lifecycle_entries {
+            lifecycle.insert(
+                graph_iri,
+                LifecycleDeletedCacheEntry {
+                    deleted,
+                    expires_at,
+                },
+            );
+        }
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+        *registry = Some(RegistryCacheEntry {
+            records: map,
+            snapshot: Some(records),
+            expires_at,
+        });
+        true
     }
 
     #[cfg(test)]
@@ -335,6 +390,7 @@ impl MetadataVisibilityCache {
             .lifecycle_deleted
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
         lifecycle.insert(
             graph_iri,
             LifecycleDeletedCacheEntry {
@@ -347,6 +403,7 @@ impl MetadataVisibilityCache {
     // Bulk refresh after a registry fill: re-stamps every supplied graph and
     // drops expired leftovers (graphs no longer in the registry) so the map
     // stays bounded.
+    #[cfg(test)]
     fn refresh_lifecycle_deleted(&self, entries: impl IntoIterator<Item = (String, bool)>) {
         let now = Instant::now();
         let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
@@ -366,6 +423,37 @@ impl MetadataVisibilityCache {
         lifecycle.retain(|_, entry| entry.expires_at > now);
     }
 
+    fn refresh_lifecycle_deleted_if_current(
+        &self,
+        entries: impl IntoIterator<Item = (String, bool)>,
+        fill_generation: u64,
+    ) -> bool {
+        if self.current_generation() != fill_generation {
+            return false;
+        }
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        let now = Instant::now();
+        let expires_at = now + METADATA_VISIBILITY_CACHE_TTL;
+        let mut lifecycle = self
+            .lifecycle_deleted
+            .lock()
+            .unwrap_or_else(|lock| lock.into_inner());
+        if self.current_generation() != fill_generation {
+            return false;
+        }
+        for (graph_iri, deleted) in entries {
+            lifecycle.insert(
+                graph_iri,
+                LifecycleDeletedCacheEntry {
+                    deleted,
+                    expires_at,
+                },
+            );
+        }
+        lifecycle.retain(|_, entry| entry.expires_at > now);
+        true
+    }
+
     // Incremental maintenance keeps the cached registry usable under writes;
     // entries never outlive their fill TTL, so a missed update converges to
     // storage truth within one TTL via the periodic refill.
@@ -377,6 +465,7 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
         let Some(entry) = registry.as_mut() else {
             return;
         };
@@ -391,6 +480,7 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
         let Some(entry) = registry.as_mut() else {
             return;
         };
@@ -404,6 +494,7 @@ impl MetadataVisibilityCache {
             .registry
             .lock()
             .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
         let Some(entry) = registry.as_mut() else {
             return;
         };
@@ -417,10 +508,12 @@ impl MetadataVisibilityCache {
     }
 
     fn remove_lifecycle_entry(&self, graph_iri: &str) {
-        self.lifecycle_deleted
+        let mut lifecycle = self
+            .lifecycle_deleted
             .lock()
-            .unwrap_or_else(|lock| lock.into_inner())
-            .remove(graph_iri);
+            .unwrap_or_else(|lock| lock.into_inner());
+        self.advance_generation();
+        lifecycle.remove(graph_iri);
     }
 
     fn expire_now(&self) {
@@ -3247,6 +3340,7 @@ async fn fill_visibility_caches(
 ) -> Result<Arc<Vec<MetadataRegistryRecord>>, MetadataError> {
     let started = Instant::now();
     let span = Span::current();
+    let fill_generation = inner.visibility_cache.current_generation();
 
     let mut records = Vec::new();
     let mut start_after = None;
@@ -3289,12 +3383,11 @@ async fn fill_visibility_caches(
         })
         .collect::<Vec<_>>();
     let records = Arc::new(records);
-    inner
-        .visibility_cache
-        .refresh_lifecycle_deleted(lifecycle_entries);
-    inner
-        .visibility_cache
-        .store_registry_records(records.clone());
+    inner.visibility_cache.store_visibility_fill(
+        records.clone(),
+        lifecycle_entries,
+        fill_generation,
+    );
     record_elapsed(&span, "elapsed_ms", started);
     Ok(records)
 }
@@ -3855,15 +3948,17 @@ async fn refresh_lifecycle_visibility_for_records(
     inner: &Arc<MetadataInner>,
     records: &[MetadataRegistryRecord],
 ) -> Result<(), MetadataError> {
+    let fill_generation = inner.visibility_cache.current_generation();
     let (deleted_graphs, _) = list_deleted_graph_iris(inner).await?;
-    inner
-        .visibility_cache
-        .refresh_lifecycle_deleted(records.iter().map(|record| {
+    inner.visibility_cache.refresh_lifecycle_deleted_if_current(
+        records.iter().map(|record| {
             (
                 record.graph_iri.clone(),
                 deleted_graphs.contains(&record.graph_iri),
             )
-        }));
+        }),
+        fill_generation,
+    );
     Ok(())
 }
 
@@ -4334,6 +4429,70 @@ mod tests {
         let (_, fresh) = cache.registry_records_any().expect("fresh entry");
         assert!(fresh);
         assert!(cache.registry_records().is_some());
+    }
+
+    #[test]
+    fn background_visibility_fill_does_not_overwrite_newer_upsert() {
+        let mut stale_record = registry_record("datasets/a");
+        let cache = filled_cache(vec![stale_record.clone()]);
+        let fill_generation = cache.current_generation();
+
+        let mut updated_record = stale_record.clone();
+        updated_record.public = false;
+        updated_record.updated_at_ms = 42;
+        cache.upsert_registry_records(std::slice::from_ref(&updated_record));
+
+        stale_record.updated_at_ms = 1;
+        assert!(!cache.store_visibility_fill(
+            Arc::new(vec![stale_record]),
+            Vec::new(),
+            fill_generation,
+        ));
+        let records = cache.registry_records().expect("cache entry");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].document_id, updated_record.document_id);
+        assert!(!records[0].public);
+        assert_eq!(records[0].updated_at_ms, 42);
+    }
+
+    #[test]
+    fn background_visibility_fill_does_not_resurrect_removed_document() {
+        let removed = registry_record("datasets/removed");
+        let kept = registry_record("datasets/kept");
+        let cache = filled_cache(vec![removed.clone(), kept.clone()]);
+        let fill_generation = cache.current_generation();
+
+        cache.remove_registry_record(removed.document_id);
+
+        assert!(!cache.store_visibility_fill(
+            Arc::new(vec![removed.clone(), kept.clone()]),
+            Vec::new(),
+            fill_generation,
+        ));
+        let records = cache.registry_records().expect("cache entry");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].document_id, kept.document_id);
+        assert!(
+            !records
+                .iter()
+                .any(|record| record.document_id == removed.document_id)
+        );
+    }
+
+    #[test]
+    fn background_visibility_fill_does_not_clear_newer_lifecycle_tombstone() {
+        let record = registry_record("datasets/deleted");
+        let cache = filled_cache(vec![record.clone()]);
+        let fill_generation = cache.current_generation();
+
+        cache.store_lifecycle_deleted(record.graph_iri.clone(), true);
+
+        assert!(!cache.store_visibility_fill(
+            Arc::new(vec![record.clone()]),
+            vec![(record.graph_iri.clone(), false)],
+            fill_generation,
+        ));
+        assert_eq!(cache.lifecycle_deleted(&record.graph_iri), Some(true));
     }
 
     #[test]
