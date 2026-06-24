@@ -646,7 +646,7 @@ fn admin_document_operations(input: &UpdateUserInput) -> Vec<AdminDocumentOperat
     }
 
     let mut set_attributes: Vec<_> = input.set_attributes.iter().collect();
-    set_attributes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    set_attributes.sort_by_key(|(left, _)| *left);
     for (key, value) in set_attributes {
         operations.push(AdminDocumentOperation::UserAttributeSet {
             key: key.clone(),

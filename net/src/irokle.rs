@@ -1827,15 +1827,15 @@ async fn apply_metadata_document_lifecycle_to_storage(
         return Ok(false);
     };
     storage_batch_write_to(storage, writes).await?;
-    if let MetadataDocumentLifecycleRecord::Delete { event } = record {
-        if event.tombstone.is_deleted() {
-            apply_metadata_registry_delete_to_storage(
-                storage,
-                event.tombstone.group_id,
-                event.tombstone.document_id,
-            )
-            .await?;
-        }
+    if let MetadataDocumentLifecycleRecord::Delete { event } = record
+        && event.tombstone.is_deleted()
+    {
+        apply_metadata_registry_delete_to_storage(
+            storage,
+            event.tombstone.group_id,
+            event.tombstone.document_id,
+        )
+        .await?;
     }
     Ok(true)
 }
@@ -2263,10 +2263,10 @@ fn materialize_user_admin_document_operation(
 
     match &event.op {
         AdminDocumentOperation::UserNameSet { .. } => {
-            if !reducer_state.conflicts.contains_key("user.name") {
-                if let Some(name) = reducer_state.materialized_user_name() {
-                    user.name = name;
-                }
+            if !reducer_state.conflicts.contains_key("user.name")
+                && let Some(name) = reducer_state.materialized_user_name()
+            {
+                user.name = name;
             }
         }
         AdminDocumentOperation::UserSubjectIdAdded { subject_id }
@@ -2282,10 +2282,10 @@ fn materialize_user_admin_document_operation(
             };
 
             user.subject_ids.retain(|candidate| candidate != subject_id);
-            if let Some(materialized_subject_id) = materialized_subject_id {
-                if !user.subject_ids.contains(&materialized_subject_id) {
-                    user.subject_ids.push(materialized_subject_id);
-                }
+            if let Some(materialized_subject_id) = materialized_subject_id
+                && !user.subject_ids.contains(&materialized_subject_id)
+            {
+                user.subject_ids.push(materialized_subject_id);
             }
         }
         AdminDocumentOperation::UserAttributeSet { key, .. }
@@ -2324,10 +2324,10 @@ async fn metadata_document_lifecycle_write_entries_if_current(
     if incoming_metadata_document_lifecycle_stale_or_equal(storage, &target, &revision).await? {
         return Ok(None);
     }
-    if let MetadataDocumentLifecycleRecord::Upsert { event } = record {
-        if metadata_create_fenced_in_storage(storage, event).await? {
-            return Ok(None);
-        }
+    if let MetadataDocumentLifecycleRecord::Upsert { event } = record
+        && metadata_create_fenced_in_storage(storage, event).await?
+    {
+        return Ok(None);
     }
 
     let mut entries = match record {
