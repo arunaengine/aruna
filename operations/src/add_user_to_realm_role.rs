@@ -617,11 +617,12 @@ fn apply_admin_reducer_updates(
     let mut admin_events = Vec::new();
     for role_id in role_ids {
         if should_seed_realm_role(state, *role_id) {
-            apply_admin_reducer_operation(
+            let event = apply_admin_reducer_operation(
                 state,
                 &input.actor,
                 AdminDocumentOperation::RealmRoleAdded { role_id: *role_id },
             )?;
+            admin_events.push(event);
         }
         let event = apply_admin_reducer_operation(
             state,
@@ -779,6 +780,84 @@ pub mod test {
     }
 
     #[test]
+    fn seeds_missing_realm_role_before_assignment_outbox_event() {
+        let realm_id = RealmId::from_bytes([12u8; 32]);
+        let owner_id = UserId::local(Ulid::from_bytes([13u8; 16]), realm_id);
+        let assigned_user_id = UserId::local(Ulid::from_bytes([14u8; 16]), realm_id);
+        let role_id = Ulid::from_bytes([15u8; 16]);
+        let actor = Actor {
+            node_id: node(16),
+            user_id: owner_id,
+            realm_id,
+        };
+        let auth_doc = RealmAuthorizationDocument {
+            realm_id,
+            roles: HashMap::from([(
+                role_id,
+                Role {
+                    role_id,
+                    name: "realm_user".to_string(),
+                    permissions: HashMap::from([("/test".to_string(), Permission::READ)]),
+                    assigned_users: HashSet::new(),
+                },
+            )]),
+            operation_restrictions: HashMap::new(),
+        };
+        let input = AddUserToRealmRolesInput {
+            actor: actor.clone(),
+            realm_id,
+            user_id: assigned_user_id,
+            role_ids: HashSet::from([role_id]),
+        };
+        let target = AdminDocumentTarget::Realm { realm_id };
+        let mut operation = AddUserToRealmRolesOperation::new(input);
+
+        let effects = operation
+            .emit_write_auth_doc_and_admin_state(
+                TxnId::new(),
+                Some(auth_doc.to_bytes(&actor).unwrap().into()),
+                None,
+            )
+            .unwrap();
+        let outbox_records: Vec<DocumentSyncOutboxRecord> = match effects.first().unwrap() {
+            Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => writes
+                .iter()
+                .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
+                .collect(),
+            other => panic!("unexpected write effect: {other:?}"),
+        };
+        assert_eq!(outbox_records.len(), 2);
+        assert!(outbox_records.iter().all(|record| {
+            record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })
+        }));
+        let events: Vec<_> = outbox_records
+            .iter()
+            .map(|record| match &record.event {
+                DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+                other => panic!("unexpected outbox event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(events[0].target, target);
+        assert_eq!(events[0].origin_seq, 1);
+        assert!(matches!(
+            &events[0].op,
+            AdminDocumentOperation::RealmRoleAdded { role_id: event_role_id }
+                if *event_role_id == role_id
+        ));
+        assert_eq!(events[1].target, target);
+        assert_eq!(events[1].origin_seq, 2);
+        assert_eq!(events[1].observed.sequence_for(&actor.node_id), 1);
+        assert!(matches!(
+            &events[1].op,
+            AdminDocumentOperation::RealmRoleUserAssignmentAdded {
+                role_id: event_role_id,
+                user_id: event_user_id,
+            } if *event_role_id == role_id && *event_user_id == assigned_user_id
+        ));
+    }
+
+    #[test]
     fn writes_reducer_state_and_conflicts_with_realm_auth_doc_transaction() {
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let owner_id = UserId::local(Ulid::from_bytes([3u8; 16]), realm_id);
@@ -888,7 +967,20 @@ pub mod test {
             }
             other => panic!("unexpected write effect: {other:?}"),
         };
-        assert_eq!(outbox_records.len(), 2);
+        assert_eq!(outbox_records.len(), 3);
+        assert!(outbox_records.iter().any(|record| {
+            record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })
+                && matches!(
+                    &record.event,
+                    DocumentSyncOutboxEvent::AdminOperation { event }
+                        if event.target == target
+                            && matches!(
+                                &event.op,
+                                AdminDocumentOperation::RealmRoleAdded { role_id: event_role_id }
+                                    if *event_role_id == second_role_id
+                            )
+                )
+        }));
         for expected_role_id in [role_id, second_role_id] {
             assert!(outbox_records.iter().any(|record| {
                 record.target == (DocumentSyncTarget::RealmAuthorization { realm_id })

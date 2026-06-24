@@ -614,11 +614,12 @@ fn apply_admin_reducer_updates(
     let mut admin_events = Vec::new();
     for role_id in role_ids {
         if should_seed_group_role(state, *role_id) {
-            apply_admin_reducer_operation(
+            let event = apply_admin_reducer_operation(
                 state,
                 &input.actor,
                 AdminDocumentOperation::GroupRoleAdded { role_id: *role_id },
             )?;
+            admin_events.push(event);
         }
         let event = apply_admin_reducer_operation(
             state,
@@ -773,6 +774,84 @@ pub mod test {
                 },
             )]),
         }
+    }
+
+    #[test]
+    fn seeds_missing_group_role_before_assignment_outbox_event() {
+        let realm_id = RealmId::from_bytes([12u8; 32]);
+        let owner_id = UserId::local(Ulid::from_bytes([13u8; 16]), realm_id);
+        let assigned_user_id = UserId::local(Ulid::from_bytes([14u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([15u8; 16]);
+        let role_id = Ulid::from_bytes([16u8; 16]);
+        let actor = Actor {
+            node_id: node(17),
+            user_id: owner_id,
+            realm_id,
+        };
+        let auth_doc = GroupAuthorizationDocument {
+            group_id,
+            roles: HashMap::from([(
+                role_id,
+                Role {
+                    role_id,
+                    name: "user".to_string(),
+                    permissions: HashMap::from([("/test".to_string(), Permission::READ)]),
+                    assigned_users: HashSet::new(),
+                },
+            )]),
+        };
+        let input = AddUserToGroupInput {
+            actor: actor.clone(),
+            group_id,
+            user_id: assigned_user_id,
+            role_ids: HashSet::from([role_id]),
+        };
+        let target = AdminDocumentTarget::Group { group_id };
+        let mut operation = AddUserToGroupOperation::new(input);
+
+        let effects = operation
+            .emit_write_auth_doc_and_admin_state(
+                TxnId::new(),
+                Some(auth_doc.to_bytes(&actor).unwrap().into()),
+                None,
+            )
+            .unwrap();
+        let outbox_records: Vec<DocumentSyncOutboxRecord> = match effects.first().unwrap() {
+            Effect::Storage(StorageEffect::BatchWrite { writes, .. }) => writes
+                .iter()
+                .filter(|(keyspace, _, _)| keyspace == DOCUMENT_SYNC_OUTBOX_KEYSPACE)
+                .map(|(_, _, value)| postcard::from_bytes(value).unwrap())
+                .collect(),
+            other => panic!("unexpected write effect: {other:?}"),
+        };
+        assert_eq!(outbox_records.len(), 2);
+        assert!(outbox_records.iter().all(|record| {
+            record.target == (DocumentSyncTarget::GroupAuthorization { group_id })
+        }));
+        let events: Vec<_> = outbox_records
+            .iter()
+            .map(|record| match &record.event {
+                DocumentSyncOutboxEvent::AdminOperation { event } => event.as_ref(),
+                other => panic!("unexpected outbox event: {other:?}"),
+            })
+            .collect();
+        assert_eq!(events[0].target, target);
+        assert_eq!(events[0].origin_seq, 1);
+        assert!(matches!(
+            &events[0].op,
+            AdminDocumentOperation::GroupRoleAdded { role_id: event_role_id }
+                if *event_role_id == role_id
+        ));
+        assert_eq!(events[1].target, target);
+        assert_eq!(events[1].origin_seq, 2);
+        assert_eq!(events[1].observed.sequence_for(&actor.node_id), 1);
+        assert!(matches!(
+            &events[1].op,
+            AdminDocumentOperation::GroupRoleUserAssignmentAdded {
+                role_id: event_role_id,
+                user_id: event_user_id,
+            } if *event_role_id == role_id && *event_user_id == assigned_user_id
+        ));
     }
 
     #[test]

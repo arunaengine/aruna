@@ -2522,12 +2522,13 @@ async fn apply_group_authorization_admin_document_operation_to_storage(
     }
     if !matches!(
         &event.op,
-        AdminDocumentOperation::GroupRoleCreated { .. }
+        AdminDocumentOperation::GroupRoleAdded { .. }
+            | AdminDocumentOperation::GroupRoleCreated { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::GroupRoleUserAssignmentRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "group admin operation sync only supports role creation and role user assignment updates"
+            "group admin operation sync only supports role seeds, role creation, and role user assignment updates"
                 .to_string(),
         ));
     }
@@ -2621,12 +2622,13 @@ async fn apply_realm_authorization_admin_document_operation_to_storage(
     }
     if !matches!(
         &event.op,
-        AdminDocumentOperation::RealmRoleCreated { .. }
+        AdminDocumentOperation::RealmRoleAdded { .. }
+            | AdminDocumentOperation::RealmRoleCreated { .. }
             | AdminDocumentOperation::RealmRoleUserAssignmentAdded { .. }
             | AdminDocumentOperation::RealmRoleUserAssignmentRemoved { .. }
     ) {
         return Err(NetError::Bootstrap(
-            "realm admin operation sync only supports role creation and role user assignment updates"
+            "realm admin operation sync only supports role seeds, role creation, and role user assignment updates"
                 .to_string(),
         ));
     }
@@ -4931,7 +4933,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_assignment_admin_operation_materializes_auth_doc_and_reducer_state() {
+    async fn group_role_seed_then_assignment_admin_operations_materialize_existing_auth_doc() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([9; 32]);
         let group_id = Ulid::from_parts(1, 1);
@@ -4968,11 +4970,29 @@ mod tests {
         .await
         .expect("auth doc writes");
 
-        let add_event = AdminDocumentEvent {
+        let target = AdminDocumentTarget::Group { group_id };
+        let seed_event = AdminDocumentEvent {
             event_id: Ulid::from_parts(5, 5),
-            target: AdminDocumentTarget::Group { group_id },
+            target: target.clone(),
             origin_node_id: actor.node_id,
             origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor: actor.clone(),
+            op: AdminDocumentOperation::GroupRoleAdded { role_id },
+        };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::GroupAuthorization { group_id },
+            seed_event,
+        )
+        .await
+        .expect("role seed applies");
+
+        let add_event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(6, 6),
+            target: target.clone(),
+            origin_node_id: actor.node_id,
+            origin_seq: 2,
             observed: AdminDocumentClock::default(),
             actor: actor.clone(),
             op: AdminDocumentOperation::GroupRoleUserAssignmentAdded {
@@ -4999,7 +5019,6 @@ mod tests {
                 .assigned_users
                 .contains(&assigned_user_id)
         );
-        let target = AdminDocumentTarget::Group { group_id };
         let reducer_state = read_storage_value(
             &storage,
             ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -5010,6 +5029,10 @@ mod tests {
         let reducer_state: AdminDocumentReducerState =
             postcard::from_bytes(&reducer_state).expect("reducer state decodes");
         assert!(reducer_state.conflicts.is_empty());
+        assert_eq!(
+            reducer_state.materialized_group_roles(),
+            BTreeSet::from([role_id])
+        );
         let assignment_path = group_role_user_assignment_path(&role_id, &assigned_user_id);
         assert_eq!(
             reducer_state
@@ -5020,10 +5043,10 @@ mod tests {
         );
 
         let remove_event = AdminDocumentEvent {
-            event_id: Ulid::from_parts(6, 6),
+            event_id: Ulid::from_parts(7, 7),
             target,
             origin_node_id: actor.node_id,
-            origin_seq: 2,
+            origin_seq: 3,
             observed: AdminDocumentClock::default(),
             actor,
             op: AdminDocumentOperation::GroupRoleUserAssignmentRemoved {
@@ -5300,7 +5323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_assignment_admin_operation_materializes_auth_doc_and_reducer_state() {
+    async fn realm_role_seed_then_assignment_admin_operations_materialize_existing_auth_doc() {
         let (_dir, storage) = test_storage();
         let realm_id = RealmId::from_bytes([10; 32]);
         let role_id = Ulid::from_parts(2, 2);
@@ -5337,11 +5360,29 @@ mod tests {
         .await
         .expect("auth doc writes");
 
-        let add_event = AdminDocumentEvent {
+        let target = AdminDocumentTarget::Realm { realm_id };
+        let seed_event = AdminDocumentEvent {
             event_id: Ulid::from_parts(5, 5),
-            target: AdminDocumentTarget::Realm { realm_id },
+            target: target.clone(),
             origin_node_id: actor.node_id,
             origin_seq: 1,
+            observed: AdminDocumentClock::default(),
+            actor: actor.clone(),
+            op: AdminDocumentOperation::RealmRoleAdded { role_id },
+        };
+        apply_admin_document_operation_to_storage(
+            &storage,
+            DocumentSyncTarget::RealmAuthorization { realm_id },
+            seed_event,
+        )
+        .await
+        .expect("role seed applies");
+
+        let add_event = AdminDocumentEvent {
+            event_id: Ulid::from_parts(6, 6),
+            target: target.clone(),
+            origin_node_id: actor.node_id,
+            origin_seq: 2,
             observed: AdminDocumentClock::default(),
             actor: actor.clone(),
             op: AdminDocumentOperation::RealmRoleUserAssignmentAdded {
@@ -5368,7 +5409,6 @@ mod tests {
                 .assigned_users
                 .contains(&assigned_user_id)
         );
-        let target = AdminDocumentTarget::Realm { realm_id };
         let reducer_state = read_storage_value(
             &storage,
             ADMIN_DOCUMENT_STATE_KEYSPACE,
@@ -5379,6 +5419,10 @@ mod tests {
         let reducer_state: AdminDocumentReducerState =
             postcard::from_bytes(&reducer_state).expect("reducer state decodes");
         assert!(reducer_state.conflicts.is_empty());
+        assert_eq!(
+            reducer_state.materialized_realm_roles(),
+            BTreeSet::from([role_id])
+        );
         let assignment_path = realm_role_user_assignment_path(&role_id, &assigned_user_id);
         assert_eq!(
             reducer_state
@@ -5389,10 +5433,10 @@ mod tests {
         );
 
         let remove_event = AdminDocumentEvent {
-            event_id: Ulid::from_parts(6, 6),
+            event_id: Ulid::from_parts(7, 7),
             target,
             origin_node_id: actor.node_id,
-            origin_seq: 2,
+            origin_seq: 3,
             observed: AdminDocumentClock::default(),
             actor,
             op: AdminDocumentOperation::RealmRoleUserAssignmentRemoved {
