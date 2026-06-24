@@ -11,7 +11,9 @@ use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE};
+use aruna_core::keyspaces::{
+    API_STATE_KEYSPACE, METADATA_GRAPH_LIFECYCLE_KEYSPACE, REALM_CONFIG_KEYSPACE,
+};
 use aruna_core::metadata::{
     MetadataBatch, MetadataCreateCrateRequest, MetadataDot, MetadataEffect, MetadataError,
     MetadataEvent, MetadataGraphLifecycleRecord, MetadataGraphPolicy, MetadataQuadOp,
@@ -19,7 +21,9 @@ use aruna_core::metadata::{
     MetadataUpsertEntityRequest,
 };
 use aruna_core::storage_entries::metadata_graph_lifecycle_key;
-use aruna_core::structs::{AuthContext, MetadataRegistryRecord, Permission, RealmId};
+use aruna_core::structs::{
+    AuthContext, MetadataRegistryRecord, Permission, RealmConfigDocument, RealmId,
+};
 use aruna_core::types::GroupId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
@@ -55,6 +59,7 @@ const METADATA_IO_TIMEOUT: Duration = Duration::from_secs(15);
 const METADATA_GRAPH_SYNC_ATTEMPTS: usize = 3;
 const METADATA_GRAPH_SYNC_RETRY_AFTER: Duration = Duration::from_millis(250);
 const SLOW_METADATA_BACKEND_THRESHOLD: Duration = Duration::from_millis(100);
+const REALM_CONFIG_SCAN_PAGE_SIZE: usize = 128;
 
 // Unbiased per-call-kind craqle latency histograms; every backend call is
 // recorded, not just the ones above the slow-call threshold.
@@ -845,7 +850,7 @@ impl MetadataHandle {
         level = "debug",
         skip(self, stream),
         fields(
-            peer = ?_peer,
+            peer = ?peer,
             request = field::Empty,
             response = field::Empty,
             read_ms = field::Empty,
@@ -858,7 +863,7 @@ impl MetadataHandle {
     pub async fn handle_inbound_stream(
         &self,
         mut stream: BiStream,
-        _peer: NodeId,
+        peer: NodeId,
     ) -> Result<(), MetadataError> {
         let total_started = Instant::now();
         let read_started = Instant::now();
@@ -874,17 +879,30 @@ impl MetadataHandle {
                 graph_iris,
                 sparql,
             } => {
-                match remote_metadata_auth_context(&self.inner.auth_validation, auth_token).await {
-                    Ok(auth_context) => {
-                        match query_local_graphs(
-                            self.inner.clone(),
-                            auth_context,
-                            graph_iris,
-                            sparql,
-                        )
-                        .await
+                match ensure_remote_metadata_peer_is_configured(&self.inner.storage_handle, peer)
+                    .await
+                {
+                    Ok(()) => {
+                        match remote_metadata_auth_context(&self.inner.auth_validation, auth_token)
+                            .await
                         {
-                            Ok(results) => MetadataTransportMessage::QueryResults { results },
+                            Ok(auth_context) => {
+                                match query_local_graphs(
+                                    self.inner.clone(),
+                                    auth_context,
+                                    graph_iris,
+                                    sparql,
+                                )
+                                .await
+                                {
+                                    Ok(results) => {
+                                        MetadataTransportMessage::QueryResults { results }
+                                    }
+                                    Err(error) => {
+                                        MetadataTransportMessage::Reject(error.to_string())
+                                    }
+                                }
+                            }
                             Err(error) => MetadataTransportMessage::Reject(error.to_string()),
                         }
                     }
@@ -897,18 +915,29 @@ impl MetadataHandle {
                 query,
                 limit,
             } => {
-                match remote_metadata_auth_context(&self.inner.auth_validation, auth_token).await {
-                    Ok(auth_context) => {
-                        match search_local_graphs(
-                            self.inner.clone(),
-                            auth_context,
-                            graph_iris,
-                            query,
-                            limit,
-                        )
-                        .await
+                match ensure_remote_metadata_peer_is_configured(&self.inner.storage_handle, peer)
+                    .await
+                {
+                    Ok(()) => {
+                        match remote_metadata_auth_context(&self.inner.auth_validation, auth_token)
+                            .await
                         {
-                            Ok(hits) => MetadataTransportMessage::SearchResults { hits },
+                            Ok(auth_context) => {
+                                match search_local_graphs(
+                                    self.inner.clone(),
+                                    auth_context,
+                                    graph_iris,
+                                    query,
+                                    limit,
+                                )
+                                .await
+                                {
+                                    Ok(hits) => MetadataTransportMessage::SearchResults { hits },
+                                    Err(error) => {
+                                        MetadataTransportMessage::Reject(error.to_string())
+                                    }
+                                }
+                            }
                             Err(error) => MetadataTransportMessage::Reject(error.to_string()),
                         }
                     }
@@ -1110,6 +1139,57 @@ where
         .await
         .map(Some)
         .map_err(|error| MetadataError::Backend(format!("invalid metadata auth token: {error}")))
+}
+
+async fn ensure_remote_metadata_peer_is_configured(
+    storage_handle: &StorageHandle,
+    peer: NodeId,
+) -> Result<(), MetadataError> {
+    let mut start_after = None;
+
+    loop {
+        let event = storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                prefix: None,
+                start: start_after.map(IterStart::After),
+                limit: REALM_CONFIG_SCAN_PAGE_SIZE,
+                txn_id: None,
+            })
+            .await;
+
+        let (values, next_start_after) = match event {
+            Event::Storage(StorageEvent::IterResult {
+                values,
+                next_start_after,
+            }) => (values, next_start_after),
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(MetadataError::Backend(format!(
+                    "realm config scan failed: {error}"
+                )));
+            }
+            other => {
+                return Err(MetadataError::Backend(format!(
+                    "unexpected realm config scan result: {other:?}"
+                )));
+            }
+        };
+
+        for (_, bytes) in values {
+            let document = RealmConfigDocument::from_bytes(&bytes)
+                .map_err(|error| MetadataError::Backend(error.to_string()))?;
+            if document.has_node(peer) {
+                return Ok(());
+            }
+        }
+
+        let Some(cursor) = next_start_after else {
+            return Err(MetadataError::InvalidInput(format!(
+                "remote metadata peer `{peer}` is not configured in any realm"
+            )));
+        };
+        start_after = Some(cursor);
+    }
 }
 
 async fn load_metadata_auth_state<T>(
@@ -3882,8 +3962,10 @@ mod tests {
     use super::*;
     use aruna_core::UserId;
     use aruna_core::auth::{TOKEN_REVOCATION_LIST_KEY, TRUSTED_REALMS_LIST_KEY, bearer_token_hash};
-    use aruna_core::keyspaces::API_STATE_KEYSPACE;
-    use aruna_core::structs::{PathRestriction, RealmId, TokenClaims};
+    use aruna_core::keyspaces::{API_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::structs::{
+        PathRestriction, RealmConfigDocument, RealmId, RealmNodeKind, TokenClaims,
+    };
     use aruna_storage::{FjallStorage, StorageHandle};
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
@@ -3908,6 +3990,38 @@ mod tests {
 
         assert_eq!(options.search_storage, MetadataSearchStorage::Memory);
         assert_eq!(options.irokle_persist_policy, FjallPersistPolicy::SyncAll);
+    }
+
+    #[tokio::test]
+    async fn remote_metadata_peer_gate_accepts_configured_peer() {
+        let (_dir, storage) = auth_storage();
+        let realm_id = RealmId([11u8; 32]);
+        let configured_peer = node_id_from_seed(12);
+        persist_realm_config(&storage, realm_id, &[configured_peer]).await;
+
+        ensure_remote_metadata_peer_is_configured(&storage, configured_peer)
+            .await
+            .expect("configured peer accepted");
+    }
+
+    #[tokio::test]
+    async fn remote_metadata_peer_gate_rejects_unknown_peer() {
+        let (_dir, storage) = auth_storage();
+        let realm_id = RealmId([21u8; 32]);
+        let configured_peer = node_id_from_seed(22);
+        let unknown_peer = node_id_from_seed(23);
+        persist_realm_config(&storage, realm_id, &[configured_peer]).await;
+
+        let error = ensure_remote_metadata_peer_is_configured(&storage, unknown_peer)
+            .await
+            .expect_err("unknown peer rejected");
+
+        assert_eq!(
+            error,
+            MetadataError::InvalidInput(format!(
+                "remote metadata peer `{unknown_peer}` is not configured in any realm"
+            ))
+        );
     }
 
     #[tokio::test]
@@ -4049,6 +4163,27 @@ mod tests {
         }
     }
 
+    async fn persist_realm_config(storage: &StorageHandle, realm_id: RealmId, node_ids: &[NodeId]) {
+        let mut config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+        for node_id in node_ids {
+            config.ensure_node(*node_id, RealmNodeKind::Server);
+        }
+        let bytes = postcard::to_allocvec(&config).expect("realm config serializes");
+
+        match storage
+            .send_storage_effect(StorageEffect::Write {
+                key_space: REALM_CONFIG_KEYSPACE.to_string(),
+                key: (*realm_id.as_bytes()).into(),
+                value: ByteView::from(bytes),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected realm config write result: {other:?}"),
+        }
+    }
+
     fn realm_fixture() -> (SigningKey, RealmId, UserId) {
         let signing_key = signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
@@ -4059,6 +4194,10 @@ mod tests {
     fn signing_key() -> SigningKey {
         let mut rng = jsonwebtoken::signature::rand_core::OsRng;
         SigningKey::generate(&mut rng)
+    }
+
+    fn node_id_from_seed(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
     fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
