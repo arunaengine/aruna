@@ -41,6 +41,11 @@ pub enum UpdateMetadataDocumentMutation {
     UpsertContextualEntity { jsonld: String },
 }
 
+/// Validates a metadata update and persists the event plus projection work.
+///
+/// A successful operation means the update has been accepted into the durable
+/// event/projection pipeline. Graph materialization and replica convergence may
+/// still be pending.
 #[derive(Debug, PartialEq)]
 pub struct UpdateMetadataDocumentOperation {
     config: UpdateMetadataDocumentConfig,

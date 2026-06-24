@@ -103,6 +103,11 @@ pub fn router() -> Router<Arc<ServerState>> {
         )
 }
 
+/// Public metadata registry summary.
+///
+/// When returned by create or update endpoints, this summary reflects a write
+/// accepted into the durable event/projection pipeline. The graph, query/search
+/// visibility, and remote replicas may still be catching up.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MetadataDocumentSummary {
     pub document_id: String,
@@ -146,8 +151,12 @@ pub enum CreateMetadataRequest {
     RoCrate(CreateMetadataRoCrateRequest),
 }
 
+/// Response for a metadata create request accepted into the durable
+/// event/projection pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateMetadataResponse {
+    /// Accepted registry summary. It does not guarantee the graph is fully
+    /// materialized, queryable, searchable, or replicated yet.
     #[serde(flatten)]
     pub summary: MetadataDocumentSummary,
 }
@@ -427,7 +436,7 @@ impl MetadataDocumentListItem {
     responses(
         (
             status = 201,
-            description = "Metadata document created",
+            description = "Metadata create accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
             body = CreateMetadataResponse,
             examples(
                 (
@@ -808,7 +817,7 @@ pub async fn export_metadata_rocrate(
     responses(
         (
             status = 200,
-            description = "Metadata document updated",
+            description = "Metadata update accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -901,7 +910,7 @@ pub async fn replace_metadata_rocrate(
     responses(
         (
             status = 200,
-            description = "Data entity upserted",
+            description = "Data entity upsert accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -990,7 +999,7 @@ pub async fn add_metadata_data_entity(
     responses(
         (
             status = 200,
-            description = "Contextual entity upserted",
+            description = "Contextual entity upsert accepted into the durable event/projection pipeline. This does not guarantee the graph is fully materialized, queryable, searchable, or replicated yet.",
             body = MetadataDocumentSummary,
             examples(
                 (
@@ -3182,6 +3191,30 @@ mod tests {
             .unwrap();
         assert!(create_examples.contains_key("ScaffoldCreate"));
         assert!(create_examples.contains_key("RoCrateCreate"));
+
+        let create_response_description = openapi["paths"]["/metadata"]["post"]["responses"]["201"]
+            ["description"]
+            .as_str()
+            .unwrap();
+        assert!(create_response_description.contains("durable event/projection pipeline"));
+        assert!(create_response_description.contains("fully materialized"));
+        assert!(create_response_description.contains("replicated yet"));
+
+        for (path, method) in [
+            ("/metadata/{document_id}/rocrate", "put"),
+            ("/metadata/{document_id}/rocrate/data-entities", "post"),
+            (
+                "/metadata/{document_id}/rocrate/contextual-entities",
+                "post",
+            ),
+        ] {
+            let description = openapi["paths"][path][method]["responses"]["200"]["description"]
+                .as_str()
+                .unwrap();
+            assert!(description.contains("durable event/projection pipeline"));
+            assert!(description.contains("fully materialized"));
+            assert!(description.contains("replicated yet"));
+        }
 
         let document_query_request =
             &openapi["paths"]["/metadata/{document_id}/sparql/query"]["post"]["requestBody"];

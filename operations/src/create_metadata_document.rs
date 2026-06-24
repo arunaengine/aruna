@@ -38,12 +38,23 @@ pub enum CreateMetadataDocumentPayload {
     },
 }
 
+/// Result returned after a metadata create is durably accepted.
+///
+/// Completion means the create event was appended for projection. Graph
+/// materialization and replica convergence may still be pending.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateMetadataDocumentResult {
+    /// Registry state accepted for the create event.
     pub record: MetadataRegistryRecord,
+    /// Durable event id used by projection and replication workers.
     pub event_id: Ulid,
 }
 
+/// Validates metadata create input and appends a durable create event.
+///
+/// A successful operation does not mean the graph has been fully materialized
+/// or replicated; callers should treat completion as acceptance into the
+/// event/projection pipeline.
 #[derive(Debug, PartialEq)]
 pub struct CreateMetadataDocumentOperation {
     config: CreateMetadataDocumentConfig,
